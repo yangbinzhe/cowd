@@ -184,11 +184,12 @@ pub use iacc::{
     IaccCrossPlaneBridgeReceipt, IaccDomainPack, IaccDomainScenario, IaccDomainSeedPlan,
     IaccDomainSeedResult, IaccEntity, IaccEntityInput, IaccEvidencePacket, IaccEvidenceSourceRef,
     IaccFact, IaccFactInput, IaccHealth, IaccImpactHop, IaccImpactPath, IaccImpactTrace,
-    IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricDependencyInput,
-    IaccMetricLineage, IaccMetricRecomputeResult, IaccMetricState, IaccMetricStatus,
-    IaccOperationalAnalysis, IaccQualityGateDecision, IaccRecommendedAction, IaccRelation,
-    IaccRelationInput, IaccSeverity, IaccSourceKey, IaccSourceKind, IaccSourceSnapshot, IaccStore,
-    IaccStoreError, IACC_SCHEMA_VERSION,
+    IaccIncident, IaccMemoryCase, IaccMetricDefinition, IaccMetricDependency,
+    IaccMetricDependencyInput, IaccMetricLineage, IaccMetricRecomputeResult, IaccMetricState,
+    IaccMetricStatus, IaccOperationalAnalysis, IaccPlaybook, IaccPlaybookStep,
+    IaccQualityGateDecision, IaccRecommendedAction, IaccRelation, IaccRelationInput, IaccSeverity,
+    IaccSourceKey, IaccSourceKind, IaccSourceSnapshot, IaccStore, IaccStoreError,
+    IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

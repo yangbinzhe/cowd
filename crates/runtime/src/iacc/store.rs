@@ -10,12 +10,13 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitReportDeliveryReceipt,
-    IaccCockpitReportRequest, IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob,
-    IaccComputeJobInput, IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult,
-    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
-    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
-    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccCasePromotion, IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection,
+    IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
+    IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput, IaccComputePlan,
+    IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket,
+    IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase,
+    IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
+    IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
 pub const IACC_SCHEMA_VERSION: i64 = 11;
@@ -49,6 +50,8 @@ pub struct IaccHealth {
     pub quality_gate_count: u64,
     pub cockpit_profile_count: u64,
     pub cockpit_report_count: u64,
+    pub memory_case_count: u64,
+    pub playbook_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +112,8 @@ impl IaccStore {
             quality_gate_count: count_table(&connection, "iacc_quality_gate")?,
             cockpit_profile_count: count_table(&connection, "iacc_cockpit_profile")?,
             cockpit_report_count: count_table(&connection, "iacc_cockpit_report")?,
+            memory_case_count: count_table(&connection, "iacc_memory_case")?,
+            playbook_count: count_table(&connection, "iacc_playbook")?,
         })
     }
 
@@ -857,6 +862,100 @@ impl IaccStore {
         }
         Ok(execution)
     }
+
+    pub fn promote_incident_to_memory_case(
+        &self,
+        incident_id: &str,
+    ) -> Result<IaccCasePromotion, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let incident = find_incident(&connection, incident_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(incident_id.to_string()))?;
+        let analysis = latest_analysis_for_incident(&connection, incident_id)?;
+        let packet = incident
+            .evidence_packet_id
+            .as_deref()
+            .map(|packet_id| find_evidence_packet(&connection, packet_id))
+            .transpose()?
+            .flatten();
+        let executions = list_executions_for_incident(&connection, incident_id, 20)?;
+        let mut memory_case = IaccMemoryCase::from_closed_loop(
+            &incident,
+            analysis.as_ref(),
+            packet.as_ref(),
+            &executions,
+        );
+        let playbook = IaccPlaybook::from_memory_case(&memory_case, analysis.as_ref());
+        memory_case.playbook_id = Some(playbook.playbook_id.clone());
+        insert_memory_case(&connection, &memory_case)?;
+        insert_playbook(&connection, &playbook)?;
+        Ok(IaccCasePromotion {
+            memory_case,
+            playbook,
+        })
+    }
+
+    pub fn get_memory_case(&self, case_id: &str) -> Result<Option<IaccMemoryCase>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_memory_case(&connection, case_id)
+    }
+
+    pub fn search_memory_cases(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IaccMemoryCase>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_memory_cases(&connection, query, limit)
+    }
+
+    pub fn upsert_playbook(&self, playbook: &IaccPlaybook) -> Result<IaccPlaybook, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_playbook(&connection, playbook)?;
+        Ok(playbook.clone())
+    }
+
+    pub fn get_playbook(&self, playbook_id: &str) -> Result<Option<IaccPlaybook>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_playbook(&connection, playbook_id)
+    }
+
+    pub fn recommend_playbooks_for_incident(
+        &self,
+        incident_id: &str,
+        limit: usize,
+    ) -> Result<Vec<IaccPlaybook>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let incident = find_incident(&connection, incident_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(incident_id.to_string()))?;
+        let analysis = latest_analysis_for_incident(&connection, incident_id)?;
+        let packet = incident
+            .evidence_packet_id
+            .as_deref()
+            .map(|packet_id| find_evidence_packet(&connection, packet_id))
+            .transpose()?
+            .flatten();
+        let probe =
+            IaccMemoryCase::from_closed_loop(&incident, analysis.as_ref(), packet.as_ref(), &[]);
+        recommend_playbooks(&connection, &probe.metric_keys, &probe.entity_refs, limit)
+    }
 }
 
 fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
@@ -1098,7 +1197,31 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_iacc_action_execution_analysis
             ON iacc_action_execution(analysis_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_iacc_action_execution_incident
-            ON iacc_action_execution(incident_id, updated_at DESC);",
+            ON iacc_action_execution(incident_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_memory_case (
+            case_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            problem_signature TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            memory_case_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_memory_case_incident
+            ON iacc_memory_case(incident_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_iacc_memory_case_signature
+            ON iacc_memory_case(problem_signature);
+
+        CREATE TABLE IF NOT EXISTS iacc_playbook (
+            playbook_id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            scenario TEXT NOT NULL,
+            playbook_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_playbook_domain
+            ON iacc_playbook(domain, scenario);",
     )
 }
 
@@ -2369,6 +2492,25 @@ fn find_analysis(
         .transpose()
 }
 
+fn latest_analysis_for_incident(
+    connection: &Connection,
+    incident_id: &str,
+) -> Result<Option<IaccOperationalAnalysis>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT analysis_json
+              FROM iacc_operational_analysis
+              WHERE incident_id = ?1
+              ORDER BY created_at DESC
+              LIMIT 1",
+            params![incident_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
 fn insert_execution(
     connection: &Connection,
     execution: &IaccActionExecution,
@@ -2420,6 +2562,169 @@ fn list_recent_executions(
     )?;
     let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn list_executions_for_incident(
+    connection: &Connection,
+    incident_id: &str,
+    limit: usize,
+) -> Result<Vec<IaccActionExecution>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT execution_json
+          FROM iacc_action_execution
+          WHERE incident_id = ?1
+          ORDER BY updated_at DESC
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![incident_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn insert_memory_case(
+    connection: &Connection,
+    memory_case: &IaccMemoryCase,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_memory_case (
+            case_id, incident_id, problem_signature, outcome, memory_case_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            memory_case.case_id,
+            memory_case.incident_id,
+            memory_case.problem_signature,
+            memory_case.outcome,
+            serde_json::to_string(memory_case)?,
+            memory_case.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_memory_case(
+    connection: &Connection,
+    case_id: &str,
+) -> Result<Option<IaccMemoryCase>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT memory_case_json FROM iacc_memory_case WHERE case_id = ?1",
+            params![case_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn search_memory_cases(
+    connection: &Connection,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<Vec<IaccMemoryCase>, IaccStoreError> {
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(query) = query {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut statement = connection.prepare(
+            r"SELECT memory_case_json
+              FROM iacc_memory_case
+              WHERE lower(problem_signature) LIKE ?1 OR lower(memory_case_json) LIKE ?1
+              ORDER BY created_at DESC
+              LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![pattern, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    } else {
+        let mut statement = connection.prepare(
+            r"SELECT memory_case_json
+              FROM iacc_memory_case
+              ORDER BY created_at DESC
+              LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+}
+
+fn insert_playbook(connection: &Connection, playbook: &IaccPlaybook) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_playbook (
+            playbook_id, domain, scenario, playbook_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            playbook.playbook_id,
+            playbook.domain,
+            playbook.scenario,
+            serde_json::to_string(playbook)?,
+            playbook.created_at.to_rfc3339(),
+            playbook.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_playbook(
+    connection: &Connection,
+    playbook_id: &str,
+) -> Result<Option<IaccPlaybook>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT playbook_json FROM iacc_playbook WHERE playbook_id = ?1",
+            params![playbook_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn recommend_playbooks(
+    connection: &Connection,
+    metric_keys: &[String],
+    entity_refs: &[String],
+    limit: usize,
+) -> Result<Vec<IaccPlaybook>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT playbook_json
+          FROM iacc_playbook
+          ORDER BY updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![(limit.max(20)) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut playbooks = rows
+        .map(|row| Ok(serde_json::from_str::<IaccPlaybook>(&row?)?))
+        .collect::<Result<Vec<_>, IaccStoreError>>()?;
+    playbooks.sort_by(|left, right| {
+        score_playbook(right, metric_keys, entity_refs).cmp(&score_playbook(
+            left,
+            metric_keys,
+            entity_refs,
+        ))
+    });
+    playbooks.truncate(limit);
+    Ok(playbooks)
+}
+
+fn score_playbook(
+    playbook: &IaccPlaybook,
+    metric_keys: &[String],
+    entity_refs: &[String],
+) -> usize {
+    let metric_score = playbook
+        .metric_keys
+        .iter()
+        .filter(|metric| metric_keys.contains(metric))
+        .count()
+        * 10;
+    let entity_score = entity_refs
+        .iter()
+        .filter(|entity| playbook.scenario.contains(entity.as_str()))
+        .count();
+    metric_score + entity_score
 }
 
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {

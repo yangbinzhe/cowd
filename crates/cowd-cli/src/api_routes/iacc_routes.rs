@@ -18,8 +18,8 @@ use runtime::{
     IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
     IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
     IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
-    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation,
-    IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
+    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook,
+    IaccRelation, IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
     IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,24 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/incidents/:id/analyze",
             post(iacc_incident_analyze_handler),
         )
+        .route(
+            "/api/iacc/incidents/:id/cases/promote",
+            post(iacc_incident_case_promote_handler),
+        )
+        .route(
+            "/api/iacc/incidents/:id/playbooks/recommend",
+            post(iacc_incident_playbook_recommend_handler),
+        )
+        .route("/api/iacc/cases/:id", get(iacc_memory_case_get_handler))
+        .route(
+            "/api/iacc/cases/search",
+            get(iacc_memory_case_search_handler),
+        )
+        .route(
+            "/api/iacc/playbooks/upsert",
+            post(iacc_playbook_upsert_handler),
+        )
+        .route("/api/iacc/playbooks/:id", get(iacc_playbook_get_handler))
         .route("/api/iacc/analyses/:id", get(iacc_analysis_get_handler))
         .route(
             "/api/iacc/analyses/:analysis_id/actions/:action_id/execute",
@@ -322,6 +340,33 @@ struct IaccExecutionFeedbackRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccCaseSearchQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccPlaybookUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    playbook: IaccPlaybook,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccPlaybookRecommendRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccCrossPlaneBridgeRequest {
     #[serde(default = "default_iacc_bridge_mode")]
     mode: String,
@@ -441,6 +486,8 @@ async fn iacc_health_handler(
         "quality_gate_count": health.quality_gate_count,
         "cockpit_profile_count": health.cockpit_profile_count,
         "cockpit_report_count": health.cockpit_report_count,
+        "memory_case_count": health.memory_case_count,
+        "playbook_count": health.playbook_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "cockpit_report_snapshot",
@@ -451,6 +498,8 @@ async fn iacc_health_handler(
             "cockpit_report_delivery_retry_state",
             "cockpit_report_webui_visibility",
             "production_operation_package",
+            "memory_case_promotion",
+            "playbook_recommendation",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -1249,6 +1298,111 @@ async fn iacc_incident_analyze_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.operational_analysis",
         "analysis": analysis,
+    })))
+}
+
+async fn iacc_incident_case_promote_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let promotion = store
+        .promote_incident_to_memory_case(&id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.memory_case.promotion",
+        "memory_case": promotion.memory_case,
+        "playbook": promotion.playbook,
+    })))
+}
+
+async fn iacc_memory_case_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let memory_case = store
+        .get_memory_case(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC memory case not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.memory_case",
+        "memory_case": memory_case,
+    })))
+}
+
+async fn iacc_memory_case_search_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<IaccCaseSearchQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let cases = store
+        .search_memory_cases(query.q.as_deref(), query.limit.unwrap_or(20).min(100))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.memory_case.search",
+        "items": cases,
+    })))
+}
+
+async fn iacc_playbook_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccPlaybookUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let playbook = store
+        .upsert_playbook(&request.playbook)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.playbook",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "playbook": playbook,
+    })))
+}
+
+async fn iacc_playbook_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let playbook = store
+        .get_playbook(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC playbook not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.playbook",
+        "playbook": playbook,
+    })))
+}
+
+async fn iacc_incident_playbook_recommend_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccPlaybookRecommendRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let playbooks = store
+        .recommend_playbooks_for_incident(&id, request.limit.unwrap_or(5).min(20))
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.playbook.recommendation",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "incident_id": id,
+        "playbooks": playbooks,
     })))
 }
 

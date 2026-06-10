@@ -16,6 +16,7 @@ mod evidence;
 mod execution;
 mod fact;
 mod incident;
+mod memory_case;
 mod metric;
 mod metric_graph;
 mod quality;
@@ -47,6 +48,7 @@ pub use execution::{
 };
 pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
+pub use memory_case::{IaccCasePromotion, IaccMemoryCase, IaccPlaybook, IaccPlaybookStep};
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
 pub use metric_graph::{IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage};
 pub use quality::IaccQualityGateDecision;
