@@ -582,6 +582,7 @@ async fn iacc_health_handler(
             "incident_room_projection",
             "source_onboarding_pack",
             "source_pack_delta_plan",
+            "production_pilot_gate",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
