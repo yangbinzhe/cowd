@@ -16,6 +16,43 @@ run_script() {
   "$ROOT/$script"
 }
 
+run_webui_module_tests() {
+  if [[ -x "$ROOT/webui/node_modules/.bin/vitest" ]]; then
+    printf '\n==> webui module tests\n'
+    (cd "$ROOT/webui" && npm test -- --pool forks --poolOptions.forks.singleFork=true)
+    return
+  fi
+
+  local external_modules="${IACC_WEBUI_NODE_MODULES:-}"
+  if [[ -z "$external_modules" && -d /media/yi/Ext/cowd-webui-deps/node_modules ]]; then
+    external_modules="/media/yi/Ext/cowd-webui-deps/node_modules"
+  fi
+
+  if [[ -n "$external_modules" && -x "$external_modules/.bin/vitest" ]]; then
+    local tmp_root="${TMPDIR:-/tmp}"
+    local webui_copy
+    webui_copy="$(mktemp -d "$tmp_root/cowd-v0998-webui.XXXXXX")"
+    cleanup_webui_copy() {
+      rm -rf "$webui_copy" >/dev/null 2>&1 || true
+    }
+    trap 'trap - RETURN; cleanup_webui_copy' RETURN
+
+    printf '\n==> webui module tests with external node_modules\n'
+    cp -a "$ROOT/webui/." "$webui_copy/"
+    rm -rf "$webui_copy/node_modules"
+    ln -s "$external_modules" "$webui_copy/node_modules"
+    (cd "$webui_copy" && PATH="$external_modules/.bin:$PATH" npm test -- --pool forks --poolOptions.forks.singleFork=true)
+    return
+  fi
+
+  if [[ "${IACC_V0998_REQUIRE_WEBUI_TESTS:-0}" == "1" ]]; then
+    echo "webui node_modules are missing; run npm ci in webui or set IACC_WEBUI_NODE_MODULES" >&2
+    exit 1
+  fi
+
+  printf '\n==> webui module tests skipped; install webui dependencies, set IACC_WEBUI_NODE_MODULES, or set IACC_V0998_REQUIRE_WEBUI_TESTS=1 in CI\n'
+}
+
 check_iacc_health_capability() {
   local bin="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
   local port="${COWD_V0998_PORT:-18718}"
@@ -124,14 +161,6 @@ run_script scripts/v0995_iacc_cockpit_report_schedule_runner_scenario.sh
 run_script scripts/v0996_iacc_report_delivery_retry_state_scenario.sh
 run_script scripts/v0997_iacc_webui_report_visibility_scenario.sh
 
-if [[ -x "$ROOT/webui/node_modules/.bin/vitest" ]]; then
-  printf '\n==> webui module tests\n'
-  (cd "$ROOT/webui" && npm test -- --runInBand)
-elif [[ "${IACC_V0998_REQUIRE_WEBUI_TESTS:-0}" == "1" ]]; then
-  echo "webui node_modules are missing but IACC_V0998_REQUIRE_WEBUI_TESTS=1" >&2
-  exit 1
-else
-  printf '\n==> webui module tests skipped; install webui dependencies or set IACC_V0998_REQUIRE_WEBUI_TESTS=1 in CI\n'
-fi
+run_webui_module_tests
 
 printf '\nIACC v0.9.98 production release gate passed.\n'
