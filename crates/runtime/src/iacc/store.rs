@@ -13,14 +13,16 @@ use super::{
     IaccCasePromotion, IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection,
     IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
     IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput, IaccComputePlan,
-    IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket,
-    IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase,
-    IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
-    IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity,
-    IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
+    IaccCrossPlaneBridgeReceipt, IaccDataPlane, IaccDataPlaneHealth, IaccDataPlaneIngestPlan,
+    IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark, IaccDomainSeedResult, IaccEntity,
+    IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace,
+    IaccIncident, IaccMemoryCase, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
+    IaccMetricState, IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation,
+    IaccSeverity, IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
+    IaccSqliteDataPlane,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 11;
+pub const IACC_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -54,6 +56,7 @@ pub struct IaccHealth {
     pub memory_case_count: u64,
     pub playbook_count: u64,
     pub source_pack_count: u64,
+    pub data_plane_watermark_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,7 +120,50 @@ impl IaccStore {
             memory_case_count: count_table(&connection, "iacc_memory_case")?,
             playbook_count: count_table(&connection, "iacc_playbook")?,
             source_pack_count: count_table(&connection, "iacc_source_pack")?,
+            data_plane_watermark_count: count_table(&connection, "iacc_data_plane_watermark")?,
         })
+    }
+
+    pub fn data_plane_health(&self) -> Result<IaccDataPlaneHealth, IaccStoreError> {
+        let health = self.health()?;
+        Ok(IaccSqliteDataPlane::new(health.data_plane_watermark_count).health())
+    }
+
+    pub fn plan_data_plane_ingest(
+        &self,
+        input: IaccDataPlaneIngestPlanInput,
+    ) -> Result<IaccDataPlaneIngestPlan, IaccStoreError> {
+        let mut plan =
+            IaccSqliteDataPlane::new(self.health()?.data_plane_watermark_count).plan_ingest(input);
+        if plan.affected_metric_ids.is_empty() {
+            let connection = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
+            affected.extend(metric_ids_for_fact_type(&connection, &plan.fact_type)?);
+            affected.sort();
+            affected.dedup();
+            plan.compute_jobs = affected
+                .iter()
+                .map(|metric_id| IaccComputeJobInput {
+                    job_id: Some(format!("compute-job-{}-{}", plan.batch_id, metric_id)),
+                    trigger_fact_type: plan.fact_type.clone(),
+                    trigger_fact_refs: vec![format!("iacc:data-plane-batch:{}", plan.batch_id)],
+                    entity_scope: None,
+                    period: Some(plan.partition_ref.clone()),
+                    metric_ids: vec![metric_id.clone()],
+                    priority: Some(0.72),
+                })
+                .collect();
+            plan.affected_metric_ids = affected;
+        }
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_data_plane_watermark(&connection, &plan.watermark)?;
+        Ok(plan)
     }
 
     pub fn upsert_cockpit_profile(
@@ -1062,7 +1108,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 11, datetime('now'))
+        VALUES (1, 12, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -1329,7 +1375,20 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_source_pack_source
-            ON iacc_source_pack(source_name, updated_at DESC);",
+            ON iacc_source_pack(source_name, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_data_plane_watermark (
+            source_ref TEXT NOT NULL,
+            fact_type TEXT NOT NULL,
+            partition_ref TEXT NOT NULL,
+            high_watermark TEXT NOT NULL,
+            last_batch_id TEXT NOT NULL,
+            watermark_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(source_ref, fact_type, partition_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_data_plane_watermark_updated
+            ON iacc_data_plane_watermark(updated_at DESC);",
     )
 }
 
@@ -2870,6 +2929,28 @@ fn find_source_pack(
         .optional()?
         .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
         .transpose()
+}
+
+fn upsert_data_plane_watermark(
+    connection: &Connection,
+    watermark: &IaccDataPlaneWatermark,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_data_plane_watermark (
+            source_ref, fact_type, partition_ref, high_watermark, last_batch_id,
+            watermark_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            watermark.source_ref,
+            watermark.fact_type,
+            watermark.partition_ref,
+            watermark.high_watermark,
+            watermark.last_batch_id,
+            serde_json::to_string(watermark)?,
+            watermark.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {

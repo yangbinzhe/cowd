@@ -19,11 +19,11 @@ use runtime::{
     IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
     IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
     IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
-    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook,
-    IaccRelation, IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun,
-    IaccSourcePack, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
-    IACC_SCHEMA_VERSION,
+    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccDataPlaneIngestPlanInput, IaccEntity,
+    IaccEntityInput, IaccFact, IaccFactInput, IaccIncident, IaccMetricDependency,
+    IaccMetricDependencyInput, IaccPlaybook, IaccRelation, IaccRelationInput, IaccSkillManifest,
+    IaccSkillPlan, IaccSkillRun, IaccSourcePack, IaccStore, IaccStoreError, IdentityTrust,
+    PolicyDecisionKind, IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,14 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
+        .route(
+            "/api/iacc/data-plane/health",
+            get(iacc_data_plane_health_handler),
+        )
+        .route(
+            "/api/iacc/data-plane/ingest-plan",
+            post(iacc_data_plane_ingest_plan_handler),
+        )
         .route("/api/iacc/skills", get(iacc_skills_handler))
         .route("/api/iacc/skills/:id", get(iacc_skill_get_handler))
         .route("/api/iacc/command-center", get(iacc_command_center_handler))
@@ -344,6 +352,15 @@ struct IaccComputeJobPlanRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccDataPlaneIngestPlanRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    ingest: IaccDataPlaneIngestPlanInput,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -540,6 +557,7 @@ async fn iacc_health_handler(
     let health = store
         .health()
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let capabilities = iacc_health_capabilities();
     Ok(Json(serde_json::json!({
         "kind": "iacc.health",
         "status": "ready",
@@ -564,52 +582,92 @@ async fn iacc_health_handler(
         "memory_case_count": health.memory_case_count,
         "playbook_count": health.playbook_count,
         "source_pack_count": health.source_pack_count,
+        "data_plane_watermark_count": health.data_plane_watermark_count,
         "store": iacc_store_path(&state.workspace_root),
-        "capabilities": [
-            "cockpit_report_snapshot",
-            "scheduled_report_foundation",
-            "cockpit_report_delivery_bridge",
-            "cockpit_report_payload_templates",
-            "cockpit_report_schedule_runner",
-            "cockpit_report_delivery_retry_state",
-            "cockpit_report_webui_visibility",
-            "production_operation_package",
-            "memory_case_promotion",
-            "playbook_recommendation",
-            "server_manufacturing_skill_pack",
-            "incident_skill_agent_graph",
-            "command_center_projection",
-            "incident_room_projection",
-            "source_onboarding_pack",
-            "source_pack_delta_plan",
-            "production_pilot_gate",
-            "personal_cockpit_projection",
-            "cockpit_profile_thresholds",
-            "evidence_quality_gate",
-            "insight_quality_gate",
-            "cross_plane_action_bridge",
-            "incremental_compute_job",
-            "scoped_metric_recompute",
-            "metric_dependency_graph",
-            "metric_lineage",
-            "fact_type_metric_impact",
-            "server_manufacturing_domain_pack",
-            "server_manufacturing_seed",
-            "entity_relation_network",
-            "entity_source_key_resolution",
-            "entity_impact_trace",
-            "fact_ingest",
-            "metric_recompute",
-            "metric_state",
-            "change_event",
-            "attention_hot",
-            "evidence_packet_build",
-            "evidence_packet_get",
-            "evidence_context_item",
-            "incident_agent_graph",
-            "incident_operational_analysis",
-            "action_execution_feedback"
-        ],
+        "capabilities": capabilities,
+    })))
+}
+
+fn iacc_health_capabilities() -> Vec<&'static str> {
+    vec![
+        "data_plane_adapter",
+        "data_plane_ingest_plan",
+        "data_plane_watermark",
+        "data_plane_replay_policy",
+        "cockpit_report_snapshot",
+        "scheduled_report_foundation",
+        "cockpit_report_delivery_bridge",
+        "cockpit_report_payload_templates",
+        "cockpit_report_schedule_runner",
+        "cockpit_report_delivery_retry_state",
+        "cockpit_report_webui_visibility",
+        "production_operation_package",
+        "memory_case_promotion",
+        "playbook_recommendation",
+        "server_manufacturing_skill_pack",
+        "incident_skill_agent_graph",
+        "command_center_projection",
+        "incident_room_projection",
+        "source_onboarding_pack",
+        "source_pack_delta_plan",
+        "production_pilot_gate",
+        "personal_cockpit_projection",
+        "cockpit_profile_thresholds",
+        "evidence_quality_gate",
+        "insight_quality_gate",
+        "cross_plane_action_bridge",
+        "incremental_compute_job",
+        "scoped_metric_recompute",
+        "metric_dependency_graph",
+        "metric_lineage",
+        "fact_type_metric_impact",
+        "server_manufacturing_domain_pack",
+        "server_manufacturing_seed",
+        "entity_relation_network",
+        "entity_source_key_resolution",
+        "entity_impact_trace",
+        "fact_ingest",
+        "metric_recompute",
+        "metric_state",
+        "change_event",
+        "attention_hot",
+        "evidence_packet_build",
+        "evidence_packet_get",
+        "evidence_context_item",
+        "incident_agent_graph",
+        "incident_operational_analysis",
+        "action_execution_feedback",
+    ]
+}
+
+async fn iacc_data_plane_health_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let health = store
+        .data_plane_health()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.data_plane.health",
+        "health": health,
+    })))
+}
+
+async fn iacc_data_plane_ingest_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccDataPlaneIngestPlanRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let plan = store
+        .plan_data_plane_ingest(request.ingest)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.data_plane.ingest_plan",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "plan": plan,
     })))
 }
 

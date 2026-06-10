@@ -10,6 +10,7 @@ mod attention;
 mod change;
 mod cockpit;
 mod compute;
+mod data_plane;
 mod domain;
 mod entity;
 mod evidence;
@@ -38,6 +39,10 @@ pub use cockpit::{
     IaccCockpitReportSnapshot, IaccCockpitWidget,
 };
 pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
+pub use data_plane::{
+    IaccDataPlane, IaccDataPlaneCapability, IaccDataPlaneHealth, IaccDataPlaneIngestPlan,
+    IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark, IaccSqliteDataPlane,
+};
 pub use domain::{
     server_manufacturing_domain_pack, server_manufacturing_seed_plan, IaccDomainPack,
     IaccDomainScenario, IaccDomainSeedPlan, IaccDomainSeedResult,
