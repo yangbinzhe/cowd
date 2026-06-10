@@ -28,6 +28,7 @@ run_script scripts/v09106_iacc_connector_runtime_scenario.sh
 run_script scripts/v09107_iacc_ontology_entity_governance_scenario.sh
 run_script scripts/v09108_iacc_metric_attention_snapshot_scenario.sh
 run_script scripts/v09109_iacc_skill_runtime_scenario.sh
+run_script scripts/v09110_iacc_command_center_product_scenario.sh
 run_script scripts/v0998_iacc_production_release_gate.sh
 
-printf '\nIACC v0.9.109 skill runtime gate passed.\n'
+printf '\nIACC v0.9.110 command center product gate passed.\n'

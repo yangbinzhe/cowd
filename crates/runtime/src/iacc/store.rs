@@ -1000,6 +1000,14 @@ impl IaccStore {
         find_incident(&connection, incident_id)
     }
 
+    pub fn list_incidents(&self, limit: usize) -> Result<Vec<IaccIncident>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_incidents(&connection, limit)
+    }
+
     pub fn analyze_incident(
         &self,
         incident_id: &str,
@@ -1129,6 +1137,17 @@ impl IaccStore {
         list_skill_executions_for_incident(&connection, incident_id, limit)
     }
 
+    pub fn list_recent_skill_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IaccSkillRun>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_recent_skill_executions(&connection, limit)
+    }
+
     pub fn list_executions_for_incident(
         &self,
         incident_id: &str,
@@ -1139,6 +1158,17 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         list_executions_for_incident(&connection, incident_id, limit)
+    }
+
+    pub fn list_recent_action_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IaccActionExecution>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_recent_executions(&connection, limit)
     }
 
     pub fn attach_cross_plane_receipt(
@@ -3160,6 +3190,34 @@ fn find_incident(
         .transpose()
 }
 
+fn list_incidents(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccIncident>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT incident_json
+          FROM iacc_incident
+          ORDER BY updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
+    let incidents = rows
+        .map(|row| {
+            let json = row.map_err(IaccStoreError::from)?;
+            serde_json::from_str::<IaccIncident>(&json).map_err(IaccStoreError::from)
+        })
+        .collect::<Result<Vec<IaccIncident>, IaccStoreError>>()?;
+    Ok(incidents
+        .into_iter()
+        .filter(|incident| {
+            !matches!(
+                incident.status.as_str(),
+                "closed" | "resolved" | "done" | "archived"
+            )
+        })
+        .collect())
+}
+
 fn insert_analysis(
     connection: &Connection,
     analysis: &IaccOperationalAnalysis,
@@ -3266,6 +3324,20 @@ fn list_recent_executions(
           LIMIT ?1",
     )?;
     let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn list_recent_skill_executions(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccSkillRun>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT execution_json
+          FROM iacc_skill_execution
+          ORDER BY updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 

@@ -199,6 +199,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/compute/jobs/:id/run",
             post(iacc_compute_job_run_handler),
         )
+        .route(
+            "/api/iacc/command-center/live",
+            get(iacc_command_center_live_handler),
+        )
         .route("/api/iacc/changes", get(iacc_changes_handler))
         .route("/api/iacc/attention/hot", get(iacc_attention_hot_handler))
         .route(
@@ -218,6 +222,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/quality-gates/:id",
             get(iacc_quality_gate_get_handler),
         )
+        .route("/api/iacc/incidents", get(iacc_incidents_list_handler))
         .route("/api/iacc/incidents", post(iacc_incident_create_handler))
         .route("/api/iacc/incidents/:id", get(iacc_incident_get_handler))
         .route(
@@ -758,6 +763,9 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "action_execution_feedback",
         "skill_execution_record",
         "skill_execution_query",
+        "incident_queue",
+        "command_center_live",
+        "incident_list",
     ]
 }
 
@@ -841,6 +849,47 @@ async fn iacc_command_center_handler(
             "procurement",
             "plan_change"
         ],
+    })))
+}
+
+async fn iacc_command_center_live_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incidents = store
+        .list_incidents(12)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let attention = store
+        .list_attention(12)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let action_queue = store
+        .list_recent_action_executions(12)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let skill_queue = store
+        .list_recent_skill_runs(12)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.command_center.live",
+        "incident_queue": incidents,
+        "attention_queue": attention,
+        "action_queue": action_queue,
+        "skill_queue": skill_queue,
+        "captured_at": chrono::Utc::now(),
+    })))
+}
+
+async fn iacc_incidents_list_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incidents = store
+        .list_incidents(50)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.incident.list",
+        "items": incidents,
     })))
 }
 
