@@ -21,6 +21,7 @@ mod metric;
 mod metric_graph;
 mod quality;
 mod relation;
+mod skill;
 mod source;
 mod store;
 
@@ -53,6 +54,11 @@ pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
 pub use metric_graph::{IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage};
 pub use quality::IaccQualityGateDecision;
 pub use relation::{IaccImpactHop, IaccImpactTrace, IaccRelation, IaccRelationInput};
+pub use skill::{
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack, skill_agent_node_id, IaccSkillManifest, IaccSkillPlan,
+    IaccSkillRun,
+};
 pub use source::{IaccSourceKind, IaccSourceSnapshot};
 pub use store::{
     IaccHealth, IaccMetricRecomputeResult, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,

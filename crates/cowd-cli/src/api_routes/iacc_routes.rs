@@ -11,16 +11,18 @@ use axum::{
 };
 use memory::store::session::SessionRecord;
 use runtime::{
-    server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk,
-    DataClassification, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
-    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_domain_pack, server_manufacturing_skill_pack, skill_agent_node_id,
+    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, CrossPlaneAction,
+    CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk, DataClassification,
+    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccCockpitProfile,
+    IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
     IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
     IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
     IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
     IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook,
-    IaccRelation, IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
-    IACC_SCHEMA_VERSION,
+    IaccRelation, IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccStore,
+    IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,8 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
+        .route("/api/iacc/skills", get(iacc_skills_handler))
+        .route("/api/iacc/skills/:id", get(iacc_skill_get_handler))
         .route(
             "/api/iacc/cockpit/profiles/upsert",
             post(iacc_cockpit_profile_upsert_handler),
@@ -160,6 +164,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/incidents/:id/playbooks/recommend",
             post(iacc_incident_playbook_recommend_handler),
+        )
+        .route(
+            "/api/iacc/incidents/:id/skills/plan",
+            post(iacc_incident_skill_plan_handler),
+        )
+        .route(
+            "/api/iacc/incidents/:id/skills/:skill_id/run",
+            post(iacc_incident_skill_run_handler),
         )
         .route("/api/iacc/cases/:id", get(iacc_memory_case_get_handler))
         .route(
@@ -367,6 +379,24 @@ struct IaccPlaybookRecommendRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccSkillPlanRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccSkillRunRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccCrossPlaneBridgeRequest {
     #[serde(default = "default_iacc_bridge_mode")]
     mode: String,
@@ -500,6 +530,8 @@ async fn iacc_health_handler(
             "production_operation_package",
             "memory_case_promotion",
             "playbook_recommendation",
+            "server_manufacturing_skill_pack",
+            "incident_skill_agent_graph",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -527,6 +559,25 @@ async fn iacc_health_handler(
             "incident_operational_analysis",
             "action_execution_feedback"
         ],
+    })))
+}
+
+async fn iacc_skills_handler() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill_pack",
+        "domain": "server_manufacturing",
+        "items": server_manufacturing_skill_pack(),
+    })))
+}
+
+async fn iacc_skill_get_handler(
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let skill = find_iacc_skill(&id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill",
+        "skill": skill,
     })))
 }
 
@@ -1406,6 +1457,68 @@ async fn iacc_incident_playbook_recommend_handler(
     })))
 }
 
+async fn iacc_incident_skill_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccSkillPlanRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incident = store
+        .get_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let analysis = store.analyze_incident(&id).ok();
+    let packet = incident
+        .evidence_packet_id
+        .as_deref()
+        .and_then(|packet_id| store.get_evidence_packet(packet_id).ok().flatten());
+    let plan = plan_server_manufacturing_skills(
+        &incident,
+        analysis.as_ref(),
+        packet.as_ref(),
+        request.limit.unwrap_or(3).clamp(1, 8),
+    );
+    let graph = plan_iacc_skill_agent_nodes(&state, &incident, &plan)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill.plan",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "incident_id": id,
+        "plan": plan,
+        "agent_graph": graph,
+    })))
+}
+
+async fn iacc_incident_skill_run_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath((id, skill_id)): AxumPath<(String, String)>,
+    Json(request): Json<IaccSkillRunRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incident = store
+        .get_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let skill = find_iacc_skill(&skill_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+    let run = run_server_manufacturing_skill(&incident, &skill);
+    let graph = complete_iacc_skill_agent_node(&state, &incident, &run)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill.run",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "incident_id": id,
+        "skill_run": run,
+        "agent_graph": graph,
+    })))
+}
+
 async fn iacc_analysis_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -1766,6 +1879,126 @@ fn iacc_report_delivery_receipt_matches(
     report: &IaccCockpitReportSnapshot,
 ) -> bool {
     receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
+}
+
+fn find_iacc_skill(skill_id: &str) -> Option<IaccSkillManifest> {
+    server_manufacturing_skill_pack()
+        .into_iter()
+        .find(|skill| skill.skill_id == skill_id)
+}
+
+async fn plan_iacc_skill_agent_nodes(
+    state: &AppState,
+    incident: &IaccIncident,
+    plan: &IaccSkillPlan,
+) -> Result<Option<AgentRunGraph>, String> {
+    let Some(task_id) = incident.task_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(mut graph) = state.task_kernel.agent_graph(task_id) else {
+        return Ok(None);
+    };
+    let now = now_ms();
+    let dependency = if graph.nodes.iter().any(|node| node.id == "iacc_reviewer") {
+        "iacc_reviewer"
+    } else {
+        "planner"
+    };
+    for skill in &plan.selected_skills {
+        let node_id = skill_agent_node_id(&skill.skill_id);
+        ensure_agent_node(
+            &mut graph,
+            AgentTaskNode {
+                id: node_id.clone(),
+                role: AgentRole::Researcher,
+                title: skill.role.clone(),
+                objective: skill.analysis_method.clone(),
+                depends_on: vec![dependency.to_string()],
+                status: AgentNodeStatus::Pending,
+                assigned_agent: Some(skill.skill_id.clone()),
+                result: None,
+                error: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        graph
+            .add_evidence(
+                &node_id,
+                "iacc_skill_manifest",
+                format!("iacc:skill:{}", skill.skill_id),
+                format!(
+                    "inputs={}, metrics={}, evidence={}",
+                    skill.input_fact_types.join(","),
+                    skill.input_metric_keys.join(","),
+                    skill.required_evidence.join(",")
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let task = state
+        .task_kernel
+        .upsert_agent_graph(task_id, graph.clone())?;
+    append_iacc_agent_runtime_event(state, &task, &graph).await?;
+    Ok(Some(graph))
+}
+
+async fn complete_iacc_skill_agent_node(
+    state: &AppState,
+    incident: &IaccIncident,
+    run: &IaccSkillRun,
+) -> Result<Option<AgentRunGraph>, String> {
+    let Some(task_id) = incident.task_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(mut graph) = state.task_kernel.agent_graph(task_id) else {
+        return Ok(None);
+    };
+    let node_id = run
+        .agent_node_id
+        .clone()
+        .unwrap_or_else(|| skill_agent_node_id(&run.skill_id));
+    if !graph.nodes.iter().any(|node| node.id == node_id) {
+        let skill = find_iacc_skill(&run.skill_id)
+            .ok_or_else(|| format!("IACC skill {} not found", run.skill_id))?;
+        let now = now_ms();
+        ensure_agent_node(
+            &mut graph,
+            AgentTaskNode {
+                id: node_id.clone(),
+                role: AgentRole::Researcher,
+                title: skill.role,
+                objective: skill.analysis_method,
+                depends_on: vec!["planner".to_string()],
+                status: AgentNodeStatus::Pending,
+                assigned_agent: Some(run.skill_id.clone()),
+                result: None,
+                error: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == node_id) {
+        node.status = AgentNodeStatus::Completed;
+        node.result = Some(run.summary.clone());
+        node.updated_at_ms = now_ms();
+    }
+    graph
+        .add_evidence(
+            &node_id,
+            "iacc_skill_run",
+            format!("iacc:skill-run:{}:{}", incident.incident_id, run.skill_id),
+            run.summary.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    let task = state
+        .task_kernel
+        .upsert_agent_graph(task_id, graph.clone())?;
+    append_iacc_agent_runtime_event(state, &task, &graph).await?;
+    Ok(Some(graph))
 }
 
 fn iacc_report_delivery_payload(
