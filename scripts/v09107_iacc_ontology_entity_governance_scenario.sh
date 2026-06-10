@@ -74,7 +74,7 @@ for _ in {1..100}; do
 done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":14'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":15'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"server_manufacturing_ontology"'
 curl -fsS "$BASE_URL/api/iacc/ontology/server-manufacturing" | rg -q '"ontology_id":"server_manufacturing_ontology"'
 curl -fsS "$BASE_URL/api/iacc/ontology/server-manufacturing" | rg -q '"metric_id":"material_shortage_risk"'

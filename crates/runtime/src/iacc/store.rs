@@ -9,20 +9,22 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::{
-    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccCasePromotion, IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection,
-    IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput, IaccComputePlan, IaccConnectorRun,
-    IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt, IaccDataPlane, IaccDataPlaneHealth,
-    IaccDataPlaneIngestPlan, IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark,
-    IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase, IaccMetricDefinition,
-    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOntologyPack,
-    IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity,
-    IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation, IaccSqliteDataPlane,
+    build_metric_compute_jobs, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
+    IaccAttentionItem, IaccCasePromotion, IaccChangeEvent, IaccCockpitProfile,
+    IaccCockpitProjection, IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest,
+    IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput,
+    IaccComputePlan, IaccConnectorRun, IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt,
+    IaccDataPlane, IaccDataPlaneHealth, IaccDataPlaneIngestPlan, IaccDataPlaneIngestPlanInput,
+    IaccDataPlaneWatermark, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket,
+    IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase,
+    IaccMetricAttentionPlan, IaccMetricAttentionScore, IaccMetricDefinition, IaccMetricDependency,
+    IaccMetricLineage, IaccMetricSnapshot, IaccMetricSnapshotItem, IaccMetricState,
+    IaccOntologyPack, IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation,
+    IaccSeverity, IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
+    IaccSqliteDataPlane,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 14;
+pub const IACC_SCHEMA_VERSION: i64 = 15;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -61,6 +63,7 @@ pub struct IaccHealth {
     pub ontology_pack_count: u64,
     pub entity_match_candidate_count: u64,
     pub entity_conflict_decision_count: u64,
+    pub metric_snapshot_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +135,7 @@ impl IaccStore {
                 &connection,
                 "iacc_entity_conflict_decision",
             )?,
+            metric_snapshot_count: count_table(&connection, "iacc_metric_snapshot")?,
         })
     }
 
@@ -381,6 +385,46 @@ impl IaccStore {
         };
         insert_entity_conflict_decision(&connection, &decision)?;
         Ok(decision)
+    }
+
+    pub fn plan_metric_attention(
+        &self,
+        trigger_fact_type: &str,
+        entity_scope: Option<String>,
+        period: Option<String>,
+        limit: usize,
+    ) -> Result<IaccMetricAttentionPlan, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut metric_ids = metrics_affected_by_fact_type(&connection, trigger_fact_type)?;
+        metric_ids.extend(metric_ids_for_fact_type(&connection, trigger_fact_type)?);
+        metric_ids.sort();
+        metric_ids.dedup();
+        let plan = build_metric_attention_plan(
+            &connection,
+            trigger_fact_type,
+            entity_scope,
+            period,
+            metric_ids,
+            limit,
+        )?;
+        Ok(plan)
+    }
+
+    pub fn materialize_metric_snapshot(
+        &self,
+        metric_ids: Vec<String>,
+        scope_ref: Option<String>,
+    ) -> Result<IaccMetricSnapshot, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = build_metric_snapshot(&connection, metric_ids, scope_ref)?;
+        insert_metric_snapshot(&connection, &snapshot)?;
+        Ok(snapshot)
     }
 
     pub fn upsert_relation(&self, relation: &IaccRelation) -> Result<IaccRelation, IaccStoreError> {
@@ -1206,7 +1250,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 14, datetime('now'))
+        VALUES (1, 15, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -1531,7 +1575,17 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             decided_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_entity_conflict_candidate
-            ON iacc_entity_conflict_decision(candidate_id, decided_at DESC);",
+            ON iacc_entity_conflict_decision(candidate_id, decided_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_metric_snapshot (
+            snapshot_id TEXT PRIMARY KEY,
+            scope_ref TEXT NOT NULL,
+            metric_ids_json TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_metric_snapshot_scope
+            ON iacc_metric_snapshot(scope_ref, created_at DESC);",
     )
 }
 
@@ -2494,6 +2548,21 @@ fn upsert_metric_definition(
     Ok(())
 }
 
+fn find_metric_definition(
+    connection: &Connection,
+    metric_id: &str,
+) -> Result<Option<IaccMetricDefinition>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT definition_json FROM iacc_metric_definition WHERE metric_id = ?1",
+            params![metric_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
 fn upsert_metric_dependency(
     connection: &Connection,
     dependency: &IaccMetricDependency,
@@ -2661,6 +2730,117 @@ fn metric_ids_for_fact_type(
         }
     }
     Ok(impacted.into_iter().collect())
+}
+
+fn build_metric_attention_plan(
+    connection: &Connection,
+    trigger_fact_type: &str,
+    entity_scope: Option<String>,
+    period: Option<String>,
+    metric_ids: Vec<String>,
+    limit: usize,
+) -> Result<IaccMetricAttentionPlan, IaccStoreError> {
+    let limit = limit.clamp(1, 24);
+    let mut scores = Vec::new();
+    for metric_id in metric_ids {
+        let definition = find_metric_definition(connection, &metric_id)?.unwrap_or_else(|| {
+            IaccMetricDefinition::inferred(metric_id.clone(), trigger_fact_type)
+        });
+        let lineage = build_metric_lineage(connection, &metric_id, 6)?;
+        let latest = latest_metric_state_for_metric(connection, &metric_id)?;
+        let latest_status = latest
+            .as_ref()
+            .map(|state| format!("{:?}", state.status).to_ascii_lowercase());
+        let latest_delta = latest.as_ref().map(|state| state.delta);
+        let score = IaccMetricAttentionScore::new(
+            metric_id.clone(),
+            definition.business_priority,
+            lineage.impacted_metric_ids.len() + lineage.upstream_dependencies.len(),
+            latest_status,
+            latest_delta,
+        );
+        scores.push(score);
+    }
+    scores.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .business_priority
+                    .partial_cmp(&left.business_priority)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    scores.truncate(limit);
+    let selected_metric_ids = scores
+        .iter()
+        .map(|score| score.metric_id.clone())
+        .collect::<Vec<_>>();
+    let compute_jobs = build_metric_compute_jobs(
+        trigger_fact_type,
+        &selected_metric_ids,
+        entity_scope.clone(),
+        period.clone(),
+    );
+    Ok(IaccMetricAttentionPlan {
+        plan_id: format!("metric-attention-plan-{}", uuid::Uuid::new_v4()),
+        trigger_fact_type: trigger_fact_type.to_string(),
+        entity_scope,
+        period,
+        limit,
+        scored_metrics: scores,
+        selected_metric_ids,
+        compute_jobs,
+        generated_at: Utc::now(),
+    })
+}
+
+fn build_metric_snapshot(
+    connection: &Connection,
+    metric_ids: Vec<String>,
+    scope_ref: Option<String>,
+) -> Result<IaccMetricSnapshot, IaccStoreError> {
+    let mut unique_metric_ids = metric_ids;
+    unique_metric_ids.sort();
+    unique_metric_ids.dedup();
+    let mut items = Vec::new();
+    for metric_id in &unique_metric_ids {
+        let state = latest_metric_state_for_metric(connection, metric_id)?;
+        items.push(IaccMetricSnapshotItem {
+            metric_id: metric_id.clone(),
+            state,
+        });
+    }
+    let state_count = items.iter().filter(|item| item.state.is_some()).count();
+    Ok(IaccMetricSnapshot {
+        snapshot_id: format!("metric-snapshot-{}", uuid::Uuid::new_v4()),
+        scope_ref: scope_ref.unwrap_or_else(|| "global".to_string()),
+        metric_ids: unique_metric_ids,
+        items,
+        created_at: Utc::now(),
+        summary: format!("metric states materialized: {state_count}"),
+    })
+}
+
+fn insert_metric_snapshot(
+    connection: &Connection,
+    snapshot: &IaccMetricSnapshot,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_metric_snapshot (
+            snapshot_id, scope_ref, metric_ids_json, snapshot_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            snapshot.snapshot_id,
+            snapshot.scope_ref,
+            serde_json::to_string(&snapshot.metric_ids)?,
+            serde_json::to_string(snapshot)?,
+            snapshot.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn priority_for_compute_job(job: &IaccComputeJob) -> f32 {

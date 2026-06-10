@@ -20,6 +20,7 @@ mod fact;
 mod incident;
 mod memory_case;
 mod metric;
+mod metric_attention;
 mod metric_graph;
 mod ontology;
 mod quality;
@@ -62,6 +63,10 @@ pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
 pub use memory_case::{IaccCasePromotion, IaccMemoryCase, IaccPlaybook, IaccPlaybookStep};
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
+pub use metric_attention::{
+    build_metric_compute_jobs, IaccMetricAttentionPlan, IaccMetricAttentionScore,
+    IaccMetricSnapshot, IaccMetricSnapshotItem,
+};
 pub use metric_graph::{IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage};
 pub use ontology::{
     match_candidate, server_manufacturing_ontology_pack, IaccEntityConflictDecision,

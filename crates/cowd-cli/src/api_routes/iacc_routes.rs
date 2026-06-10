@@ -168,6 +168,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(iacc_metric_lineage_handler),
         )
         .route(
+            "/api/iacc/metrics/attention-plan",
+            post(iacc_metric_attention_plan_handler),
+        )
+        .route(
+            "/api/iacc/metrics/snapshots/materialize",
+            post(iacc_metric_snapshot_materialize_handler),
+        )
+        .route(
             "/api/iacc/metrics/recompute",
             post(iacc_metric_recompute_handler),
         )
@@ -384,6 +392,32 @@ struct IaccMetricDependencyUpsertRequest {
     #[serde(default)]
     session_id: Option<String>,
     dependency: IaccMetricDependencyInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccMetricAttentionPlanRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    trigger_fact_type: String,
+    #[serde(default)]
+    entity_scope: Option<String>,
+    #[serde(default)]
+    period: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccMetricSnapshotMaterializeRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    metric_ids: Vec<String>,
+    #[serde(default)]
+    scope_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +684,7 @@ async fn iacc_health_handler(
         "ontology_pack_count": health.ontology_pack_count,
         "entity_match_candidate_count": health.entity_match_candidate_count,
         "entity_conflict_decision_count": health.entity_conflict_decision_count,
+        "metric_snapshot_count": health.metric_snapshot_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": capabilities,
     })))
@@ -668,6 +703,10 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "entity_match_candidate",
         "entity_conflict_decision",
         "entity_survivorship_rule",
+        "metric_attention_plan",
+        "metric_snapshot_materialize",
+        "metric_attention_scoring",
+        "incremental_metric_focus",
         "cockpit_report_snapshot",
         "scheduled_report_foundation",
         "cockpit_report_delivery_bridge",
@@ -1505,6 +1544,51 @@ async fn iacc_metric_lineage_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.metric.lineage",
         "lineage": lineage,
+    })))
+}
+
+async fn iacc_metric_attention_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccMetricAttentionPlanRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let plan = store
+        .plan_metric_attention(
+            &request.trigger_fact_type,
+            request.entity_scope,
+            request.period,
+            request.limit.unwrap_or(12),
+        )
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric_attention.plan",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "plan": plan,
+    })))
+}
+
+async fn iacc_metric_snapshot_materialize_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccMetricSnapshotMaterializeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if request.metric_ids.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "at least one metric_id is required",
+        ));
+    }
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let snapshot = store
+        .materialize_metric_snapshot(request.metric_ids, request.scope_ref)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric_snapshot",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "snapshot": snapshot,
     })))
 }
 
