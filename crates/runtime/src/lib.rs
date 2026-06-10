@@ -189,7 +189,8 @@ pub use iacc::{
     IaccMetricDependencyInput, IaccMetricLineage, IaccMetricRecomputeResult, IaccMetricState,
     IaccMetricStatus, IaccOperationalAnalysis, IaccPlaybook, IaccPlaybookStep,
     IaccQualityGateDecision, IaccRecommendedAction, IaccRelation, IaccRelationInput, IaccSeverity,
-    IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccSourceKey, IaccSourceKind,
+    IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccSourceDeltaPlan, IaccSourceEntityMapping,
+    IaccSourceFactMapping, IaccSourceKey, IaccSourceKind, IaccSourcePack, IaccSourcePackValidation,
     IaccSourceSnapshot, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{

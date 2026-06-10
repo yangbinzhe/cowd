@@ -1,7 +1,7 @@
 # COWD — AI Agent Runtime
 
 > **Rust 原生 AI 运行时框架 + 结构化运营智能系统**
-> v0.9.102 · IACC · Unified Daemon Runtime · SQLite Session Source-of-Truth
+> v0.9.103 · IACC · Unified Daemon Runtime · SQLite Session Source-of-Truth
 > TUI/WebUI Control · Connector Runtime · Cross-plane Governance · MCP/Feishu/Local Service
 
 ---

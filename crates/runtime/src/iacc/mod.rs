@@ -23,6 +23,7 @@ mod quality;
 mod relation;
 mod skill;
 mod source;
+mod source_pack;
 mod store;
 
 pub use analysis::{
@@ -60,6 +61,10 @@ pub use skill::{
     IaccSkillRun,
 };
 pub use source::{IaccSourceKind, IaccSourceSnapshot};
+pub use source_pack::{
+    IaccSourceDeltaPlan, IaccSourceEntityMapping, IaccSourceFactMapping, IaccSourcePack,
+    IaccSourcePackValidation,
+};
 pub use store::{
     IaccHealth, IaccMetricRecomputeResult, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };

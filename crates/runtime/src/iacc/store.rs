@@ -17,6 +17,7 @@ use super::{
     IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase,
     IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
     IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
 };
 
 pub const IACC_SCHEMA_VERSION: i64 = 11;
@@ -52,6 +53,7 @@ pub struct IaccHealth {
     pub cockpit_report_count: u64,
     pub memory_case_count: u64,
     pub playbook_count: u64,
+    pub source_pack_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +116,7 @@ impl IaccStore {
             cockpit_report_count: count_table(&connection, "iacc_cockpit_report")?,
             memory_case_count: count_table(&connection, "iacc_memory_case")?,
             playbook_count: count_table(&connection, "iacc_playbook")?,
+            source_pack_count: count_table(&connection, "iacc_source_pack")?,
         })
     }
 
@@ -463,6 +466,76 @@ impl IaccStore {
         )?;
         upsert_attention(&connection, &attention)?;
         Ok(attention)
+    }
+
+    pub fn upsert_source_pack(
+        &self,
+        source_pack: IaccSourcePack,
+    ) -> Result<IaccSourcePack, IaccStoreError> {
+        let source_pack = source_pack.normalized();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_source_pack(&connection, &source_pack)?;
+        Ok(source_pack)
+    }
+
+    pub fn get_source_pack(
+        &self,
+        source_pack_id: &str,
+    ) -> Result<Option<IaccSourcePack>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_source_pack(&connection, source_pack_id)
+    }
+
+    pub fn validate_source_pack(
+        &self,
+        source_pack_id: &str,
+    ) -> Result<IaccSourcePackValidation, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_pack = find_source_pack(&connection, source_pack_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(source_pack_id.to_string()))?;
+        Ok(source_pack.validate())
+    }
+
+    pub fn source_pack_delta_plan(
+        &self,
+        source_pack_id: &str,
+    ) -> Result<IaccSourceDeltaPlan, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_pack = find_source_pack(&connection, source_pack_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(source_pack_id.to_string()))?;
+        let mut fact_types = source_pack
+            .fact_mappings
+            .iter()
+            .map(|mapping| mapping.fact_type.clone())
+            .collect::<Vec<_>>();
+        fact_types.sort();
+        fact_types.dedup();
+        let mut affected_metric_ids = Vec::new();
+        for fact_type in &fact_types {
+            affected_metric_ids.extend(metrics_affected_by_fact_type(&connection, fact_type)?);
+            affected_metric_ids.extend(metric_ids_for_fact_type(&connection, fact_type)?);
+        }
+        affected_metric_ids.sort();
+        affected_metric_ids.dedup();
+        Ok(IaccSourceDeltaPlan {
+            source_pack_id: source_pack.source_pack_id,
+            fact_types,
+            affected_metric_ids,
+            compute_scope: "partitioned_by_source_period_entity".to_string(),
+            planned_at: Utc::now(),
+        })
     }
 
     pub fn list_attention(&self, limit: usize) -> Result<Vec<IaccAttentionItem>, IaccStoreError> {
@@ -1244,7 +1317,19 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_playbook_domain
-            ON iacc_playbook(domain, scenario);",
+            ON iacc_playbook(domain, scenario);
+
+        CREATE TABLE IF NOT EXISTS iacc_source_pack (
+            source_pack_id TEXT PRIMARY KEY,
+            source_name TEXT NOT NULL,
+            access_mode TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL,
+            source_pack_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_source_pack_source
+            ON iacc_source_pack(source_name, updated_at DESC);",
     )
 }
 
@@ -2748,6 +2833,43 @@ fn score_playbook(
         .filter(|entity| playbook.scenario.contains(entity.as_str()))
         .count();
     metric_score + entity_score
+}
+
+fn insert_source_pack(
+    connection: &Connection,
+    source_pack: &IaccSourcePack,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_source_pack (
+            source_pack_id, source_name, access_mode, refresh_mode,
+            source_pack_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            source_pack.source_pack_id,
+            source_pack.source_name,
+            source_pack.access_mode,
+            source_pack.refresh_mode,
+            serde_json::to_string(source_pack)?,
+            source_pack.created_at.to_rfc3339(),
+            source_pack.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_source_pack(
+    connection: &Connection,
+    source_pack_id: &str,
+) -> Result<Option<IaccSourcePack>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT source_pack_json FROM iacc_source_pack WHERE source_pack_id = ?1",
+            params![source_pack_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
 }
 
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {

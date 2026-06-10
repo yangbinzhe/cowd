@@ -21,8 +21,9 @@ use runtime::{
     IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
     IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
     IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook,
-    IaccRelation, IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccStore,
-    IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
+    IaccRelation, IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun,
+    IaccSourcePack, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
+    IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,26 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/iacc/skills", get(iacc_skills_handler))
         .route("/api/iacc/skills/:id", get(iacc_skill_get_handler))
         .route("/api/iacc/command-center", get(iacc_command_center_handler))
+        .route(
+            "/api/iacc/source-packs/upsert",
+            post(iacc_source_pack_upsert_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id",
+            get(iacc_source_pack_get_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id/validate",
+            post(iacc_source_pack_validate_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id/ingest-file",
+            post(iacc_source_pack_ingest_file_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id/delta-plan",
+            post(iacc_source_pack_delta_plan_handler),
+        )
         .route(
             "/api/iacc/cockpit/profiles/upsert",
             post(iacc_cockpit_profile_upsert_handler),
@@ -402,6 +423,25 @@ struct IaccSkillRunRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccSourcePackUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    source_pack: IaccSourcePack,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccSourcePackIngestFileRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    facts: Vec<IaccFactInput>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccCrossPlaneBridgeRequest {
     #[serde(default = "default_iacc_bridge_mode")]
     mode: String,
@@ -523,6 +563,7 @@ async fn iacc_health_handler(
         "cockpit_report_count": health.cockpit_report_count,
         "memory_case_count": health.memory_case_count,
         "playbook_count": health.playbook_count,
+        "source_pack_count": health.source_pack_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "cockpit_report_snapshot",
@@ -539,6 +580,8 @@ async fn iacc_health_handler(
             "incident_skill_agent_graph",
             "command_center_projection",
             "incident_room_projection",
+            "source_onboarding_pack",
+            "source_pack_delta_plan",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -618,6 +661,106 @@ async fn iacc_command_center_handler(
             "procurement",
             "plan_change"
         ],
+    })))
+}
+
+async fn iacc_source_pack_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccSourcePackUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let source_pack = store
+        .upsert_source_pack(request.source_pack)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.source_pack",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "source_pack": source_pack,
+    })))
+}
+
+async fn iacc_source_pack_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let source_pack = store
+        .get_source_pack(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC source pack not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.source_pack",
+        "source_pack": source_pack,
+    })))
+}
+
+async fn iacc_source_pack_validate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let validation = store
+        .validate_source_pack(&id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.source_pack.validation",
+        "validation": validation,
+    })))
+}
+
+async fn iacc_source_pack_delta_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let delta_plan = store
+        .source_pack_delta_plan(&id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.source_pack.delta_plan",
+        "delta_plan": delta_plan,
+    })))
+}
+
+async fn iacc_source_pack_ingest_file_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccSourcePackIngestFileRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    store
+        .validate_source_pack(&id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    let mut attention = Vec::new();
+    for input in request.facts {
+        let fact = IaccFact::from_input(input);
+        let item = store
+            .ingest_fact(&fact)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        attention.push(item);
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.source_pack.ingest_file",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "source_pack_id": id,
+        "ingested": attention.len(),
+        "attention": attention,
     })))
 }
 
