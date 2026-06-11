@@ -431,6 +431,37 @@ impl WeChatLinkAdapter {
         }
     }
 
+    async fn try_reconnect(&mut self) -> PlatformResult<()> {
+        let should_retry = {
+            let last = self.last_connect_attempt.read().await;
+            let fails = *self.consecutive_failures.read().await;
+            match *last {
+                None => true,
+                Some(t) => {
+                    let backoff = std::time::Duration::from_secs(
+                        (fails.min(6) as u64).saturating_mul(5).max(5),
+                    );
+                    t.elapsed() >= backoff
+                }
+            }
+        };
+        if !should_retry {
+            return Ok(());
+        }
+        match self.connect().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mut fails = self.consecutive_failures.write().await;
+                *fails = fails.saturating_add(1);
+                tracing::warn!(
+                    "wechat_ilink adapter: reconnect attempt {} failed: {e}",
+                    *fails
+                );
+                Err(e)
+            }
+        }
+    }
+
     pub async fn request_qr_login(bot_type: &str) -> PlatformResult<WeChatQrCode> {
         request_wechat_qr_login(bot_type).await
     }
@@ -985,37 +1016,6 @@ impl PlatformAdapter for WeChatLinkAdapter {
             &token[token.len().saturating_sub(8)..]
         );
         Ok(())
-    }
-
-    async fn try_reconnect(&mut self) -> PlatformResult<()> {
-        let should_retry = {
-            let last = self.last_connect_attempt.read().await;
-            let fails = *self.consecutive_failures.read().await;
-            match *last {
-                None => true,
-                Some(t) => {
-                    let backoff = std::time::Duration::from_secs(
-                        (fails.min(6) as u64).saturating_mul(5).max(5)
-                    );
-                    t.elapsed() >= backoff
-                }
-            }
-        };
-        if !should_retry {
-            return Ok(());
-        }
-        match self.connect().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let mut fails = self.consecutive_failures.write().await;
-                *fails = fails.saturating_add(1);
-                tracing::warn!(
-                    "wechat_ilink adapter: reconnect attempt {} failed: {e}",
-                    *fails
-                );
-                Err(e)
-            }
-        }
     }
 
     async fn disconnect(&mut self) -> PlatformResult<()> {
