@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 
+use commands::slash_command_specs;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -130,112 +131,25 @@ fn score_entry(query: &str, entry: &CommandEntry) -> usize {
 // Default command registry
 // ═══════════════════════════════════════════════════════════════════
 
-/// All known slash commands (from `prompt.rs` KNOWN_COMMANDS) plus keybind actions.
+/// All known slash commands plus keybind actions.
 fn default_entries() -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = Vec::new();
 
-    // ── Slash commands (agents/solve/discuss/perf use register() in new()) ──
-    let slash_cmds: &[&str] = &[
-        "add-dir",
-        "advisor",
-        "allowed-tools",
-        "api-key",
-        "approve",
-        "approvals",
-        "branch",
-        "brief",
-        "bughunter",
-        "clear",
-        "color",
-        "commit",
-        "compact",
-        "config",
-        "context",
-        "copy",
-        "cost",
-        "cross-plane",
-        "debug-tool-call",
-        "deny",
-        "desktop",
-        "diff",
-        "doctor",
-        "effort",
-        "exit",
-        "export",
-        "fast",
-        "feedback",
-        "files",
-        "handoff",
-        "help",
-        "hooks",
-        "ide",
-        "image",
-        "init",
-        "insights",
-        "issue",
-        "keybindings",
-        "listen",
-        "mcp",
-        "memory",
-        "model",
-        "output-style",
-        "paste",
-        "permissions",
-        "plan",
-        "plugin",
-        "pr",
-        "privacy-settings",
-        "release-notes",
-        "rename",
-        "resume",
-        "retry",
-        "review",
-        "rewind",
-        "sandbox",
-        "screenshot",
-        "search",
-        "security-review",
-        "session",
-        "share",
-        "skills",
-        "speak",
-        "stats",
-        "status",
-        "stickers",
-        "stop",
-        "summary",
-        "tag",
-        "tasks",
-        "teleport",
-        "terminal-setup",
-        "theme",
-        "thinkback",
-        "ultraplan",
-        "undo",
-        "upgrade",
-        "usage",
-        "version",
-        "vim",
-        "voice",
-    ];
+    // ── Slash commands ──────────────────────────────────────────
+    for spec in slash_command_specs() {
+        entries.push(CommandEntry::new(
+            format!("/{}", spec.name),
+            spec.summary,
+            Action::Execute(format!("/{}", spec.name)),
+        ));
 
-    // Simple description generator from kebab-case names
-    fn slug_to_desc(slug: &str) -> String {
-        let desc = slug.replace('-', " ");
-        let mut c = desc.chars();
-        c.next()
-            .map(|f| f.to_uppercase().to_string() + c.as_str())
-            .unwrap_or_default()
-    }
-
-    for cmd in slash_cmds {
-        let desc = slug_to_desc(cmd);
-        entries.push(CommandEntry {
-            name: format!("/{cmd}"),
-            description: desc,
-            action: Action::Execute(format!("/{cmd}")),
-            dynamic: false,
-        });
+        for alias in spec.aliases {
+            entries.push(CommandEntry::new(
+                format!("/{alias}"),
+                format!("Alias for /{} · {}", spec.name, spec.summary),
+                Action::Execute(format!("/{alias}")),
+            ));
+        }
     }
 
     // ── Keybind actions ─────────────────────────────────────────
@@ -1154,10 +1068,37 @@ mod tests {
         let p = setup_palette();
         // Should have all slash commands + keybind entries
         assert!(
-            p.command_count() >= 80,
-            "expected >=80 default commands, got {}",
+            p.command_count() >= slash_command_specs().len(),
+            "expected at least all registered slash commands, got {}",
             p.command_count()
         );
+    }
+
+    #[test]
+    fn default_entries_include_every_registered_slash_command_and_alias() {
+        let p = setup_palette();
+
+        for spec in slash_command_specs() {
+            let command = format!("/{}", spec.name);
+            assert!(
+                p.all_commands.iter().any(|entry| entry.name == command
+                    && entry.description == spec.summary
+                    && entry.action == Action::Execute(command.clone())),
+                "palette missing registered slash command {command}"
+            );
+
+            for alias in spec.aliases {
+                let alias_command = format!("/{alias}");
+                assert!(
+                    p.all_commands
+                        .iter()
+                        .any(|entry| entry.name == alias_command
+                            && entry.action == Action::Execute(alias_command.clone())),
+                    "palette missing alias {alias_command} for /{}",
+                    spec.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -1765,7 +1706,7 @@ mod tests {
         });
 
         terminal.assert_line_contains("/help");
-        terminal.assert_line_contains("Help");
+        terminal.assert_line_contains("Show available slash command");
     }
 
     #[test]
