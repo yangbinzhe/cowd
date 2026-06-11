@@ -36,6 +36,8 @@ use crate::tui::components::base::{Component, EventResult, RenderContext};
 pub enum SuggestionKind {
     /// A file-system path (triggered by '@' prefix).
     File,
+    /// A structured context reference (triggered by '@' prefix).
+    Context,
     /// A slash command (triggered by '/' prefix).
     Command,
     /// A historical input.
@@ -204,7 +206,7 @@ impl AutocompleteEngine {
     ///   - `hello` → matches history entries containing "hello"
     pub fn suggest(&mut self, prefix: &str) -> Vec<Suggestion> {
         let mut suggestions: Vec<Suggestion> = if prefix.starts_with('@') {
-            self.file_suggestions(&prefix[1..])
+            self.context_suggestions(&prefix[1..])
         } else if prefix.starts_with('/') {
             self.command_suggestions(&prefix[1..])
         } else {
@@ -239,7 +241,88 @@ impl AutocompleteEngine {
 
     // ── private helpers ──────────────────────────────────────────
 
+    fn context_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
+        if prefix.is_empty() {
+            return vec![
+                Suggestion::new("@diff", SuggestionKind::Context),
+                Suggestion::new("@staged", SuggestionKind::Context),
+                Suggestion::new("@file:", SuggestionKind::Context),
+                Suggestion::new("@folder:", SuggestionKind::Context),
+                Suggestion::new("@url:", SuggestionKind::Context),
+                Suggestion::new("@git:", SuggestionKind::Context),
+            ];
+        }
+
+        if prefix == "file" || prefix == "folder" {
+            return self.typed_context_file_suggestions(prefix, "");
+        }
+
+        if let Some(path_part) = prefix.strip_prefix("file:") {
+            return self.typed_context_file_suggestions("file", path_part);
+        }
+
+        if let Some(path_part) = prefix.strip_prefix("folder:") {
+            return self.typed_context_file_suggestions("folder", path_part);
+        }
+
+        let static_items = [
+            ("diff", "git diff"),
+            ("staged", "staged diff"),
+            ("file:", "attach file"),
+            ("folder:", "attach folder"),
+            ("url:", "fetch url"),
+            ("git:", "git reference"),
+        ];
+
+        let static_matches: Vec<Suggestion> = static_items
+            .into_iter()
+            .filter(|(text, _)| text.starts_with(prefix))
+            .map(|(text, _)| Suggestion::new(format!("@{text}"), SuggestionKind::Context))
+            .collect();
+
+        if !static_matches.is_empty() {
+            return static_matches;
+        }
+
+        self.file_suggestions(prefix)
+    }
+
+    fn typed_context_file_suggestions(&self, kind: &str, path_part: &str) -> Vec<Suggestion> {
+        let want_dir = kind == "folder";
+        let suggestions = if !want_dir
+            && path_part.len() >= 2
+            && !path_part.contains('/')
+            && !path_part.starts_with('.')
+        {
+            self.fuzzy_repo_file_suggestions(path_part)
+        } else {
+            self.file_suggestions_filtered(path_part, Some(want_dir))
+        };
+
+        suggestions
+            .into_iter()
+            .map(|suggestion| {
+                Suggestion::new(format!("@{kind}:{}", suggestion.text), SuggestionKind::File)
+            })
+            .collect()
+    }
+
+    fn fuzzy_repo_file_suggestions(&self, query: &str) -> Vec<Suggestion> {
+        let mut ranked = Vec::new();
+        collect_repo_file_matches(&self.cwd, &self.cwd, query, 0, &mut ranked);
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        ranked
+            .into_iter()
+            .take(self.max_suggestions)
+            .map(|(_, rel)| Suggestion::new(rel, SuggestionKind::File))
+            .collect()
+    }
+
     fn file_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
+        self.file_suggestions_filtered(prefix, None)
+    }
+
+    fn file_suggestions_filtered(&self, prefix: &str, want_dir: Option<bool>) -> Vec<Suggestion> {
         // Determine the directory and file prefix from the pattern.
         // e.g., prefix "sr" with cwd "/project" → look in cwd for "sr*"
         let (search_dir, file_prefix) = resolve_file_search(&self.cwd, prefix);
@@ -250,6 +333,12 @@ impl AutocompleteEngine {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with(&file_prefix) {
+                    let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
+                    if let Some(want_dir) = want_dir {
+                        if want_dir != is_dir {
+                            continue;
+                        }
+                    }
                     // Reconstruct the full suggestion text relative to cwd
                     let rel_path = if search_dir == self.cwd {
                         name_str.to_string()
@@ -260,7 +349,7 @@ impl AutocompleteEngine {
                     };
 
                     // Add trailing slash for directories
-                    let display = if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    let display = if is_dir {
                         format!("{}/", rel_path)
                     } else {
                         rel_path
@@ -311,6 +400,87 @@ fn resolve_file_search(cwd: &std::path::Path, pattern: &str) -> (std::path::Path
     } else {
         (cwd.to_path_buf(), pattern.to_string())
     }
+}
+
+fn collect_repo_file_matches(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    query: &str,
+    depth: usize,
+    ranked: &mut Vec<((usize, usize), String)>,
+) {
+    if depth > 8 || ranked.len() > 200 {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | ".venv" | "venv"
+        ) {
+            continue;
+        }
+
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            collect_repo_file_matches(root, &path, query, depth + 1, ranked);
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let Some(rank) = fuzzy_basename_rank(&name, query) else {
+            continue;
+        };
+
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        ranked.push((rank, rel));
+    }
+}
+
+fn fuzzy_basename_rank(name: &str, query: &str) -> Option<(usize, usize)> {
+    let name_lower = name.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    if name_lower == query_lower {
+        return Some((0, name.len()));
+    }
+    if name_lower.starts_with(&query_lower) {
+        return Some((1, name.len()));
+    }
+    if name_lower.contains(&query_lower) {
+        return Some((2, name.len()));
+    }
+
+    let mut query_chars = query_lower.chars();
+    let mut current = query_chars.next()?;
+    for ch in name_lower.chars() {
+        if ch == current {
+            if let Some(next) = query_chars.next() {
+                current = next;
+            } else {
+                return Some((3, name.len()));
+            }
+        }
+    }
+
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1033,6 +1203,7 @@ impl Prompt {
             .map(|(i, s)| {
                 let kind_char = match s.kind {
                     SuggestionKind::File => "📁",
+                    SuggestionKind::Context => "◎",
                     SuggestionKind::Command => "⚡",
                     SuggestionKind::History => "🕐",
                 };
@@ -1461,6 +1632,75 @@ mod tests {
             "@src/ma should find src/main.rs, got: {:?}",
             suggestions.iter().map(|s| &s.text).collect::<Vec<_>>()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autocomplete_context_root_lists_structured_context_entries() {
+        let mut engine = AutocompleteEngine::new("/tmp");
+
+        let suggestions = engine.suggest("@");
+        let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
+
+        assert!(texts.contains(&"@diff"), "missing @diff in {texts:?}");
+        assert!(texts.contains(&"@staged"), "missing @staged in {texts:?}");
+        assert!(texts.contains(&"@file:"), "missing @file: in {texts:?}");
+        assert!(texts.contains(&"@folder:"), "missing @folder: in {texts:?}");
+    }
+
+    #[test]
+    fn autocomplete_at_file_only_yields_files() {
+        let dir = std::env::temp_dir().join("cowd_prompt_test_at_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("readme.md"), "readme").unwrap();
+        std::fs::write(dir.join(".env"), "secret").unwrap();
+
+        let mut engine = AutocompleteEngine::new(dir.clone());
+        let suggestions = engine.suggest("@file:");
+        let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
+
+        assert!(texts.contains(&"@file:readme.md"), "{texts:?}");
+        assert!(texts.contains(&"@file:.env"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|text| text.starts_with("@file:src/")),
+            "{texts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autocomplete_at_folder_only_yields_directories() {
+        let dir = std::env::temp_dir().join("cowd_prompt_test_at_folder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("readme.md"), "readme").unwrap();
+
+        let mut engine = AutocompleteEngine::new(dir.clone());
+        let suggestions = engine.suggest("@folder:");
+        let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
+
+        assert!(texts.contains(&"@folder:src/"), "{texts:?}");
+        assert!(!texts.contains(&"@folder:readme.md"), "{texts:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autocomplete_at_file_fuzzy_finds_nested_basename() {
+        let dir = std::env::temp_dir().join("cowd_prompt_test_at_file_fuzzy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(dir.join("src/bin").join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+
+        let mut engine = AutocompleteEngine::new(dir.clone());
+        let suggestions = engine.suggest("@file:mai");
+        let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
+
+        assert!(texts.contains(&"@file:src/bin/main.rs"), "{texts:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
