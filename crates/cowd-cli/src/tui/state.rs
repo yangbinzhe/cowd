@@ -48,6 +48,7 @@ use crate::tui::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::status_bar::StatusBar;
+use crate::tui::components::system_status_bar::SystemStatusBar;
 use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
 use crate::tui::components::todo_panel::TodoPanel;
@@ -228,6 +229,9 @@ pub struct TuiState {
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
+    /// Top system status strip for runtime/network/service health.
+    pub system_status_bar: SystemStatusBar,
+
     /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Diff, 6=Files, 7=Sessions, 8=Memory, 9=Skills, 10=Gateway).
     pub sidebar_active_tab: usize,
 
@@ -330,6 +334,7 @@ impl TuiState {
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
+        let system_status_bar = SystemStatusBar::new();
 
         Self {
             app,
@@ -373,6 +378,7 @@ impl TuiState {
             skills_panel,
             gateway_panel,
             runtime_activity_panel,
+            system_status_bar,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -565,6 +571,7 @@ impl TuiState {
         }
 
         // Sync status bar from App state
+        self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
         self.status_bar.tick();
 
@@ -572,10 +579,18 @@ impl TuiState {
         let input_lines = self.app.input.lines().len().max(1) as u16;
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
+        let top_h = 1u16;
+        let content_area = ratatui::layout::Rect::new(
+            area.x,
+            area.y.saturating_add(top_h),
+            area.width,
+            area.height.saturating_sub(top_h),
+        );
 
         // FIX A: Render search bar BEFORE content to prevent overlap
         if self.app.search_active {
-            let search_area = ratatui::layout::Rect::new(0, 0, area.width, 1);
+            let search_area =
+                ratatui::layout::Rect::new(content_area.x, content_area.y, content_area.width, 1);
             let search_text = if self.app.search_query.is_empty() {
                 "/ ".to_string()
             } else {
@@ -599,10 +614,21 @@ impl TuiState {
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
         let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
 
+        {
+            let system_area = ratatui::layout::Rect::new(area.x, area.y, area.width, top_h);
+            let _guard = self.render_profiler.guard("system_status_bar");
+            let _ = error_recovery::catch_render_panic(
+                "system_status_bar",
+                AssertUnwindSafe(|| {
+                    self.system_status_bar.render(&mut main_ctx, system_area);
+                }),
+            );
+        }
+
         // 1. Render chat view + sidebar using the layout tree
         {
-            self.layout_tree.resize(area);
-            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
+            self.layout_tree.resize(content_area);
+            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(content_area);
             // Subtract status bar (1 line) + input area from chat viewport height
             // so scroll calculation doesn't think it has more visible lines than available
             chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);

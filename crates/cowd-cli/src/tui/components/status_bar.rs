@@ -12,8 +12,6 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use runtime;
-
 use crate::tui::app::App;
 use crate::tui::components::{Component, EventResult, RenderContext};
 
@@ -93,23 +91,39 @@ impl StatusBar {
     /// matching the original `widgets/status_bar.rs` functionality.
     pub fn with_default_sections() -> Self {
         let mut sb = Self::new();
-        sb.add_section(Self::brand_section());
-        sb.add_section(Self::panel_model_status_section());
-        sb.add_section(Self::reputation_section());
-        sb.add_section(Self::token_bar_section());
-        sb.add_section(Self::token_count_section());
-        sb.add_section(Self::turn_token_section());
-        sb.add_section(Self::compaction_section());
-        sb.add_section(Self::cache_section());
+        sb.add_section(StatusSection {
+            id: "model".into(),
+            content: None,
+            style: Style::default().fg(Color::White),
+            width: SectionWidth::Fixed(28),
+        });
+        sb.add_section(StatusSection {
+            id: "context".into(),
+            content: None,
+            style: Style::default().fg(Color::DarkGray),
+            width: SectionWidth::Fixed(28),
+        });
+        sb.add_section(StatusSection {
+            id: "approvals".into(),
+            content: None,
+            style: Style::default().fg(Color::Yellow),
+            width: SectionWidth::Fixed(14),
+        });
+        sb.add_section(Self::permission_status_section());
+        sb.add_section(StatusSection {
+            id: "session".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(20),
+        });
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
-        sb.add_section(Self::lease_section());
-        sb.add_section(Self::task_section());
-        sb.add_section(Self::wave_section());
-        // Task 12: Footer status sections (right-aligned)
-        sb.add_section(Self::mcp_status_section());
-        sb.add_section(Self::lsp_status_section());
-        sb.add_section(Self::permission_status_section());
+        sb.add_section(StatusSection {
+            id: "input_hint".into(),
+            content: None,
+            style: Style::default().fg(Color::DarkGray),
+            width: SectionWidth::Fill,
+        });
         sb
     }
 
@@ -322,72 +336,32 @@ impl StatusBar {
     /// Only sections with recognized built-in IDs are populated;
     /// custom sections are left unchanged.
     pub fn sync_from_app(&mut self, app: &App) {
-        let status = if app.turn_active {
-            format!("{} Thinking", app.spinner_char())
-        } else {
-            "✓ Ready".to_string()
-        };
-
         for section in &mut self.sections {
             section.content = match section.id.as_str() {
-                "brand" => Some("Cowd".to_string()),
-                "panel_model_status" => {
-                    let label = match runtime::resolve_global_provider(&app.model) {
-                        Some(p) => {
-                            let proto = p.protocol.as_deref().unwrap_or("openai-compat");
-                            format!("{} ({})", p.name, proto)
-                        }
-                        None => "未配置".to_string(),
-                    };
+                "model" => {
                     let mode = if app.yolo_mode { "YOLO" } else { "STD" };
-                    Some(format!("{label} │ {status} │ {mode} │ {}", app.model))
+                    Some(format!("model:{} {mode}", preview(&app.model, 18)))
                 }
-                "reputation" => {
-                    app.selected_agent_reputation.map(|r| {
-                        // Gold/Yellow for >=4.0, Silver/Gray for >=2.0
-                        let style = if r >= 4.0 { Color::Yellow } else { Color::Gray };
-                        // Override the section's style with dynamic color
-                        section.style = section.style.fg(style);
-                        format!("⭐{r:.1}")
-                    })
-                }
-                "token_bar" => token_bar(app),
-                "token_count" => {
-                    if app.input_tokens > 0 || app.output_tokens > 0 {
-                        Some(format!(
-                            "in:{} out:{}",
-                            fmt_tokens(app.input_tokens),
-                            fmt_tokens(app.output_tokens)
-                        ))
+                "context" => {
+                    let pct = if app.context_window > 0 {
+                        (app.token_count as f64 / app.context_window as f64 * 100.0).min(100.0)
                     } else {
-                        None
-                    }
+                        0.0
+                    };
+                    Some(format!(
+                        "ctx:{}/{} {:.0}%",
+                        fmt_tokens(app.token_count),
+                        fmt_tokens(app.context_window),
+                        pct
+                    ))
                 }
-                "turn_token" => {
-                    if app.turn_active && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0)
-                    {
-                        Some(format!(
-                            "turn:in:{} out:{}",
-                            fmt_tokens(app.turn_input_tokens),
-                            fmt_tokens(app.turn_output_tokens)
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                "compaction" => {
-                    if app.compaction_count > 0 {
-                        Some(format!("cmp:{}", app.compaction_count))
-                    } else {
-                        None
-                    }
-                }
-                "cache" => {
-                    if app.cache_hits > 0 {
-                        Some(format!("cache:{}", app.cache_hits))
-                    } else {
-                        None
-                    }
+                "approvals" => {
+                    let count = app
+                        .daemon_pending_approvals
+                        .unwrap_or_default()
+                        .max(app.permission_count as u64)
+                        + u64::from(app.approval.is_some());
+                    Some(format!("approvals:{count}"))
                 }
                 "search" => {
                     if app.search_active {
@@ -404,53 +378,9 @@ impl StatusBar {
                     }
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
-                "lease" => app.daemon_lease_owner.as_ref().map(|owner| {
-                    format!(
-                        "Lease {}:{}",
-                        app.daemon_lease_mode.as_deref().unwrap_or("unknown"),
-                        owner
-                    )
-                }),
-                "task" => app.current_task.as_ref().map(|task| {
-                    let short_id: String = task.id.chars().take(8).collect();
-                    let phase = task
-                        .current_phase
-                        .as_deref()
-                        .map(|phase| {
-                            let phase_status = task.phase_status.as_deref().unwrap_or("active");
-                            format!(" · {phase}:{phase_status}")
-                        })
-                        .unwrap_or_default();
-                    let review = task
-                        .review_result
-                        .as_deref()
-                        .map(|result| format!(" · review:{result}"))
-                        .unwrap_or_default();
-                    let artifacts = if task.artifact_count > 0 {
-                        format!(" · art:{}", task.artifact_count)
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "Task {} {}{}{}{}",
-                        task.status, short_id, phase, artifacts, review
-                    )
-                }),
-                "wave" => {
-                    let ws = &app.wave_state;
-                    if ws.total > 0 {
-                        let task_total = ws.pending + ws.running + ws.done + ws.failed;
-                        Some(format!(
-                            "Wave {}/{} ∥ {} tasks · ⏳{} 🔄{} ✅{}",
-                            ws.current, ws.total, task_total, ws.pending, ws.running, ws.done,
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                "mcp_status" => Some(format!("● MCP:{}", app.mcp_count)),
-                "lsp_status" => Some(format!("● LSP:{}", app.lsp_available)),
-                "permission_status" => Some("△ 2".to_string()),
+                "permission_status" => Some(format!("perm:{}", app.permission_count)),
+                "session" => Some(format!("session:{}", short_id(&app.session_id))),
+                "input_hint" => Some("Enter send · Shift+Enter newline · Ctrl+B panels".into()),
                 _ => None,
             };
         }
@@ -562,6 +492,23 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+fn short_id(value: &str) -> String {
+    if value.chars().count() <= 10 {
+        value.to_string()
+    } else {
+        value.chars().take(10).collect()
+    }
+}
+
+fn preview(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Build a character-based progress bar: "████░░░░ 6.2K/128K (39%)"
 pub fn token_bar(app: &App) -> Option<String> {
     let window = app.context_window;
@@ -595,7 +542,6 @@ pub fn token_bar(app: &App) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::CurrentTaskSummary;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
@@ -632,17 +578,14 @@ mod tests {
     fn with_default_sections_has_all_parts() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"brand"));
-        assert!(ids.contains(&"panel_model_status"));
-        assert!(ids.contains(&"token_bar"));
-        assert!(ids.contains(&"token_count"));
-        assert!(ids.contains(&"turn_token"));
-        assert!(ids.contains(&"compaction"));
-        assert!(ids.contains(&"cache"));
+        assert!(ids.contains(&"model"));
+        assert!(ids.contains(&"context"));
+        assert!(ids.contains(&"approvals"));
+        assert!(ids.contains(&"permission_status"));
+        assert!(ids.contains(&"session"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
-        assert!(ids.contains(&"lease"));
-        assert!(ids.contains(&"task"));
+        assert!(ids.contains(&"input_hint"));
     }
 
     // ── Notification ─────────────────────────────────────────────
@@ -683,27 +626,26 @@ mod tests {
     // ── sync_from_app ────────────────────────────────────────────
 
     #[test]
-    fn sync_from_app_populates_brand_section() {
+    fn sync_from_app_populates_model_section() {
         let app = App::new("test-model", "test-session");
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let brand = bar.section_mut("brand").unwrap();
-        assert_eq!(brand.content.as_deref(), Some("Cowd"));
+        let model = bar.section_mut("model").unwrap();
+        assert_eq!(model.content.as_deref(), Some("model:test-model STD"));
     }
 
     #[test]
-    fn sync_from_app_populates_panel_model_status() {
+    fn sync_from_app_populates_context_section() {
         let app = App::new("claude-sonnet-4", "test-session");
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("panel_model_status").unwrap();
+        let section = bar.section_mut("context").unwrap();
         let content = section.content.as_deref().unwrap();
-        assert!(content.contains("✓ Ready"));
-        assert!(content.contains("claude-sonnet-4"));
+        assert!(content.contains("ctx:"));
     }
 
     #[test]
@@ -714,71 +656,34 @@ mod tests {
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("panel_model_status").unwrap();
+        let section = bar.section_mut("model").unwrap();
         let content = section.content.as_ref().unwrap();
         assert!(content.contains("YOLO"));
     }
 
     #[test]
-    fn sync_from_app_shows_current_task() {
+    fn sync_from_app_shows_approval_count() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.current_task = Some(CurrentTaskSummary {
-            id: "task-123456789".to_string(),
-            objective: "ship v0.8.10".to_string(),
-            status: "running".to_string(),
-            current_phase: None,
-            phase_status: None,
-            review_result: None,
-            artifact_count: 0,
-            blocker_reason: None,
-        });
+        app.daemon_pending_approvals = Some(2);
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("task").unwrap();
+        let section = bar.section_mut("approvals").unwrap();
         let content = section.content.as_ref().unwrap();
-        assert!(content.contains("Task running"));
-        assert!(content.contains("task-123"));
+        assert_eq!(content, "approvals:2");
     }
 
     #[test]
-    fn sync_from_app_shows_daemon_session_lease() {
-        let mut app = App::new("claude-sonnet-4", "test-session");
-        app.daemon_lease_owner = Some("tui:4242".to_string());
-        app.daemon_lease_mode = Some("collaborative".to_string());
+    fn sync_from_app_shows_session_id() {
+        let app = App::new("claude-sonnet-4", "test-session-abcdef");
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("lease").unwrap();
+        let section = bar.section_mut("session").unwrap();
         let content = section.content.as_ref().unwrap();
-        assert!(content.contains("collaborative"));
-        assert!(content.contains("tui:4242"));
-    }
-
-    #[test]
-    fn sync_from_app_shows_current_task_phase_review_and_artifacts() {
-        let mut app = App::new("claude-sonnet-4", "test-session");
-        app.current_task = Some(CurrentTaskSummary {
-            id: "task-123456789".to_string(),
-            objective: "ship v0.8.10".to_string(),
-            status: "running".to_string(),
-            current_phase: Some("tui-cockpit".to_string()),
-            phase_status: Some("completed".to_string()),
-            review_result: Some("accepted".to_string()),
-            artifact_count: 2,
-            blocker_reason: None,
-        });
-        let mut bar = StatusBar::with_default_sections();
-
-        bar.sync_from_app(&app);
-
-        let section = bar.section_mut("task").unwrap();
-        let content = section.content.as_ref().unwrap();
-        assert!(content.contains("tui-cockpit:completed"));
-        assert!(content.contains("art:2"));
-        assert!(content.contains("review:accepted"));
+        assert!(content.contains("test-sessi"));
     }
 
     // ── Render tests ─────────────────────────────────────────────
@@ -875,45 +780,28 @@ mod tests {
 
     // ── Notification render ──────────────────────────────────────
 
-    // ── Task 12: Footer status tests ──────────────────────────────
-
-    #[test]
-    fn mcp_status_shows() {
-        let app = App::new("test-model", "test-session");
-        let mut bar = StatusBar::with_default_sections();
-        bar.sync_from_app(&app);
-
-        let section = bar.section_mut("mcp_status").unwrap();
-        let content = section.content.as_deref().unwrap();
-        assert!(
-            content.contains("MCP"),
-            "MCP status section should show MCP info, got: {content}"
-        );
-    }
-
-    #[test]
-    fn lsp_status_shows() {
-        let app = App::new("test-model", "test-session");
-        let mut bar = StatusBar::with_default_sections();
-        bar.sync_from_app(&app);
-
-        let section = bar.section_mut("lsp_status").unwrap();
-        let content = section.content.as_deref().unwrap();
-        assert!(
-            content.contains("LSP"),
-            "LSP status section should show LSP info, got: {content}"
-        );
-    }
-
     #[test]
     fn permission_status_shows() {
-        let app = App::new("test-model", "test-session");
+        let mut app = App::new("test-model", "test-session");
+        app.permission_count = 2;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
         let section = bar.section_mut("permission_status").unwrap();
         let content = section.content.as_deref().unwrap();
-        assert!(!content.is_empty(), "Permission status should have content");
+        assert_eq!(content, "perm:2");
+    }
+
+    #[test]
+    fn input_hint_shows_core_interactions() {
+        let app = App::new("test-model", "test-session");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("input_hint").unwrap();
+        let content = section.content.as_deref().unwrap();
+        assert!(content.contains("Enter send"));
+        assert!(content.contains("Ctrl+B"));
     }
 
     #[test]
@@ -921,17 +809,12 @@ mod tests {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
         assert!(
-            ids.contains(&"mcp_status"),
-            "Should have mcp_status section"
-        );
-        assert!(
-            ids.contains(&"lsp_status"),
-            "Should have lsp_status section"
-        );
-        assert!(
             ids.contains(&"permission_status"),
             "Should have permission_status section"
         );
+        assert!(ids.contains(&"model"), "Should have model section");
+        assert!(ids.contains(&"context"), "Should have context section");
+        assert!(ids.contains(&"approvals"), "Should have approvals section");
     }
 
     #[test]
