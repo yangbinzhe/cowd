@@ -104,6 +104,27 @@ impl FocusTarget {
             FocusTarget::Dialog => "dialog",
         }
     }
+
+    fn hint(self) -> &'static str {
+        match self {
+            FocusTarget::Chat => "j/k scroll · / commands · Ctrl+P palette · Ctrl+B panels",
+            FocusTarget::Input => "Enter send · Shift+Enter newline · / commands · Esc clear",
+            FocusTarget::Activity => "j/k scroll · PgUp/PgDn page · Esc close",
+            FocusTarget::Sidebar => "Tab switch · j/k scroll · Esc close · /focus input",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => {
+                "j/k scroll · n next hunk · m reviewed · Esc close"
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory) => {
+                "j/k select · Enter detail · / search · Esc back/close"
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => {
+                "j/k select · Tab category · Enter detail · Esc close"
+            }
+            FocusTarget::CommandPalette => "type to filter · j/k move · Enter run · Esc close",
+            FocusTarget::PromptSuggestions => "Tab accept · arrows move · Esc close",
+            FocusTarget::Dialog => "Tab move · Enter confirm · Esc close",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,9 +656,13 @@ impl TuiState {
         // Sync status bar from App state
         self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
-        let focus_label = self.focus_for_current_surface().label();
+        let current_focus = self.focus_for_current_surface();
+        let focus_label = current_focus.label();
         if let Some(section) = self.status_bar.section_mut("focus") {
             section.content = Some(format!("focus:{focus_label}"));
+        }
+        if let Some(section) = self.status_bar.section_mut("input_hint") {
+            section.content = Some(current_focus.hint().into());
         }
         self.status_bar.tick();
         let show_activity_panel = (self.app.turn_active || self.activity_panel_visible)
@@ -800,7 +825,7 @@ impl TuiState {
                                 .add_modifier(ratatui::style::Modifier::BOLD),
                         ),
                         ratatui::text::Span::styled(
-                            "  topic panel",
+                            "  topic panel · Esc close · j/k scroll",
                             ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
                         ),
                     ]);
@@ -4316,6 +4341,19 @@ providers:
         let joined = terminal.buffer_lines().join("\n");
 
         assert!(joined.contains("focus:activity"), "missing focus: {joined}");
+    }
+
+    #[test]
+    fn render_status_bar_shows_focus_specific_hint() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/memory".into()));
+
+        let mut terminal = MockTerminal::new(140, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(joined.contains("focus:memory"), "missing focus: {joined}");
+        assert!(joined.contains("Enter detail"), "missing hint: {joined}");
     }
 
     #[test]
