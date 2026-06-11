@@ -651,11 +651,15 @@ impl TuiState {
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
         let top_h = 1u16;
+        let bottom_status_h = 1u16;
         let content_area = ratatui::layout::Rect::new(
             area.x,
             area.y.saturating_add(top_h),
             area.width,
-            area.height.saturating_sub(top_h),
+            area.height
+                .saturating_sub(top_h)
+                .saturating_sub(bottom_status_h)
+                .saturating_sub(input_h),
         );
 
         // FIX A: Render search bar BEFORE content to prevent overlap
@@ -684,6 +688,7 @@ impl TuiState {
 
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
         let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
+        let toast_anchor_area: ratatui::layout::Rect;
 
         {
             let system_area = ratatui::layout::Rect::new(area.x, area.y, area.width, top_h);
@@ -700,9 +705,9 @@ impl TuiState {
         {
             self.layout_tree.resize(content_area);
             let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(content_area);
-            // Subtract status bar (1 line) + input area from chat viewport height
-            // so scroll calculation doesn't think it has more visible lines than available
-            chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
+            let topic_fullscreen = self.layout_state.sidebar_visible
+                && self.active_topic_panel.is_some()
+                && content_area.width < 100;
             if self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && content_area.width >= 100
@@ -711,6 +716,19 @@ impl TuiState {
                 let topic_w =
                     ((content_area.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
                 chat_area.width = content_area.width.saturating_sub(topic_w).max(40);
+            }
+            if topic_fullscreen {
+                chat_area.width = 0;
+                toast_anchor_area = ratatui::layout::Rect::new(
+                    content_area.x,
+                    content_area.y,
+                    content_area.width.min(56),
+                    content_area.height,
+                );
+            } else if self.layout_state.sidebar_visible {
+                toast_anchor_area = chat_area;
+            } else {
+                toast_anchor_area = content_area;
             }
             let activity_area = if show_activity_panel && chat_area.width >= 72 {
                 let desired = (chat_area.width / 3).clamp(30, 48);
@@ -729,15 +747,27 @@ impl TuiState {
             } else {
                 None
             };
-            let sidebar_w = area.width.saturating_sub(chat_area.width);
-            let sidebar_area =
-                ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
+            let sidebar_area = if topic_fullscreen {
+                content_area
+            } else {
+                let sidebar_x = chat_area.x.saturating_add(chat_area.width);
+                let sidebar_w = content_area
+                    .x
+                    .saturating_add(content_area.width)
+                    .saturating_sub(sidebar_x);
+                ratatui::layout::Rect::new(
+                    sidebar_x,
+                    content_area.y,
+                    sidebar_w,
+                    content_area.height,
+                )
+            };
 
             self.chat_view.scroll_state.offset = self.app.scroll_offset;
             self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
 
             // Render chat view (already synced above)
-            {
+            if chat_area.width > 0 && chat_area.height > 0 {
                 let _guard = self.render_profiler.guard("chat_view");
                 self.chat_view.render(&mut main_ctx, chat_area);
             }
@@ -1119,7 +1149,8 @@ impl TuiState {
                 match error_recovery::catch_render_panic(
                     "toast_manager",
                     AssertUnwindSafe(|| {
-                        self.toast_manager.render(&mut overlay_ctx, area);
+                        self.toast_manager
+                            .render(&mut overlay_ctx, toast_anchor_area);
                     }),
                 ) {
                     RenderResult::Ok => None,
@@ -4183,8 +4214,23 @@ providers:
         let joined = terminal.buffer_lines().join("\n");
 
         assert!(joined.contains("Skills"));
+        terminal.assert_line_contains("topic panel");
+        assert!(!joined.contains("Gateway"));
+    }
+
+    #[test]
+    fn render_topic_panel_compact_layout_keeps_input_and_status_visible() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/memory".into()));
+
+        let mut terminal = MockTerminal::new(88, 28);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(joined.contains("Memory"));
         assert!(joined.contains("topic panel"));
-        assert!(!joined.contains("Memory"));
+        assert!(joined.contains("Input"));
+        assert!(joined.contains("focus:memory"));
     }
 
     #[test]
