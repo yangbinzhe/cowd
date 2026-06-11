@@ -6,12 +6,13 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, TimelineEntry};
+use crate::tui::components::panel_scroll::PanelScrollState;
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 #[derive(Debug, Clone, Default)]
 pub struct ActivityPanel {
     labels: Vec<String>,
-    offset: usize,
+    scroll: PanelScrollState,
 }
 
 impl ActivityPanel {
@@ -26,33 +27,26 @@ impl ActivityPanel {
             .rev()
             .map(activity_label)
             .collect();
-        self.clamp_offset(10);
+        self.scroll.sync(self.labels.len(), 10);
     }
 
     pub fn scroll_down(&mut self, visible_rows: usize) {
-        let max = self.labels.len().saturating_sub(visible_rows.max(1));
-        self.offset = (self.offset + 1).min(max);
+        self.scroll.sync(self.labels.len(), visible_rows);
+        self.scroll.line_down();
     }
 
     pub fn scroll_up(&mut self) {
-        self.offset = self.offset.saturating_sub(1);
+        self.scroll.line_up();
     }
 
     pub fn scroll_page_down(&mut self, visible_rows: usize) {
-        let rows = visible_rows.max(1);
-        let max = self.labels.len().saturating_sub(rows);
-        self.offset = (self.offset + rows).min(max);
+        self.scroll.sync(self.labels.len(), visible_rows);
+        self.scroll.page_down();
     }
 
     pub fn scroll_page_up(&mut self, visible_rows: usize) {
-        self.offset = self.offset.saturating_sub(visible_rows.max(1));
-    }
-
-    fn clamp_offset(&mut self, visible_rows: usize) {
-        let max = self.labels.len().saturating_sub(visible_rows.max(1));
-        if self.offset > max {
-            self.offset = max;
-        }
+        self.scroll.sync(self.labels.len(), visible_rows);
+        self.scroll.page_up();
     }
 
     fn visible_rows(&self, area: Rect) -> usize {
@@ -63,7 +57,7 @@ impl ActivityPanel {
 impl Component for ActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let visible_rows = self.visible_rows(area);
-        self.clamp_offset(visible_rows);
+        self.scroll.sync(self.labels.len(), visible_rows);
 
         let mut lines = vec![Line::from(vec![
             Span::styled(
@@ -81,9 +75,10 @@ impl Component for ActivityPanel {
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            let end = (self.offset + visible_rows).min(self.labels.len());
-            for (idx, label) in self.labels[self.offset..end].iter().enumerate() {
-                let absolute = self.offset + idx;
+            let start = self.scroll.offset;
+            let end = (start + visible_rows).min(self.labels.len());
+            for (idx, label) in self.labels[start..end].iter().enumerate() {
+                let absolute = start + idx;
                 let marker = if absolute == 0 { "* " } else { "  " };
                 let color = if label.contains("error") || label.contains("failed") {
                     Color::Red
@@ -234,12 +229,12 @@ mod tests {
     fn activity_panel_scrolls_with_bounds() {
         let mut panel = ActivityPanel {
             labels: (0..20).map(|idx| format!("event {idx}")).collect(),
-            offset: 0,
+            scroll: PanelScrollState::new(),
         };
 
         panel.scroll_page_down(5);
-        assert_eq!(panel.offset, 5);
+        assert_eq!(panel.scroll.offset, 4);
         panel.scroll_page_up(5);
-        assert_eq!(panel.offset, 0);
+        assert_eq!(panel.scroll.offset, 0);
     }
 }

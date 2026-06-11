@@ -25,6 +25,7 @@ use memory::types::{MemoryId, MemoryLayer};
 use memory::{MemoryInformationState, MemoryKernel, MemoryTurnContext};
 
 use crate::tui::app::{App, MemoryEntry};
+use crate::tui::components::panel_scroll::{clamp_u16_offset, offset_to_u16, PanelScrollState};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 // ── Layer Filter ─────────────────────────────────────────────────
@@ -128,6 +129,8 @@ pub struct MemoryPanel {
     view_mode: ViewMode,
     /// Scroll offset for detail view and long lists.
     pub scroll_offset: u16,
+    last_list_viewport_len: usize,
+    last_detail_viewport_len: usize,
     /// Status message to display (e.g., "Archived", "Refreshed").
     status_message: Option<String>,
     /// Tick counter for auto-clearing status messages.
@@ -145,6 +148,8 @@ impl MemoryPanel {
             search_active: false,
             view_mode: ViewMode::List,
             scroll_offset: 0,
+            last_list_viewport_len: 1,
+            last_detail_viewport_len: 1,
             status_message: None,
             status_ticks: 0,
         }
@@ -371,8 +376,19 @@ impl MemoryPanel {
             )));
             lines.push(Line::raw(""));
 
-            let visible_start = self.scroll_offset as usize;
             let max_visible = inner_height.saturating_sub(4); // top header + bottom padding
+            self.last_list_viewport_len = max_visible.max(1);
+            clamp_u16_offset(&mut self.scroll_offset, total, self.last_list_viewport_len);
+            if let Some(selected) = self.selected_entry {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: total,
+                    viewport_len: self.last_list_viewport_len,
+                };
+                scroll.ensure_visible(selected);
+                self.scroll_offset = offset_to_u16(scroll.offset);
+            }
+            let visible_start = self.scroll_offset as usize;
             let visible_end = (visible_start + max_visible).min(total);
 
             for i in visible_start..visible_end {
@@ -469,8 +485,14 @@ impl MemoryPanel {
 
         // Content (scrollable)
         let content_lines: Vec<&str> = entry.content.lines().collect();
-        let offset = self.scroll_offset as usize;
         let max_content_lines = inner_height.saturating_sub(lines.len() + 2);
+        self.last_detail_viewport_len = max_content_lines.max(1);
+        clamp_u16_offset(
+            &mut self.scroll_offset,
+            content_lines.len(),
+            self.last_detail_viewport_len,
+        );
+        let offset = self.scroll_offset as usize;
         let visible_content = &content_lines[offset.min(content_lines.len())
             ..(offset + max_content_lines).min(content_lines.len())];
 
@@ -617,14 +639,50 @@ impl MemoryPanel {
                     .map_or(0, |i| (i + 1).min(self.entries.len().saturating_sub(1)));
                 if !self.entries.is_empty() {
                     self.selected_entry = Some(next);
+                    let mut scroll = PanelScrollState {
+                        offset: self.scroll_offset as usize,
+                        content_len: self.entries.len(),
+                        viewport_len: self.last_list_viewport_len,
+                    };
+                    scroll.ensure_visible(next);
+                    self.scroll_offset = offset_to_u16(scroll.offset);
                 }
                 EventResult::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if !self.entries.is_empty() {
-                    self.selected_entry =
-                        Some(self.selected_entry.map_or(0, |i| i.saturating_sub(1)));
+                    let prev = self.selected_entry.map_or(0, |i| i.saturating_sub(1));
+                    self.selected_entry = Some(prev);
+                    let mut scroll = PanelScrollState {
+                        offset: self.scroll_offset as usize,
+                        content_len: self.entries.len(),
+                        viewport_len: self.last_list_viewport_len,
+                    };
+                    scroll.ensure_visible(prev);
+                    self.scroll_offset = offset_to_u16(scroll.offset);
                 }
+                EventResult::Consumed
+            }
+            KeyCode::PageDown => {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self.entries.len(),
+                    viewport_len: self.last_list_viewport_len,
+                };
+                scroll.page_down();
+                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.selected_entry = (!self.entries.is_empty()).then_some(scroll.offset);
+                EventResult::Consumed
+            }
+            KeyCode::PageUp => {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self.entries.len(),
+                    viewport_len: self.last_list_viewport_len,
+                };
+                scroll.page_up();
+                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.selected_entry = (!self.entries.is_empty()).then_some(scroll.offset);
                 EventResult::Consumed
             }
             KeyCode::Char('g') => {
@@ -638,6 +696,31 @@ impl MemoryPanel {
             KeyCode::Char('G') => {
                 // Go to bottom (shift-g)
                 if !self.entries.is_empty() {
+                    self.selected_entry = Some(self.entries.len() - 1);
+                    let mut scroll = PanelScrollState {
+                        offset: self.scroll_offset as usize,
+                        content_len: self.entries.len(),
+                        viewport_len: self.last_list_viewport_len,
+                    };
+                    scroll.bottom();
+                    self.scroll_offset = offset_to_u16(scroll.offset);
+                }
+                EventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.scroll_offset = 0;
+                self.selected_entry = (!self.entries.is_empty()).then_some(0);
+                EventResult::Consumed
+            }
+            KeyCode::End => {
+                if !self.entries.is_empty() {
+                    let mut scroll = PanelScrollState {
+                        offset: self.scroll_offset as usize,
+                        content_len: self.entries.len(),
+                        viewport_len: self.last_list_viewport_len,
+                    };
+                    scroll.bottom();
+                    self.scroll_offset = offset_to_u16(scroll.offset);
                     self.selected_entry = Some(self.entries.len() - 1);
                 }
                 EventResult::Consumed
@@ -697,11 +780,71 @@ impl MemoryPanel {
                 EventResult::Consumed
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                let entry = self.selected_entry.and_then(|idx| self.entries.get(idx));
+                let content_len = entry.map_or(0, |entry| entry.content.lines().count());
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len,
+                    viewport_len: self.last_detail_viewport_len,
+                };
+                scroll.line_down();
+                self.scroll_offset = offset_to_u16(scroll.offset);
                 EventResult::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self
+                        .selected_entry
+                        .and_then(|idx| self.entries.get(idx))
+                        .map_or(0, |entry| entry.content.lines().count()),
+                    viewport_len: self.last_detail_viewport_len,
+                };
+                scroll.line_up();
+                self.scroll_offset = offset_to_u16(scroll.offset);
+                EventResult::Consumed
+            }
+            KeyCode::PageDown => {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self
+                        .selected_entry
+                        .and_then(|idx| self.entries.get(idx))
+                        .map_or(0, |entry| entry.content.lines().count()),
+                    viewport_len: self.last_detail_viewport_len,
+                };
+                scroll.page_down();
+                self.scroll_offset = offset_to_u16(scroll.offset);
+                EventResult::Consumed
+            }
+            KeyCode::PageUp => {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self
+                        .selected_entry
+                        .and_then(|idx| self.entries.get(idx))
+                        .map_or(0, |entry| entry.content.lines().count()),
+                    viewport_len: self.last_detail_viewport_len,
+                };
+                scroll.page_up();
+                self.scroll_offset = offset_to_u16(scroll.offset);
+                EventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.scroll_offset = 0;
+                EventResult::Consumed
+            }
+            KeyCode::End => {
+                let mut scroll = PanelScrollState {
+                    offset: self.scroll_offset as usize,
+                    content_len: self
+                        .selected_entry
+                        .and_then(|idx| self.entries.get(idx))
+                        .map_or(0, |entry| entry.content.lines().count()),
+                    viewport_len: self.last_detail_viewport_len,
+                };
+                scroll.bottom();
+                self.scroll_offset = offset_to_u16(scroll.offset);
                 EventResult::Consumed
             }
             KeyCode::Char('d') => {

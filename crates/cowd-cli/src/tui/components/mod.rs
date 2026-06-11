@@ -21,6 +21,7 @@ pub mod gateway_panel;
 pub mod goal_workbench_panel;
 pub mod l4_knowledge_view;
 pub mod memory_panel;
+pub mod panel_scroll;
 pub mod performance_dashboard;
 pub mod prompt;
 pub mod question_form;
