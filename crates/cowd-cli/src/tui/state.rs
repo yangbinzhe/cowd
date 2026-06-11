@@ -19,7 +19,7 @@
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
 use crate::tui::accessibility::AccessibilityMode;
@@ -72,18 +72,17 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 12;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 11;
 
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {
         vec![
-            "Run", "Ctx", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill",
+            "Run", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill",
             "Gate",
         ]
     } else {
         vec![
-            "Runtime",
-            "Context",
+            "Run",
             "Changes",
             "Goals",
             "Approvals",
@@ -683,21 +682,13 @@ impl TuiState {
                 }
                 1 => {
                     let _ = error_recovery::catch_render_panic(
-                        "context_panel",
-                        AssertUnwindSafe(|| {
-                            self.context_panel.render(&mut main_ctx, panel_area);
-                        }),
-                    );
-                }
-                2 => {
-                    let _ = error_recovery::catch_render_panic(
                         "file_changes_panel",
                         AssertUnwindSafe(|| {
                             self.file_changes_panel.render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
-                3 => {
+                2 => {
                     let _ = error_recovery::catch_render_panic(
                         "goal_workbench_panel",
                         AssertUnwindSafe(|| {
@@ -705,7 +696,7 @@ impl TuiState {
                         }),
                     );
                 }
-                4 => {
+                3 => {
                     let _ = error_recovery::catch_render_panic(
                         "approval_cockpit_panel",
                         AssertUnwindSafe(|| {
@@ -714,7 +705,7 @@ impl TuiState {
                         }),
                     );
                 }
-                5 => {
+                4 => {
                     let _ = error_recovery::catch_render_panic(
                         "todo_panel",
                         AssertUnwindSafe(|| {
@@ -722,7 +713,7 @@ impl TuiState {
                         }),
                     );
                 }
-                6 => {
+                5 => {
                     let _guard = self.render_profiler.guard("diff_viewer");
                     let _ = error_recovery::catch_render_panic(
                         "diff_viewer",
@@ -731,7 +722,7 @@ impl TuiState {
                         }),
                     );
                 }
-                7 => {
+                6 => {
                     let _guard = self.render_profiler.guard("file_tree");
                     let _ = error_recovery::catch_render_panic(
                         "file_tree",
@@ -740,7 +731,7 @@ impl TuiState {
                         }),
                     );
                 }
-                8 => {
+                7 => {
                     let _guard = self.render_profiler.guard("session_sidebar");
                     let _ = error_recovery::catch_render_panic(
                         "session_sidebar",
@@ -749,7 +740,7 @@ impl TuiState {
                         }),
                     );
                 }
-                9 => {
+                8 => {
                     let _guard = self.render_profiler.guard("memory_panel");
                     let _ = error_recovery::catch_render_panic(
                         "memory_panel",
@@ -758,7 +749,7 @@ impl TuiState {
                         }),
                     );
                 }
-                10 => {
+                9 => {
                     let _ = error_recovery::catch_render_panic(
                         "skills_panel",
                         AssertUnwindSafe(|| {
@@ -766,7 +757,7 @@ impl TuiState {
                         }),
                     );
                 }
-                11 => {
+                10 => {
                     let _ = error_recovery::catch_render_panic(
                         "gateway_panel",
                         AssertUnwindSafe(|| {
@@ -840,14 +831,26 @@ impl TuiState {
         // ── Overlays: one RenderContext for all conditional overlays ──
         let mut overlay_ctx: RenderContext = RenderContext::new(frame, &skin);
 
-        // 3. Render thinking panel when turn is active
+        // 3. Render thinking panel as compact floating box when turn is active.
+        // Positioned at top-right of chat area so it doesn't obscure the full screen.
         if self.app.turn_active {
+            // Compute a compact area: top-right corner of the main chat region.
+            // Width ~35% of screen, height capped at 12 rows.
+            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
+            chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
+            let thinking_w = (area.width / 3).max(30).min(50);
+            let thinking_h = (chat_area.height / 3).max(6).min(14);
+            let thinking_x = chat_area.x + chat_area.width.saturating_sub(thinking_w);
+            let thinking_y = if self.app.search_active { 1 } else { chat_area.y };
+            let thinking_area =
+                ratatui::layout::Rect::new(thinking_x, thinking_y, thinking_w, thinking_h);
+
             let degraded = {
                 let _guard = self.render_profiler.guard("thinking_panel");
                 match error_recovery::catch_render_panic(
                     "thinking_panel",
                     AssertUnwindSafe(|| {
-                        self.thinking_panel.render(&mut overlay_ctx, area);
+                        self.thinking_panel.render(&mut overlay_ctx, thinking_area);
                     }),
                 ) {
                     RenderResult::Ok => None,
@@ -1121,6 +1124,20 @@ impl TuiState {
                 return true;
             }
             _ => {}
+        }
+
+        // 1.8. 'v' toggle compact chat view
+        if let KeyCode::Char('v') = event.code {
+            if !event.modifiers.contains(KeyModifiers::CONTROL) && !event.modifiers.contains(KeyModifiers::ALT) {
+                self.app.compact_chat = !self.app.compact_chat;
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    None,
+                    format!("Chat view: {}", if self.app.compact_chat { "compact (summary)" } else { "verbose (full timeline)" }),
+                    1500,
+                );
+                return true;
+            }
         }
 
         // 2. Route through keybind engine
@@ -3323,9 +3340,9 @@ providers:
         assert_eq!(compact.len(), SIDEBAR_TAB_COUNT);
         assert_eq!(full.len(), SIDEBAR_TAB_COUNT);
         assert_eq!(compact[0], "Run");
-        assert_eq!(compact[4], "Appr");
-        assert_eq!(full[0], "Runtime");
-        assert_eq!(full[4], "Approvals");
+        assert_eq!(compact[3], "Appr");
+        assert_eq!(full[0], "Run");
+        assert_eq!(full[3], "Approvals");
     }
 
     #[test]

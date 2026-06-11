@@ -4,6 +4,9 @@ window.Messages = (()=>{
   let currentEvent='', messageBuffer='';
   let activeToolId=null;
   let activeStreamEl=null;
+  let activeThinkCard=null;
+  let thinkCount=0;
+  let answerStarted=false;
   function approve(id,approved){
     Api.respondApproval(id,approved).catch(()=>{});
   }
@@ -172,8 +175,25 @@ window.Messages = (()=>{
       const body=el.querySelector('.msg-body')||el;
       messageBuffer+=delta;
       body.innerHTML=UI.renderMd(messageBuffer);
+      if(!answerStarted){
+        answerStarted=true;
+        collapseProcessCards(el);
+      }
     }
     scrollToBottom();
+  }
+
+  function collapseProcessCards(el){
+    if(!el)return;
+    el.querySelectorAll('.think-card').forEach(c=>{
+      const b=c.querySelector('.think-card-body');
+      if(b&&!b.classList.contains('collapsed'))b.classList.add('collapsed');
+    });
+    el.querySelectorAll('.tool-card').forEach(c=>{
+      const b=c.querySelector('.tool-card-body');
+      if(b&&!b.classList.contains('collapsed'))b.classList.add('collapsed');
+      c.classList.add('dimmed');
+    });
   }
 
   function handleToolUse(data){
@@ -209,6 +229,9 @@ window.Messages = (()=>{
     }
     messageBuffer='';
     activeStreamEl=null;
+    activeThinkCard=null;
+    thinkCount=0;
+    answerStarted=false;
     if(data&&data.usage)Sessions.addTokens(data.usage.total_tokens||data.usage.output_tokens||0);
     Sessions.load();
   }
@@ -217,10 +240,15 @@ window.Messages = (()=>{
     const content=data.content||data.text||data.reasoning||'';
     if(!content)return;
     const el=getOrCreateStreamEl();
-    if(el){
-      const card=UI.addThinkCard(content);
-      el.appendChild(card);
+    if(!el)return;
+    thinkCount++;
+    if(!activeThinkCard||!activeThinkCard.isConnected){
+      activeThinkCard=UI.addThinkCard(content);
+      el.appendChild(activeThinkCard);
+    }else{
+      UI.updateThinkCard(activeThinkCard,content,thinkCount);
     }
+    scrollToBottom();
   }
 
   function getOrCreateStreamEl(){

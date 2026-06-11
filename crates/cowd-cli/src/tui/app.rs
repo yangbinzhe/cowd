@@ -274,6 +274,8 @@ pub struct App {
 
     pub layout_tree: LayoutTree,
     pub layout_state: LayoutState,
+
+    pub compact_chat: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -488,6 +490,7 @@ impl App {
 
             layout_tree: build_default_layout(),
             layout_state: LayoutState::new(),
+            compact_chat: false,
         }
     }
 

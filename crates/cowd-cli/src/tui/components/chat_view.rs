@@ -51,6 +51,10 @@ pub struct ChatView {
     /// Set when user presses Enter on a tool call with subagent_session_id.
     pub pending_subagent_nav: Option<String>,
 
+    // ── Compact chat mode ──
+    /// When true, shows only key content (thinking, final answer, stats).
+    pub compact_mode: bool,
+
     // ── Render cache ──
     cached_chat_lines: Vec<Line<'static>>,
     entry_line_counts: Vec<u16>,
@@ -80,6 +84,7 @@ impl ChatView {
             pending_message_menu: false,
             pending_menu_entry_idx: 0,
             pending_subagent_nav: None,
+            compact_mode: false,
             cached_chat_lines: Vec::new(),
             entry_line_counts: Vec::new(),
             msg_version: 0,
@@ -152,6 +157,7 @@ impl ChatView {
         self.search_query = app.search_query.clone();
         self.search_matches = app.search_matches.clone();
         self.search_current = app.search_current;
+        self.compact_mode = app.compact_chat;
     }
 
     /// Persist view-model back to the shared App state.
@@ -281,6 +287,18 @@ impl Component for ChatView {
             .scroll_state
             .offset
             .min(total_lines.saturating_sub(1) as u16) as usize;
+
+        // ── Compact mode: summary view ──
+        if self.compact_mode {
+            let compact_lines = Self::build_compact_lines(self);
+            let frame = ctx.frame_mut();
+            frame.render_widget(Clear, area);
+            let paragraph = Paragraph::new(Text::from(compact_lines))
+                .wrap(Wrap { trim: false })
+                .scroll((0, 0));
+            frame.render_widget(paragraph, area);
+            return;
+        }
 
         // ── Build visible lines ──
         let mut visible_lines: Vec<Line<'static>>;
@@ -478,7 +496,119 @@ impl ChatView {
         lines
     }
 
-    /// Rebuild only the last entry (being streamed) in-place.
+    fn build_compact_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.timeline.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Type to start. /help /resume /exit",
+                Style::default().fg(Color::DarkGray),
+            )));
+            return lines;
+        }
+
+        let mut tool_count = 0u32;
+        let mut thinking_active = false;
+        let mut thinking_preview = String::new();
+        let mut last_assistant: Option<&str> = None;
+        let mut last_assistant_idx = 0usize;
+        let mut user_messages = 0u32;
+
+        for (i, entry) in self.timeline.iter().enumerate() {
+            match entry {
+                TimelineEntry::ToolCall { done, .. } => {
+                    if *done {
+                        tool_count += 1;
+                    }
+                }
+                TimelineEntry::Thinking { content, complete, .. } => {
+                    if !complete {
+                        thinking_active = true;
+                        thinking_preview = content.chars().take(120).collect();
+                    }
+                }
+                TimelineEntry::Message { role, content, .. } => {
+                    if role == "assistant" {
+                        last_assistant = Some(content.as_str());
+                        last_assistant_idx = i;
+                    } else if role == "user" {
+                        user_messages += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if thinking_active && !thinking_preview.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("⚡ ", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("Thinking: ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(thinking_preview, Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::raw(""));
+        }
+
+        if let Some(content) = last_assistant {
+            let is_focused = last_assistant_idx == self.timeline_cursor;
+            let label = if is_focused { "● Answer" } else { "  Answer" };
+            lines.push(Line::from(Span::styled(
+                format!("{}  ─────────────────────────────────────", label),
+                Style::default().fg(if is_focused { Color::Cyan } else { Color::Green }).bold(),
+            )));
+            let md_lines = md_renderer::render_markdown_lines(content, Color::White);
+            let max_lines = 800usize;
+            for line in md_lines.into_iter().take(max_lines) {
+                lines.push(line);
+            }
+            let total = content.lines().count();
+            if total > max_lines {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ... ({} more lines)",
+                        total.saturating_sub(max_lines)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::raw(""));
+        }
+
+        lines.push(Line::from(Span::styled(
+            "─".repeat(60),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let mut stats_parts: Vec<String> = Vec::new();
+        if tool_count > 0 {
+            stats_parts.push(format!("Tools: {}", tool_count));
+        }
+        if user_messages > 0 {
+            stats_parts.push(format!("Msgs: {}", user_messages));
+        }
+        stats_parts.push(format!(
+            "Tokens: {}/{}",
+            if self.timeline.iter().any(|e| matches!(e, TimelineEntry::Message { role, .. } if role == "assistant")) {
+                "—"
+            } else {
+                "—"
+            },
+            "—"
+        ));
+        stats_parts.push(format!(
+            "Turn: {:.1}s",
+            0.0
+        ));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", stats_parts.join(" · ")),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  v:expand full timeline · ↑↓:scroll · /:search",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        lines
+    }
     fn rebuild_streaming_tail(&mut self) {
         let n = self.timeline.len();
         if n == 0 || n > self.timeline.len() {
@@ -778,69 +908,23 @@ impl ChatView {
                 id: _,
                 content,
                 complete,
-                expanded,
+                expanded: _,
             } => {
                 let total_lines = content.lines().count();
                 let status = if *complete { "complete" } else { "thinking" };
                 let focus_marker = if is_focused { "● " } else { "  " };
 
-                if *expanded {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{focus_marker}┌─ 💭 Thinking [{status}] ({total_lines} lines)"
-                            ),
-                            Style::default().fg(Color::Cyan),
+                // Always collapsed in main view – details in Run panel
+                let preview: String = content.chars().take(80).collect();
+                let more = if content.len() > 80 { "..." } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"
                         ),
-                        Span::styled(
-                            if is_focused {
-                                "[Enter=collapse]".to_string()
-                            } else {
-                                String::new()
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-
-                    for line in content.lines().take(200) {
-                        lines.push(Line::from(vec![
-                            Span::styled("│  ".to_string(), Style::default().fg(Color::Cyan)),
-                            Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-                        ]));
-                    }
-                    if total_lines > 200 {
-                        lines.push(Line::from(vec![
-                            Span::styled("│  ".to_string(), Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                format!("... ({} more lines)", total_lines - 200),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "└─".to_string(),
-                        Style::default().fg(Color::Cyan),
-                    )));
-                } else {
-                    let preview: String = content.chars().take(80).collect();
-                    let more = if content.len() > 80 { "..." } else { "" };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"
-                            ),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            if is_focused && *complete {
-                                "[Enter=expand]".to_string()
-                            } else {
-                                String::new()
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
             }
 
             TimelineEntry::ToolCall {
@@ -849,7 +933,7 @@ impl ChatView {
                 preview,
                 output,
                 done,
-                expanded,
+                expanded: _,
                 exit_code,
             } => {
                 let status_style = if *done {
@@ -877,8 +961,27 @@ impl ChatView {
                 };
                 let focus_marker = if is_focused { "● " } else { "  " };
 
-                // Check for subagent session (Task 9)
-                let subagent_label = if *done && name == "task" && !output.is_empty() {
+                // Always collapsed in main view – details in Run panel
+                let preview_text = if preview.is_empty() {
+                    name.as_str()
+                } else {
+                    preview.as_str()
+                };
+                let short_preview: String = preview_text.chars().take(60).collect();
+                let more = if preview_text.len() > 60 { "..." } else { "" };
+                let mut tool_line = vec![
+                    Span::styled(
+                        format!("{focus_marker}🔧 {name}"),
+                        Style::default().fg(Color::Yellow).bold(),
+                    ),
+                    Span::styled(
+                        format!(": {short_preview}{more}"),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(format!(" [{status_icon} {status_text}]"), status_style),
+                ];
+                // Check for subagent session
+                if *done && name == "task" && !output.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
                         let has_sid = val
                             .get("subagent_session_id")
@@ -887,101 +990,14 @@ impl ChatView {
                             .map(|s| !s.is_empty())
                             .unwrap_or(false);
                         if has_sid && is_focused {
-                            Some(" [Open Subagent]".to_string())
-                        } else if has_sid {
-                            Some(String::new())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if *expanded && !output.is_empty() {
-                    let total_lines = output.lines().count();
-                    let mut tool_line = vec![
-                        Span::styled(
-                            format!("{focus_marker}┌─ 🔧 {name}"),
-                            Style::default().fg(Color::Yellow).bold(),
-                        ),
-                        Span::styled(format!(" [{status_text}]"), status_style),
-                    ];
-                    if let Some(sa) = &subagent_label {
-                        if !sa.is_empty() {
-                            tool_line
-                                .push(Span::styled(sa.clone(), Style::default().fg(Color::Cyan)));
+                            tool_line.push(Span::styled(
+                                " [Open Subagent]".to_string(),
+                                Style::default().fg(Color::Cyan),
+                            ));
                         }
                     }
-                    tool_line.push(Span::styled(
-                        if is_focused {
-                            "[Enter=collapse]".to_string()
-                        } else {
-                            String::new()
-                        },
-                        Style::default().fg(Color::Gray),
-                    ));
-                    lines.push(Line::from(tool_line));
-
-                    let display_lines: Vec<String> =
-                        output.lines().take(100).map(|s| s.to_string()).collect();
-                    for line in &display_lines {
-                        lines.push(Line::from(Span::styled(
-                            format!("│ {line}"),
-                            Style::default().fg(Color::Gray),
-                        )));
-                    }
-                    if total_lines > 100 {
-                        lines.push(Line::from(Span::styled(
-                            format!("│ ... ({} more lines)", total_lines - 100),
-                            Style::default().fg(Color::Gray),
-                        )));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "└─".to_string(),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                } else {
-                    let preview_text = if preview.is_empty() {
-                        name.as_str()
-                    } else {
-                        preview.as_str()
-                    };
-                    let short_preview: String = preview_text.chars().take(60).collect();
-                    let more = if preview_text.len() > 60 { "..." } else { "" };
-                    let mut tool_line = vec![
-                        Span::styled(
-                            format!("{focus_marker}🔧 {name}"),
-                            Style::default().fg(Color::Yellow).bold(),
-                        ),
-                        Span::styled(
-                            format!(": {short_preview}{more}"),
-                            Style::default().fg(Color::Gray),
-                        ),
-                        Span::styled(format!(" [{status_icon} {status_text}]"), status_style),
-                    ];
-                    if let Some(sa) = &subagent_label {
-                        if !sa.is_empty() {
-                            tool_line
-                                .push(Span::styled(sa.clone(), Style::default().fg(Color::Cyan)));
-                        }
-                    }
-                    tool_line.push(Span::styled(
-                        if is_focused && *done {
-                            if name == "task" {
-                                "[Enter=expand|nav]".to_string()
-                            } else {
-                                "[Enter=expand]".to_string()
-                            }
-                        } else {
-                            String::new()
-                        },
-                        Style::default().fg(Color::Gray),
-                    ));
-                    lines.push(Line::from(tool_line));
                 }
+                lines.push(Line::from(tool_line));
             }
 
             TimelineEntry::SlashOutput {
@@ -1185,30 +1201,27 @@ mod tests {
     }
 
     #[test]
-    fn render_thinking_expanded() {
+    fn render_thinking() {
         let mut view = ChatView::new();
         view.timeline = vec![make_thinking(1, "line A\nline B", true, true)];
         view.timeline_cursor = 0;
-        view.entry_line_counts = vec![4];
+        view.entry_line_counts = vec![1];
         view.msg_version = 0;
         view.lines_dirty = false;
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
+        // Thinking always renders collapsed in main view — shows preview only
         assert!(
             joined.contains("line A"),
-            "Expected 'line A' in expanded thinking"
+            "Expected preview to contain 'line A'"
         );
         assert!(
-            joined.contains("line B"),
-            "Expected 'line B' in expanded thinking"
+            joined.contains("Thinking [complete]"),
+            "Expected thinking status indicator"
         );
         assert!(
-            joined.contains("[Enter=collapse]"),
-            "Expected collapse hint for focused entry"
-        );
-        assert!(
-            joined.contains("🔒") || joined.contains("💭"),
+            joined.contains("💭"),
             "Expected thinking icon in output"
         );
     }
@@ -1238,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_call_expanded() {
+    fn render_tool_call_completed() {
         let mut view = ChatView::new();
         view.timeline = vec![make_tool_call(
             "t1",
@@ -1249,17 +1262,21 @@ mod tests {
             Some(0),
         )];
         view.timeline_cursor = 0;
-        view.entry_line_counts = vec![4];
+        view.entry_line_counts = vec![1];
         view.msg_version = 0;
         view.lines_dirty = false;
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        assert!(joined.contains("Hello"), "Expected 'Hello' in output");
-        assert!(joined.contains("World"), "Expected 'World' in output");
+        // Tool calls always render collapsed in main view
+        assert!(joined.contains("echo"), "Expected tool name 'echo'");
         assert!(
-            joined.contains("[Enter=collapse]"),
-            "Expected collapse hint"
+            joined.contains("exit:0"),
+            "Expected 'exit:0' for success status"
+        );
+        assert!(
+            joined.contains("🔧"),
+            "Expected tool icon"
         );
     }
 

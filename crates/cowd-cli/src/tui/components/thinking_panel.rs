@@ -167,16 +167,21 @@ impl Component for ThinkingPanel {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )]));
-                for line in self.reasoning.lines().take(10) {
-                    let trimmed = if line.len() > 80 { &line[..80] } else { line };
+                for line in self.reasoning.lines().take(3) {
+                    let trimmed = if line.chars().count() > 60 {
+                        // Safe UTF-8 truncation at char boundary
+                        line.chars().take(60).collect::<String>()
+                    } else {
+                        line.to_string()
+                    };
                     lines.push(Line::from(Span::styled(
                         format!("  {trimmed}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                if self.reasoning.lines().count() > 10 {
+                if self.reasoning.lines().count() > 3 {
                     lines.push(Line::from(Span::styled(
-                        "  ... (truncated)",
+                        "  ... (more)",
                         Style::default().fg(Color::DarkGray),
                     )));
                 }

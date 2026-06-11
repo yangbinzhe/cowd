@@ -293,6 +293,11 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
     if !has_wechat {
         if let Ok(accounts) = runtime::platform::wechat_ilink::list_wechat_qr_accounts(None) {
             if let Some(account) = accounts.first() {
+                tracing::info!(
+                    "wechat_ilink: auto-detected QR account {} (saved at {})",
+                    account.account_id,
+                    account.saved_at
+                );
                 let mut pc = runtime::platform::PlatformConfig::new("wechat_ilink");
                 pc = pc
                     .with_setting("credential_source", "qr_account")
@@ -8783,10 +8788,21 @@ WantedBy=default.target
 }
 
 fn gateway_auth_token_from_platform(platform: &runtime::GatewayPlatformConfig) -> Option<String> {
-    platform
+    // Prefer flat auth_token key (legacy format).
+    let flat = platform
         .extra
         .get("auth_token")
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.as_str());
+
+    // Fallback: nested auth.token (current config format).
+    let nested = platform
+        .extra
+        .get("auth")
+        .and_then(|v| v.as_object())
+        .and_then(|auth_obj| auth_obj.get("token"))
+        .and_then(|v| v.as_str());
+
+    flat.or(nested)
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(String::from)

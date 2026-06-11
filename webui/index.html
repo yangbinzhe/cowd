@@ -45,10 +45,8 @@
   <div id="chat-header">
   <div id="chat-header-left">
     <select id="model-selector" class="model-picker" title="Select model"></select>
-    <span id="token-usage">0 tk</span>
   </div>
   <div id="chat-header-right">
-    <span id="cost-display" style="font-size:12px;color:var(--text3);margin-right:12px"></span>
     <span id="connection-status" style="font-size:11px;margin-right:12px">Disconnected</span>
     <button id="btn-toggle-panel" class="btn-icon" title="Toggle Panel">&xllcor;</button>
   </div>
@@ -61,6 +59,8 @@
     <div id="chat-input-actions">
       <button id="btn-slash" class="btn-icon btn-sm" title="Slash Commands">/</button>
       <div id="slash-dropdown" class="dropdown hidden"></div>
+      <span id="token-usage" style="font-size:11px;color:var(--text3);margin:0 8px;white-space:nowrap">0 tk</span>
+      <span id="cost-display" style="font-size:11px;color:var(--text3);white-space:nowrap"></span>
       <button id="btn-send" class="btn-primary">Send</button>
     </div>
   </div>

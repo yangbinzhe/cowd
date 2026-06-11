@@ -87,7 +87,7 @@ window.UI = (()=>{
   function addThinkCard(content){
     const wrapper=el('div','think-card');
     const hdr=el('div','think-card-header');
-    hdr.innerHTML='&xodot; Thinking';
+    hdr.innerHTML='&xodot; Thinking <span class="think-count">(1)</span>';
     hdr.onclick=function(){
       const body=wrapper.querySelector('.think-card-body');
       body.classList.toggle('collapsed');
@@ -97,6 +97,12 @@ window.UI = (()=>{
     wrapper.appendChild(hdr);
     wrapper.appendChild(body);
     return wrapper;
+  }
+
+  function updateThinkCard(card,content,count){
+    card.querySelector('.think-card-body').textContent=content;
+    const cntEl=card.querySelector('.think-count');
+    if(cntEl)cntEl.textContent='('+count+')';
   }
 
   function switchPanel(name){
@@ -146,5 +152,5 @@ window.UI = (()=>{
 
   function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
-  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,switchPanel,openModal,closeModal,switchCCTab,esc};
+  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,updateThinkCard,switchPanel,openModal,closeModal,switchCCTab,esc};
 })();
