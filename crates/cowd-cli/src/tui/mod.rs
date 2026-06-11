@@ -5,6 +5,7 @@ pub mod callbacks;
 pub mod clipboard;
 pub mod components;
 pub mod config_migration;
+pub mod context_tokens;
 pub mod control_client;
 pub mod error_recovery;
 pub mod event;

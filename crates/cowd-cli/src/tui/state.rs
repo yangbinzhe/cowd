@@ -52,6 +52,7 @@ use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
 use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, RenderContext};
+use crate::tui::context_tokens::validate_context_tokens;
 use crate::tui::error_recovery::{self, RenderResult};
 use crate::tui::event::dispatcher::EventDispatcher;
 use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority};
@@ -1439,6 +1440,16 @@ impl TuiState {
             }
             // Non-empty input → submit
             let text = self.app.input.lines().join("\n").trim().to_string();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if let Err(err) = validate_context_tokens(&text, &cwd) {
+                self.toast_manager.push(
+                    ToastVariant::Error,
+                    Some("Context invalid".into()),
+                    err.to_string(),
+                    4000,
+                );
+                return ProcessedKey::Nothing;
+            }
             self.prompt.add_history(text.clone());
             self.app.input = tui_textarea::TextArea::default();
             self.app.input.set_block(
@@ -3295,6 +3306,47 @@ providers:
         let handled = state.handle_input(x);
 
         assert!(!handled);
+    }
+
+    #[test]
+    #[serial]
+    fn process_raw_key_blocks_submit_when_context_file_is_missing() {
+        let original_cwd = std::env::current_dir().unwrap();
+        let dir = unique_temp_dir("cowd-tui-context-missing");
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("分析 @file:missing.rs");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert!(!state.toast_manager.is_empty());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial]
+    fn process_raw_key_allows_submit_when_context_file_is_valid() {
+        let original_cwd = std::env::current_dir().unwrap();
+        let dir = unique_temp_dir("cowd-tui-context-valid");
+        std::fs::write(dir.join("readme.md"), "readme").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("分析 @file:readme.md");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            ProcessedKey::Submit(text) => assert_eq!(text, "分析 @file:readme.md"),
+            other => panic!("expected submit, got {other:?}"),
+        }
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
