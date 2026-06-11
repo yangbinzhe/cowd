@@ -8,53 +8,6 @@ use ratatui::{
 use crate::tui::app::{App, TimelineEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
-/// Scrolling state for the Recent activities list.
-#[derive(Debug, Clone, Default)]
-struct ActivityScroll {
-    /// Topmost visible entry index in the Recent list.
-    offset: usize,
-    /// Total number of entries.
-    total: usize,
-}
-
-impl ActivityScroll {
-    fn scroll_down(&mut self, visible_rows: usize) {
-        let max = self.total.saturating_sub(visible_rows);
-        if self.offset < max {
-            self.offset += 1;
-        }
-    }
-
-    fn scroll_up(&mut self) {
-        self.offset = self.offset.saturating_sub(1);
-    }
-
-    fn scroll_page_down(&mut self, visible_rows: usize) {
-        let max = self.total.saturating_sub(visible_rows);
-        self.offset = (self.offset + visible_rows).min(max);
-    }
-
-    fn scroll_page_up(&mut self, visible_rows: usize) {
-        self.offset = self.offset.saturating_sub(visible_rows);
-    }
-
-    fn update_total(&mut self, total: usize, visible_rows: usize) {
-        self.total = total;
-        let max = total.saturating_sub(visible_rows);
-        if self.offset > max {
-            self.offset = max;
-        }
-    }
-}
-
-/// Whether the Recent section has keyboard focus for scrolling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Focus {
-    #[default]
-    None,
-    Recent,
-}
-
 /// Turn-level activity summary for "what's happening now" display.
 #[derive(Debug, Clone, Default)]
 struct TurnActivity {
@@ -106,15 +59,11 @@ pub struct RuntimeActivityPanel {
     control_plane_reason: String,
     yolo_mode: bool,
 
-    // ── Recent activities ─────────────────────────────────────────
-    /// All timeline entries as labeled strings (newest first).
-    recent_labels: Vec<String>,
-    /// Full entries for scrollable detail.
-    recent_entries: Vec<TimelineEntry>,
-    activity_scroll: ActivityScroll,
-    focus: Focus,
-    /// Highlighted entry index in the Recent list (None = no focus).
-    recent_cursor: Option<usize>,
+    // ── Runtime counters ─────────────────────────────────────────
+    event_count: usize,
+    message_count: usize,
+    tool_event_count: usize,
+    open_tool_count: usize,
     /// Current turn activity summary.
     turn_activity: TurnActivity,
 }
@@ -256,23 +205,28 @@ impl RuntimeActivityPanel {
             if self.yolo_mode { "on" } else { "off" }
         );
 
-        // ── Recent activities — all entries, newest first ─────────
-        self.recent_entries = app.timeline_clone_vec();
-        self.recent_entries.reverse();
-        self.recent_labels = self.recent_entries.iter().map(activity_label).collect();
-
-        // ── Turn activity snapshot ──
+        // ── Runtime counters and current activity snapshot ──
+        let timeline = app.timeline_clone_vec();
+        self.event_count = timeline.len();
+        self.message_count = 0;
+        self.tool_event_count = 0;
+        self.open_tool_count = 0;
         self.turn_activity = TurnActivity::default();
         self.turn_activity.active = app.turn_active;
-        for entry in &self.recent_entries {
+        for entry in &timeline {
             match entry {
+                TimelineEntry::Message { .. } => {
+                    self.message_count += 1;
+                }
                 TimelineEntry::Thinking { complete, .. } => {
                     if !complete {
                         self.turn_activity.thinking = true;
                     }
                 }
                 TimelineEntry::ToolCall { name, done, .. } => {
+                    self.tool_event_count += 1;
                     if !*done {
+                        self.open_tool_count += 1;
                         self.turn_activity.tool_count += 1;
                         if self.turn_activity.tool_names.len() < 5 {
                             self.turn_activity.tool_names.push(name.clone());
@@ -284,8 +238,8 @@ impl RuntimeActivityPanel {
                 _ => {}
             }
         }
-        if !self.recent_entries.is_empty() {
-            self.turn_activity.last_phase = match &self.recent_entries[0] {
+        if let Some(entry) = timeline.last() {
+            self.turn_activity.last_phase = match entry {
                 TimelineEntry::Thinking { complete, .. } => {
                     if *complete {
                         "thinking done".into()
@@ -308,18 +262,6 @@ impl RuntimeActivityPanel {
                 }
             };
         }
-    }
-
-    /// Compute approximate visible rows for the Recent section.
-    fn recent_visible_rows(&self, area: Rect) -> usize {
-        // Rough: header rows + empty lines take ~3 rows; the rest for Recent.
-        let ctx_rows = 10usize; // turn activity + token bar + context header
-        let title_rows = 3usize; // "Recent" header + separator
-        let available = area
-            .height
-            .saturating_sub(ctx_rows as u16)
-            .saturating_sub(title_rows as u16) as usize;
-        available.max(1)
     }
 }
 
@@ -498,105 +440,116 @@ impl Component for RuntimeActivityPanel {
             ),
         ]));
 
-        // ── Recent activities (bottom section, scrollable) ────────
-        let _recent_header_y = lines.len();
-
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            format!(
-                "Recent ({})  ↑↓/j/k:scroll  Ctrl+U/D:page",
-                self.recent_labels.len()
-            ),
+            "Status",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-
-        if self.recent_labels.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No activity yet",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            // Determine visible range with scrolling
-            let visible_rows = self.recent_visible_rows(area);
-            self.activity_scroll
-                .update_total(self.recent_labels.len(), visible_rows);
-
-            let start = self.activity_scroll.offset;
-            let end = (start + visible_rows).min(self.recent_labels.len());
-
-            for (i, label) in self
-                .recent_labels
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(end - start)
-            {
-                // Show scroll indicator if not at top
-                let prefix = if start > 0 && i == start {
-                    "↑"
-                } else if end < self.recent_labels.len()
-                    && i == end - 1
-                    && self.recent_labels.len() > visible_rows
-                {
-                    "↓"
+        lines.push(metric_line(
+            "Runtime:",
+            &self.control_plane_status,
+            &preview(&self.control_plane_reason, 72),
+            match self.control_plane_status.as_str() {
+                "healthy" => Color::Green,
+                "degraded" => Color::Red,
+                _ => Color::Yellow,
+            },
+        ));
+        lines.push(metric_line(
+            "Provider:",
+            &self.provider_status,
+            &format!(
+                "{} providers {} models route {}",
+                self.provider_count,
+                self.provider_model_count,
+                preview(&self.provider_route, 28)
+            ),
+            if self.provider_status == "available" {
+                Color::Green
+            } else if self.provider_status == "degraded" {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            },
+        ));
+        lines.push(metric_line(
+            "Context:",
+            &self.pressure_level,
+            &format!(
+                "pressure {}% path {} hashes {}/{}/{}",
+                self.pressure_pct,
+                self.degradation_path,
+                self.stable_hash,
+                self.runtime_hash,
+                self.dynamic_hash
+            ),
+            if self.pressure_pct > 85 {
+                Color::Red
+            } else if self.pressure_pct > 70 {
+                Color::Yellow
+            } else {
+                Color::Green
+            },
+        ));
+        lines.push(metric_line(
+            "Policy:",
+            &self.runtime_policy_level,
+            &format!(
+                "score {} agent {} review {} signals {}",
+                self.runtime_policy_score,
+                self.runtime_policy_agent,
+                if self.runtime_policy_review {
+                    "required"
                 } else {
-                    " "
-                };
-
-                let is_cursor = self.recent_cursor == Some(i);
-                let cursor_mark = if is_cursor { "▶ " } else { "  " };
-
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        cursor_mark,
-                        Style::default().fg(if is_cursor {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        }),
-                    ),
-                    Span::styled(
-                        label.clone(),
-                        if is_cursor {
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        },
-                    ),
-                ]));
-            }
-
-            // Show indicator if entries are scrolled
-            if self.recent_labels.len() > visible_rows {
-                let progress = if start == 0 {
-                    "Top".to_string()
-                } else if end >= self.recent_labels.len() {
-                    "End".to_string()
-                } else {
-                    format!("{}/{}", start + 1, self.recent_labels.len())
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("  ↕ {}", progress),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
+                    "clear"
+                },
+                self.runtime_policy_signals
+            ),
+            if self.runtime_policy_review {
+                Color::Yellow
+            } else {
+                Color::White
+            },
+        ));
+        lines.push(metric_line(
+            "Workgraph:",
+            &self.workgraph_status,
+            &format!(
+                "graph {} board {} candidates {} conflicts {}",
+                self.workgraph_graph_id,
+                self.workgraph_board_id,
+                self.workgraph_candidates,
+                self.workgraph_conflicts
+            ),
+            if self.workgraph_conflicts > 0 {
+                Color::Yellow
+            } else {
+                Color::White
+            },
+        ));
+        lines.push(metric_line(
+            "Activity:",
+            &format!("{} events", self.event_count),
+            &format!(
+                "{} messages {} tools {} open last {}",
+                self.message_count,
+                self.tool_event_count,
+                self.open_tool_count,
+                preview(&self.turn_activity.last_phase, 32)
+            ),
+            if self.open_tool_count > 0 {
+                Color::Yellow
+            } else {
+                Color::White
+            },
+        ));
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(format!(
-                " Run {}",
-                match self.focus {
-                    Focus::Recent => "[Recent ⇅]",
-                    Focus::None => "",
-                }
-            ));
+            .title(" Runtime Status ");
         ctx.frame_mut().render_widget(
             Paragraph::new(lines)
                 .block(block)
@@ -605,91 +558,12 @@ impl Component for RuntimeActivityPanel {
         );
     }
 
-    fn handle_event(&mut self, event: &crossterm::event::Event) -> EventResult {
-        let visible_rows = 10usize; // will be refined during render
-        match event {
-            crossterm::event::Event::Key(key)
-                if key.kind == crossterm::event::KeyEventKind::Press =>
-            {
-                match key.code {
-                    crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
-                        self.focus = Focus::Recent;
-                        // Move cursor or scroll
-                        if let Some(cursor) = self.recent_cursor {
-                            let next = (cursor + 1).min(self.recent_labels.len().saturating_sub(1));
-                            self.recent_cursor = Some(next);
-                            // Auto-scroll to keep cursor visible
-                            if next >= self.activity_scroll.offset + visible_rows {
-                                self.activity_scroll.scroll_down(visible_rows);
-                            }
-                        } else if !self.recent_labels.is_empty() {
-                            self.recent_cursor = Some(0);
-                        } else {
-                            self.activity_scroll.scroll_down(visible_rows);
-                        }
-                        EventResult::Consumed
-                    }
-                    crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
-                        self.focus = Focus::Recent;
-                        if let Some(cursor) = self.recent_cursor {
-                            let prev = cursor.saturating_sub(1);
-                            self.recent_cursor = Some(prev);
-                            if prev < self.activity_scroll.offset {
-                                self.activity_scroll.scroll_up();
-                            }
-                        } else if !self.recent_labels.is_empty() {
-                            self.recent_cursor = Some(0);
-                        } else {
-                            self.activity_scroll.scroll_up();
-                        }
-                        EventResult::Consumed
-                    }
-                    crossterm::event::KeyCode::Char('d')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        self.focus = Focus::Recent;
-                        self.activity_scroll.scroll_page_down(visible_rows);
-                        EventResult::Consumed
-                    }
-                    crossterm::event::KeyCode::Char('u')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        self.focus = Focus::Recent;
-                        self.activity_scroll.scroll_page_up(visible_rows);
-                        EventResult::Consumed
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        self.focus = Focus::Recent;
-                        // Toggle Recent focus
-                        if self.recent_cursor.is_some() {
-                            self.recent_cursor = None;
-                        } else if !self.recent_labels.is_empty() {
-                            self.recent_cursor = Some(
-                                self.activity_scroll
-                                    .offset
-                                    .min(self.recent_labels.len().saturating_sub(1)),
-                            );
-                        }
-                        EventResult::Consumed
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        self.recent_cursor = None;
-                        self.focus = Focus::None;
-                        EventResult::Consumed
-                    }
-                    _ => EventResult::NotConsumed,
-                }
-            }
-            _ => EventResult::NotConsumed,
-        }
+    fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
+        EventResult::NotConsumed
     }
 
     fn focusable(&self) -> bool {
-        true
+        false
     }
 
     fn id(&self) -> &str {
@@ -726,56 +600,23 @@ impl RuntimeActivityPanel {
 
 // ── Free functions ───────────────────────────────────────────────────
 
-fn activity_label(entry: &TimelineEntry) -> String {
-    match entry {
-        TimelineEntry::Message { role, content, .. } => {
-            format!("{}: {}", role, preview(content, 72))
-        }
-        TimelineEntry::Thinking {
-            content, complete, ..
-        } => {
-            format!(
-                "{}thinking: {}",
-                if *complete { "" } else { "⚡" },
-                preview(content, 72)
-            )
-        }
-        TimelineEntry::ToolCall {
-            name,
-            preview: tool_preview,
-            done,
-            exit_code,
-            output,
-            ..
-        } => {
-            let status = exit_code
-                .map(|code| format!("exit {}", code))
-                .unwrap_or_else(|| {
-                    if *done {
-                        "done".to_string()
-                    } else {
-                        "running".to_string()
-                    }
-                });
-            let out_hint = if output.is_empty() {
-                String::new()
-            } else {
-                format!(" → {}", preview(output, 40))
-            };
-            format!(
-                "tool {} {}: {}{}",
-                name,
-                status,
-                preview(tool_preview, 48),
-                out_hint
-            )
-        }
-        TimelineEntry::SlashOutput {
-            command, output, ..
-        } => {
-            format!("/{}: {}", command, preview(output, 72))
-        }
-    }
+fn metric_line(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    detail: impl Into<String>,
+    value_color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.into(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}", value.into()),
+            Style::default().fg(value_color),
+        ),
+        Span::styled(
+            format!("  {}", detail.into()),
+            Style::default().fg(Color::White),
+        ),
+    ])
 }
 
 fn preview(value: &str, max: usize) -> String {
@@ -917,34 +758,36 @@ mod tests {
         assert!(rendered.contains("12.0k"));
         assert!(rendered.contains("3.0k"));
 
-        // Verify runtime activity
+        // Verify runtime status summary
         assert!(rendered.contains("YoloGoal"));
         assert!(rendered.contains("Parallel"));
-        assert!(rendered.contains("tool bash exit 0"));
-        assert!(rendered.contains("user: ship the runtime console"));
+        assert!(rendered.contains("Runtime Status"));
+        assert!(rendered.contains("Status"));
+        assert!(rendered.contains("Provider:"));
+        assert!(rendered.contains("Context:"));
+        assert!(rendered.contains("Policy:"));
+        assert!(rendered.contains("Workgraph:"));
+        assert!(rendered.contains("Activity:"));
+        assert!(rendered.contains("2 events"));
+        assert!(rendered.contains("1 messages"));
+        assert!(rendered.contains("1 tools"));
 
-        // Verify scroll indicator exists
-        assert!(rendered.contains("Recent"));
+        // Recent/process details live in ActivityPanel, not Runtime.
+        assert!(!rendered.contains("Recent"));
+        assert!(!rendered.contains("user: ship the runtime console"));
 
         runtime::init_global_providers(runtime::ProvidersConfig::default());
     }
 
     #[test]
-    fn activity_scroll_bounds() {
-        let mut scroll = ActivityScroll::default();
-        scroll.update_total(10, 5);
-        assert_eq!(scroll.offset, 0);
+    fn runtime_status_panel_does_not_consume_recent_scroll_keys() {
+        let mut panel = RuntimeActivityPanel::new();
+        let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
 
-        scroll.scroll_down(5);
-        assert_eq!(scroll.offset, 1);
-
-        scroll.scroll_page_down(5);
-        assert_eq!(scroll.offset, 5); // max = 10 - 5 = 5
-
-        scroll.scroll_down(5); // at max, should stay
-        assert_eq!(scroll.offset, 5);
-
-        scroll.scroll_up();
-        assert_eq!(scroll.offset, 4);
+        assert_eq!(panel.handle_event(&event), EventResult::NotConsumed);
+        assert!(!panel.focusable());
     }
 }
