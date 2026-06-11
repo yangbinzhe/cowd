@@ -116,6 +116,12 @@ impl StatusBar {
             style: Style::default().fg(Color::Cyan),
             width: SectionWidth::Fixed(20),
         });
+        sb.add_section(StatusSection {
+            id: "focus".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(16),
+        });
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
         sb.add_section(StatusSection {

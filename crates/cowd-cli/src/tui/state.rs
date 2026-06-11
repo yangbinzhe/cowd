@@ -78,6 +78,35 @@ pub enum ProcessedKey {
 pub(crate) const SIDEBAR_TAB_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusTarget {
+    Chat,
+    Input,
+    Activity,
+    Sidebar,
+    TopicPanel(SidebarTopicPanel),
+    CommandPalette,
+    PromptSuggestions,
+    Dialog,
+}
+
+impl FocusTarget {
+    fn label(self) -> &'static str {
+        match self {
+            FocusTarget::Chat => "chat",
+            FocusTarget::Input => "input",
+            FocusTarget::Activity => "activity",
+            FocusTarget::Sidebar => "sidebar",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => "diff",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory) => "memory",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => "skills",
+            FocusTarget::CommandPalette => "palette",
+            FocusTarget::PromptSuggestions => "suggest",
+            FocusTarget::Dialog => "dialog",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarTopicPanel {
     Diff,
     Memory,
@@ -255,6 +284,9 @@ pub struct TuiState {
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
     pub(crate) active_topic_panel: Option<SidebarTopicPanel>,
 
+    /// Current keyboard focus target used to route navigation and scrolling.
+    pub(crate) focus_target: FocusTarget,
+
     /// Status bar at the bottom showing model, tokens, and system info.
     pub status_bar: StatusBar,
 
@@ -404,6 +436,7 @@ impl TuiState {
             activity_panel_visible: false,
             sidebar_active_tab: 0,
             active_topic_panel: None,
+            focus_target: FocusTarget::Chat,
             accessibility,
             active_sessions: None,
             startup_phase: StartupPhase::Hidden,
@@ -602,6 +635,10 @@ impl TuiState {
         // Sync status bar from App state
         self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
+        let focus_label = self.focus_for_current_surface().label();
+        if let Some(section) = self.status_bar.section_mut("focus") {
+            section.content = Some(format!("focus:{focus_label}"));
+        }
         self.status_bar.tick();
         let show_activity_panel = (self.app.turn_active || self.activity_panel_visible)
             && !self.layout_state.sidebar_visible;
@@ -1253,16 +1290,22 @@ impl TuiState {
             }
         }
 
+        if self.app.input.is_empty() && self.route_navigation_to_focus(event) {
+            return true;
+        }
+
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         if self.layout_state.sidebar_visible {
             match event.code {
                 KeyCode::Tab => {
                     self.active_topic_panel = None;
+                    self.set_focus_target(FocusTarget::Sidebar);
                     self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                     return true;
                 }
                 KeyCode::BackTab => {
                     self.active_topic_panel = None;
+                    self.set_focus_target(FocusTarget::Sidebar);
                     self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                         SIDEBAR_TAB_COUNT - 1
                     } else {
@@ -1495,11 +1538,13 @@ impl TuiState {
         // Tab / Shift+Tab: cycle through sidebar tabs.
         if self.layout_state.sidebar_visible && key.code == KeyCode::Tab {
             self.active_topic_panel = None;
+            self.set_focus_target(FocusTarget::Sidebar);
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
         }
         if self.layout_state.sidebar_visible && key.code == KeyCode::BackTab {
             self.active_topic_panel = None;
+            self.set_focus_target(FocusTarget::Sidebar);
             self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                 SIDEBAR_TAB_COUNT - 1
             } else {
@@ -1507,20 +1552,8 @@ impl TuiState {
             };
             return ProcessedKey::Nothing;
         }
-        if self.activity_panel_visible
-            && !self.layout_state.sidebar_visible
-            && self.app.input.is_empty()
-            && matches!(
-                key.code,
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('u') | KeyCode::Char('d')
-            )
-        {
-            let event = crossterm::event::Event::Key(key);
-            if self.activity_panel.handle_event(&event)
-                == crate::tui::components::EventResult::Consumed
-            {
-                return ProcessedKey::Nothing;
-            }
+        if self.app.input.is_empty() && self.route_navigation_to_focus(key) {
+            return ProcessedKey::Nothing;
         }
 
         // ── Modal overrides (pick up where old input.rs left off) ──
@@ -1537,16 +1570,21 @@ impl TuiState {
             let text = self.app.input.lines().join("\n");
             self.prompt.refresh_suggestions_from_text(&text);
             self.open_command_palette_with_query("/");
+            self.set_focus_target(FocusTarget::CommandPalette);
             return ProcessedKey::Nothing;
         }
 
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
+            self.set_focus_target(FocusTarget::Input);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
             let text = self.input_text();
             self.prompt
                 .refresh_suggestions_from_text_at_cursor(&text, self.input_cursor_byte_offset());
+            if self.prompt.suggestions_visible() {
+                self.set_focus_target(FocusTarget::PromptSuggestions);
+            }
             return ProcessedKey::Nothing;
         }
 
@@ -1634,8 +1672,28 @@ impl TuiState {
                 return ProcessedKey::Nothing;
             }
             // ESC when no turn active: dismiss overlays, not exit
+            if self.active_topic_panel.is_some() {
+                self.active_topic_panel = None;
+                self.set_focus_target(if self.layout_state.sidebar_visible {
+                    FocusTarget::Sidebar
+                } else {
+                    FocusTarget::Chat
+                });
+                return ProcessedKey::Nothing;
+            }
+            if self.activity_panel_visible {
+                self.activity_panel_visible = false;
+                self.set_focus_target(FocusTarget::Chat);
+                return ProcessedKey::Nothing;
+            }
+            if self.layout_state.sidebar_visible {
+                self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                self.set_focus_target(FocusTarget::Chat);
+                return ProcessedKey::Nothing;
+            }
             self.pending_cancel = false;
             self.pending_quit = false;
+            self.set_focus_target(FocusTarget::Chat);
             return ProcessedKey::Nothing;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1761,6 +1819,147 @@ impl TuiState {
         self.app.input = input;
     }
 
+    fn focus_for_current_surface(&self) -> FocusTarget {
+        if self.command_palette.is_open() {
+            FocusTarget::CommandPalette
+        } else if !self.dialog_manager.is_empty() || self.export_dialog_active {
+            FocusTarget::Dialog
+        } else if self.prompt.suggestions_visible() {
+            FocusTarget::PromptSuggestions
+        } else if let Some(topic) = self.active_topic_panel {
+            FocusTarget::TopicPanel(topic)
+        } else if self.layout_state.sidebar_visible {
+            FocusTarget::Sidebar
+        } else if self.activity_panel_visible || self.app.turn_active {
+            FocusTarget::Activity
+        } else if !self.app.input.is_empty() {
+            FocusTarget::Input
+        } else {
+            self.focus_target
+        }
+    }
+
+    fn set_focus_target(&mut self, target: FocusTarget) {
+        self.focus_target = target;
+    }
+
+    fn is_navigation_key(key: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        matches!(
+            key.code,
+            KeyCode::Char('j')
+                | KeyCode::Char('k')
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        ) || matches!(key.code, KeyCode::Char('u' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn route_navigation_to_focus(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        if !Self::is_navigation_key(&key) {
+            return false;
+        }
+        let event = crossterm::event::Event::Key(key);
+        match self.focus_for_current_surface() {
+            FocusTarget::PromptSuggestions
+            | FocusTarget::CommandPalette
+            | FocusTarget::Dialog
+            | FocusTarget::Input => false,
+            FocusTarget::Activity => {
+                if self.activity_panel.handle_event(&event)
+                    == crate::tui::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::Activity);
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => {
+                if self.diff_viewer.handle_event(&event)
+                    == crate::tui::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Diff));
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory) => {
+                if self.memory_panel.handle_event(&event)
+                    == crate::tui::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Memory));
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => {
+                if self.skills_panel.handle_event(&event)
+                    == crate::tui::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Skills));
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusTarget::Sidebar => self.route_navigation_to_sidebar(event),
+            FocusTarget::Chat => {
+                let crossterm::event::Event::Key(key) = event else {
+                    return false;
+                };
+                match key.code {
+                    crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
+                        self.app.scroll_offset = self.app.scroll_offset.saturating_add(1);
+                        self.app.auto_scroll = false;
+                    }
+                    crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
+                        self.app.scroll_offset = self.app.scroll_offset.saturating_sub(1);
+                        self.app.auto_scroll = false;
+                    }
+                    crossterm::event::KeyCode::PageDown => {
+                        self.app.scroll_page_down();
+                        self.app.auto_scroll = false;
+                    }
+                    crossterm::event::KeyCode::PageUp => {
+                        self.app.scroll_page_up();
+                        self.app.auto_scroll = false;
+                    }
+                    crossterm::event::KeyCode::Home => {
+                        self.app.scroll_offset = 0;
+                        self.app.auto_scroll = false;
+                    }
+                    crossterm::event::KeyCode::End => {
+                        self.app.auto_scroll = true;
+                    }
+                    _ => return false,
+                }
+                self.set_focus_target(FocusTarget::Chat);
+                true
+            }
+        }
+    }
+
+    fn route_navigation_to_sidebar(&mut self, event: crossterm::event::Event) -> bool {
+        let consumed = match self.sidebar_active_tab {
+            1 => self.file_changes_panel.handle_event(&event),
+            4 => self.todo_panel.handle_event(&event),
+            5 => self.file_tree.handle_event(&event),
+            6 => self.session_sidebar.handle_event(&event),
+            7 => self.gateway_panel.handle_event(&event),
+            _ => crate::tui::components::EventResult::NotConsumed,
+        } == crate::tui::components::EventResult::Consumed;
+        if consumed {
+            self.set_focus_target(FocusTarget::Sidebar);
+        }
+        consumed
+    }
+
     fn open_sidebar_tab(&mut self, tab: usize, label: &str) {
         self.activity_panel_visible = false;
         self.active_topic_panel = None;
@@ -1768,6 +1967,7 @@ impl TuiState {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
         self.sidebar_active_tab = tab.min(SIDEBAR_TAB_COUNT.saturating_sub(1));
+        self.set_focus_target(FocusTarget::Sidebar);
         self.toast_manager.push(
             ToastVariant::Info,
             Some("Panel".into()),
@@ -1782,6 +1982,7 @@ impl TuiState {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
         self.active_topic_panel = Some(panel);
+        self.set_focus_target(FocusTarget::TopicPanel(panel));
         self.toast_manager.push(
             ToastVariant::Info,
             Some("Panel".into()),
@@ -1805,6 +2006,11 @@ impl TuiState {
                 self.layout_state.toggle_sidebar(&mut self.layout_tree);
             }
             self.activity_panel_visible = !self.activity_panel_visible;
+            self.set_focus_target(if self.activity_panel_visible {
+                FocusTarget::Activity
+            } else {
+                FocusTarget::Chat
+            });
             let label = if self.activity_panel_visible {
                 "Activity opened"
             } else {
@@ -1849,6 +2055,7 @@ impl TuiState {
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
         self.command_palette.open();
+        self.set_focus_target(FocusTarget::CommandPalette);
     }
 
     fn open_command_palette_with_query(&mut self, query: &str) {
@@ -1856,6 +2063,7 @@ impl TuiState {
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
         self.command_palette.open_with_query(query);
+        self.set_focus_target(FocusTarget::CommandPalette);
     }
 
     /// Handle a key press while search is active.
@@ -1958,6 +2166,7 @@ impl TuiState {
                     self.app.scroll_offset = self.app.scroll_offset.saturating_sub((-delta) as u16);
                     self.app.auto_scroll = false;
                 }
+                self.set_focus_target(FocusTarget::Chat);
             }
             Action::ScrollPage(direction) => {
                 if direction > 0 {
@@ -1966,13 +2175,16 @@ impl TuiState {
                     self.app.scroll_page_up();
                 }
                 self.app.auto_scroll = false;
+                self.set_focus_target(FocusTarget::Chat);
             }
             Action::ScrollTop => {
                 self.app.scroll_offset = 0;
                 self.app.auto_scroll = false;
+                self.set_focus_target(FocusTarget::Chat);
             }
             Action::ScrollBottom => {
                 self.app.auto_scroll = true;
+                self.set_focus_target(FocusTarget::Chat);
             }
             Action::ExpandCollapse => {
                 self.app.toggle_expand_current();
@@ -2006,6 +2218,7 @@ impl TuiState {
             Action::ToggleCommandPalette => {
                 if self.command_palette.is_open() {
                     self.command_palette.close();
+                    self.set_focus_target(FocusTarget::Chat);
                 } else {
                     self.open_command_palette();
                 }
@@ -2456,6 +2669,12 @@ impl TuiState {
             }
             Action::TogglePanel(ref name) if name == "sidebar" => {
                 self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                self.active_topic_panel = None;
+                self.set_focus_target(if self.layout_state.sidebar_visible {
+                    FocusTarget::Sidebar
+                } else {
+                    FocusTarget::Chat
+                });
                 let message = if self.layout_state.sidebar_visible {
                     "Sidebar opened"
                 } else {
@@ -3820,6 +4039,34 @@ providers:
     }
 
     #[test]
+    fn empty_input_navigation_routes_to_focus_instead_of_textarea() {
+        let mut state = TuiState::new("m", "s");
+        state.app.scroll_offset = 0;
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(state.input_text(), "");
+        assert_eq!(state.app.scroll_offset, 1);
+        assert_eq!(state.focus_target, FocusTarget::Chat);
+    }
+
+    #[test]
+    fn topic_panel_navigation_keeps_topic_focus() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/memory".into()));
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(
+            state.focus_target,
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory)
+        );
+        assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
     fn slash_activity_command_closes_sidebar_for_focused_first_screen() {
         let mut state = TuiState::new("m", "s");
         state.dispatch_action(Action::Execute("/files".into()));
@@ -3907,6 +4154,18 @@ providers:
             !state.layout_state.sidebar_visible,
             "activity rail should not open the heavy sidebar"
         );
+    }
+
+    #[test]
+    fn render_status_bar_shows_current_focus() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/activity".into()));
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(joined.contains("focus:activity"), "missing focus: {joined}");
     }
 
     #[test]
