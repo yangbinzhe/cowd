@@ -75,13 +75,28 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 11;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarTopicPanel {
+    Diff,
+    Memory,
+    Skills,
+}
+
+impl SidebarTopicPanel {
+    fn label(self) -> &'static str {
+        match self {
+            SidebarTopicPanel::Diff => "Diff",
+            SidebarTopicPanel::Memory => "Memory",
+            SidebarTopicPanel::Skills => "Skills",
+        }
+    }
+}
 
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {
-        vec![
-            "Run", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill", "Gate",
-        ]
+        vec!["Run", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Gate"]
     } else {
         vec![
             "Run",
@@ -89,11 +104,8 @@ fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
             "Goals",
             "Approvals",
             "Todo",
-            "Diff",
             "Files",
             "Sessions",
-            "Memory",
-            "Skills",
             "Gateway",
         ]
     }
@@ -237,8 +249,11 @@ pub struct TuiState {
     pub activity_panel: ActivityPanel,
     pub activity_panel_visible: bool,
 
-    /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Diff, 6=Files, 7=Sessions, 8=Memory, 9=Skills, 10=Gateway).
+    /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Files, 6=Sessions, 7=Gateway).
     pub sidebar_active_tab: usize,
+
+    /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
+    pub(crate) active_topic_panel: Option<SidebarTopicPanel>,
 
     /// Status bar at the bottom showing model, tokens, and system info.
     pub status_bar: StatusBar,
@@ -388,6 +403,7 @@ impl TuiState {
             activity_panel,
             activity_panel_visible: false,
             sidebar_active_tab: 0,
+            active_topic_panel: None,
             accessibility,
             active_sessions: None,
             startup_phase: StartupPhase::Hidden,
@@ -514,48 +530,53 @@ impl TuiState {
         self.thinking_panel.tick();
 
         if self.layout_state.sidebar_visible {
-            match self.sidebar_active_tab {
-                0 => self.runtime_activity_panel.sync_from_app(&self.app),
-                1 => {
-                    let timeline = self.app.timeline_clone_vec();
-                    self.file_changes_panel.sync_from_timeline(&timeline);
-                }
-                2 => self.goal_workbench_panel.sync_from_app(&self.app),
-                3 => self.approval_cockpit_panel.sync_from_app(&self.app),
-                4 => {
-                    let timeline = self.app.timeline_clone_vec();
-                    self.todo_panel.sync_from_timeline(&timeline);
-                }
-                5 => self.diff_viewer.sync_from_app(&self.app),
-                6 => {
-                    if !self.app.file_entries.is_empty() {
-                        self.file_tree.rebuild(&self.app.file_entries);
-                    }
-                }
-                7 => {
-                    if !self.app.picker_sessions.is_empty() {
-                        self.session_sidebar.load(self.app.picker_sessions.clone());
-                    }
-                    self.session_sidebar
-                        .set_current_session(&self.app.session_id);
-                }
-                8 => {
-                    if self.memory_panel.memory_manager.is_some() {
-                        let should_sync = self
-                            .memory_panel_last_sync
-                            .map(|last| last.elapsed() >= Duration::from_millis(750))
-                            .unwrap_or(true);
-                        if should_sync {
-                            self.memory_panel.sync_from_cognitive();
-                            self.memory_panel_last_sync = Some(Instant::now());
+            if let Some(topic) = self.active_topic_panel {
+                match topic {
+                    SidebarTopicPanel::Diff => self.diff_viewer.sync_from_app(&self.app),
+                    SidebarTopicPanel::Memory => {
+                        if self.memory_panel.memory_manager.is_some() {
+                            let should_sync = self
+                                .memory_panel_last_sync
+                                .map(|last| last.elapsed() >= Duration::from_millis(750))
+                                .unwrap_or(true);
+                            if should_sync {
+                                self.memory_panel.sync_from_cognitive();
+                                self.memory_panel_last_sync = Some(Instant::now());
+                            }
+                        } else {
+                            self.memory_panel.sync_from_app(&self.app);
                         }
-                    } else {
-                        self.memory_panel.sync_from_app(&self.app);
                     }
+                    SidebarTopicPanel::Skills => self.skills_panel.sync_from_app(&self.app),
                 }
-                9 => self.skills_panel.sync_from_app(&self.app),
-                10 => self.gateway_panel.sync_from_app(&self.app),
-                _ => {}
+            } else {
+                match self.sidebar_active_tab {
+                    0 => self.runtime_activity_panel.sync_from_app(&self.app),
+                    1 => {
+                        let timeline = self.app.timeline_clone_vec();
+                        self.file_changes_panel.sync_from_timeline(&timeline);
+                    }
+                    2 => self.goal_workbench_panel.sync_from_app(&self.app),
+                    3 => self.approval_cockpit_panel.sync_from_app(&self.app),
+                    4 => {
+                        let timeline = self.app.timeline_clone_vec();
+                        self.todo_panel.sync_from_timeline(&timeline);
+                    }
+                    5 => {
+                        if !self.app.file_entries.is_empty() {
+                            self.file_tree.rebuild(&self.app.file_entries);
+                        }
+                    }
+                    6 => {
+                        if !self.app.picker_sessions.is_empty() {
+                            self.session_sidebar.load(self.app.picker_sessions.clone());
+                        }
+                        self.session_sidebar
+                            .set_current_session(&self.app.session_id);
+                    }
+                    7 => self.gateway_panel.sync_from_app(&self.app),
+                    _ => {}
+                }
             }
         }
 
@@ -645,6 +666,15 @@ impl TuiState {
             // Subtract status bar (1 line) + input area from chat viewport height
             // so scroll calculation doesn't think it has more visible lines than available
             chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
+            if self.layout_state.sidebar_visible
+                && self.active_topic_panel.is_some()
+                && content_area.width >= 100
+            {
+                let max_topic_w = content_area.width.saturating_sub(40);
+                let topic_w =
+                    ((content_area.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
+                chat_area.width = content_area.width.saturating_sub(topic_w).max(40);
+            }
             let activity_area = if show_activity_panel && chat_area.width >= 72 {
                 let desired = (chat_area.width / 3).clamp(30, 48);
                 let width = desired.min(chat_area.width.saturating_sub(40));
@@ -698,15 +728,34 @@ impl TuiState {
             if self.layout_state.sidebar_visible && sidebar_area.width > 0 {
                 // Render sidebar: tab bar + active panel
                 let tab_height = 1u16;
-                let tab_labels = sidebar_tab_labels(sidebar_area.width);
                 let tab_area = ratatui::layout::Rect::new(
                     sidebar_area.x,
                     sidebar_area.y,
                     sidebar_area.width,
                     tab_height,
                 );
-                let tabs = ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
-                main_ctx.frame_mut().render_widget(tabs, tab_area);
+                if let Some(topic) = self.active_topic_panel {
+                    let title = ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled(
+                            topic.label(),
+                            ratatui::style::Style::default()
+                                .fg(ratatui::style::Color::Cyan)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::styled(
+                            "  topic panel",
+                            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                        ),
+                    ]);
+                    main_ctx
+                        .frame_mut()
+                        .render_widget(ratatui::widgets::Paragraph::new(title), tab_area);
+                } else {
+                    let tab_labels = sidebar_tab_labels(sidebar_area.width);
+                    let tabs =
+                        ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
+                    main_ctx.frame_mut().render_widget(tabs, tab_area);
+                }
 
                 let panel_area = ratatui::layout::Rect::new(
                     sidebar_area.x,
@@ -714,7 +763,7 @@ impl TuiState {
                     sidebar_area.width,
                     sidebar_area.height.saturating_sub(tab_height),
                 );
-                if self.sidebar_active_tab == 5 {
+                if self.active_topic_panel == Some(SidebarTopicPanel::Diff) {
                     // Collect diff text only when the diff panel is visible.
                     let diffs: Vec<String> = self
                         .app
@@ -748,102 +797,107 @@ impl TuiState {
                         self.diff_viewer.load(&combined);
                     }
                 }
-                match self.sidebar_active_tab {
-                    0 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "runtime_activity_panel",
-                            AssertUnwindSafe(|| {
-                                self.runtime_activity_panel
-                                    .render(&mut main_ctx, panel_area);
-                            }),
-                        );
+                if let Some(topic) = self.active_topic_panel {
+                    match topic {
+                        SidebarTopicPanel::Diff => {
+                            let _guard = self.render_profiler.guard("diff_viewer");
+                            let _ = error_recovery::catch_render_panic(
+                                "diff_viewer",
+                                AssertUnwindSafe(|| {
+                                    self.diff_viewer.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        SidebarTopicPanel::Memory => {
+                            let _guard = self.render_profiler.guard("memory_panel");
+                            let _ = error_recovery::catch_render_panic(
+                                "memory_panel",
+                                AssertUnwindSafe(|| {
+                                    self.memory_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        SidebarTopicPanel::Skills => {
+                            let _ = error_recovery::catch_render_panic(
+                                "skills_panel",
+                                AssertUnwindSafe(|| {
+                                    self.skills_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
                     }
-                    1 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "file_changes_panel",
-                            AssertUnwindSafe(|| {
-                                self.file_changes_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
+                } else {
+                    match self.sidebar_active_tab {
+                        0 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "runtime_activity_panel",
+                                AssertUnwindSafe(|| {
+                                    self.runtime_activity_panel
+                                        .render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        1 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "file_changes_panel",
+                                AssertUnwindSafe(|| {
+                                    self.file_changes_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        2 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "goal_workbench_panel",
+                                AssertUnwindSafe(|| {
+                                    self.goal_workbench_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        3 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "approval_cockpit_panel",
+                                AssertUnwindSafe(|| {
+                                    self.approval_cockpit_panel
+                                        .render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        4 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "todo_panel",
+                                AssertUnwindSafe(|| {
+                                    self.todo_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        5 => {
+                            let _guard = self.render_profiler.guard("file_tree");
+                            let _ = error_recovery::catch_render_panic(
+                                "file_tree",
+                                AssertUnwindSafe(|| {
+                                    self.file_tree.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        6 => {
+                            let _guard = self.render_profiler.guard("session_sidebar");
+                            let _ = error_recovery::catch_render_panic(
+                                "session_sidebar",
+                                AssertUnwindSafe(|| {
+                                    self.session_sidebar.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        7 => {
+                            let _ = error_recovery::catch_render_panic(
+                                "gateway_panel",
+                                AssertUnwindSafe(|| {
+                                    self.gateway_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        _ => {}
                     }
-                    2 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "goal_workbench_panel",
-                            AssertUnwindSafe(|| {
-                                self.goal_workbench_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    3 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "approval_cockpit_panel",
-                            AssertUnwindSafe(|| {
-                                self.approval_cockpit_panel
-                                    .render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    4 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "todo_panel",
-                            AssertUnwindSafe(|| {
-                                self.todo_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    5 => {
-                        let _guard = self.render_profiler.guard("diff_viewer");
-                        let _ = error_recovery::catch_render_panic(
-                            "diff_viewer",
-                            AssertUnwindSafe(|| {
-                                self.diff_viewer.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    6 => {
-                        let _guard = self.render_profiler.guard("file_tree");
-                        let _ = error_recovery::catch_render_panic(
-                            "file_tree",
-                            AssertUnwindSafe(|| {
-                                self.file_tree.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    7 => {
-                        let _guard = self.render_profiler.guard("session_sidebar");
-                        let _ = error_recovery::catch_render_panic(
-                            "session_sidebar",
-                            AssertUnwindSafe(|| {
-                                self.session_sidebar.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    8 => {
-                        let _guard = self.render_profiler.guard("memory_panel");
-                        let _ = error_recovery::catch_render_panic(
-                            "memory_panel",
-                            AssertUnwindSafe(|| {
-                                self.memory_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    9 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "skills_panel",
-                            AssertUnwindSafe(|| {
-                                self.skills_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    10 => {
-                        let _ = error_recovery::catch_render_panic(
-                            "gateway_panel",
-                            AssertUnwindSafe(|| {
-                                self.gateway_panel.render(&mut main_ctx, panel_area);
-                            }),
-                        );
-                    }
-                    _ => {}
                 }
             }
         }
@@ -1213,10 +1267,12 @@ impl TuiState {
         if self.layout_state.sidebar_visible {
             match event.code {
                 KeyCode::Tab => {
+                    self.active_topic_panel = None;
                     self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                     return true;
                 }
                 KeyCode::BackTab => {
+                    self.active_topic_panel = None;
                     self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                         SIDEBAR_TAB_COUNT - 1
                     } else {
@@ -1448,10 +1504,12 @@ impl TuiState {
         // ── Sidebar tab switching ──
         // Tab / Shift+Tab: cycle through sidebar tabs.
         if self.layout_state.sidebar_visible && key.code == KeyCode::Tab {
+            self.active_topic_panel = None;
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
         }
         if self.layout_state.sidebar_visible && key.code == KeyCode::BackTab {
+            self.active_topic_panel = None;
             self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                 SIDEBAR_TAB_COUNT - 1
             } else {
@@ -1715,6 +1773,7 @@ impl TuiState {
 
     fn open_sidebar_tab(&mut self, tab: usize, label: &str) {
         self.activity_panel_visible = false;
+        self.active_topic_panel = None;
         if !self.layout_state.sidebar_visible {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
@@ -1723,6 +1782,20 @@ impl TuiState {
             ToastVariant::Info,
             Some("Panel".into()),
             format!("Opened {label}"),
+            1600,
+        );
+    }
+
+    fn open_topic_panel(&mut self, panel: SidebarTopicPanel) {
+        self.activity_panel_visible = false;
+        if !self.layout_state.sidebar_visible {
+            self.layout_state.toggle_sidebar(&mut self.layout_tree);
+        }
+        self.active_topic_panel = Some(panel);
+        self.toast_manager.push(
+            ToastVariant::Info,
+            Some("Panel".into()),
+            format!("Opened {}", panel.label()),
             1600,
         );
     }
@@ -1752,18 +1825,26 @@ impl TuiState {
             return true;
         }
 
+        let topic = match name {
+            "diff" => Some(SidebarTopicPanel::Diff),
+            "memory" => Some(SidebarTopicPanel::Memory),
+            "skills" | "skill" => Some(SidebarTopicPanel::Skills),
+            _ => None,
+        };
+        if let Some(topic) = topic {
+            self.open_topic_panel(topic);
+            return true;
+        }
+
         let Some((tab, label)) = (match name {
             "context" | "runtime" => Some((0, "Runtime")),
             "changes" => Some((1, "Changes")),
             "tasks" | "goals" => Some((2, "Goals")),
             "approvals" | "approve" => Some((3, "Approvals")),
             "todo" => Some((4, "Todo")),
-            "diff" => Some((5, "Diff")),
-            "files" => Some((6, "Files")),
-            "sessions" => Some((7, "Sessions")),
-            "memory" => Some((8, "Memory")),
-            "skills" | "skill" => Some((9, "Skills")),
-            "gateway" => Some((10, "Gateway")),
+            "files" => Some((5, "Files")),
+            "sessions" => Some((6, "Sessions")),
+            "gateway" => Some((7, "Gateway")),
             _ => None,
         }) else {
             return false;
@@ -2054,22 +2135,21 @@ impl TuiState {
                 }
             }
             Action::FocusDiff => {
-                if !self.layout_state.sidebar_visible {
-                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
-                }
-                self.sidebar_active_tab = 5;
+                self.open_topic_panel(SidebarTopicPanel::Diff);
             }
             Action::FocusFileTree => {
                 if !self.layout_state.sidebar_visible {
                     self.layout_state.toggle_sidebar(&mut self.layout_tree);
                 }
-                self.sidebar_active_tab = 6;
+                self.active_topic_panel = None;
+                self.sidebar_active_tab = 5;
             }
             Action::FocusSessions => {
                 if !self.layout_state.sidebar_visible {
                     self.layout_state.toggle_sidebar(&mut self.layout_tree);
                 }
-                self.sidebar_active_tab = 7;
+                self.active_topic_panel = None;
+                self.sidebar_active_tab = 6;
             }
             Action::Execute(ref cmd) => {
                 if self.try_open_sidebar_for_panel_command(cmd) {
@@ -3671,8 +3751,14 @@ providers:
         assert_eq!(full.len(), SIDEBAR_TAB_COUNT);
         assert_eq!(compact[0], "Run");
         assert_eq!(compact[3], "Appr");
+        assert_eq!(compact[5], "File");
+        assert!(!compact.contains(&"Mem"));
+        assert!(!compact.contains(&"Skill"));
         assert_eq!(full[0], "Run");
         assert_eq!(full[3], "Approvals");
+        assert_eq!(full[5], "Files");
+        assert!(!full.contains(&"Memory"));
+        assert!(!full.contains(&"Skills"));
     }
 
     #[test]
@@ -3701,17 +3787,19 @@ providers:
 
         state.dispatch_action(Action::FocusDiff);
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 5);
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Diff));
 
         state.layout_state.toggle_sidebar(&mut state.layout_tree);
         state.dispatch_action(Action::FocusFileTree);
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 6);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 5);
 
         state.layout_state.toggle_sidebar(&mut state.layout_tree);
         state.dispatch_action(Action::FocusSessions);
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 7);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 6);
     }
 
     #[test]
@@ -3723,7 +3811,8 @@ providers:
 
         assert!(matches!(result, ProcessedKey::Nothing));
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 6);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 5);
         assert_eq!(state.input_text(), "");
     }
 
@@ -3761,8 +3850,38 @@ providers:
         state.dispatch_action(Action::Execute("/memory".into()));
 
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 8);
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Memory));
         assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn topic_panel_commands_open_on_demand_and_tab_returns_to_core_tabs() {
+        let mut state = TuiState::new("m", "s");
+
+        state.dispatch_action(Action::Execute("/skills".into()));
+
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Skills));
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 1);
+    }
+
+    #[test]
+    fn render_topic_panel_uses_dedicated_title_instead_of_core_tabs() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/skills".into()));
+
+        let mut terminal = MockTerminal::new(140, 32);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(joined.contains("Skills"));
+        assert!(joined.contains("topic panel"));
+        assert!(!joined.contains("Memory"));
     }
 
     #[test]
@@ -3831,7 +3950,7 @@ providers:
     fn render_bridge_projects_runtime_command_center_to_gateway_tab() {
         let mut state = TuiState::new("m", "scenario-session");
         state.layout_state.toggle_sidebar(&mut state.layout_tree);
-        state.sidebar_active_tab = 10;
+        state.sidebar_active_tab = 7;
         state.app.server_running = true;
         state.app.server_uptime_secs = Some(61);
         state.app.active_api_sessions = 2;
