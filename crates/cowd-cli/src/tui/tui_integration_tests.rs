@@ -233,6 +233,33 @@ fn integration_slash_opens_command_palette_and_prepares_command() {
 }
 
 #[test]
+fn integration_mid_text_slash_completion_replaces_current_token() {
+    let mut state = TuiState::new("test-model", "test-session");
+
+    for c in "please run /statu now".chars() {
+        state.process_raw_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    for _ in 0..4 {
+        state.process_raw_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    }
+
+    state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(state.app.input.lines().join("\n"), "please run /status now");
+}
+
+#[test]
+fn integration_absolute_path_slash_does_not_open_command_palette() {
+    let mut state = TuiState::new("test-model", "test-session");
+
+    for c in "read /home/yi/project".chars() {
+        state.process_raw_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    assert!(!state.command_palette.is_open());
+}
+
+#[test]
 fn integration_dialog_focus_trap_multiple() {
     let mut state = TuiState::new("test-model", "test-session");
 

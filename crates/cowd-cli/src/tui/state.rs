@@ -96,6 +96,13 @@ fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     }
 }
 
+fn char_col_to_byte_offset(text: &str, col: usize) -> usize {
+    text.char_indices()
+        .nth(col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
 // ── TuiState ────────────────────────────────────────────────────
 
 /// Unified TUI application state.
@@ -1309,38 +1316,47 @@ impl TuiState {
         // Route these keys through the prompt component before sidebar cycling.
         // BUG 1 FIX: Sync prompt textarea from app.input on-demand (not every frame).
         // This eliminates the bidirectional sync race condition.
-        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-            // Sync prompt textarea from app.input, then refresh suggestions and handle Tab
-            let input_text = self.app.input.lines().join("\n");
-            self.prompt.set_text(&input_text);
-            self.prompt.refresh_suggestions();
-            let event = crossterm::event::Event::Key(key);
-            let result = self.prompt.handle_event(&event);
-            if result == crate::tui::components::EventResult::Consumed {
-                // Sync accepted suggestion back to app.input
-                let new_text = self.prompt.text();
-                let mut ta = tui_textarea::TextArea::default();
-                // Preserve the input block style
-                ta.set_block(
-                    ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
-                );
-                if !new_text.is_empty() {
-                    ta.insert_str(&new_text);
+        if self.prompt.suggestions_visible() {
+            match key.code {
+                KeyCode::Up => {
+                    self.prompt.select_prev_suggestion();
+                    return ProcessedKey::Nothing;
                 }
-                self.app.input = ta;
+                KeyCode::Down => {
+                    self.prompt.select_next_suggestion();
+                    return ProcessedKey::Nothing;
+                }
+                _ => {}
+            }
+        }
+        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            let input_text = self.input_text();
+            self.prompt.refresh_suggestions_from_text_at_cursor(
+                &input_text,
+                self.input_cursor_byte_offset(),
+            );
+            if self.prompt.suggestions_visible() {
+                if let Some(new_text) = self
+                    .prompt
+                    .apply_highlighted_suggestion_to_text(&input_text)
+                {
+                    self.replace_input_text(&new_text);
+                }
                 return ProcessedKey::Nothing;
             }
             // Fall through to sidebar tab cycling
         }
         if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
-            let input_text = self.app.input.lines().join("\n");
-            self.prompt.set_text(&input_text);
-            self.prompt.refresh_suggestions();
-            let event = crossterm::event::Event::Key(key);
-            let result = self.prompt.handle_event(&event);
-            if result == crate::tui::components::EventResult::Consumed {
+            if self.prompt.suggestions_visible() {
+                self.prompt.select_next_suggestion();
+                return ProcessedKey::Nothing;
+            }
+            let input_text = self.input_text();
+            self.prompt.refresh_suggestions_from_text_at_cursor(
+                &input_text,
+                self.input_cursor_byte_offset(),
+            );
+            if self.prompt.suggestions_visible() {
                 return ProcessedKey::Nothing;
             }
             // Fall through to sidebar tab cycling
@@ -1390,8 +1406,9 @@ impl TuiState {
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
-            let text = self.app.input.lines().join("\n");
-            self.prompt.refresh_suggestions_from_text(&text);
+            let text = self.input_text();
+            self.prompt
+                .refresh_suggestions_from_text_at_cursor(&text, self.input_cursor_byte_offset());
             return ProcessedKey::Nothing;
         }
 
@@ -1400,6 +1417,16 @@ impl TuiState {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 self.app.input.insert_newline();
                 return ProcessedKey::Nothing;
+            }
+            if self.prompt.suggestions_visible() {
+                let input_text = self.input_text();
+                if let Some(new_text) = self
+                    .prompt
+                    .apply_highlighted_suggestion_to_text(&input_text)
+                {
+                    self.replace_input_text(&new_text);
+                    return ProcessedKey::Nothing;
+                }
             }
             if self.app.input.is_empty() {
                 // Empty input + Enter → toggle expand on focused entry
@@ -1550,6 +1577,36 @@ impl TuiState {
         event.code == KeyCode::Char('/')
             && event.modifiers.is_empty()
             && self.app.input.lines().join("\n").trim().is_empty()
+    }
+
+    fn input_text(&self) -> String {
+        self.app.input.lines().join("\n")
+    }
+
+    fn input_cursor_byte_offset(&self) -> usize {
+        let (row, col) = self.app.input.cursor();
+        let mut offset = 0usize;
+        for (idx, line) in self.app.input.lines().iter().enumerate() {
+            if idx == row {
+                return offset + char_col_to_byte_offset(line, col);
+            }
+            offset += line.len() + 1;
+        }
+        self.input_text().len()
+    }
+
+    fn replace_input_text(&mut self, text: &str) {
+        let mut input = tui_textarea::TextArea::default();
+        input.set_block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+        );
+        input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+        if !text.is_empty() {
+            input.insert_str(text);
+        }
+        self.app.input = input;
     }
 
     fn open_command_palette(&mut self) {

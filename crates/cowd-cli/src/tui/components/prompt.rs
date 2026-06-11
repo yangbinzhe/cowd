@@ -314,6 +314,161 @@ fn resolve_file_search(cwd: &std::path::Path, pattern: &str) -> (std::path::Path
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Cursor-aware completion kernel
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTrigger {
+    SlashCommand,
+    Path,
+    Context,
+    History,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionRequest {
+    pub trigger: CompletionTrigger,
+    pub token: String,
+    pub replace_start: usize,
+    pub replace_end: usize,
+    source_text: String,
+}
+
+impl CompletionRequest {
+    pub fn from_text_at_cursor(text: &str, cursor: usize) -> Option<Self> {
+        let cursor = clamp_to_char_boundary(text, cursor.min(text.len()));
+        let (start, end) = token_bounds_at_cursor(text, cursor)?;
+        if start == end {
+            return None;
+        }
+
+        let token = text[start..end].to_string();
+        let trigger = classify_completion_token(&token)?;
+
+        Some(Self {
+            trigger,
+            token,
+            replace_start: start,
+            replace_end: end,
+            source_text: text.to_string(),
+        })
+    }
+
+    pub fn apply(&self, replacement: &str) -> String {
+        self.apply_to_text(&self.source_text, replacement)
+    }
+
+    pub fn apply_to_text(&self, text: &str, replacement: &str) -> String {
+        let replacement = match self.trigger {
+            CompletionTrigger::SlashCommand
+                if self.token.starts_with('/') && !replacement.starts_with('/') =>
+            {
+                format!("/{replacement}")
+            }
+            CompletionTrigger::Context
+                if self.token.starts_with('@') && !replacement.starts_with('@') =>
+            {
+                format!("@{replacement}")
+            }
+            _ => replacement.to_string(),
+        };
+
+        format!(
+            "{}{}{}",
+            &text[..self.replace_start],
+            replacement,
+            &text[self.replace_end..]
+        )
+    }
+}
+
+fn clamp_to_char_boundary(text: &str, mut cursor: usize) -> usize {
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn token_bounds_at_cursor(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut start = cursor;
+    while start > 0 {
+        let prev = prev_char_boundary_raw(text, start);
+        let ch = text[prev..start].chars().next()?;
+        if ch.is_whitespace() {
+            break;
+        }
+        start = prev;
+    }
+
+    let mut end = cursor;
+    while end < text.len() {
+        let next = next_char_boundary_raw(text, end);
+        let ch = text[end..next].chars().next()?;
+        if ch.is_whitespace() {
+            break;
+        }
+        end = next;
+    }
+
+    if bytes.get(start..end).is_some() {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn prev_char_boundary_raw(text: &str, byte_pos: usize) -> usize {
+    let mut pos = byte_pos.saturating_sub(1);
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+fn next_char_boundary_raw(text: &str, byte_pos: usize) -> usize {
+    let mut pos = byte_pos.saturating_add(1);
+    while pos < text.len() && !text.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos.min(text.len())
+}
+
+fn classify_completion_token(token: &str) -> Option<CompletionTrigger> {
+    if token.starts_with('@') {
+        return Some(CompletionTrigger::Context);
+    }
+
+    if looks_like_slash_command_token(token) {
+        return Some(CompletionTrigger::SlashCommand);
+    }
+
+    if looks_like_path_token(token) {
+        return Some(CompletionTrigger::Path);
+    }
+
+    Some(CompletionTrigger::History)
+}
+
+fn looks_like_slash_command_token(token: &str) -> bool {
+    token.starts_with('/')
+        && (token.len() == 1
+            || (token.len() > 1
+                && !token[1..].contains('/')
+                && token[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))))
+}
+
+fn looks_like_path_token(token: &str) -> bool {
+    token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || (token.starts_with('/') && token[1..].contains('/'))
+        || token.contains('/')
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Prompt — The enhanced input component
 // ═══════════════════════════════════════════════════════════════════
 
@@ -342,6 +497,8 @@ pub struct Prompt {
     current_prefix: String,
     /// Cached inline preview text (empty if no suggestion applicable).
     inline_preview: String,
+    /// Cursor-aware completion request for external input replacement.
+    current_request: Option<CompletionRequest>,
     /// Input history buffer for free-text autocomplete.
     input_history: Vec<String>,
     /// Whether Enter should submit via propagate.
@@ -374,6 +531,7 @@ impl Prompt {
             show_suggestions: false,
             current_prefix: String::new(),
             inline_preview: String::new(),
+            current_request: None,
             input_history: Vec::new(),
             submit_on_enter: true,
             block_title: " Input ".to_string(),
@@ -691,6 +849,7 @@ impl Prompt {
         self.show_suggestions = false;
         self.current_prefix.clear();
         self.inline_preview.clear();
+        self.current_request = None;
     }
 
     /// Cycle to the next suggestion.
@@ -770,6 +929,56 @@ impl Prompt {
         } else {
             String::new()
         };
+    }
+
+    /// Refresh autocomplete suggestions from external text at a cursor byte offset.
+    pub fn refresh_suggestions_from_text_at_cursor(&mut self, text: &str, cursor: usize) {
+        self.update_shell_mode();
+        let Some(request) = CompletionRequest::from_text_at_cursor(text, cursor) else {
+            self.clear_suggestions();
+            return;
+        };
+
+        self.current_prefix = request.token.clone();
+        self.suggestions = self.suggestions_for_request(&request);
+        self.highlighted = 0;
+        self.show_suggestions = !self.suggestions.is_empty();
+        self.current_request = Some(request);
+        self.update_inline_preview();
+    }
+
+    fn suggestions_for_request(&mut self, request: &CompletionRequest) -> Vec<Suggestion> {
+        match request.trigger {
+            CompletionTrigger::SlashCommand
+            | CompletionTrigger::Context
+            | CompletionTrigger::History => self.engine.suggest(&request.token),
+            CompletionTrigger::Path => self.engine.file_suggestions(&request.token),
+        }
+    }
+
+    /// Return whether autocomplete suggestions are visible.
+    pub fn suggestions_visible(&self) -> bool {
+        self.show_suggestions && !self.suggestions.is_empty()
+    }
+
+    /// Select the next visible suggestion.
+    pub fn select_next_suggestion(&mut self) {
+        self.next_suggestion();
+    }
+
+    /// Select the previous visible suggestion.
+    pub fn select_prev_suggestion(&mut self) {
+        self.prev_suggestion();
+    }
+
+    /// Apply the highlighted suggestion to external text using the cursor-aware replacement range.
+    pub fn apply_highlighted_suggestion_to_text(&mut self, text: &str) -> Option<String> {
+        let suggestion = self.highlighted_suggestion()?.clone();
+        let request = self.current_request.clone()?;
+        let next = request.apply_to_text(text, &suggestion.text);
+        self.engine.record_use(&suggestion);
+        self.clear_suggestions();
+        Some(next)
     }
 
     /// Extract the word being typed from a raw text string (uses end of text as cursor).
@@ -1280,6 +1489,37 @@ mod tests {
         let (dir, prefix) = resolve_file_search(cwd, "a/b/c/fi");
         assert_eq!(dir, std::path::Path::new("/project/a/b/c"));
         assert_eq!(prefix, "fi");
+    }
+
+    // ── CompletionKernel tests ────────────────────────────────────
+
+    #[test]
+    fn completion_kernel_detects_mid_text_slash_command() {
+        let text = "please run /statu now";
+        let cursor = text.find(" now").unwrap();
+        let request = CompletionRequest::from_text_at_cursor(text, cursor).unwrap();
+
+        assert_eq!(request.trigger, CompletionTrigger::SlashCommand);
+        assert_eq!(request.token, "/statu");
+        assert_eq!(&text[request.replace_start..request.replace_end], "/statu");
+    }
+
+    #[test]
+    fn completion_kernel_treats_absolute_slash_as_path_not_command() {
+        let text = "read /home/yi/project/mai";
+        let request = CompletionRequest::from_text_at_cursor(text, text.len()).unwrap();
+
+        assert_eq!(request.trigger, CompletionTrigger::Path);
+        assert_eq!(request.token, "/home/yi/project/mai");
+    }
+
+    #[test]
+    fn completion_kernel_replaces_only_current_token() {
+        let text = "please run /statu now";
+        let cursor = text.find(" now").unwrap();
+        let request = CompletionRequest::from_text_at_cursor(text, cursor).unwrap();
+
+        assert_eq!(request.apply("status"), "please run /status now");
     }
 
     // ── Prompt tab_accepts test ────────────────────────────────────
