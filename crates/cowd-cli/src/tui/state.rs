@@ -1993,7 +1993,15 @@ impl TuiState {
 
     fn try_open_sidebar_for_panel_command(&mut self, text: &str) -> bool {
         let command = text.trim();
-        if command.is_empty() || command.split_whitespace().count() != 1 {
+        if command.is_empty() {
+            return false;
+        }
+
+        if self.try_focus_command(command) {
+            return true;
+        }
+
+        if command.split_whitespace().count() != 1 {
             return false;
         }
 
@@ -2047,6 +2055,64 @@ impl TuiState {
         };
 
         self.open_sidebar_tab(tab, label);
+        true
+    }
+
+    fn try_focus_command(&mut self, command: &str) -> bool {
+        let Some(rest) = command.strip_prefix("/focus") else {
+            return false;
+        };
+        let target = rest.trim();
+        if target.is_empty() {
+            self.toast_manager.push(
+                ToastVariant::Info,
+                Some("Focus".into()),
+                "Use /focus chat|input|activity|runtime|files|sessions|gateway|diff|memory|skills"
+                    .into(),
+                2400,
+            );
+            return true;
+        }
+
+        match target {
+            "chat" => {
+                self.active_topic_panel = None;
+                self.activity_panel_visible = false;
+                self.set_focus_target(FocusTarget::Chat);
+            }
+            "input" => {
+                self.active_topic_panel = None;
+                self.activity_panel_visible = false;
+                self.set_focus_target(FocusTarget::Input);
+            }
+            "activity" | "recent" => {
+                if self.layout_state.sidebar_visible {
+                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                }
+                self.activity_panel_visible = true;
+                self.set_focus_target(FocusTarget::Activity);
+            }
+            "sidebar" => {
+                if !self.layout_state.sidebar_visible {
+                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                }
+                self.active_topic_panel = None;
+                self.activity_panel_visible = false;
+                self.set_focus_target(FocusTarget::Sidebar);
+            }
+            "runtime" | "status" => self.open_sidebar_tab(0, "Runtime"),
+            "changes" => self.open_sidebar_tab(1, "Changes"),
+            "tasks" | "goals" => self.open_sidebar_tab(2, "Goals"),
+            "approvals" | "approve" => self.open_sidebar_tab(3, "Approvals"),
+            "todo" => self.open_sidebar_tab(4, "Todo"),
+            "files" => self.open_sidebar_tab(5, "Files"),
+            "sessions" => self.open_sidebar_tab(6, "Sessions"),
+            "gateway" => self.open_sidebar_tab(7, "Gateway"),
+            "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
+            "memory" => self.open_topic_panel(SidebarTopicPanel::Memory),
+            "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
+            _ => return false,
+        }
         true
     }
 
@@ -4130,6 +4196,44 @@ providers:
         assert!(state.activity_panel_visible);
         assert!(!state.layout_state.sidebar_visible);
         assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn runtime_and_gateway_panel_commands_open_expected_tabs() {
+        let mut state = TuiState::new("m", "s");
+
+        state.dispatch_action(Action::Execute("/runtime".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 0);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+
+        state.dispatch_action(Action::Execute("/gateway".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 7);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn focus_command_switches_between_primary_surfaces() {
+        let mut state = TuiState::new("m", "s");
+
+        state.dispatch_action(Action::Execute("/focus activity".into()));
+        assert!(state.activity_panel_visible);
+        assert_eq!(state.focus_target, FocusTarget::Activity);
+
+        state.dispatch_action(Action::Execute("/focus input".into()));
+        assert!(!state.activity_panel_visible);
+        assert_eq!(state.focus_target, FocusTarget::Input);
+
+        state.dispatch_action(Action::Execute("/focus memory".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Memory));
+        assert_eq!(
+            state.focus_target,
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory)
+        );
     }
 
     #[test]

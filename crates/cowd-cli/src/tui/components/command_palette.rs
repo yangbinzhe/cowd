@@ -199,6 +199,51 @@ fn default_entries() -> Vec<CommandEntry> {
         Action::Execute("/setup".into()),
     ));
     entries.push(CommandEntry::new(
+        "Open Runtime Panel",
+        "Show runtime status, tasks, approvals, network, and connector health",
+        Action::Execute("/runtime".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Activity Panel",
+        "Show the recent execution stream beside the main conversation",
+        Action::Execute("/activity".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Files Panel",
+        "Browse workspace files in the sidebar",
+        Action::Execute("/files".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Sessions Panel",
+        "Browse and switch recent sessions",
+        Action::Execute("/sessions".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Gateway Panel",
+        "Inspect external connector and gateway state",
+        Action::Execute("/gateway".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Memory Panel",
+        "Inspect memory entries in the on-demand topic panel",
+        Action::Execute("/memory".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Open Diff Panel",
+        "Review current code changes in the on-demand topic panel",
+        Action::Execute("/diff".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Focus Input",
+        "Return keyboard focus to the prompt input",
+        Action::Execute("/focus input".into()),
+    ));
+    entries.push(CommandEntry::new(
+        "Focus Chat",
+        "Return keyboard focus to the main conversation",
+        Action::Execute("/focus chat".into()),
+    ));
+    entries.push(CommandEntry::new(
         "Cancel",
         "Cancel the current operation",
         Action::Cancel,
@@ -1098,6 +1143,29 @@ mod tests {
                     spec.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn default_entries_include_on_demand_panel_shortcuts() {
+        let p = setup_palette();
+        for (name, action) in [
+            ("Open Runtime Panel", Action::Execute("/runtime".into())),
+            ("Open Activity Panel", Action::Execute("/activity".into())),
+            ("Open Files Panel", Action::Execute("/files".into())),
+            ("Open Sessions Panel", Action::Execute("/sessions".into())),
+            ("Open Gateway Panel", Action::Execute("/gateway".into())),
+            ("Open Memory Panel", Action::Execute("/memory".into())),
+            ("Open Diff Panel", Action::Execute("/diff".into())),
+            ("Focus Input", Action::Execute("/focus input".into())),
+            ("Focus Chat", Action::Execute("/focus chat".into())),
+        ] {
+            assert!(
+                p.all_commands
+                    .iter()
+                    .any(|entry| entry.name == name && entry.action == action),
+                "palette missing {name}"
+            );
         }
     }
 
