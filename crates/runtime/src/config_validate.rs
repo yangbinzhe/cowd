@@ -254,11 +254,23 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
+        name: "pre_tool_use",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
         name: "PreToolUse",
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "post_tool_use",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
         name: "PostToolUse",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "post_tool_use_failure",
         expected: FieldType::StringArray,
     },
     FieldSpec {
@@ -301,6 +313,10 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "externalDirectories",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "external_directories",
         expected: FieldType::StringArray,
     },
     FieldSpec {
@@ -372,6 +388,10 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "allowedMounts",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "allowed_mounts",
         expected: FieldType::StringArray,
     },
     FieldSpec {

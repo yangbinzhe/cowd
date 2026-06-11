@@ -1707,7 +1707,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
         config.enabled_plugins = parse_bool_map(enabled_value, "merged settings.plugins.enabled")?;
     }
     config.external_directories =
-        optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
+        optional_string_array_dual(plugins, "external_directories", "merged settings.plugins")?
             .map(|v| {
                 v.into_iter()
                     .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
@@ -1785,13 +1785,17 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         )?,
         network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
         filesystem_mode,
-        allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
-            .map(|v| {
-                v.into_iter()
-                    .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        allowed_mounts: optional_string_array_dual(
+            sandbox,
+            "allowed_mounts",
+            "merged settings.sandbox",
+        )?
+        .map(|v| {
+            v.into_iter()
+                .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
+                .collect()
+        })
+        .unwrap_or_default(),
     })
 }
 

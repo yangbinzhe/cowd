@@ -601,6 +601,14 @@ fn run_gateway_action(
             Ok(())
         }
         GatewayAction::Run => {
+            if let Ok(Some(status)) = server::get_server_status() {
+                tracing::info!(pid = status.pid, address = %status.address, "gateway run: existing gateway is already running");
+                println!(
+                    "Gateway is already running (pid: {}, address: {})",
+                    status.pid, status.address
+                );
+                return Ok(());
+            }
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let loader = runtime::ConfigLoader::default_for(&cwd);
             let runtime_config = match loader.load() {
@@ -1159,7 +1167,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..], output_format);
+        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        return parse_resume_args(
+            &rest[1..],
+            output_format,
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort.clone(),
+            allow_broad_cwd,
+            yolo_mode,
+        );
     }
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
@@ -1729,7 +1748,18 @@ fn parse_dump_manifests_args(
     })
 }
 
-fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+#[allow(clippy::too_many_arguments)]
+fn parse_resume_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+    yolo_mode: bool,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -1764,6 +1794,19 @@ fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<
 
     if !current_command.is_empty() {
         commands.push(current_command);
+    }
+
+    if commands.is_empty() && output_format == CliOutputFormat::Text {
+        return Ok(CliAction::Repl {
+            model,
+            session_id: Some(session_path.display().to_string()),
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+            yolo_mode,
+        });
     }
 
     Ok(CliAction::ResumeSession {
@@ -3685,14 +3728,14 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         if let Err(err) =
             SHARED_RT.block_on(daemon_client.release_session_lease(&session_id, owner))
         {
-            tracing::warn!(error = %err, session_id = %session_id, owner, "failed to release daemon session lease");
+            tracing::debug!(error = %err, session_id = %session_id, owner, "best-effort daemon session lease release failed");
         }
     }
     if daemon_session_attached {
         if let Err(err) =
             SHARED_RT.block_on(daemon_client.detach_session(&session_id, &daemon_actor_id))
         {
-            tracing::warn!(error = %err, session_id = %session_id, actor = %daemon_actor_id, "failed to detach daemon session lifecycle");
+            tracing::debug!(error = %err, session_id = %session_id, actor = %daemon_actor_id, "best-effort daemon session lifecycle detach failed");
         }
     }
     cli.persist_session()?;
@@ -6750,10 +6793,24 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
         || reference.eq_ignore_ascii_case("recent")
     {
         let store = get_unified_store()?;
-        let records = list_workspace_session_records(store)?;
-        let record = records
-            .into_iter()
-            .next()
+        let workspace_records = list_workspace_session_records(store)?;
+        let record = workspace_records
+            .iter()
+            .find(|record| record.message_count > 0)
+            .cloned()
+            .or_else(|| workspace_records.into_iter().next())
+            .or_else(|| {
+                SHARED_RT
+                    .block_on(store.list_sessions())
+                    .ok()
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .find(|record| record.message_count > 0)
+                            .cloned()
+                            .or_else(|| records.into_iter().next())
+                    })
+            })
             .ok_or_else(|| -> Box<dyn std::error::Error> { "no managed sessions found".into() })?;
         return Ok(SessionHandle {
             id: record.session_id,
@@ -6908,11 +6965,14 @@ fn load_session_reference(
     if let Some(ref session_workspace) = session.workspace_root {
         let current_dir = std::env::current_dir()?;
         if *session_workspace != current_dir {
-            return Err(format!(
+            tracing::warn!(
+                session_workspace = %session_workspace.display(),
+                current_workspace = %current_dir.display(),
+                session_id = %session.session_id,
                 "session workspace mismatch: session was created in '{}' but current workspace is '{}'",
                 session_workspace.display(),
                 current_dir.display()
-            ).into());
+            );
         }
     }
 
@@ -8735,13 +8795,24 @@ fn run_prompt(
 }
 
 fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let install_dir = path
+    let raw_install_dir = path
         .map(PathBuf::from)
-        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("bin"));
-    std::fs::create_dir_all(&install_dir)?;
+        .unwrap_or_else(runtime::cowd_dirs::config_home_dir);
+    let install_dir = if raw_install_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        raw_install_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(raw_install_dir)
+    } else {
+        raw_install_dir
+    };
+    let bin_dir = install_dir.join("bin");
+    let webui_dir = install_dir.join("webui");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(&webui_dir)?;
 
     let current_exe = std::env::current_exe()?;
-    let target = install_dir.join("cowd");
+    let target = bin_dir.join("cowd");
     std::fs::copy(&current_exe, &target)?;
     #[cfg(unix)]
     {
@@ -8749,7 +8820,12 @@ fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::err
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
     }
 
+    let webui_source = resolve_install_webui_source(&current_exe)
+        .ok_or("cannot install WebUI assets: webui/index.html was not found")?;
+    copy_dir_recursive(&webui_source, &webui_dir)?;
+
     println!("Installed cowd to {}", target.display());
+    println!("Installed WebUI to {}", webui_dir.display());
 
     if systemd {
         let unit = format!(
@@ -8762,11 +8838,13 @@ ExecStart={} gateway run
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=warn
+Environment=COWD_WEBUI_DIR={}
 
 [Install]
 WantedBy=default.target
 "#,
-            target.display()
+            target.display(),
+            webui_dir.display()
         );
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
         let unit_path = PathBuf::from(&home_dir)
@@ -8783,6 +8861,52 @@ WantedBy=default.target
             "To enable: systemctl --user enable --now {}",
             unit_path.display()
         );
+    }
+    Ok(())
+}
+
+fn resolve_install_webui_source(current_exe: &Path) -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_webui = cwd.join("webui");
+        if gateway_static::has_webui_index(&cwd_webui) {
+            return Some(cwd_webui);
+        }
+    }
+    if let Some(exe_dir) = current_exe.parent() {
+        let installed_sibling = exe_dir.parent().map(|dir| dir.join("webui"));
+        if let Some(path) = installed_sibling {
+            if gateway_static::has_webui_index(&path) {
+                return Some(path);
+            }
+        }
+        let exe_webui = exe_dir.join("webui");
+        if gateway_static::has_webui_index(&exe_webui) {
+            return Some(exe_webui);
+        }
+    }
+    let manifest_webui = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("webui"));
+    if let Some(path) = manifest_webui {
+        if gateway_static::has_webui_index(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
     }
     Ok(())
 }
@@ -13225,10 +13349,15 @@ mod tests {
     fn parses_resume_flag_without_path_as_latest_session() {
         assert_eq!(
             parse_args(&["--resume".to_string()]).expect("args should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("latest"),
-                commands: vec![],
-                output_format: CliOutputFormat::Text,
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                session_id: Some("latest".to_string()),
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
         assert_eq!(

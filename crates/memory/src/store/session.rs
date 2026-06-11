@@ -168,12 +168,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
         END",
         r"CREATE INDEX IF NOT EXISTS idx_sessions_platform      ON sessions(platform)",
         r"CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity)",
-        r"CREATE INDEX IF NOT EXISTS idx_sessions_status_model_last_activity
-            ON sessions(status COLLATE NOCASE, model COLLATE NOCASE, last_activity DESC)",
-        r"CREATE INDEX IF NOT EXISTS idx_sessions_model_last_activity
-            ON sessions(model COLLATE NOCASE, last_activity DESC)",
-        r"CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)",
-        r"CREATE INDEX IF NOT EXISTS idx_sessions_message_count ON sessions(message_count)",
         r"CREATE TABLE IF NOT EXISTS messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id      TEXT NOT NULL,
@@ -190,32 +184,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
         )",
         r"CREATE INDEX IF NOT EXISTS idx_messages_session     ON messages(session_id)",
         r"CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence)",
-        r"CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-            session_id UNINDEXED,
-            role,
-            content_text,
-            tool_name,
-            content=messages,
-            content_rowid=id
-        )",
-        r"CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
-            VALUES (new.id, new.session_id, new.role,
-                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
-                    new.tool_name);
-        END",
-        r"CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
-            VALUES ('delete', old.rowid, old.session_id, old.role, NULL, old.tool_name);
-        END",
-        r"CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
-            VALUES ('delete', old.rowid, old.session_id, old.role, NULL, old.tool_name);
-            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
-            VALUES (new.rowid, new.session_id, new.role,
-                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
-                    new.tool_name);
-        END",
         r"CREATE TABLE IF NOT EXISTS session_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -247,6 +215,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     for stmt in statements {
         conn.execute_batch(stmt).map_err(sql_err)?;
     }
+
+    ensure_messages_schema(conn)?;
 
     let existing_session_columns = {
         let mut stmt = conn
@@ -332,6 +302,167 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .map_err(sql_err)?;
 
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<std::collections::BTreeSet<String>> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_err)?;
+    let mut columns = std::collections::BTreeSet::new();
+    for row in rows {
+        columns.insert(row.map_err(sql_err)?);
+    }
+    Ok(columns)
+}
+
+fn ensure_messages_schema(conn: &Connection) -> Result<()> {
+    let existing_message_columns = table_columns(conn, "messages")?;
+    if !existing_message_columns.contains("content_json") {
+        conn.execute(
+            r#"ALTER TABLE messages ADD COLUMN content_json TEXT NOT NULL DEFAULT '[{"type":"text","text":""}]'"#,
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_message_columns.contains("blocks_count") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN blocks_count INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_message_columns.contains("tool_use_id") {
+        conn.execute("ALTER TABLE messages ADD COLUMN tool_use_id TEXT", [])
+            .map_err(sql_err)?;
+    }
+    if !existing_message_columns.contains("tool_name") {
+        conn.execute("ALTER TABLE messages ADD COLUMN tool_name TEXT", [])
+            .map_err(sql_err)?;
+    }
+    if !existing_message_columns.contains("token_usage_json") {
+        conn.execute("ALTER TABLE messages ADD COLUMN token_usage_json TEXT", [])
+            .map_err(sql_err)?;
+    }
+
+    if table_columns(conn, "message_blocks").is_ok_and(|columns| columns.contains("block_type")) {
+        conn.execute_batch(
+            r#"
+            UPDATE messages
+               SET content_json = COALESCE(
+                       (
+                         SELECT json_group_array(json(block_json))
+                           FROM (
+                             SELECT json_object(
+                                      'type',
+                                      CASE
+                                        WHEN block_type = 'tool_use' THEN 'tool_use'
+                                        WHEN block_type = 'tool_result' THEN 'tool_result'
+                                        WHEN block_type = 'thinking' THEN 'thinking'
+                                        ELSE 'text'
+                                      END,
+                                      'text', COALESCE(text, tool_output, ''),
+                                      'id', COALESCE(tool_id, ''),
+                                      'name', COALESCE(tool_name, ''),
+                                      'input', COALESCE(tool_input, ''),
+                                      'content', COALESCE(tool_output, ''),
+                                      'is_error', CASE WHEN is_error = 0 THEN json('false') ELSE json('true') END
+                                    ) AS block_json
+                               FROM message_blocks
+                              WHERE message_blocks.message_id = messages.id
+                              ORDER BY block_order ASC
+                           )
+                       ),
+                       content_json
+                   ),
+                   blocks_count = COALESCE(
+                       (
+                         SELECT COUNT(*)
+                           FROM message_blocks
+                          WHERE message_blocks.message_id = messages.id
+                       ),
+                       blocks_count
+                   ),
+                   tool_use_id = COALESCE(
+                       (
+                         SELECT tool_id
+                           FROM message_blocks
+                          WHERE message_blocks.message_id = messages.id
+                            AND tool_id IS NOT NULL
+                          ORDER BY block_order ASC
+                          LIMIT 1
+                       ),
+                       tool_use_id
+                   ),
+                   tool_name = COALESCE(
+                       (
+                         SELECT tool_name
+                           FROM message_blocks
+                          WHERE message_blocks.message_id = messages.id
+                            AND tool_name IS NOT NULL
+                          ORDER BY block_order ASC
+                          LIMIT 1
+                       ),
+                       tool_name
+                   )
+             WHERE EXISTS (
+                       SELECT 1
+                         FROM message_blocks
+                        WHERE message_blocks.message_id = messages.id
+                   );
+            "#,
+        )
+        .map_err(sql_err)?;
+    }
+
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS messages_fts_ai;
+        DROP TRIGGER IF EXISTS messages_fts_ad;
+        DROP TRIGGER IF EXISTS messages_fts_au;
+        DROP TABLE IF EXISTS messages_fts;
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            session_id UNINDEXED,
+            role,
+            content_text,
+            tool_name,
+            content=messages,
+            content_rowid=id
+        );
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+            VALUES (new.id, new.session_id, new.role,
+                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
+                    new.tool_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
+            VALUES ('delete', old.id, old.session_id, old.role, NULL, old.tool_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
+            VALUES ('delete', old.id, old.session_id, old.role, NULL, old.tool_name);
+            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+            VALUES (new.id, new.session_id, new.role,
+                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
+                    new.tool_name);
+        END;
+        INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+        SELECT id,
+               session_id,
+               role,
+               (SELECT group_concat(json_extract(value,'$.text'),' ')
+                  FROM json_each(messages.content_json)
+                 WHERE json_extract(value,'$.type')='text'),
+               tool_name
+          FROM messages;
+        "#,
+    )
+    .map_err(sql_err)?;
+
     Ok(())
 }
 
@@ -2277,6 +2408,85 @@ mod tests {
             .pragma_query_value(None, "busy_timeout", |row| row.get(0))
             .unwrap();
         assert!(timeout > 0, "busy_timeout should be > 0, got {}", timeout);
+    }
+
+    #[test]
+    fn open_migrates_legacy_message_block_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy-sessions.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    platform TEXT DEFAULT '',
+                    chat_id TEXT DEFAULT '',
+                    user_id TEXT DEFAULT '',
+                    model TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    last_activity TEXT NOT NULL DEFAULT '',
+                    message_count INTEGER DEFAULT 0,
+                    reset_policy TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT DEFAULT '{}',
+                    created_at_ms INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    usage_input INTEGER DEFAULT 0,
+                    usage_output INTEGER DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, sequence)
+                );
+                CREATE TABLE message_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    block_order INTEGER NOT NULL,
+                    block_type TEXT NOT NULL,
+                    text TEXT,
+                    signature TEXT,
+                    tool_id TEXT,
+                    tool_name TEXT,
+                    tool_input TEXT,
+                    tool_output TEXT,
+                    is_error INTEGER DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO sessions(session_id, message_count) VALUES ('legacy', 1);
+                INSERT INTO messages(session_id, sequence, role, created_at_ms)
+                    VALUES ('legacy', 0, 'user', 1);
+                INSERT INTO message_blocks(message_id, session_id, block_order, block_type, text, created_at_ms)
+                    VALUES (1, 'legacy', 0, 'text', 'resume survives migration', 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteSessionStore::open(&db).unwrap();
+        let messages = store.get_all_messages("legacy").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .content_json
+            .contains("resume survives migration"));
+        store
+            .insert_message(&SessionMessage {
+                session_id: "legacy".to_string(),
+                sequence: 1,
+                role: "assistant".to_string(),
+                content_json: r#"[{"type":"text","text":"new write works"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(store.get_message_count("legacy").unwrap(), 2);
     }
 
     #[test]

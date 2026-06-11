@@ -47,6 +47,13 @@ pub(crate) fn resolve_static_webui_source() -> StaticWebUiSource {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
+            if let Some(install_dir) = exe_dir.parent() {
+                let source =
+                    StaticWebUiSource::new("installed:exe-dir/../webui", install_dir.join("webui"));
+                if source.available {
+                    return source;
+                }
+            }
             let source = StaticWebUiSource::new("installed:exe-dir/webui", exe_dir.join("webui"));
             if source.available {
                 return source;
