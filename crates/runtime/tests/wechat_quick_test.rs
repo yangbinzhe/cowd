@@ -72,7 +72,11 @@ async fn test_wechat_ilink_qr_token_live() {
             println!("✅ get_updates() succeeded with {} messages", msgs.len());
             if !msgs.is_empty() {
                 for (i, msg) in msgs.iter().enumerate() {
-                    println!("   msg[{}]: {}", i, serde_json::to_string_pretty(msg).unwrap_or_default());
+                    println!(
+                        "   msg[{}]: {}",
+                        i,
+                        serde_json::to_string_pretty(msg).unwrap_or_default()
+                    );
                 }
             } else {
                 println!("   (no pending messages — expected)");

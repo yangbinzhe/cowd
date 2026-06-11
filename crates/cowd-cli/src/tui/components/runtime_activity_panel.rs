@@ -244,7 +244,11 @@ impl RuntimeActivityPanel {
         };
         self.control_plane_reason = format!(
             "session {} context {} agent {} graph-agents {} provider {} yolo {}",
-            if self.session_id.trim().is_empty() { "missing" } else { "active" },
+            if self.session_id.trim().is_empty() {
+                "missing"
+            } else {
+                "active"
+            },
             if has_context { "ready" } else { "pending" },
             self.runtime_policy_agent,
             self.workgraph_agent_tasks,
@@ -255,11 +259,7 @@ impl RuntimeActivityPanel {
         // ── Recent activities — all entries, newest first ─────────
         self.recent_entries = app.timeline_clone_vec();
         self.recent_entries.reverse();
-        self.recent_labels = self
-            .recent_entries
-            .iter()
-            .map(activity_label)
-            .collect();
+        self.recent_labels = self.recent_entries.iter().map(activity_label).collect();
 
         // ── Turn activity snapshot ──
         self.turn_activity = TurnActivity::default();
@@ -287,10 +287,18 @@ impl RuntimeActivityPanel {
         if !self.recent_entries.is_empty() {
             self.turn_activity.last_phase = match &self.recent_entries[0] {
                 TimelineEntry::Thinking { complete, .. } => {
-                    if *complete { "thinking done".into() } else { "thinking".into() }
+                    if *complete {
+                        "thinking done".into()
+                    } else {
+                        "thinking".into()
+                    }
                 }
                 TimelineEntry::ToolCall { name, done, .. } => {
-                    if *done { format!("tool {} done", name) } else { format!("tool {} running", name) }
+                    if *done {
+                        format!("tool {} done", name)
+                    } else {
+                        format!("tool {} running", name)
+                    }
                 }
                 TimelineEntry::Message { role, .. } => {
                     format!("{} responded", role)
@@ -307,7 +315,10 @@ impl RuntimeActivityPanel {
         // Rough: header rows + empty lines take ~3 rows; the rest for Recent.
         let ctx_rows = 10usize; // turn activity + token bar + context header
         let title_rows = 3usize; // "Recent" header + separator
-        let available = area.height.saturating_sub(ctx_rows as u16).saturating_sub(title_rows as u16) as usize;
+        let available = area
+            .height
+            .saturating_sub(ctx_rows as u16)
+            .saturating_sub(title_rows as u16) as usize;
         available.max(1)
     }
 }
@@ -334,16 +345,25 @@ impl Component for RuntimeActivityPanel {
         // ── Turn activity status (what's happening now) ──
         if self.turn_activity.active {
             let mut status_parts: Vec<Span> = Vec::new();
-            status_parts.push(Span::styled("● ", Style::default().fg(Color::Yellow).bold()));
+            status_parts.push(Span::styled(
+                "● ",
+                Style::default().fg(Color::Yellow).bold(),
+            ));
             if self.turn_activity.thinking {
-                status_parts.push(Span::styled("Thinking ", Style::default().fg(Color::Cyan).bold()));
+                status_parts.push(Span::styled(
+                    "Thinking ",
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
             }
             if self.turn_activity.tool_count > 0 {
                 status_parts.push(Span::styled(
                     format!("Tools:{} ", self.turn_activity.tool_count),
                     Style::default().fg(Color::Yellow),
                 ));
-                let names: String = self.turn_activity.tool_names.iter()
+                let names: String = self
+                    .turn_activity
+                    .tool_names
+                    .iter()
                     .take(3)
                     .cloned()
                     .collect::<Vec<_>>()
@@ -365,12 +385,14 @@ impl Component for RuntimeActivityPanel {
 
         // Token bar
         lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
-                bar,
-                Style::default().fg(bar_color),
-            ),
-            Span::styled(
-                format!(" {:.0}% {} / {}", pct, fmt_tokens(self.token_count), fmt_tokens(self.context_window)),
+                format!(
+                    " {:.0}% {} / {}",
+                    pct,
+                    fmt_tokens(self.token_count),
+                    fmt_tokens(self.context_window)
+                ),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -398,24 +420,30 @@ impl Component for RuntimeActivityPanel {
             ),
             Span::styled(
                 format!("  {} {}%", self.profile, self.pressure_pct),
-                Style::default().fg(if self.pressure_pct > 85 { Color::Red } else if self.pressure_pct > 70 { Color::Yellow } else { Color::White }),
+                Style::default().fg(if self.pressure_pct > 85 {
+                    Color::Red
+                } else if self.pressure_pct > 70 {
+                    Color::Yellow
+                } else {
+                    Color::White
+                }),
             ),
         ]));
         if !self.policy_action.is_empty() && self.policy_action != "None" {
             lines.push(Line::from(vec![
                 Span::styled("Policy:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    preview(&format!("{} - {}", self.policy_action, self.policy_reason), 60),
+                    preview(
+                        &format!("{} - {}", self.policy_action, self.policy_reason),
+                        60,
+                    ),
                     Style::default().fg(Color::White),
                 ),
             ]));
         }
         lines.push(Line::from(vec![
             Span::styled("Model:", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                preview(&self.model, 32),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(preview(&self.model, 32), Style::default().fg(Color::White)),
             Span::styled(
                 format!("  sel:{} omi:{}", self.selected_count, self.omitted_count),
                 Style::default().fg(Color::DarkGray),
@@ -427,13 +455,23 @@ impl Component for RuntimeActivityPanel {
                 Span::styled(
                     format!(
                         "{} {} agents {}",
-                        self.workgraph_status, self.workgraph_completion_pct, self.workgraph_agent_tasks
+                        self.workgraph_status,
+                        self.workgraph_completion_pct,
+                        self.workgraph_agent_tasks
                     ),
-                    Style::default().fg(if self.workgraph_status == "completed" { Color::Green } else { Color::Cyan }),
+                    Style::default().fg(if self.workgraph_status == "completed" {
+                        Color::Green
+                    } else {
+                        Color::Cyan
+                    }),
                 ),
                 Span::styled(
                     format!("  conflicts {}", self.workgraph_conflicts),
-                    Style::default().fg(if self.workgraph_conflicts > 0 { Color::Yellow } else { Color::DarkGray }),
+                    Style::default().fg(if self.workgraph_conflicts > 0 {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
             ]));
         }
@@ -441,7 +479,11 @@ impl Component for RuntimeActivityPanel {
             Span::styled("Agent:", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}", self.runtime_policy_agent),
-                Style::default().fg(if self.runtime_policy_agent == "Off" { Color::DarkGray } else { Color::Cyan }),
+                Style::default().fg(if self.runtime_policy_agent == "Off" {
+                    Color::DarkGray
+                } else {
+                    Color::Cyan
+                }),
             ),
             Span::styled(
                 format!(
@@ -484,11 +526,18 @@ impl Component for RuntimeActivityPanel {
             let start = self.activity_scroll.offset;
             let end = (start + visible_rows).min(self.recent_labels.len());
 
-            for (i, label) in self.recent_labels.iter().enumerate().skip(start).take(end - start) {
+            for (i, label) in self
+                .recent_labels
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(end - start)
+            {
                 // Show scroll indicator if not at top
                 let prefix = if start > 0 && i == start {
                     "↑"
-                } else if end < self.recent_labels.len() && i == end - 1
+                } else if end < self.recent_labels.len()
+                    && i == end - 1
                     && self.recent_labels.len() > visible_rows
                 {
                     "↓"
@@ -501,11 +550,20 @@ impl Component for RuntimeActivityPanel {
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                    Span::styled(cursor_mark, Style::default().fg(if is_cursor { Color::Cyan } else { Color::DarkGray })),
+                    Span::styled(
+                        cursor_mark,
+                        Style::default().fg(if is_cursor {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
                     Span::styled(
                         label.clone(),
                         if is_cursor {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
                         },
@@ -587,14 +645,18 @@ impl Component for RuntimeActivityPanel {
                         EventResult::Consumed
                     }
                     crossterm::event::KeyCode::Char('d')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
                         self.focus = Focus::Recent;
                         self.activity_scroll.scroll_page_down(visible_rows);
                         EventResult::Consumed
                     }
                     crossterm::event::KeyCode::Char('u')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
                         self.focus = Focus::Recent;
                         self.activity_scroll.scroll_page_up(visible_rows);
@@ -700,7 +762,13 @@ fn activity_label(entry: &TimelineEntry) -> String {
             } else {
                 format!(" → {}", preview(output, 40))
             };
-            format!("tool {} {}: {}{}", name, status, preview(tool_preview, 48), out_hint)
+            format!(
+                "tool {} {}: {}{}",
+                name,
+                status,
+                preview(tool_preview, 48),
+                out_hint
+            )
         }
         TimelineEntry::SlashOutput {
             command, output, ..

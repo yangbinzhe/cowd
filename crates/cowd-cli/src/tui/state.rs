@@ -77,8 +77,7 @@ pub(crate) const SIDEBAR_TAB_COUNT: usize = 11;
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {
         vec![
-            "Run", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill",
-            "Gate",
+            "Run", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill", "Gate",
         ]
     } else {
         vec![
@@ -841,7 +840,11 @@ impl TuiState {
             let thinking_w = (area.width / 3).max(30).min(50);
             let thinking_h = (chat_area.height / 3).max(6).min(14);
             let thinking_x = chat_area.x + chat_area.width.saturating_sub(thinking_w);
-            let thinking_y = if self.app.search_active { 1 } else { chat_area.y };
+            let thinking_y = if self.app.search_active {
+                1
+            } else {
+                chat_area.y
+            };
             let thinking_area =
                 ratatui::layout::Rect::new(thinking_x, thinking_y, thinking_w, thinking_h);
 
@@ -1128,12 +1131,21 @@ impl TuiState {
 
         // 1.8. 'v' toggle compact chat view
         if let KeyCode::Char('v') = event.code {
-            if !event.modifiers.contains(KeyModifiers::CONTROL) && !event.modifiers.contains(KeyModifiers::ALT) {
+            if !event.modifiers.contains(KeyModifiers::CONTROL)
+                && !event.modifiers.contains(KeyModifiers::ALT)
+            {
                 self.app.compact_chat = !self.app.compact_chat;
                 self.toast_manager.push(
                     ToastVariant::Info,
                     None,
-                    format!("Chat view: {}", if self.app.compact_chat { "compact (summary)" } else { "verbose (full timeline)" }),
+                    format!(
+                        "Chat view: {}",
+                        if self.app.compact_chat {
+                            "compact (summary)"
+                        } else {
+                            "verbose (full timeline)"
+                        }
+                    ),
                     1500,
                 );
                 return true;

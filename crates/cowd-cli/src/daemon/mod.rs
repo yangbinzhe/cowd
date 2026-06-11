@@ -557,7 +557,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
             "wechat_ilink" | "wechat" => {
                 tracing::info!(
                     "wechat_ilink: creating adapter from settings keys=[{}]",
-                    settings_json.as_object()
+                    settings_json
+                        .as_object()
                         .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
                         .unwrap_or_default()
                 );

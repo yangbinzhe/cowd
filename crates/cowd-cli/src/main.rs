@@ -8789,10 +8789,7 @@ WantedBy=default.target
 
 fn gateway_auth_token_from_platform(platform: &runtime::GatewayPlatformConfig) -> Option<String> {
     // Prefer flat auth_token key (legacy format).
-    let flat = platform
-        .extra
-        .get("auth_token")
-        .and_then(|v| v.as_str());
+    let flat = platform.extra.get("auth_token").and_then(|v| v.as_str());
 
     // Fallback: nested auth.token (current config format).
     let nested = platform

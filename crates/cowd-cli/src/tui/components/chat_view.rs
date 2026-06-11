@@ -520,7 +520,9 @@ impl ChatView {
                         tool_count += 1;
                     }
                 }
-                TimelineEntry::Thinking { content, complete, .. } => {
+                TimelineEntry::Thinking {
+                    content, complete, ..
+                } => {
                     if !complete {
                         thinking_active = true;
                         thinking_preview = content.chars().take(120).collect();
@@ -552,7 +554,13 @@ impl ChatView {
             let label = if is_focused { "● Answer" } else { "  Answer" };
             lines.push(Line::from(Span::styled(
                 format!("{}  ─────────────────────────────────────", label),
-                Style::default().fg(if is_focused { Color::Cyan } else { Color::Green }).bold(),
+                Style::default()
+                    .fg(if is_focused {
+                        Color::Cyan
+                    } else {
+                        Color::Green
+                    })
+                    .bold(),
             )));
             let md_lines = md_renderer::render_markdown_lines(content, Color::White);
             let max_lines = 800usize;
@@ -562,10 +570,7 @@ impl ChatView {
             let total = content.lines().count();
             if total > max_lines {
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ... ({} more lines)",
-                        total.saturating_sub(max_lines)
-                    ),
+                    format!("  ... ({} more lines)", total.saturating_sub(max_lines)),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -586,17 +591,18 @@ impl ChatView {
         }
         stats_parts.push(format!(
             "Tokens: {}/{}",
-            if self.timeline.iter().any(|e| matches!(e, TimelineEntry::Message { role, .. } if role == "assistant")) {
+            if self
+                .timeline
+                .iter()
+                .any(|e| matches!(e, TimelineEntry::Message { role, .. } if role == "assistant"))
+            {
                 "—"
             } else {
                 "—"
             },
             "—"
         ));
-        stats_parts.push(format!(
-            "Turn: {:.1}s",
-            0.0
-        ));
+        stats_parts.push(format!("Turn: {:.1}s", 0.0));
         lines.push(Line::from(Span::styled(
             format!("  {}", stats_parts.join(" · ")),
             Style::default().fg(Color::Yellow),
@@ -917,14 +923,12 @@ impl ChatView {
                 // Always collapsed in main view – details in Run panel
                 let preview: String = content.chars().take(80).collect();
                 let more = if content.len() > 80 { "..." } else { "" };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"
-                        ),
-                        Style::default().fg(Color::DarkGray),
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"
                     ),
-                ]));
+                    Style::default().fg(Color::DarkGray),
+                )]));
             }
 
             TimelineEntry::ToolCall {
@@ -1220,10 +1224,7 @@ mod tests {
             joined.contains("Thinking [complete]"),
             "Expected thinking status indicator"
         );
-        assert!(
-            joined.contains("💭"),
-            "Expected thinking icon in output"
-        );
+        assert!(joined.contains("💭"), "Expected thinking icon in output");
     }
 
     #[test]
@@ -1274,10 +1275,7 @@ mod tests {
             joined.contains("exit:0"),
             "Expected 'exit:0' for success status"
         );
-        assert!(
-            joined.contains("🔧"),
-            "Expected tool icon"
-        );
+        assert!(joined.contains("🔧"), "Expected tool icon");
     }
 
     #[test]
