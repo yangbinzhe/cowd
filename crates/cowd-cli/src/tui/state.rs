@@ -25,6 +25,7 @@ use ratatui::Frame;
 use crate::tui::accessibility::AccessibilityMode;
 use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
+use crate::tui::components::activity_panel::ActivityPanel;
 use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::approval_cockpit_panel::ApprovalCockpitPanel;
@@ -232,6 +233,10 @@ pub struct TuiState {
     /// Top system status strip for runtime/network/service health.
     pub system_status_bar: SystemStatusBar,
 
+    /// Main-screen activity stream for thinking/tool/runtime process events.
+    pub activity_panel: ActivityPanel,
+    pub activity_panel_visible: bool,
+
     /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Diff, 6=Files, 7=Sessions, 8=Memory, 9=Skills, 10=Gateway).
     pub sidebar_active_tab: usize,
 
@@ -335,6 +340,7 @@ impl TuiState {
         let gateway_panel = GatewayPanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let system_status_bar = SystemStatusBar::new();
+        let activity_panel = ActivityPanel::new();
 
         Self {
             app,
@@ -379,6 +385,8 @@ impl TuiState {
             gateway_panel,
             runtime_activity_panel,
             system_status_bar,
+            activity_panel,
+            activity_panel_visible: false,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -574,6 +582,11 @@ impl TuiState {
         self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
         self.status_bar.tick();
+        let show_activity_panel = (self.app.turn_active || self.activity_panel_visible)
+            && !self.layout_state.sidebar_visible;
+        if show_activity_panel {
+            self.activity_panel.sync_from_app(&self.app);
+        }
 
         // BUG 2 FIX: Dynamic input height based on line count.
         let input_lines = self.app.input.lines().len().max(1) as u16;
@@ -632,6 +645,23 @@ impl TuiState {
             // Subtract status bar (1 line) + input area from chat viewport height
             // so scroll calculation doesn't think it has more visible lines than available
             chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
+            let activity_area = if show_activity_panel && chat_area.width >= 72 {
+                let desired = (chat_area.width / 3).clamp(30, 48);
+                let width = desired.min(chat_area.width.saturating_sub(40));
+                if width >= 24 {
+                    chat_area.width = chat_area.width.saturating_sub(width);
+                    Some(ratatui::layout::Rect::new(
+                        chat_area.x.saturating_add(chat_area.width),
+                        chat_area.y,
+                        width,
+                        chat_area.height,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let sidebar_w = area.width.saturating_sub(chat_area.width);
             let sidebar_area =
                 ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
@@ -655,6 +685,15 @@ impl TuiState {
                 self.chat_view.render(&mut main_ctx, chat_area);
             }
             self.chat_view.sync_to_app(&mut self.app);
+
+            if let Some(activity_area) = activity_area {
+                let _ = error_recovery::catch_render_panic(
+                    "activity_panel",
+                    AssertUnwindSafe(|| {
+                        self.activity_panel.render(&mut main_ctx, activity_area);
+                    }),
+                );
+            }
 
             if self.layout_state.sidebar_visible && sidebar_area.width > 0 {
                 // Render sidebar: tab bar + active panel
@@ -1420,6 +1459,21 @@ impl TuiState {
             };
             return ProcessedKey::Nothing;
         }
+        if self.activity_panel_visible
+            && !self.layout_state.sidebar_visible
+            && self.app.input.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('u') | KeyCode::Char('d')
+            )
+        {
+            let event = crossterm::event::Event::Key(key);
+            if self.activity_panel.handle_event(&event)
+                == crate::tui::components::EventResult::Consumed
+            {
+                return ProcessedKey::Nothing;
+            }
+        }
 
         // ── Modal overrides (pick up where old input.rs left off) ──
         // 1. Picker active → route to dialog (already handled by dialog_manager in handle_input)
@@ -1660,6 +1714,7 @@ impl TuiState {
     }
 
     fn open_sidebar_tab(&mut self, tab: usize, label: &str) {
+        self.activity_panel_visible = false;
         if !self.layout_state.sidebar_visible {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
@@ -1681,6 +1736,21 @@ impl TuiState {
         let Some(name) = command.strip_prefix('/') else {
             return false;
         };
+
+        if matches!(name, "activity" | "recent") {
+            if self.layout_state.sidebar_visible {
+                self.layout_state.toggle_sidebar(&mut self.layout_tree);
+            }
+            self.activity_panel_visible = !self.activity_panel_visible;
+            let label = if self.activity_panel_visible {
+                "Activity opened"
+            } else {
+                "Activity hidden"
+            };
+            self.toast_manager
+                .push(ToastVariant::Info, Some("Panel".into()), label.into(), 1600);
+            return true;
+        }
 
         let Some((tab, label)) = (match name {
             "context" | "runtime" => Some((0, "Runtime")),
@@ -3658,6 +3728,33 @@ providers:
     }
 
     #[test]
+    fn slash_activity_command_toggles_activity_panel_without_submitting() {
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("/activity");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert!(!state.layout_state.sidebar_visible);
+        assert!(state.activity_panel_visible);
+        assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn slash_activity_command_closes_sidebar_for_focused_first_screen() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/files".into()));
+        assert!(state.layout_state.sidebar_visible);
+
+        state.replace_input_text("/recent");
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert!(!state.layout_state.sidebar_visible);
+        assert!(state.activity_panel_visible);
+    }
+
+    #[test]
     fn command_palette_panel_execute_opens_sidebar_directly() {
         let mut state = TuiState::new("m", "s");
 
@@ -3666,6 +3763,41 @@ providers:
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.sidebar_active_tab, 8);
         assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn command_palette_activity_execute_toggles_activity_panel_directly() {
+        let mut state = TuiState::new("m", "s");
+
+        state.dispatch_action(Action::Execute("/activity".into()));
+
+        assert!(state.activity_panel_visible);
+        assert!(!state.layout_state.sidebar_visible);
+        assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn render_activity_panel_as_main_screen_side_rail() {
+        let mut state = TuiState::new("m", "s");
+        state.activity_panel_visible = true;
+        state.app.add_message("assistant", "inspect build runtime");
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(
+            joined.contains("Activity"),
+            "missing activity title: {joined}"
+        );
+        assert!(
+            joined.contains("inspect build runtime"),
+            "missing activity event: {joined}"
+        );
+        assert!(
+            !state.layout_state.sidebar_visible,
+            "activity rail should not open the heavy sidebar"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 // Component trait, render context, event result, and component ID types.
 // This is Wave 1, Task 1 — the foundation for all TUI components.
 
+pub mod activity_panel;
 pub mod agent_team_panel;
 pub mod agents_overlay;
 pub mod approval_cockpit_panel;
