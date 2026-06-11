@@ -36,6 +36,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
         .route(
+            "/api/iacc/production/governance",
+            get(iacc_production_governance_handler),
+        )
+        .route(
             "/api/iacc/data-plane/health",
             get(iacc_data_plane_health_handler),
         )
@@ -701,6 +705,87 @@ async fn iacc_health_handler(
     })))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct IaccProductionGovernanceBundle {
+    auth_token_configured: bool,
+    approval_gate_configured: bool,
+    session_store_ready: bool,
+    platform_runtime_ready: bool,
+    audit_export_surface: bool,
+    cross_plane_audit_surface: bool,
+    runbook_present: bool,
+    health_capability_present: bool,
+}
+
+async fn iacc_production_governance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let bundle = IaccProductionGovernanceBundle {
+        auth_token_configured: state.auth_token.is_some(),
+        approval_gate_configured: state.approval_gate.is_some(),
+        session_store_ready: state.has_unified_store(),
+        platform_runtime_ready: state.platform_runtime.is_some(),
+        audit_export_surface: true,
+        cross_plane_audit_surface: true,
+        runbook_present: state
+            .workspace_root
+            .join("docs/operator/iacc-production-runbook.md")
+            .is_file(),
+        health_capability_present: iacc_health_capabilities()
+            .contains(&"production_governance_bundle"),
+    };
+
+    let checks = [
+        bundle.auth_token_configured,
+        bundle.approval_gate_configured,
+        bundle.session_store_ready,
+        bundle.platform_runtime_ready,
+        bundle.audit_export_surface,
+        bundle.cross_plane_audit_surface,
+        bundle.runbook_present,
+        bundle.health_capability_present,
+    ];
+    let score = checks.iter().filter(|ok| **ok).count();
+    let status = if score == checks.len() {
+        "ready"
+    } else {
+        "attention"
+    };
+    let mut reasons = Vec::new();
+    if !bundle.auth_token_configured {
+        reasons.push("auth_token_not_configured");
+    }
+    if !bundle.approval_gate_configured {
+        reasons.push("approval_gate_missing");
+    }
+    if !bundle.session_store_ready {
+        reasons.push("session_store_unavailable");
+    }
+    if !bundle.platform_runtime_ready {
+        reasons.push("platform_runtime_unavailable");
+    }
+    if !bundle.runbook_present {
+        reasons.push("production_runbook_missing");
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.production_governance",
+        "status": status,
+        "bundle": bundle,
+        "readiness": {
+            "score": score,
+            "total": checks.len(),
+            "ready": score == checks.len(),
+            "reasons": reasons,
+        },
+        "evidence": {
+            "audit_export_route": "/api/audit/export",
+            "cross_plane_audit_route": "/api/cross-plane/audit",
+            "production_runbook": "docs/operator/iacc-production-runbook.md",
+        }
+    })))
+}
+
 fn iacc_health_capabilities() -> Vec<&'static str> {
     vec![
         "data_plane_adapter",
@@ -726,6 +811,7 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "cockpit_report_delivery_retry_state",
         "cockpit_report_webui_visibility",
         "production_operation_package",
+        "production_governance_bundle",
         "memory_case_promotion",
         "playbook_recommendation",
         "server_manufacturing_skill_pack",

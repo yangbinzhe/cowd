@@ -126,6 +126,7 @@ EOF
   curl -fsS "$base_url/healthz" | rg -q '"gateway":"daemon-http-gateway"'
   curl -fsS "$base_url/api/iacc/health" | rg -q '"expected_schema_version":17'
   curl -fsS "$base_url/api/iacc/health" | rg -q '"production_operation_package"'
+  curl -fsS "$base_url/api/iacc/health" | rg -q '"production_governance_bundle"'
 }
 
 run_step cargo fmt --all --check
@@ -160,6 +161,7 @@ run_script scripts/v0994_iacc_report_delivery_payload_templates_scenario.sh
 run_script scripts/v0995_iacc_cockpit_report_schedule_runner_scenario.sh
 run_script scripts/v0996_iacc_report_delivery_retry_state_scenario.sh
 run_script scripts/v0997_iacc_webui_report_visibility_scenario.sh
+run_script scripts/v09111_iacc_production_governance_scenario.sh
 
 run_webui_module_tests
 
