@@ -404,21 +404,30 @@ pub struct WeChatLinkAdapter {
     token: Arc<RwLock<Option<String>>>,
     /// Latest context_token from getupdates response, echoed back in the next call.
     context_token: Arc<RwLock<String>>,
-    /// Dedup store: message_id → timestamp. Used to avoid
-    /// processing the same message twice in long-poll cycles.
-    /// Uses LRU eviction with TTL expiry.
+    /// Dedup store: message_id → timestamp.
     seen_ids: DedupStore,
+    /// Timestamp of last successful connect, used for reconnect backoff.
+    last_connect_attempt: RwLock<Option<std::time::Instant>>,
+    /// Count of consecutive auth/receive failures for backoff.
+    consecutive_failures: RwLock<u32>,
 }
 
 impl WeChatLinkAdapter {
     /// Create a new WeChat iLink adapter.
     pub fn new(config: WeChatLinkConfig) -> Self {
+        tracing::info!(
+            "wechat_ilink adapter created: mode={} base_url={}",
+            if config.qr_token_mode { "qr" } else { "bot" },
+            config.base_url
+        );
         Self {
             config,
             connected: Arc::new(RwLock::new(false)),
             token: Arc::new(RwLock::new(None)),
             context_token: Arc::new(RwLock::new(String::new())),
             seen_ids: DedupStore::new(10_000, 3600),
+            last_connect_attempt: RwLock::new(None),
+            consecutive_failures: RwLock::new(0),
         }
     }
 
@@ -964,17 +973,57 @@ impl PlatformAdapter for WeChatLinkAdapter {
     }
 
     async fn connect(&mut self) -> PlatformResult<()> {
+        tracing::info!("wechat_ilink adapter: attempting connection...");
+        *self.last_connect_attempt.write().await = Some(std::time::Instant::now());
         let token = self.authenticate().await?;
-        *self.token.write().await = Some(token);
+        *self.token.write().await = Some(token.clone());
         *self.connected.write().await = true;
-        tracing::info!("wechat_ilink adapter connected");
+        *self.consecutive_failures.write().await = 0;
+        tracing::info!(
+            "wechat_ilink adapter: connected successfully (token={}...{})",
+            &token[..token.len().min(8)],
+            &token[token.len().saturating_sub(8)..]
+        );
         Ok(())
+    }
+
+    async fn try_reconnect(&mut self) -> PlatformResult<()> {
+        let should_retry = {
+            let last = self.last_connect_attempt.read().await;
+            let fails = *self.consecutive_failures.read().await;
+            match *last {
+                None => true,
+                Some(t) => {
+                    let backoff = std::time::Duration::from_secs(
+                        (fails.min(6) as u64).saturating_mul(5).max(5)
+                    );
+                    t.elapsed() >= backoff
+                }
+            }
+        };
+        if !should_retry {
+            return Ok(());
+        }
+        match self.connect().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mut fails = self.consecutive_failures.write().await;
+                *fails = fails.saturating_add(1);
+                tracing::warn!(
+                    "wechat_ilink adapter: reconnect attempt {} failed: {e}",
+                    *fails
+                );
+                Err(e)
+            }
+        }
     }
 
     async fn disconnect(&mut self) -> PlatformResult<()> {
         *self.connected.write().await = false;
         *self.token.write().await = None;
         *self.context_token.write().await = String::new();
+        *self.last_connect_attempt.write().await = None;
+        *self.consecutive_failures.write().await = 0;
         tracing::info!("wechat_ilink adapter disconnected");
         Ok(())
     }
@@ -985,13 +1034,32 @@ impl PlatformAdapter for WeChatLinkAdapter {
     }
 
     async fn receive(&mut self) -> PlatformResult<Option<InboundMessage>> {
-        let connected = self.connected.read().await;
-        if !*connected {
+        let connected = *self.connected.read().await;
+        if !connected {
+            if let Err(e) = self.try_reconnect().await {
+                tracing::debug!("wechat_ilink adapter: reconnect pending ({e})");
+            }
             return Ok(None);
         }
-        drop(connected);
 
-        let updates = self.get_updates().await?;
+        let updates = match self.get_updates().await {
+            Ok(updates) => updates,
+            Err(e) => {
+                let err_str = e.to_string();
+                tracing::warn!("wechat_ilink adapter: get_updates failed: {err_str}");
+                if err_str.contains("401")
+                    || err_str.contains("403")
+                    || err_str.contains("unauthorized")
+                    || err_str.contains("auth")
+                    || err_str.contains("token")
+                {
+                    tracing::info!("wechat_ilink adapter: auth failure detected, marking disconnected for reconnect");
+                    *self.connected.write().await = false;
+                    *self.token.write().await = None;
+                }
+                return Ok(None);
+            }
+        };
 
         for msg in updates {
             // Extract message_id for dedup

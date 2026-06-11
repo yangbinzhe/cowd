@@ -555,9 +555,15 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                 }
             }
             "wechat_ilink" | "wechat" => {
+                tracing::info!(
+                    "wechat_ilink: creating adapter from settings keys=[{}]",
+                    settings_json.as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default()
+                );
                 match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
                     Ok(adapter) => {
-                        tracing::info!("wechat_ilink adapter created");
+                        tracing::info!("wechat_ilink adapter created successfully");
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
                             tracing::error!("failed to register wechat_ilink adapter: {e}");
                         }
