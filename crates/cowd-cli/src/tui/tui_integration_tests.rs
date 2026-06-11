@@ -29,6 +29,10 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+fn key_ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
 #[test]
 fn integration_launch_type_stream() {
     let mut state = TuiState::new("test-model", "test-session");
@@ -83,6 +87,11 @@ fn integration_render_chat_view_visible() {
 #[test]
 fn integration_panel_switch() {
     let mut state = TuiState::new("test-model", "test-session");
+    assert!(!state.layout_state.sidebar_visible);
+
+    state.handle_input(key_ctrl(KeyCode::Char('b')));
+    assert!(state.layout_state.sidebar_visible);
+
     // Default tab is Chat (index 0)
     assert_eq!(state.sidebar_active_tab, 0);
 
