@@ -14,7 +14,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
 };
 
 use crate::tui::app::{Theme, TimelineEntry};
@@ -273,8 +273,27 @@ impl Component for ChatView {
         let viewport_h = area.height as usize;
         self.scroll_state.viewport_height = viewport_h as u16;
 
-        // ── Compute total lines ──
-        let total_lines = self.total_lines();
+        // ── Build line buffer before computing scroll bounds ──
+        // Scroll is intentionally based on the exact line buffer we render.
+        // This avoids the old split-brain path where entry estimates, virtual
+        // slicing, Paragraph wrapping, and the scrollbar each had different
+        // ideas of content height.
+        if self.msg_version != self.last_drawn_version {
+            self.cached_chat_lines = Self::build_new_lines(self);
+            self.entry_line_counts = Self::compute_entry_line_counts(self);
+            self.last_drawn_version = self.msg_version;
+            self.lines_dirty = false;
+        } else if self.lines_dirty {
+            Self::rebuild_streaming_tail(self);
+            self.entry_line_counts = Self::compute_entry_line_counts(self);
+            self.lines_dirty = false;
+        }
+        if self.cached_chat_lines.is_empty() {
+            self.cached_chat_lines = Self::build_new_lines(self);
+            self.entry_line_counts = Self::compute_entry_line_counts(self);
+        }
+
+        let total_lines = self.cached_chat_lines.len().max(1);
 
         // ── Post-render size callback: sync actual content height ──
         self.scroll_state.set_content_size(total_lines as u16);
@@ -283,10 +302,10 @@ impl Component for ChatView {
         if self.scroll_state.auto_scroll && total_lines > viewport_h {
             self.scroll_state.offset = (total_lines.saturating_sub(viewport_h)) as u16;
         }
-        let scroll_off = self
-            .scroll_state
-            .offset
-            .min(total_lines.saturating_sub(1) as u16) as usize;
+        let scroll_off =
+            self.scroll_state
+                .offset
+                .min(total_lines.saturating_sub(viewport_h).max(0) as u16) as usize;
 
         // ── Compact mode: summary view ──
         if self.compact_mode {
@@ -301,28 +320,7 @@ impl Component for ChatView {
         }
 
         // ── Build visible lines ──
-        let mut visible_lines: Vec<Line<'static>>;
-        let paragraph_scroll: u16;
-
-        if total_lines > viewport_h.saturating_mul(3) {
-            // Virtual scrolling
-            visible_lines = Self::build_visible(self, scroll_off, viewport_h);
-            paragraph_scroll = 0;
-        } else {
-            // Small timeline: use render cache
-            if self.msg_version != self.last_drawn_version {
-                self.cached_chat_lines = Self::build_new_lines(self);
-                self.entry_line_counts = Self::compute_entry_line_counts(self);
-                self.last_drawn_version = self.msg_version;
-                self.lines_dirty = false;
-            } else if self.lines_dirty {
-                Self::rebuild_streaming_tail(self);
-                self.entry_line_counts = Self::compute_entry_line_counts(self);
-                self.lines_dirty = false;
-            }
-            visible_lines = self.cached_chat_lines.clone();
-            paragraph_scroll = scroll_off as u16;
-        }
+        let mut visible_lines = self.cached_chat_lines.clone();
 
         // ── Apply search highlight (Task 17) ──
         if !self.search_query.is_empty() && !self.search_matches.is_empty() {
@@ -341,39 +339,15 @@ impl Component for ChatView {
         }
 
         // ── Render ──
-        let inner_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width.saturating_sub(1),
-            height: area.height,
-        };
-        let scrollbar_area = Rect {
-            x: area.right().saturating_sub(1),
-            y: area.y,
-            width: 1,
-            height: area.height,
-        };
-
         let frame = ctx.frame_mut();
         frame.render_widget(Clear, area);
 
         let paragraph = Paragraph::new(Text::from(visible_lines))
-            .wrap(Wrap { trim: false })
-            .scroll((paragraph_scroll, 0));
-        frame.render_widget(paragraph, inner_area);
-
-        // ── Scrollbar ──
-        if total_lines > viewport_h {
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓"))
-                .track_symbol(Some("│"))
-                .thumb_symbol("█");
-            let mut scroll_state = ScrollbarState::new(total_lines)
-                .position(scroll_off)
-                .viewport_content_length(viewport_h);
-            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scroll_state);
-        }
+            // No Wrap here: wrapping makes rendered height depend on terminal
+            // width while scroll offset is line-based. Clipping long lines is
+            // less harmful than a viewport that cannot reliably reach top/bottom.
+            .scroll((scroll_off as u16, 0));
+        frame.render_widget(paragraph, area);
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
@@ -448,6 +422,14 @@ impl ChatView {
             KeyCode::PageDown => {
                 self.scroll_page_down();
                 self.scroll_state.auto_scroll = false;
+                EventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.scroll_state.scroll_to_top();
+                EventResult::Consumed
+            }
+            KeyCode::End => {
+                self.scroll_state.scroll_to_bottom();
                 EventResult::Consumed
             }
             _ => EventResult::NotConsumed,
@@ -1540,6 +1522,50 @@ mod tests {
             view.scroll_state.offset > 5,
             "PageDown should increase scroll offset"
         );
+    }
+
+    #[test]
+    fn render_clamps_scroll_to_bottom_with_exact_rendered_lines() {
+        let mut view = ChatView::new();
+        for i in 0..40 {
+            view.timeline
+                .push(make_message("assistant", &format!("message {i}")));
+        }
+        view.msg_version = 1;
+        view.scroll_state.auto_scroll = true;
+
+        let _ = render_view(&mut view, 80, 10);
+
+        let max_offset =
+            view.cached_chat_lines
+                .len()
+                .saturating_sub(view.scroll_state.viewport_height as usize) as u16;
+        assert_eq!(view.scroll_state.offset, max_offset);
+        assert!(max_offset > 0);
+    }
+
+    #[test]
+    fn home_and_end_jump_to_stable_scroll_bounds() {
+        let mut view = ChatView::new();
+        for i in 0..30 {
+            view.timeline
+                .push(make_message("assistant", &format!("line {i}")));
+        }
+        view.msg_version = 1;
+        view.scroll_state.auto_scroll = true;
+        let _ = render_view(&mut view, 80, 8);
+        let bottom = view.scroll_state.offset;
+        assert!(bottom > 0);
+
+        view.handle_event(&Event::Key(KeyEvent::from(KeyCode::Home)));
+        let _ = render_view(&mut view, 80, 8);
+        assert_eq!(view.scroll_state.offset, 0);
+        assert!(!view.scroll_state.auto_scroll);
+
+        view.handle_event(&Event::Key(KeyEvent::from(KeyCode::End)));
+        let _ = render_view(&mut view, 80, 8);
+        assert_eq!(view.scroll_state.offset, bottom);
+        assert!(view.scroll_state.auto_scroll);
     }
 
     #[test]

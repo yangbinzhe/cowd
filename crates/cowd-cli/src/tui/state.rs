@@ -696,16 +696,6 @@ impl TuiState {
             let sidebar_area =
                 ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
 
-            // Auto-scroll during streaming — computed BEFORE render to eliminate 1-frame lag
-            if self.app.auto_scroll {
-                let total = self.chat_view.total_lines();
-                let vh = self.app.viewport_height as usize;
-                if total > vh {
-                    self.app.scroll_offset = (total - vh) as u16;
-                } else {
-                    self.app.scroll_offset = 0;
-                }
-            }
             self.chat_view.scroll_state.offset = self.app.scroll_offset;
             self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
 
