@@ -613,6 +613,16 @@ impl CommandPalette {
         self.run_search();
     }
 
+    /// Open the palette with a prefilled search query.
+    pub fn open_with_query(&mut self, query: impl Into<String>) {
+        self.visible = true;
+        self.search_input = query.into();
+        self.cursor = self.search_input.len();
+        self.selected_index = 0;
+        self.pending_action = None;
+        self.run_search();
+    }
+
     /// Close the palette.
     pub fn close(&mut self) {
         self.visible = false;
@@ -845,6 +855,10 @@ impl CommandPalette {
                 true
             }
             KeyCode::Enter => {
+                self.accept_selected();
+                true
+            }
+            KeyCode::Tab => {
                 self.accept_selected();
                 true
             }

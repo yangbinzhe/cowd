@@ -216,7 +216,7 @@ pub struct TuiState {
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
-    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Diff, 7=Files, 8=Sessions, 9=Memory, 10=Skills, 11=Gateway).
+    /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Diff, 6=Files, 7=Sessions, 8=Memory, 9=Skills, 10=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -1092,6 +1092,23 @@ impl TuiState {
     /// Returns `true` if the event was consumed (handled), `false` if
     /// it should propagate further.
     pub fn handle_input(&mut self, event: KeyEvent) -> bool {
+        if self.command_palette.is_open() {
+            if event.code == KeyCode::Esc {
+                self.command_palette.close();
+                return true;
+            }
+
+            let result = self
+                .command_palette
+                .handle_event(&crossterm::event::Event::Key(event));
+            if result == crate::tui::components::EventResult::Consumed {
+                if let Some(action) = self.command_palette.take_action() {
+                    self.dispatch_action(action);
+                }
+                return true;
+            }
+        }
+
         // 1. Dialog focus trap: if a dialog is active, keys go to it
         if !self.dialog_manager.is_empty() {
             return self.dialog_manager.handle_key(&event);
@@ -1361,6 +1378,14 @@ impl TuiState {
             return self.handle_search_key(key);
         }
 
+        if self.should_open_slash_command_palette(&key) {
+            self.app.input.input(key);
+            let text = self.app.input.lines().join("\n");
+            self.prompt.refresh_suggestions_from_text(&text);
+            self.open_command_palette_with_query("/");
+            return ProcessedKey::Nothing;
+        }
+
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
@@ -1519,6 +1544,28 @@ impl TuiState {
         )
     }
 
+    fn should_open_slash_command_palette(&self, event: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+
+        event.code == KeyCode::Char('/')
+            && event.modifiers.is_empty()
+            && self.app.input.lines().join("\n").trim().is_empty()
+    }
+
+    fn open_command_palette(&mut self) {
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette.open();
+    }
+
+    fn open_command_palette_with_query(&mut self, query: &str) {
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette.open_with_query(query);
+    }
+
     /// Handle a key press while search is active.
     fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
         use crossterm::event::KeyCode;
@@ -1668,12 +1715,7 @@ impl TuiState {
                 if self.command_palette.is_open() {
                     self.command_palette.close();
                 } else {
-                    let snapshot =
-                        crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(
-                            &self.app,
-                        );
-                    self.command_palette.sync_runtime_actions(&snapshot);
-                    self.command_palette.open();
+                    self.open_command_palette();
                 }
             }
             Action::ToggleAgentsOverlay => {
@@ -1770,23 +1812,15 @@ impl TuiState {
             Action::OpenDialog(name) => {
                 use crate::tui::components::dialog::{DialogKind, DialogState};
                 match name.as_str() {
+                    "command_palette" => {
+                        self.open_command_palette();
+                    }
                     "export" => {
                         self.export_dialog.reset();
                         self.export_dialog_active = true;
                     }
                     _ => {
                         let dialog = match name.as_str() {
-                            "command_palette" => DialogState::new(DialogKind::Select {
-                                title: "Command Palette".into(),
-                                items: vec![
-                                    "New Session".into(),
-                                    "Open Session".into(),
-                                    "Toggle Theme".into(),
-                                    "Show Help".into(),
-                                    "Quit".into(),
-                                ],
-                                selected: 0,
-                            }),
                             _ => DialogState::new(DialogKind::Alert {
                                 title: name.clone(),
                                 message: format!("Dialog '{name}' not yet implemented."),
@@ -3273,24 +3307,19 @@ providers:
         assert_eq!(state.theme_engine.theme.name, "light");
     }
 
-    // ── open_dialog ─────────────────────────────────────────────
+    // ── command_palette ─────────────────────────────────────────
 
     #[test]
-    fn open_dialog_via_leader_chord() {
+    fn command_palette_via_leader_chord() {
         let mut state = TuiState::new("m", "s");
 
         // Space → leader prefix
         state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        // p → OpenDialog("command_palette")
+        // p → ToggleCommandPalette
         state.handle_input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
 
-        assert!(!state.dialog_manager.is_empty());
-        let current = state.dialog_manager.current().unwrap();
-        assert!(matches!(
-            current.kind,
-            crate::tui::components::dialog::DialogKind::Select { ref title, .. }
-            if title == "Command Palette"
-        ));
+        assert!(state.command_palette.is_open());
+        assert!(state.dialog_manager.is_empty());
     }
 
     // ── cancel_action ───────────────────────────────────────────
@@ -3386,7 +3415,7 @@ providers:
     #[test]
     fn render_bridge_projects_runtime_command_center_to_gateway_tab() {
         let mut state = TuiState::new("m", "scenario-session");
-        state.sidebar_active_tab = 11;
+        state.sidebar_active_tab = 10;
         state.app.server_running = true;
         state.app.server_uptime_secs = Some(61);
         state.app.active_api_sessions = 2;

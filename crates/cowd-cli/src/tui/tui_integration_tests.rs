@@ -206,18 +206,30 @@ fn integration_command_palette() {
     state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     state.handle_input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
 
-    assert!(!state.dialog_manager.is_empty());
-
-    let current = state.dialog_manager.current().unwrap();
-    assert!(matches!(
-        &current.kind,
-        crate::tui::components::dialog::DialogKind::Select { title, .. }
-        if title == "Command Palette"
-    ));
+    assert!(state.command_palette.is_open());
+    assert!(state.dialog_manager.is_empty());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     state.handle_input(esc);
-    assert!(state.dialog_manager.is_empty());
+    assert!(!state.command_palette.is_open());
+}
+
+#[test]
+fn integration_slash_opens_command_palette_and_prepares_command() {
+    let mut state = TuiState::new("test-model", "test-session");
+
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert!(state.command_palette.is_open());
+
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+    state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(!state.command_palette.is_open());
+    assert_eq!(state.app.input.lines().join("\n"), "/status");
 }
 
 #[test]

@@ -577,7 +577,7 @@ pub fn default_bindings() -> KeyMap {
                 KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
             ],
         },
-        Action::OpenDialog("command_palette".into()),
+        Action::ToggleCommandPalette,
         "Command palette",
         GROUP_DIALOG,
     );
@@ -811,12 +811,12 @@ mod tests {
     }
 
     #[test]
-    fn space_leader_chord_p_dispatches_open_dialog() {
+    fn space_leader_chord_p_dispatches_command_palette() {
         let mut eng = engine();
         assert_eq!(eng.handle_key(k(KeyCode::Char(' '))), None);
         assert_eq!(
             eng.handle_key(k(KeyCode::Char('p'))),
-            Some(Action::OpenDialog("command_palette".into()))
+            Some(Action::ToggleCommandPalette)
         );
     }
 
