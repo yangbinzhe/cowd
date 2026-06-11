@@ -1179,7 +1179,8 @@ impl Prompt {
 
         let dropdown_width = base_area.width.min(60);
         let dropdown_y = base_area.y + base_area.height;
-        let dropdown_h = self.suggestions.len() as u16 + 2;
+        let visible_suggestions = self.suggestions.len().min(self.engine.max_suggestions);
+        let dropdown_h = visible_suggestions as u16 + 2;
 
         // Ensure dropdown fits on screen
         let screen_h = ctx.area().height;
@@ -1199,6 +1200,7 @@ impl Prompt {
         let lines: Vec<Line> = self
             .suggestions
             .iter()
+            .take(visible_suggestions)
             .enumerate()
             .map(|(i, s)| {
                 let kind_char = match s.kind {
@@ -1375,6 +1377,16 @@ impl Prompt {
             KeyCode::Backspace | KeyCode::Delete => {
                 self.textarea.input(Event::Key(*key));
                 self.update_suggestions();
+                EventResult::Consumed
+            }
+
+            // ── Suggestion navigation ──
+            KeyCode::Up if self.show_suggestions => {
+                self.prev_suggestion();
+                EventResult::Consumed
+            }
+            KeyCode::Down if self.show_suggestions => {
+                self.next_suggestion();
                 EventResult::Consumed
             }
 
@@ -1835,6 +1847,47 @@ mod tests {
             prompt.highlighted, initial_highlighted,
             "Shift+Tab should change highlighted index"
         );
+    }
+
+    #[test]
+    fn up_down_navigate_visible_suggestions() {
+        let mut prompt = Prompt::new("/tmp");
+
+        for c in "/s".chars() {
+            let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
+        }
+
+        assert!(prompt.show_suggestions);
+        assert!(prompt.suggestions.len() >= 2);
+        assert_eq!(prompt.highlighted, 0);
+
+        let down = prompt.handle_event(&crossterm::event::Event::Key(key(KeyCode::Down)));
+        assert!(down.is_consumed());
+        assert_eq!(prompt.highlighted, 1);
+
+        let up = prompt.handle_event(&crossterm::event::Event::Key(key(KeyCode::Up)));
+        assert!(up.is_consumed());
+        assert_eq!(prompt.highlighted, 0);
+    }
+
+    #[test]
+    fn enter_accepts_currently_highlighted_suggestion() {
+        let mut prompt = Prompt::new("/tmp");
+
+        for c in "/s".chars() {
+            let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
+        }
+
+        assert!(prompt.show_suggestions);
+        assert!(prompt.suggestions.len() >= 2);
+
+        let _ = prompt.handle_event(&crossterm::event::Event::Key(key(KeyCode::Down)));
+        let selected = prompt.suggestions[prompt.highlighted].text.clone();
+        let enter = prompt.handle_event(&crossterm::event::Event::Key(key_enter()));
+
+        assert!(enter.is_consumed());
+        assert_eq!(prompt.text(), selected);
+        assert!(!prompt.show_suggestions);
     }
 
     #[test]
