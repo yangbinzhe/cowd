@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 use crate::tui::components::{Component, EventResult, RenderContext};
 use crate::tui::{
     app::App,
@@ -754,11 +755,22 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop  / connector actions",
+            "Keys: j/k scroll  PgUp/PgDn page  r refresh  h health  s start/stop  / connector actions",
             Style::default().fg(Color::DarkGray),
         )));
 
-        let paragraph = Paragraph::new(lines).block(block);
+        let viewport_len = area.height.saturating_sub(2).max(1) as usize;
+        let mut scroll = PanelScrollState {
+            offset: self.scroll_offset as usize,
+            content_len: lines.len(),
+            viewport_len,
+        };
+        scroll.clamp();
+        self.scroll_offset = offset_to_u16(scroll.offset);
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .scroll((self.scroll_offset, 0));
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -771,6 +783,30 @@ impl Component for GatewayPanel {
         }
 
         match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                EventResult::Consumed
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                EventResult::Consumed
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(8);
+                EventResult::Consumed
+            }
+            KeyCode::PageUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(8);
+                EventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.scroll_offset = 0;
+                EventResult::Consumed
+            }
+            KeyCode::End => {
+                self.scroll_offset = u16::MAX;
+                EventResult::Consumed
+            }
             KeyCode::Char('r') => EventResult::Consumed, // refresh
             KeyCode::Char('h') => EventResult::Consumed, // health check
             KeyCode::Char('s') => EventResult::Consumed, // start/stop

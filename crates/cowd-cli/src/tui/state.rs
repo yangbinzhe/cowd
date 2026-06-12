@@ -2045,6 +2045,7 @@ impl TuiState {
 
     fn route_navigation_to_sidebar(&mut self, event: crossterm::event::Event) -> bool {
         let consumed = match self.sidebar_active_tab {
+            0 => self.runtime_activity_panel.handle_event(&event),
             1 => self.file_changes_panel.handle_event(&event),
             4 => self.todo_panel.handle_event(&event),
             5 => self.file_tree.handle_event(&event),
@@ -2056,6 +2057,26 @@ impl TuiState {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    pub fn handle_mouse_scroll(&mut self, down: bool) -> bool {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let code = if down {
+            KeyCode::PageDown
+        } else {
+            KeyCode::PageUp
+        };
+        if self.route_navigation_to_focus(KeyEvent::new(code, KeyModifiers::NONE)) {
+            return true;
+        }
+        if down {
+            self.app.scroll_page_down();
+        } else {
+            self.app.scroll_page_up();
+        }
+        self.app.auto_scroll = false;
+        self.set_focus_target(FocusTarget::Chat);
+        true
     }
 
     fn open_sidebar_tab(&mut self, tab: usize, label: &str) {
@@ -4353,6 +4374,26 @@ providers:
             state.focus_target,
             FocusTarget::TopicPanel(SidebarTopicPanel::Memory)
         );
+    }
+
+    #[test]
+    fn mouse_scroll_routes_to_focused_sidebar_panel() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/gateway".into()));
+        state.app.scroll_offset = 12;
+        state.gateway_panel.scroll_offset = 0;
+
+        assert!(state.handle_mouse_scroll(true));
+
+        assert_eq!(
+            state.app.scroll_offset, 12,
+            "sidebar mouse scroll should not move chat"
+        );
+        assert!(
+            state.gateway_panel.scroll_offset > 0,
+            "gateway panel should receive the scroll"
+        );
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
     }
 
     #[test]

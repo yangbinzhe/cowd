@@ -1,3 +1,4 @@
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
@@ -6,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, TimelineEntry};
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 /// Turn-level activity summary for "what's happening now" display.
@@ -66,6 +68,8 @@ pub struct RuntimeActivityPanel {
     open_tool_count: usize,
     /// Current turn activity summary.
     turn_activity: TurnActivity,
+    /// Scroll offset for long runtime status content.
+    scroll: PanelScrollState,
 }
 
 impl RuntimeActivityPanel {
@@ -550,16 +554,35 @@ impl Component for RuntimeActivityPanel {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Runtime Status ");
+        self.scroll
+            .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
         ctx.frame_mut().render_widget(
             Paragraph::new(lines)
                 .block(block)
+                .scroll((offset_to_u16(self.scroll.offset), 0))
                 .wrap(Wrap { trim: false }),
             area,
         );
     }
 
-    fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
-        EventResult::NotConsumed
+    fn handle_event(&mut self, event: &Event) -> EventResult {
+        let Event::Key(key) = event else {
+            return EventResult::NotConsumed;
+        };
+        if key.kind != KeyEventKind::Press {
+            return EventResult::NotConsumed;
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll.line_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll.line_up(),
+            KeyCode::PageDown => self.scroll.page_down(),
+            KeyCode::PageUp => self.scroll.page_up(),
+            KeyCode::Home => self.scroll.top(),
+            KeyCode::End => self.scroll.bottom(),
+            _ => return EventResult::NotConsumed,
+        }
+        EventResult::Consumed
     }
 
     fn focusable(&self) -> bool {
@@ -780,14 +803,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_status_panel_does_not_consume_recent_scroll_keys() {
+    fn runtime_status_panel_consumes_scroll_keys() {
         let mut panel = RuntimeActivityPanel::new();
         let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Down,
             crossterm::event::KeyModifiers::NONE,
         ));
 
-        assert_eq!(panel.handle_event(&event), EventResult::NotConsumed);
+        assert_eq!(panel.handle_event(&event), EventResult::Consumed);
         assert!(!panel.focusable());
     }
 }

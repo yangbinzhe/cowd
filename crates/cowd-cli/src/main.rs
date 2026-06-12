@@ -3561,13 +3561,11 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     // Mouse scroll handling
                     if let Event::Mouse(mouse) = &event {
                         if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
-                            state.scroll_offset = state.scroll_offset.saturating_add(state.viewport_height.max(1).saturating_sub(1));
-                            state.auto_scroll = false;
+                            state.handle_mouse_scroll(true);
                             continue;
                         }
                         if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
-                            state.scroll_offset = state.scroll_offset.saturating_sub(state.viewport_height.max(1).saturating_sub(1));
-                            state.auto_scroll = false;
+                            state.handle_mouse_scroll(false);
                             continue;
                         }
                     }
