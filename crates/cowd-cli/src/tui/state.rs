@@ -1340,7 +1340,16 @@ impl TuiState {
 
     // ── Input Handling ──────────────────────────────────────────
 
-    /// Process a raw keyboard event through the keybinding engine.
+    /// Compatibility wrapper for tests and legacy keybinding-only callers.
+    ///
+    /// The production TUI event loop must use [`Self::process_raw_key`] so text
+    /// editing, slash completion, dialogs, focus routing, and submissions stay
+    /// on one path.
+    pub fn handle_input(&mut self, event: KeyEvent) -> bool {
+        self.handle_keybind_input(event)
+    }
+
+    /// Process a non-text keyboard event through the keybinding engine.
     ///
     /// If a dialog is active, the event is routed to the dialog manager
     /// first (focus trap). Otherwise, it goes through the keybind engine:
@@ -1350,7 +1359,7 @@ impl TuiState {
     ///
     /// Returns `true` if the event was consumed (handled), `false` if
     /// it should propagate further.
-    pub fn handle_input(&mut self, event: KeyEvent) -> bool {
+    pub fn handle_keybind_input(&mut self, event: KeyEvent) -> bool {
         if self.command_palette.is_open() {
             if event.code == KeyCode::Esc {
                 self.command_palette.close();
