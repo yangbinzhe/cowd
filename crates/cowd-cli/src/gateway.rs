@@ -136,37 +136,8 @@ impl Default for ActiveSessions {
 mod tests {
     use super::*;
 
-    fn init_test_provider() {
-        runtime::init_global_providers(runtime::ProvidersConfig {
-            providers: std::collections::HashMap::from([(
-                "test-provider".to_string(),
-                runtime::ProviderConfig {
-                    name: "test-provider".to_string(),
-                    base_url: "http://127.0.0.1:9".to_string(),
-                    api_key: "test-dummy-key".to_string(),
-                    models: vec!["test-model".to_string()],
-                    protocol: Some("openai-compat".to_string()),
-                },
-            )]),
-        });
-    }
-
     fn dummy_runtime() -> crate::BuiltRuntime {
-        init_test_provider();
-        let session = runtime::Session::new();
-        crate::build_runtime(
-            session,
-            "test-session",
-            "test-model".to_string(),
-            vec![],
-            false,
-            false,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-        .expect("dummy runtime should build")
+        crate::BuiltRuntime::test_placeholder()
     }
 
     #[test]
@@ -176,7 +147,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(provider_registry)]
     fn register_and_get() {
         let sessions = ActiveSessions::new();
         let rt = dummy_runtime();
@@ -186,7 +156,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(provider_registry)]
     fn list_returns_sorted_ids() {
         let sessions = ActiveSessions::new();
         sessions.register("b".into(), dummy_runtime()).unwrap();
@@ -197,7 +166,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(provider_registry)]
     fn remove_drops_session() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
@@ -222,7 +190,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(provider_registry)]
     fn register_overwrite() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();

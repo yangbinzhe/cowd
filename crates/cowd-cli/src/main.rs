@@ -4136,6 +4136,18 @@ impl BuiltRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_placeholder() -> Self {
+        Self {
+            runtime: None,
+            plugin_registry: PluginRegistry::default(),
+            plugins_active: false,
+            mcp_state: None,
+            mcp_active: false,
+            resume_context_loaded: false,
+        }
+    }
+
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
         let runtime = self
             .runtime
