@@ -128,6 +128,22 @@ impl ContextSuggestions {
         self.current.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_show(&mut self, text: impl Into<String>) {
+        self.current = Some(Suggestion {
+            text: text.into(),
+            action_label: " Review? [Enter]".to_string(),
+            source_event: L4Event {
+                agent_id: "test".into(),
+                memory_id: "test-memory".into(),
+                operation: memory::L4Operation::Insert,
+                title: "test".into(),
+                timestamp_ms: 0,
+            },
+        });
+        self.shown_at = Some(Instant::now());
+    }
+
     /// Render the suggestion bar as a single floating line above `prompt_area`.
     ///
     /// The bar is drawn at `prompt_area.y - 1` with a `Clear` widget to

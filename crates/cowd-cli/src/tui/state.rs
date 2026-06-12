@@ -222,6 +222,24 @@ impl TuiFrameAreas {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct TuiHitAreas {
+    chat: ratatui::layout::Rect,
+    activity: Option<ratatui::layout::Rect>,
+    sidebar: Option<ratatui::layout::Rect>,
+    topic: Option<ratatui::layout::Rect>,
+    input: ratatui::layout::Rect,
+}
+
+impl TuiHitAreas {
+    fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
+        x >= area.x
+            && x < area.x.saturating_add(area.width)
+            && y >= area.y
+            && y < area.y.saturating_add(area.height)
+    }
+}
+
 // ── TuiState ────────────────────────────────────────────────────
 
 /// Unified TUI application state.
@@ -361,6 +379,9 @@ pub struct TuiState {
 
     /// Current keyboard focus target used to route navigation and scrolling.
     pub(crate) focus_target: FocusTarget,
+
+    /// Last rendered hit regions for mouse routing.
+    last_hit_areas: TuiHitAreas,
 
     /// Status bar at the bottom showing model, tokens, and system info.
     pub status_bar: StatusBar,
@@ -512,6 +533,7 @@ impl TuiState {
             sidebar_active_tab: 0,
             active_topic_panel: None,
             focus_target: FocusTarget::Chat,
+            last_hit_areas: TuiHitAreas::default(),
             accessibility,
             active_sessions: None,
             startup_phase: StartupPhase::Hidden,
@@ -833,6 +855,14 @@ impl TuiState {
                 )
             };
             thinking_anchor_area = chat_area;
+            self.last_hit_areas = TuiHitAreas {
+                chat: chat_area,
+                activity: activity_area,
+                sidebar: (self.layout_state.sidebar_visible && sidebar_area.width > 0)
+                    .then_some(sidebar_area),
+                topic: None,
+                input: frame_areas.input,
+            };
 
             self.chat_view.scroll_state.offset = self.app.scroll_offset;
             self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
@@ -891,6 +921,9 @@ impl TuiState {
                     sidebar_area.width,
                     sidebar_area.height.saturating_sub(tab_height),
                 );
+                if self.active_topic_panel.is_some() {
+                    self.last_hit_areas.topic = Some(panel_area);
+                }
                 if self.active_topic_panel == Some(SidebarTopicPanel::Diff) {
                     // Collect diff text only when the diff panel is visible.
                     let diffs: Vec<String> = self
@@ -1076,7 +1109,7 @@ impl TuiState {
                 );
             }
             // Render context suggestion bar above the input area
-            if self.context_suggestions.is_active() {
+            if self.context_suggestions.is_active() && !self.prompt.suggestions_visible() {
                 let _ = error_recovery::catch_render_panic(
                     "context_suggestions",
                     AssertUnwindSafe(|| {
@@ -2056,6 +2089,7 @@ impl TuiState {
         let consumed = match self.sidebar_active_tab {
             0 => self.runtime_activity_panel.handle_event(&event),
             1 => self.file_changes_panel.handle_event(&event),
+            2 => self.goal_workbench_panel.handle_event(&event),
             4 => self.todo_panel.handle_event(&event),
             5 => self.file_tree.handle_event(&event),
             6 => self.session_sidebar.handle_event(&event),
@@ -2069,6 +2103,66 @@ impl TuiState {
     }
 
     pub fn handle_mouse_scroll(&mut self, down: bool) -> bool {
+        self.handle_mouse_scroll_by_focus(down)
+    }
+
+    pub fn handle_mouse_scroll_at(&mut self, down: bool, x: u16, y: u16) -> bool {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let code = if down {
+            KeyCode::PageDown
+        } else {
+            KeyCode::PageUp
+        };
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        let event = crossterm::event::Event::Key(key);
+
+        if let Some(topic) = self.active_topic_panel {
+            if let Some(area) = self.last_hit_areas.topic {
+                if TuiHitAreas::contains(area, x, y) {
+                    let consumed = match topic {
+                        SidebarTopicPanel::Diff => self.diff_viewer.handle_event(&event),
+                        SidebarTopicPanel::Memory => self.memory_panel.handle_event(&event),
+                        SidebarTopicPanel::Skills => self.skills_panel.handle_event(&event),
+                    } == crate::tui::components::EventResult::Consumed;
+                    if consumed {
+                        self.set_focus_target(FocusTarget::TopicPanel(topic));
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if let Some(area) = self.last_hit_areas.activity {
+            if TuiHitAreas::contains(area, x, y)
+                && self.activity_panel.handle_event(&event)
+                    == crate::tui::components::EventResult::Consumed
+            {
+                self.set_focus_target(FocusTarget::Activity);
+                return true;
+            }
+        }
+
+        if let Some(area) = self.last_hit_areas.sidebar {
+            if TuiHitAreas::contains(area, x, y) && self.route_navigation_to_sidebar(event) {
+                return true;
+            }
+        }
+
+        if TuiHitAreas::contains(self.last_hit_areas.chat, x, y) {
+            if down {
+                self.app.scroll_page_down();
+            } else {
+                self.app.scroll_page_up();
+            }
+            self.app.auto_scroll = false;
+            self.set_focus_target(FocusTarget::Chat);
+            return true;
+        }
+
+        self.handle_mouse_scroll_by_focus(down)
+    }
+
+    fn handle_mouse_scroll_by_focus(&mut self, down: bool) -> bool {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let code = if down {
             KeyCode::PageDown
@@ -4401,6 +4495,80 @@ providers:
         assert!(
             state.gateway_panel.scroll_offset > 0,
             "gateway panel should receive the scroll"
+        );
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn mid_text_slash_uses_input_suggestions_without_opening_palette() {
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("inspect ");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert!(!state.command_palette.is_open());
+        assert_eq!(state.input_text(), "inspect /");
+        assert!(
+            state.prompt.suggestions_visible(),
+            "mid-text slash should use inline suggestions"
+        );
+        assert_eq!(
+            state.focus_for_current_surface(),
+            FocusTarget::PromptSuggestions
+        );
+    }
+
+    #[test]
+    fn context_suggestions_do_not_render_over_prompt_dropdown() {
+        let mut state = TuiState::new("m", "s");
+        state.context_suggestions.test_show("context side effect");
+        state.replace_input_text("inspect ");
+        state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(state.prompt.suggestions_visible());
+
+        let mut terminal = MockTerminal::new(100, 24);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(
+            joined.contains("suggestions"),
+            "missing prompt dropdown: {joined}"
+        );
+        assert!(
+            !joined.contains("context side effect"),
+            "context bar should yield while prompt dropdown is active: {joined}"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_uses_pointer_region_before_focus() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/gateway".into()));
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let sidebar = state
+            .last_hit_areas
+            .sidebar
+            .expect("sidebar area should be recorded");
+        state.set_focus_target(FocusTarget::Chat);
+        state.app.scroll_offset = 7;
+        state.gateway_panel.scroll_offset = 0;
+
+        assert!(state.handle_mouse_scroll_at(
+            true,
+            sidebar.x.saturating_add(1),
+            sidebar.y.saturating_add(2),
+        ));
+
+        assert_eq!(
+            state.app.scroll_offset, 7,
+            "pointer over sidebar should not scroll chat even when chat has focus"
+        );
+        assert!(
+            state.gateway_panel.scroll_offset > 0,
+            "sidebar pointer scroll should route into gateway panel"
         );
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
     }

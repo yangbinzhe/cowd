@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use crate::tui::components::base::{Component, EventResult, RenderContext};
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 
 /// A single todo item extracted from TodoWrite JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,8 @@ impl TodoItem {
 pub struct TodoPanel {
     /// Parsed todo items.
     items: Vec<TodoItem>,
+    /// First visible row in expanded todo content.
+    scroll: PanelScrollState,
     /// Whether the panel is collapsed (>2 items).
     collapsed: bool,
     /// Max items before collapsing. Default: 2.
@@ -92,6 +95,7 @@ impl TodoPanel {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
+            scroll: PanelScrollState::new(),
             collapsed: false,
             collapse_limit: 2,
         }
@@ -141,6 +145,7 @@ impl TodoPanel {
     /// Populate with pre-parsed items (for testing).
     pub fn load(&mut self, items: Vec<TodoItem>) {
         self.items = items;
+        self.scroll.top();
         self.collapsed = self.items.len() > self.collapse_limit;
     }
 
@@ -229,13 +234,41 @@ impl Component for TodoPanel {
         )));
 
         let text = Text::from(items);
-        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        self.scroll
+            .sync(text.lines.len(), inner.height.max(1) as usize);
+        let paragraph = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((offset_to_u16(self.scroll.offset), 0));
         ctx.frame_mut().render_widget(paragraph, inner);
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.scroll.line_down();
+                    EventResult::Consumed
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.scroll.line_up();
+                    EventResult::Consumed
+                }
+                KeyCode::PageDown => {
+                    self.scroll.page_down();
+                    EventResult::Consumed
+                }
+                KeyCode::PageUp => {
+                    self.scroll.page_up();
+                    EventResult::Consumed
+                }
+                KeyCode::Home => {
+                    self.scroll.top();
+                    EventResult::Consumed
+                }
+                KeyCode::End => {
+                    self.scroll.bottom();
+                    EventResult::Consumed
+                }
                 KeyCode::Char('c') => {
                     self.toggle_collapse();
                     EventResult::Consumed

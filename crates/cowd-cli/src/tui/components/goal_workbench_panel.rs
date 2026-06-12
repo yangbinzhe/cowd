@@ -1,3 +1,4 @@
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -6,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, CurrentTaskSummary};
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 use crate::tui::components::{Component, EventResult, RenderContext};
 use crate::tui::runtime_control_store::DaemonTaskSummary;
 
@@ -15,6 +17,7 @@ pub struct GoalWorkbenchPanel {
     daemon_tasks: Vec<DaemonTaskSummary>,
     daemon_task_count: Option<u64>,
     pending_approvals: Option<u64>,
+    scroll: PanelScrollState,
 }
 
 impl GoalWorkbenchPanel {
@@ -147,13 +150,34 @@ impl Component for GoalWorkbenchPanel {
         )));
 
         ctx.frame_mut().render_widget(
-            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            {
+                self.scroll.sync(lines.len(), inner.height.max(1) as usize);
+                Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((offset_to_u16(self.scroll.offset), 0))
+            },
             inner,
         );
     }
 
-    fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
-        EventResult::NotConsumed
+    fn handle_event(&mut self, event: &Event) -> EventResult {
+        let Event::Key(key) = event else {
+            return EventResult::NotConsumed;
+        };
+        if key.kind != KeyEventKind::Press {
+            return EventResult::NotConsumed;
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll.line_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll.line_up(),
+            KeyCode::PageDown => self.scroll.page_down(),
+            KeyCode::PageUp => self.scroll.page_up(),
+            KeyCode::Home => self.scroll.top(),
+            KeyCode::End => self.scroll.bottom(),
+            _ => return EventResult::NotConsumed,
+        }
+        EventResult::Consumed
     }
 
     fn focusable(&self) -> bool {

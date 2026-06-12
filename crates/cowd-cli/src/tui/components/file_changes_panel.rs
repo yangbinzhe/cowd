@@ -14,6 +14,7 @@ use ratatui::{
 };
 
 use crate::tui::components::base::{Component, EventResult, RenderContext};
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 
 /// A single changed file entry in the file changes panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub struct FileChangeEntry {
 pub struct FileChangesPanel {
     files: Vec<FileChangeEntry>,
     selected_idx: usize,
+    scroll_offset: u16,
     collapsed: bool,
     /// Max items to show before collapsing. Default: 8.
     collapse_limit: usize,
@@ -47,6 +49,7 @@ impl FileChangesPanel {
         Self {
             files: Vec::new(),
             selected_idx: 0,
+            scroll_offset: 0,
             collapsed: false,
             collapse_limit: 8,
         }
@@ -56,6 +59,7 @@ impl FileChangesPanel {
     pub fn load(&mut self, files: Vec<FileChangeEntry>) {
         self.files = files;
         self.selected_idx = 0;
+        self.scroll_offset = 0;
         self.collapsed = self.files.len() > self.collapse_limit;
     }
 
@@ -125,6 +129,11 @@ impl FileChangesPanel {
     #[must_use]
     pub fn selected_idx(&self) -> usize {
         self.selected_idx
+    }
+
+    #[must_use]
+    pub fn scroll_offset(&self) -> u16 {
+        self.scroll_offset
     }
 
     /// Return whether the panel is currently collapsed.
@@ -221,11 +230,27 @@ impl Component for FileChangesPanel {
             self.files.len()
         };
 
-        let display_files: Vec<&FileChangeEntry> = self.files.iter().take(max_display).collect();
+        let viewport_len = inner.height.saturating_sub(3).max(1) as usize;
+        let mut scroll = PanelScrollState {
+            offset: self.scroll_offset as usize,
+            content_len: max_display,
+            viewport_len,
+        };
+        scroll.ensure_visible(self.selected_idx.min(max_display.saturating_sub(1)));
+        self.scroll_offset = offset_to_u16(scroll.offset);
+
+        let display_files: Vec<(usize, &FileChangeEntry)> = self
+            .files
+            .iter()
+            .take(max_display)
+            .enumerate()
+            .skip(self.scroll_offset as usize)
+            .take(viewport_len)
+            .collect();
 
         let mut items: Vec<Line> = Vec::new();
 
-        for (i, file) in display_files.iter().enumerate() {
+        for (i, file) in display_files {
             let is_selected = i == self.selected_idx;
             let prefix = if is_selected { "▸" } else { " " };
             let label = format!(
@@ -308,12 +333,44 @@ impl FileChangesPanel {
                 self.select_prev();
                 EventResult::Consumed
             }
+            KeyCode::PageDown => {
+                let step = self.visible_len().min(8).max(1);
+                self.selected_idx = (self.selected_idx + step).min(self.max_select_idx());
+                EventResult::Consumed
+            }
+            KeyCode::PageUp => {
+                let step = self.visible_len().min(8).max(1);
+                self.selected_idx = self.selected_idx.saturating_sub(step);
+                EventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.selected_idx = 0;
+                self.scroll_offset = 0;
+                EventResult::Consumed
+            }
+            KeyCode::End => {
+                self.selected_idx = self.max_select_idx();
+                self.scroll_offset = u16::MAX;
+                EventResult::Consumed
+            }
             KeyCode::Char('c') => {
                 self.toggle_collapse();
                 EventResult::Consumed
             }
             _ => EventResult::NotConsumed,
         }
+    }
+
+    fn visible_len(&self) -> usize {
+        if self.collapsed {
+            self.collapse_limit.min(self.files.len())
+        } else {
+            self.files.len()
+        }
+    }
+
+    fn max_select_idx(&self) -> usize {
+        self.visible_len().saturating_sub(1)
     }
 }
 
@@ -443,6 +500,30 @@ mod tests {
         // k → 1
         let _ = panel.handle_event(&key_event(KeyCode::Char('k')));
         assert_eq!(panel.selected_idx(), 1);
+    }
+
+    #[test]
+    fn file_changes_page_navigation_updates_visible_window() {
+        let mut panel = FileChangesPanel::new();
+        panel.set_collapse_limit(50);
+        panel.load(
+            (0..20)
+                .map(|idx| file_entry(&format!("file_{idx}.rs"), idx, 0))
+                .collect(),
+        );
+
+        let _ = panel.handle_event(&key_event(KeyCode::PageDown));
+        assert!(panel.selected_idx() > 1);
+
+        let _ = render_panel(&mut panel, 60, 8);
+        assert!(
+            panel.scroll_offset() > 0,
+            "render should keep selected item visible by advancing scroll"
+        );
+
+        let _ = panel.handle_event(&key_event(KeyCode::Home));
+        assert_eq!(panel.selected_idx(), 0);
+        assert_eq!(panel.scroll_offset(), 0);
     }
 
     #[test]

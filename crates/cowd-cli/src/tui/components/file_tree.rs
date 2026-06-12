@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -25,6 +25,7 @@ use ratatui::{
 
 use crate::tui::app::FileEntry;
 use crate::tui::components::base::{Component, EventResult, RenderContext};
+use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 
 // ── Git Status ──────────────────────────────────────────────────────
 
@@ -263,6 +264,8 @@ pub struct FileTree {
     root_nodes: Vec<FileNode>,
     /// Cursor position (index into the flat list).
     cursor: usize,
+    /// First visible tree row.
+    scroll_offset: u16,
     /// Preview content of the currently selected file.
     preview: Option<String>,
     /// Path of the file whose preview is currently loaded.
@@ -282,6 +285,7 @@ impl FileTree {
         Self {
             root_nodes: Vec::new(),
             cursor: 0,
+            scroll_offset: 0,
             preview: None,
             preview_path: None,
             git_statuses: HashMap::new(),
@@ -299,6 +303,7 @@ impl FileTree {
         apply_git_status_recursive(&mut self.root_nodes, statuses);
         // Clamp cursor to valid range after rebuild.
         self.clamp_cursor();
+        self.scroll_offset = 0;
     }
 
     /// Load git status by running `git status --porcelain` in `cwd`.
@@ -502,13 +507,36 @@ impl Component for FileTree {
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
         match event {
-            Event::Key(key) => match key.code {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.move_down();
                     EventResult::Consumed
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.move_up();
+                    EventResult::Consumed
+                }
+                KeyCode::PageDown => {
+                    let max = self.visible_nodes().len().saturating_sub(1);
+                    self.cursor = (self.cursor + self.page_step()).min(max);
+                    self.load_preview();
+                    EventResult::Consumed
+                }
+                KeyCode::PageUp => {
+                    self.cursor = self.cursor.saturating_sub(self.page_step());
+                    self.load_preview();
+                    EventResult::Consumed
+                }
+                KeyCode::Home => {
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
+                    self.load_preview();
+                    EventResult::Consumed
+                }
+                KeyCode::End => {
+                    self.cursor = self.visible_nodes().len().saturating_sub(1);
+                    self.scroll_offset = u16::MAX;
+                    self.load_preview();
                     EventResult::Consumed
                 }
                 KeyCode::Enter => {
@@ -525,6 +553,7 @@ impl Component for FileTree {
                 }
                 _ => EventResult::NotConsumed,
             },
+            Event::Key(_) => EventResult::NotConsumed,
             _ => EventResult::NotConsumed,
         }
     }
@@ -538,17 +567,43 @@ impl Component for FileTree {
     }
 }
 
+impl FileTree {
+    fn page_step(&self) -> usize {
+        self.visible_nodes().len().min(8).max(1)
+    }
+}
+
 // ── Rendering helpers ──────────────────────────────────────────────
 
 impl FileTree {
     /// Render the tree portion (left panel or full area).
-    fn render_tree(&self, ctx: &mut RenderContext, area: Rect, vis: &[VisibleNode], accent: Color) {
+    fn render_tree(
+        &mut self,
+        ctx: &mut RenderContext,
+        area: Rect,
+        vis: &[VisibleNode],
+        accent: Color,
+    ) {
         let mut lines: Vec<Line> = Vec::new();
 
         if vis.is_empty() {
             lines.push(Line::from("  (empty directory)"));
         } else {
-            for (i, node) in vis.iter().enumerate() {
+            let viewport_len = area.height.saturating_sub(3).max(1) as usize;
+            let mut scroll = PanelScrollState {
+                offset: self.scroll_offset as usize,
+                content_len: vis.len(),
+                viewport_len,
+            };
+            scroll.ensure_visible(self.cursor.min(vis.len().saturating_sub(1)));
+            self.scroll_offset = offset_to_u16(scroll.offset);
+
+            for (i, node) in vis
+                .iter()
+                .enumerate()
+                .skip(self.scroll_offset as usize)
+                .take(viewport_len)
+            {
                 let is_selected = i == self.cursor;
                 let icon = if node.is_dir {
                     if node.is_expanded {
@@ -942,6 +997,38 @@ mod tests {
         let k_event = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         ft.handle_event(&k_event);
         assert_eq!(ft.cursor, 0);
+    }
+
+    #[test]
+    fn filetree_page_navigation_updates_scroll_window() {
+        let mut ft = FileTree::new();
+        let entries: Vec<FileEntry> = (0..24)
+            .map(|idx| f(&format!("file_{idx:02}.rs"), false, 10))
+            .collect();
+        ft.rebuild(&entries);
+
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let page_down = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        ft.handle_event(&page_down);
+        assert!(ft.cursor > 1);
+
+        let mut terminal = MockTerminal::new(60, 8);
+        let theme = SkinConfig::default();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let mut ctx = RenderContext::new(frame, &theme);
+            ft.render(&mut ctx, area);
+        });
+
+        assert!(
+            ft.scroll_offset > 0,
+            "render should keep paged cursor visible"
+        );
+
+        let home = Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        ft.handle_event(&home);
+        assert_eq!(ft.cursor, 0);
+        assert_eq!(ft.scroll_offset, 0);
     }
 
     // ── Rendering Tests ───────────────────────────────────────────
