@@ -85,6 +85,7 @@ pub mod team_discovery;
 pub mod tool_dispatch;
 pub mod tool_execution_plan;
 pub mod tool_invocation;
+pub mod tool_memory;
 pub mod tool_orchestrator;
 pub mod trust_resolver;
 mod usage;
@@ -281,6 +282,7 @@ pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutio
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
 };
+pub use tool_memory::{memory_candidate_from_tool_invocation, ToolMemoryCandidatePolicy};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
