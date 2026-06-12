@@ -256,6 +256,35 @@ impl ToolInvocationRecord {
         ];
         event
     }
+
+    #[must_use]
+    pub fn evidence_reference(&self) -> String {
+        self.output_ref
+            .as_ref()
+            .map(|reference| reference.ref_id.clone())
+            .unwrap_or_else(|| self.invocation_id.clone())
+    }
+
+    #[must_use]
+    pub fn evidence_summary(&self) -> String {
+        let mut parts = vec![
+            format!("tool `{}`", self.tool_name),
+            format!("status {}", self.status.as_str()),
+        ];
+        if let Some(duration_ms) = self.duration_ms {
+            parts.push(format!("duration {duration_ms}ms"));
+        }
+        if let Some(line_count) = self.output_line_count {
+            parts.push(format!("output {line_count} lines"));
+        }
+        if let Some(failure_kind) = self.failure_kind {
+            parts.push(format!("failure {}", failure_kind.as_str()));
+        }
+        if self.output_ref.is_some() {
+            parts.push("large output indexed by reference".to_string());
+        }
+        parts.join(", ")
+    }
 }
 
 #[must_use]
@@ -408,5 +437,29 @@ mod tests {
         );
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(!serialized.contains("unique-large-output-token-79"));
+    }
+
+    #[test]
+    fn agent_evidence_summary_uses_refs_for_large_output() {
+        let output = (0..80)
+            .map(|idx| format!("line {idx} {}", "x".repeat(24)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-large",
+            "bash",
+            "generate",
+            ToolSafetyCategory::WriteLocal,
+            200,
+        )
+        .completed_with_output_policy(&output, 250, 3);
+
+        assert!(record.evidence_reference().starts_with("tool-output:"));
+        let summary = record.evidence_summary();
+        assert!(summary.contains("tool `bash`"));
+        assert!(summary.contains("large output indexed by reference"));
+        assert!(!summary.contains("line 79"));
     }
 }
