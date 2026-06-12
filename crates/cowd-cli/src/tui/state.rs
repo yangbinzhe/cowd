@@ -168,6 +168,60 @@ fn char_col_to_byte_offset(text: &str, col: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TuiFrameAreas {
+    system: ratatui::layout::Rect,
+    search: Option<ratatui::layout::Rect>,
+    body: ratatui::layout::Rect,
+    input: ratatui::layout::Rect,
+    status: ratatui::layout::Rect,
+}
+
+impl TuiFrameAreas {
+    fn build(area: ratatui::layout::Rect, input_h: u16, search_active: bool) -> Self {
+        let top_h = 1u16;
+        let bottom_status_h = 1u16;
+        let system = ratatui::layout::Rect::new(area.x, area.y, area.width, top_h);
+        let status = ratatui::layout::Rect::new(
+            area.x,
+            area.y
+                .saturating_add(area.height.saturating_sub(bottom_status_h)),
+            area.width,
+            bottom_status_h,
+        );
+        let input_y = status.y.saturating_sub(input_h);
+        let input = ratatui::layout::Rect::new(area.x, input_y, area.width, input_h);
+        let available_body_h = input_y.saturating_sub(system.y.saturating_add(system.height));
+        let search_h = if search_active && available_body_h > 1 {
+            1
+        } else {
+            0
+        };
+        let search = (search_h > 0).then(|| {
+            ratatui::layout::Rect::new(
+                area.x,
+                system.y.saturating_add(system.height),
+                area.width,
+                search_h,
+            )
+        });
+        let body_y = system
+            .y
+            .saturating_add(system.height)
+            .saturating_add(search_h);
+        let body_h = input_y.saturating_sub(body_y);
+        let body = ratatui::layout::Rect::new(area.x, body_y, area.width, body_h);
+
+        Self {
+            system,
+            search,
+            body,
+            input,
+            status,
+        }
+    }
+}
+
 // ── TuiState ────────────────────────────────────────────────────
 
 /// Unified TUI application state.
@@ -675,22 +729,25 @@ impl TuiState {
         let input_lines = self.app.input.lines().len().max(1) as u16;
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
-        let top_h = 1u16;
-        let bottom_status_h = 1u16;
-        let content_area = ratatui::layout::Rect::new(
-            area.x,
-            area.y.saturating_add(top_h),
-            area.width,
-            area.height
-                .saturating_sub(top_h)
-                .saturating_sub(bottom_status_h)
-                .saturating_sub(input_h),
-        );
+        let frame_areas = TuiFrameAreas::build(area, input_h, self.app.search_active);
 
-        // FIX A: Render search bar BEFORE content to prevent overlap
-        if self.app.search_active {
-            let search_area =
-                ratatui::layout::Rect::new(content_area.x, content_area.y, content_area.width, 1);
+        // ── Main content: one RenderContext for chat, sidebar, status, input ──
+        let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
+        let toast_anchor_area: ratatui::layout::Rect;
+        let thinking_anchor_area: ratatui::layout::Rect;
+
+        {
+            let _guard = self.render_profiler.guard("system_status_bar");
+            let _ = error_recovery::catch_render_panic(
+                "system_status_bar",
+                AssertUnwindSafe(|| {
+                    self.system_status_bar
+                        .render(&mut main_ctx, frame_areas.system);
+                }),
+            );
+        }
+
+        if let Some(search_area) = frame_areas.search {
             let search_text = if self.app.search_query.is_empty() {
                 "/ ".to_string()
             } else {
@@ -708,52 +765,39 @@ impl TuiState {
                     ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
                 ),
             ]);
-            frame.render_widget(ratatui::widgets::Paragraph::new(search_line), search_area);
-        }
-
-        // ── Main content: one RenderContext for chat, sidebar, status, input ──
-        let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
-        let toast_anchor_area: ratatui::layout::Rect;
-
-        {
-            let system_area = ratatui::layout::Rect::new(area.x, area.y, area.width, top_h);
-            let _guard = self.render_profiler.guard("system_status_bar");
-            let _ = error_recovery::catch_render_panic(
-                "system_status_bar",
-                AssertUnwindSafe(|| {
-                    self.system_status_bar.render(&mut main_ctx, system_area);
-                }),
-            );
+            main_ctx
+                .frame_mut()
+                .render_widget(ratatui::widgets::Paragraph::new(search_line), search_area);
         }
 
         // 1. Render chat view + sidebar using the layout tree
         {
-            self.layout_tree.resize(content_area);
-            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(content_area);
+            self.layout_tree.resize(frame_areas.body);
+            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(frame_areas.body);
             let topic_fullscreen = self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
-                && content_area.width < 100;
+                && frame_areas.body.width < 100;
             if self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
-                && content_area.width >= 100
+                && frame_areas.body.width >= 100
             {
-                let max_topic_w = content_area.width.saturating_sub(40);
+                let max_topic_w = frame_areas.body.width.saturating_sub(40);
                 let topic_w =
-                    ((content_area.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
-                chat_area.width = content_area.width.saturating_sub(topic_w).max(40);
+                    ((frame_areas.body.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
+                chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
             if topic_fullscreen {
                 chat_area.width = 0;
                 toast_anchor_area = ratatui::layout::Rect::new(
-                    content_area.x,
-                    content_area.y,
-                    content_area.width.min(56),
-                    content_area.height,
+                    frame_areas.body.x,
+                    frame_areas.body.y,
+                    frame_areas.body.width.min(56),
+                    frame_areas.body.height,
                 );
             } else if self.layout_state.sidebar_visible {
                 toast_anchor_area = chat_area;
             } else {
-                toast_anchor_area = content_area;
+                toast_anchor_area = frame_areas.body;
             }
             let activity_area = if show_activity_panel && chat_area.width >= 72 {
                 let desired = (chat_area.width / 3).clamp(30, 48);
@@ -773,20 +817,22 @@ impl TuiState {
                 None
             };
             let sidebar_area = if topic_fullscreen {
-                content_area
+                frame_areas.body
             } else {
                 let sidebar_x = chat_area.x.saturating_add(chat_area.width);
-                let sidebar_w = content_area
+                let sidebar_w = frame_areas
+                    .body
                     .x
-                    .saturating_add(content_area.width)
+                    .saturating_add(frame_areas.body.width)
                     .saturating_sub(sidebar_x);
                 ratatui::layout::Rect::new(
                     sidebar_x,
-                    content_area.y,
+                    frame_areas.body.y,
                     sidebar_w,
-                    content_area.height,
+                    frame_areas.body.height,
                 )
             };
+            thinking_anchor_area = chat_area;
 
             self.chat_view.scroll_state.offset = self.app.scroll_offset;
             self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
@@ -986,14 +1032,12 @@ impl TuiState {
 
         // 2. Render status bar at bottom (reuses main_ctx)
         {
-            let status_area =
-                ratatui::layout::Rect::new(0, area.height.saturating_sub(1), area.width, 1);
             let degraded = {
                 let _guard = self.render_profiler.guard("status_bar");
                 match error_recovery::catch_render_panic(
                     "status_bar",
                     AssertUnwindSafe(|| {
-                        self.status_bar.render(&mut main_ctx, status_area);
+                        self.status_bar.render(&mut main_ctx, frame_areas.status);
                     }),
                 ) {
                     RenderResult::Ok => None,
@@ -1008,8 +1052,6 @@ impl TuiState {
         // 2.5. Render input directly from app.input (BUG 1 FIX: single source of truth)
         // FIX B: Set block on textarea before rendering for cursor visibility
         {
-            let input_y = area.height.saturating_sub(1 + input_h);
-            let input_area = ratatui::layout::Rect::new(0, input_y, area.width, input_h);
             self.app.input.set_block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
@@ -1020,7 +1062,7 @@ impl TuiState {
                 let _guard = self.render_profiler.guard("input");
                 main_ctx
                     .frame_mut()
-                    .render_widget(&self.app.input, input_area);
+                    .render_widget(&self.app.input, frame_areas.input);
             }
             // Render prompt's autocomplete dropdown as overlay
             {
@@ -1028,7 +1070,8 @@ impl TuiState {
                 let _ = error_recovery::catch_render_panic(
                     "prompt_dropdown",
                     AssertUnwindSafe(|| {
-                        self.prompt.render_dropdown(&mut main_ctx, input_area);
+                        self.prompt
+                            .render_dropdown(&mut main_ctx, frame_areas.input);
                     }),
                 );
             }
@@ -1037,7 +1080,8 @@ impl TuiState {
                 let _ = error_recovery::catch_render_panic(
                     "context_suggestions",
                     AssertUnwindSafe(|| {
-                        self.context_suggestions.render(&mut main_ctx, input_area);
+                        self.context_suggestions
+                            .render(&mut main_ctx, frame_areas.input);
                     }),
                 );
             }
@@ -1049,18 +1093,15 @@ impl TuiState {
         // 3. Render thinking panel as compact floating box when turn is active.
         // Positioned at top-right of chat area so it doesn't obscure the full screen.
         if self.app.turn_active {
-            // Compute a compact area: top-right corner of the main chat region.
-            // Width ~35% of screen, height capped at 12 rows.
-            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
-            chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
-            let thinking_w = (area.width / 3).max(30).min(50);
-            let thinking_h = (chat_area.height / 3).max(6).min(14);
-            let thinking_x = chat_area.x + chat_area.width.saturating_sub(thinking_w);
-            let thinking_y = if self.app.search_active {
-                1
+            let anchor = if thinking_anchor_area.width >= 30 && thinking_anchor_area.height >= 6 {
+                thinking_anchor_area
             } else {
-                chat_area.y
+                frame_areas.body
             };
+            let thinking_w = (anchor.width / 3).max(30).min(50).min(anchor.width);
+            let thinking_h = (anchor.height / 3).max(6).min(14).min(anchor.height);
+            let thinking_x = anchor.x + anchor.width.saturating_sub(thinking_w);
+            let thinking_y = anchor.y;
             let thinking_area =
                 ratatui::layout::Rect::new(thinking_x, thinking_y, thinking_w, thinking_h);
 
@@ -1154,7 +1195,8 @@ impl TuiState {
                     match error_recovery::catch_render_panic(
                         "l4_knowledge_view",
                         AssertUnwindSafe(|| {
-                            self.l4_knowledge_view.render(&mut overlay_ctx, area);
+                            self.l4_knowledge_view
+                                .render(&mut overlay_ctx, frame_areas.body);
                         }),
                     ) {
                         RenderResult::Ok => None,
@@ -1270,7 +1312,7 @@ impl TuiState {
 
         // 11. Render startup loading overlay (highest z-index, below dialogs)
         if self.startup_phase != StartupPhase::Done {
-            self.render_startup_overlay(frame, area);
+            self.render_startup_overlay(frame, frame_areas.body);
         }
 
         // 12. Render which-key overlay when Space leader is active
@@ -3100,8 +3142,8 @@ impl TuiState {
         let fg = self.theme_engine.theme.palette.fg;
         let bg = self.theme_engine.theme.palette.muted;
 
-        let overlay_y = area.height.saturating_sub(2);
-        let overlay_rect = ratatui::layout::Rect::new(0, overlay_y, area.width, 1);
+        let overlay_y = area.y.saturating_add(area.height.saturating_sub(1));
+        let overlay_rect = ratatui::layout::Rect::new(area.x, overlay_y, area.width, 1);
 
         let paragraph = Paragraph::new(Span::styled(text, Style::default().fg(fg).bg(bg)))
             .alignment(Alignment::Center);
@@ -3275,8 +3317,14 @@ impl L4KnowledgeView {
             )));
         }
 
+        let width = area.width.min(40);
         let height = (lines.len() as u16 + 2).min(area.height);
-        let rect = ratatui::layout::Rect::new(area.width.saturating_sub(40), 0, 40, height);
+        let rect = ratatui::layout::Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(width)),
+            area.y,
+            width,
+            height,
+        );
 
         let paragraph = Paragraph::new(lines).block(block);
         ctx.frame_mut().render_widget(paragraph, rect);
@@ -4354,6 +4402,50 @@ providers:
 
         assert!(joined.contains("focus:memory"), "missing focus: {joined}");
         assert!(joined.contains("Enter detail"), "missing hint: {joined}");
+    }
+
+    #[test]
+    fn render_search_bar_is_not_cleared_by_chat_view() {
+        let mut state = TuiState::new("m", "s");
+        state.app.search_active = true;
+        state.app.search_query = "needle".to_string();
+        state
+            .app
+            .add_message("assistant", "needle in the conversation");
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(joined.contains("/ needle"), "missing search bar: {joined}");
+        assert!(
+            joined.contains("Esc:cancel Enter:search"),
+            "missing search hint: {joined}"
+        );
+        assert!(joined.contains("needle in the conversation"));
+    }
+
+    #[test]
+    fn startup_overlay_stays_above_input_area() {
+        let mut state = TuiState::new("m", "s");
+        state.startup_phase = StartupPhase::Loading;
+
+        let mut terminal = MockTerminal::new(100, 24);
+        terminal.draw(|frame| state.render(frame));
+        let lines = terminal.buffer_lines();
+        let loading_row = lines
+            .iter()
+            .position(|line| line.contains("Loading plugins"))
+            .expect("loading overlay should render");
+        let input_row = lines
+            .iter()
+            .position(|line| line.contains("Input (Enter=send"))
+            .expect("input should render");
+
+        assert!(
+            loading_row < input_row,
+            "loading overlay row {loading_row} should be above input row {input_row}"
+        );
     }
 
     #[test]
