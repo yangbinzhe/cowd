@@ -13,6 +13,7 @@ pub mod keybind;
 pub mod layout;
 pub mod md_renderer;
 pub mod osc52;
+pub mod panel_policy;
 pub mod profiler;
 pub mod projection_client;
 pub mod render;

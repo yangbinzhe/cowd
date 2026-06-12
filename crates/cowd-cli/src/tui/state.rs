@@ -59,6 +59,7 @@ use crate::tui::keybind::types::Action;
 use crate::tui::keybind::which_key::WhichKey;
 use crate::tui::keybind::{default_bindings, KeybindEngine};
 use crate::tui::layout::LayoutTree;
+use crate::tui::panel_policy::{should_sync_panel, SidebarPanel};
 use crate::tui::profiler::{FrameTimer, RenderProfiler};
 use crate::tui::theme::ThemeEngine;
 use runtime::CowdEvent;
@@ -473,6 +474,8 @@ impl TuiState {
 
         // Context suggestions tick: drain L4 events, expire stale suggestions
         self.context_suggestions.tick();
+        let active_panel =
+            SidebarPanel::from_tab(self.sidebar_active_tab).unwrap_or(SidebarPanel::Runtime);
 
         // Sync chat view from App state before rendering
         self.chat_view.sync_from_app(&self.app);
@@ -502,24 +505,33 @@ impl TuiState {
         // Sync approval/permission cockpit from daemon runtime state.
         self.approval_cockpit_panel.sync_from_app(&self.app);
 
-        // Sync diff viewer from App (extract diff text from timeline ToolCall outputs)
-        self.diff_viewer.sync_from_app(&self.app);
+        // Heavy panels are synced only when their tab is active.
+        if should_sync_panel(active_panel, SidebarPanel::Diff) {
+            self.diff_viewer.sync_from_app(&self.app);
+        }
 
         // Sync file tree from App file_entries
-        if !self.app.file_entries.is_empty() {
+        if should_sync_panel(active_panel, SidebarPanel::Files) && !self.app.file_entries.is_empty()
+        {
             self.file_tree.rebuild(&self.app.file_entries);
         }
 
         // Sync session sidebar from App picker_sessions
-        if !self.app.picker_sessions.is_empty() {
+        if should_sync_panel(active_panel, SidebarPanel::Sessions)
+            && !self.app.picker_sessions.is_empty()
+        {
             self.session_sidebar.load(self.app.picker_sessions.clone());
         }
-        self.session_sidebar
-            .set_current_session(&self.app.session_id);
+        if should_sync_panel(active_panel, SidebarPanel::Sessions) {
+            self.session_sidebar
+                .set_current_session(&self.app.session_id);
+        }
 
         // Sync memory panel from the real cognitive store only when the tab is
         // visible. Keep App fallback for memory-disabled sessions.
-        if self.sidebar_active_tab == 9 && self.memory_panel.memory_manager.is_some() {
+        if should_sync_panel(active_panel, SidebarPanel::Memory)
+            && self.memory_panel.memory_manager.is_some()
+        {
             let should_sync = self
                 .memory_panel_last_sync
                 .map(|last| last.elapsed() >= Duration::from_millis(750))
@@ -528,7 +540,7 @@ impl TuiState {
                 self.memory_panel.sync_from_cognitive();
                 self.memory_panel_last_sync = Some(Instant::now());
             }
-        } else {
+        } else if should_sync_panel(active_panel, SidebarPanel::Memory) {
             self.memory_panel.sync_from_app(&self.app);
         }
 
@@ -537,10 +549,14 @@ impl TuiState {
         self.performance_dashboard.sync(&self.memory_orchestrator);
 
         // Sync skills panel from App state
-        self.skills_panel.sync_from_app(&self.app);
+        if should_sync_panel(active_panel, SidebarPanel::Skills) {
+            self.skills_panel.sync_from_app(&self.app);
+        }
 
         // Sync gateway panel from App state
-        self.gateway_panel.sync_from_app(&self.app);
+        if should_sync_panel(active_panel, SidebarPanel::Gateway) {
+            self.gateway_panel.sync_from_app(&self.app);
+        }
 
         // BUG 1 FIX: No bidirectional sync — app.input is the single source of truth.
         // Prompt is used only for autocomplete suggestions (rendered as overlay dropdown).
@@ -641,8 +657,8 @@ impl TuiState {
                 sidebar_area.width,
                 sidebar_area.height.saturating_sub(tab_height),
             );
-            // Sync diff_viewer before rendering
-            {
+            // Sync diff_viewer before rendering only when the diff panel is active.
+            if active_panel == SidebarPanel::Diff {
                 // Collect diff text from recent tool calls for diff viewer
                 let diffs: Vec<String> = self
                     .app
