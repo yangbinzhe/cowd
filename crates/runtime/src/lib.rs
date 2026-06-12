@@ -83,6 +83,7 @@ pub mod task_registry;
 pub mod team_cron_registry;
 pub mod team_discovery;
 pub mod tool_dispatch;
+pub mod tool_execution_plan;
 pub mod tool_invocation;
 pub mod tool_orchestrator;
 pub mod trust_resolver;
@@ -276,6 +277,7 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
+pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
 };

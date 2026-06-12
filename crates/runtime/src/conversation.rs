@@ -51,6 +51,7 @@ use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
+use crate::tool_execution_plan::ToolExecutionPlan;
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
@@ -1782,6 +1783,8 @@ where
                     .collect();
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
+                let execution_plan = ToolExecutionPlan::from_requests(&requests);
+                self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
                 let (read_indices, rest_indices) = categorize(&requests);
 
                 let mut result_map: std::collections::HashMap<
@@ -3259,6 +3262,25 @@ where
                 "indexed oversized tool output"
             );
         }
+    }
+
+    fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, sequence: usize) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let event = plan.to_runtime_event(session_id.clone(), sequence, now_ms());
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "tool execution plan event append failed"
+                );
+            }
+        });
     }
 
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
