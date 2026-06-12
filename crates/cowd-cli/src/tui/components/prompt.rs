@@ -22,7 +22,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::tui::components::base::{Component, EventResult, RenderContext};
@@ -1170,24 +1170,41 @@ impl Prompt {
         chars[start..chars.len()].iter().collect()
     }
 
-    /// Render the suggestion dropdown below the input area.
+    /// Render the suggestion dropdown near the input area.
     /// Public so TuiState can call it after rendering app.input directly.
     pub fn render_dropdown(&self, ctx: &mut RenderContext, base_area: Rect) {
         if !self.show_suggestions || self.suggestions.is_empty() {
             return;
         }
 
-        let dropdown_width = base_area.width.min(60);
-        let dropdown_y = base_area.y + base_area.height;
-        let visible_suggestions = self.suggestions.len().min(self.engine.max_suggestions);
-        let dropdown_h = visible_suggestions as u16 + 2;
+        let screen = ctx.area();
+        let dropdown_width = base_area.width.saturating_sub(2).min(60).max(16);
+        let desired_visible = self
+            .suggestions
+            .len()
+            .min(self.engine.max_suggestions)
+            .max(1);
+        let desired_h = desired_visible as u16 + 2;
+        let below_y = base_area.y.saturating_add(base_area.height);
+        let below_space = screen
+            .y
+            .saturating_add(screen.height)
+            .saturating_sub(below_y);
+        let above_space = base_area.y.saturating_sub(screen.y);
 
-        // Ensure dropdown fits on screen
-        let screen_h = ctx.area().height;
-        if dropdown_y + dropdown_h > screen_h {
-            // Not enough room — skip rendering or render above
+        let (dropdown_y, dropdown_h) = if below_space >= desired_h {
+            (below_y, desired_h)
+        } else if above_space >= 3 {
+            let h = desired_h.min(above_space);
+            (base_area.y.saturating_sub(h), h)
+        } else if below_space >= 3 {
+            (below_y, desired_h.min(below_space))
+        } else {
             return;
-        }
+        };
+        let visible_suggestions = (dropdown_h.saturating_sub(2) as usize)
+            .min(self.suggestions.len())
+            .max(1);
 
         let dropdown_area = Rect::new(
             base_area.x + 2, // indent slightly
@@ -1234,6 +1251,7 @@ impl Prompt {
             .block(block)
             .style(Style::default().fg(Color::Gray));
 
+        ctx.frame_mut().render_widget(Clear, dropdown_area);
         ctx.frame_mut().render_widget(paragraph, dropdown_area);
     }
 }
@@ -1422,6 +1440,7 @@ impl Prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_utils::MockTerminal;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1888,6 +1907,32 @@ mod tests {
         assert!(enter.is_consumed());
         assert_eq!(prompt.text(), selected);
         assert!(!prompt.show_suggestions);
+    }
+
+    #[test]
+    fn dropdown_renders_above_bottom_anchored_input() {
+        let mut prompt = Prompt::new("/tmp");
+        for c in "/s".chars() {
+            let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
+        }
+        assert!(prompt.show_suggestions);
+
+        let mut terminal = MockTerminal::new(80, 12);
+        terminal.draw(|frame| {
+            let skin = crate::tui::skin::SkinConfig::default();
+            let mut ctx = RenderContext::new(frame, &skin);
+            prompt.render_dropdown(&mut ctx, Rect::new(0, 8, 80, 3));
+        });
+        let lines = terminal.buffer_lines();
+        let suggestion_row = lines
+            .iter()
+            .position(|line| line.contains("suggestions"))
+            .expect("dropdown should render above the input");
+
+        assert!(
+            suggestion_row < 8,
+            "suggestions row {suggestion_row} should be above input row 8"
+        );
     }
 
     #[test]
