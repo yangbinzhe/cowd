@@ -51,7 +51,9 @@ use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
-use crate::tool_invocation::{now_ms, ToolFailureKind, ToolInvocationRecord};
+use crate::tool_invocation::{
+    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
+};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -283,6 +285,8 @@ pub struct ConversationRuntime<C, T> {
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
+    /// Runtime-local searchable index for oversized tool outputs.
+    tool_output_sandbox: Option<Arc<std::sync::Mutex<memory::ToolOutputSandbox>>>,
     /// Optional SSE callback for real-time streaming events to WebUI.
     /// Receives pre-formatted JSON event strings.
     sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -475,6 +479,13 @@ where
             tool_callback: None,
             session_store: None,
             event_log: None,
+            tool_output_sandbox: memory::ToolOutputSandbox::new()
+                .map(|sandbox| Arc::new(std::sync::Mutex::new(sandbox)))
+                .map_err(|error| {
+                    tracing::warn!(%error, "tool output sandbox unavailable");
+                    error
+                })
+                .ok(),
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
@@ -2471,15 +2482,21 @@ where
                     combined.push_str("\n");
                     combined.push_str(msg);
                 }
+                self.maybe_index_tool_output(tool_use_id, tool_name, &combined);
                 let truncated = self.tool_orchestrator.truncate_result(&combined);
                 let completed_record = if is_error {
-                    invocation_record.failed(
+                    invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
-                        &truncated,
+                        &combined,
                         now_ms(),
+                        DEFAULT_OUTPUT_REF_MIN_LINES,
                     )
                 } else {
-                    invocation_record.completed(&truncated, now_ms())
+                    invocation_record.completed_with_output_policy(
+                        &combined,
+                        now_ms(),
+                        DEFAULT_OUTPUT_REF_MIN_LINES,
+                    )
                 };
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
@@ -3215,6 +3232,33 @@ where
                 );
             }
         });
+    }
+
+    fn maybe_index_tool_output(&self, tool_use_id: &str, tool_name: &str, output: &str) {
+        if output.lines().count() < DEFAULT_OUTPUT_REF_MIN_LINES {
+            return;
+        }
+        let Some(ref sandbox) = self.tool_output_sandbox else {
+            return;
+        };
+        let Ok(mut guard) = sandbox.lock() else {
+            tracing::warn!(
+                tool_call_id = tool_use_id,
+                "tool output sandbox lock poisoned"
+            );
+            return;
+        };
+        if let Some(summary) =
+            guard.index_tool_output(tool_use_id, tool_name, output, DEFAULT_OUTPUT_REF_MIN_LINES)
+        {
+            tracing::debug!(
+                tool_call_id = tool_use_id,
+                tool_name,
+                total_lines = summary.total_lines,
+                full_size_bytes = summary.full_size_bytes,
+                "indexed oversized tool output"
+            );
+        }
     }
 
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {

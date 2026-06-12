@@ -9,6 +9,7 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 
 const INPUT_PREVIEW_CHARS: usize = 240;
 const OUTPUT_PREVIEW_CHARS: usize = 500;
+pub const DEFAULT_OUTPUT_REF_MIN_LINES: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +64,16 @@ impl ToolFailureKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputRef {
+    pub ref_id: String,
+    pub tool_call_id: String,
+    pub line_count: usize,
+    pub byte_count: usize,
+    pub sha256: String,
+    pub search_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationRecord {
     pub invocation_id: String,
     pub session_id: String,
@@ -76,7 +87,10 @@ pub struct ToolInvocationRecord {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub output_line_count: Option<usize>,
+    pub output_byte_count: Option<usize>,
     pub output_preview: Option<String>,
+    pub output_ref: Option<ToolOutputRef>,
     pub is_error: Option<bool>,
     pub failure_kind: Option<ToolFailureKind>,
 }
@@ -105,7 +119,10 @@ impl ToolInvocationRecord {
             started_at_ms,
             ended_at_ms: None,
             duration_ms: None,
+            output_line_count: None,
+            output_byte_count: None,
             output_preview: None,
+            output_ref: None,
             is_error: None,
             failure_kind: None,
         }
@@ -113,10 +130,26 @@ impl ToolInvocationRecord {
 
     #[must_use]
     pub fn completed(mut self, output: &str, ended_at_ms: u64) -> Self {
+        self = self.with_output_digest(output, DEFAULT_OUTPUT_REF_MIN_LINES);
         self.status = ToolInvocationStatus::Completed;
         self.ended_at_ms = Some(ended_at_ms);
         self.duration_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
-        self.output_preview = Some(preview(output, OUTPUT_PREVIEW_CHARS));
+        self.is_error = Some(false);
+        self.failure_kind = None;
+        self
+    }
+
+    #[must_use]
+    pub fn completed_with_output_policy(
+        mut self,
+        output: &str,
+        ended_at_ms: u64,
+        output_ref_min_lines: usize,
+    ) -> Self {
+        self = self.with_output_digest(output, output_ref_min_lines);
+        self.status = ToolInvocationStatus::Completed;
+        self.ended_at_ms = Some(ended_at_ms);
+        self.duration_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
         self.is_error = Some(false);
         self.failure_kind = None;
         self
@@ -124,6 +157,23 @@ impl ToolInvocationRecord {
 
     #[must_use]
     pub fn failed(mut self, kind: ToolFailureKind, output: &str, ended_at_ms: u64) -> Self {
+        self = self.with_output_digest(output, DEFAULT_OUTPUT_REF_MIN_LINES);
+        self.apply_failure(kind, ended_at_ms)
+    }
+
+    #[must_use]
+    pub fn failed_with_output_policy(
+        mut self,
+        kind: ToolFailureKind,
+        output: &str,
+        ended_at_ms: u64,
+        output_ref_min_lines: usize,
+    ) -> Self {
+        self = self.with_output_digest(output, output_ref_min_lines);
+        self.apply_failure(kind, ended_at_ms)
+    }
+
+    fn apply_failure(mut self, kind: ToolFailureKind, ended_at_ms: u64) -> Self {
         self.status = match kind {
             ToolFailureKind::Timeout => ToolInvocationStatus::TimedOut,
             ToolFailureKind::ApprovalDenied
@@ -134,9 +184,24 @@ impl ToolInvocationRecord {
         };
         self.ended_at_ms = Some(ended_at_ms);
         self.duration_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
-        self.output_preview = Some(preview(output, OUTPUT_PREVIEW_CHARS));
         self.is_error = Some(true);
         self.failure_kind = Some(kind);
+        self
+    }
+
+    fn with_output_digest(mut self, output: &str, output_ref_min_lines: usize) -> Self {
+        let line_count = output.lines().count();
+        let byte_count = output.len();
+        self.output_line_count = Some(line_count);
+        self.output_byte_count = Some(byte_count);
+        self.output_preview = Some(preview(output, OUTPUT_PREVIEW_CHARS));
+        self.output_ref = large_output_ref(
+            &self.tool_call_id,
+            output,
+            line_count,
+            byte_count,
+            output_ref_min_lines,
+        );
         self
     }
 
@@ -154,7 +219,10 @@ impl ToolInvocationRecord {
             "started_at_ms": self.started_at_ms,
             "ended_at_ms": self.ended_at_ms,
             "duration_ms": self.duration_ms,
+            "output_line_count": self.output_line_count,
+            "output_byte_count": self.output_byte_count,
             "output_preview": self.output_preview,
+            "output_ref": self.output_ref,
             "is_error": self.is_error,
             "failure_kind": self.failure_kind.map(ToolFailureKind::as_str),
         });
@@ -202,6 +270,28 @@ fn stable_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn large_output_ref(
+    tool_call_id: &str,
+    output: &str,
+    line_count: usize,
+    byte_count: usize,
+    output_ref_min_lines: usize,
+) -> Option<ToolOutputRef> {
+    if line_count < output_ref_min_lines {
+        return None;
+    }
+    let sha256 = stable_hash(output);
+    let short_hash: String = sha256.chars().take(16).collect();
+    Some(ToolOutputRef {
+        ref_id: format!("tool-output:{tool_call_id}:{short_hash}"),
+        tool_call_id: tool_call_id.to_string(),
+        line_count,
+        byte_count,
+        sha256,
+        search_hint: format!("/sandbox-search {tool_call_id} <query>"),
+    })
 }
 
 fn preview(value: &str, limit: usize) -> String {
@@ -285,5 +375,38 @@ mod tests {
         let event = record.to_runtime_event(10, "tool.invocation.failed");
         assert_eq!(event.payload["failure_kind"], "execution_error");
         assert_eq!(event.payload["output_preview"], "boom");
+    }
+
+    #[test]
+    fn large_output_event_uses_reference_without_full_body() {
+        let output = (0..80)
+            .map(|idx| {
+                format!(
+                    "line {idx} unique-large-output-token-{idx} {}",
+                    "x".repeat(24)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-large",
+            "bash",
+            "generate",
+            ToolSafetyCategory::WriteLocal,
+            200,
+        )
+        .completed_with_output_policy(&output, 250, 3);
+
+        let event = record.to_runtime_event(10, "tool.invocation.completed");
+        assert_eq!(event.payload["output_line_count"], 80);
+        assert_eq!(event.payload["output_ref"]["tool_call_id"], "toolu-large");
+        assert_eq!(
+            event.payload["output_ref"]["search_hint"],
+            "/sandbox-search toolu-large <query>"
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(!serialized.contains("unique-large-output-token-79"));
     }
 }
