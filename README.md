@@ -1,895 +1,980 @@
-# COWD — AI Agent Runtime
+# Cowd
 
-> **Rust 原生 AI 运行时框架 + 结构化运营智能系统**
-> v0.9.104 · IACC · Unified Daemon Runtime · SQLite Session Source-of-Truth
-> TUI/WebUI Control · Connector Runtime · Cross-plane Governance · MCP/Feishu/Local Service
+Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Connector、Cross-plane 治理和 IACC 结构化运营智能。
 
----
+当前版本：`0.9.108`
 
-## 系统架构总览
+当前安装约定：
 
-COWD 是一个七层异构系统：下层承载 AI 智能体的基础设施（会话、记忆、编排、安全），上层嫁接结构化运营智能（IACC）用于企业运营决策。
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         VII.  产品交互层  (Product Layer)                      │
-│  Command Center ▏ Personal Cockpit ▏ Incident Room ▏ Report ▏ Case UI        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                          VI.  接入层  (Access Layer)                          │
-│     CLI · TUI(9/9 panels) · WebUI · Gateway(HTTP:8642) · Feishu · WeCom      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                      V.  Cowd 统一运行时层  (Cowd Runtime)                     │
-│ ┌────────────┐ ┌──────────┐ ┌─────────────────┐ ┌──────────────────────┐    │
-│ │ Session    │ │ Agent    │ │ Context         │ │ Channel/Permission   │    │
-│ │ Kernel     │ │ WorkGraph│ │ Runtime         │ │ PolicyEngine         │    │
-│ │ Lifecycle  │ │ Wave     │ │ StableHeader    │ │ CrossPlanePolicy     │    │
-│ │ LeaseMgr   │ │ SubAgent │ │ Snapshot/Diff   │ │ Identity/Grant/Audit │    │
-│ └─────┬──────┘ └────┬─────┘ └───────┬─────────┘ └───────────┬──────────┘    │
-│       └──────────────┴──────────────┼────────────────────────┘               │
-│                                     ▼                                        │
-│ ┌──────────────────────────────────────────────────────────────────────┐    │
-│ │                      Memory System (3D: Scope × Layer × State)        │    │
-│ │  10 Groups · 36 Modules · CodeIndexer(tree-sitter) · Universal Scan   │    │
-│ └──────────────────────────────────────────────────────────────────────┘    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│               IV.  Connector 运行时  (Connector Runtime)                      │
-│  ConnectorRegistry · CapabilityManifest · ResourceDirectory · Feishu Plane   │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ ┌──────────────────────────────────────────────────────────────────────┐    │
-│ │                III.  IACC 结构化运营智能  (Operating Intelligence)     │    │
-│ │                                                                        │    │
-│ │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────────────┐  │    │
-│ │  │ Attention │  │ Evidence  │  │ Quality   │  │ Analysis          │  │    │
-│ │  │ Item      │─▶│ Packet    │─▶│ Gate      │─▶│ Attribution       │  │    │
-│ │  │ Priority  │  │ Budget    │  │ 6-dim     │  │ ImpactPropagation │  │    │
-│ │  └───────────┘  └───────────┘  └───────────┘  └─────────┬─────────┘  │    │
-│ │                                                         ▼              │    │
-│ │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────────────┐  │    │
-│ │  │ Incident  │  │ Execution │  │ Cockpit   │  │ Recovery          │  │    │
-│ │  │ Lifecycle │──│ dry_run/  │──│ Profile/  │──│ Monitor           │  │    │
-│ │  │ TaskBridge│  │ commit    │  │ Report    │  │ MemoryCase/Play   │  │    │
-│ │  └───────────┘  └───────────┘  └───────────┘  └───────────────────┘  │    │
-│ └──────────────────────────────────────────────────────────────────────┘    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ ┌──────────────────────────────────────────────────────────────────────┐    │
-│ │               II.  IACC 结构化认知层  (Structured Cognition)          │    │
-│ │                                                                        │    │
-│ │  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────────┐  ┌───────────────┐  │    │
-│ │  │ Entity│  │Relation│  │ Metric│  │MetricGraph│  │Compute        │  │    │
-│ │  │Resolve│──│Graph  │  │Define │──│Dependency │──│Job/Plan       │  │    │
-│ │  │Alias  │  │Impact │  │State  │  │Lineage    │  │Incremental    │  │    │
-│ │  └───────┘  └───────┘  └───────┘  └───────────┘  └───────────────┘  │    │
-│ └──────────────────────────────────────────────────────────────────────┘    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│              I.  IACC 数据处理层  (Data Processing)                           │
-│  SourceSnapshot · Fact(Ingest+Dedup) · Change(Deduplicate) · DomainSeed      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                        底层企业系统  (Enterprise Systems)                     │
-│    ERP · MES · PLM · WMS · SRM · QMS · Excel · DB · API · RPA               │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+- 主程序：`~/AI/cowd`
+- WebUI 静态资源：`~/AI/webui`
+- 不再使用：`~/AI/bin`
 
 ---
 
-## 项目规模
+## 1. 快速开始
 
-| Crate | 文件数 | 行数 | 职责 |
-|-------|--------|------|------|
-| `cowd-cli` | 70+ | ~47K | 主程序入口：CLI/TUI/Server/Gateway/daemon |
-| `runtime` | 79+ | ~45K | 运行时核心：会话、编排、安全、MCP、Connector、IACC |
-| `memory` | 61 | ~32K | 36 模块记忆系统 + 代码图谱 + 通用知识扫描 |
-| `tools` | 8 | ~10K | 50+ 内置工具规范 |
-| `commands` | 7 | ~9K | 100+ 斜杠命令 + 技能系统 |
-| `api` | 13 | ~8K | 多 Provider 模型适配层（Anthropic/OpenAI/DeepSeek/Qwen） |
-| `plugins` | 3 | ~4K | 插件注册与生命周期管理 |
-| `config` | 2 | ~2K | 统一配置管理（YAML-only） |
-| 其他 | 5 | ~2K | 遥测、兼容测试、Mock 服务 |
-| **总计** | **~250+** | **~170K** | |
-
----
-
-# 第一部分：Cowd 运行时基础设施
-
-## 1. 统一 Daemon Runtime
-
-v0.9.67-v0.9.75 重构后，Cowd 收束为**统一 daemon runtime** 架构：
-
-```
-                 ┌─────────────────────────────┐
-                 │       Unified Daemon         │
-                 │   ┌─────────────────────┐    │
-                 │   │    RuntimeHandle     │    │
-                 │   │  (Unified Entry)    │    │
-                 │   └─────────┬───────────┘    │
-                 │             │                │
-                 │   ┌─────────▼───────────┐    │
-                 │   │  ┌───────┐ ┌───────┐│    │
-                 │   │  │Socket │ │ HTTP  ││    │
-                 │   │  │Control│ │Proj.  ││    │
-                 │   │  │Plane  │ │Plane  ││    │
-                 │   │  └───┬───┘ └───┬───┘│    │
-                 │   └──────┼─────────┼────┘    │
-                 └──────────┼─────────┼─────────┘
-                            │         │
-              ┌─────────────▼──┐  ┌──▼──────────────┐
-              │  TUI Control   │  │  WebUI / HTTP    │
-              │  (Unix Socket) │  │  (Projection)    │
-              │  P95 <20ms     │  │  P95 <150ms      │
-              │  + SSE stream  │  │  + REST + SSE    │
-              └────────────────┘  └──────────────────┘
-```
-
-### Socket Control Plane — 核心指令协议
-
-本地控制面使用 Unix domain socket，支持 12 类指令：
-
-| 指令 | 作用 |
-|------|------|
-| `runtime.status` | 查询 daemon 健康状态和模块就绪度 |
-| `session.ensure` | 确保 session 存在（创建或复用） |
-| `session.attach` | 客户端 attach 到已有 session |
-| `session.detach` | 客户端 detach |
-| `session.lease.acquire` | 获取 session 写入租约 |
-| `session.lease.release` | 释放租约 |
-| `session.chat` | 发送对话 turn |
-| `task.start` | 启动异步任务 |
-| `agent.dispatch` | 派发 Agent 协作消息 |
-| `memory.query` | 查询记忆系统 |
-| `context.snapshot` | 获取上下文快照 |
-| `channel.execute` | 执行渠道特定操作 |
-
-每条指令携带：`protocol_version`, `request_id`, `session_id`, `actor`, `timeout_ms`, `idempotency_key`。
-每条响应返回：`ok`, `request_id`, `event_sequence`, `payload`, `error.kind`, `error.retryable`。
-
-### HTTP Projection Plane — REST API + Event Stream
-
-WebUI/远程访问走 HTTP 投影面，Gateway 提供：
-- 静态 WebUI 资源服务
-- REST 投影 API（`/api/runtime/*`, `/api/memory/*`, `/api/context/*` 等）
-- Server-Sent Events 实时流
-- Health/Readiness 探针
-
----
-
-## 2. 会话生命周期
-
-Session 是 Cowd 运行时的**根对象**，所有 agent/memory/context/task/channel 操作都挂靠到 session。
-
-```
-  ┌──────────────────────────────────────────────────────┐
-  │                  Session Lifecycle                    │
-  │                                                      │
-  │  ┌──────────┐   attach   ┌──────────────────────┐   │
-  │  │ CLI/TUI  │───────────▶│                       │   │
-  │  └──────────┘            │   ActiveSessions      │   │
-  │  ┌──────────┐   attach   │   (Hot Runtime Cache) │   │
-  │  │ WebUI    │───────────▶│                       │   │
-  │  └──────────┘            └───────────┬───────────┘   │
-  │                                      │ fan-out        │
-  │  ┌──────────┐   attach              ▼                │
-  │  │ Feishu   │───────────▶ ┌──────────────────────┐   │
-  │  └──────────┘             │ SessionEventBus       │   │
-  │                           │ (Multi-Frontend Sync) │   │
-  │                           └───────────┬───────────┘   │
-  │                                       │               │
-  │  ┌────────────────────────────────────▼───────────┐   │
-  │  │              SessionKernel                      │   │
-  │  │  ┌─────────┐  ┌──────────┐  ┌──────────────┐  │   │
-  │  │  │ Lease   │  │ Event    │  │ State        │  │   │
-  │  │  │ Manager │  │ Replay   │  │ Machine      │  │   │
-  │  │  └────┬────┘  └────┬─────┘  └──────┬───────┘  │   │
-  │  └───────┼────────────┼───────────────┼──────────┘   │
-  │          ▼            ▼               ▼              │
-  │  ┌──────────────────────────────────────────────┐    │
-  │  │          UnifiedSessionStore (SQLite)         │    │
-  │  │   session/message/event/snapshot/memory      │    │
-  │  └──────────────────────────────────────────────┘    │
-  └──────────────────────────────────────────────────────┘
-```
-
-**关键规则**：
-- SQLite/DB 是 session 运行态**唯一事实源**（不再依赖 JSONL）
-- 同一 session 可被多个前端同时 attach，通过 Lease 控制写入权
-- Event Replay 保证新 attach 的客户端能追上历史事件
-
----
-
-## 3. 多智能体编排
-
-### AgentWorkGraph
-
-```
-  Task Reception
-       │
-       ▼
-  Task Decomposition  ←── Agent Roles (researcher/reviewer/merger/executor)
-       │
-       ▼
-  ┌───────────────────────────────────┐
-  │         Wave Engine               │
-  │                                   │
-  │  Wave 1: [Task A] [Task B]       │  并行执行
-  │       │        │                  │
-  │       └───┬────┘                  │
-  │           ▼                       │
-  │  Wave 2: [Task C] [Task D]       │  依赖完成后并行
-  │           │        │              │
-  │           └───┬────┘              │
-  │               ▼                   │
-  │  Wave 3:      [Task E]           │  最终汇总
-  └───────────────────────────────────┘
-```
-
-### SubAgent 约束模型
-
-| 约束维度 | 限制 |
-|----------|------|
-| 工具列表 | 仅分配必要工具（如只读文件、写特定目录） |
-| WriteGuard | 限制写入 L3/L4，不可写 L0/L1 |
-| Token 预算 | 默认 20K 上限 |
-| 超时控制 | `timeout_secs` 可配置 |
-| 结果汇总 | 执行结果回流到父 Agent |
-
----
-
-# 第二部分：认知基础设施 — Memory System
-
-## 1. 3D 记忆架构（Scope × Layer × State）
-
-```
-          Scope轴 (知识属于谁)
-     Global ─── Project ─── Session ─── Agent
-           \        |         |       /
-            ═══◎ 记忆定位点 ◎═══
-           /        |         |       \
-     L0 ── L1 ──── L2 ───── L3 ──── L4
-          Layer轴 (知识如何存储)
-               ↑
-            State轴 (知识处于什么阶段)
-        Stable ─── Transient ─── Rotting ─── Archived
-```
-
-每个知识条目被三维坐标定位，系统据此决定：
-
-| 操作 | 决策逻辑 |
-|------|----------|
-| **写** | 确定目标 SQLite 存储、Layer、Write Strategy |
-| **读** | 确定 FTS5/BM25/Embedding 检索范围、重排序策略 |
-| **衰减** | Stable 永不压缩，Transient 逐代降级，Rotting 标记重建，Archived 冻结 |
-
-**五层含义**：
-- **L0 (Identity)**：Agent 是谁、角色定义、权限边界
-- **L1 (Essential)**：基础设施知识、关键架构决策、不可变项目上下文
-- **L2 (Project)**：项目代码结构、API 文档、业务逻辑
-- **L3 (Deep)**：会话历史、工具调用结果、推理链
-- **L4 (Shared)**：跨 Agent/跨会话共享共识（peer perception + hot topics）
-
-## 2. 36 模块 10 组分类
-
-| 组 | 模块 | 职责 | 关键连接 |
-|----|------|------|----------|
-| **调度中枢** | Cognitive, Orchestrator, SessionManager | 所有生命周期入口，编排记忆读/写 | ConversationRuntime → Cognitive → Orchestrator |
-| **范围隔离** | ProjectScopeManager | 每项目独立 SQLite，决定知识可见边界 | 所有 Scope=Project 的读写都经此路由 |
-| **代码智能** | CodeIndexer, ProjectKG, HotSymbols | tree-sitter AST → KG → L1 热槽 | prepare_context() 时注入当前文件结构 |
-| **检索引擎** | FTS5, BM25, FreshContext, Relevance | 4 维度召回，混合排序 | Extractor/Miner 写入 → 检索 → prepare_context |
-| **知识提取** | Extractor, Miner, ToolSandbox | 对话/工具输出/文件 → 结构化知识 | on_turn_end → Extractor → Miner → KG |
-| **共享层** | SharedMemoryManager | L4 跨 Agent/跨会话中介 | peer perception + hot_topics → prepare_context |
-| **审计控制** | VerbatimSink, WriteGuard, Drift, ContextRot | 写控制、衰减、清理 | WriteGuard 检查所有写操作 |
-| **重建恢复** | StateRebuilder, Handoff, Seeds | 会话中断恢复、决策回溯、交接 | Session 恢复时重建状态 |
-| **压缩路由** | AAAK, AAAK Index, Closet | 70-85% 压缩率 + 主题指针索引 | ContextRot → AAAK → Closet 索引 |
-| **一致性** | FactChecker, Coherence, EntityRegistry, ContextFence | 多 Agent 知识不冲突/不重复 | Writer → FactChecker → Coherence 校验 |
-
-## 3. 检索管道
-
-```
-  用户提问 / 工具调用
-       │
-       ▼
-  ┌──────────────────────────────────────────────┐
-  │          prepare_context()                   │
-  │                                              │
-  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌─────────┐ │
-  │  │FTS5  │  │BM25  │  │Embed │  │HotSymbol│ │  四路并行召回
-  │  │全文  │  │关键词 │  │语义  │  │CodeL1   │ │
-  │  └──┬───┘  └──┬───┘  └──┬───┘  └────┬────┘ │
-  │     │          │          │           │      │
-  │     └──────────┴──────────┴───────────┘      │
-  │                    │                         │
-  │                    ▼                         │
-  │           ┌──────────────┐                   │
-  │           │ HybridRank   │  混合排序去重      │
-  │           └──────┬───────┘                   │
-  │                  ▼                           │
-  │           ┌──────────────┐                   │
-  │           │ Context      │  Token budget 约束 │
-  │           │ Assembly     │  + 13 步注入       │
-  │           └──────────────┘                   │
-  └──────────────────────────────────────────────┘
-```
-
-## 4. CodeIndexer — 代码结构理解
-
-```
-  文件变更 / 初次索引
-       │
-       ▼
-  tree-sitter AST 解析 (Rust / Python / JS / TS / Go)
-       │
-       ▼
-  ┌──────────────────────────────┐
-  │     ProjectKG (代码图谱)     │
-  │  ┌────────┐  ┌────────────┐  │
-  │  │Function│──│CALLS       │  │
-  │  │Class   │──│EXTENDS     │  │
-  │  │Method  │──│IMPLEMENTS  │  │
-  │  │Import  │──│IMPORTS     │  │
-  │  └────────┘  └────────────┘  │
-  └──────────────┬───────────────┘
-                 ▼
-  ┌──────────────────────────────┐
-  │      HotSymbols (L1 热槽)    │
-  │  当前打开文件 + 热点调用链    │
-  └──────────────┬───────────────┘
-                 ▼
-         prepare_context()
-```
-
----
-
-# 第三部分：安全与管控
-
-## 1. 四层防护模型
-
-```
-  ┌──────────────┐
-  │ 1. 权限判定   │  PermissionMode: read-only / workspace-write / danger-full
-  └──────┬───────┘
-         ▼
-  ┌──────────────┐
-  │ 2. Gate 流水线│  PreFlight → Approval → Revision → Escalation → Abort
-  └──────┬───────┘
-         ▼
-  ┌──────────────┐
-  │ 3. WriteGuard │  控制 L0/L1/Agent/External 写入权限，全审计日志
-  └──────┬───────┘
-         ▼
-  ┌──────────────┐
-  │ 4. Sandbox   │  Linux Sandbox: 容器隔离 + 文件系统隔离 + 网络限制
-  └──────────────┘
-```
-
-## 2. Gate 流水线详解
-
-| Gate | 触发时机 | 行为 |
-|------|----------|------|
-| **PreFlightGate** | 执行前 | 检查影响范围，触发 impact analysis |
-| **ApprovalGate** | PreFlight 后 | 根据 PolicyEngine 规则自动批准或转人工 |
-| **RevisionGate** | 执行中 | 检测修改是否超出预期，触发修正建议 |
-| **EscalationGate** | 风险上升 | 重新评估权限，升级审批 |
-| **AbortGate** | 硬终止 | 回滚到上一个安全状态 |
-
-## 3. Cross-plane PolicyEngine
-
-```
-  Action Request
-       │
-       ▼
-  PolicyEngine 检查:
-  ┌─────────────────────────────────┐
-  │ 1. 高风险动作 → 必须审批        │
-  │ 2. 外部系统写 → 必须 idempotent │
-  │ 3. 无 Evidence 动作 → 禁止      │
-  │ 4. 无目标实体绑定 → 禁止        │
-  │ 5. 高影响无回滚计划 → 禁止      │
-  │ 6. 跨组织动作 → 记录责任链      │
-  │ 7. 低置信度归因 → 仅生成人工任务 │
-  └─────────────────────────────────┘
-       │
-       ▼
-  Decision: allow / allow_with_approval / dry_run_only / deny / needs_more_evidence
-```
-
----
-
-# 第四部分：Connector 运行时
-
-## 1. Connector 注册与发现
-
-```
-  ┌─────────────────────────────────┐
-  │     ConnectorRegistry           │
-  │  ┌───────────┐ ┌─────────────┐  │
-  │  │ Accounts  │ │ Capabilities│  │
-  │  │ (Feishu/  │ │ (read/write │  │
-  │  │  WeCom/   │ │  /probe/    │  │
-  │  │  Email)   │ │  execute)   │  │
-  │  └─────┬─────┘ └──────┬──────┘  │
-  │        └───────────────┘         │
-  │                ▼                 │
-  │      ┌──────────────────┐        │
-  │      │ ResourceDirectory │        │
-  │      │ (File/Doc/Data)   │        │
-  │      └──────────────────┘        │
-  └─────────────────────────────────┘
-```
-
-## 2. 飞书只读证据平面
-
-```
-  Feishu API
-      │
-      ▼
-  Connector Registry → Capability: readonly
-      │
-      ▼
-  Resource Promotion → Memory (L2/L3)
-      │
-      ▼
-  Evidence Bridge → Context Runtime
-```
-
-## 3. MCP Operator 控制台
-
-```
-  MCP Server (stdio/SSE/remote)
-      │
-      ▼
-  mcp_client.rs → tool registry
-      │
-      ▼
-  mcp_tool_bridge.rs → Cowd tool dispatch
-      │
-      ▼
-  WebUI MCP console (operator management)
-```
-
----
-
-# 第五部分：IACC 结构化运营智能
-
-IACC（智能体认知架构）是 Cowd 的可选结构化认知子系统，处理企业运营数据的摄入、计算、推理、行动和呈现。
-
-## 1. 完整认知链路（21 步全链）
-
-```
-  SourceSnapshot
-       │
-       ▼
-  EntityResolution → Entity + SourceKey registry
-       │
-       ▼
-  FactIngest (SHA-256 dedup) → IaccAttentionItem 自动生成
-       │
-       ▼
-  MetricRecompute (affected scope 增量) ← MetricGraph (dependency/lineage)
-       │
-       ▼
-  ChangeEvent (delta severity) → Anomaly (多信号)
-       │
-       ▼
-  Attribution (entity-relation graph reasoning)
-       │
-       ▼
-  ImpactPropagation (BFS entity graph traversal)
-       │
-       ▼
-  Attention (priority_score × severity × urgency)
-       │
-       ▼
-  EvidencePacket (bounded context, token_budget)
-       │
-       ▼
-  QualityGate (6-dim scoring: pass >=0.75 / review >=0.45 / fail)
-       │
-       ▼
-  Incident (open → AgentGraph bridge)
-       │
-       ▼
-  OperationalAnalysis (attribution + impact + recommended actions)
-       │
-       ▼
-  CrossPlaneAction (dry_run → preflight → approval → commit → receipt)
-       │
-       ▼
-  ExecutionReceipt (bridge receipt + audit_record)
-       │
-       ▼
-  Feedback (outcome → auto-close incident 或 re-attribute)
-       │
-       ▼
-  RecoveryMonitor (主指标+保护指标 double-check, observation window)
-       │
-       ▼
-  MemoryCase / Playbook (case promotion 6 rules)
-       │
-       ▼
-  CockpitUpdate (Profile → Projection → Report → Delivery)
-```
-
-## 2. 17 模块五层架构
-
-### 数据层
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **source** | `source.rs` (56行) | `IaccSourceSnapshot`, `IaccSourceKind` | 6 种数据源（API/DB/File/RPA/Manual/Connector）快照 |
-| **entity** | `entity.rs` (88行) | `IaccEntity`, `IaccSourceKey` | 跨系统实体统一，规范化 key 匹配 |
-| **fact** | `fact.rs` (103行) | `IaccFact`, `IaccFactInput` | 运营事实记录，SHA-256 内容 hash 去重 |
-| **domain** | `domain.rs` (735行) | `IaccDomainPack`, `IaccDomainSeedPlan` | 服务器制造领域包（22实体/14关系/8指标/3场景） |
-
-### 指标层
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **metric** | `metric.rs` (95行) | `IaccMetricDefinition`, `IaccMetricState` | 指标定义（domain/grain/formula/threshold）+ 状态快照 |
-| **metric_graph** | `metric_graph.rs` (77行) | `IaccMetricDependency`, `IaccMetricLineage` | 指标依赖图（上下游 typed transformation） |
-| **change** | `change.rs` (35行) | `IaccChangeEvent` | 指标变动事件（from/to/delta/severity） |
-| **compute** | `compute.rs` (72行) | `IaccComputeJob`, `IaccComputePlan` | 增量计算引擎（trigger_fact_type → affected_metric_ids） |
-
-### 认知层
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **attention** | `attention.rs` (76行) | `IaccAttentionItem`, `IaccSeverity` | 注意力管理（priority × severity × urgency） |
-| **relation** | `relation.rs` (72行) | `IaccRelation`, `IaccImpactTrace` | 实体关系图 + BFS 影响传播 |
-| **evidence** | `evidence.rs` (97行) | `IaccEvidencePacket`, `IaccEvidenceSourceRef` | 有界证据包（token_budget）→ ContextItem 桥接 |
-| **quality** | `quality.rs` (98行) | `IaccQualityGateDecision` | 证据质量门（6维评分 pass/review/fail） |
-
-### 行动层
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **incident** | `incident.rs` (33行) | `IaccIncident` | 运营事件生命周期（open→analysis→execution→closed） |
-| **analysis** | `analysis.rs` (314行) | `IaccOperationalAnalysis`, `IaccRecommendedAction` | 归因分析 + 影响路径 + 推荐处置 |
-| **execution** | `execution.rs` (220行) | `IaccActionExecution`, `IaccCrossPlaneBridgeReceipt` | 治理执行（dry_run/commit + feedback + cross-plane receipt） |
-
-### 呈现层
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **cockpit** | `cockpit.rs` (560行) | `IaccCockpitProfile/Projection/Report/Delivery` | 驾驶舱投影、报告快照、多渠道投递 |
-
-### 持久化
-
-| 模块 | 文件 | 核心类型 | 作用 |
-|------|------|----------|------|
-| **store** | `store.rs` (3294行) | `IaccStore`, `IaccHealth`, `IaccMetricRecomputeResult` | 15 张 SQLite 表，完整 CRUD + 10 集成测试 |
-
-## 3. IaccStore 表结构（15 张表）
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  source_snapshots│     │  facts           │     │  entities        │
-│  (source_system, │     │  (fact_type,     │     │  (entity_type,   │
-│   business_period)│    │   measures JSON)  │     │   source_keys)   │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  attention_items │     │  metric_states   │     │  relations       │
-│  (priority_score,│     │  (value, delta,  │     │  (relation_type, │
-│   severity)      │     │   status)        │     │   entity_a/b)    │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  evidence_packets│     │  metric_defs    │     │  metric_deps     │
-│  (bound context, │     │  (domain, grain │     │  (upstream_id,   │
-│   confidence)    │     │   formula)      │     │   downstream_id) │
-└────────┬────────┘     └────────┬────────┘     └──────────────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│  incidents       │     │  compute_jobs    │
-│  (status,        │     │  (status,        │
-│   task_id)       │     │   metric_ids)    │
-└────────┬────────┘     └──────────────────┘
-         │
-         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  analyses        │     │  executions      │     │  quality_gates   │
-│  (attributions,  │     │  (mode, status,  │     │  (score,         │
-│   impact_paths)  │     │   xplane_receipts)│     │   decision)      │
-└────────┬────────┘     └────────┬────────┘     └──────────────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│  cockpit_profiles│     │  cockpit_reports │
-│  (focus_refs,    │     │  (projection,    │
-│   cadence)       │     │   deliveries)    │
-└─────────────────┘     └─────────────────┘
-```
-
-## 4. 核心数据流示例 — 短缺风险处理
-
-```
-  数据源输入: ERP 库存 < 安全库存
-      │
-      ▼
-  SourceSnapshot(ERP, Api, weekly) → schema_version=1, row_count=5000
-      │
-      ▼
-  EntityResolution:
-    "MAT-0042" → IaccEntity(entity_type="component", canonical_key="gpu-h100-80gb")
-      │
-      ▼
-  FactIngest: fact_type="inventory_level", measures={"on_hand": 120, "safety": 200}
-      │ SHA-256 hash: 3a2f...
-      ▼
-  MetricRecompute: trigger → affected_metric_ids=["inventory_coverage", "supply_risk"]
-      │
-      ▼
-  MetricGraph traversal:
-    inventory_coverage ← BOM_req ─→ supply_risk ─→ prod_plan_feasibility
-      │
-      ▼
-  ChangeEvent: entity=MAT-0042, metric=inventory_coverage, delta=-40%, severity=critical
-      │
-      ▼
-  Attention: priority_score=0.92, severity=Critical, reason_codes=["safety_stock_breach"]
-      │
-      ▼
-  EvidencePacket: metric_evidence + change_evidence + source_refs, confidence=0.85
-      │
-      ▼
-  QualityGate: score=0.88 → decision=pass (>=0.75)
-      │
-      ▼
-  Incident(title="GPU H100 库存跌破安全线", status=open)
-      │
-      ▼
-  AgentRunGraph bridge: researcher(分析归因) → reviewer(审查方案) → merger(汇总)
-      │
-      ▼
-  OperationalAnalysis:
-    attributions = [IaccAttributionCandidate(cause_type="supplier_delay", confidence=0.78)]
-    impact_paths = [BOM→server_config→customer_order]
-    recommended_actions = [IaccRecommendedAction(type="expedite_order", priority=P0)]
-      │
-      ▼
-  CrossPlaneAction(action=expedite_order, mode=dry_run → preflight → commit)
-      │
-      ▼
-  ExecutionReceipt: IaccCrossPlaneBridgeReceipt(bridge_id="SRM-001", status=committed)
-      │
-      ▼
-  Feedback: outcome="order_expedited", metric_delta={"inventory_coverage": "recovering"}
-      │
-      ▼
-  Incident close: status=closed
-
-  全程 Cockpit 实时更新 → Report 投递飞书
-```
-
----
-
-# 第六部分：接入层
-
-## 入口模式
-
-```
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │                          COWD Entry Points                           │
-  │                                                                      │
-  │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐ │
-  │  │ CLI     │  │ TUI      │  │ Gateway  │  │ WebUI (bundled)      │ │
-  │  │ cowd    │  │ --solo   │  │ run      │  │ http://127.0.0.1:8642 │ │
-  │  │ prompt  │  │ 9/9 panel│  │ HTTP:8642│  │                      │ │
-  │  │ --resume│  │          │  │ +Socket  │  │                      │ │
-  │  └────┬────┘  └────┬─────┘  └────┬─────┘  └──────────┬───────────┘ │
-  │       └─────────────┴────────────┼────────────────────┘             │
-  │                                  │                                   │
-  │                                  ▼                                   │
-  │  ┌──────────────────────────────────────────────────────────────┐   │
-  │  │                    Feishu / WeCom / Email                     │   │
-  │  │                  (双向消息通道 → EventBus)                    │   │
-  │  └──────────────────────────────────────────────────────────────┘   │
-  └──────────────────────────────────────────────────────────────────────┘
-```
-
-## TUI 9/9 面板
-
-```
-  ┌──────────────┬──────────────────────────────────────────────┐
-  │              │                                              │
-  │  Sessions    │           ChatView (主对话区)                 │
-  │  (会话列表)   │                                              │
-  │              │    [User] 提问...                            │
-  ├──────────────┤    [Agent] 回答...                           │
-  │              │    [Tool] 工具输出...                         │
-  │  File Tree   │                                              │
-  │  (文件树)    ├──────────────────────────────────────────────┤
-  │              │                                              │
-  ├──────────────┤  ┌─────────┐ ┌──────────┐ ┌──────────────┐  │
-  │              │  │ Context │ │ Approval │ │ DiffView     │  │
-  │  Memory      │  │ (上下文) │ │ (审批)    │ │ (差异视图)   │  │
-  │  (记忆面板)  │  └─────────┘ └──────────┘ └──────────────┘  │
-  │              │  ┌─────────┐ ┌──────────┐ ┌──────────────┐  │
-  ├──────────────┤  │ Agent   │ │ Connector│ │ Task         │  │
-  │  StatusBar   │  │ Team    │ │ Console  │ │ Workbench    │  │
-  │  (状态栏)    │  └─────────┘ └──────────┘ └──────────────┘  │
-  └──────────────┴──────────────────────────────────────────────┘
-```
-
----
-
-# 第七部分：模块交互矩阵
-
-## Crate 间依赖关系
-
-```
-                ┌─────────┐
-                │ cowd-cli │  ← Gateway, TUI, daemon, api_routes
-                └────┬─────┘
-                     │ 依赖
-         ┌───────────┼───────────┐
-         ▼           ▼           ▼
-    ┌────────┐ ┌────────┐ ┌──────────┐
-    │runtime │ │memory  │ │commands  │
-    │(核心)  │ │(记忆)  │ │(100+cmd) │
-    └───┬────┘ └───┬────┘ └────┬─────┘
-        │          │           │
-        ▼          ▼           ▼
-    ┌────────┐ ┌────────┐ ┌──────────┐
-    │ tools  │ │ api    │ │ plugins  │
-    │ (50+)  │ │ (LLM)  │ │ (动态)   │
-    └───┬────┘ └───┬────┘ └────┬─────┘
-        │          │           │
-        └──────────┼───────────┘
-                   ▼
-            ┌────────────┐
-            │  config    │
-            │  (YAML)    │
-            └────────────┘
-```
-
-## 核心模块间的数据流关系
-
-| 源模块 | 目标模块 | 交互方式 | 关键函数/类型 |
-|--------|----------|----------|---------------|
-| ConversationRuntime | Memory::Cognitive | 调用 | `prepare_context()` 注入上下文 |
-| Memory::Orchestrator | ConversationRuntime | 回调 | `on_turn_end()` 写入本轮记忆 |
-| ToolDispatch | Gate Pipeline | 拦截 | PreFlight → Approval 检查 |
-| Gate Pipeline | PolicyEngine | 查询 | `evaluate(action, context)` → Decision |
-| ToolDispatch | Sandbox | 委派 | 沙箱隔离执行 |
-| AgentWorkGraph | Wave Engine | 编排 | TaskGraph 依赖解析 + 并行执行 |
-| Wave Engine | SubAgent | 派发 | 受限子任务执行 |
-| EventBus | ConversationRuntime | 注入 | 外部事件（飞书/API/CLI）驱动 |
-| IaccStore | Cowd Memory | 桥接 | Evidence → ContextItem 转化 |
-| IaccEvidencePacket | Context Runtime | 注入 | `to_context_item()` → 上下文 |
-| ConnectorRegistry | Memory::Shared | 提升 | Resource 推入记忆 L2/L3 |
-| SessionKernel | UnifiedSessionStore | 读写 | Session CRUD + Lease |
-| SessionKernel | SessionEventBus | 广播 | 多前端 fan-out |
-
----
-
-# 第八部分：启动与开发
-
-## 启动方式
+### 1.1 直接使用已安装版本
 
 ```bash
-# 编译
-cargo build --release          # → target/release/cowd (~28MB)
-
-# TUI 终端模式
-cowd                           # 新建会话，全功能 TUI
-cowd --solo                    # 显式别名
-cowd --resume latest           # 续接最近会话
-cowd --resume <id>             # 续接指定会话
-cowd --tui                     # 显式 TUI 启动
-
-# API 网关服务
-cowd gateway run               # 前台 (HTTP:8642 + Unix Socket + 飞书)
-cowd gateway start             # systemd 后台
-cowd gateway stop              # 停止
-cowd gateway status            # 状态
-
-# 安装部署
-cowd install --systemd         # → ~/.cowd/bin/cowd + systemd
-
-# 信息
-cowd version                   # 版本
-cowd help                      # 帮助
+~/AI/cowd --version
+~/AI/cowd doctor
+~/AI/cowd setup
 ```
 
-## IACC 专用操作
+### 1.2 启动 CLI / TUI
 
 ```bash
-# 播种服务器制造领域数据
-cowd iacc seed-manufacturing
-
-# 查看 Cockpit 投影
-curl http://127.0.0.1:8642/api/iacc/cockpit/projection?profile_id=default
-
-# 生成驾驶舱报告
-curl -X POST http://127.0.0.1:8642/api/iacc/cockpit/reports \
-  -H "Content-Type: application/json" \
-  -d '{"profile_id":"default","cadence":"daily"}'
-
-# 列出活跃事件
-curl http://127.0.0.1:8642/api/iacc/incidents?status=open
-
-# Connector 管理
-curl http://127.0.0.1:8642/api/connectors/summary
-curl http://127.0.0.1:8642/api/connectors/accounts
-curl http://127.0.0.1:8642/api/connectors/capabilities
-curl http://127.0.0.1:8642/api/connectors/resources
+~/AI/cowd
 ```
 
-## 开发
+默认进入交互式终端界面。也可以指定模型、会话、权限：
 
 ```bash
-cargo test -p cowd-memory        # Memory: 456+ tests
-cargo test --workspace           # 全量: 1000+ tests
-
-# 验证脚本
-scripts/validate.sh fast         # 快速验证
-scripts/validate.sh core         # 核心验证
-scripts/validate.sh full         # 全量验证
-scripts/validate.sh live         # 实时场景验证
-scripts/validate.sh release      # 发版验证
+~/AI/cowd --model claude-sonnet-4-6
+~/AI/cowd --session my-session
+~/AI/cowd --permission-mode workspace-write
 ```
 
-## 日志
+一次性 prompt：
 
 ```bash
-RUST_LOG=debug cowd --solo
-tail -f ~/.cowd/logs/cowd.$(date +%Y-%m-%d)
+~/AI/cowd prompt "总结当前仓库结构"
+~/AI/cowd --output-format json prompt "列出可用 skills"
+~/AI/cowd --compact "总结 Cargo.toml"
+```
+
+恢复会话：
+
+```bash
+~/AI/cowd --resume latest
+~/AI/cowd --resume latest /status /diff
+```
+
+### 1.3 启动 WebUI / Gateway
+
+推荐从项目工作区或目标工作区启动：
+
+```bash
+cd /path/to/workspace
+~/AI/cowd gateway run
+```
+
+默认 HTTP Gateway 由配置文件决定。常见本地配置如下：
+
+```yaml
+model: "claude-sonnet-4-6"
+permissions:
+  defaultMode: "dontAsk"
+gateway:
+  enabled: true
+  sessionReset: "none"
+  platforms:
+    - platformType: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+      auth:
+        enabled: false
+```
+
+访问：
+
+```text
+http://127.0.0.1:8642/
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8642/healthz
+curl http://127.0.0.1:8642/readyz
+```
+
+Gateway 静态资源解析顺序：
+
+1. 当前工作区的 `webui/`
+2. 安装目录的 `~/AI/webui`
+3. fallback 路径
+
+因此正式安装时只需要：
+
+```text
+~/AI/cowd
+~/AI/webui
 ```
 
 ---
 
-# 当前状态评估
+## 2. 顶层框架逻辑
 
-## 已完成核心能力
+Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、WebUI 和外部渠道都只是 runtime 的不同投影。
 
-| 领域 | 完成度 | 关键指标 |
-|------|--------|----------|
-| 内存系统 36 模块 | 100% | 456 测试，3D 架构（Scope×Layer×State），14+ 语言扫描 |
-| 统一 Daemon Runtime | 95% | Socket control plane + HTTP projection plane |
-| Session Lifecycle | 95% | SessionKernel + Lease + EventReplay，多端 attach |
-| Gate 流水线 | 90% | 5 种 Gate + PolicyEngine + 7 条强制策略 |
-| Multi-Agent | 85% | AgentWorkGraph + Wave + SubAgent |
-| Connector Runtime | 85% | Feishu/MCP/本地服务，Capability & Resource 注册 |
-| TUI | 95% | 9/9 侧边栏全功能，socket 控制传输 |
-| IACC 数据层 | 100% | Entity/Relation/Fact/Source/Domain 完整链路 |
-| IACC 指标层 | 70% | MetricGraph + Compute(增量) 存在，缺 CDC/partition |
-| IACC 认知层 | 90% | Attention/Evidence/Quality/Analysis 完整闭环 |
-| IACC 行动层 | 40% | Execution receipt 存在，缺完整 Cross-plane bridge |
-| IACC 呈现层 | 60% | Cockpit Profile/Report/Delivery 完整，缺 CommandCenter/IncidentRoom |
-| IACC 智能化层 | 0% | Recovery Monitor/MemoryCase/Playbook/Agent Skills 全部缺失 |
+```text
+用户入口
+  ├─ CLI: cowd prompt / cowd skills / cowd doctor / cowd gateway
+  ├─ TUI: cowd 交互界面
+  ├─ WebUI: Gateway 提供浏览器控制台
+  └─ Channel: Feishu / WeCom / Email / MCP / future connectors
 
-## 存在薄弱环节
+统一运行时
+  ├─ Session Kernel
+  ├─ Runtime Event Bus
+  ├─ Context Runtime
+  ├─ Memory System
+  ├─ Tool Runtime
+  ├─ Skill Registry + Skill Action API
+  ├─ Connector Runtime
+  ├─ Cross-plane Governance
+  └─ IACC Operating Intelligence
 
-1. **IACC 行动闭环缺少完整治理**：Cross-plane receipt 存在，但 ActionPlan → PolicyDecision → multi-connector dispatch 链路不足。
-2. **IACC 智能化层空白**：Recovery Monitor、MemoryCase/Playbook、Agent Skill System 未经实现。
-3. **内存-运行时尚未 push 模式**：CognitiveContextManager 是"调用-返回"，非"订阅-推送"。
-4. **TUI 未全面 daemon 驱动**：保留直连逻辑，socket protocol 未固化。
-5. **性能基线无 CI 护栏**：1K/10K/20K 手动运行，无自动化回归。
+持久化
+  ├─ SQLite Session Store
+  ├─ Memory Stores
+  ├─ IACC SQLite Store
+  └─ Config / Skills / Plugins 文件系统目录
+```
+
+关键原则：
+
+- Session 是运行时根对象。
+- SQLite 是会话状态事实源。
+- WebUI/TUI 不发明独立状态，只投影 daemon/API contract。
+- CLI 保持极简，不承担复杂状态管理。
+- Skills 的发现、投影、执行统一走 `/api/skills/*`。
+- IACC 的领域能力保留专用 API，同时通过 Skills Action API 对外统一。
 
 ---
 
-# 下一阶段演进
+## 3. Workspace 和 crate 结构
 
-## IACC 主线：补全生产试运行条件
+### 3.1 Cargo workspace
 
+根目录 `Cargo.toml` 使用 workspace：
+
+```text
+crates/api
+crates/commands
+crates/compat-harness
+crates/cowd-cli
+crates/memory
+crates/mock-anthropic-service
+crates/plugins
+crates/runtime
+crates/telemetry
+crates/tools
 ```
-P0: Cross-plane Bridge 完整化 → Recovery Monitor → Command Center API
-P1: MemoryCase/Playbook → Anomaly Detection → Incident Room → Metric Engine 强化
-P2: Agent Skill System → Personal Cockpit → IACC WebUI
-P3: Scale benchmark → Multi-tenant → DAO connector → Production package
+
+### 3.2 `crates/cowd-cli`
+
+主二进制 crate，输出 `cowd`。
+
+职责：
+
+- CLI 参数解析
+- 交互式 REPL / TUI 启动
+- Gateway 启停
+- HTTP API 路由聚合
+- 静态 WebUI 服务
+- Session lifecycle 接入
+- IACC API 接入
+- TUI panel 状态构建
+- install / doctor / setup / init / export / import-session 等本地命令
+
+重要文件：
+
+| 文件 | 说明 |
+|---|---|
+| `src/main.rs` | 主入口，CLI action 分发，TUI 启动，Gateway 启动，安装逻辑 |
+| `src/daemon/mod.rs` | HTTP daemon / Gateway 服务 |
+| `src/api_routes.rs` | API route 聚合 |
+| `src/api_routes/*.rs` | 各业务域 API |
+| `src/gateway_static.rs` | WebUI 静态资源解析 |
+| `src/gateway_health.rs` | Gateway 健康和 ready 状态 |
+| `src/session_kernel.rs` | Session 运行时基础 |
+| `src/session_lifecycle_kernel.rs` | Session attach / lease / lifecycle |
+| `src/runtime_protocol.rs` | 运行时协议类型 |
+| `src/tui/*` | TUI 状态、布局、面板和控制客户端 |
+
+### 3.3 `crates/runtime`
+
+运行时核心库。
+
+职责：
+
+- 会话模型和执行上下文
+- 工具调用 runtime 抽象
+- MCP stdio / OAuth / connector 基础
+- 平台和 channel 类型
+- IACC 领域模型、store、skill pack
+- server manufacturing domain pack
+- skill plan/run 逻辑
+
+重要目录：
+
+| 路径 | 说明 |
+|---|---|
+| `src/iacc/*` | IACC 结构化运营智能 |
+| `src/platform/*` | 平台和 channel 类型 |
+| `src/mcp_stdio.rs` | MCP stdio 管理 |
+| `src/connector.rs` | Connector 基础 |
+| `src/session.rs` | session 基础类型 |
+| `src/tool_runtime.rs` | 工具 runtime |
+
+### 3.4 `crates/memory`
+
+记忆与上下文系统。
+
+职责：
+
+- 多层记忆模型
+- SQLite memory store
+- FTS / BM25 / entity / triple
+- 代码索引和项目知识图谱
+- compression / handoff / rebuild
+- write guard / audit / consistency
+
+典型能力：
+
+- session memory
+- project memory
+- shared memory
+- code symbol indexing
+- memory packet assembly
+- fact checking
+- context fence
+
+### 3.5 `crates/commands`
+
+命令和技能解析库。
+
+职责：
+
+- slash command parser
+- `/skills`、`/agents`、`/mcp` 等命令处理
+- `SkillRegistry`
+- skill discovery
+- skill install / view / list
+- 兼容 `.cowd/skills`、`.agents/skills`、`.codex/skills`、`~/.cowd/skills`、`~/.codex/skills`、legacy `/commands`
+
+CLI 的 skills 能力由这里收敛为极简：
+
+```text
+list
+view <name>
+install <path>
+<skill> [args] 作为 prompt dispatch
 ```
 
-## Cowd 主线：从被动到主动
+复杂的 validate / plan / run / watch / governance 不放在 CLI 状态管理中，而由 WebUI/TUI + API 承担。
 
-1. **记忆 2.0**：后台知识流持续摄入，预测性预取，语义压缩
-2. **蜂群 1.0**：多 Agent 通过 L4 实时协商，加权投票决策
-3. **Gates 2.0**：自动修正 Gate，影响预测反馈，事务式回滚执行
-4. **运维 1.0**：CI 性能门禁，内存剖析仪表盘，自适应存储策略
-5. **Platform 2.0**：双向事件驱动（Webhook → 记忆注入，异常 → 主动推送）
+### 3.6 `crates/tools`
+
+工具定义和内置工具集合。
+
+职责：
+
+- 文件读写
+- shell 执行
+- grep/glob/search
+- memory 工具
+- web fetch
+- tool schema
+- runtime tool registry
+
+### 3.7 `crates/api`
+
+模型 Provider 适配层。
+
+职责：
+
+- Anthropic / OpenAI / DeepSeek / Qwen 等 API 适配
+- streaming / non-streaming
+- 请求签名和响应结构
+- mock parity 支持
+
+### 3.8 `crates/plugins`
+
+插件系统。
+
+职责：
+
+- plugin manifest
+- plugin registry
+- plugin install / enable / disable / uninstall
+- 插件生命周期状态
+
+### 3.9 `crates/telemetry`
+
+遥测基础类型和 JSON 事件结构。
+
+### 3.10 `crates/compat-harness`
+
+兼容性测试和命令/tool 对齐验证。
+
+### 3.11 `crates/mock-anthropic-service`
+
+本地 mock 服务，用于 API 和兼容测试。
 
 ---
 
-## 许可证
+## 4. WebUI 结构
 
-MIT License
+WebUI 位于 `webui/`，由 Gateway 静态服务直接提供。
+
+| 文件 | 说明 |
+|---|---|
+| `index.html` | 页面骨架、侧栏、聊天区、右侧 panel、控制中心 |
+| `api.js` | 所有 HTTP API client |
+| `boot.js` | DOMContentLoaded、登录、模型选择、panel 恢复 |
+| `state.js` | 浏览器状态 |
+| `sessions.js` | session 列表、创建、搜索 |
+| `messages.js` | 消息发送、stream、渲染 |
+| `workspace.js` | 文件树和 workspace API |
+| `panels.js` | 右侧功能面板，Memory、Runtime、Context、Skills、IACC、Gateway 等 |
+| `commands.js` | WebUI slash command autocomplete 和执行 |
+| `ui.js` | 通用 UI helper、toast、modal、markdown |
+| `style.css` | 设计系统和全部面板样式 |
+| `modules.test.js` | Vitest 单元测试 |
+| `*.e2e.spec.js` | Playwright E2E 测试 |
+
+WebUI 的定位：
+
+- 浏览器端管理面
+- 适合复杂状态、表格、过滤、详情、批量操作
+- 当前 Skills 面板已经支持 catalog、projection、detail、validate、plan、run、runs、watch
+- IACC 面板用于领域运营智能的 command center、incident、report、cockpit
+
+---
+
+## 5. API 和 Gateway
+
+Gateway 暴露 HTTP API 和 WebUI 静态资源。
+
+### 5.1 公共 API
+
+| API | 用途 |
+|---|---|
+| `GET /health` | 简单健康 |
+| `GET /healthz` | Gateway health |
+| `GET /readyz` | ready 状态，包含 static WebUI source |
+| `GET /api/webui/manifest` | WebUI 服务 manifest |
+| `POST /api/auth/login` | token 登录 |
+| `GET /api/auth/verify` | token 验证 |
+
+### 5.2 Session / Message
+
+| API | 用途 |
+|---|---|
+| `GET /api/sessions` | session 列表 |
+| `POST /api/sessions` | 创建 session |
+| `GET /api/sessions/search` | 搜索消息 |
+| `GET /api/sessions/:id/events` | session event |
+| `GET /api/sessions/:id/runs` | run 列表 |
+| `POST /api/sessions/:id/compact` | compact |
+| `GET /api/sessions/:id/stats` | session 统计 |
+| `POST /api/sessions/:id/messages` | 发送消息 |
+| `GET /api/sessions/:id/stream` | SSE stream |
+
+### 5.3 Runtime / Context / Memory
+
+| API | 用途 |
+|---|---|
+| `GET /api/runtime/timeline` | runtime timeline |
+| `GET /api/runtime/control-plane` | 控制面摘要 |
+| `GET /api/context/current` | 当前上下文 |
+| `GET /api/evidence/resolve` | evidence ref 解析 |
+| `GET /api/memory` | memory 总览 |
+| `GET /api/memory/status` | memory 状态 |
+| `GET /api/memory/search` | memory 搜索 |
+| `GET /api/memory/packet` | context packet |
+| `GET /api/memory/entities` | entity |
+| `GET /api/memory/triples` | triples |
+| `POST /api/memory/facts/check` | fact check |
+| `POST /api/memory/facts/register` | fact register |
+
+### 5.4 Skills API
+
+Skills API 分三层：Catalog、Projection、Action。
+
+Catalog：
+
+| API | 用途 |
+|---|---|
+| `GET /api/skills/catalog` | 技能全集 |
+| `GET /api/skills/catalog?scope=iacc` | 过滤 IACC skills |
+| `GET /api/skills/:id` | 技能详情 |
+
+Projection：
+
+| API | 用途 |
+|---|---|
+| `GET /api/skills/projection?surface=webui` | WebUI 投影 |
+| `GET /api/skills/projection?surface=tui` | TUI 投影 |
+| `GET /api/skills/projection?surface=cli` | CLI 投影 |
+
+Action：
+
+| API | 用途 |
+|---|---|
+| `POST /api/skills/:id/actions/validate` | 校验 skill manifest / evidence / tools / quality gate |
+| `POST /api/skills/:id/actions/plan` | 基于 incident 生成 skill plan |
+| `POST /api/skills/:id/actions/run` | 基于 incident 执行 skill |
+| `GET /api/skills/runs` | 最近 skill run |
+| `GET /api/skills/runs/:id` | 单个 skill run 详情 |
+
+IACC skill 示例：
+
+```bash
+curl http://127.0.0.1:8642/api/skills/catalog
+curl http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst
+
+curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/validate \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"demo-validate"}'
+
+curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/plan \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"demo-plan","incident_id":"incident-id","limit":3}'
+
+curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/run \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"demo-run","incident_id":"incident-id"}'
+```
+
+Local skill 的 action 当前返回 `unsupported_for_local_skill`。这是有意设计：local skill 在 CLI 侧保留 list/view/install/invoke，不承担 IACC 状态管理。
+
+### 5.5 IACC API
+
+IACC API 是结构化运营智能的领域实现层。
+
+常用入口：
+
+| API | 用途 |
+|---|---|
+| `GET /api/iacc/health` | IACC store 健康 |
+| `POST /api/iacc/domain/server-manufacturing/seed` | 注入服务器制造领域种子 |
+| `GET /api/iacc/skills` | IACC skill pack |
+| `GET /api/iacc/command-center` | command center |
+| `GET /api/iacc/command-center/live` | live 队列 |
+| `GET /api/iacc/entities` | entity 列表 |
+| `POST /api/iacc/facts/ingest` | fact ingest |
+| `GET /api/iacc/metrics` | metric 列表 |
+| `GET /api/iacc/changes` | change event |
+| `GET /api/iacc/attention/hot` | attention hot |
+| `POST /api/iacc/evidence/build` | 构建 evidence packet |
+| `POST /api/iacc/incidents` | 创建 incident |
+| `GET /api/iacc/incidents` | incident 列表 |
+| `POST /api/iacc/incidents/:id/analyze` | operational analysis |
+| `POST /api/iacc/incidents/:id/skills/plan` | IACC 专用 skill plan |
+| `POST /api/iacc/incidents/:id/skills/:skill_id/run` | IACC 专用 skill run |
+| `GET /api/iacc/skill-runs/:id` | IACC skill run |
+
+对外产品面推荐优先使用 `/api/skills/*` 的统一 action 协议。IACC 专用 API 保留为领域能力层和高级调试入口。
+
+---
+
+## 6. CLI 使用说明
+
+CLI 的定位是极简控制和一次性任务，不承担复杂状态管理。
+
+### 6.1 常用命令
+
+```bash
+~/AI/cowd --help
+~/AI/cowd --version
+~/AI/cowd status
+~/AI/cowd sandbox
+~/AI/cowd doctor
+~/AI/cowd setup
+~/AI/cowd init
+```
+
+### 6.2 Prompt
+
+```bash
+~/AI/cowd prompt "解释当前项目"
+~/AI/cowd "解释当前项目"
+~/AI/cowd --output-format json prompt "列出模块"
+~/AI/cowd --compact "只输出最终结论"
+```
+
+### 6.3 Session
+
+```bash
+~/AI/cowd --resume latest
+~/AI/cowd --resume latest /status
+~/AI/cowd export conversation.md
+~/AI/cowd import-session old-session.jsonl
+```
+
+### 6.4 Skills
+
+```bash
+~/AI/cowd skills
+~/AI/cowd skills list
+~/AI/cowd skills view release
+~/AI/cowd skills install ./my-skill
+```
+
+技能目录来源：
+
+```text
+.cowd/skills
+.agents/skills
+.codex/skills
+~/.cowd/skills
+~/.cowd/skills/omc-learned
+~/.codex/skills
+legacy /commands
+```
+
+### 6.5 Gateway
+
+```bash
+~/AI/cowd gateway run
+~/AI/cowd gateway status
+~/AI/cowd gateway stop
+~/AI/cowd gateway restart
+```
+
+---
+
+## 7. TUI 使用说明
+
+启动：
+
+```bash
+~/AI/cowd
+```
+
+TUI 是控制台式全能力入口，适合键盘操作和本地开发循环。
+
+主要区域：
+
+| 区域 | 用途 |
+|---|---|
+| Chat | 对话和任务执行 |
+| Files | workspace 文件浏览 |
+| Memory | 记忆条目和上下文 |
+| Runtime | runtime activity |
+| Context | 当前上下文、证据、推荐 |
+| Skills | skill 全集、action availability |
+| Agents | agent 和子任务 |
+| Gateway | gateway 状态 |
+| Diff | 工作区 diff |
+
+常用 slash commands：
+
+```text
+/status
+/diff
+/doctor
+/setup
+/skills
+/skills view <name>
+/skills install <path>
+/agents
+/mcp list
+/memory
+/context show
+/approvals list
+/cross-plane summary
+/session list
+/session switch latest
+/export conversation.md
+```
+
+Skills panel 控制台操作：
+
+| 键 | 作用 |
+|---|---|
+| `j` / `↓` | 下移 |
+| `k` / `↑` | 上移 |
+| `/` | 搜索 |
+| `Tab` | 切换分类或 scope |
+| `Enter` | toggle 本地 enabled 状态 |
+| `v` | validate action 提示 |
+| `p` | plan action 提示 |
+| `r` | run action 提示 |
+| `w` | watch action 提示 |
+
+说明：
+
+- TUI 展示 WebUI 等同的核心能力全集。
+- TUI 当前以控制台方式显示 action availability。
+- 真正的 IACC skill action 通过统一 Skills API 和 incident id 执行。
+- local skills 保持 view/import/invoke 边界，不做状态 run。
+
+---
+
+## 8. WebUI 使用说明
+
+启动 Gateway 后打开：
+
+```text
+http://127.0.0.1:8642/
+```
+
+WebUI 适合浏览器增强管理：
+
+- session 浏览和搜索
+- 聊天和 stream
+- 文件浏览
+- memory / context 可视化
+- runtime timeline
+- skills 管理
+- IACC command center
+- connector console
+- cross-plane governance
+- approvals
+- settings
+
+### 8.1 Skills 面板
+
+入口：右侧 panel 中的 `Skills`。
+
+能力：
+
+- surface 选择：`WEBUI`、`TUI`、`CLI`
+- search task
+- incident id 输入
+- skill catalog
+- skill projection
+- governance 摘要
+- activation 摘要
+- `View`
+- `Validate`
+- `Plan`
+- `Run`
+- Runs 队列
+- Runs 过滤
+- Watch 自动刷新
+- Run detail 展开
+
+IACC skill 执行流程：
+
+1. 在 IACC 面板或 API 中创建 incident。
+2. 在 Skills 面板输入 incident id。
+3. 对目标 IACC skill 点 `Validate`。
+4. 点 `Plan` 查看证据需求和 agent node plan。
+5. 点 `Run` 生成 skill run。
+6. 在 Runs 区域过滤、查看、展开详情。
+7. 开启 `Watch` 观察后续运行记录。
+
+### 8.2 IACC 面板
+
+入口：右侧 panel 中的 `IACC`。
+
+用途：
+
+- IACC health
+- command center
+- cockpit report
+- retry report
+- incident / report 状态检查
+
+### 8.3 Control Center
+
+左下角控制中心入口用于：
+
+- config
+- providers
+- approval
+- history
+- usage
+
+---
+
+## 9. IACC 核心逻辑
+
+IACC 是 Cowd 的结构化运营智能层，用来把企业运营事实转为可追踪的 evidence、incident、analysis、action、report。
+
+核心链路：
+
+```text
+SourceSnapshot
+  -> Entity / Relation
+  -> Fact ingest
+  -> Metric recompute
+  -> Change event
+  -> Attention
+  -> Evidence packet
+  -> Quality gate
+  -> Incident
+  -> Operational analysis
+  -> Skill plan
+  -> Skill run
+  -> Cross-plane action
+  -> Feedback / Recovery
+  -> Memory case / Playbook
+  -> Cockpit report
+```
+
+主要模块：
+
+| 模块 | 职责 |
+|---|---|
+| source | 外部数据源快照 |
+| entity | 实体统一和 source key |
+| relation | 实体关系和影响传播 |
+| fact | 事实摄入和去重 |
+| metric | 指标定义和指标状态 |
+| metric_graph | 指标依赖和 lineage |
+| compute | 增量计算计划和 job |
+| change | 指标变动事件 |
+| attention | 注意力队列 |
+| evidence | 有界证据包 |
+| quality | 质量门 |
+| incident | 事件生命周期 |
+| analysis | 归因、影响和建议动作 |
+| execution | dry_run / commit / feedback |
+| cockpit | profile / projection / report / delivery |
+| skill | IACC skill manifest、plan、run |
+| store | IACC SQLite store |
+
+IACC store 默认位置：
+
+```text
+<workspace>/.cowd/iacc.sqlite
+```
+
+---
+
+## 10. Skills 核心逻辑
+
+Skills 是 Cowd 当前统一能力管理的核心面。
+
+### 10.1 数据来源
+
+```text
+IACC skill pack
+  + local SkillRegistry
+    + .cowd/skills
+    + .agents/skills
+    + .codex/skills
+    + ~/.cowd/skills
+    + ~/.codex/skills
+    + legacy /commands
+```
+
+### 10.2 三层协议
+
+```text
+Catalog: 发现和详情
+Projection: 按 WebUI/TUI/CLI 投影能力
+Action: validate / plan / run / runs / run detail
+```
+
+### 10.3 三端分工
+
+| 入口 | 定位 | 能力 |
+|---|---|---|
+| CLI | 极简控制 | list、view、install、invoke |
+| TUI | 控制台全集 | 展示全集、搜索、action availability、键盘操作 |
+| WebUI | 管理全集 | catalog、projection、validate、plan、run、watch、runs、detail、filter |
+
+---
+
+## 11. Connector 和 Cross-plane
+
+Connector runtime 负责外部系统接入。
+
+典型对象：
+
+- account
+- capability
+- resource ref
+- connector run
+- platform channel
+- service action
+
+Cross-plane governance 负责跨系统动作治理。
+
+典型对象：
+
+- identity binding
+- grant
+- preflight
+- policy decision
+- execution receipt
+- audit record
+
+常用 API：
+
+```text
+GET  /api/connectors/summary
+GET  /api/connectors/accounts
+GET  /api/connectors/mcp/servers
+GET  /api/cross-plane/summary
+POST /api/cross-plane/preflight
+POST /api/cross-plane/execute
+GET  /api/cross-plane/audit
+```
+
+---
+
+## 12. 配置
+
+配置文件常见位置：
+
+```text
+~/.cowd/config.yaml
+<workspace>/.cowd/config.yaml
+$COWD_CONFIG_HOME/config.yaml
+```
+
+常用字段：
+
+```yaml
+model: "claude-sonnet-4-6"
+permissions:
+  defaultMode: "dontAsk"
+memory:
+  enabled: true
+gateway:
+  enabled: true
+  sessionReset: "none"
+  platforms:
+    - platformType: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+      auth:
+        enabled: false
+```
+
+---
+
+## 13. 开发和验证
+
+### 13.1 Rust
+
+```bash
+cargo fmt --check
+cargo test -p commands skill --no-default-features
+cargo test -p cowd-cli skill --no-default-features -- --test-threads=1
+cargo build -p cowd-cli --no-default-features
+cargo build --release -p cowd-cli --no-default-features
+```
+
+### 13.2 WebUI
+
+```bash
+cd webui
+npm ci
+npm test
+```
+
+### 13.3 场景脚本
+
+Skills 统一面验收：
+
+```bash
+COWD_BIN=/path/to/cowd scripts/v09136_skill_surface_unification_scenario.sh
+```
+
+安装版验收：
+
+```bash
+COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
+```
+
+### 13.4 浏览器评测
+
+WebUI E2E 使用 Playwright。若本地 Playwright 浏览器未安装，可指定系统 Chromium：
+
+```js
+chromium.launch({
+  headless: true,
+  executablePath: "/snap/bin/chromium",
+  args: ["--no-sandbox"]
+})
+```
+
+---
+
+## 14. 安装和发布
+
+当前推荐安装方式：
+
+```bash
+cargo build --release -p cowd-cli --no-default-features
+rm -f ~/AI/cowd
+install -m 0755 target/release/cowd ~/AI/cowd
+rm -rf ~/AI/webui
+mkdir -p ~/AI/webui
+cp -a webui/. ~/AI/webui/
+~/AI/cowd --version
+```
+
+不再复制到：
+
+```text
+~/AI/bin/cowd
+```
+
+也不再需要：
+
+```text
+~/AI/bin/
+```
+
+---
+
+## 15. 当前能力状态
+
+已完成：
+
+- 三分支统一：`master`、`develop`、`dev-iacc`
+- `~/AI/cowd` 安装
+- `~/AI/webui` 安装
+- Skills catalog/projection/action API
+- WebUI Skills 闭环：validate/plan/run/watch/runs/detail/filter
+- TUI Skills action availability
+- CLI skills 极简化
+- IACC skill pack 接入统一 Skills API
+
+仍需后续增强：
+
+- TUI 直接调用 Skills Action API 的完整交互流
+- WebUI skill runs 的更强批量操作和对比视图
+- candidate skills 的 promote/reject/archive
+- local skills 的安全扫描和 manifest 校验报告
+- IACC action 与 memory case/playbook 的更完整闭环展示
+
+---
+
+## 16. 常见问题
+
+### WebUI 打开是 404
+
+检查：
+
+```bash
+ls ~/AI/webui/index.html
+~/AI/cowd gateway run
+curl http://127.0.0.1:8642/readyz
+```
+
+`readyz` 中应看到 static WebUI source 指向 `installed:exe-dir/webui` 或当前工作区 `webui`。
+
+### Skills Run 报 `incident_id is required`
+
+`plan` 和 `run` 需要 IACC incident。先通过 IACC API 或 WebUI IACC 面板创建 incident，再在 Skills 面板输入 incident id。
+
+### local skill 不能 Run
+
+这是设计约束。local skill 由 CLI 管理导入、查看和 prompt dispatch，不承载 IACC 状态执行。
+
+### `cargo clippy -D warnings` 报 memory 历史 lint
+
+当前严格 clippy 会被 `cowd-memory` 既有 lint 阻断。针对 Skills 闭环的验证使用：
+
+```bash
+cargo fmt --check
+cargo test -p cowd-cli skill --no-default-features -- --test-threads=1
+cd webui && npm test
+COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
+```
+
