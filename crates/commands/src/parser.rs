@@ -9,11 +9,7 @@ use runtime::{
 };
 use serde_json::{json, Value};
 
-use crate::skill_tools::{
-    SkillCreateInput, SkillCreateOutput, SkillDeleteInput, SkillDeleteOutput, SkillEditInput,
-    SkillEditOutput, SkillGenerateInput, SkillGenerateOutput, SkillManager, SkillViewInput,
-    SkillViewOutput,
-};
+use crate::skill_tools::{SkillManager, SkillViewInput, SkillViewOutput};
 use crate::specs::{
     SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
@@ -1342,11 +1338,10 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             return Ok(match help_path.as_slice() {
                 [] => render_skills_usage(None),
                 ["install", ..] => render_skills_usage(Some("install")),
-                ["create", ..] => render_skills_usage(Some("create")),
                 ["view", ..] => render_skills_usage(Some("view")),
-                ["edit", ..] => render_skills_usage(Some("edit")),
-                ["delete", ..] => render_skills_usage(Some("delete")),
-                ["generate", ..] => render_skills_usage(Some("generate")),
+                ["create" | "edit" | "delete" | "generate", ..] => {
+                    render_skills_usage(Some("managed"))
+                }
                 _ => render_skills_usage(Some(&help_path.join(" "))),
             });
         }
@@ -1367,15 +1362,6 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let install = install_skill(target, cwd)?;
             Ok(render_skill_install_report(&install))
         }
-        // New CRUD operations
-        Some("create") => Ok(render_skills_usage(Some("create"))),
-        Some(args) if args.starts_with("create ") => {
-            let input = parse_skill_create_args(args["create ".len()..].trim());
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let result = manager.create_skill(input);
-            Ok(render_skill_create_report(&result))
-        }
         Some("view") => Ok(render_skills_usage(Some("view"))),
         Some(args) if args.starts_with("view ") => {
             let name = args["view ".len()..].trim();
@@ -1392,51 +1378,14 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let result = manager.view_skill(input);
             Ok(render_skill_view_report(&result))
         }
-        Some("edit") => Ok(render_skills_usage(Some("edit"))),
-        Some(args) if args.starts_with("edit ") => {
-            let input = parse_skill_edit_args(args["edit ".len()..].trim());
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let result = manager.edit_skill(input);
-            Ok(render_skill_edit_report(&result))
-        }
-        Some("delete") => Ok(render_skills_usage(Some("delete"))),
-        Some(args) if args.starts_with("delete ") => {
-            let name = args["delete ".len()..].trim();
-            let force = name.contains("--force") || name.contains("-f");
-            let name = name
-                .trim_end_matches("--force")
-                .trim_end_matches("-f")
-                .trim();
-            if name.is_empty() {
-                return Ok(render_skills_usage(Some("delete")));
-            }
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let input = SkillDeleteInput {
-                name: name.to_string(),
-                force,
-            };
-            let result = manager.delete_skill(input);
-            Ok(render_skill_delete_report(&result))
-        }
-        Some("generate") => Ok(render_skills_usage(Some("generate"))),
-        Some(args) if args.starts_with("generate ") => {
-            let task = args["generate ".len()..].trim();
-            if task.is_empty() {
-                return Ok(render_skills_usage(Some("generate")));
-            }
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let input = SkillGenerateInput {
-                task_description: Some(task.to_string()),
-                tool_call_count: None,
-                error_count: None,
-                user_corrections: None,
-                name: None,
-            };
-            let result = manager.generate_skill(input);
-            Ok(render_skill_generate_report(&result))
+        Some("create" | "edit" | "delete" | "generate") => Ok(render_skills_usage(Some("managed"))),
+        Some(args)
+            if args.starts_with("create ")
+                || args.starts_with("edit ")
+                || args.starts_with("delete ")
+                || args.starts_with("generate ") =>
+        {
+            Ok(render_skills_usage(Some("managed")))
         }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage(None)),
         Some(args) => Ok(render_skills_usage(Some(args))),
@@ -1470,11 +1419,10 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             return Ok(match help_path.as_slice() {
                 [] => render_skills_usage_json(None),
                 ["install", ..] => render_skills_usage_json(Some("install")),
-                ["create", ..] => render_skills_usage_json(Some("create")),
                 ["view", ..] => render_skills_usage_json(Some("view")),
-                ["edit", ..] => render_skills_usage_json(Some("edit")),
-                ["delete", ..] => render_skills_usage_json(Some("delete")),
-                ["generate", ..] => render_skills_usage_json(Some("generate")),
+                ["create" | "edit" | "delete" | "generate", ..] => {
+                    render_skills_usage_json(Some("managed"))
+                }
                 _ => render_skills_usage_json(Some(&help_path.join(" "))),
             });
         }
@@ -1494,22 +1442,6 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             }
             let install = install_skill(target, cwd)?;
             Ok(render_skill_install_report_json(&install))
-        }
-        // New CRUD operations
-        Some("create") => Ok(render_skills_usage_json(Some("create"))),
-        Some(args) if args.starts_with("create ") => {
-            let input = parse_skill_create_args(args["create ".len()..].trim());
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let result = manager.create_skill(input);
-            Ok(json!({
-                "kind": "skills",
-                "action": "create",
-                "success": result.success,
-                "name": result.name,
-                "path": result.path,
-                "message": result.message,
-            }))
         }
         Some("view") => Ok(render_skills_usage_json(Some("view"))),
         Some(args) if args.starts_with("view ") => {
@@ -1544,72 +1476,16 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 "path": result.path,
             }))
         }
-        Some("edit") => Ok(render_skills_usage_json(Some("edit"))),
-        Some(args) if args.starts_with("edit ") => {
-            let input = parse_skill_edit_args(args["edit ".len()..].trim());
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let result = manager.edit_skill(input);
-            Ok(json!({
-                "kind": "skills",
-                "action": "edit",
-                "success": result.success,
-                "name": result.name,
-                "path": result.path,
-                "message": result.message,
-            }))
+        Some("create" | "edit" | "delete" | "generate") => {
+            Ok(render_skills_usage_json(Some("managed")))
         }
-        Some("delete") => Ok(render_skills_usage_json(Some("delete"))),
-        Some(args) if args.starts_with("delete ") => {
-            let name = args["delete ".len()..].trim();
-            let force = name.contains("--force") || name.contains("-f");
-            let name = name
-                .trim_end_matches("--force")
-                .trim_end_matches("-f")
-                .trim();
-            if name.is_empty() {
-                return Ok(render_skills_usage_json(Some("delete")));
-            }
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let input = SkillDeleteInput {
-                name: name.to_string(),
-                force,
-            };
-            let result = manager.delete_skill(input);
-            Ok(json!({
-                "kind": "skills",
-                "action": "delete",
-                "success": result.success,
-                "name": result.name,
-                "message": result.message,
-            }))
-        }
-        Some("generate") => Ok(render_skills_usage_json(Some("generate"))),
-        Some(args) if args.starts_with("generate ") => {
-            let task = args["generate ".len()..].trim();
-            if task.is_empty() {
-                return Ok(render_skills_usage_json(Some("generate")));
-            }
-            let paths = discover_skill_root_paths(cwd);
-            let manager = SkillManager::new(paths);
-            let input = SkillGenerateInput {
-                task_description: Some(task.to_string()),
-                tool_call_count: None,
-                error_count: None,
-                user_corrections: None,
-                name: None,
-            };
-            let result = manager.generate_skill(input);
-            Ok(json!({
-                "kind": "skills",
-                "action": "generate",
-                "success": result.success,
-                "name": result.name,
-                "content": result.content,
-                "path": result.path,
-                "message": result.message,
-            }))
+        Some(args)
+            if args.starts_with("create ")
+                || args.starts_with("edit ")
+                || args.starts_with("delete ")
+                || args.starts_with("generate ") =>
+        {
+            Ok(render_skills_usage_json(Some("managed")))
         }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage_json(None)),
         Some(args) => Ok(render_skills_usage_json(Some(args))),
@@ -1623,11 +1499,11 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         Some(args) if args == "install" || args.starts_with("install ") => {
             SkillSlashDispatch::Local
         }
-        // New CRUD commands - all handled locally
-        Some("create" | "view" | "edit" | "delete" | "generate") => SkillSlashDispatch::Local,
+        Some("view") => SkillSlashDispatch::Local,
+        Some(args) if args.starts_with("view ") => SkillSlashDispatch::Local,
+        Some("create" | "edit" | "delete" | "generate") => SkillSlashDispatch::Local,
         Some(args)
             if args.starts_with("create ")
-                || args.starts_with("view ")
                 || args.starts_with("edit ")
                 || args.starts_with("delete ")
                 || args.starts_with("generate ") =>
@@ -1668,7 +1544,9 @@ pub fn resolve_skill_invocation(
                         message.push_str(&names.join(", "));
                     }
                 }
-                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
+                message.push_str(
+                    "\n  Usage: /skills [list|view <name>|install <path>|help|<skill> [args]]",
+                );
                 return Err(message);
             }
         }
@@ -2744,163 +2622,6 @@ pub(crate) fn render_skill_install_report_json(skill: &InstalledSkill) -> Value 
     })
 }
 
-// Helper function to parse skill create arguments
-fn parse_skill_create_args(input: &str) -> SkillCreateInput {
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut category = None;
-    let mut tags = None;
-    let content = None;
-
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let mut i = 0;
-    while i < parts.len() {
-        match parts[i] {
-            "-n" | "--name" => {
-                if i + 1 < parts.len() {
-                    name = parts[i + 1].to_string();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-d" | "--description" => {
-                if i + 1 < parts.len() {
-                    description = parts[i + 1].to_string();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-c" | "--category" => {
-                if i + 1 < parts.len() {
-                    category = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-t" | "--tags" => {
-                if i + 1 < parts.len() {
-                    tags = Some(parts[i + 1].split(',').map(String::from).collect());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                if name.is_empty() {
-                    name = parts[i].to_string();
-                } else if description.is_empty() {
-                    description = parts[i].to_string();
-                }
-                i += 1;
-            }
-        }
-    }
-
-    SkillCreateInput {
-        name,
-        description,
-        category,
-        tags,
-        content,
-    }
-}
-
-// Helper function to parse skill edit arguments
-fn parse_skill_edit_args(input: &str) -> SkillEditInput {
-    let mut name = String::new();
-    let mut content = None;
-    let mut description = None;
-    let mut search = None;
-    let mut replace = None;
-    let mut file_path = None;
-
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let mut i = 0;
-    while i < parts.len() {
-        match parts[i] {
-            "-n" | "--name" => {
-                if i + 1 < parts.len() {
-                    name = parts[i + 1].to_string();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-c" | "--content" => {
-                if i + 1 < parts.len() {
-                    content = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-d" | "--description" => {
-                if i + 1 < parts.len() {
-                    description = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-s" | "--search" => {
-                if i + 1 < parts.len() {
-                    search = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-r" | "--replace" => {
-                if i + 1 < parts.len() {
-                    replace = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "-f" | "--file" => {
-                if i + 1 < parts.len() {
-                    file_path = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                if name.is_empty() {
-                    name = parts[i].to_string();
-                }
-                i += 1;
-            }
-        }
-    }
-
-    SkillEditInput {
-        name,
-        content,
-        description,
-        search,
-        replace,
-        file_path,
-    }
-}
-
-// Render skill create report
-fn render_skill_create_report(result: &SkillCreateOutput) -> String {
-    let mut lines = vec!["Skills".to_string()];
-    if result.success {
-        lines.push(format!("  Result           created {}", result.name));
-        lines.push(format!("  Path             {}", result.path));
-    } else {
-        lines.push(format!("  Result           failed"));
-        lines.push(format!("  Error            {}", result.message));
-    }
-    lines.join("\n")
-}
-
 // Render skill view report
 fn render_skill_view_report(result: &SkillViewOutput) -> String {
     let mut lines = vec!["Skills".to_string()];
@@ -2952,73 +2673,17 @@ fn render_skill_view_report(result: &SkillViewOutput) -> String {
     lines.join("\n")
 }
 
-// Render skill edit report
-fn render_skill_edit_report(result: &SkillEditOutput) -> String {
-    let mut lines = vec!["Skills".to_string()];
-    if result.success {
-        lines.push(format!("  Result           updated {}", result.name));
-        lines.push(format!("  Path             {}", result.path));
-    } else {
-        lines.push(format!("  Result           failed"));
-        lines.push(format!("  Error            {}", result.message));
-    }
-    lines.join("\n")
-}
-
-// Render skill delete report
-fn render_skill_delete_report(result: &SkillDeleteOutput) -> String {
-    let mut lines = vec!["Skills".to_string()];
-    if result.success {
-        lines.push(format!("  Result           deleted {}", result.name));
-    } else {
-        lines.push(format!("  Result           failed"));
-        lines.push(format!("  Error            {}", result.message));
-    }
-    lines.join("\n")
-}
-
-// Render skill generate report
-fn render_skill_generate_report(result: &SkillGenerateOutput) -> String {
-    let mut lines = vec!["Skills".to_string()];
-    if result.success {
-        lines.push(format!("  Result           generated {}", result.name));
-        lines.push(format!("  Message          {}", result.message));
-        if let Some(ref path) = result.path {
-            lines.push(format!("  Path             {}", path));
-        }
-        lines.push(String::new());
-        lines.push("---".to_string());
-        lines.push(String::new());
-        // Show generated content preview
-        let preview = if result.content.len() > 800 {
-            format!("{}...\n\n[Content truncated]", &result.content[..800])
-        } else {
-            result.content.clone()
-        };
-        lines.push(preview);
-    } else {
-        lines.push(format!("  Result           failed"));
-        lines.push(format!("  Error            {}", result.message));
-    }
-    lines.join("\n")
-}
-
 // Render skills usage help
 fn render_skills_usage(topic: Option<&str>) -> String {
     match topic {
-        Some("create") => r#"Skills - Create
+        Some("create" | "edit" | "delete" | "generate" | "managed") => {
+            r#"Skills - Managed In WebUI/TUI
 
-Usage: /skill create [options] <name> [--description <desc>]
-
-Options:
-  -n, --name <name>       Skill name
-  -d, --description <desc> Description
-  -c, --category <cat>   Category
-  -t, --tags <tags>      Comma-separated tags
-
-Example:
-  /skill create my-skill --name my-skill --description "My custom skill""#
-            .to_string(),
+The CLI intentionally exposes only list, view, install, and invocation.
+Use WebUI or TUI for create, edit, delete, generate, validation, run queues,
+governance review, and stateful skill management."#
+                .to_string()
+        }
         Some("view") => r#"Skills - View
 
 Usage: /skill view <name>
@@ -3028,41 +2693,6 @@ View skill metadata and content.
 Example:
   /skill view git-essentials
   /skill view my-skill --file references/api.md"#
-            .to_string(),
-        Some("edit") => r#"Skills - Edit
-
-Usage: /skill edit <name> [options]
-
-Options:
-  -n, --name <name>       Skill name
-  -c, --content <text>    New content
-  -d, --description <desc> New description
-  -s, --search <text>     Search text for patch
-  -r, --replace <text>    Replacement text
-  -f, --file <path>       File to edit
-
-Example:
-  /skill edit my-skill --search old --replace new"#
-            .to_string(),
-        Some("delete") => r#"Skills - Delete
-
-Usage: /skill delete <name> [--force]
-
-Options:
-  --force, -f           Skip confirmation
-
-Example:
-  /skill delete my-skill
-  /skill delete my-skill --force"#
-            .to_string(),
-        Some("generate") => r#"Skills - Generate
-
-Usage: /skill generate <task-description>
-
-Auto-generate a skill based on task context.
-
-Example:
-  /skill generate "AWS Lambda deployment workflow""#
             .to_string(),
         Some("install") => r#"Skills - Install
 
@@ -3077,9 +2707,11 @@ Example:
         _ => {
             let mut lines = vec![
                 "Skills".to_string(),
-                "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
+                "  Usage            /skills [list|view <name>|install <path>|help|<skill> [args]]".to_string(),
                 "  Alias            /skill".to_string(),
-                "  Direct CLI       cowd skills [list|install <path>|help|<skill> [args]]".to_string(),
+                "  Direct CLI       cowd skills [list|view <name>|install <path>|help|<skill> [args]]".to_string(),
+                "  Local controls   list, view <name>, install <path>".to_string(),
+                "  Managed in UI    create, edit, delete, generate, validate, run, governance".to_string(),
                 "  Invoke           /skills help overview -> $help overview".to_string(),
                 "  Install root     $COWD_CONFIG_HOME/skills or ~/.cowd/skills".to_string(),
                 "  Sources          .cowd/skills, .agents/skills, .codex/skills, ~/.cowd/skills, ~/.cowd/skills/omc-learned, ~/.codex/skills, legacy /commands".to_string(),
@@ -3095,17 +2727,11 @@ Example:
 
 fn render_skills_usage_json(topic: Option<&str>) -> Value {
     match topic {
-        Some("create") => json!({
+        Some("create" | "edit" | "delete" | "generate" | "managed") => json!({
             "kind": "skills",
             "action": "help",
-            "topic": "create",
-            "usage": r#"Usage: /skill create [options] <name> [--description <desc>]
-
-Options:
-  -n, --name <name>       Skill name
-  -d, --description <desc> Description
-  -c, --category <cat>   Category
-  -t, --tags <tags>      Comma-separated tags"#,
+            "topic": "managed",
+            "usage": "CLI supports only list, view, install, and invocation. Use WebUI or TUI for create, edit, delete, generate, validation, run queues, governance review, and stateful skill management.",
         }),
         Some("view") => json!({
             "kind": "skills",
@@ -3118,35 +2744,6 @@ View skill metadata and content.
 Example:
   /skill view git-essentials
   /skill view my-skill --file references/api.md"#,
-        }),
-        Some("edit") => json!({
-            "kind": "skills",
-            "action": "help",
-            "topic": "edit",
-            "usage": r#"Usage: /skill edit <name> [options]
-
-Options:
-  -n, --name <name>       Skill name
-  -c, --content <text>    New content
-  -d, --description <desc> New description
-  -s, --search <text>     Search text for patch
-  -r, --replace <text>    Replacement text
-  -f, --file <path>       File to edit"#,
-        }),
-        Some("delete") => json!({
-            "kind": "skills",
-            "action": "help",
-            "topic": "delete",
-            "usage": r#"Usage: /skill delete <name> [--force]
-
-Options:
-  --force, -f           Skip confirmation"#,
-        }),
-        Some("generate") => json!({
-            "kind": "skills",
-            "action": "help",
-            "topic": "generate",
-            "usage": "Usage: /skill generate <task-description>\n\nAuto-generate a skill based on task context.",
         }),
         Some("install") => json!({
             "kind": "skills",
@@ -3164,9 +2761,11 @@ Example:
             "kind": "skills",
             "action": "help",
             "usage": {
-                "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
+                "slash_command": "/skills [list|view <name>|install <path>|help|<skill> [args]]",
                 "aliases": ["/skill"],
-                "direct_cli": "cowd skills [list|install <path>|help|<skill> [args]]",
+                "direct_cli": "cowd skills [list|view <name>|install <path>|help|<skill> [args]]",
+                "local_controls": ["list", "view <name>", "install <path>"],
+                "managed_in_ui": ["create", "edit", "delete", "generate", "validate", "run", "governance"],
                 "invoke": "/skills help overview -> $help overview",
                 "install_root": "$CC_CONFIG_HOME/skills or ~/.cowd/skills",
                 "sources": [

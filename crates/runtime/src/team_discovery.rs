@@ -8,6 +8,8 @@ use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::agent_reputation::ReputationManager;
 use serde::{Deserialize, Serialize};
 
+use crate::skill_activation::SkillActivationRecord;
+
 // ── TeamDiscoveryProtocol ──────────────────────────────────────────────────────
 
 /// Discovers and ranks agents for a given task using the global
@@ -126,6 +128,21 @@ impl TeamDiscoveryProtocol {
         })
     }
 
+    /// Auto-assemble agents from skill activation candidates.
+    ///
+    /// The selected skill name becomes the strongest capability signal, while
+    /// high-scoring candidate names are retained as secondary signals.
+    pub fn auto_assemble_for_activation(
+        &self,
+        activation: &SkillActivationRecord,
+    ) -> Option<DiscoveredTeam> {
+        let required = skill_names_from_activation(activation);
+        if required.is_empty() {
+            return None;
+        }
+        self.auto_assemble(&activation.query, &required)
+    }
+
     // ── persistence helpers ────────────────────────────────────────────────
 
     /// Persist a discovered team to the `teams` table.
@@ -242,6 +259,20 @@ impl Default for TeamDiscoveryProtocol {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
+
+fn skill_names_from_activation(activation: &SkillActivationRecord) -> Vec<String> {
+    let mut skills = Vec::new();
+    if let Some(selected) = &activation.selected {
+        skills.push(selected.clone());
+    }
+    for candidate in &activation.candidates {
+        if candidate.score < 2 || skills.contains(&candidate.name) {
+            continue;
+        }
+        skills.push(candidate.name.clone());
+    }
+    skills
+}
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -372,6 +403,36 @@ mod tests {
         );
 
         cleanup(&["td3_lead", "td3_wr", "td3_wt"]);
+    }
+
+    #[test]
+    fn auto_assemble_for_activation_uses_skill_candidate_names() {
+        register_test_agent(
+            "td_skill_release",
+            vec!["release".into(), "git-release".into()],
+            None,
+        );
+        register_test_agent("td_skill_debug", vec!["debug".into()], None);
+
+        let activation = crate::skill_activation::SkillActivationRecord::new(
+            "session-skill",
+            1,
+            "prepare a release",
+            vec![crate::skill_activation::RuntimeSkillCandidate {
+                name: "release".to_string(),
+                score: 10,
+                reasons: vec!["tags:1".to_string()],
+                path: None,
+            }],
+        );
+        let proto = TeamDiscoveryProtocol::new();
+        let team = proto
+            .auto_assemble_for_activation(&activation)
+            .expect("skill activation should assemble a team");
+
+        assert_eq!(team.leader.agent_id, "td_skill_release");
+
+        cleanup(&["td_skill_release", "td_skill_debug"]);
     }
 
     #[test]

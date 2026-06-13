@@ -299,6 +299,11 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub installed: bool,
+    pub category: String,
+    pub source: String,
+    pub status: String,
+    pub risk: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

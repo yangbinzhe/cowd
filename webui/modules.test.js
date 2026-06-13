@@ -994,6 +994,29 @@ describe('API module', () => {
     ]);
   });
 
+  it('skills api uses unified skill surface routes', async () => {
+    const mockF = vi.fn((path) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(String(path).includes('projection')
+          ? { kind: 'skills.projection', items: [] }
+          : { kind: 'skills.catalog', items: [] })
+      })
+    );
+    global.fetch = mockF;
+
+    await window.Api.listSkillCatalog('iacc');
+    await window.Api.skillProjection('webui', 'release');
+    await window.Api.skillDetail('iacc:supply-risk-analyst');
+
+    expect(mockF.mock.calls.map(call => call[0])).toEqual([
+      '/api/skills/catalog?scope=iacc',
+      '/api/skills/projection?surface=webui&query=release',
+      '/api/skills/iacc%3Asupply-risk-analyst',
+    ]);
+  });
+
   it('Panels module exposes all panel renderers', () => {
     expect(typeof window.Panels.renderMemory).toBe('function');
     expect(typeof window.Panels.renderContext).toBe('function');
@@ -1013,6 +1036,54 @@ describe('API module', () => {
     expect(typeof window.Panels.renderCCApproval).toBe('function');
     expect(typeof window.Panels.renderCCHistory).toBe('function');
     expect(typeof window.Panels.renderCCUsage).toBe('function');
+  });
+
+  it('renders skills panel from unified projection', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/skills/iacc%3Asupply-risk-analyst')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'skills.detail',
+          skill: { id: 'iacc:supply-risk-analyst', name: 'supply-risk-analyst', scope: 'iacc' }
+        }) });
+      }
+      if (path.includes('/api/skills/projection')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'skills.projection',
+          surface: 'webui',
+          catalog_count: 1,
+          capabilities: ['catalog.read', 'skill.run', 'governance.bulk'],
+          governance: {
+            evidence_model: 'iacc.evidence.packet + agent_evidence + tool_invocation',
+            tool_fact_model: 'tool.execution_plan + tool.invocation.runtime_event',
+            approval_model: 'quality_gate + cross_plane_policy'
+          },
+          queue: { supports_watch: true },
+          facets: { scopes: ['iacc'], domains: ['server_manufacturing'], risks: ['governed'], statuses: ['ready'] },
+          activation: { selected: { name: 'release' }, candidates: [{ name: 'release' }] },
+          items: [{
+            id: 'iacc:supply-risk-analyst',
+            name: 'supply-risk-analyst',
+            description: 'Supply Risk Analyst',
+            scope: 'iacc',
+            domain: 'server_manufacturing',
+            risk: 'governed',
+            status: 'ready',
+            tags: ['iacc']
+          }]
+        }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    }));
+
+    await window.Panels.renderSkills();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Supply Risk Analyst');
+    expect(text).toContain('supply-risk-analyst');
+    expect(text).toContain('governance.bulk');
+    expect(text).toContain('tool.execution_plan');
   });
 
   it('renders gateway platform readiness without secrets', async () => {

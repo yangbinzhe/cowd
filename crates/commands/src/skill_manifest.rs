@@ -333,7 +333,9 @@ fn parse_enhanced_manifest(
         || obj.contains_key(&serde_yaml::Value::String("config".into()))
         || obj.contains_key(&serde_yaml::Value::String("prerequisites".into()))
         || obj.contains_key(&serde_yaml::Value::String("platforms".into()))
-        || obj.contains_key(&serde_yaml::Value::String("version".into()));
+        || obj.contains_key(&serde_yaml::Value::String("version".into()))
+        || obj.contains_key(&serde_yaml::Value::String("tags".into()))
+        || obj.contains_key(&serde_yaml::Value::String("related_skills".into()));
 
     if !has_enhanced {
         return Ok(None);

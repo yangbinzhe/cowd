@@ -74,6 +74,8 @@ pub mod pairing;
 pub mod profile;
 pub mod provider_registry;
 pub mod session_lifecycle;
+pub mod skill_activation;
+pub mod skill_memory;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
@@ -83,6 +85,9 @@ pub mod task_registry;
 pub mod team_cron_registry;
 pub mod team_discovery;
 pub mod tool_dispatch;
+pub mod tool_execution_plan;
+pub mod tool_invocation;
+pub mod tool_memory;
 pub mod tool_orchestrator;
 pub mod trust_resolver;
 mod usage;
@@ -281,6 +286,8 @@ pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
 };
+pub use skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
+pub use skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
@@ -294,6 +301,12 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
+pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
+pub use tool_invocation::{
+    now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
+    ToolOutputRef, DEFAULT_OUTPUT_REF_MIN_LINES,
+};
+pub use tool_memory::{memory_candidate_from_tool_invocation, ToolMemoryCandidatePolicy};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

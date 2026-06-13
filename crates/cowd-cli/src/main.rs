@@ -58,7 +58,7 @@ use commands::{
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, SkillSlashDispatch, SlashCommand,
+    slash_command_specs, SkillRegistry, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -3187,45 +3187,53 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
         }
     }
 
-    // P1: Skills data pipeline
+    // P1: Skills data pipeline, aligned with the WebUI unified skill catalog.
     app.skill_list.clear();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let skill_roots = [
-        PathBuf::from(format!("{}/.cowd/skills", home)),
-        PathBuf::from(format!("{}/.cowd/skills", cwd.to_string_lossy())),
-        PathBuf::from(format!("{}/.agents/skills", home)),
-        PathBuf::from(format!("{}/.agents/skills", cwd.to_string_lossy())),
-    ];
-    for root in &skill_roots {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let skill_md = path.join("SKILL.md");
-                    if skill_md.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let desc = content
-                                .lines()
-                                .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("---"))
-                                .nth(0)
-                                .map(|l| l.trim().to_string())
-                                .unwrap_or_default();
-                            let installed = path.join("installed.json").exists()
-                                || path.join("installed").exists();
-                            app.skill_list.push(tui::SkillSummary {
-                                name,
-                                description: desc,
-                                installed,
-                            });
-                        }
-                    }
-                }
+    for skill in runtime::server_manufacturing_skill_pack() {
+        let risk = if skill
+            .output_actions
+            .iter()
+            .any(|action| action.contains("dispatch") || action.contains("escalation"))
+        {
+            "controlled"
+        } else if skill.tools.iter().any(|tool| tool.contains("cross_plane")) {
+            "governed"
+        } else {
+            "review"
+        };
+        app.skill_list.push(tui::SkillSummary {
+            name: skill.skill_id,
+            description: skill.role,
+            installed: true,
+            category: skill.domain.clone(),
+            source: "iacc".to_string(),
+            status: "ready".to_string(),
+            risk: risk.to_string(),
+            tags: vec![skill.domain, "iacc".to_string()],
+        });
+    }
+    match SkillRegistry::discover(&cwd).list() {
+        Ok(skills) => {
+            for skill in skills {
+                app.skill_list.push(tui::SkillSummary {
+                    name: skill.name,
+                    description: skill.description.unwrap_or_default(),
+                    installed: skill.shadowed_by.is_none(),
+                    category: "local".to_string(),
+                    source: format!("{:?}", skill.source),
+                    status: if skill.shadowed_by.is_some() {
+                        "shadowed".to_string()
+                    } else {
+                        "ready".to_string()
+                    },
+                    risk: "operator_review".to_string(),
+                    tags: skill.tags,
+                });
             }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load skill registry for TUI");
         }
     }
 
@@ -15895,10 +15903,16 @@ mod skill_pipeline_tests {
             name: "test-skill".to_string(),
             description: "A test skill".to_string(),
             installed: true,
+            category: "local".to_string(),
+            source: "ProjectCowd".to_string(),
+            status: "ready".to_string(),
+            risk: "operator_review".to_string(),
+            tags: vec!["test".to_string()],
         };
         assert_eq!(s.name, "test-skill");
         assert_eq!(s.description, "A test skill");
         assert!(s.installed);
+        assert_eq!(s.status, "ready");
     }
 
     #[test]
@@ -15928,13 +15942,18 @@ mod skill_pipeline_tests {
                         let desc = content
                             .lines()
                             .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("---"))
-                            .nth(0)
+                            .next()
                             .map(|l| l.trim().to_string())
                             .unwrap_or_default();
                         app.skill_list.push(SkillSummary {
                             name,
                             description: desc,
                             installed: false,
+                            category: "local".to_string(),
+                            source: "fixture".to_string(),
+                            status: "ready".to_string(),
+                            risk: "operator_review".to_string(),
+                            tags: Vec::new(),
                         });
                     }
                 }

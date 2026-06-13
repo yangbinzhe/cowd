@@ -184,6 +184,7 @@ run_scenario() {
   run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step tui_smoke bash scripts/tui_smoke.sh
+  run_step skill_surface_unification bash scripts/v09136_skill_surface_unification_scenario.sh
   run_step unified_runtime_surface bash scripts/v0964_unified_runtime_surface_scenario.sh
   run_step session_lifecycle bash scripts/v0968_session_lifecycle_scenario.sh
   run_step agent_graph_contract bash scripts/v0971_agent_graph_scenario.sh

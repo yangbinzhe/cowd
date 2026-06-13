@@ -712,7 +712,7 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
+        assert!(help.contains("/skills [list|view <name>|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "cowd skills [list|install <path>|help|<skill> [args]]"
+            "cowd skills [list|view <name>|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -1255,8 +1255,9 @@ mod tests {
         assert!(agents_unexpected.contains("Unexpected       show planner"));
 
         let skills_help = handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains(
+            "Usage            /skills [list|view <name>|install <path>|help|<skill> [args]]"
+        ));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     $COWD_CONFIG_HOME/skills or ~/.cowd/skills"));
@@ -1276,8 +1277,9 @@ mod tests {
 
         let skills_unknown_help =
             handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(skills_unknown_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_unknown_help.contains(
+            "Usage            /skills [list|view <name>|install <path>|help|<skill> [args]]"
+        ));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let skills_help_json =

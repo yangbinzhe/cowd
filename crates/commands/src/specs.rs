@@ -249,8 +249,8 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
-        summary: "List, install, or invoke available skills",
-        argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
+        summary: "List, view, install, or invoke available skills",
+        argument_hint: Some("[list|view <name>|install <path>|help|<skill> [args]]"),
         resume_supported: true,
     },
     SlashCommandSpec {

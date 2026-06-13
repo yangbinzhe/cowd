@@ -11,52 +11,54 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  check:
+  validate-fast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      - run: cargo fmt -- --check
-      - run: cargo clippy --workspace --all-targets
-
-  test-core:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p api -p commands -p tools -p runtime -p plugins -p cowd-memory
-
-  test-all:
-    runs-on: ubuntu-latest
-    needs: test-core
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace -- --test-threads=1
-
-  test-webui:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: webui
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: webui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
       - run: npm ci
-      - run: npm test
+        working-directory: webui
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace --all-targets
+      - run: scripts/validate_fast.sh
+
+  validate-core:
+    runs-on: ubuntu-latest
+    needs: validate-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+        working-directory: webui
+      - run: scripts/validate_core.sh
+
+  validate-scenario:
+    runs-on: ubuntu-latest
+    needs: validate-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: scripts/validate_live.sh
 
   build:
     runs-on: ubuntu-latest
+    needs: validate-fast
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

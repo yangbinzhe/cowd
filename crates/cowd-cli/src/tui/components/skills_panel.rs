@@ -250,6 +250,10 @@ pub struct SkillDisplayEntry {
     pub description: String,
     pub category: String,
     pub enabled: bool,
+    pub source: String,
+    pub status: String,
+    pub risk: String,
+    pub tags: Vec<String>,
 }
 
 impl SkillsPanel {
@@ -296,11 +300,23 @@ impl SkillsPanel {
                 .map(|s| SkillDisplayEntry {
                     name: s.name.clone(),
                     description: s.description.clone(),
-                    category: "General".to_string(),
+                    category: s.category.clone(),
                     enabled: s.installed,
+                    source: s.source.clone(),
+                    status: s.status.clone(),
+                    risk: s.risk.clone(),
+                    tags: s.tags.clone(),
                 })
                 .collect();
-            self.categories = vec!["General".to_string()];
+            self.categories = self
+                .entries
+                .iter()
+                .fold(Vec::new(), |mut categories, entry| {
+                    if !categories.contains(&entry.category) {
+                        categories.push(entry.category.clone());
+                    }
+                    categories
+                });
             self.active_category = None;
         }
     }
@@ -460,6 +476,13 @@ impl SkillsPanel {
             if entry.name.to_lowercase().contains(&lower)
                 || entry.description.to_lowercase().contains(&lower)
                 || entry.category.to_lowercase().contains(&lower)
+                || entry.source.to_lowercase().contains(&lower)
+                || entry.status.to_lowercase().contains(&lower)
+                || entry.risk.to_lowercase().contains(&lower)
+                || entry
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&lower))
             {
                 matching.push(entry);
             } else {
@@ -476,6 +499,10 @@ impl SkillsPanel {
                 e.name.to_lowercase().contains(&lower)
                     || e.description.to_lowercase().contains(&lower)
                     || e.category.to_lowercase().contains(&lower)
+                    || e.source.to_lowercase().contains(&lower)
+                    || e.status.to_lowercase().contains(&lower)
+                    || e.risk.to_lowercase().contains(&lower)
+                    || e.tags.iter().any(|tag| tag.to_lowercase().contains(&lower))
             })
             .count();
 
@@ -580,7 +607,9 @@ impl SkillsPanel {
             let status_label = if self.using_builtins {
                 format!("{total} skills | j↓ k↑ select | Enter toggle | e enable | d disable | / search | Tab category")
             } else {
-                format!("{total} skills (from app) | j↓ k↑ select | Enter toggle | / search")
+                format!(
+                    "{total} unified skills | j↓ k↑ select | Enter toggle | / search | Tab scope"
+                )
             };
             lines.push(Line::from(Span::styled(
                 status_label,
@@ -618,11 +647,41 @@ impl SkillsPanel {
 
                 let status_icon = if entry.enabled { "✅" } else { "⬜" };
 
+                let mut meta = vec![
+                    entry.category.clone(),
+                    entry.status.clone(),
+                    entry.risk.clone(),
+                ];
+                if !entry.source.is_empty() {
+                    meta.push(entry.source.clone());
+                }
+                let tag_suffix = if entry.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        entry
+                            .tags
+                            .iter()
+                            .take(4)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+
                 lines.push(Line::from(vec![
                     Span::styled(cursor, cursor_style),
                     Span::styled(format!("{status_icon} "), status_style),
                     Span::styled(&entry.name, name_style),
                     Span::styled(format!(" — {}", entry.description), desc_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        format!("{}{}", meta.join(" · "), tag_suffix),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
 
@@ -798,6 +857,12 @@ fn flatten_builtin_skills(categories: &[(&str, Vec<BuiltinSkill>)]) -> Vec<Skill
                 description: skill.description.to_string(),
                 category: (*cat_name).to_string(),
                 enabled: skill.enabled,
+                source: skill.category.to_string(),
+                status: if skill.enabled { "ready" } else { "disabled" }.to_string(),
+                risk: "local".to_string(),
+                tags: skill
+                    .version
+                    .map_or_else(Vec::new, |version| vec![format!("v{version}")]),
             });
         }
     }
@@ -983,6 +1048,11 @@ mod tests {
             name: "TestSkill".to_string(),
             description: "A test skill".to_string(),
             installed: true,
+            category: "iacc".to_string(),
+            source: "iacc".to_string(),
+            status: "ready".to_string(),
+            risk: "governed".to_string(),
+            tags: vec!["demo".to_string()],
         }];
         let panel = SkillsPanel::from_app(&app);
         assert!(!panel.using_builtins);

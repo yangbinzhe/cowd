@@ -8,6 +8,7 @@ use crate::agent_protocol::{
     AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
     AgentTaskNode, ReviewVerdict,
 };
+use crate::tool_invocation::ToolInvocationRecord;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AgentGraphError {
@@ -266,6 +267,19 @@ impl AgentRunGraph {
         Ok(evidence)
     }
 
+    pub fn add_tool_invocation_evidence(
+        &mut self,
+        node_id: &str,
+        invocation: &ToolInvocationRecord,
+    ) -> Result<AgentEvidence, AgentGraphError> {
+        self.add_evidence(
+            node_id,
+            "tool_invocation",
+            invocation.evidence_reference(),
+            invocation.evidence_summary(),
+        )
+    }
+
     pub fn add_review(
         &mut self,
         node_id: &str,
@@ -335,6 +349,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_invocation::ToolInvocationRecord;
+    use crate::tool_orchestrator::ToolSafetyCategory;
 
     fn node(id: &str, deps: Vec<&str>) -> AgentTaskNode {
         AgentTaskNode {
@@ -427,5 +443,37 @@ mod tests {
         assert_eq!(graph.nodes[0].status, AgentNodeStatus::Failed);
         assert_eq!(graph.nodes[1].status, AgentNodeStatus::Ready);
         assert_eq!(graph.status, AgentNodeStatus::Blocked);
+    }
+
+    #[test]
+    fn agent_tool_invocation_evidence_uses_reference_without_output_copy() {
+        let mut graph = AgentRunGraph::new("s1", "ship");
+        graph.add_node(node("a", vec![])).unwrap();
+        let output = (0..80)
+            .map(|idx| format!("line {idx} {}", "x".repeat(24)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let invocation = ToolInvocationRecord::started(
+            "s1",
+            1,
+            "toolu-large",
+            "bash",
+            "generate",
+            ToolSafetyCategory::WriteLocal,
+            100,
+        )
+        .completed_with_output_policy(&output, 150, 3);
+
+        let evidence = graph
+            .add_tool_invocation_evidence("a", &invocation)
+            .unwrap();
+
+        assert_eq!(evidence.kind, "tool_invocation");
+        assert!(evidence.reference.starts_with("tool-output:toolu-large:"));
+        assert!(evidence
+            .summary
+            .contains("large output indexed by reference"));
+        assert!(!evidence.summary.contains("line 79"));
+        assert_eq!(graph.evidence.len(), 1);
     }
 }

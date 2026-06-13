@@ -58,6 +58,7 @@ mod profile_routes;
 mod public_routes;
 mod runtime_routes;
 mod session_routes;
+mod skill_routes;
 mod system_routes;
 mod task_routes;
 mod workspace_routes;
@@ -169,6 +170,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(profile_routes::router())
         .merge(runtime_routes::router())
         .merge(session_routes::router())
+        .merge(skill_routes::router())
         .merge(system_routes::router())
         .merge(task_routes::router())
         .merge(workspace_routes::router())

@@ -23,6 +23,19 @@ pub use skill_security::{
     SecurityStatus, Severity,
 };
 
+// Re-export shared skill registry module.
+pub mod skill_registry;
+pub use skill_registry::{
+    discover_skill_registry_roots, SkillInfo, SkillRegistry, SkillRegistryRoot,
+    SkillRegistryRootKind, SkillRegistryScope, SkillRegistrySource,
+};
+
+// Re-export local skill activation router.
+pub mod skill_router;
+pub use skill_router::{
+    SkillActivationCandidate, SkillActivationResult, SkillRouter, SkillRouterConfig,
+};
+
 // New split modules
 pub mod handlers;
 pub mod parser;

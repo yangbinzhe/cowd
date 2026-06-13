@@ -324,9 +324,21 @@ window.Api = (()=>{
     async upsertTaskAgentGraph(id,graph){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/agent-graph',graph||{})},
 
     // ── Skills ──
-    async listSkills(){return req('GET','/v1/skills')},
+    async listSkillCatalog(scope){
+      const query=scope&&scope!=='all'?'?scope='+encodeURIComponent(scope):'';
+      return req('GET','/api/skills/catalog'+query);
+    },
+    async skillProjection(surface,query){
+      const params=new URLSearchParams();
+      if(surface)params.set('surface',surface);
+      if(query)params.set('query',query);
+      const suffix=params.toString()?'?'+params.toString():'';
+      return req('GET','/api/skills/projection'+suffix);
+    },
+    async skillDetail(id){return req('GET','/api/skills/'+encodeURIComponent(id))},
+    async listSkills(){return req('GET','/api/skills/catalog')},
     async installSkill(name,src){return req('POST','/v1/skills/install',{name,source:src})},
-    async viewSkill(name){return req('GET','/v1/skills/'+name)},
+    async viewSkill(name){return req('GET','/api/skills/'+encodeURIComponent(name))},
     async uninstallSkill(name){return req('DELETE','/v1/skills/'+name)},
     async invokeSkill(name,args){return req('POST','/v1/skills/'+name+'/invoke',{args})},
     async toggleSkill(name){return req('POST','/v1/skills/'+name+'/toggle')},

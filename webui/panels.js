@@ -1830,30 +1830,134 @@ window.Panels = (()=>{
 
   async function renderSkills(){
     const c=cont();c.innerHTML='<h3>Skills</h3>';
-    try{
-      const data=await Api.listSkills();
-      (data.skills||data||[]).forEach(s=>{
-        const item=UI.el('div','panel-item');
-        const name=UI.el('span','pi-name');
-        name.textContent=s.name||s;
-        item.appendChild(name);
-        const acts=UI.el('span','pi-actions');
-        if(!s.installed){
-          const installBtn=UI.el('button');
-          installBtn.textContent='Install';
-          installBtn.onclick=async()=>{try{await Api.installSkill(s.name||s);UI.showToast('Installed','success');renderSkills()}catch(e){UI.showToast(e.message,'error')}};
-          acts.appendChild(installBtn);
-        }else{
-          const uninstallBtn=UI.el('button');
-          uninstallBtn.textContent='Remove';
-          uninstallBtn.style.color='var(--error)';
-          uninstallBtn.onclick=async()=>{try{await Api.uninstallSkill(s.name||s);UI.showToast('Removed','success');renderSkills()}catch(e){UI.showToast(e.message,'error')}};
-          acts.appendChild(uninstallBtn);
+    const controls=UI.el('div','skill-surface-controls');
+    const surface=UI.el('select');
+    ['webui','tui','cli'].forEach(function(value){
+      const opt=document.createElement('option');
+      opt.value=value;
+      opt.textContent=value.toUpperCase();
+      surface.appendChild(opt);
+    });
+    const search=UI.el('input');
+    search.placeholder='Search task';
+    search.value='prepare release';
+    const refresh=UI.el('button','btn-primary');
+    refresh.textContent='Refresh';
+    controls.appendChild(surface);
+    controls.appendChild(search);
+    controls.appendChild(refresh);
+    c.appendChild(controls);
+
+    const summary=UI.el('div','skill-summary memory-grid');
+    const list=UI.el('div','skill-catalog');
+    c.appendChild(summary);
+    c.appendChild(list);
+
+    const load=async()=>{
+      summary.innerHTML='';
+      list.innerHTML='<div class="panel-empty">Loading skills...</div>';
+      try{
+        const projection=await Api.skillProjection(surface.value,search.value.trim());
+        const items=projection.items||[];
+        summary.appendChild(renderSkillSummaryCard('Surface',[
+          surface.value.toUpperCase(),
+          'catalog '+(projection.catalog_count||items.length),
+          (projection.queue&&projection.queue.supports_watch)?'watch ready':'watch readonly'
+        ]));
+        summary.appendChild(renderSkillSummaryCard('Capabilities',(projection.capabilities||[]).slice(0,8)));
+        summary.appendChild(renderSkillSummaryCard('Governance',[
+          projection.governance&&projection.governance.evidence_model,
+          projection.governance&&projection.governance.tool_fact_model,
+          projection.governance&&projection.governance.approval_model
+        ].filter(Boolean)));
+        if(projection.activation){
+          const selected=projection.activation.selected;
+          summary.appendChild(renderSkillSummaryCard('Activation',[
+            selected?('selected '+selected.name):'no selection',
+            'candidates '+((projection.activation.candidates||[]).length)
+          ]));
         }
-        item.appendChild(acts);
-        c.appendChild(item);
-      });
-    }catch(e){c.appendChild(UI.el('div','panel-empty','No skills loaded'))}
+        list.innerHTML='';
+        const facets=projection.facets||{};
+        const facetRow=UI.el('div','skill-facets');
+        ['scopes','domains','risks','statuses'].forEach(function(key){
+          (facets[key]||[]).slice(0,6).forEach(function(value){
+            const badge=UI.el('span','audit-source');
+            badge.textContent=value;
+            facetRow.appendChild(badge);
+          });
+        });
+        list.appendChild(facetRow);
+        if(!items.length){
+          list.appendChild(UI.el('div','panel-empty','No skills available'));
+          return;
+        }
+        items.forEach(function(skill){
+          list.appendChild(renderSkillCatalogRow(skill));
+        });
+      }catch(e){
+        list.innerHTML='';
+        list.appendChild(UI.el('div','panel-empty','No skills loaded'));
+        UI.showToast(e.message,'error');
+      }
+    };
+    refresh.onclick=load;
+    surface.onchange=load;
+    search.onkeydown=function(e){if(e.key==='Enter')load()};
+    await load();
+  }
+
+  function renderSkillSummaryCard(title,values){
+    const card=UI.el('div','memory-card skill-summary-card');
+    card.innerHTML='<h3>'+UI.esc(title)+'</h3>';
+    const body=UI.el('div','skill-summary-values');
+    (values||[]).filter(Boolean).forEach(function(value){
+      const item=UI.el('span');
+      item.textContent=String(value);
+      body.appendChild(item);
+    });
+    card.appendChild(body);
+    return card;
+  }
+
+  function renderSkillCatalogRow(skill){
+    const item=UI.el('div','panel-item skill-row');
+    const main=UI.el('div','skill-row-main');
+    const name=UI.el('span','pi-name');
+    name.textContent=skill.name||skill.id;
+    const meta=UI.el('small');
+    meta.textContent=[skill.scope,skill.domain,skill.risk,skill.status].filter(Boolean).join(' · ');
+    main.appendChild(name);
+    main.appendChild(meta);
+    if(skill.description){
+      const desc=UI.el('em');
+      desc.textContent=skill.description;
+      main.appendChild(desc);
+    }
+    const tags=UI.el('div','skill-tags');
+    (skill.tags||[]).slice(0,5).forEach(function(tag){
+      const badge=UI.el('span','audit-source');
+      badge.textContent=tag;
+      tags.appendChild(badge);
+    });
+    main.appendChild(tags);
+    const acts=UI.el('span','pi-actions');
+    const detail=UI.el('button');
+    detail.textContent='View';
+    detail.onclick=async function(){
+      try{
+        const response=await Api.skillDetail(skill.id);
+        let pre=item.querySelector('pre');
+        if(pre){pre.remove();return}
+        pre=UI.el('pre','skill-detail-json');
+        pre.textContent=JSON.stringify(response.skill||response,null,2).slice(0,2200);
+        item.appendChild(pre);
+      }catch(e){UI.showToast(e.message,'error')}
+    };
+    acts.appendChild(detail);
+    item.appendChild(main);
+    item.appendChild(acts);
+    return item;
   }
 
   async function renderCrons(){

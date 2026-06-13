@@ -51,6 +51,11 @@ use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
+use crate::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
+use crate::tool_execution_plan::ToolExecutionPlan;
+use crate::tool_invocation::{
+    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
+};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -282,6 +287,8 @@ pub struct ConversationRuntime<C, T> {
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
+    /// Runtime-local searchable index for oversized tool outputs.
+    tool_output_sandbox: Option<Arc<std::sync::Mutex<memory::ToolOutputSandbox>>>,
     /// Optional SSE callback for real-time streaming events to WebUI.
     /// Receives pre-formatted JSON event strings.
     sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -474,6 +481,13 @@ where
             tool_callback: None,
             session_store: None,
             event_log: None,
+            tool_output_sandbox: memory::ToolOutputSandbox::new()
+                .map(|sandbox| Arc::new(std::sync::Mutex::new(sandbox)))
+                .map_err(|error| {
+                    tracing::warn!(%error, "tool output sandbox unavailable");
+                    error
+                })
+                .ok(),
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
@@ -1770,6 +1784,8 @@ where
                     .collect();
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
+                let execution_plan = ToolExecutionPlan::from_requests(&requests);
+                self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
                 let (read_indices, rest_indices) = categorize(&requests);
 
                 let mut result_map: std::collections::HashMap<
@@ -2087,6 +2103,21 @@ where
             if self.should_use_collaboration(&last_user_msg) {
                 let skills: Vec<String> = Self::infer_required_skills(&last_user_msg);
                 if !skills.is_empty() {
+                    let activation = SkillActivationRecord::new(
+                        self.session().session_id.clone(),
+                        self.session().messages.len(),
+                        last_user_msg.clone(),
+                        skills
+                            .iter()
+                            .map(|skill| RuntimeSkillCandidate {
+                                name: skill.clone(),
+                                score: 5,
+                                reasons: vec!["runtime_keyword_inference".to_string()],
+                                path: None,
+                            })
+                            .collect(),
+                    );
+                    self.record_skill_activation_event(&activation, self.session().messages.len());
                     let collab_clone = Arc::clone(collab);
                     let task = last_user_msg.clone();
                     let skills_clone = skills.clone();
@@ -2261,6 +2292,14 @@ where
                     let gate_result = gate.evaluate(tool_name, &effective_input).await;
                     if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result
                     {
+                        self.record_tool_invocation_denied(
+                            tool_use_id,
+                            tool_name,
+                            &effective_input,
+                            iterations,
+                            ToolFailureKind::ApprovalDenied,
+                            &reason,
+                        );
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(),
                             tool_name.to_string(),
@@ -2313,10 +2352,19 @@ where
                                 msg
                             })
                             .collect();
+                        let reason = format!("Gate check failed: {}", reasons.join("; "));
+                        self.record_tool_invocation_denied(
+                            tool_use_id,
+                            tool_name,
+                            &effective_input,
+                            iterations,
+                            ToolFailureKind::GateDenied,
+                            &reason,
+                        );
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(),
                             tool_name.to_string(),
-                            format!("Gate check failed: {}", reasons.join("; ")),
+                            reason,
                             true,
                         );
                         self.session
@@ -2332,6 +2380,17 @@ where
                     }
                 }
 
+                let invocation_record = self.start_tool_invocation_record(
+                    tool_use_id,
+                    tool_name,
+                    &effective_input,
+                    iterations,
+                );
+                self.record_tool_invocation_event(
+                    &invocation_record,
+                    "tool.invocation.started",
+                    self.session().messages.len(),
+                );
                 self.record_tool_started(iterations, tool_name);
 
                 if let Some(callback) = &self.tool_callback {
@@ -2353,8 +2412,10 @@ where
                 });
 
                 let start = Instant::now();
-                let (output, mut is_error) = if let Some(mock_output) = effect_mock {
-                    (mock_output, false)
+                let (output, mut is_error, mut failure_kind) = if let Some(mock_output) =
+                    effect_mock
+                {
+                    (mock_output, false, None)
                 } else {
                     let tool_exec = Arc::clone(&self.tool_executor);
                     let tname = tool_name.to_string();
@@ -2375,16 +2436,23 @@ where
                     )
                     .await
                     {
-                        Ok(Ok(Ok(output))) => (output, false),
-                        Ok(Ok(Err(error))) => (error.to_string(), true),
-                        Ok(Err(join_error)) => {
-                            (format!("tool execution panicked: {join_error}"), true)
-                        }
+                        Ok(Ok(Ok(output))) => (output, false, None),
+                        Ok(Ok(Err(error))) => (
+                            error.to_string(),
+                            true,
+                            Some(ToolFailureKind::ExecutionError),
+                        ),
+                        Ok(Err(join_error)) => (
+                            format!("tool execution panicked: {join_error}"),
+                            true,
+                            Some(ToolFailureKind::Panic),
+                        ),
                         Err(_elapsed) => {
                             tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
                             (
                                 format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
                                 true,
+                                Some(ToolFailureKind::Timeout),
                             )
                         }
                     }
@@ -2409,6 +2477,9 @@ where
                     || post_hook_result.is_cancelled()
                 {
                     is_error = true;
+                    if failure_kind.is_none() {
+                        failure_kind = Some(ToolFailureKind::HookDenied);
+                    }
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -2430,7 +2501,22 @@ where
                     combined.push_str("\n");
                     combined.push_str(msg);
                 }
+                self.maybe_index_tool_output(tool_use_id, tool_name, &combined);
                 let truncated = self.tool_orchestrator.truncate_result(&combined);
+                let completed_record = if is_error {
+                    invocation_record.failed_with_output_policy(
+                        failure_kind.unwrap_or(ToolFailureKind::Unknown),
+                        &combined,
+                        now_ms(),
+                        DEFAULT_OUTPUT_REF_MIN_LINES,
+                    )
+                } else {
+                    invocation_record.completed_with_output_policy(
+                        &combined,
+                        now_ms(),
+                        DEFAULT_OUTPUT_REF_MIN_LINES,
+                    )
+                };
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
@@ -2443,10 +2529,32 @@ where
                     .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
+                self.record_tool_invocation_event(
+                    &completed_record,
+                    if is_error {
+                        "tool.invocation.failed"
+                    } else {
+                        "tool.invocation.completed"
+                    },
+                    self.session().messages.len().wrapping_sub(1),
+                );
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
             }
             PermissionOutcome::Deny { reason } => {
+                let failure_kind = if reason.starts_with("PreToolUse hook") {
+                    ToolFailureKind::HookDenied
+                } else {
+                    ToolFailureKind::PermissionDenied
+                };
+                self.record_tool_invocation_denied(
+                    tool_use_id,
+                    tool_name,
+                    &effective_input,
+                    iterations,
+                    failure_kind,
+                    &reason,
+                );
                 let denied = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
@@ -3080,6 +3188,136 @@ where
     /// background task. The in-memory session remains the hot turn state;
     /// SQLite is the managed session source of truth. JSONL is only used by
     /// explicit import/export codecs.
+    fn record_skill_activation_event(&self, activation: &SkillActivationRecord, sequence: usize) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = activation.session_id.clone();
+        let event = activation.to_runtime_event(sequence);
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "skill activation runtime event append failed"
+                );
+            }
+        });
+    }
+
+    fn maybe_index_tool_output(&self, tool_use_id: &str, tool_name: &str, output: &str) {
+        if output.lines().count() < DEFAULT_OUTPUT_REF_MIN_LINES {
+            return;
+        }
+        let Some(ref sandbox) = self.tool_output_sandbox else {
+            return;
+        };
+        let Ok(mut guard) = sandbox.lock() else {
+            tracing::warn!(
+                tool_call_id = tool_use_id,
+                "tool output sandbox lock poisoned"
+            );
+            return;
+        };
+        if let Some(summary) =
+            guard.index_tool_output(tool_use_id, tool_name, output, DEFAULT_OUTPUT_REF_MIN_LINES)
+        {
+            tracing::debug!(
+                tool_call_id = tool_use_id,
+                tool_name,
+                total_lines = summary.total_lines,
+                full_size_bytes = summary.full_size_bytes,
+                "indexed oversized tool output"
+            );
+        }
+    }
+
+    fn start_tool_invocation_record(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        iterations: usize,
+    ) -> ToolInvocationRecord {
+        let session_id = self.session().session_id;
+        let safety_category =
+            crate::tool_orchestrator::ToolSafetyRegistry::global().classify(tool_name);
+        ToolInvocationRecord::started(
+            session_id,
+            iterations,
+            tool_use_id.to_string(),
+            tool_name.to_string(),
+            input,
+            safety_category,
+            now_ms(),
+        )
+    }
+
+    fn record_tool_invocation_denied(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        iterations: usize,
+        failure_kind: ToolFailureKind,
+        reason: &str,
+    ) {
+        let record = self
+            .start_tool_invocation_record(tool_use_id, tool_name, input, iterations)
+            .failed(failure_kind, reason, now_ms());
+        self.record_tool_invocation_event(
+            &record,
+            "tool.invocation.denied",
+            self.session().messages.len(),
+        );
+    }
+
+    fn record_tool_invocation_event(
+        &self,
+        record: &ToolInvocationRecord,
+        kind: &'static str,
+        sequence: usize,
+    ) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = record.session_id.clone();
+        let event = record.to_runtime_event(sequence, kind);
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    event_kind = kind,
+                    "tool invocation runtime event append failed"
+                );
+            }
+        });
+    }
+
+    fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, sequence: usize) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let event = plan.to_runtime_event(session_id.clone(), sequence, now_ms());
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "tool execution plan event append failed"
+                );
+            }
+        });
+    }
+
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
         // Record the message in the event log for time-travel debugging.
         if let Some(ref log) = self.event_log {
