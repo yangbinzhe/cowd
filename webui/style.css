@@ -224,7 +224,7 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-history-item small{grid-column:1;font-size:10px;color:var(--text3)}
 .context-history-item em{grid-column:1;font-style:normal;font-size:11px;color:var(--text2)}
 .context-history-item span{grid-column:2;grid-row:1 / span 3;align-self:center;font-size:11px;color:var(--accent)}
-.skill-surface-controls{display:grid;grid-template-columns:92px minmax(0,1fr) 84px;gap:6px;margin:8px 0 10px}
+.skill-surface-controls{display:grid;grid-template-columns:76px minmax(0,1fr) minmax(0,1fr) 72px;gap:6px;margin:8px 0 10px}
 .skill-summary{margin-bottom:10px}
 .skill-summary-values{display:flex;flex-wrap:wrap;gap:6px}
 .skill-summary-values span{font-size:11px;color:var(--text2);border:1px solid var(--border);border-radius:var(--radius);padding:3px 6px;max-width:100%;overflow:hidden;text-overflow:ellipsis}
@@ -234,7 +234,22 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .skill-row-main{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;min-width:0}
 .skill-row-main small,.skill-row-main em{font-size:11px;color:var(--text3);font-style:normal;overflow:hidden;text-overflow:ellipsis}
 .skill-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
-.skill-detail-json{grid-column:1 / -1;width:100%;max-height:260px;overflow:auto;margin-top:8px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px}
+.skill-detail-json,.skill-action-json,.skill-run-detail{grid-column:1 / -1;width:100%;max-height:260px;overflow:auto;margin-top:8px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px}
+.skill-runs{margin-top:12px}
+.skill-runs-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;margin-bottom:8px}
+.skill-runs-head h3{margin:0;border:0;padding:0}
+.skill-runs-head input{min-width:0;padding:5px 7px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:11px}
+.skill-watch-toggle{display:flex;align-items:center;gap:5px;color:var(--text2);font-size:11px;white-space:nowrap}
+.skill-run-table{display:grid;grid-template-columns:minmax(0,1fr);gap:4px}
+.skill-run-row{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;text-align:left;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);padding:7px 8px;cursor:pointer}
+.skill-run-row:hover{background:var(--surface2)}
+.skill-run-row:disabled{opacity:.65;cursor:progress}
+.skill-run-row b,.skill-run-row small,.skill-run-row em{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.skill-run-row b{font-size:12px}
+.skill-run-row small{margin-top:2px;color:var(--text3);font-size:10px}
+.skill-run-row em{margin-top:2px;color:var(--text2);font-size:11px;font-style:normal}
+.skill-run-row>span:last-child{align-self:center;color:var(--accent);font-size:11px}
+@media (max-width:760px){.skill-surface-controls{grid-template-columns:1fr 1fr}.skill-runs-head{grid-template-columns:1fr}.skill-watch-toggle{justify-content:flex-start}}
 .context-history-controls{padding-top:6px}
 .context-history-more{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);color:var(--text2);font-size:11px;padding:6px;cursor:pointer}
 .context-history-more:hover{background:var(--surface2);color:var(--text)}

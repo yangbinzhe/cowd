@@ -608,7 +608,7 @@ impl SkillsPanel {
                 format!("{total} skills | j↓ k↑ select | Enter toggle | e enable | d disable | / search | Tab category")
             } else {
                 format!(
-                    "{total} unified skills | j↓ k↑ select | Enter toggle | / search | Tab scope"
+                    "{total} unified skills | j↓ k↑ select | v validate | p plan | r run | w watch | / search"
                 )
             };
             lines.push(Line::from(Span::styled(
@@ -669,6 +669,7 @@ impl SkillsPanel {
                             .join(", ")
                     )
                 };
+                let action_suffix = entry_action_hints(entry).join(" · ");
 
                 lines.push(Line::from(vec![
                     Span::styled(cursor, cursor_style),
@@ -680,6 +681,13 @@ impl SkillsPanel {
                     Span::raw("     "),
                     Span::styled(
                         format!("{}{}", meta.join(" · "), tag_suffix),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        format!("actions: {action_suffix}"),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -696,7 +704,7 @@ impl SkillsPanel {
         // Keyboard hint bar
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "/ search  j↓ k↑  Tab category  Enter toggle  e enable  d disable  g top  G bottom",
+            "/ search  j↓ k↑  Tab category  Enter toggle  v validate  p plan  r run  w watch",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -809,6 +817,22 @@ impl SkillsPanel {
                 self.toggle_selected();
                 EventResult::Consumed
             }
+            KeyCode::Char('v') => {
+                self.report_selected_action("validate");
+                EventResult::Consumed
+            }
+            KeyCode::Char('p') => {
+                self.report_selected_action("plan");
+                EventResult::Consumed
+            }
+            KeyCode::Char('r') => {
+                self.report_selected_action("run");
+                EventResult::Consumed
+            }
+            KeyCode::Char('w') => {
+                self.report_selected_action("watch");
+                EventResult::Consumed
+            }
             KeyCode::Char('e') => {
                 self.enable_selected();
                 EventResult::Consumed
@@ -818,6 +842,33 @@ impl SkillsPanel {
                 EventResult::Consumed
             }
             _ => EventResult::NotConsumed,
+        }
+    }
+
+    fn report_selected_action(&mut self, action: &str) {
+        let Some(idx) = self.selected_index else {
+            self.set_status("Select a skill first");
+            return;
+        };
+        let Some((name, supported)) = ({
+            let filtered = self.filtered_entries();
+            filtered.get(idx).map(|target| {
+                (
+                    target.name.clone(),
+                    entry_action_hints(target).contains(&action),
+                )
+            })
+        }) else {
+            self.set_status("Select a skill first");
+            return;
+        };
+        if supported {
+            self.set_status(&format!(
+                "{} {action}: unified action ready; incident id required for plan/run",
+                name
+            ));
+        } else {
+            self.set_status(&format!("{name} does not support {action}"));
         }
     }
 
@@ -867,6 +918,23 @@ fn flatten_builtin_skills(categories: &[(&str, Vec<BuiltinSkill>)]) -> Vec<Skill
         }
     }
     entries
+}
+
+fn entry_action_hints(entry: &SkillDisplayEntry) -> Vec<&'static str> {
+    if entry.source.eq_ignore_ascii_case("iacc")
+        || entry
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("iacc"))
+    {
+        vec!["view", "validate", "plan", "run", "watch"]
+    } else if entry.category.eq_ignore_ascii_case("local")
+        || entry.risk.eq_ignore_ascii_case("operator_review")
+    {
+        vec!["view", "import"]
+    } else {
+        vec!["view"]
+    }
 }
 
 // ── Default impl ────────────────────────────────────────────────────
@@ -1058,6 +1126,52 @@ mod tests {
         assert!(!panel.using_builtins);
         assert_eq!(panel.entries.len(), 1);
         assert_eq!(panel.entries[0].name, "TestSkill");
+    }
+
+    #[test]
+    fn unified_iacc_entries_render_action_hints() {
+        let mut app = App::new("test-model", "test-session");
+        app.skill_list = vec![SkillSummary {
+            name: "supply-risk-analyst".to_string(),
+            description: "Supply Risk Analyst".to_string(),
+            installed: true,
+            category: "server_manufacturing".to_string(),
+            source: "iacc".to_string(),
+            status: "ready".to_string(),
+            risk: "governed".to_string(),
+            tags: vec!["iacc".to_string()],
+        }];
+        let mut panel = SkillsPanel::from_app(&app);
+        let lines = render_panel(&mut panel, 92, 12);
+        let joined = lines.join("\n");
+        assert!(joined.contains("actions: view · validate · plan · run · watch"));
+    }
+
+    #[test]
+    fn local_entries_report_run_as_unsupported() {
+        let mut app = App::new("test-model", "test-session");
+        app.skill_list = vec![SkillSummary {
+            name: "release".to_string(),
+            description: "Prepare release".to_string(),
+            installed: true,
+            category: "local".to_string(),
+            source: "Project".to_string(),
+            status: "ready".to_string(),
+            risk: "operator_review".to_string(),
+            tags: vec!["git".to_string()],
+        }];
+        let mut panel = SkillsPanel::from_app(&app);
+        panel.selected_index = Some(0);
+        let key_r = crossterm::event::KeyEvent::new(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let result = panel.handle_list_key(&key_r);
+        assert!(result.is_consumed());
+        assert_eq!(
+            panel.status_message.as_deref(),
+            Some("release does not support run")
+        );
     }
 
     #[test]

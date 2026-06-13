@@ -1052,6 +1052,24 @@ describe('API module', () => {
     document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
     vi.stubGlobal('fetch', vi.fn((url) => {
       const path = String(url);
+      if (path.includes('/api/skills/runs/run-1')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'skills.run',
+          skill_run: { execution_id: 'run-1', skill_id: 'supply-risk-analyst', status: 'completed' }
+        }) });
+      }
+      if (path.includes('/api/skills/runs')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'skills.runs',
+          items: [{
+            execution_id: 'run-1',
+            skill_id: 'supply-risk-analyst',
+            incident_id: 'incident-1',
+            status: 'completed',
+            summary: 'Checked supplier risk'
+          }]
+        }) });
+      }
       if (path.includes('/api/skills/iacc%3Asupply-risk-analyst')) {
         if (path.includes('/actions/validate')) {
           return Promise.resolve({ ok: true, json: () => Promise.resolve({
@@ -1100,12 +1118,19 @@ describe('API module', () => {
     expect(text).toContain('supply-risk-analyst');
     expect(text).toContain('governance.bulk');
     expect(text).toContain('tool.execution_plan');
+    expect(text).toContain('Checked supplier risk');
 
     const validate = Array.from(document.querySelectorAll('button')).find((button) => button.textContent === 'Validate');
     expect(validate).toBeTruthy();
     validate.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(document.getElementById('panel-content').textContent).toContain('skills.action.validate');
+
+    const runOpen = Array.from(document.querySelectorAll('button')).find((button) => button.textContent.includes('Open'));
+    expect(runOpen).toBeTruthy();
+    runOpen.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(document.getElementById('panel-content').textContent).toContain('"execution_id": "run-1"');
   });
 
   it('renders gateway platform readiness without secrets', async () => {

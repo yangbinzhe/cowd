@@ -1853,8 +1853,22 @@ window.Panels = (()=>{
 
     const summary=UI.el('div','skill-summary memory-grid');
     const list=UI.el('div','skill-catalog');
+    const runs=UI.el('div','skill-runs panel-section');
     c.appendChild(summary);
     c.appendChild(list);
+    c.appendChild(runs);
+
+    let lastRuns=[];
+    let watchTimer=null;
+    const scheduleWatch=function(){
+      if(watchTimer)clearTimeout(watchTimer);
+      const watching=c.querySelector('[data-skill-watch]');
+      if(!watching||!watching.checked||!document.body.contains(c))return;
+      watchTimer=setTimeout(async function(){
+        await loadRuns();
+        scheduleWatch();
+      },4000);
+    };
 
     const load=async()=>{
       summary.innerHTML='';
@@ -1893,11 +1907,13 @@ window.Panels = (()=>{
         list.appendChild(facetRow);
         if(!items.length){
           list.appendChild(UI.el('div','panel-empty','No skills available'));
+          await loadRuns();
           return;
         }
         items.forEach(function(skill){
-          list.appendChild(renderSkillCatalogRow(skill,incident));
+          list.appendChild(renderSkillCatalogRow(skill,incident,loadRuns));
         });
+        await loadRuns();
       }catch(e){
         list.innerHTML='';
         list.appendChild(UI.el('div','panel-empty','No skills loaded'));
@@ -1907,6 +1923,57 @@ window.Panels = (()=>{
     refresh.onclick=load;
     surface.onchange=load;
     search.onkeydown=function(e){if(e.key==='Enter')load()};
+    function renderRuns(){
+      runs.innerHTML='';
+      const head=UI.el('div','skill-runs-head');
+      const title=UI.el('h3');
+      title.textContent='Runs';
+      const filter=UI.el('input');
+      filter.placeholder='Filter skill, incident, status';
+      filter.value=runs.dataset.filter||'';
+      filter.oninput=function(){runs.dataset.filter=filter.value;renderRuns()};
+      const watchLabel=UI.el('label','skill-watch-toggle');
+      const watch=UI.el('input');
+      watch.type='checkbox';
+      watch.setAttribute('data-skill-watch','1');
+      watch.checked=runs.dataset.watch==='1';
+      watch.onchange=function(){runs.dataset.watch=watch.checked?'1':'';scheduleWatch()};
+      watchLabel.appendChild(watch);
+      watchLabel.appendChild(document.createTextNode('Watch'));
+      head.appendChild(title);
+      head.appendChild(filter);
+      head.appendChild(watchLabel);
+      runs.appendChild(head);
+
+      const query=(filter.value||'').trim().toLowerCase();
+      const items=lastRuns.filter(function(run){
+        if(!query)return true;
+        return [run.skill_id,run.incident_id,run.status,run.summary,run.execution_id]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+          .includes(query);
+      });
+      if(!items.length){
+        runs.appendChild(UI.el('div','panel-empty',lastRuns.length?'No matching runs':'No skill runs yet'));
+        return;
+      }
+      const table=UI.el('div','skill-run-table');
+      items.slice(0,18).forEach(function(run){
+        table.appendChild(renderSkillRunRow(run));
+      });
+      runs.appendChild(table);
+    }
+    async function loadRuns(){
+      try{
+        const response=await Api.skillRuns();
+        lastRuns=response.items||[];
+        renderRuns();
+      }catch(e){
+        runs.innerHTML='';
+        runs.appendChild(UI.el('div','panel-empty','Runs unavailable'));
+      }
+    }
     await load();
   }
 
@@ -1923,7 +1990,7 @@ window.Panels = (()=>{
     return card;
   }
 
-  function renderSkillCatalogRow(skill,incidentInput){
+  function renderSkillCatalogRow(skill,incidentInput,onAction){
     const item=UI.el('div','panel-item skill-row');
     const main=UI.el('div','skill-row-main');
     const name=UI.el('span','pi-name');
@@ -1962,21 +2029,21 @@ window.Panels = (()=>{
       const validate=UI.el('button');
       validate.textContent='Validate';
       validate.onclick=async function(){
-        await renderSkillActionResult(item,async()=>Api.skillValidate(skill.id,{request_id:'webui-skill-validate'}),'validation');
+        await renderSkillActionResult(item,async()=>Api.skillValidate(skill.id,{request_id:'webui-skill-validate'}),'validation',onAction);
       };
       const plan=UI.el('button');
       plan.textContent='Plan';
       plan.onclick=async function(){
         const incidentId=(incidentInput&&incidentInput.value||'').trim();
         if(!incidentId){UI.showToast('Incident ID required','error');return}
-        await renderSkillActionResult(item,async()=>Api.skillPlan(skill.id,{request_id:'webui-skill-plan',incident_id:incidentId,limit:3}),'plan');
+        await renderSkillActionResult(item,async()=>Api.skillPlan(skill.id,{request_id:'webui-skill-plan',incident_id:incidentId,limit:3}),'plan',onAction);
       };
       const run=UI.el('button');
       run.textContent='Run';
       run.onclick=async function(){
         const incidentId=(incidentInput&&incidentInput.value||'').trim();
         if(!incidentId){UI.showToast('Incident ID required','error');return}
-        await renderSkillActionResult(item,async()=>Api.skillRun(skill.id,{request_id:'webui-skill-run',incident_id:incidentId}),'run');
+        await renderSkillActionResult(item,async()=>Api.skillRun(skill.id,{request_id:'webui-skill-run',incident_id:incidentId}),'run',onAction);
       };
       acts.appendChild(validate);
       acts.appendChild(plan);
@@ -1987,7 +2054,36 @@ window.Panels = (()=>{
     return item;
   }
 
-  async function renderSkillActionResult(item,loader,label){
+  function renderSkillRunRow(run){
+    const row=UI.el('button','skill-run-row');
+    row.type='button';
+    const main=UI.el('span');
+    main.innerHTML='<b>'+UI.esc(run.skill_id||'skill')+'</b><small>'+UI.esc([run.incident_id,run.status].filter(Boolean).join(' · '))+'</small><em>'+UI.esc(run.summary||'No summary')+'</em>';
+    const open=UI.el('span');
+    open.textContent='Open';
+    row.appendChild(main);
+    row.appendChild(open);
+    row.onclick=async function(){
+      const id=run.execution_id;
+      if(!id){UI.showToast('Run has no execution id','error');return}
+      row.disabled=true;
+      try{
+        const response=await Api.skillRunDetail(id);
+        let detail=row.parentElement.querySelector('.skill-run-detail');
+        if(detail)detail.remove();
+        detail=UI.el('pre','skill-run-detail');
+        detail.textContent=JSON.stringify(response.skill_run||response,null,2).slice(0,3000);
+        row.insertAdjacentElement('afterend',detail);
+      }catch(e){
+        UI.showToast(e.message,'error');
+      }finally{
+        row.disabled=false;
+      }
+    };
+    return row;
+  }
+
+  async function renderSkillActionResult(item,loader,label,onAction){
     try{
       const response=await loader();
       let pre=item.querySelector('pre.skill-action-json');
@@ -1997,6 +2093,7 @@ window.Panels = (()=>{
       }
       pre.textContent=JSON.stringify(response,null,2).slice(0,2600);
       UI.showToast('Skill '+label+' completed','success');
+      if(onAction)await onAction();
     }catch(e){
       UI.showToast(e.message,'error');
     }
