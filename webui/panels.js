@@ -1841,10 +1841,13 @@ window.Panels = (()=>{
     const search=UI.el('input');
     search.placeholder='Search task';
     search.value='prepare release';
+    const incident=UI.el('input');
+    incident.placeholder='IACC incident id';
     const refresh=UI.el('button','btn-primary');
     refresh.textContent='Refresh';
     controls.appendChild(surface);
     controls.appendChild(search);
+    controls.appendChild(incident);
     controls.appendChild(refresh);
     c.appendChild(controls);
 
@@ -1893,7 +1896,7 @@ window.Panels = (()=>{
           return;
         }
         items.forEach(function(skill){
-          list.appendChild(renderSkillCatalogRow(skill));
+          list.appendChild(renderSkillCatalogRow(skill,incident));
         });
       }catch(e){
         list.innerHTML='';
@@ -1920,7 +1923,7 @@ window.Panels = (()=>{
     return card;
   }
 
-  function renderSkillCatalogRow(skill){
+  function renderSkillCatalogRow(skill,incidentInput){
     const item=UI.el('div','panel-item skill-row');
     const main=UI.el('div','skill-row-main');
     const name=UI.el('span','pi-name');
@@ -1955,9 +1958,48 @@ window.Panels = (()=>{
       }catch(e){UI.showToast(e.message,'error')}
     };
     acts.appendChild(detail);
+    if(skill.scope==='iacc'){
+      const validate=UI.el('button');
+      validate.textContent='Validate';
+      validate.onclick=async function(){
+        await renderSkillActionResult(item,async()=>Api.skillValidate(skill.id,{request_id:'webui-skill-validate'}),'validation');
+      };
+      const plan=UI.el('button');
+      plan.textContent='Plan';
+      plan.onclick=async function(){
+        const incidentId=(incidentInput&&incidentInput.value||'').trim();
+        if(!incidentId){UI.showToast('Incident ID required','error');return}
+        await renderSkillActionResult(item,async()=>Api.skillPlan(skill.id,{request_id:'webui-skill-plan',incident_id:incidentId,limit:3}),'plan');
+      };
+      const run=UI.el('button');
+      run.textContent='Run';
+      run.onclick=async function(){
+        const incidentId=(incidentInput&&incidentInput.value||'').trim();
+        if(!incidentId){UI.showToast('Incident ID required','error');return}
+        await renderSkillActionResult(item,async()=>Api.skillRun(skill.id,{request_id:'webui-skill-run',incident_id:incidentId}),'run');
+      };
+      acts.appendChild(validate);
+      acts.appendChild(plan);
+      acts.appendChild(run);
+    }
     item.appendChild(main);
     item.appendChild(acts);
     return item;
+  }
+
+  async function renderSkillActionResult(item,loader,label){
+    try{
+      const response=await loader();
+      let pre=item.querySelector('pre.skill-action-json');
+      if(!pre){
+        pre=UI.el('pre','skill-action-json');
+        item.appendChild(pre);
+      }
+      pre.textContent=JSON.stringify(response,null,2).slice(0,2600);
+      UI.showToast('Skill '+label+' completed','success');
+    }catch(e){
+      UI.showToast(e.message,'error');
+    }
   }
 
   async function renderCrons(){

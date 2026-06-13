@@ -1053,6 +1053,12 @@ describe('API module', () => {
     vi.stubGlobal('fetch', vi.fn((url) => {
       const path = String(url);
       if (path.includes('/api/skills/iacc%3Asupply-risk-analyst')) {
+        if (path.includes('/actions/validate')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({
+            kind: 'skills.action.validate',
+            validation: { status: 'pass' }
+          }) });
+        }
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           kind: 'skills.detail',
           skill: { id: 'iacc:supply-risk-analyst', name: 'supply-risk-analyst', scope: 'iacc' }
@@ -1094,6 +1100,12 @@ describe('API module', () => {
     expect(text).toContain('supply-risk-analyst');
     expect(text).toContain('governance.bulk');
     expect(text).toContain('tool.execution_plan');
+
+    const validate = Array.from(document.querySelectorAll('button')).find((button) => button.textContent === 'Validate');
+    expect(validate).toBeTruthy();
+    validate.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(document.getElementById('panel-content').textContent).toContain('skills.action.validate');
   });
 
   it('renders gateway platform readiness without secrets', async () => {
