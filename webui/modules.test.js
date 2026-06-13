@@ -1009,11 +1009,21 @@ describe('API module', () => {
     await window.Api.listSkillCatalog('iacc');
     await window.Api.skillProjection('webui', 'release');
     await window.Api.skillDetail('iacc:supply-risk-analyst');
+    await window.Api.skillValidate('iacc:supply-risk-analyst', { request_id: 'validate' });
+    await window.Api.skillPlan('iacc:supply-risk-analyst', { incident_id: 'incident-1' });
+    await window.Api.skillRun('iacc:supply-risk-analyst', { incident_id: 'incident-1' });
+    await window.Api.skillRuns();
+    await window.Api.skillRunDetail('run-1');
 
     expect(mockF.mock.calls.map(call => call[0])).toEqual([
       '/api/skills/catalog?scope=iacc',
       '/api/skills/projection?surface=webui&query=release',
       '/api/skills/iacc%3Asupply-risk-analyst',
+      '/api/skills/iacc%3Asupply-risk-analyst/actions/validate',
+      '/api/skills/iacc%3Asupply-risk-analyst/actions/plan',
+      '/api/skills/iacc%3Asupply-risk-analyst/actions/run',
+      '/api/skills/runs',
+      '/api/skills/runs/run-1',
     ]);
   });
 

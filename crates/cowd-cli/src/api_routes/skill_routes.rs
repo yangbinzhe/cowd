@@ -1,14 +1,20 @@
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use commands::{SkillInfo, SkillRegistry, SkillRouter};
-use runtime::{server_manufacturing_skill_pack, IaccSkillManifest};
+use runtime::{
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack, IaccEvidencePacket, IaccIncident, IaccOperationalAnalysis,
+    IaccSkillManifest, IaccStore, IaccStoreError,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};
@@ -17,6 +23,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/skills/catalog", get(skills_catalog_handler))
         .route("/api/skills/projection", get(skills_projection_handler))
+        .route("/api/skills/runs", get(skill_runs_handler))
+        .route("/api/skills/runs/:id", get(skill_run_get_handler))
+        .route(
+            "/api/skills/:id/actions/validate",
+            post(skill_validate_handler),
+        )
+        .route("/api/skills/:id/actions/plan", post(skill_plan_handler))
+        .route("/api/skills/:id/actions/run", post(skill_run_handler))
         .route("/api/skills/:id", get(skill_get_handler))
 }
 
@@ -32,6 +46,18 @@ struct SkillProjectionQuery {
     surface: Option<String>,
     #[serde(default)]
     query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillActionRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    incident_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +195,184 @@ async fn skill_get_handler(
     })))
 }
 
+async fn skill_validate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let item = find_catalog_item(&state, &id)?;
+    let validation = match item.scope.as_str() {
+        "iacc" => {
+            let skill = find_iacc_skill(&item.name)
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+            serde_json::json!({
+                "status": "pass",
+                "scope": "iacc",
+                "skill_id": skill.skill_id,
+                "checks": [
+                    {"id":"manifest.present","status":"pass"},
+                    {"id":"evidence.required","status": if skill.required_evidence.is_empty() {"warn"} else {"pass"}},
+                    {"id":"tools.declared","status": if skill.tools.is_empty() {"warn"} else {"pass"}},
+                    {"id":"quality_gate.present","status": if skill.quality_gate.is_empty() {"warn"} else {"pass"}}
+                ],
+                "required_evidence": skill.required_evidence,
+                "tools": skill.tools,
+                "quality_gate": skill.quality_gate,
+            })
+        }
+        _ => serde_json::json!({
+            "status": "unsupported",
+            "scope": item.scope,
+            "reason": "unsupported_for_local_skill",
+            "path": item.path,
+        }),
+    };
+
+    Ok(Json(serde_json::json!({
+        "kind": "skills.action.validate",
+        "schema_version": 1,
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "skill": item,
+        "validation": validation,
+    })))
+}
+
+async fn skill_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let item = find_catalog_item(&state, &id)?;
+    if item.scope != "iacc" {
+        return Ok(Json(serde_json::json!({
+            "kind": "skills.action.plan",
+            "schema_version": 1,
+            "request_id": request.request_id,
+            "session_id": request.session_id,
+            "skill": item,
+            "status": "unsupported",
+            "reason": "unsupported_for_local_skill",
+        })));
+    }
+
+    let incident_id = required_incident_id(&request)?;
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (incident, analysis, packet) = iacc_incident_context(&store, &incident_id)?;
+    let mut plan = plan_server_manufacturing_skills(
+        &incident,
+        analysis.as_ref(),
+        packet.as_ref(),
+        request.limit.unwrap_or(3).clamp(1, 8),
+    );
+    if let Some(skill) = find_iacc_skill(&item.name) {
+        let contains_selected = plan
+            .selected_skills
+            .iter()
+            .any(|selected| selected.skill_id == skill.skill_id);
+        if !contains_selected {
+            plan.selected_skills.insert(0, skill);
+            plan.selected_skills
+                .truncate(request.limit.unwrap_or(3).clamp(1, 8));
+            plan.evidence_requirements = plan
+                .selected_skills
+                .iter()
+                .flat_map(|skill| skill.required_evidence.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            plan.planned_agent_nodes = plan
+                .selected_skills
+                .iter()
+                .map(|skill| runtime::skill_agent_node_id(&skill.skill_id))
+                .collect();
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "skills.action.plan",
+        "schema_version": 1,
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "skill": item,
+        "incident_id": incident.incident_id,
+        "plan": plan,
+    })))
+}
+
+async fn skill_run_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let item = find_catalog_item(&state, &id)?;
+    if item.scope != "iacc" {
+        return Ok(Json(serde_json::json!({
+            "kind": "skills.action.run",
+            "schema_version": 1,
+            "request_id": request.request_id,
+            "session_id": request.session_id,
+            "skill": item,
+            "status": "unsupported",
+            "reason": "unsupported_for_local_skill",
+        })));
+    }
+
+    let incident_id = required_incident_id(&request)?;
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (incident, analysis, packet) = iacc_incident_context(&store, &incident_id)?;
+    let skill = find_iacc_skill(&item.name)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+    let run = run_server_manufacturing_skill(&incident, &skill, analysis.as_ref(), packet.as_ref());
+    let run = store
+        .record_skill_run(&run)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "kind": "skills.action.run",
+        "schema_version": 1,
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "skill": item,
+        "incident_id": incident.incident_id,
+        "skill_run": run,
+    })))
+}
+
+async fn skill_runs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let runs = store
+        .list_recent_skill_runs(50)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.runs",
+        "schema_version": 1,
+        "items": runs,
+    })))
+}
+
+async fn skill_run_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let run = store
+        .get_skill_run(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill run not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.run",
+        "schema_version": 1,
+        "skill_run": run,
+    })))
+}
+
 fn collect_skill_catalog(state: &AppState) -> std::io::Result<Vec<SkillCatalogItem>> {
     let mut items = server_manufacturing_skill_pack()
         .into_iter()
@@ -186,6 +390,71 @@ fn collect_skill_catalog(state: &AppState) -> std::io::Result<Vec<SkillCatalogIt
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(items)
+}
+
+fn find_catalog_item(
+    state: &AppState,
+    id: &str,
+) -> Result<SkillCatalogItem, (StatusCode, Json<ErrorResponse>)> {
+    collect_skill_catalog(state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .find(|item| item.id == id || item.name.eq_ignore_ascii_case(id))
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill not found"))
+}
+
+fn find_iacc_skill(skill_id: &str) -> Option<IaccSkillManifest> {
+    server_manufacturing_skill_pack()
+        .into_iter()
+        .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
+}
+
+fn open_iacc_store(state: &AppState) -> Result<IaccStore, IaccStoreError> {
+    let path = iacc_store_path(&state.workspace_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            IaccStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+    }
+    IaccStore::open(path)
+}
+
+fn iacc_store_path(workspace_root: &std::path::Path) -> PathBuf {
+    workspace_root.join(".cowd").join("iacc.sqlite")
+}
+
+fn required_incident_id(
+    request: &SkillActionRequest,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    request
+        .incident_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "incident_id is required"))
+}
+
+fn iacc_incident_context(
+    store: &IaccStore,
+    incident_id: &str,
+) -> Result<
+    (
+        IaccIncident,
+        Option<IaccOperationalAnalysis>,
+        Option<IaccEvidencePacket>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let incident = store
+        .get_incident(incident_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let analysis = store.analyze_incident(incident_id).ok();
+    let packet = incident
+        .evidence_packet_id
+        .as_deref()
+        .and_then(|packet_id| store.get_evidence_packet(packet_id).ok().flatten());
+    Ok((incident, analysis, packet))
 }
 
 fn iacc_skill_catalog_item(skill: IaccSkillManifest) -> SkillCatalogItem {

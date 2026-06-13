@@ -336,6 +336,11 @@ window.Api = (()=>{
       return req('GET','/api/skills/projection'+suffix);
     },
     async skillDetail(id){return req('GET','/api/skills/'+encodeURIComponent(id))},
+    async skillValidate(id,payload){return req('POST','/api/skills/'+encodeURIComponent(id)+'/actions/validate',payload||{})},
+    async skillPlan(id,payload){return req('POST','/api/skills/'+encodeURIComponent(id)+'/actions/plan',payload||{})},
+    async skillRun(id,payload){return req('POST','/api/skills/'+encodeURIComponent(id)+'/actions/run',payload||{})},
+    async skillRuns(){return req('GET','/api/skills/runs')},
+    async skillRunDetail(id){return req('GET','/api/skills/runs/'+encodeURIComponent(id))},
     async listSkills(){return req('GET','/api/skills/catalog')},
     async installSkill(name,src){return req('POST','/v1/skills/install',{name,source:src})},
     async viewSkill(name){return req('GET','/api/skills/'+encodeURIComponent(name))},

@@ -126,3 +126,45 @@ printf '%s' "$cli_projection_json" | rg -vq '"skill.run"'
 
 curl -fsS "$BASE_URL/api/skills/iacc:supply-risk-analyst" | rg -q '"kind":"skills.detail"'
 curl -fsS "$BASE_URL/api/skills/local:release" | rg -q '"kind":"skills.detail"'
+
+curl -fsS "$BASE_URL/api/iacc/domain/server-manufacturing/seed" -X POST | rg -q '"metric_dependency_count":5'
+
+packet_json="$(curl -fsS "$BASE_URL/api/iacc/evidence/build" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-packet","session_id":"session-v09136","problem_statement":"GPU shortage and delivery risk for server build plan"}')"
+printf '%s' "$packet_json" | rg -q '"kind":"iacc.evidence.packet"'
+packet_id="$(printf '%s' "$packet_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packet"]["packet_id"])')"
+
+incident_json="$(curl -fsS "$BASE_URL/api/iacc/incidents" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-incident","session_id":"session-v09136","title":"GPU shortage and delivery risk","evidence_packet_id":"'"$packet_id"'"}')"
+printf '%s' "$incident_json" | rg -q '"kind":"iacc.incident"'
+incident_id="$(printf '%s' "$incident_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["incident"]["incident_id"])')"
+
+curl -fsS "$BASE_URL/api/iacc/incidents/$incident_id/analyze" -X POST | rg -q '"kind":"iacc.operational_analysis"'
+
+validate_json="$(curl -fsS "$BASE_URL/api/skills/iacc:supply-risk-analyst/actions/validate" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-validate","session_id":"session-v09136"}')"
+printf '%s' "$validate_json" | rg -q '"kind":"skills.action.validate"'
+printf '%s' "$validate_json" | rg -q '"status":"pass"'
+
+plan_json="$(curl -fsS "$BASE_URL/api/skills/iacc:supply-risk-analyst/actions/plan" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-plan","session_id":"session-v09136","incident_id":"'"$incident_id"'","limit":3}')"
+printf '%s' "$plan_json" | rg -q '"kind":"skills.action.plan"'
+printf '%s' "$plan_json" | rg -q '"supply-risk-analyst"'
+
+run_json="$(curl -fsS "$BASE_URL/api/skills/iacc:supply-risk-analyst/actions/run" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-run","session_id":"session-v09136","incident_id":"'"$incident_id"'"}')"
+printf '%s' "$run_json" | rg -q '"kind":"skills.action.run"'
+skill_run_id="$(printf '%s' "$run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["skill_run"]["execution_id"])')"
+
+curl -fsS "$BASE_URL/api/skills/runs" | rg -q '"kind":"skills.runs"'
+curl -fsS "$BASE_URL/api/skills/runs/$skill_run_id" | rg -q '"kind":"skills.run"'
+
+local_validate_json="$(curl -fsS "$BASE_URL/api/skills/local:release/actions/validate" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v09136-local-validate","session_id":"session-v09136"}')"
+printf '%s' "$local_validate_json" | rg -q '"unsupported_for_local_skill"'
