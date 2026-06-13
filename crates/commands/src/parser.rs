@@ -13,6 +13,7 @@ use crate::skill_tools::{SkillManager, SkillViewInput, SkillViewOutput};
 use crate::specs::{
     SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
+use crate::{SkillInfo, SkillRegistry, SkillRegistryRootKind, SkillRegistrySource};
 impl SlashCommand {
     pub fn parse(input: &str) -> Result<Option<Self>, SlashCommandParseError> {
         validate_slash_command_input(input)
@@ -1050,6 +1051,7 @@ impl SkillOrigin {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillRoot {
     pub(crate) source: DefinitionSource,
@@ -1349,8 +1351,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
 
     match normalize_optional_args(args) {
         None | Some("list") => {
-            let roots = discover_skill_roots_internal(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let skills = load_skills_from_registry(cwd)?;
             Ok(render_skills_report(&skills))
         }
         Some("install") => Ok(render_skills_usage(Some("install"))),
@@ -1394,23 +1395,12 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
 
 // Discover skill root paths for SkillManager
 fn discover_skill_root_paths(cwd: &Path) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for ancestor in cwd.ancestors() {
-        for subdir in [".cowd/skills", ".cowd/skills", ".agents/skills"] {
-            let path = ancestor.join(subdir);
-            if path.exists() && !roots.contains(&path) {
-                roots.push(path);
-            }
-        }
-    }
-    // Also check ~/.cowd/skills
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(home).join(".cowd/skills");
-        if home_path.exists() && !roots.contains(&home_path) {
-            roots.push(home_path);
-        }
-    }
-    roots
+    SkillRegistry::discover(cwd)
+        .roots()
+        .iter()
+        .filter(|root| root.kind == SkillRegistryRootKind::SkillsDir)
+        .map(|root| root.path.clone())
+        .collect()
 }
 
 pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::io::Result<Value> {
@@ -1430,8 +1420,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 
     match normalize_optional_args(args) {
         None | Some("list") => {
-            let roots = discover_skill_roots_internal(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let skills = load_skills_from_registry(cwd)?;
             Ok(render_skills_report_json(&skills))
         }
         Some("install") => Ok(render_skills_usage_json(Some("install"))),
@@ -1532,8 +1521,7 @@ pub fn resolve_skill_invocation(
         if !skill_token.is_empty() {
             if let Err(error) = resolve_skill_path(cwd, skill_token) {
                 let mut message = format!("Unknown skill: {skill_token} ({error})");
-                let roots = discover_skill_roots_internal(cwd);
-                if let Ok(available) = load_skills_from_roots(&roots) {
+                if let Ok(available) = load_skills_from_registry(cwd) {
                     let names: Vec<String> = available
                         .iter()
                         .filter(|s| s.shadowed_by.is_none())
@@ -1555,75 +1543,9 @@ pub fn resolve_skill_invocation(
 }
 
 pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
-    if requested.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "skill must not be empty",
-        ));
-    }
-
-    let roots = discover_skill_roots_internal(cwd);
-    for root in &roots {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&root.path)? {
-            let entry = entry?;
-            match root.origin {
-                SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let skill_path = entry.path().join("SKILL.md");
-                    if !skill_path.is_file() {
-                        continue;
-                    }
-                    let contents = fs::read_to_string(&skill_path)?;
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((
-                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        skill_path,
-                    ));
-                }
-                SkillOrigin::LegacyCommandsDir => {
-                    let path = entry.path();
-                    let markdown_path = if path.is_dir() {
-                        let skill_path = path.join("SKILL.md");
-                        if !skill_path.is_file() {
-                            continue;
-                        }
-                        skill_path
-                    } else if path
-                        .extension()
-                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-                    {
-                        path
-                    } else {
-                        continue;
-                    };
-
-                    let contents = fs::read_to_string(&markdown_path)?;
-                    let fallback_name = markdown_path.file_stem().map_or_else(
-                        || entry.file_name().to_string_lossy().to_string(),
-                        |stem| stem.to_string_lossy().to_string(),
-                    );
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((name.unwrap_or(fallback_name), markdown_path));
-                }
-            }
-        }
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        if let Some((_, path)) = entries
-            .into_iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(requested))
-        {
-            return Ok(path);
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("unknown skill: {requested}"),
-    ))
+    SkillRegistry::discover(cwd)
+        .resolve(skill)
+        .map(|skill| skill.path)
 }
 
 pub(crate) fn render_mcp_report_for(
@@ -1871,168 +1793,6 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     roots
 }
 
-#[allow(clippy::too_many_lines)]
-fn discover_skill_roots_internal(cwd: &Path) -> Vec<SkillRoot> {
-    let mut roots = Vec::new();
-
-    for ancestor in cwd.ancestors() {
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".cowd").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".agents").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectCodex,
-            ancestor.join(".codex").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        // Migration: discover from .claude if directory exists
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectClaude,
-            ancestor.join(".claude").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".cowd").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectCodex,
-            ancestor.join(".codex").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-        // Migration: discover from .claude if directory exists
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::ProjectClaude,
-            ancestor.join(".claude").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    if let Ok(cc_config_home) = env::var("COWD_CONFIG_HOME") {
-        let cc_config_home = PathBuf::from(cc_config_home);
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            cc_config_home.join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            cc_config_home.join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    if let Ok(codex_home) = env::var("CODEX_HOME") {
-        let codex_home = PathBuf::from(codex_home);
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserCodexHome,
-            codex_home.join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserCodexHome,
-            codex_home.join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".cowd").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".cowd").join("skills").join("omc-learned"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".cowd").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserCodex,
-            home.join(".codex").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserCodex,
-            home.join(".codex").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-        // Migration: discover from .claude if directory exists
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaude,
-            home.join(".claude").join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaude,
-            home.join(".claude").join("skills").join("omc-learned"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClaude,
-            home.join(".claude").join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    if let Ok(cowd_config_home) = env::var("COWD_CONFIG_HOME") {
-        let cowd_config_home = PathBuf::from(cowd_config_home);
-        let skills_dir = cowd_config_home.join("skills");
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            skills_dir.clone(),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            skills_dir.join("omc-learned"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            cowd_config_home.join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    roots
-}
-
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
     let registry_root = default_skill_install_root()?;
     install_skill_into(source, cwd, &registry_root)
@@ -2242,21 +2002,6 @@ fn push_unique_root(
     }
 }
 
-fn push_unique_skill_root(
-    roots: &mut Vec<SkillRoot>,
-    source: DefinitionSource,
-    path: PathBuf,
-    origin: SkillOrigin,
-) {
-    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
-        roots.push(SkillRoot {
-            source,
-            path,
-            origin,
-        });
-    }
-}
-
 pub(crate) fn load_agents_from_roots(
     roots: &[(DefinitionSource, PathBuf)],
 ) -> std::io::Result<Vec<AgentSummary>> {
@@ -2300,6 +2045,7 @@ pub(crate) fn load_agents_from_roots(
     Ok(agents)
 }
 
+#[cfg(test)]
 pub(crate) fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
     let mut skills = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
@@ -2375,6 +2121,48 @@ pub(crate) fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec
     }
 
     Ok(skills)
+}
+
+pub(crate) fn load_skills_from_registry(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
+    SkillRegistry::discover(cwd)
+        .list()
+        .map(|skills| skills.into_iter().map(skill_summary_from_info).collect())
+}
+
+fn skill_summary_from_info(skill: SkillInfo) -> SkillSummary {
+    SkillSummary {
+        name: skill.name,
+        description: skill.description,
+        source: definition_source_from_skill_source(skill.source),
+        shadowed_by: skill.shadowed_by.map(definition_source_from_skill_source),
+        origin: skill_origin_from_registry_kind(skill.kind),
+    }
+}
+
+fn definition_source_from_skill_source(source: SkillRegistrySource) -> DefinitionSource {
+    match source {
+        SkillRegistrySource::ProjectCowd | SkillRegistrySource::ProjectAgents => {
+            DefinitionSource::ProjectClaw
+        }
+        SkillRegistrySource::ProjectCodex => DefinitionSource::ProjectCodex,
+        SkillRegistrySource::ProjectClaude => DefinitionSource::ProjectClaude,
+        SkillRegistrySource::UserCowdConfigHome => DefinitionSource::UserClawConfigHome,
+        SkillRegistrySource::UserCodexHome => DefinitionSource::UserCodexHome,
+        SkillRegistrySource::UserCowd | SkillRegistrySource::UserAgents => {
+            DefinitionSource::UserClaw
+        }
+        SkillRegistrySource::UserCodex | SkillRegistrySource::UserOpenCode => {
+            DefinitionSource::UserCodex
+        }
+        SkillRegistrySource::UserClaude => DefinitionSource::UserClaude,
+    }
+}
+
+fn skill_origin_from_registry_kind(kind: SkillRegistryRootKind) -> SkillOrigin {
+    match kind {
+        SkillRegistryRootKind::SkillsDir => SkillOrigin::SkillsDir,
+        SkillRegistryRootKind::LegacyCommandsDir => SkillOrigin::LegacyCommandsDir,
+    }
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
