@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use memory::store::session::SessionRecord;
+use runtime::execution_outcome::CowdExecutionOutcome;
 use runtime::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_domain_pack, server_manufacturing_ontology_pack,
@@ -878,15 +879,23 @@ async fn iacc_data_plane_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<IaccDataPlaneIngestPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = request.session_id.clone();
     let store = open_iacc_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_data_plane_ingest(request.ingest)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    append_iacc_execution_outcome(
+        &state,
+        session_id.as_deref(),
+        CowdExecutionOutcome::from(&plan),
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "iacc.data_plane.ingest_plan",
         "request_id": request.request_id,
-        "session_id": request.session_id,
+        "session_id": session_id,
         "plan": plan,
     })))
 }
@@ -1622,6 +1631,7 @@ async fn iacc_fact_ingest_handler(
             "at least one IACC fact is required",
         ));
     }
+    let session_id = request.session_id.clone();
     let store = open_iacc_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut facts = Vec::with_capacity(request.facts.len());
@@ -1631,13 +1641,20 @@ async fn iacc_fact_ingest_handler(
         let item = store
             .ingest_fact(&fact)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        append_iacc_execution_outcome(
+            &state,
+            session_id.as_deref(),
+            CowdExecutionOutcome::from(&fact),
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         facts.push(fact);
         attention.push(item);
     }
     Ok(Json(serde_json::json!({
         "kind": "iacc.fact.ingest",
         "request_id": request.request_id,
-        "session_id": request.session_id,
+        "session_id": session_id,
         "ingested": facts.len(),
         "facts": facts,
         "attention": attention,
@@ -1870,6 +1887,7 @@ async fn iacc_evidence_build_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<IaccEvidenceBuildRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = request.session_id.clone();
     let store = open_iacc_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
@@ -1881,10 +1899,17 @@ async fn iacc_evidence_build_handler(
             IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
+    append_iacc_execution_outcome(
+        &state,
+        session_id.as_deref(),
+        CowdExecutionOutcome::from(&packet),
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "iacc.evidence.packet",
         "request_id": request.request_id,
-        "session_id": request.session_id,
+        "session_id": session_id,
         "packet": packet,
     })))
 }
@@ -2235,6 +2260,7 @@ async fn iacc_incident_skill_run_handler(
     AxumPath((id, skill_id)): AxumPath<(String, String)>,
     Json(request): Json<IaccSkillRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = request.session_id.clone();
     let store = open_iacc_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let incident = store
@@ -2255,10 +2281,17 @@ async fn iacc_incident_skill_run_handler(
     let graph = complete_iacc_skill_agent_node(&state, &incident, &run)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    append_iacc_execution_outcome(
+        &state,
+        session_id.as_deref().or(incident.task_id.as_deref()),
+        CowdExecutionOutcome::from(&run),
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "iacc.skill.run",
         "request_id": request.request_id,
-        "session_id": request.session_id,
+        "session_id": session_id,
         "incident_id": id,
         "skill_run": run,
         "agent_graph": graph,
@@ -2330,6 +2363,19 @@ async fn iacc_action_execute_handler(
             IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
+    let incident = store
+        .get_incident(&execution.incident_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    append_iacc_execution_outcome(
+        &state,
+        incident
+            .as_ref()
+            .and_then(|incident| incident.task_id.as_deref())
+            .or(Some(execution.incident_id.as_str())),
+        CowdExecutionOutcome::from(&execution),
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "iacc.action_execution",
         "execution": execution,
@@ -3049,6 +3095,79 @@ async fn append_iacc_agent_runtime_event(
         )
         .await
         .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn append_iacc_execution_outcome(
+    state: &AppState,
+    session_id: Option<&str>,
+    outcome: CowdExecutionOutcome,
+) -> Result<(), String> {
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let Some(store) = state.unified_store() else {
+        return Ok(());
+    };
+    ensure_iacc_outcome_session_record(state, session_id)
+        .await
+        .map_err(|error| format!("failed to prepare IACC outcome session: {error}"))?;
+    let sequence = store
+        .next_event_sequence(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let event = outcome.to_runtime_event(session_id.to_string(), sequence);
+    store
+        .append_runtime_event(&event)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn ensure_iacc_outcome_session_record(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), String> {
+    let Some(store) = state.unified_store() else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(mut record) = store
+        .get_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        record.last_activity = now;
+        record.platform = "iacc".to_string();
+        store
+            .update_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let metadata_json = serde_json::json!({
+        "kind": "iacc.execution_outcome.session",
+        "session_id": session_id,
+    })
+    .to_string();
+    let record = SessionRecord {
+        session_id: session_id.to_string(),
+        platform: "iacc".to_string(),
+        chat_id: session_id.to_string(),
+        user_id: None,
+        model: None,
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: 0,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(metadata_json),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: "active".to_string(),
+    };
+    store
+        .create_session(&record)
+        .await
         .map_err(|error| error.to_string())
 }
 

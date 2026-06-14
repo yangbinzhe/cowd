@@ -1495,6 +1495,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iacc_fact_and_evidence_append_execution_outcomes_to_runtime_timeline() {
+        let workspace = test_temp_dir("iacc-outcome-timeline");
+        let config_home = test_temp_dir("iacc-outcome-config");
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let app = api_router(test_state_with_store_and_workspace(
+            store,
+            workspace.clone(),
+            config_home,
+        ));
+        let session_id = "iacc-outcome-session";
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "iacc-outcome-fact",
+                            "session_id": session_id,
+                            "facts": [{
+                                "fact_id": "fact-outcome-stock",
+                                "snapshot_id": "snapshot-outcome",
+                                "fact_type": "inventory_balance",
+                                "entity_refs": ["factory:sz"],
+                                "metric_key": "stock_on_hand",
+                                "dimensions": {"week": "2026-W30"},
+                                "measures": {"qty": 64},
+                                "source_ref": "pack-outcome",
+                                "confidence": 0.93
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+        let body = to_bytes(ingest.into_body(), usize::MAX).await.unwrap();
+        let ingest_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let attention_id = ingest_json["attention"][0]["attention_id"]
+            .as_str()
+            .unwrap();
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "iacc-outcome-evidence",
+                            "session_id": session_id,
+                            "attention_id": attention_id,
+                            "problem_statement": "Inventory balance outcome should reach timeline"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+
+        let timeline = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline.status(), StatusCode::OK);
+        let body = to_bytes(timeline.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let outcome_events = json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "execution.outcome")
+            .collect::<Vec<_>>();
+        assert_eq!(outcome_events.len(), 2);
+        assert!(outcome_events.iter().any(|event| {
+            event["refs"].as_array().is_some_and(|refs| {
+                refs.iter().any(|reference| {
+                    reference["type"] == "structured_fact"
+                        && reference["id"] == "fact-outcome-stock"
+                })
+            })
+        }));
+        assert!(outcome_events.iter().any(|event| {
+            event["refs"].as_array().is_some_and(|refs| {
+                refs.iter()
+                    .any(|reference| reference["type"] == "structured_evidence")
+            })
+        }));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn iacc_metric_recompute_projects_changes_and_attention() {
         let workspace = test_temp_dir("iacc-metric");
         let config_home = test_temp_dir("iacc-metric-config");

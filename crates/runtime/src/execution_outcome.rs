@@ -3,7 +3,10 @@ use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::iacc::{IaccActionExecution, IaccComputeJob, IaccDataPlaneIngestPlan, IaccSkillRun};
+use crate::iacc::{
+    IaccActionExecution, IaccComputeJob, IaccDataPlaneIngestPlan, IaccEvidencePacket, IaccFact,
+    IaccSkillRun,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -12,6 +15,8 @@ pub enum CowdExecutionOutcomeKind {
     Agent,
     Task,
     StructuredIngest,
+    StructuredFact,
+    StructuredEvidence,
     ManufacturingCompute,
     ManufacturingAction,
     SkillRun,
@@ -146,6 +151,87 @@ impl From<&IaccComputeJob> for CowdExecutionOutcome {
     }
 }
 
+impl From<&IaccFact> for CowdExecutionOutcome {
+    fn from(fact: &IaccFact) -> Self {
+        let mut refs = vec![CowdExecutionRef {
+            ref_type: "structured_fact".to_string(),
+            id: fact.fact_id.clone(),
+            label: Some(fact.fact_type.clone()),
+        }];
+        if let Some(source_ref) = fact.source_ref.as_ref() {
+            refs.push(CowdExecutionRef {
+                ref_type: "structured_source".to_string(),
+                id: source_ref.clone(),
+                label: Some(source_ref.clone()),
+            });
+        }
+        Self {
+            outcome_id: format!("structured-fact:{}", fact.fact_id),
+            kind: CowdExecutionOutcomeKind::StructuredFact,
+            status: CowdExecutionOutcomeStatus::Succeeded,
+            title: format!("Structured fact {}", fact.fact_type),
+            summary: format!(
+                "Fact {} of type {} references {} entities with confidence {:.2}.",
+                fact.fact_id,
+                fact.fact_type,
+                fact.entity_refs.len(),
+                fact.confidence
+            ),
+            domain: Some("iacc".to_string()),
+            refs,
+            evidence_refs: fact
+                .source_ref
+                .iter()
+                .map(|source_ref| format!("structured-source:{source_ref}"))
+                .collect(),
+            metrics: fact.metric_key.iter().cloned().collect(),
+            payload: serde_json::to_value(fact).unwrap_or(Value::Null),
+            created_at: fact.event_time,
+        }
+    }
+}
+
+impl From<&IaccEvidencePacket> for CowdExecutionOutcome {
+    fn from(packet: &IaccEvidencePacket) -> Self {
+        Self {
+            outcome_id: format!("structured-evidence:{}", packet.packet_id),
+            kind: CowdExecutionOutcomeKind::StructuredEvidence,
+            status: if packet.missing_evidence.is_empty() {
+                CowdExecutionOutcomeStatus::Succeeded
+            } else {
+                CowdExecutionOutcomeStatus::Partial
+            },
+            title: format!("Evidence packet {}", packet.packet_id),
+            summary: format!(
+                "Evidence packet for '{}' has {} metric items, {} change items and confidence {:.2}.",
+                packet.problem_statement,
+                packet.metric_evidence.len(),
+                packet.change_evidence.len(),
+                packet.confidence
+            ),
+            domain: Some("iacc".to_string()),
+            refs: vec![CowdExecutionRef {
+                ref_type: "structured_evidence".to_string(),
+                id: packet.packet_id.clone(),
+                label: packet.attention_id.clone(),
+            }],
+            evidence_refs: packet
+                .source_refs
+                .iter()
+                .map(|source| source.reference.clone())
+                .collect(),
+            metrics: packet
+                .metric_evidence
+                .iter()
+                .filter_map(|item| item.get("metric_id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect(),
+            payload: serde_json::to_value(packet).unwrap_or(Value::Null),
+            created_at: packet.created_at,
+        }
+    }
+}
+
 impl From<&IaccActionExecution> for CowdExecutionOutcome {
     fn from(execution: &IaccActionExecution) -> Self {
         Self {
@@ -261,6 +347,7 @@ mod tests {
     use super::*;
     use crate::iacc::{
         IaccComputeJob, IaccComputeJobInput, IaccDataPlaneIngestPlan, IaccDataPlaneWatermark,
+        IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccFactInput,
     };
 
     #[test]
@@ -322,5 +409,61 @@ mod tests {
         assert_eq!(outcome.evidence_refs, vec!["fact-1"]);
         assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
         assert_eq!(outcome.refs[0].ref_type, "iacc_compute_job");
+    }
+
+    #[test]
+    fn structured_fact_outcome_keeps_fact_source_and_metric_refs() {
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-1".to_string()),
+            snapshot_id: Some("snapshot-1".to_string()),
+            fact_type: "inventory_balance".to_string(),
+            entity_refs: vec!["factory:sz".to_string()],
+            metric_key: Some("stock_on_hand".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W30"}),
+            measures: serde_json::json!({"qty": 42}),
+            event_time: Some(DateTime::<Utc>::UNIX_EPOCH),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("pack-1".to_string()),
+            confidence: Some(0.95),
+            raw_hash: Some("sha256:fact".to_string()),
+        });
+
+        let outcome = CowdExecutionOutcome::from(&fact);
+        let event = outcome.to_runtime_event("session-1", 2);
+
+        assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredFact);
+        assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Succeeded);
+        assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
+        assert!(event.refs.iter().any(|reference| {
+            reference.ref_type == "structured_fact" && reference.id == "fact-1"
+        }));
+        assert!(event.refs.iter().any(|reference| {
+            reference.ref_type == "structured_source" && reference.id == "pack-1"
+        }));
+    }
+
+    #[test]
+    fn structured_evidence_outcome_keeps_packet_refs_and_partial_status() {
+        let mut packet = IaccEvidencePacket::new("Inventory balance needs review");
+        packet.packet_id = "evidence-1".to_string();
+        packet.attention_id = Some("attention-1".to_string());
+        packet.metric_evidence = vec![serde_json::json!({"metric_id": "stock_on_hand"})];
+        packet.source_refs = vec![IaccEvidenceSourceRef {
+            kind: "fact".to_string(),
+            reference: "iacc:fact:fact-1".to_string(),
+            summary: "Fact source".to_string(),
+        }];
+
+        let outcome = CowdExecutionOutcome::from(&packet);
+        let event = outcome.to_runtime_event("session-1", 3);
+
+        assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredEvidence);
+        assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Partial);
+        assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
+        assert_eq!(outcome.evidence_refs, vec!["iacc:fact:fact-1"]);
+        assert!(event.refs.iter().any(|reference| {
+            reference.ref_type == "structured_evidence" && reference.id == "evidence-1"
+        }));
     }
 }
