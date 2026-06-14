@@ -348,7 +348,7 @@ describe('API module', () => {
   });
 
   it('runtime session lease APIs use the control-plane route contract', async () => {
-    const mockF = vi.fn((path) => {
+    const mockF = vi.fn((path, opts = {}) => {
       if (String(path).includes('/api/runtime/session-leases/acquire')) {
         return Promise.resolve({
           ok: true,
@@ -1457,6 +1457,15 @@ describe('API module', () => {
     document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
     localStorage.setItem('cowd-iacc-report-id', 'cockpit-report-webui');
     const mockF = vi.fn((path) => {
+      if (path === '/api/iacc/app') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          app_id: 'iacc.manufacturing',
+          layer: 'application',
+          cowd_capabilities: ['cowd.structured_data.core', 'cowd.runtime.event'],
+          domains: [{ domain_id: 'server_manufacturing', name: 'Server Manufacturing' }],
+          surfaces: { webui: { role: 'enhanced_management' }, tui: { role: 'console_full_capability' }, cli: { role: 'minimal_core_control' } }
+        }) });
+      }
       if (path === '/api/iacc/health') {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           kind: 'iacc.health',
@@ -1468,6 +1477,47 @@ describe('API module', () => {
           execution_count: 5,
           attention_count: 6,
           capabilities: ['cockpit_report_delivery_retry_state', 'cockpit_report_schedule_runner']
+        }) });
+      }
+      if (path === '/api/cowd/structured/sources') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'cowd.structured.sources',
+          list_status: 'ready',
+          count: 1,
+          items: [{ source_id: 'pack-webui', source_name: 'ERP', owner: 'ops', mappings: [{ mapping_id: 'm1' }] }]
+        }) });
+      }
+      if (path === '/api/cowd/structured/facts') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'cowd.structured.facts',
+          list_status: 'ready',
+          count: 1,
+          items: [{ fact_id: 'fact-webui', fact_type: 'inventory_balance', metric_key: 'stock_on_hand', confidence: 0.91 }]
+        }) });
+      }
+      if (path === '/api/cowd/structured/evidence') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'cowd.structured.evidence',
+          list_status: 'ready',
+          count: 1,
+          items: [{ evidence_id: 'evidence-webui', problem_statement: 'Inventory balance review', confidence: 0.72, source_refs: [{ reference: 'iacc:fact:fact-webui' }] }]
+        }) });
+      }
+      if (path === '/api/cowd/structured/watermarks') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'cowd.structured.watermarks',
+          list_status: 'ready',
+          count: 1,
+          items: [{ source_ref: 'pack-webui', fact_type: 'inventory_balance', high_watermark: '2026-06-14T00:00:00Z' }]
+        }) });
+      }
+      if (path === '/api/cowd/structured/ingest-plan') {
+        const body = JSON.parse(opts.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          batch_id: 'batch-webui',
+          source_ref: body.source_ref,
+          fact_type: body.fact_type,
+          watermark: { source_ref: body.source_ref, high_watermark: body.high_watermark || 'now' }
         }) });
       }
       if (path === '/api/iacc/cockpit/reports/cockpit-report-webui') {
@@ -1520,10 +1570,28 @@ describe('API module', () => {
 
     await window.Panels.renderIacc();
     const panel = document.getElementById('panel-content');
-    expect(panel.textContent).toContain('IACC Reports');
+    expect(panel.textContent).toContain('IACC Workbench');
+    expect(panel.textContent).toContain('iacc.manufacturing');
+    expect(panel.textContent).toContain('cowd.structured_data.core');
+    expect(panel.textContent).toContain('Structured Data');
+    expect(panel.textContent).toContain('pack-webui');
+    expect(panel.textContent).toContain('fact-webui');
+    expect(panel.textContent).toContain('evidence-webui');
+    expect(panel.textContent).toContain('2026-06-14T00:00:00Z');
     expect(panel.textContent).toContain('cockpit-report-webui');
     expect(panel.textContent).toContain('dry_run_planned');
     expect(panel.textContent).toContain('cpx-webui');
+
+    const ingestFormInputs = document.querySelectorAll('.structured-ingest-form input');
+    ingestFormInputs[0].value = 'pack-webui';
+    ingestFormInputs[1].value = 'inventory_balance';
+    ingestFormInputs[2].value = '2026-W30';
+    ingestFormInputs[3].value = '2026-06-14T00:00:00Z';
+    document.querySelector('.structured-ingest-form button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const ingestCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/cowd/structured/ingest-plan'));
+    expect(JSON.parse(ingestCall[1].body).source_ref).toBe('pack-webui');
 
     document.querySelectorAll('.iacc-report-controls button')[1].click();
     await new Promise(resolve => setTimeout(resolve, 0));

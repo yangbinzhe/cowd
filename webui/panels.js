@@ -258,6 +258,7 @@ window.Panels = (()=>{
   }
 
   function renderRuntimeTimelineItem(item,onContextSelect){
+    if(item&&item.kind==='execution.outcome')return renderExecutionOutcomeTimelineItem(item,onContextSelect);
     const row=UI.el('div','runtime-run-item runtime-timeline-item');
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     const refsList=(item.refs||[]).filter(function(ref){return ref&&ref.id});
@@ -272,6 +273,45 @@ window.Panels = (()=>{
       ? 'board '+payload.board_id+' · complete '+fmtPct(score.completion_rate)+' · conflicts '+fmtNumber(score.conflict_count)+' · candidates '+((payload.maintenance_candidates||[]).length)
       : '';
     row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(policyText||refs||scoreText||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
+    const contextRefs=refsList.filter(function(ref){return (ref.type||ref.ref_type)==='context_envelope'});
+    if(contextRefs.length&&onContextSelect){
+      const refRow=UI.el('div','runtime-ref-actions');
+      contextRefs.slice(0,2).forEach(function(ref){
+        const btn=UI.el('button','runtime-context-link');
+        btn.type='button';
+        btn.textContent='context '+ref.id;
+        btn.onclick=function(){onContextSelect(ref.id)};
+        refRow.appendChild(btn);
+      });
+      row.appendChild(refRow);
+    }
+    return row;
+  }
+
+  function renderExecutionOutcomeTimelineItem(item,onContextSelect){
+    const row=UI.el('div','runtime-run-item runtime-timeline-item runtime-outcome');
+    const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
+    const payload=item.payload||{};
+    const refsList=(item.refs||[]).filter(function(ref){return ref&&ref.id});
+    const metrics=(payload.metrics||[]).slice(0,3).join(' · ');
+    const status=item.status||payload.status||'unknown';
+    const title=payload.title||payload.outcome_id||'execution outcome';
+    const summary=payload.summary||refsList.map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+ref.id}).slice(0,3).join(' · ');
+    row.innerHTML='<b>'+UI.esc(title)+'</b><small>'+UI.esc([status,payload.kind||'outcome','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(summary))+'</em>';
+    if(metrics){
+      const metricRow=UI.el('div','runtime-ref-actions');
+      metricRow.appendChild(UI.el('span','memory-chip','metrics '+metrics));
+      row.appendChild(metricRow);
+    }
+    if(refsList.length){
+      const refRow=UI.el('div','runtime-ref-actions');
+      refsList.slice(0,4).forEach(function(ref){
+        const chip=UI.el('span','memory-chip');
+        chip.textContent=(ref.type||ref.ref_type||'ref')+' '+ref.id;
+        refRow.appendChild(chip);
+      });
+      row.appendChild(refRow);
+    }
     const contextRefs=refsList.filter(function(ref){return (ref.type||ref.ref_type)==='context_envelope'});
     if(contextRefs.length&&onContextSelect){
       const refRow=UI.el('div','runtime-ref-actions');
@@ -690,6 +730,26 @@ window.Panels = (()=>{
       const detail=UI.el('div','runtime-workgraph-detail');
       detail.innerHTML='<b>'+UI.esc(reasons[0])+'</b><small>'+UI.esc(['agents '+fmtNumber(latest.agent_tasks),'synthesis '+fmtPct(latest.synthesis_lift),'complement '+fmtPct(latest.complementarity_score)].join(' · '))+'</small>';
       sec.appendChild(detail);
+    }
+    return sec;
+  }
+
+  function renderCowdOverview(capabilities,projection,surfaces,gate){
+    const sec=UI.el('div','runtime-control-plane cowd-overview');
+    sec.innerHTML='<h4>Cowd Kernel</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('caps',((capabilities&&capabilities.capabilities)||[]).length,'registry'));
+    metrics.appendChild(renderMemoryMetric('projection',(projection&&projection.capability_count)||0,'webui'));
+    metrics.appendChild(renderMemoryMetric('parity',surfaces&&surfaces.webui_tui_full_parity?'yes':'no','webui/tui'));
+    metrics.appendChild(renderMemoryMetric('cli',surfaces&&surfaces.cli_is_minimal_control?'minimal':'check','surface'));
+    metrics.appendChild(renderMemoryMetric('gate',(gate&&gate.status)||'unknown','release'));
+    sec.appendChild(metrics);
+    const failed=((gate&&gate.checks)||[]).filter(function(check){return check.status!=='pass'});
+    if(failed.length){
+      const list=UI.el('div','runtime-control-plane-reasons');
+      list.textContent=failed.slice(0,4).map(function(check){return check.check_id+': '+check.status}).join(' · ');
+      sec.classList.add('cowd-gate-fail');
+      sec.appendChild(list);
     }
     return sec;
   }
@@ -1586,6 +1646,10 @@ window.Panels = (()=>{
       let budget={};
       let controlPolicy=null;
       let controlPlane=null;
+      let cowdCapabilities=null;
+      let cowdProjection=null;
+      let cowdSurfaces=null;
+      let cowdGate=null;
       try{
         const ctx=await Api.currentContext(opts);
         envelope=(ctx&&ctx.envelope)||{};
@@ -1602,6 +1666,13 @@ window.Panels = (()=>{
       }catch(e){}
       try{
         controlPlane=await Api.runtimeControlPlane();
+      }catch(e){}
+      try{
+        const cowd=await Promise.all([Api.cowdCapabilities(),Api.cowdProjection('webui'),Api.cowdSurfaces(),Api.cowdReleaseGate()]);
+        cowdCapabilities=cowd[0];
+        cowdProjection=cowd[1];
+        cowdSurfaces=cowd[2];
+        cowdGate=cowd[3];
       }catch(e){}
       acquireLease.onclick=async function(){
         acquireLease.disabled=true;
@@ -1640,6 +1711,7 @@ window.Panels = (()=>{
         metrics.appendChild(renderMemoryMetric('agents',agent.max_parallel_agents??0,'max'));
       }
       summary.appendChild(metrics);
+      summary.appendChild(renderCowdOverview(cowdCapabilities,cowdProjection,cowdSurfaces,cowdGate));
       summary.appendChild(renderRuntimeControlPlane(controlPlane));
       summary.appendChild(renderLeanProbe(leanProbe,policyDecision));
       if((diagnostics.degraded_sources||[]).length){
@@ -2470,10 +2542,107 @@ window.Panels = (()=>{
     target.appendChild(sec);
   }
 
+  function renderIaccAppDescriptor(app){
+    const sec=UI.el('div','panel-section iacc-app-descriptor');
+    sec.innerHTML='<h3>IACC Application</h3>';
+    if(!app){
+      sec.appendChild(UI.el('div','panel-empty','Application descriptor unavailable'));
+      return sec;
+    }
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('app',app.app_id||app.application_id||'iacc','descriptor'));
+    metrics.appendChild(renderMemoryMetric('layer',app.layer||'application','boundary'));
+    metrics.appendChild(renderMemoryMetric('domains',(app.domains||[]).length,'manufacturing'));
+    metrics.appendChild(renderMemoryMetric('cowd',(app.cowd_capabilities||[]).length,'capabilities'));
+    sec.appendChild(metrics);
+    const caps=UI.el('div','runtime-control-plane-caps');
+    (app.cowd_capabilities||[]).slice(0,8).forEach(function(cap){caps.appendChild(UI.el('span','memory-chip',cap))});
+    (app.domains||[]).slice(0,4).forEach(function(domain){caps.appendChild(UI.el('span','memory-chip',domain.domain_id||domain.name||'domain'))});
+    if(caps.childNodes.length)sec.appendChild(caps);
+    return sec;
+  }
+
+  function structuredItemTitle(item){
+    return item.source_id||item.fact_id||item.evidence_id||item.source_ref||item.id||'structured item';
+  }
+
+  function structuredItemMeta(item){
+    return [item.source_name,item.fact_type,item.metric_key,item.owner,item.confidence!==undefined?'confidence '+item.confidence:'',item.high_watermark,item.problem_statement,Array.isArray(item.mappings)?item.mappings.length+' mappings':'',Array.isArray(item.source_refs)?item.source_refs.length+' refs':''].filter(Boolean).join(' · ');
+  }
+
+  function renderStructuredCollection(title,collection){
+    const sec=UI.el('div','structured-collection');
+    const count=collection&&collection.count!==undefined?collection.count:((collection&&collection.items)||[]).length;
+    sec.innerHTML='<h4>'+UI.esc(title)+'</h4><small>'+UI.esc([collection&&collection.list_status||'unknown','count '+count].join(' · '))+'</small>';
+    const items=(collection&&collection.items)||[];
+    if(!items.length){
+      sec.appendChild(UI.el('div','panel-empty','empty'));
+      return sec;
+    }
+    items.slice(0,6).forEach(function(item){
+      const row=UI.el('div','structured-row');
+      row.innerHTML='<b>'+UI.esc(structuredItemTitle(item))+'</b><small>'+UI.esc(structuredItemMeta(item))+'</small>';
+      sec.appendChild(row);
+    });
+    return sec;
+  }
+
+  function renderStructuredIngestComposer(onDone){
+    const sec=UI.el('div','panel-section structured-ingest-form');
+    sec.innerHTML='<h3>Ingest Plan</h3>';
+    const form=UI.el('div','panel-form');
+    const source=UI.el('input');source.placeholder='source_ref';source.setAttribute('aria-label','source_ref');
+    const fact=UI.el('input');fact.placeholder='fact_type';fact.setAttribute('aria-label','fact_type');
+    const partition=UI.el('input');partition.placeholder='partition_ref';partition.setAttribute('aria-label','partition_ref');
+    const watermark=UI.el('input');watermark.placeholder='high_watermark';watermark.setAttribute('aria-label','high_watermark');
+    const rows=UI.el('input');rows.placeholder='estimated_rows';rows.type='number';rows.setAttribute('aria-label','estimated_rows');
+    const run=UI.el('button','btn-secondary btn-sm','Plan ingest');
+    const result=UI.el('div','structured-ingest-result');
+    [source,fact,partition,watermark,rows,run].forEach(function(el){form.appendChild(el)});
+    sec.appendChild(form);
+    sec.appendChild(result);
+    run.onclick=async function(){
+      run.disabled=true;
+      try{
+        const plan=await Api.structuredIngestPlan({
+          source_ref:source.value.trim(),
+          fact_type:fact.value.trim(),
+          partition_ref:partition.value.trim()||undefined,
+          high_watermark:watermark.value.trim()||undefined,
+          estimated_rows:rows.value?Number(rows.value):undefined,
+        });
+        result.innerHTML='';
+        result.appendChild(UI.el('div','panel-empty','planned '+(plan.batch_id||plan.source_ref||'ingest')));
+        if(onDone)await onDone(plan);
+      }catch(e){
+        result.innerHTML='';
+        result.appendChild(UI.el('div','panel-empty',e.message));
+      }finally{
+        run.disabled=false;
+      }
+    };
+    return sec;
+  }
+
+  async function renderStructuredWorkbench(target){
+    target.innerHTML='<h3>Structured Data</h3>';
+    try{
+      const data=await Promise.all([Api.structuredSources(),Api.structuredFacts(),Api.structuredEvidence(),Api.structuredWatermarks()]);
+      const grid=UI.el('div','structured-workbench');
+      grid.appendChild(renderStructuredCollection('Sources',data[0]));
+      grid.appendChild(renderStructuredCollection('Facts',data[1]));
+      grid.appendChild(renderStructuredCollection('Evidence',data[2]));
+      grid.appendChild(renderStructuredCollection('Watermarks',data[3]));
+      target.appendChild(grid);
+    }catch(e){
+      target.appendChild(UI.el('div','panel-empty','Structured data unavailable'));
+    }
+  }
+
   async function renderIacc(){
     const c=cont();c.innerHTML='';
     const header=UI.el('div','panel-section iacc-console');
-    header.innerHTML='<h3>IACC Reports</h3>';
+    header.innerHTML='<h3>IACC Workbench</h3>';
     const controls=UI.el('div','iacc-report-controls');
     const reportInput=UI.el('input');
     reportInput.placeholder='Report id';
@@ -2486,12 +2655,27 @@ window.Panels = (()=>{
     controls.appendChild(retryBtn);
     header.appendChild(controls);
     c.appendChild(header);
+    const appSec=UI.el('div','iacc-app-mount');
+    c.appendChild(appSec);
     const healthSec=UI.el('div','panel-section iacc-health');
     healthSec.innerHTML='<h3>IACC Health</h3>';
     c.appendChild(healthSec);
+    const structuredSec=UI.el('div','panel-section iacc-structured');
+    structuredSec.innerHTML='<h3>Structured Data</h3>';
+    c.appendChild(structuredSec);
+    c.appendChild(renderStructuredIngestComposer(async function(){await renderStructuredWorkbench(structuredSec)}));
     const reportMount=UI.el('div','iacc-report-mount');
     c.appendChild(reportMount);
     let currentReport=null;
+
+    async function loadApp(){
+      appSec.innerHTML='';
+      try{
+        appSec.appendChild(renderIaccAppDescriptor(await Api.iaccApp()));
+      }catch(e){
+        appSec.appendChild(renderIaccAppDescriptor(null));
+      }
+    }
 
     async function loadHealth(){
       healthSec.innerHTML='<h3>IACC Health</h3>';
@@ -2560,7 +2744,9 @@ window.Panels = (()=>{
       }
     };
 
+    await loadApp();
     await loadHealth();
+    await renderStructuredWorkbench(structuredSec);
     if(reportInput.value.trim())await loadReport();
     else renderIaccReportState(null,null,reportMount);
   }
