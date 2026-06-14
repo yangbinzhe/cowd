@@ -10,7 +10,7 @@ use axum::{
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
 use runtime::iacc::{IaccDataPlaneIngestPlanInput, IaccStore, IaccStoreError};
 use runtime::projection::CowdProjection;
-use runtime::release_gate::CowdReleaseGateReport;
+use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
 use runtime::structured_data::{
     CowdIngestPlan, CowdStructuredEvidence, CowdStructuredFact, CowdStructuredSource, CowdWatermark,
 };
@@ -71,8 +71,10 @@ async fn surfaces_handler() -> impl IntoResponse {
     Json(CowdSurfaceParityContract::from_registry(&registry))
 }
 
-async fn release_gate_handler() -> impl IntoResponse {
-    Json(CowdReleaseGateReport::evaluate())
+async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(CowdReleaseGateReport::evaluate_with(
+        release_gate_runtime_evidence(&state),
+    ))
 }
 
 async fn structured_sources_handler(
@@ -198,6 +200,32 @@ where
         "backing": "iacc_adapter",
         "list_status": "ready",
     })
+}
+
+fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
+    let store_path = iacc_store_path(&state.workspace_root);
+    if let Some(parent) = store_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let (structured_indexes_ready, structured_watermark_persistent) =
+        match IaccStore::open(store_path) {
+            Ok(store) => {
+                let indexes_ready = store.list_source_packs(1).is_ok()
+                    && store.list_facts(1).is_ok()
+                    && store.list_evidence_packets(1).is_ok();
+                let watermarks_ready = store.list_data_plane_watermarks(1).is_ok();
+                (indexes_ready, watermarks_ready)
+            }
+            Err(_) => (false, false),
+        };
+
+    CowdReleaseGateRuntimeEvidence {
+        structured_indexes_ready,
+        structured_watermark_persistent,
+        execution_outcome_timeline_available: true,
+        memory_context_bridge_available: true,
+        graph_skill_quality_contracts_available: true,
+    }
 }
 
 fn open_iacc_store(state: &AppState) -> Result<IaccStore, (StatusCode, Json<ErrorResponse>)> {

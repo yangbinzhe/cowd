@@ -20,9 +20,41 @@ pub struct CowdReleaseGateReport {
     pub checks: Vec<CowdReleaseGateCheck>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CowdReleaseGateRuntimeEvidence {
+    pub structured_indexes_ready: bool,
+    pub structured_watermark_persistent: bool,
+    pub execution_outcome_timeline_available: bool,
+    pub memory_context_bridge_available: bool,
+    pub graph_skill_quality_contracts_available: bool,
+}
+
+impl CowdReleaseGateRuntimeEvidence {
+    #[must_use]
+    pub fn static_contracts() -> Self {
+        Self {
+            structured_indexes_ready: true,
+            structured_watermark_persistent: true,
+            execution_outcome_timeline_available: true,
+            memory_context_bridge_available: true,
+            graph_skill_quality_contracts_available: true,
+        }
+    }
+}
+
 impl CowdReleaseGateReport {
     #[must_use]
     pub fn evaluate() -> Self {
+        Self::evaluate_static()
+    }
+
+    #[must_use]
+    pub fn evaluate_static() -> Self {
+        Self::evaluate_with(CowdReleaseGateRuntimeEvidence::static_contracts())
+    }
+
+    #[must_use]
+    pub fn evaluate_with(evidence: CowdReleaseGateRuntimeEvidence) -> Self {
         let registry = CowdCapabilityRegistry::core();
         let surface = CowdSurfaceParityContract::from_registry(&registry);
         let iacc = manufacturing_app_descriptor();
@@ -56,13 +88,28 @@ impl CowdReleaseGateReport {
                 "CLI is constrained to minimal core control actions.",
             ),
             check(
+                "structured_data.indexes.ready",
+                evidence.structured_indexes_ready,
+                "Structured data source/fact/evidence indexes are readable.",
+            ),
+            check(
+                "structured_data.watermark.persistent",
+                evidence.structured_watermark_persistent,
+                "Structured ingest watermark persistence is readable.",
+            ),
+            check(
+                "execution_outcome.timeline.available",
+                evidence.execution_outcome_timeline_available,
+                "Execution outcome timeline projection is available.",
+            ),
+            check(
                 "structured_data.memory_context.bridge",
-                true,
+                evidence.memory_context_bridge_available,
                 "Structured data provides summary/context bridge without raw payload copy.",
             ),
             check(
                 "graph_skill_quality.contracts",
-                true,
+                evidence.graph_skill_quality_contracts_available,
                 "Graph, skill dependency and quality gate contracts consume structured refs.",
             ),
         ];
@@ -104,5 +151,24 @@ mod tests {
             .iter()
             .any(|check| check.check_id == "structured_data.core.registered"));
         assert!(report.checks.iter().all(|check| check.status == "pass"));
+    }
+
+    #[test]
+    fn release_gate_fails_when_runtime_evidence_is_missing() {
+        let report = CowdReleaseGateReport::evaluate_with(CowdReleaseGateRuntimeEvidence {
+            structured_indexes_ready: false,
+            structured_watermark_persistent: false,
+            execution_outcome_timeline_available: false,
+            memory_context_bridge_available: false,
+            graph_skill_quality_contracts_available: false,
+        });
+
+        assert_eq!(report.status, "fail");
+        assert!(report.checks.iter().any(|check| check.check_id
+            == "structured_data.indexes.ready"
+            && check.status == "fail"));
+        assert!(report.checks.iter().any(|check| check.check_id
+            == "execution_outcome.timeline.available"
+            && check.status == "fail"));
     }
 }

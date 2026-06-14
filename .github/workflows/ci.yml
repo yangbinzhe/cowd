@@ -46,9 +46,28 @@ jobs:
         working-directory: webui
       - run: scripts/validate_core.sh
 
+  release-gate:
+    runs-on: ubuntu-latest
+    needs: validate-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+        working-directory: webui
+      - run: cargo test -p runtime release_gate
+      - run: cargo test -p cowd-cli cowd_release_gate
+      - run: npm test -- modules.test.js
+        working-directory: webui
+
   validate-scenario:
     runs-on: ubuntu-latest
-    needs: validate-core
+    needs: [validate-core, release-gate]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
