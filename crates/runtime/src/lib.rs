@@ -34,6 +34,7 @@ pub use json::JsonValue;
 pub mod context_profiler;
 pub mod context_runtime;
 pub mod effect;
+pub mod execution_outcome;
 mod lane_events;
 pub mod lifecycle_hooks;
 pub mod lsp_client;
