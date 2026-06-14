@@ -1384,6 +1384,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cowd_iacc_full_loop_passes_release_gate() {
+        let workspace = test_temp_dir("cowd-iacc-full-loop");
+        let config_home = test_temp_dir("cowd-iacc-full-loop-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let source_upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/source-packs/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "full-loop-source",
+                            "session_id": "session-full-loop",
+                            "source_pack": {
+                                "source_pack_id": "pack-full-loop",
+                                "source_name": "mes",
+                                "owner": "manufacturing",
+                                "access_mode": "connector",
+                                "refresh_mode": "incremental",
+                                "entity_mappings": [{
+                                    "source_entity": "line",
+                                    "iacc_entity_type": "production_line",
+                                    "source_key_field": "line_id"
+                                }],
+                                "fact_mappings": [{
+                                    "source_table": "line_output",
+                                    "fact_type": "production_output",
+                                    "metric_key": "units_completed",
+                                    "entity_ref_fields": ["line_id"],
+                                    "measure_fields": ["units"],
+                                    "dedup_key": "line_id:shift",
+                                    "delta_signature": "units"
+                                }],
+                                "reconciliation_rules": ["dedup_key_unique"],
+                                "quality_rules": ["units_non_negative"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source_upsert.status(), StatusCode::OK);
+
+        let fact_ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "full-loop-fact",
+                            "session_id": "session-full-loop",
+                            "facts": [{
+                                "fact_id": "fact-full-loop",
+                                "snapshot_id": "snapshot-full-loop",
+                                "fact_type": "production_output",
+                                "entity_refs": ["production_line:l1"],
+                                "metric_key": "units_completed",
+                                "dimensions": {"shift": "A"},
+                                "measures": {"units": 128},
+                                "source_ref": "pack-full-loop",
+                                "confidence": 0.96
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fact_ingest.status(), StatusCode::OK);
+        let body = to_bytes(fact_ingest.into_body(), usize::MAX).await.unwrap();
+        let fact_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let attention_id = fact_json["attention"][0]["attention_id"].as_str().unwrap();
+
+        let evidence_build = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "attention_id": attention_id,
+                            "problem_statement": "Production output requires full-loop evidence"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence_build.status(), StatusCode::OK);
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cowd/structured/ingest-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_ref": "pack-full-loop",
+                            "fact_type": "production_output",
+                            "partition_ref": "shift-A",
+                            "high_watermark": "2026-06-14T00:00:00Z",
+                            "estimated_rows": 128,
+                            "metric_ids": ["units_completed"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+
+        for uri in [
+            "/api/cowd/structured/sources",
+            "/api/cowd/structured/facts",
+            "/api/cowd/structured/evidence",
+            "/api/cowd/structured/watermarks",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["list_status"], "ready", "{uri}");
+            assert!(json["count"].as_u64().unwrap_or_default() >= 1, "{uri}");
+        }
+
+        let gate = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/release-gate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate.status(), StatusCode::OK);
+        let body = to_bytes(gate.into_body(), usize::MAX).await.unwrap();
+        let gate_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(gate_json["status"], "pass");
+        assert!(gate_json["checks"].as_array().unwrap().iter().any(|check| {
+            check["check_id"] == "structured_data.indexes.ready" && check["status"] == "pass"
+        }));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("iacc-foundation");
         let config_home = test_temp_dir("iacc-config");
