@@ -87,6 +87,7 @@ pub mod stale_base;
 pub mod stale_branch;
 pub mod structured_data;
 pub mod summary_compression;
+pub mod surface_contract;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;

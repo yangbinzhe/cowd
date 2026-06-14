@@ -244,6 +244,7 @@ window.Api = (()=>{
       const query=surface?'?surface='+encodeURIComponent(surface):'';
       return req('GET','/api/cowd/projection'+query);
     },
+    async cowdSurfaces(){return req('GET','/api/cowd/surfaces')},
     async structuredSources(){return req('GET','/api/cowd/structured/sources')},
     async structuredSource(id){return req('GET','/api/cowd/structured/sources/'+encodeURIComponent(id))},
     async structuredIngestPlan(body){return req('POST','/api/cowd/structured/ingest-plan',body||{})},

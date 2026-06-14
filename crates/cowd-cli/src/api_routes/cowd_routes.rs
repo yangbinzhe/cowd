@@ -13,6 +13,7 @@ use runtime::iacc::{
 };
 use runtime::projection::CowdProjection;
 use runtime::structured_data::{CowdIngestPlan, CowdStructuredSource};
+use runtime::surface_contract::CowdSurfaceParityContract;
 use serde::Deserialize;
 
 use super::{api_error, AppState, ErrorResponse};
@@ -21,6 +22,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/cowd/capabilities", get(capabilities_handler))
         .route("/api/cowd/projection", get(projection_handler))
+        .route("/api/cowd/surfaces", get(surfaces_handler))
         .route(
             "/api/cowd/structured/sources",
             get(structured_sources_handler),
@@ -60,6 +62,11 @@ async fn projection_handler(
     let surface = parse_surface(query.surface.as_deref())?;
     let registry = CowdCapabilityRegistry::core();
     Ok(Json(CowdProjection::for_surface(&registry, surface)))
+}
+
+async fn surfaces_handler() -> impl IntoResponse {
+    let registry = CowdCapabilityRegistry::core();
+    Json(CowdSurfaceParityContract::from_registry(&registry))
 }
 
 async fn structured_sources_handler() -> impl IntoResponse {

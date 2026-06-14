@@ -277,20 +277,25 @@ describe('API module', () => {
     const mockF = vi.fn((path) =>
       Promise.resolve({
         ok: true,
-        json: () => Promise.resolve(String(path).includes('/projection')
-          ? { surface: 'webui', capability_count: 1, capabilities: [] }
-          : { capabilities: [{ id: 'cowd.structured_data.core' }] })
+        json: () => Promise.resolve(String(path).includes('/surfaces')
+          ? { webui_tui_full_parity: true, cli_is_minimal_control: true }
+          : String(path).includes('/projection')
+            ? { surface: 'webui', capability_count: 1, capabilities: [] }
+            : { capabilities: [{ id: 'cowd.structured_data.core' }] })
       })
     );
     vi.stubGlobal('fetch', mockF);
 
     const capabilities = await window.Api.cowdCapabilities();
     const projection = await window.Api.cowdProjection('webui');
+    const surfaces = await window.Api.cowdSurfaces();
 
     expect(String(mockF.mock.calls[0][0])).toBe('/api/cowd/capabilities');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/cowd/projection?surface=webui');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/cowd/surfaces');
     expect(capabilities.capabilities[0].id).toBe('cowd.structured_data.core');
     expect(projection.surface).toBe('webui');
+    expect(surfaces.webui_tui_full_parity).toBe(true);
   });
 
   it('structured data APIs use cowd kernel routes', async () => {

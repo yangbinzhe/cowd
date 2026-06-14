@@ -1180,6 +1180,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cowd_surfaces_route_declares_webui_tui_parity_and_cli_minimality() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/surfaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["webui_tui_full_parity"], true);
+        assert_eq!(json["cli_is_minimal_control"], true);
+        assert_eq!(json["webui"]["role"], "enhanced_management");
+        assert_eq!(json["tui"]["role"], "console_full_capability");
+        assert_eq!(json["cli"]["role"], "minimal_core_control");
+    }
+
+    #[tokio::test]
     async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("iacc-foundation");
         let config_home = test_temp_dir("iacc-config");
