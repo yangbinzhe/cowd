@@ -50,6 +50,7 @@ mod audit_routes;
 mod channel_routes;
 pub(crate) mod connector_routes;
 mod context_routes;
+mod cowd_routes;
 mod cross_plane_routes;
 mod iacc_routes;
 pub(crate) mod memory_routes;
@@ -163,6 +164,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(channel_routes::router())
         .merge(connector_routes::router())
         .merge(context_routes::router())
+        .merge(cowd_routes::router())
         .merge(cross_plane_routes::router())
         .merge(iacc_routes::router())
         .merge(memory_routes::router())
@@ -1020,6 +1022,76 @@ mod tests {
         assert_eq!(
             json["socket_control"],
             "local low-latency daemon control plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn cowd_capabilities_route_exposes_core_registry() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let capabilities = json["capabilities"].as_array().unwrap();
+
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability["id"] == "cowd.structured_data.core"));
+        assert!(capabilities.iter().any(|capability| capability["id"]
+            == "iacc.manufacturing.application"
+            && capability["layer"] == "application"));
+    }
+
+    #[tokio::test]
+    async fn cowd_projection_route_separates_cli_from_webui_surface() {
+        let app = api_router(test_state());
+        let webui = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/projection?surface=webui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cli = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/projection?surface=cli")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(webui.status(), StatusCode::OK);
+        assert_eq!(cli.status(), StatusCode::OK);
+        let webui_body = to_bytes(webui.into_body(), usize::MAX).await.unwrap();
+        let cli_body = to_bytes(cli.into_body(), usize::MAX).await.unwrap();
+        let webui_json: serde_json::Value = serde_json::from_slice(&webui_body).unwrap();
+        let cli_json: serde_json::Value = serde_json::from_slice(&cli_body).unwrap();
+
+        assert_eq!(webui_json["surface"], "webui");
+        assert_eq!(cli_json["surface"], "cli");
+        assert_eq!(webui_json["capability_count"], cli_json["capability_count"]);
+        assert!(webui_json["capabilities"][0]["management_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "bulk_actions"));
+        assert_eq!(
+            cli_json["capabilities"][0]["management_fields"],
+            serde_json::json!(["json_output", "core_controls"])
         );
     }
 

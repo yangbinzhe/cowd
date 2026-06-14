@@ -273,6 +273,26 @@ describe('API module', () => {
     expect(plane.status).toBe('healthy');
   });
 
+  it('cowd capability APIs use unified projection endpoints', async () => {
+    const mockF = vi.fn((path) =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(String(path).includes('/projection')
+          ? { surface: 'webui', capability_count: 1, capabilities: [] }
+          : { capabilities: [{ id: 'cowd.structured_data.core' }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const capabilities = await window.Api.cowdCapabilities();
+    const projection = await window.Api.cowdProjection('webui');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/cowd/capabilities');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/cowd/projection?surface=webui');
+    expect(capabilities.capabilities[0].id).toBe('cowd.structured_data.core');
+    expect(projection.surface).toBe('webui');
+  });
+
   it('runtimeReloadProviders posts provider reload request', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({

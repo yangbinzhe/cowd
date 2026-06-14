@@ -237,6 +237,13 @@ window.Api = (()=>{
     async runtimeControlPlane(){
       return req('GET','/api/runtime/control-plane');
     },
+    async cowdCapabilities(){
+      return req('GET','/api/cowd/capabilities');
+    },
+    async cowdProjection(surface){
+      const query=surface?'?surface='+encodeURIComponent(surface):'';
+      return req('GET','/api/cowd/projection'+query);
+    },
     async runtimeReloadProviders(){
       return req('POST','/api/runtime/providers/reload');
     },

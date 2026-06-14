@@ -46,6 +46,21 @@ impl DaemonProjectionClient {
         self.get_json("/api/runtime/control-plane").await
     }
 
+    pub async fn cowd_capabilities(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/capabilities").await
+    }
+
+    pub async fn cowd_projection(
+        &self,
+        surface: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json(&format!(
+            "/api/cowd/projection?surface={}",
+            url_encode(surface)
+        ))
+        .await
+    }
+
     pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, ProjectionError> {
         self.get_json("/api/runtime/session-leases").await
     }
@@ -384,6 +399,31 @@ mod tests {
                 .expect("client");
         let json = client.runtime_control_plane().await.expect("json");
         assert_eq!(json["ok"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn cowd_projection_gets_surface_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept projection");
+            let mut buf = vec![0; 2048];
+            let n = socket.read(&mut buf).await.expect("read projection");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET /api/cowd/projection?surface=tui HTTP/1.1"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{\"surface\":\"tui\",\"capability_count\":1,\"capabilities\":[]}",
+                )
+                .await
+                .expect("write projection");
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let json = client.cowd_projection("tui").await.expect("json");
+        assert_eq!(json["surface"], "tui");
+        assert_eq!(json["capability_count"], 1);
         server.await.expect("server task");
     }
 
