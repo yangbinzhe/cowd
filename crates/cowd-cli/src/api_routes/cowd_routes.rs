@@ -8,14 +8,14 @@ use axum::{
     Json, Router,
 };
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
-use runtime::iacc::{
-    IaccDataPlane, IaccDataPlaneIngestPlanInput, IaccSqliteDataPlane, IaccStore, IaccStoreError,
-};
+use runtime::iacc::{IaccDataPlaneIngestPlanInput, IaccStore, IaccStoreError};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::CowdReleaseGateReport;
-use runtime::structured_data::{CowdIngestPlan, CowdStructuredSource};
+use runtime::structured_data::{
+    CowdIngestPlan, CowdStructuredEvidence, CowdStructuredFact, CowdStructuredSource, CowdWatermark,
+};
 use runtime::surface_contract::CowdSurfaceParityContract;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -75,8 +75,21 @@ async fn release_gate_handler() -> impl IntoResponse {
     Json(CowdReleaseGateReport::evaluate())
 }
 
-async fn structured_sources_handler() -> impl IntoResponse {
-    Json(empty_structured_collection("cowd.structured.sources"))
+async fn structured_sources_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)?;
+    let items = store
+        .list_source_packs(100)
+        .map_err(store_error)?
+        .iter()
+        .map(CowdStructuredSource::from)
+        .collect::<Vec<_>>();
+    Ok(Json(structured_collection(
+        "cowd.structured.sources",
+        items,
+        100,
+    )))
 }
 
 async fn structured_source_get_handler(
@@ -94,23 +107,63 @@ async fn structured_source_get_handler(
 }
 
 async fn structured_ingest_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Json(input): Json<IaccDataPlaneIngestPlanInput>,
-) -> impl IntoResponse {
-    let data_plane = IaccSqliteDataPlane::new(0);
-    let plan = data_plane.plan_ingest(input);
-    Json(CowdIngestPlan::from(&plan))
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)?;
+    let plan = store.plan_data_plane_ingest(input).map_err(store_error)?;
+    Ok(Json(CowdIngestPlan::from(&plan)))
 }
 
-async fn structured_facts_handler() -> impl IntoResponse {
-    Json(empty_structured_collection("cowd.structured.facts"))
+async fn structured_facts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)?;
+    let items = store
+        .list_facts(100)
+        .map_err(store_error)?
+        .iter()
+        .map(CowdStructuredFact::from)
+        .collect::<Vec<_>>();
+    Ok(Json(structured_collection(
+        "cowd.structured.facts",
+        items,
+        100,
+    )))
 }
 
-async fn structured_evidence_handler() -> impl IntoResponse {
-    Json(empty_structured_collection("cowd.structured.evidence"))
+async fn structured_evidence_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)?;
+    let items = store
+        .list_evidence_packets(100)
+        .map_err(store_error)?
+        .iter()
+        .map(CowdStructuredEvidence::from)
+        .collect::<Vec<_>>();
+    Ok(Json(structured_collection(
+        "cowd.structured.evidence",
+        items,
+        100,
+    )))
 }
 
-async fn structured_watermarks_handler() -> impl IntoResponse {
-    Json(empty_structured_collection("cowd.structured.watermarks"))
+async fn structured_watermarks_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)?;
+    let items = store
+        .list_data_plane_watermarks(100)
+        .map_err(store_error)?
+        .iter()
+        .map(CowdWatermark::from)
+        .collect::<Vec<_>>();
+    Ok(Json(structured_collection(
+        "cowd.structured.watermarks",
+        items,
+        100,
+    )))
 }
 
 fn parse_surface(surface: Option<&str>) -> Result<CowdSurface, (StatusCode, Json<ErrorResponse>)> {
@@ -130,14 +183,20 @@ fn parse_surface(surface: Option<&str>) -> Result<CowdSurface, (StatusCode, Json
     }
 }
 
-fn empty_structured_collection(kind: &'static str) -> serde_json::Value {
+fn structured_collection<T>(kind: &'static str, items: Vec<T>, limit: usize) -> serde_json::Value
+where
+    T: Serialize,
+{
+    let count = items.len();
     serde_json::json!({
         "kind": kind,
         "contract": "cowd.structured_data.v1",
-        "items": [],
+        "items": items,
+        "count": count,
+        "limit": limit,
         "source": "cowd.structured_data.core",
         "backing": "iacc_adapter",
-        "list_status": "pending_store_index",
+        "list_status": "ready",
     })
 }
 

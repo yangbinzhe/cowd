@@ -1124,7 +1124,110 @@ mod tests {
 
     #[tokio::test]
     async fn cowd_structured_routes_expose_contract_and_ingest_plan_adapter() {
-        let app = api_router(test_state());
+        let workspace = test_temp_dir("cowd-structured-index");
+        let config_home = test_temp_dir("cowd-structured-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let source_upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/source-packs/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "cowd-structured-source",
+                            "session_id": "session-cowd-structured",
+                            "source_pack": {
+                                "source_pack_id": "pack-1",
+                                "source_name": "erp",
+                                "owner": "operations",
+                                "access_mode": "connector",
+                                "refresh_mode": "incremental",
+                                "entity_mappings": [{
+                                    "source_entity": "plant",
+                                    "iacc_entity_type": "factory",
+                                    "source_key_field": "plant_id"
+                                }],
+                                "fact_mappings": [{
+                                    "source_table": "inventory",
+                                    "fact_type": "inventory_balance",
+                                    "metric_key": "stock_on_hand",
+                                    "entity_ref_fields": ["plant_id"],
+                                    "measure_fields": ["qty"],
+                                    "dedup_key": "plant_id:sku:week",
+                                    "delta_signature": "qty"
+                                }],
+                                "reconciliation_rules": ["dedup_key_unique"],
+                                "quality_rules": ["qty_non_negative"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source_upsert.status(), StatusCode::OK);
+
+        let fact_ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "cowd-structured-fact",
+                            "session_id": "session-cowd-structured",
+                            "facts": [{
+                                "fact_id": "fact-stock-1",
+                                "snapshot_id": "snapshot-week-30",
+                                "fact_type": "inventory_balance",
+                                "entity_refs": ["factory:sz"],
+                                "metric_key": "stock_on_hand",
+                                "dimensions": {"week": "2026-W30"},
+                                "measures": {"qty": 42},
+                                "source_ref": "pack-1",
+                                "confidence": 0.97
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fact_ingest.status(), StatusCode::OK);
+        let body = to_bytes(fact_ingest.into_body(), usize::MAX).await.unwrap();
+        let fact_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let attention_id = fact_json["attention"][0]["attention_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let evidence_build = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "attention_id": attention_id,
+                            "problem_statement": "Inventory balance requires structured evidence"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence_build.status(), StatusCode::OK);
+
         let sources = app
             .clone()
             .oneshot(
@@ -1135,7 +1238,28 @@ mod tests {
             )
             .await
             .unwrap();
+        let facts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/structured/facts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/structured/evidence")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let ingest = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1157,16 +1281,43 @@ mod tests {
             )
             .await
             .unwrap();
+        let watermarks = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/structured/watermarks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(sources.status(), StatusCode::OK);
+        assert_eq!(facts.status(), StatusCode::OK);
+        assert_eq!(evidence.status(), StatusCode::OK);
         assert_eq!(ingest.status(), StatusCode::OK);
+        assert_eq!(watermarks.status(), StatusCode::OK);
         let sources_body = to_bytes(sources.into_body(), usize::MAX).await.unwrap();
+        let facts_body = to_bytes(facts.into_body(), usize::MAX).await.unwrap();
+        let evidence_body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
         let ingest_body = to_bytes(ingest.into_body(), usize::MAX).await.unwrap();
+        let watermarks_body = to_bytes(watermarks.into_body(), usize::MAX).await.unwrap();
         let sources_json: serde_json::Value = serde_json::from_slice(&sources_body).unwrap();
+        let facts_json: serde_json::Value = serde_json::from_slice(&facts_body).unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
         let ingest_json: serde_json::Value = serde_json::from_slice(&ingest_body).unwrap();
+        let watermarks_json: serde_json::Value = serde_json::from_slice(&watermarks_body).unwrap();
 
         assert_eq!(sources_json["contract"], "cowd.structured_data.v1");
-        assert_eq!(sources_json["list_status"], "pending_store_index");
+        assert_eq!(sources_json["list_status"], "ready");
+        assert_eq!(sources_json["count"], 1);
+        assert_eq!(sources_json["items"][0]["source_id"], "pack-1");
+        assert_eq!(facts_json["list_status"], "ready");
+        assert_eq!(facts_json["items"][0]["fact_id"], "fact-stock-1");
+        assert_eq!(evidence_json["list_status"], "ready");
+        assert_eq!(
+            evidence_json["items"][0]["problem_statement"],
+            "Inventory balance requires structured evidence"
+        );
         assert_eq!(ingest_json["source_ref"], "pack-1");
         assert_eq!(ingest_json["fact_type"], "inventory_balance");
         assert_eq!(
@@ -1177,6 +1328,9 @@ mod tests {
             ingest_json["watermark"]["high_watermark"],
             "2026-06-14T00:00:00Z"
         );
+        assert_eq!(watermarks_json["list_status"], "ready");
+        assert_eq!(watermarks_json["items"][0]["source_ref"], "pack-1");
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

@@ -674,6 +674,14 @@ impl IaccStore {
         find_source_pack(&connection, source_pack_id)
     }
 
+    pub fn list_source_packs(&self, limit: usize) -> Result<Vec<IaccSourcePack>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_source_packs(&connection, limit)
+    }
+
     pub fn validate_source_pack(
         &self,
         source_pack_id: &str,
@@ -741,6 +749,14 @@ impl IaccStore {
         )?;
         let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn list_facts(&self, limit: usize) -> Result<Vec<IaccFact>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_facts(&connection, limit)
     }
 
     pub fn recompute_metrics(&self) -> Result<IaccMetricRecomputeResult, IaccStoreError> {
@@ -957,6 +973,17 @@ impl IaccStore {
         find_evidence_packet(&connection, packet_id)
     }
 
+    pub fn list_evidence_packets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IaccEvidencePacket>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_evidence_packets(&connection, limit)
+    }
+
     pub fn evaluate_evidence_quality(
         &self,
         packet_id: &str,
@@ -981,6 +1008,17 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_quality_gate(&connection, gate_id)
+    }
+
+    pub fn list_data_plane_watermarks(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IaccDataPlaneWatermark>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_data_plane_watermarks(&connection, limit)
     }
 
     pub fn create_incident(&self, incident: &IaccIncident) -> Result<IaccIncident, IaccStoreError> {
@@ -2433,6 +2471,20 @@ fn find_evidence_packet(
         .transpose()
 }
 
+fn list_evidence_packets(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccEvidencePacket>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT packet_json
+          FROM iacc_evidence_packet
+          ORDER BY created_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 fn insert_quality_gate(
     connection: &Connection,
     gate: &IaccQualityGateDecision,
@@ -2590,6 +2642,69 @@ fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, IaccStore
             period,
             value,
             confidence,
+        });
+    }
+    Ok(facts)
+}
+
+fn list_facts(connection: &Connection, limit: usize) -> Result<Vec<IaccFact>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
+            dimensions_json, measures_json, event_time, valid_from, valid_to,
+            source_ref, confidence, raw_hash
+          FROM iacc_fact
+          ORDER BY event_time DESC, fact_id ASC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, f32>(11)?,
+            row.get::<_, String>(12)?,
+        ))
+    })?;
+
+    let mut facts = Vec::new();
+    for row in rows {
+        let (
+            fact_id,
+            snapshot_id,
+            fact_type,
+            entity_refs_json,
+            metric_key,
+            dimensions_json,
+            measures_json,
+            event_time,
+            valid_from,
+            valid_to,
+            source_ref,
+            confidence,
+            raw_hash,
+        ) = row?;
+        facts.push(IaccFact {
+            fact_id,
+            snapshot_id,
+            fact_type,
+            entity_refs: serde_json::from_str(&entity_refs_json)?,
+            metric_key,
+            dimensions: serde_json::from_str(&dimensions_json)?,
+            measures: serde_json::from_str(&measures_json)?,
+            event_time: parse_rfc3339_utc(&event_time)?,
+            valid_from: parse_optional_rfc3339_utc(valid_from)?,
+            valid_to: parse_optional_rfc3339_utc(valid_to)?,
+            source_ref,
+            confidence,
+            raw_hash,
         });
     }
     Ok(facts)
@@ -3541,6 +3656,20 @@ fn find_source_pack(
         .transpose()
 }
 
+fn list_source_packs(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccSourcePack>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT source_pack_json
+          FROM iacc_source_pack
+          ORDER BY updated_at DESC, source_pack_id ASC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 fn source_pack_delta_plan_for(
     connection: &Connection,
     source_pack: &IaccSourcePack,
@@ -3630,6 +3759,37 @@ fn upsert_data_plane_watermark(
         ],
     )?;
     Ok(())
+}
+
+fn list_data_plane_watermarks(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccDataPlaneWatermark>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT watermark_json
+          FROM iacc_data_plane_watermark
+          ORDER BY updated_at DESC, source_ref ASC, fact_type ASC, partition_ref ASC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, IaccStoreError> {
+    Ok(chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|error| {
+            IaccStoreError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?
+        .with_timezone(&Utc))
+}
+
+fn parse_optional_rfc3339_utc(
+    value: Option<String>,
+) -> Result<Option<chrono::DateTime<Utc>>, IaccStoreError> {
+    value.as_deref().map(parse_rfc3339_utc).transpose()
 }
 
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
