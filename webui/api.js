@@ -452,6 +452,7 @@ window.Api = (()=>{
     async executeConnectorService(service,body){return req('POST','/api/connectors/services/'+encodeURIComponent(service)+'/execute',body||{})},
 
     // ── IACC cockpit ──
+    async iaccApp(){return req('GET','/api/iacc/app')},
     async iaccHealth(){return req('GET','/api/iacc/health')},
     async iaccCockpitReport(reportId){return req('GET','/api/iacc/cockpit/reports/'+encodeURIComponent(reportId))},
     async iaccCockpitReportDeliveryState(reportId){return req('GET','/api/iacc/cockpit/reports/'+encodeURIComponent(reportId)+'/delivery-state')},

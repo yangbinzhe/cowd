@@ -1096,6 +1096,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iacc_app_route_projects_manufacturing_as_application_descriptor() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["app_id"], "iacc.manufacturing");
+        assert_eq!(json["layer"], "application");
+        assert!(json["cowd_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "cowd.structured_data.core"));
+        assert_eq!(json["domains"][0]["domain_id"], "server_manufacturing");
+    }
+
+    #[tokio::test]
     async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("iacc-foundation");
         let config_home = test_temp_dir("iacc-config");

@@ -34,6 +34,7 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/iacc/app", get(iacc_app_handler))
         .route("/api/iacc/health", get(iacc_health_handler))
         .route(
             "/api/iacc/production/governance",
@@ -282,6 +283,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/executions/:id/feedback",
             post(iacc_execution_feedback_handler),
         )
+}
+
+async fn iacc_app_handler() -> impl IntoResponse {
+    Json(runtime::iacc::manufacturing_app_descriptor())
 }
 
 #[derive(Debug, Deserialize)]

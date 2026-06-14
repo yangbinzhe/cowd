@@ -655,6 +655,9 @@ describe('API module', () => {
 
   it('IACC cockpit report endpoints use the delivery visibility route contract', async () => {
     const mockF = vi.fn((path, opts) => {
+      if (path === '/api/iacc/app') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ app_id: 'iacc.manufacturing', layer: 'application' }) });
+      }
       if (path === '/api/iacc/health') {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.health', status: 'ready' }) });
       }
@@ -674,18 +677,20 @@ describe('API module', () => {
     });
     vi.stubGlobal('fetch', mockF);
 
+    await window.Api.iaccApp();
     await window.Api.iaccHealth();
     await window.Api.iaccCockpitReport('report-1');
     await window.Api.iaccCockpitReportDeliveryState('report-1');
     await window.Api.retryIaccCockpitReportDelivery('report-1', { force: true });
     await window.Api.runIaccCockpitReportSchedule({ cadence: 'daily' });
 
-    expect(String(mockF.mock.calls[0][0])).toBe('/api/iacc/health');
-    expect(String(mockF.mock.calls[1][0])).toBe('/api/iacc/cockpit/reports/report-1');
-    expect(String(mockF.mock.calls[2][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery-state');
-    expect(String(mockF.mock.calls[3][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery/retry');
-    expect(mockF.mock.calls[3][1].method).toBe('POST');
-    expect(String(mockF.mock.calls[4][0])).toBe('/api/iacc/cockpit/reports/schedules/run');
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/iacc/app');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/iacc/health');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/iacc/cockpit/reports/report-1');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery-state');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery/retry');
+    expect(mockF.mock.calls[4][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/iacc/cockpit/reports/schedules/run');
   });
 
   it('connector runtime endpoints use the management route contract', async () => {

@@ -6,6 +6,7 @@
 //! memory runtime.
 
 mod analysis;
+mod app;
 mod attention;
 mod change;
 mod cockpit;
@@ -32,6 +33,10 @@ mod store;
 
 pub use analysis::{
     IaccAttributionCandidate, IaccImpactPath, IaccOperationalAnalysis, IaccRecommendedAction,
+};
+pub use app::{
+    manufacturing_app_descriptor, IaccApplicationDescriptor, IaccApplicationDomain,
+    IaccApplicationSurface, IaccApplicationSurfaceKind,
 };
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
