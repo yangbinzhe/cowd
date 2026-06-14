@@ -6,6 +6,7 @@ use crate::iacc::{
     IaccDataPlaneIngestPlan, IaccDataPlaneWatermark, IaccEvidencePacket, IaccFact,
     IaccSourceDeltaPlan, IaccSourceEntityMapping, IaccSourceFactMapping, IaccSourcePack,
 };
+use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,6 +278,31 @@ impl From<&IaccFact> for CowdStructuredFact {
     }
 }
 
+impl CowdStructuredFact {
+    #[must_use]
+    pub fn stable_ref(&self) -> String {
+        format!("structured-fact:{}", self.fact_id)
+    }
+
+    #[must_use]
+    pub fn memory_summary(&self) -> CowdStructuredMemorySummary {
+        CowdStructuredMemorySummary {
+            reference: self.stable_ref(),
+            title: format!("{} fact {}", self.fact_type, self.fact_id),
+            summary: format!(
+                "Structured fact {} of type {} references {} entities and metric {}.",
+                self.fact_id,
+                self.fact_type,
+                self.entity_refs.len(),
+                self.metric_key.as_deref().unwrap_or("none")
+            ),
+            source_ref: self.source_ref.clone(),
+            confidence: self.confidence,
+            raw_hash: self.raw_hash.clone(),
+        }
+    }
+}
+
 impl From<&IaccEvidencePacket> for CowdStructuredEvidence {
     fn from(packet: &IaccEvidencePacket) -> Self {
         Self {
@@ -305,6 +331,63 @@ impl From<&IaccEvidencePacket> for CowdStructuredEvidence {
             created_at: packet.created_at,
         }
     }
+}
+
+impl CowdStructuredEvidence {
+    #[must_use]
+    pub fn stable_ref(&self) -> String {
+        format!("structured-evidence:{}", self.evidence_id)
+    }
+
+    #[must_use]
+    pub fn memory_summary(&self) -> CowdStructuredMemorySummary {
+        CowdStructuredMemorySummary {
+            reference: self.stable_ref(),
+            title: format!("Evidence {}", self.evidence_id),
+            summary: format!(
+                "{}. metric_evidence={}, change_evidence={}, source_refs={}, confidence={:.2}",
+                self.problem_statement,
+                self.metric_evidence.len(),
+                self.change_evidence.len(),
+                self.source_refs.len(),
+                self.confidence
+            ),
+            source_ref: None,
+            confidence: self.confidence,
+            raw_hash: self.evidence_id.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_context_item(&self) -> ContextItem {
+        let summary = self.memory_summary();
+        let mut item = ContextItem::new(
+            summary.reference,
+            ContextSourceKind::Task,
+            ContextRole::Evidence,
+            summary.summary,
+        );
+        item.authority = ContextAuthority::Derived;
+        item.visibility = ContextVisibility::Shared;
+        item.score = self.confidence;
+        item.evidence = self
+            .source_refs
+            .iter()
+            .map(|source| source.reference.clone())
+            .collect();
+        item
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CowdStructuredMemorySummary {
+    pub reference: String,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    pub confidence: f32,
+    pub raw_hash: String,
 }
 
 impl From<&IaccDataPlaneWatermark> for CowdWatermark {
@@ -511,5 +594,58 @@ mod tests {
         assert_eq!(evidence.source_refs[0].reference, "fact-1");
         assert_eq!(evidence.metric_evidence.len(), 1);
         assert_eq!(evidence.confidence, 0.7);
+    }
+
+    #[test]
+    fn structured_fact_memory_summary_keeps_reference_without_raw_payload_copy() {
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-1".to_string()),
+            snapshot_id: Some("snapshot-1".to_string()),
+            fact_type: "inventory_balance".to_string(),
+            entity_refs: vec!["material:123".to_string(), "site:cn-1".to_string()],
+            metric_key: Some("stock_on_hand".to_string()),
+            dimensions: serde_json::json!({"large_dimension": "x".repeat(512)}),
+            measures: serde_json::json!({"quantity": 12}),
+            event_time: Some(DateTime::<Utc>::UNIX_EPOCH),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("pack-1".to_string()),
+            confidence: Some(0.9),
+            raw_hash: Some("sha256:fact".to_string()),
+        });
+
+        let summary = CowdStructuredFact::from(&fact).memory_summary();
+
+        assert_eq!(summary.reference, "structured-fact:fact-1");
+        assert_eq!(summary.source_ref.as_deref(), Some("pack-1"));
+        assert_eq!(summary.raw_hash, "sha256:fact");
+        assert!(!summary.summary.contains("large_dimension"));
+        assert!(summary.summary.contains("references 2 entities"));
+    }
+
+    #[test]
+    fn structured_evidence_context_item_uses_summary_and_source_refs() {
+        let mut packet = IaccEvidencePacket::new("supplier delivery risk changed");
+        packet.packet_id = "packet-1".to_string();
+        packet.source_refs.push(IaccEvidenceSourceRef {
+            kind: "fact".to_string(),
+            reference: "fact-1".to_string(),
+            summary: "inventory fact".to_string(),
+        });
+        packet
+            .metric_evidence
+            .push(serde_json::json!({"metric": "order_delivery_risk"}));
+        packet.confidence = 0.75;
+
+        let evidence = CowdStructuredEvidence::from(&packet);
+        let item = evidence.to_context_item();
+
+        assert_eq!(item.id, "structured-evidence:packet-1");
+        assert_eq!(item.role, ContextRole::Evidence);
+        assert_eq!(item.authority, ContextAuthority::Derived);
+        assert_eq!(item.visibility, ContextVisibility::Shared);
+        assert_eq!(item.score, 0.75);
+        assert_eq!(item.evidence, vec!["fact-1"]);
+        assert!(item.content.contains("metric_evidence=1"));
     }
 }
