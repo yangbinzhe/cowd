@@ -16,10 +16,11 @@ fn help_emits_json_when_requested() {
 
     let parsed = assert_json_command(&root, &["--output-format", "json", "help"]);
     assert_eq!(parsed["kind"], "help");
-    assert!(parsed["message"]
-        .as_str()
-        .expect("help text")
-        .contains("Usage:"));
+    let message = parsed["message"].as_str().expect("help text");
+    assert!(message.contains("Core commands:"));
+    assert!(message.contains("cowd gateway start|stop|status|doctor"));
+    assert!(message.contains("cowd skills list|show|validate"));
+    assert!(message.contains("Advanced compatibility:"));
 }
 
 #[test]

@@ -600,6 +600,7 @@ fn run_gateway_action(
             }
             Ok(())
         }
+        GatewayAction::Doctor => doctor::run_doctor(output_format),
         GatewayAction::Run => {
             if let Ok(Some(status)) = server::get_server_status() {
                 tracing::info!(pid = status.pid, address = %status.address, "gateway run: existing gateway is already running");
@@ -791,6 +792,7 @@ pub(crate) enum GatewayAction {
     Start,
     Stop,
     Status,
+    Doctor,
     Run,
     Restart,
     WechatQr,
@@ -802,6 +804,7 @@ impl GatewayAction {
             "start" => Some(Self::Start),
             "stop" => Some(Self::Stop),
             "status" => Some(Self::Status),
+            "doctor" => Some(Self::Doctor),
             "run" => Some(Self::Run),
             "restart" => Some(Self::Restart),
             "wechat-qr" => Some(Self::WechatQr),
@@ -1702,11 +1705,11 @@ fn parse_gateway_args(
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let action_str = args.first().ok_or_else(|| {
-        "gateway requires a subcommand: start, stop, status, run, restart, or wechat-qr".to_string()
+        "gateway requires a subcommand: start, stop, status, or doctor. Advanced: run, restart, wechat-qr".to_string()
     })?;
     let action = GatewayAction::from_str(action_str).ok_or_else(|| {
         format!(
-            "unknown gateway subcommand: {action_str}. Expected start, stop, status, run, restart, or wechat-qr"
+            "unknown gateway subcommand: {action_str}. Expected core start, stop, status, doctor. Advanced compatibility: run, restart, wechat-qr"
         )
     })?;
     Ok(CliAction::Gateway {
@@ -11472,17 +11475,56 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "cowd v{VERSION}")?;
     writeln!(out)?;
-    writeln!(out, "Usage:")?;
-    writeln!(
-        out,
-        "  cowd [--model MODEL] [--session SESSION] [--allowedTools TOOL[,TOOL...]]"
-    )?;
-    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(out, "Core commands:")?;
+    writeln!(out, "  cowd")?;
+    writeln!(out, "      Start the interactive TUI")?;
+    writeln!(out, "  cowd --tui")?;
+    writeln!(out, "      Explicitly start the interactive TUI")?;
     writeln!(
         out,
         "  cowd [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
+    writeln!(out, "  cowd gateway start|stop|status|doctor")?;
+    writeln!(out, "      Control the daemon and browser WebUI gateway")?;
+    writeln!(out, "  cowd status")?;
+    writeln!(out, "      Show the current local workspace snapshot")?;
+    writeln!(out, "  cowd doctor")?;
+    writeln!(
+        out,
+        "      Diagnose local auth, config, workspace, and sandbox health"
+    )?;
+    writeln!(out, "  cowd setup")?;
+    writeln!(
+        out,
+        "      Check local setup, channels, gateway/WebUI, and next action"
+    )?;
+    writeln!(
+        out,
+        "  cowd export [PATH] [--session SESSION] [--output PATH]"
+    )?;
+    writeln!(out, "      Dump the latest or named session as markdown")?;
+    writeln!(out, "  cowd import-session PATH")?;
+    writeln!(out, "      Import a local legacy .jsonl/.json session file")?;
+    writeln!(out, "  cowd skills list|show|validate")?;
+    writeln!(
+        out,
+        "      Basic skill inventory and validation; use WebUI/TUI for management"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "WebUI access:")?;
+    writeln!(out, "  cowd gateway start")?;
+    writeln!(
+        out,
+        "      Start the gateway daemon that serves the browser console"
+    )?;
+    writeln!(out, "  cowd gateway status")?;
+    writeln!(
+        out,
+        "      Print the local WebUI/API address when the gateway is running"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Advanced compatibility:")?;
     writeln!(
         out,
         "  cowd [--model MODEL] [--output-format text|json] TEXT"
@@ -11494,53 +11536,31 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "      Inspect or maintain a saved session without entering the REPL"
-    )?;
-    writeln!(out, "  cowd help")?;
-    writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  cowd version")?;
-    writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  cowd status")?;
-    writeln!(
-        out,
-        "      Show the current local workspace status snapshot"
+        "      Inspect or maintain a saved session without entering the TUI"
     )?;
     writeln!(out, "  cowd sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  cowd doctor")?;
-    writeln!(
-        out,
-        "      Diagnose local auth, config, workspace, and sandbox health"
-    )?;
-    writeln!(out, "  cowd setup")?;
-    writeln!(
-        out,
-        "      Check local setup, channels, gateway/WebUI, and next action"
-    )?;
-    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
-    writeln!(
-        out,
-        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
-    )?;
-    writeln!(out, "  cowd dump-manifests [--manifests-dir PATH]")?;
-    writeln!(out, "  cowd bootstrap-plan")?;
+    writeln!(out, "  cowd help | cowd version")?;
+    writeln!(out, "      Local help and version aliases")?;
+    writeln!(out, "  cowd init")?;
+    writeln!(out, "      Initialize local cowd project files")?;
     writeln!(out, "  cowd agents")?;
     writeln!(out, "  cowd mcp")?;
-    writeln!(out, "  cowd skills")?;
+    writeln!(out, "  cowd plugins")?;
+    writeln!(out, "  cowd dump-manifests [--manifests-dir PATH]")?;
+    writeln!(out, "  cowd bootstrap-plan")?;
     writeln!(out, "  cowd system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  cowd init")?;
+    writeln!(out, "  cowd gateway run|restart")?;
+    writeln!(out, "  cowd gateway wechat-qr")?;
     writeln!(
         out,
-        "  cowd export [PATH] [--session SESSION] [--output PATH]"
+        "      Compatibility and channel helpers; prefer WebUI/TUI for broad state management"
     )?;
+    writeln!(out)?;
+    writeln!(out, "Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
         out,
-        "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
-    )?;
-    writeln!(out, "  cowd import-session PATH")?;
-    writeln!(
-        out,
-        "      Import a local legacy .jsonl/.json session file into the SQLite store"
+        "Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
     )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
@@ -11931,6 +11951,16 @@ mod tests {
             .expect("wechat qr gateway subcommand should parse");
         match parsed {
             CliAction::Gateway { action, .. } => assert_eq!(action, GatewayAction::WechatQr),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_gateway_doctor_core_subcommand() {
+        let parsed = parse_gateway_args(&["doctor".to_string()], CliOutputFormat::Text)
+            .expect("gateway doctor should parse");
+        match parsed {
+            CliAction::Gateway { action, .. } => assert_eq!(action, GatewayAction::Doctor),
             other => panic!("unexpected action: {other:?}"),
         }
     }
@@ -12644,6 +12674,65 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn help_prioritizes_minimal_core_surface() {
+        let mut out = Vec::new();
+        print_help_to(&mut out).expect("help should render");
+        let help = String::from_utf8(out).expect("help should be utf8");
+
+        assert!(help.contains("Core commands:"));
+        assert!(help.contains("cowd --tui"));
+        assert!(help.contains("cowd gateway start|stop|status|doctor"));
+        assert!(help.contains("cowd status"));
+        assert!(help.contains("cowd doctor"));
+        assert!(help.contains("cowd export"));
+        assert!(help.contains("cowd import-session PATH"));
+        assert!(help.contains("cowd skills list|show|validate"));
+        assert!(help.contains("Advanced compatibility:"));
+
+        let core_start = help.find("Core commands:").expect("core section");
+        let advanced_start = help
+            .find("Advanced compatibility:")
+            .expect("advanced section");
+        let core = &help[core_start..advanced_start];
+        let advanced = &help[advanced_start..];
+
+        for complex in [
+            "cowd agents",
+            "cowd mcp",
+            "cowd plugins",
+            "cowd dump-manifests",
+            "cowd bootstrap-plan",
+            "cowd system-prompt",
+        ] {
+            assert!(
+                !core.contains(complex),
+                "{complex} must not be presented as a core CLI command"
+            );
+            assert!(
+                advanced.contains(complex),
+                "{complex} must remain documented for compatibility"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_help_keeps_channel_helpers_out_of_core_surface() {
+        let mut out = Vec::new();
+        print_help_to(&mut out).expect("help should render");
+        let help = String::from_utf8(out).expect("help should be utf8");
+        let core_start = help.find("Core commands:").expect("core section");
+        let advanced_start = help
+            .find("Advanced compatibility:")
+            .expect("advanced section");
+        let core = &help[core_start..advanced_start];
+        let advanced = &help[advanced_start..];
+
+        assert!(core.contains("gateway start|stop|status|doctor"));
+        assert!(!core.contains("wechat-qr"));
+        assert!(advanced.contains("gateway wechat-qr"));
     }
 
     #[test]
