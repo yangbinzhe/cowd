@@ -194,14 +194,16 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 
 fn classify_cause(metric_id: Option<&str>, entity_ref: &str, delta: f64) -> &'static str {
     let metric = metric_id.unwrap_or_default();
-    if metric.contains("shortage") || entity_ref.starts_with("component:") {
+    if metric.contains("shortage") {
+        "supply_constraint"
+    } else if metric.contains("quality") {
+        "quality_escape"
+    } else if metric.contains("capacity") || metric.contains("work_center") {
+        "capacity_constraint"
+    } else if entity_ref.starts_with("component:") {
         "supply_constraint"
     } else if metric.contains("bom") || metric.contains("demand") || delta > 0.0 {
         "planning_demand_change"
-    } else if metric.contains("quality") {
-        "quality_escape"
-    } else if metric.contains("capacity") {
-        "capacity_constraint"
     } else {
         "metric_delta"
     }
@@ -231,6 +233,8 @@ fn impact_scope(metric_id: Option<&str>) -> &'static str {
     let metric = metric_id.unwrap_or_default();
     if metric.contains("shortage") {
         "supply_to_production"
+    } else if metric.contains("capacity") || metric.contains("work_center") {
+        "capacity_to_output"
     } else if metric.contains("bom") || metric.contains("demand") {
         "plan_to_material_and_capacity"
     } else if metric.contains("quality") {
@@ -244,6 +248,8 @@ fn impact_type(metric_id: Option<&str>) -> &'static str {
     let metric = metric_id.unwrap_or_default();
     if metric.contains("shortage") {
         "material_availability_risk"
+    } else if metric.contains("capacity") || metric.contains("work_center") {
+        "capacity_throughput_risk"
     } else if metric.contains("bom") || metric.contains("demand") {
         "schedule_and_inventory_risk"
     } else if metric.contains("quality") {
@@ -296,6 +302,34 @@ fn recommended_action(
                 .to_string(),
             required_evidence: evidence_refs.to_vec(),
             command_hint: Some("iacc://actions/plan/reconcile-bom-demand".to_string()),
+            governance: "human_review_required".to_string(),
+        };
+    }
+    if metric.contains("capacity") || metric.contains("work_center") {
+        return IaccRecommendedAction {
+            action_id: format!("action-{}", uuid::Uuid::new_v4()),
+            action_type: "capacity_rebalance".to_string(),
+            title: "Rebalance weekly capacity and protect committed output".to_string(),
+            owner_role: "production_planner".to_string(),
+            priority: priority.to_string(),
+            expected_effect: "Reduce work center overload before it constrains shipment readiness"
+                .to_string(),
+            required_evidence: evidence_refs.to_vec(),
+            command_hint: Some("iacc://actions/capacity/rebalance-week".to_string()),
+            governance: "human_review_required".to_string(),
+        };
+    }
+    if metric.contains("quality") {
+        return IaccRecommendedAction {
+            action_id: format!("action-{}", uuid::Uuid::new_v4()),
+            action_type: "quality_containment".to_string(),
+            title: "Start quality containment and affected order assessment".to_string(),
+            owner_role: "quality_engineer".to_string(),
+            priority: priority.to_string(),
+            expected_effect: "Contain quality escape risk and identify affected shipment scope"
+                .to_string(),
+            required_evidence: evidence_refs.to_vec(),
+            command_hint: Some("iacc://actions/quality/containment-review".to_string()),
             governance: "human_review_required".to_string(),
         };
     }

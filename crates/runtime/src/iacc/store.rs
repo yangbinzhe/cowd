@@ -3856,7 +3856,7 @@ mod tests {
         IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
         IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
         IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccComputeJobInput,
-        IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
+        IaccEntityInput, IaccFactInput, IaccMetricStatus, IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -4099,6 +4099,170 @@ mod tests {
             .metric_states("work_center_load")
             .expect("states load")
             .is_empty());
+    }
+
+    #[test]
+    fn server_manufacturing_scenario_eval_covers_decision_inference_and_quality_gate() {
+        struct ScenarioExpectation {
+            scenario_id: &'static str,
+            trigger_metric: &'static str,
+            trigger_fact_type: &'static str,
+            root_entity_id: &'static str,
+            must_reach_entity_id: &'static str,
+            expected_cause_type: &'static str,
+            expected_impact_type: &'static str,
+            expected_action_type: &'static str,
+        }
+
+        let expectations = [
+            ScenarioExpectation {
+                scenario_id: "server_mfg_gpu_shortage",
+                trigger_metric: "material_shortage_risk",
+                trigger_fact_type: "supply.material_shortage",
+                root_entity_id: "entity-component-gpu-h100",
+                must_reach_entity_id: "entity-order-co-2026-0001",
+                expected_cause_type: "supply_constraint",
+                expected_impact_type: "material_availability_risk",
+                expected_action_type: "supplier_recovery",
+            },
+            ScenarioExpectation {
+                scenario_id: "server_mfg_bottleneck_load",
+                trigger_metric: "work_center_load",
+                trigger_fact_type: "manufacturing.work_center_load",
+                root_entity_id: "entity-work-center-final-assembly",
+                must_reach_entity_id: "entity-work-order-wo-2026-w30-001",
+                expected_cause_type: "capacity_constraint",
+                expected_impact_type: "capacity_throughput_risk",
+                expected_action_type: "capacity_rebalance",
+            },
+            ScenarioExpectation {
+                scenario_id: "server_mfg_quality_escape",
+                trigger_metric: "quality_escape_risk",
+                trigger_fact_type: "quality.escape_risk",
+                root_entity_id: "entity-component-dimm-64g",
+                must_reach_entity_id: "entity-product-storage-server",
+                expected_cause_type: "quality_escape",
+                expected_impact_type: "delivery_quality_risk",
+                expected_action_type: "quality_containment",
+            },
+        ];
+
+        for expected in expectations {
+            let store = IaccStore::in_memory().expect("store opens");
+            let seed = store
+                .seed_server_manufacturing_domain()
+                .expect("domain seed runs");
+            assert_eq!(seed.scenario_count, 3);
+
+            let recompute = store.recompute_metrics().expect("metrics recompute");
+            let metric_state = recompute
+                .metric_states
+                .iter()
+                .find(|state| state.metric_id == expected.trigger_metric)
+                .unwrap_or_else(|| panic!("{} metric state exists", expected.trigger_metric));
+            assert!(metric_state.value > 0.0);
+            assert_eq!(metric_state.status, IaccMetricStatus::Critical);
+            assert!(!metric_state.input_fact_refs.is_empty());
+
+            let affected = store
+                .metrics_affected_by_fact_type(expected.trigger_fact_type)
+                .expect("affected metrics resolve");
+            assert!(
+                affected
+                    .iter()
+                    .any(|metric_id| metric_id == expected.trigger_metric),
+                "{} should affect {}",
+                expected.trigger_fact_type,
+                expected.trigger_metric
+            );
+
+            let attention = recompute
+                .attention
+                .iter()
+                .find(|item| item.title.contains(expected.trigger_metric))
+                .unwrap_or_else(|| panic!("{} attention exists", expected.trigger_metric));
+            let packet = store
+                .build_evidence_packet(
+                    Some(&attention.attention_id),
+                    Some(&format!("manufacturing scenario eval {}", expected.scenario_id)),
+                )
+                .expect("packet builds");
+            assert!(!packet.metric_evidence.is_empty());
+            assert!(!packet.change_evidence.is_empty());
+
+            let review_gate = store
+                .evaluate_evidence_quality(&packet.packet_id)
+                .expect("review gate evaluates");
+            assert_eq!(review_gate.decision, "review");
+
+            let mut incident = IaccIncident::new(format!(
+                "Manufacturing scenario eval {}",
+                expected.scenario_id
+            ));
+            incident.attention_id = packet.attention_id.clone();
+            incident.evidence_packet_id = Some(packet.packet_id.clone());
+            store.create_incident(&incident).expect("incident saves");
+            let analysis = store
+                .analyze_incident(&incident.incident_id)
+                .expect("incident analyzes");
+
+            assert_eq!(
+                analysis.attribution_candidates[0].cause_type,
+                expected.expected_cause_type
+            );
+            assert_eq!(
+                analysis.impact_paths[0].impact_type,
+                expected.expected_impact_type
+            );
+            assert_eq!(
+                analysis.recommended_actions[0].action_type,
+                expected.expected_action_type
+            );
+            assert_eq!(analysis.status, "ready_for_review");
+            assert!(analysis.confidence >= 0.65);
+
+            let pass_gate = store
+                .evaluate_evidence_quality(&packet.packet_id)
+                .expect("pass gate evaluates");
+            assert_eq!(pass_gate.decision, "pass");
+            assert!(pass_gate.score >= 0.75);
+
+            let trace = store
+                .impact_trace(expected.root_entity_id, 4)
+                .expect("impact trace builds");
+            assert!(
+                trace
+                    .entities
+                    .iter()
+                    .any(|entity| entity.entity_id == expected.must_reach_entity_id),
+                "{} should reach {}",
+                expected.root_entity_id,
+                expected.must_reach_entity_id
+            );
+
+            let plan = store
+                .plan_compute_job_for_fact_type(IaccComputeJobInput {
+                    job_id: Some(format!(
+                        "eval-compute-{}",
+                        expected.trigger_metric.replace('_', "-")
+                    )),
+                    trigger_fact_type: expected.trigger_fact_type.to_string(),
+                    trigger_fact_refs: metric_state
+                        .input_fact_refs
+                        .iter()
+                        .map(|fact_id| format!("iacc:fact:{fact_id}"))
+                        .collect(),
+                    entity_scope: Some(expected.root_entity_id.to_string()),
+                    period: Some(metric_state.period.clone()),
+                    metric_ids: Vec::new(),
+                    priority: None,
+                })
+                .expect("compute plan builds");
+            assert!(plan
+                .affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == expected.trigger_metric));
+        }
     }
 
     #[test]
