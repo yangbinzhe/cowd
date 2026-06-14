@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cowd_release_gate_route_reports_passed_core_contracts() {
+    async fn cowd_release_gate_route_reports_missing_timeline_evidence() {
         let app = api_router(test_state());
         let response = app
             .oneshot(
@@ -1375,19 +1375,46 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["gate_id"], "cowd.release_gate.v1");
-        assert_eq!(json["status"], "pass");
+        assert_eq!(json["status"], "fail");
         assert!(json["checks"]
             .as_array()
             .unwrap()
             .iter()
             .any(|check| check["check_id"] == "surface.cli.minimal" && check["status"] == "pass"));
+        assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+            check["check_id"] == "execution_outcome.timeline.available" && check["status"] == "fail"
+        }));
     }
 
     #[tokio::test]
     async fn cowd_iacc_full_loop_passes_release_gate() {
         let workspace = test_temp_dir("cowd-iacc-full-loop");
         let config_home = test_temp_dir("cowd-iacc-full-loop-config");
-        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "session-full-loop";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".to_string()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                0,
+                memory::RuntimeEventScope::Turn,
+                "execution.outcome",
+                serde_json::json!({"status": "ok", "title": "full loop outcome"}),
+                current_time_ms(),
+            ))
+            .await
+            .unwrap();
+        let app = api_router(test_state_with_store_and_workspace(
+            store,
+            workspace.clone(),
+            config_home,
+        ));
 
         let source_upsert = app
             .clone()
@@ -1399,7 +1426,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "request_id": "full-loop-source",
-                            "session_id": "session-full-loop",
+                            "session_id": session_id,
                             "source_pack": {
                                 "source_pack_id": "pack-full-loop",
                                 "source_name": "mes",
@@ -1442,7 +1469,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "request_id": "full-loop-fact",
-                            "session_id": "session-full-loop",
+                            "session_id": session_id,
                             "facts": [{
                                 "fact_id": "fact-full-loop",
                                 "snapshot_id": "snapshot-full-loop",

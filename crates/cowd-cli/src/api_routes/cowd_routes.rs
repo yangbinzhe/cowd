@@ -8,9 +8,16 @@ use axum::{
     Json, Router,
 };
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
-use runtime::iacc::{IaccDataPlaneIngestPlanInput, IaccStore, IaccStoreError};
+use runtime::iacc::{
+    server_manufacturing_skill_pack, IaccDataPlaneIngestPlanInput, IaccEvidencePacket,
+    IaccEvidenceSourceRef, IaccStore, IaccStoreError,
+};
 use runtime::projection::CowdProjection;
+use runtime::quality_gate::CowdStructuredQualityGate;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
+use runtime::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
+use runtime::skill_dependency::CowdSkillStructuredDependency;
+use runtime::skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 use runtime::structured_data::{
     CowdIngestPlan, CowdStructuredEvidence, CowdStructuredFact, CowdStructuredSource, CowdWatermark,
 };
@@ -73,7 +80,7 @@ async fn surfaces_handler() -> impl IntoResponse {
 
 async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(CowdReleaseGateReport::evaluate_with(
-        release_gate_runtime_evidence(&state),
+        release_gate_runtime_evidence(&state).await,
     ))
 }
 
@@ -202,7 +209,7 @@ where
     })
 }
 
-fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
+async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
     let store_path = iacc_store_path(&state.workspace_root);
     if let Some(parent) = store_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -222,10 +229,83 @@ fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvid
     CowdReleaseGateRuntimeEvidence {
         structured_indexes_ready,
         structured_watermark_persistent,
-        execution_outcome_timeline_available: true,
-        memory_context_bridge_available: true,
-        graph_skill_quality_contracts_available: true,
+        execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
+        memory_context_bridge_available: memory_context_bridge_smoke(),
+        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(),
     }
+}
+
+async fn execution_outcome_timeline_available(state: &AppState) -> bool {
+    let Some(store) = state.unified_store() else {
+        return false;
+    };
+    let Ok(sessions) = store.list_sessions().await else {
+        return false;
+    };
+    for session in sessions.into_iter().take(50) {
+        let Ok(page) = store
+            .timeline_events_page(&session.session_id, 0, 100)
+            .await
+        else {
+            continue;
+        };
+        if page
+            .events
+            .iter()
+            .any(|event| event.kind == "execution.outcome")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn memory_context_bridge_smoke() -> bool {
+    let activation = SkillActivationRecord::new(
+        "release-gate-smoke",
+        1,
+        "structured data bridge",
+        vec![RuntimeSkillCandidate {
+            name: "structured-data".to_string(),
+            score: 12,
+            reasons: vec!["release-gate".to_string()],
+            path: None,
+        }],
+    );
+    memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
+        .map(|candidate| candidate.content.contains("source=skill_activation"))
+        .unwrap_or(false)
+}
+
+fn graph_skill_quality_contract_smoke() -> bool {
+    let Some(skill) = server_manufacturing_skill_pack()
+        .into_iter()
+        .find(|skill| skill.skill_id == "supply-risk-analyst")
+    else {
+        return false;
+    };
+    let dependency = CowdSkillStructuredDependency::from(&skill);
+    if dependency.required_fact_types.is_empty() || dependency.quality_gate.is_empty() {
+        return false;
+    }
+
+    let mut packet = IaccEvidencePacket::new("release gate structured quality smoke");
+    packet.packet_id = "release-gate-smoke".to_string();
+    packet.confidence = 0.9;
+    packet
+        .metric_evidence
+        .push(serde_json::json!({"metric": "material_shortage_risk"}));
+    packet.source_refs.push(IaccEvidenceSourceRef {
+        kind: "fact".to_string(),
+        reference: "structured-fact:release-gate-smoke".to_string(),
+        summary: "release gate smoke fact".to_string(),
+    });
+    let evidence = CowdStructuredEvidence::from(&packet);
+    let gate = CowdStructuredQualityGate::for_structured_evidence(&evidence);
+    gate.decision == "pass"
+        && gate
+            .structured_refs
+            .contains(&"structured-fact:release-gate-smoke".to_string())
 }
 
 fn open_iacc_store(state: &AppState) -> Result<IaccStore, (StatusCode, Json<ErrorResponse>)> {
