@@ -65,6 +65,28 @@ pub struct RuntimeActionReceiptSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CowdKernelSummary {
+    pub capability_count: u64,
+    pub projection_capability_count: u64,
+    pub webui_tui_full_parity: bool,
+    pub cli_is_minimal_control: bool,
+    pub release_gate_status: String,
+    pub release_gate_failed_checks: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructuredDataSummary {
+    pub source_count: u64,
+    pub fact_count: u64,
+    pub evidence_count: u64,
+    pub watermark_count: u64,
+    pub sample_sources: Vec<String>,
+    pub sample_facts: Vec<String>,
+    pub sample_evidence: Vec<String>,
+    pub sample_watermarks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub daemon_running: bool,
     pub active_sessions: usize,
@@ -85,6 +107,8 @@ pub struct RuntimeControlSnapshot {
     pub connector_capabilities: Vec<ConnectorCapabilitySummary>,
     pub connector_resources: Vec<ConnectorResourceSummary>,
     pub action_receipts: Vec<RuntimeActionReceiptSummary>,
+    pub cowd_kernel: Option<CowdKernelSummary>,
+    pub structured_data: Option<StructuredDataSummary>,
     pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
@@ -133,6 +157,8 @@ impl RuntimeControlSnapshot {
             connector_capabilities: app.daemon_connector_capabilities.clone(),
             connector_resources: app.daemon_connector_resources.clone(),
             action_receipts: app.daemon_action_receipts.clone(),
+            cowd_kernel: app.daemon_cowd_kernel.clone(),
+            structured_data: app.daemon_structured_data.clone(),
             connector_degraded_reasons: app.daemon_connector_degraded_reasons.clone(),
             degraded_reasons: app.daemon_degraded_reasons.clone(),
             ..Self::default()
@@ -161,6 +187,8 @@ impl RuntimeControlSnapshot {
         app.daemon_connector_capabilities = self.connector_capabilities.clone();
         app.daemon_connector_resources = self.connector_resources.clone();
         app.daemon_action_receipts = self.action_receipts.clone();
+        app.daemon_cowd_kernel = self.cowd_kernel.clone();
+        app.daemon_structured_data = self.structured_data.clone();
         app.daemon_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.daemon_degraded_reasons = self.degraded_reasons.clone();
         app.daemon_lease_owner = self.lease_owner.clone();
@@ -228,6 +256,84 @@ impl RuntimeControlSnapshot {
         self.cross_plane_actions_24h = value
             .pointer("/interop/actions_24h")
             .and_then(serde_json::Value::as_u64);
+    }
+
+    pub fn ingest_cowd_projection_state(
+        &mut self,
+        capabilities: &serde_json::Value,
+        projection: &serde_json::Value,
+        surfaces: &serde_json::Value,
+        release_gate: &serde_json::Value,
+    ) {
+        let capability_count = capabilities
+            .get("capability_count")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                capabilities
+                    .get("capabilities")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| items.len() as u64)
+            })
+            .unwrap_or_default();
+        let projection_capability_count = projection
+            .get("capability_count")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                projection
+                    .get("capabilities")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| items.len() as u64)
+            })
+            .unwrap_or_default();
+        let release_gate_failed_checks = release_gate
+            .get("checks")
+            .and_then(serde_json::Value::as_array)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .filter(|check| {
+                        check.get("status").and_then(serde_json::Value::as_str) != Some("pass")
+                    })
+                    .count() as u64
+            })
+            .unwrap_or_default();
+        self.cowd_kernel = Some(CowdKernelSummary {
+            capability_count,
+            projection_capability_count,
+            webui_tui_full_parity: surfaces
+                .get("webui_tui_full_parity")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            cli_is_minimal_control: surfaces
+                .get("cli_is_minimal_control")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            release_gate_status: release_gate
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            release_gate_failed_checks,
+        });
+    }
+
+    pub fn ingest_structured_data(
+        &mut self,
+        sources: &serde_json::Value,
+        facts: &serde_json::Value,
+        evidence: &serde_json::Value,
+        watermarks: &serde_json::Value,
+    ) {
+        self.structured_data = Some(StructuredDataSummary {
+            source_count: structured_count(sources),
+            fact_count: structured_count(facts),
+            evidence_count: structured_count(evidence),
+            watermark_count: structured_count(watermarks),
+            sample_sources: structured_samples(sources, &["source_id", "source_ref", "id"]),
+            sample_facts: structured_samples(facts, &["fact_id", "id"]),
+            sample_evidence: structured_samples(evidence, &["evidence_id", "id"]),
+            sample_watermarks: structured_samples(watermarks, &["source_ref", "id"]),
+        });
     }
 
     pub fn ingest_connector_accounts(&mut self, value: &serde_json::Value) {
@@ -469,6 +575,38 @@ fn approval_summary_from_json(value: &serde_json::Value) -> Option<DaemonApprova
     })
 }
 
+fn structured_count(value: &serde_json::Value) -> u64 {
+    value
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len() as u64)
+        })
+        .unwrap_or_default()
+}
+
+fn structured_samples(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    keys.iter()
+                        .filter_map(|key| item.get(*key).and_then(serde_json::Value::as_str))
+                        .find(|sample| !sample.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                })
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn connector_account_from_json(value: &serde_json::Value) -> Option<ConnectorAccountSummary> {
     let provider = value.get("provider").and_then(serde_json::Value::as_str)?;
     let account_id = value
@@ -637,6 +775,70 @@ pub async fn refresh_runtime_control_snapshot(
             )),
         },
     }
+    let (capabilities, projection_state, surfaces, release_gate) = tokio::join!(
+        projection.cowd_capabilities(),
+        projection.cowd_projection("tui"),
+        projection.cowd_surfaces(),
+        projection.cowd_release_gate()
+    );
+    match (capabilities, projection_state, surfaces, release_gate) {
+        (Ok(capabilities), Ok(projection_state), Ok(surfaces), Ok(release_gate)) => snapshot
+            .ingest_cowd_projection_state(
+                &capabilities,
+                &projection_state,
+                &surfaces,
+                &release_gate,
+            ),
+        (capabilities, projection_state, surfaces, release_gate) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = capabilities {
+                reasons.push(format!("capabilities: {err}"));
+            }
+            if let Err(err) = projection_state {
+                reasons.push(format!("projection: {err}"));
+            }
+            if let Err(err) = surfaces {
+                reasons.push(format!("surfaces: {err}"));
+            }
+            if let Err(err) = release_gate {
+                reasons.push(format!("release gate: {err}"));
+            }
+            snapshot.degrade(format!(
+                "cowd kernel projection unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
+    }
+    let (sources, facts, evidence, watermarks) = tokio::join!(
+        projection.structured_sources(),
+        projection.structured_facts(),
+        projection.structured_evidence(),
+        projection.structured_watermarks()
+    );
+    match (sources, facts, evidence, watermarks) {
+        (Ok(sources), Ok(facts), Ok(evidence), Ok(watermarks)) => {
+            snapshot.ingest_structured_data(&sources, &facts, &evidence, &watermarks);
+        }
+        (sources, facts, evidence, watermarks) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = sources {
+                reasons.push(format!("sources: {err}"));
+            }
+            if let Err(err) = facts {
+                reasons.push(format!("facts: {err}"));
+            }
+            if let Err(err) = evidence {
+                reasons.push(format!("evidence: {err}"));
+            }
+            if let Err(err) = watermarks {
+                reasons.push(format!("watermarks: {err}"));
+            }
+            snapshot.degrade(format!(
+                "structured data projection unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
+    }
     match projection.cross_plane_summary().await {
         Ok(value) => snapshot.ingest_cross_plane_summary(&value),
         Err(err) => snapshot.degrade(format!("cross-plane projection unavailable: {err}")),
@@ -787,6 +989,113 @@ mod tests {
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"
         );
+    }
+
+    #[test]
+    fn snapshot_extracts_cowd_and_structured_summaries() {
+        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        snapshot.ingest_cowd_projection_state(
+            &serde_json::json!({
+                "capability_count": 9,
+                "capabilities": []
+            }),
+            &serde_json::json!({
+                "surface": "tui",
+                "capability_count": 8,
+                "capabilities": []
+            }),
+            &serde_json::json!({
+                "webui_tui_full_parity": true,
+                "cli_is_minimal_control": true
+            }),
+            &serde_json::json!({
+                "status": "fail",
+                "checks": [
+                    {"check_id": "webui_tui_parity", "status": "pass"},
+                    {"check_id": "structured_data", "status": "fail"}
+                ]
+            }),
+        );
+        snapshot.ingest_structured_data(
+            &serde_json::json!({
+                "count": 1,
+                "items": [{"source_id": "pack-tui"}]
+            }),
+            &serde_json::json!({
+                "items": [{"fact_id": "fact-tui"}]
+            }),
+            &serde_json::json!({
+                "items": [{"evidence_id": "evidence-tui"}]
+            }),
+            &serde_json::json!({
+                "items": [{"source_ref": "pack-tui", "high_watermark": "2026-06-14T00:00:00Z"}]
+            }),
+        );
+
+        let kernel = snapshot.cowd_kernel.as_ref().expect("kernel summary");
+        assert_eq!(kernel.capability_count, 9);
+        assert_eq!(kernel.projection_capability_count, 8);
+        assert!(kernel.webui_tui_full_parity);
+        assert!(kernel.cli_is_minimal_control);
+        assert_eq!(kernel.release_gate_status, "fail");
+        assert_eq!(kernel.release_gate_failed_checks, 1);
+
+        let data = snapshot
+            .structured_data
+            .as_ref()
+            .expect("structured summary");
+        assert_eq!(data.source_count, 1);
+        assert_eq!(data.fact_count, 1);
+        assert_eq!(data.evidence_count, 1);
+        assert_eq!(data.watermark_count, 1);
+        assert_eq!(data.sample_sources, vec!["pack-tui"]);
+        assert_eq!(data.sample_facts, vec!["fact-tui"]);
+        assert_eq!(data.sample_evidence, vec!["evidence-tui"]);
+        assert_eq!(data.sample_watermarks, vec!["pack-tui"]);
+    }
+
+    #[test]
+    fn snapshot_round_trips_cowd_structured_through_app() {
+        let mut app = App::new("claude-sonnet-4-6", "session-cowd-structured");
+        let snapshot = RuntimeControlSnapshot {
+            cowd_kernel: Some(CowdKernelSummary {
+                capability_count: 12,
+                projection_capability_count: 12,
+                webui_tui_full_parity: true,
+                cli_is_minimal_control: true,
+                release_gate_status: "pass".to_string(),
+                release_gate_failed_checks: 0,
+            }),
+            structured_data: Some(StructuredDataSummary {
+                source_count: 2,
+                fact_count: 3,
+                evidence_count: 4,
+                watermark_count: 1,
+                sample_sources: vec!["pack-a".to_string()],
+                sample_facts: vec!["fact-a".to_string()],
+                sample_evidence: vec!["evidence-a".to_string()],
+                sample_watermarks: vec!["pack-a".to_string()],
+            }),
+            ..RuntimeControlSnapshot::from_status(&status())
+        };
+
+        snapshot.apply_to_app(&mut app);
+        assert_eq!(
+            app.daemon_cowd_kernel
+                .as_ref()
+                .map(|kernel| kernel.release_gate_status.as_str()),
+            Some("pass")
+        );
+        assert_eq!(
+            app.daemon_structured_data
+                .as_ref()
+                .map(|data| data.fact_count),
+            Some(3)
+        );
+
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(restored.cowd_kernel, snapshot.cowd_kernel);
+        assert_eq!(restored.structured_data, snapshot.structured_data);
     }
 
     #[test]

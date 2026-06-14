@@ -2,7 +2,8 @@
 use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::tui::runtime_control_store::{
     ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    DaemonApprovalSummary, DaemonTaskSummary, RuntimeActionReceiptSummary,
+    CowdKernelSummary, DaemonApprovalSummary, DaemonTaskSummary, RuntimeActionReceiptSummary,
+    StructuredDataSummary,
 };
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
@@ -216,6 +217,10 @@ pub struct App {
     pub daemon_connector_resources: Vec<ConnectorResourceSummary>,
     /// Recent runtime action receipts produced by TUI controls.
     pub daemon_action_receipts: Vec<RuntimeActionReceiptSummary>,
+    /// Cowd kernel capability and release-gate summary observed through projection API.
+    pub daemon_cowd_kernel: Option<CowdKernelSummary>,
+    /// Structured data-plane summary observed through projection API.
+    pub daemon_structured_data: Option<StructuredDataSummary>,
     /// Connector-specific degraded reasons observed through the daemon projection API.
     pub daemon_connector_degraded_reasons: Vec<String>,
     /// Degraded daemon projection/control reasons collected during snapshot refresh.
@@ -441,6 +446,8 @@ impl App {
             daemon_connector_capabilities: Vec::new(),
             daemon_connector_resources: Vec::new(),
             daemon_action_receipts: Vec::new(),
+            daemon_cowd_kernel: None,
+            daemon_structured_data: None,
             daemon_connector_degraded_reasons: Vec::new(),
             daemon_degraded_reasons: Vec::new(),
             daemon_lease_owner: None,

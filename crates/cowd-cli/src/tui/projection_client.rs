@@ -73,6 +73,18 @@ impl DaemonProjectionClient {
         self.get_json("/api/cowd/structured/sources").await
     }
 
+    pub async fn structured_facts(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/structured/facts").await
+    }
+
+    pub async fn structured_evidence(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/structured/evidence").await
+    }
+
+    pub async fn structured_watermarks(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/structured/watermarks").await
+    }
+
     pub async fn structured_ingest_plan(
         &self,
         input: serde_json::Value,
@@ -444,6 +456,64 @@ mod tests {
         let json = client.cowd_projection("tui").await.expect("json");
         assert_eq!(json["surface"], "tui");
         assert_eq!(json["capability_count"], 1);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn structured_projection_gets_all_list_contracts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "/api/cowd/structured/facts",
+                    r#"{"kind":"cowd.structured.facts","count":1,"items":[]}"#,
+                ),
+                (
+                    "/api/cowd/structured/evidence",
+                    r#"{"kind":"cowd.structured.evidence","count":1,"items":[]}"#,
+                ),
+                (
+                    "/api/cowd/structured/watermarks",
+                    r#"{"kind":"cowd.structured.watermarks","count":1,"items":[]}"#,
+                ),
+            ];
+            for (path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept structured");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read structured");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with(&format!("GET {path} HTTP/1.1")),
+                    "unexpected request: {req}"
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write structured");
+            }
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        assert_eq!(
+            client.structured_facts().await.expect("facts")["kind"],
+            "cowd.structured.facts"
+        );
+        assert_eq!(
+            client.structured_evidence().await.expect("evidence")["kind"],
+            "cowd.structured.evidence"
+        );
+        assert_eq!(
+            client.structured_watermarks().await.expect("watermarks")["kind"],
+            "cowd.structured.watermarks"
+        );
         server.await.expect("server task");
     }
 

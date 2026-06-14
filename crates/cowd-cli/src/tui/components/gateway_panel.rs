@@ -23,7 +23,7 @@ use crate::tui::{
     app::App,
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-        RuntimeActionReceiptSummary,
+        CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary,
     },
 };
 
@@ -58,6 +58,10 @@ pub struct GatewayPanel {
     pub adapter_capabilities: Vec<GatewayAdapterCapability>,
     /// Recent cross-plane execution receipts.
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
+    /// Cowd kernel capability and release-gate summary.
+    pub cowd_kernel: Option<CowdKernelSummary>,
+    /// Structured data-plane summary.
+    pub structured_data: Option<StructuredDataSummary>,
     /// Recent dispatch target readiness summaries.
     pub dispatch_targets: Vec<GatewayDispatchTarget>,
     /// Connector provider account summaries.
@@ -140,6 +144,8 @@ impl GatewayPanel {
             memory_status: None,
             adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
+            cowd_kernel: None,
+            structured_data: None,
             dispatch_targets: Vec::new(),
             connector_accounts: Vec::new(),
             connector_capabilities: Vec::new(),
@@ -170,6 +176,8 @@ impl GatewayPanel {
         self.connector_capabilities = app.daemon_connector_capabilities.clone();
         self.connector_resources = app.daemon_connector_resources.clone();
         self.execution_receipts = app.daemon_action_receipts.clone();
+        self.cowd_kernel = app.daemon_cowd_kernel.clone();
+        self.structured_data = app.daemon_structured_data.clone();
         self.connector_degraded_reasons = app.daemon_connector_degraded_reasons.clone();
         self.degraded_reasons = app.daemon_degraded_reasons.clone();
         if app.server_running {
@@ -367,6 +375,98 @@ impl Component for GatewayPanel {
                     Span::styled("Memory: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(memory_status.clone(), Style::default().fg(Color::Green)),
                 ]));
+            }
+
+            if let Some(kernel) = self.cowd_kernel.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Cowd Kernel ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Kernel: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "caps {}, tui {}",
+                            kernel.capability_count, kernel.projection_capability_count
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                let parity = if kernel.webui_tui_full_parity {
+                    "parity yes"
+                } else {
+                    "parity no"
+                };
+                let cli = if kernel.cli_is_minimal_control {
+                    "cli minimal"
+                } else {
+                    "cli check"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("Surfaces: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{parity}, {cli}"), Style::default().fg(Color::Cyan)),
+                ]));
+                let gate_color = if kernel.release_gate_status == "pass" {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("Gate: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{}, failed {}",
+                            kernel.release_gate_status, kernel.release_gate_failed_checks
+                        ),
+                        Style::default().fg(gate_color),
+                    ),
+                ]));
+            }
+
+            if let Some(data) = self.structured_data.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Structured Data ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Data: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "sources {}, facts {}, evidence {}, watermarks {}",
+                            data.source_count,
+                            data.fact_count,
+                            data.evidence_count,
+                            data.watermark_count
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                let samples = [
+                    data.sample_sources
+                        .first()
+                        .map(|value| format!("source {value}")),
+                    data.sample_facts
+                        .first()
+                        .map(|value| format!("fact {value}")),
+                    data.sample_evidence
+                        .first()
+                        .map(|value| format!("evidence {value}")),
+                    data.sample_watermarks
+                        .first()
+                        .map(|value| format!("watermark {value}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+                if !samples.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Samples: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(samples, Style::default().fg(Color::Yellow)),
+                    ]));
+                }
             }
 
             if self.task_count.is_some() || self.pending_approvals.is_some() {
@@ -655,7 +755,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 22] = [
+        let endpoints: [(&str, &str); 31] = [
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -666,6 +766,27 @@ impl Component for GatewayPanel {
             ("GET  /api/config", "View config"),
             ("PUT  /api/config", "Update config"),
             ("GET  /api/platforms", "List platforms"),
+            ("GET  /api/cowd/capabilities", "Cowd capability registry"),
+            ("GET  /api/cowd/projection", "Surface capability projection"),
+            ("GET  /api/cowd/surfaces", "Surface parity contract"),
+            ("GET  /api/cowd/release-gate", "Release gate status"),
+            (
+                "GET  /api/cowd/structured/sources",
+                "Structured data sources",
+            ),
+            ("GET  /api/cowd/structured/facts", "Structured facts"),
+            (
+                "GET  /api/cowd/structured/evidence",
+                "Structured evidence packets",
+            ),
+            (
+                "GET  /api/cowd/structured/watermarks",
+                "Structured ingest watermarks",
+            ),
+            (
+                "POST /api/cowd/structured/ingest-plan",
+                "Plan structured ingest",
+            ),
             ("GET  /api/cross-plane/summary", "Interop policy summary"),
             ("GET  /api/cross-plane/grants", "List interop grants"),
             (
@@ -975,16 +1096,81 @@ mod tests {
     }
 
     #[test]
+    fn render_shows_cowd_kernel_and_structured_data_state() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.cowd_kernel = Some(CowdKernelSummary {
+            capability_count: 11,
+            projection_capability_count: 10,
+            webui_tui_full_parity: true,
+            cli_is_minimal_control: true,
+            release_gate_status: "pass".to_string(),
+            release_gate_failed_checks: 0,
+        });
+        panel.structured_data = Some(StructuredDataSummary {
+            source_count: 1,
+            fact_count: 2,
+            evidence_count: 3,
+            watermark_count: 1,
+            sample_sources: vec!["pack-tui".to_string()],
+            sample_facts: vec!["fact-tui".to_string()],
+            sample_evidence: vec!["evidence-tui".to_string()],
+            sample_watermarks: vec!["pack-tui".to_string()],
+        });
+
+        let mut terminal = MockTerminal::new(100, 34);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 100, 34));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Cowd Kernel"),
+            "Should show cowd kernel section, got: {joined}"
+        );
+        assert!(
+            joined.contains("caps 11") && joined.contains("tui 10"),
+            "Should show capability summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("parity yes") && joined.contains("cli minimal"),
+            "Should show surface policy summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("Structured Data"),
+            "Should show structured section, got: {joined}"
+        );
+        assert!(
+            joined.contains("sources 1")
+                && joined.contains("facts 2")
+                && joined.contains("evidence 3")
+                && joined.contains("watermarks 1"),
+            "Should show structured counts, got: {joined}"
+        );
+        assert!(
+            joined.contains("pack-tui")
+                && joined.contains("fact-tui")
+                && joined.contains("evidence-tui"),
+            "Should show structured samples, got: {joined}"
+        );
+    }
+
+    #[test]
     fn render_shows_api_endpoints() {
         use crate::tui::skin::SkinConfig;
         use crate::tui::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        let mut terminal = MockTerminal::new(70, 22);
+        let mut terminal = MockTerminal::new(82, 42);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
             let mut ctx = RenderContext::new(f, &skin);
-            panel.render(&mut ctx, Rect::new(0, 0, 70, 22));
+            panel.render(&mut ctx, Rect::new(0, 0, 82, 42));
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
@@ -1011,6 +1197,20 @@ mod tests {
         assert!(
             joined.contains("/api/platforms"),
             "Should show platforms endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cowd/capabilities")
+                && joined.contains("/api/cowd/projection")
+                && joined.contains("/api/cowd/release-gate"),
+            "Should show cowd kernel endpoints, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cowd/structured/sources")
+                && joined.contains("/api/cowd/structured/facts")
+                && joined.contains("/api/cowd/structured/evidence")
+                && joined.contains("/api/cowd/structured/watermarks")
+                && joined.contains("/api/cowd/structured/ingest-plan"),
+            "Should show structured data endpoints, got: {joined}"
         );
         assert!(
             joined.contains("/api/cross-plane/action/adapters"),
@@ -1101,11 +1301,11 @@ mod tests {
         use crate::tui::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        let mut terminal = MockTerminal::new(118, 40);
+        let mut terminal = MockTerminal::new(118, 54);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
             let mut ctx = RenderContext::new(f, &skin);
-            panel.render(&mut ctx, Rect::new(0, 0, 118, 40));
+            panel.render(&mut ctx, Rect::new(0, 0, 118, 54));
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(
