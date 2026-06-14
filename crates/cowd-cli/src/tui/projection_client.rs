@@ -65,6 +65,10 @@ impl DaemonProjectionClient {
         self.get_json("/api/cowd/surfaces").await
     }
 
+    pub async fn cowd_release_gate(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/release-gate").await
+    }
+
     pub async fn structured_sources(&self) -> Result<serde_json::Value, ProjectionError> {
         self.get_json("/api/cowd/structured/sources").await
     }

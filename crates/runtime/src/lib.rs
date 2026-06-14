@@ -78,6 +78,7 @@ pub mod profile;
 pub mod projection;
 pub mod provider_registry;
 pub mod quality_gate;
+pub mod release_gate;
 pub mod session_lifecycle;
 pub mod skill_activation;
 pub mod skill_dependency;

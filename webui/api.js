@@ -245,6 +245,7 @@ window.Api = (()=>{
       return req('GET','/api/cowd/projection'+query);
     },
     async cowdSurfaces(){return req('GET','/api/cowd/surfaces')},
+    async cowdReleaseGate(){return req('GET','/api/cowd/release-gate')},
     async structuredSources(){return req('GET','/api/cowd/structured/sources')},
     async structuredSource(id){return req('GET','/api/cowd/structured/sources/'+encodeURIComponent(id))},
     async structuredIngestPlan(body){return req('POST','/api/cowd/structured/ingest-plan',body||{})},

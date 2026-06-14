@@ -1204,6 +1204,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cowd_release_gate_route_reports_passed_core_contracts() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/release-gate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["gate_id"], "cowd.release_gate.v1");
+        assert_eq!(json["status"], "pass");
+        assert!(json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["check_id"] == "surface.cli.minimal" && check["status"] == "pass"));
+    }
+
+    #[tokio::test]
     async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("iacc-foundation");
         let config_home = test_temp_dir("iacc-config");
