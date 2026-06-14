@@ -61,6 +61,18 @@ impl DaemonProjectionClient {
         .await
     }
 
+    pub async fn structured_sources(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/cowd/structured/sources").await
+    }
+
+    pub async fn structured_ingest_plan(
+        &self,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json("/api/cowd/structured/ingest-plan", input)
+            .await
+    }
+
     pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, ProjectionError> {
         self.get_json("/api/runtime/session-leases").await
     }

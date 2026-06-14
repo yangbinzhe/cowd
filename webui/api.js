@@ -244,6 +244,12 @@ window.Api = (()=>{
       const query=surface?'?surface='+encodeURIComponent(surface):'';
       return req('GET','/api/cowd/projection'+query);
     },
+    async structuredSources(){return req('GET','/api/cowd/structured/sources')},
+    async structuredSource(id){return req('GET','/api/cowd/structured/sources/'+encodeURIComponent(id))},
+    async structuredIngestPlan(body){return req('POST','/api/cowd/structured/ingest-plan',body||{})},
+    async structuredFacts(){return req('GET','/api/cowd/structured/facts')},
+    async structuredEvidence(){return req('GET','/api/cowd/structured/evidence')},
+    async structuredWatermarks(){return req('GET','/api/cowd/structured/watermarks')},
     async runtimeReloadProviders(){
       return req('POST','/api/runtime/providers/reload');
     },

@@ -1123,6 +1123,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cowd_structured_routes_expose_contract_and_ingest_plan_adapter() {
+        let app = api_router(test_state());
+        let sources = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/structured/sources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ingest = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cowd/structured/ingest-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_ref": "pack-1",
+                            "fact_type": "inventory_balance",
+                            "partition_ref": "2026-W30",
+                            "high_watermark": "2026-06-14T00:00:00Z",
+                            "estimated_rows": 42,
+                            "raw_checksum": "sha256:test",
+                            "metric_ids": ["stock_on_hand"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(sources.status(), StatusCode::OK);
+        assert_eq!(ingest.status(), StatusCode::OK);
+        let sources_body = to_bytes(sources.into_body(), usize::MAX).await.unwrap();
+        let ingest_body = to_bytes(ingest.into_body(), usize::MAX).await.unwrap();
+        let sources_json: serde_json::Value = serde_json::from_slice(&sources_body).unwrap();
+        let ingest_json: serde_json::Value = serde_json::from_slice(&ingest_body).unwrap();
+
+        assert_eq!(sources_json["contract"], "cowd.structured_data.v1");
+        assert_eq!(sources_json["list_status"], "pending_store_index");
+        assert_eq!(ingest_json["source_ref"], "pack-1");
+        assert_eq!(ingest_json["fact_type"], "inventory_balance");
+        assert_eq!(
+            ingest_json["affected_metric_ids"],
+            serde_json::json!(["stock_on_hand"])
+        );
+        assert_eq!(
+            ingest_json["watermark"]["high_watermark"],
+            "2026-06-14T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
     async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("iacc-foundation");
         let config_home = test_temp_dir("iacc-config");

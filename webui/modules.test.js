@@ -293,6 +293,33 @@ describe('API module', () => {
     expect(projection.surface).toBe('webui');
   });
 
+  it('structured data APIs use cowd kernel routes', async () => {
+    const mockF = vi.fn((path) =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(String(path).includes('/ingest-plan')
+          ? { batch_id: 'batch-1', source_ref: 'pack-1' }
+          : { kind: 'cowd.structured.collection', items: [] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.structuredSources();
+    await window.Api.structuredSource('pack-1');
+    await window.Api.structuredIngestPlan({ source_ref: 'pack-1', fact_type: 'inventory_balance' });
+    await window.Api.structuredFacts();
+    await window.Api.structuredEvidence();
+    await window.Api.structuredWatermarks();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/cowd/structured/sources');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/cowd/structured/sources/pack-1');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/cowd/structured/ingest-plan');
+    expect(mockF.mock.calls[2][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/cowd/structured/facts');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/cowd/structured/evidence');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/cowd/structured/watermarks');
+  });
+
   it('runtimeReloadProviders posts provider reload request', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
