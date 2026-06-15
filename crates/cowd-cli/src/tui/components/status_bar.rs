@@ -92,16 +92,36 @@ impl StatusBar {
     pub fn with_default_sections() -> Self {
         let mut sb = Self::new();
         sb.add_section(StatusSection {
+            id: "version".into(),
+            content: None,
+            style: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            width: SectionWidth::Fixed(10),
+        });
+        sb.add_section(StatusSection {
             id: "model".into(),
             content: None,
             style: Style::default().fg(Color::White),
-            width: SectionWidth::Fixed(28),
+            width: SectionWidth::Fixed(24),
+        });
+        sb.add_section(StatusSection {
+            id: "session".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(16),
+        });
+        sb.add_section(StatusSection {
+            id: "focus".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(16),
         });
         sb.add_section(StatusSection {
             id: "context".into(),
             content: None,
             style: Style::default().fg(Color::DarkGray),
-            width: SectionWidth::Fixed(28),
+            width: SectionWidth::Fixed(18),
         });
         sb.add_section(StatusSection {
             id: "approvals".into(),
@@ -110,18 +130,6 @@ impl StatusBar {
             width: SectionWidth::Fixed(14),
         });
         sb.add_section(Self::permission_status_section());
-        sb.add_section(StatusSection {
-            id: "session".into(),
-            content: None,
-            style: Style::default().fg(Color::Cyan),
-            width: SectionWidth::Fixed(20),
-        });
-        sb.add_section(StatusSection {
-            id: "focus".into(),
-            content: None,
-            style: Style::default().fg(Color::Cyan),
-            width: SectionWidth::Fixed(16),
-        });
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
         sb.add_section(StatusSection {
@@ -344,9 +352,10 @@ impl StatusBar {
     pub fn sync_from_app(&mut self, app: &App) {
         for section in &mut self.sections {
             section.content = match section.id.as_str() {
+                "version" => Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 "model" => {
                     let mode = if app.yolo_mode { "YOLO" } else { "STD" };
-                    Some(format!("model:{} {mode}", preview(&app.model, 18)))
+                    Some(format!("model:{} {mode}", preview(&app.model, 14)))
                 }
                 "context" => {
                     let pct = if app.context_window > 0 {
@@ -584,6 +593,7 @@ mod tests {
     fn with_default_sections_has_all_parts() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"version"));
         assert!(ids.contains(&"model"));
         assert!(ids.contains(&"context"));
         assert!(ids.contains(&"approvals"));
@@ -638,6 +648,11 @@ mod tests {
 
         bar.sync_from_app(&app);
 
+        let version = bar.section_mut("version").unwrap();
+        assert_eq!(
+            version.content.as_deref(),
+            Some(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
         let model = bar.section_mut("model").unwrap();
         assert_eq!(model.content.as_deref(), Some("model:test-model STD"));
     }
@@ -719,6 +734,30 @@ mod tests {
 
         terminal.assert_line_contains("Cowd");
         terminal.assert_line_contains("Ready");
+    }
+
+    #[test]
+    fn render_default_status_keeps_version_and_model_on_narrow_width() {
+        let app = App::new("deepseek-v4-pro", "session-status-narrow");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+
+        let mut terminal = MockTerminal::new(88, 3);
+        let theme = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &theme);
+            bar.render(&mut ctx, Rect::new(0, 0, 88, 1));
+        });
+
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "version should stay visible on narrow status bars: {joined}"
+        );
+        assert!(
+            joined.contains("model:deepseek"),
+            "model should stay visible on narrow status bars: {joined}"
+        );
     }
 
     #[test]

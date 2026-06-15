@@ -1234,27 +1234,11 @@ impl TuiState {
             }
         }
 
-        // 5.5 Sync and render L4KnowledgeView when memory orchestrator is available
+        // 5.5 Keep L4 knowledge cached, but do not auto-render it as a startup
+        // overlay. The full memory/L4 surfaces are opened explicitly from the
+        // sidebar/topic panels so they cannot cover the first screen.
         if self.memory_orchestrator.is_some() {
             self.l4_knowledge_view.sync(&self.memory_orchestrator);
-            if !self.l4_knowledge_view.entries.is_empty() {
-                let degraded = {
-                    let _guard = self.render_profiler.guard("l4_knowledge_view");
-                    match error_recovery::catch_render_panic(
-                        "l4_knowledge_view",
-                        AssertUnwindSafe(|| {
-                            self.l4_knowledge_view
-                                .render(&mut overlay_ctx, frame_areas.body);
-                        }),
-                    ) {
-                        RenderResult::Ok => None,
-                        RenderResult::Degraded(msg) => Some(msg),
-                    }
-                };
-                if let Some(msg) = degraded {
-                    self.add_message("system", &msg);
-                }
-            }
         }
 
         // 6. Render toast notifications at top-right
@@ -4627,6 +4611,28 @@ providers:
         let joined = terminal.buffer_lines().join("\n");
 
         assert!(joined.contains("focus:activity"), "missing focus: {joined}");
+    }
+
+    #[test]
+    fn render_status_bar_keeps_identity_and_focus_on_narrow_width() {
+        let mut state = TuiState::new("deepseek-v4-pro", "session-status-narrow");
+
+        let mut terminal = MockTerminal::new(88, 28);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(
+            joined.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "missing version on narrow status line: {joined}"
+        );
+        assert!(
+            joined.contains("model:deepseek"),
+            "missing model on narrow status line: {joined}"
+        );
+        assert!(
+            joined.contains("focus:chat"),
+            "missing focus on narrow status line: {joined}"
+        );
     }
 
     #[test]
