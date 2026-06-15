@@ -771,7 +771,6 @@ impl TuiState {
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
         let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
         let toast_anchor_area: ratatui::layout::Rect;
-        let thinking_anchor_area: ratatui::layout::Rect;
 
         {
             let _guard = self.render_profiler.guard("system_status_bar");
@@ -869,7 +868,6 @@ impl TuiState {
                     frame_areas.body.height,
                 )
             };
-            thinking_anchor_area = chat_area;
             self.last_hit_areas = TuiHitAreas {
                 chat: chat_area,
                 activity: activity_area,
@@ -1137,38 +1135,6 @@ impl TuiState {
 
         // ── Overlays: one RenderContext for all conditional overlays ──
         let mut overlay_ctx: RenderContext = RenderContext::new(frame, &skin);
-
-        // 3. Render thinking panel as compact floating box when turn is active.
-        // Positioned at top-right of chat area so it doesn't obscure the full screen.
-        if self.app.turn_active {
-            let anchor = if thinking_anchor_area.width >= 30 && thinking_anchor_area.height >= 6 {
-                thinking_anchor_area
-            } else {
-                frame_areas.body
-            };
-            let thinking_w = (anchor.width / 3).max(30).min(50).min(anchor.width);
-            let thinking_h = (anchor.height / 3).max(6).min(14).min(anchor.height);
-            let thinking_x = anchor.x + anchor.width.saturating_sub(thinking_w);
-            let thinking_y = anchor.y;
-            let thinking_area =
-                ratatui::layout::Rect::new(thinking_x, thinking_y, thinking_w, thinking_h);
-
-            let degraded = {
-                let _guard = self.render_profiler.guard("thinking_panel");
-                match error_recovery::catch_render_panic(
-                    "thinking_panel",
-                    AssertUnwindSafe(|| {
-                        self.thinking_panel.render(&mut overlay_ctx, thinking_area);
-                    }),
-                ) {
-                    RenderResult::Ok => None,
-                    RenderResult::Degraded(msg) => Some(msg),
-                }
-            };
-            if let Some(msg) = degraded {
-                self.add_message("system", &msg);
-            }
-        }
 
         // 4. Render agents overlay when visible
         if self.agents_overlay.visible {
@@ -3978,14 +3944,18 @@ providers:
             iterations: 1,
         });
 
-        // Should have: assistant message + "✓ Done"
-        assert!(state.timeline_len() >= 2);
-        // The last entry should be "✓ Done"
+        assert!(state.timeline_len() >= 1);
         let last = state.timeline_get(state.timeline_len() - 1).unwrap();
         let text = last.full_text();
         assert!(
-            text.contains("Done"),
-            "expected '✓ Done' marker, got: {text}"
+            text.contains("Hello world"),
+            "expected streamed assistant text to remain the final entry, got: {text}"
+        );
+        assert!(
+            !state
+                .timeline_iter()
+                .any(|(_, entry)| entry.full_text().contains("Done")),
+            "turn completion should not inject Done messages"
         );
     }
 
@@ -4646,6 +4616,52 @@ providers:
 
         assert!(joined.contains("focus:memory"), "missing focus: {joined}");
         assert!(joined.contains("Enter detail"), "missing hint: {joined}");
+    }
+
+    #[test]
+    fn render_thinking_inline_without_floating_panel() {
+        let mut state = TuiState::new("m", "s");
+        state.apply_event(CowdEvent::TurnStarted);
+        state.apply_event(CowdEvent::ThinkingDelta {
+            thinking: "Reviewing the request and checking the TUI render path.".into(),
+        });
+
+        let mut terminal = MockTerminal::new(100, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(
+            joined.contains("think"),
+            "missing inline think label: {joined}"
+        );
+        assert!(
+            joined.contains("Reviewing the request"),
+            "missing inline thinking text: {joined}"
+        );
+        assert!(
+            !joined.contains("┌💭 Thinking") && !joined.contains("┌ 💭 Thinking"),
+            "thinking should not render as a floating panel: {joined}"
+        );
+    }
+
+    #[test]
+    fn streaming_snapshot_deltas_replace_instead_of_duplicate() {
+        let mut state = TuiState::new("m", "s");
+        state.apply_event(CowdEvent::TurnStarted);
+        state.apply_event(CowdEvent::TextDelta {
+            text: "partial".into(),
+        });
+        state.apply_event(CowdEvent::TextDelta {
+            text: "partial output".into(),
+        });
+        state.apply_event(CowdEvent::TurnComplete {
+            assistant_text: "partial output".into(),
+            iterations: 1,
+        });
+
+        assert_eq!(state.timeline_len(), 1);
+        let text = state.timeline_get(0).unwrap().full_text();
+        assert_eq!(text, "partial output");
     }
 
     #[test]

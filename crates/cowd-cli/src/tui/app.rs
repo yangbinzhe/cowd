@@ -952,7 +952,12 @@ impl App {
                 if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline_last_mut()
                 {
                     if role == "assistant" && content != "✓ Done" {
-                        content.push_str(&text);
+                        if text.starts_with(content.as_str()) {
+                            content.clear();
+                            content.push_str(&text);
+                        } else {
+                            content.push_str(&text);
+                        }
                         found = true;
                     }
                 }
@@ -976,7 +981,12 @@ impl App {
                 }) = self.timeline_last_mut()
                 {
                     if !*complete {
-                        content.push_str(&thinking);
+                        if thinking.starts_with(content.as_str()) {
+                            content.clear();
+                            content.push_str(&thinking);
+                        } else {
+                            content.push_str(&thinking);
+                        }
                         found = true;
                     }
                 }
@@ -1132,18 +1142,23 @@ impl App {
                         _ => {}
                     }
                 }
-                if !assistant_text.is_empty() && !self.streaming_received {
-                    self.timeline_push(TimelineEntry::Message {
-                        role: "assistant".into(),
-                        content: assistant_text,
-                        timestamp: App::format_timestamp(),
-                    });
+                if !assistant_text.is_empty() {
+                    if self.streaming_received {
+                        if let Some(TimelineEntry::Message { role, content, .. }) =
+                            self.timeline_last_mut()
+                        {
+                            if role == "assistant" && assistant_text.starts_with(content.as_str()) {
+                                *content = assistant_text;
+                            }
+                        }
+                    } else {
+                        self.timeline_push(TimelineEntry::Message {
+                            role: "assistant".into(),
+                            content: assistant_text,
+                            timestamp: App::format_timestamp(),
+                        });
+                    }
                 }
-                self.timeline_push(TimelineEntry::Message {
-                    role: "assistant".into(),
-                    content: "✓ Done".into(),
-                    timestamp: App::format_timestamp(),
-                });
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }

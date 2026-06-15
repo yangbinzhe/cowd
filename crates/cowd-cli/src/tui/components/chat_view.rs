@@ -299,7 +299,7 @@ impl Component for ChatView {
             self.last_drawn_version = self.msg_version;
             self.lines_dirty = false;
         } else if self.lines_dirty {
-            Self::rebuild_streaming_tail(self);
+            self.cached_chat_lines = Self::build_new_lines(self);
             self.entry_line_counts = Self::compute_entry_line_counts(self);
             self.lines_dirty = false;
         }
@@ -928,19 +928,56 @@ impl ChatView {
                 complete,
                 expanded: _,
             } => {
-                let total_lines = content.lines().count();
-                let status = if *complete { "complete" } else { "thinking" };
                 let focus_marker = if is_focused { "● " } else { "  " };
-
-                // Always collapsed in main view – details in Run panel
-                let preview: String = content.chars().take(80).collect();
-                let more = if content.len() > 80 { "..." } else { "" };
-                lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"
+                let label = if *complete { "thought" } else { "thinking" };
+                let status = if *complete { "saved" } else { "streaming" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{focus_marker}think "),
+                        Style::default().fg(Color::Cyan).bold(),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                )]));
+                    Span::styled(label.to_string(), Style::default().fg(Color::Gray).bold()),
+                    Span::styled(
+                        format!(" · {status}"),
+                        Style::default().fg(if *complete {
+                            Color::DarkGray
+                        } else {
+                            Color::Yellow
+                        }),
+                    ),
+                ]));
+
+                let max_lines = if *complete { 3 } else { 8 };
+                let mut shown = 0usize;
+                for line in content.lines().filter(|line| !line.trim().is_empty()) {
+                    if shown >= max_lines {
+                        break;
+                    }
+                    let trimmed: String = line.chars().take(120).collect();
+                    let more = if line.chars().count() > 120 {
+                        "..."
+                    } else {
+                        ""
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  ".to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{trimmed}{more}"),
+                            Style::default().fg(if *complete { Color::Gray } else { Color::White }),
+                        ),
+                    ]));
+                    shown += 1;
+                }
+                let total_non_empty = content
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                if total_non_empty > shown {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ... {} more thinking lines", total_non_empty - shown),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
             }
 
             TimelineEntry::ToolCall {
@@ -1209,11 +1246,14 @@ mod tests {
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("Thinking"),
-            "Expected 'Thinking' in collapsed output"
+            joined.contains("think"),
+            "Expected thinking label in collapsed output"
         );
-        assert!(joined.contains("3L"), "Expected line count '3L'");
-        assert!(joined.contains("complete"), "Expected 'complete' status");
+        assert!(
+            joined.contains("line1"),
+            "Expected thinking text to be visible"
+        );
+        assert!(joined.contains("saved"), "Expected saved status");
     }
 
     #[test]
@@ -1233,10 +1273,13 @@ mod tests {
             "Expected preview to contain 'line A'"
         );
         assert!(
-            joined.contains("Thinking [complete]"),
+            joined.contains("thought"),
             "Expected thinking status indicator"
         );
-        assert!(joined.contains("💭"), "Expected thinking icon in output");
+        assert!(
+            joined.contains("line B"),
+            "Expected thinking text in output"
+        );
     }
 
     #[test]
