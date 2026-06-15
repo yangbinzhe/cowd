@@ -436,6 +436,9 @@ impl Component for StatusBar {
         let sep = " │ ";
 
         for section in &self.sections {
+            if !status_section_visible_for_width(section.id.as_str(), available) {
+                continue;
+            }
             let text = match &section.content {
                 Some(c) if !c.is_empty() => c.clone(),
                 _ => continue,
@@ -489,6 +492,16 @@ impl Component for StatusBar {
 
     fn id(&self) -> &str {
         "status_bar"
+    }
+}
+
+fn status_section_visible_for_width(id: &str, available: u16) -> bool {
+    match id {
+        "version" | "model" | "session" | "focus" => true,
+        "context" => available >= 96,
+        "approvals" | "permission_status" => available >= 120,
+        "input_hint" => available >= 150,
+        _ => available >= 132,
     }
 }
 
@@ -758,6 +771,30 @@ mod tests {
             joined.contains("model:deepseek"),
             "model should stay visible on narrow status bars: {joined}"
         );
+    }
+
+    #[test]
+    fn render_default_status_suppresses_low_priority_sections_on_medium_width() {
+        let app = App::new("deepseek-v4-pro", "session-status-medium");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+        if let Some(section) = bar.section_mut("focus") {
+            section.content = Some("focus:chat".into());
+        }
+
+        let mut terminal = MockTerminal::new(110, 3);
+        let theme = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &theme);
+            bar.render(&mut ctx, Rect::new(0, 0, 110, 1));
+        });
+
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(joined.contains("focus:chat"));
+        assert!(joined.contains("ctx:"));
+        assert!(!joined.contains("approvals:"));
+        assert!(!joined.contains("perm:"));
+        assert!(!joined.contains("Enter send"));
     }
 
     #[test]

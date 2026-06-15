@@ -3464,10 +3464,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             state.app.server_running = false;
             state.app.active_api_sessions = 0;
             state.app.server_uptime_secs = None;
-            state.add_message(
-                "system",
-                &format!("Daemon control unavailable; using local TUI runtime fallback: {err}"),
-            );
+            tracing::debug!("daemon control unavailable; local TUI runtime fallback: {err}");
+            state.add_message("system", "Daemon unavailable; local TUI runtime active.");
         }
     }
     terminal.draw(|f| state.render(f))?;
@@ -4973,20 +4971,17 @@ fn format_startup_banner_with_task(
             objective
         )
     });
+    let short_session = truncate_for_banner(session_id, 18);
     format!(
-        "============================\n\x1b[1;31m          COWD v{VERSION}\x1b[0m\n============================\n\
-   \x1b[2mModel\x1b[0m       {}\n\
-   \x1b[2mWorkspace\x1b[0m    {}\n\
-   \x1b[2mBranch\x1b[0m       {}\n\
-   \x1b[2mMode\x1b[0m         {}\n\
-   \x1b[2mSession\x1b[0m      {}\n{}\
-\n\
-   \x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts · \x1b[2mShift+Enter\x1b[0m newline",
+        "\x1b[1;31mCOWD v{VERSION}\x1b[0m  \x1b[2m{}\x1b[0m\n\
+\x1b[2mBranch\x1b[0m {}  \x1b[2mMode\x1b[0m {}  \x1b[2mSession\x1b[0m {}\n\
+\x1b[2mWorkspace\x1b[0m {}\n{}\
+\x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts",
         model,
-        workspace,
         git_branch,
         if yolo_mode { "yolo" } else { "standard" },
-        session_id,
+        short_session,
+        workspace,
         task_line,
     )
 }

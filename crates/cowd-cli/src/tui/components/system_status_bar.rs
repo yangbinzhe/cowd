@@ -70,42 +70,20 @@ impl Component for SystemStatusBar {
             "blocked" | "degraded" => Color::Red,
             _ => Color::Yellow,
         };
-        let gateway_color = if self.gateway.starts_with("up:") {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
-        let connector_color = if self.connectors.contains("degraded") {
-            Color::Yellow
-        } else if self.connectors == "none" {
-            Color::DarkGray
-        } else {
-            Color::Green
-        };
-        let memory_color = match self.memory.as_str() {
-            "available" | "enabled" | "ready" => Color::Green,
-            "degraded" => Color::Yellow,
-            "disabled" => Color::DarkGray,
-            _ => Color::DarkGray,
+        let turn_color = match self.turn.as_str() {
+            "idle" => Color::DarkGray,
+            "thinking" => Color::Yellow,
+            _ => Color::White,
         };
 
         let mut spans = vec![
             Span::styled(
-                "runtime ",
+                "cowd ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(self.runtime.clone(), Style::default().fg(runtime_color)),
-            sep(),
-            Span::styled("turn ", Style::default().fg(Color::DarkGray)),
-            Span::styled(self.turn.clone(), Style::default().fg(Color::White)),
-            sep(),
-            Span::styled("daemon ", Style::default().fg(Color::DarkGray)),
-            Span::styled(self.daemon.clone(), Style::default().fg(runtime_color)),
-            sep(),
-            Span::styled("gateway ", Style::default().fg(Color::DarkGray)),
-            Span::styled(self.gateway.clone(), Style::default().fg(gateway_color)),
             sep(),
             Span::styled("provider ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -113,14 +91,8 @@ impl Component for SystemStatusBar {
                 Style::default().fg(Color::White),
             ),
             sep(),
-            Span::styled("connectors ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                self.connectors.clone(),
-                Style::default().fg(connector_color),
-            ),
-            sep(),
-            Span::styled("memory ", Style::default().fg(Color::DarkGray)),
-            Span::styled(preview(&self.memory, 18), Style::default().fg(memory_color)),
+            Span::styled("turn ", Style::default().fg(Color::DarkGray)),
+            Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
         ];
 
         if let Some(issue) = &self.issue {
@@ -207,6 +179,9 @@ fn fit_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::components::RenderContext;
+    use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
 
     #[test]
     fn runtime_health_blocks_on_pending_approvals() {
@@ -241,5 +216,27 @@ mod tests {
         );
 
         assert_eq!(connector_health(&app), "1a/1c");
+    }
+
+    #[test]
+    fn render_system_status_bar_keeps_top_line_calm() {
+        let app = App::new("deepseek-v4-pro", "s");
+        let mut bar = SystemStatusBar::new();
+        bar.sync_from_app(&app);
+
+        let mut terminal = MockTerminal::new(100, 3);
+        let skin = SkinConfig::default();
+        terminal.draw(|frame| {
+            let mut ctx = RenderContext::new(frame, &skin);
+            bar.render(&mut ctx, Rect::new(0, 0, 100, 1));
+        });
+
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(joined.contains("cowd"));
+        assert!(joined.contains("provider"));
+        assert!(joined.contains("turn"));
+        assert!(!joined.contains("gateway"));
+        assert!(!joined.contains("connectors"));
+        assert!(!joined.contains("memory"));
     }
 }
