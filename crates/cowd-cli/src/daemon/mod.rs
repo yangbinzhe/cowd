@@ -31,7 +31,8 @@ use memory::UnifiedSessionStore;
 use runtime::mirror::MessageMirror;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::platform::config::PlatformRuntimeConfig;
-use runtime::platform::{PlatformConfig, PlatformRuntime};
+use runtime::platform::{InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime};
+use runtime::{ContentBlock, ConversationMessage};
 use tools::GlobalToolRegistry;
 
 use runtime::session_lifecycle::{
@@ -332,6 +333,229 @@ fn resolve_webui_dir() -> PathBuf {
     crate::gateway_static::resolve_static_webui_source().path
 }
 
+fn spawn_platform_inbound_loop(
+    platform_runtime: Arc<PlatformRuntime>,
+    app_state: Arc<api_routes::AppState>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move {
+            tracing::info!("platform inbound loop started");
+            loop {
+                match platform_runtime.next_message().await {
+                    Ok(Some(message)) => {
+                        if let Err(error) = handle_platform_inbound_message(
+                            platform_runtime.clone(),
+                            app_state.clone(),
+                            message,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %error, "platform inbound message handling failed");
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!("platform inbound message channel closed");
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "platform inbound receive failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+    });
+}
+
+async fn handle_platform_inbound_message(
+    platform_runtime: Arc<PlatformRuntime>,
+    app_state: Arc<api_routes::AppState>,
+    message: InboundMessage,
+) -> Result<(), String> {
+    let session_id = platform_session_id(&message);
+    let runtime_entry = ensure_platform_session_runtime(&app_state, &session_id).await?;
+
+    tracing::info!(
+        platform = %message.session_key.platform,
+        user = %message.session_key.user_id,
+        session_id = %session_id,
+        text_len = message.text.len(),
+        "platform inbound message received"
+    );
+
+    let summary = {
+        let mut runtime = runtime_entry.lock().await;
+        runtime
+            .run_turn_async(&message.text, &runtime::permissions::SharedPrompter::none())
+            .await
+            .map_err(|error| format!("runtime turn failed: {error}"))?
+    };
+    let reply = assistant_reply_text(&summary.assistant_messages)
+        .unwrap_or_else(|| "我已收到，但这次没有生成可发送的文本回复。".to_string());
+
+    let outbound = OutboundMessage {
+        session_key: message.session_key.clone(),
+        text: reply,
+        reply_to: message.message_id.clone(),
+        metadata: serde_json::json!({
+            "source": "cowd.platform_inbound_loop",
+            "session_id": session_id,
+            "inbound_message_id": message.message_id,
+        }),
+    };
+    platform_runtime
+        .send_response(&message.session_key.platform, outbound)
+        .await
+        .map_err(|error| format!("send response failed: {error}"))?;
+
+    if let (Some(store), Some(runtime_entry)) = (
+        app_state.session_kernel.unified_store(),
+        app_state.session_kernel.active_runtime(&session_id),
+    ) {
+        let runtime = runtime_entry.lock().await;
+        let session = runtime.session();
+        if let Err(error) = crate::api_routes::sync_runtime_session_metadata_to_store(
+            store.as_ref(),
+            &session_id,
+            &session,
+        )
+        .await
+        {
+            tracing::warn!(%session_id, error = %error, "failed to sync platform session metadata");
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_platform_session_runtime(
+    app_state: &api_routes::AppState,
+    session_id: &str,
+) -> Result<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>, String> {
+    if let Some(entry) = app_state.session_kernel.active_runtime(session_id) {
+        return Ok(entry);
+    }
+
+    let model = default_platform_session_model(app_state);
+    let session = runtime::Session::new();
+    let runtime = if let Some(store) = app_state.session_kernel.unified_store() {
+        crate::build_runtime_with_session_store(
+            store.clone(),
+            session,
+            session_id,
+            model.clone(),
+            vec![],
+            true,
+            false,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    } else {
+        crate::build_runtime(
+            session,
+            session_id,
+            model.clone(),
+            vec![],
+            true,
+            false,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    }
+    .map_err(|error| format!("failed to build platform session runtime: {error}"))?;
+
+    app_state
+        .session_kernel
+        .register_runtime(session_id.to_string(), runtime)
+        .map_err(|error| format!("failed to register platform session runtime: {error}"))?;
+
+    if app_state.session_kernel.unified_store().is_some() {
+        let mut record = crate::api_routes::new_api_session_record(session_id, Some(model));
+        record.platform = "platform".to_string();
+        record.chat_id = session_id.to_string();
+        record.metadata_json = Some(
+            serde_json::json!({
+                "title": format!("WeChat {}", session_id.chars().rev().take(8).collect::<String>().chars().rev().collect::<String>()),
+                "source": "platform_inbound",
+            })
+            .to_string(),
+        );
+        if let Err(error) = app_state
+            .session_kernel
+            .upsert_stored_session(&record)
+            .await
+        {
+            tracing::warn!(%session_id, error = %error, "failed to persist platform session");
+        }
+    }
+
+    app_state
+        .session_kernel
+        .active_runtime(session_id)
+        .ok_or_else(|| "registered platform runtime missing".to_string())
+}
+
+fn default_platform_session_model(app_state: &api_routes::AppState) -> String {
+    app_state
+        .config
+        .as_ref()
+        .and_then(|config| config.get("model"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+}
+
+fn platform_session_id(message: &InboundMessage) -> String {
+    let thread = message
+        .session_key
+        .thread_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&message.session_key.user_id);
+    format!(
+        "channel-{}-{}",
+        safe_session_component(&message.session_key.platform),
+        safe_session_component(thread)
+    )
+}
+
+fn safe_session_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
+fn assistant_reply_text(messages: &[ConversationMessage]) -> Option<String> {
+    let text = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 fn build_cors_layer(explicit_origins: Vec<HeaderValue>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
@@ -572,9 +796,20 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         if !pc.enabled {
             continue;
         }
-        let settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
+        let mut settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
         match pc.platform_type.as_str() {
             "feishu" | "lark" => {
+                // Auto-inject base_url for Lark (international) — defaults to open.larksuite.com
+                if pc.platform_type == "lark" {
+                    if let Some(obj) = settings_json.as_object_mut() {
+                        if !obj.contains_key("base_url") {
+                            obj.insert(
+                                "base_url".to_string(),
+                                serde_json::Value::String("https://open.larksuite.com".to_string()),
+                            );
+                        }
+                    }
+                }
                 match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
                     Ok(adapter) => {
                         let app_id = pc
@@ -641,6 +876,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     if let Err(e) = platform_runtime.start().await {
         tracing::error!("failed to start platform runtime: {e}");
     }
+    spawn_platform_inbound_loop(platform_runtime.clone(), app_state.clone());
 
     // 6. Unix socket accept loop (background)
     // Use spawn_blocking — handle_unix_client internally calls run_turn_async
@@ -1698,6 +1934,52 @@ mod tests {
                 "{origin} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn platform_session_id_is_stable_and_safe() {
+        let message = InboundMessage {
+            platform: runtime::platform::Platform::WeChat,
+            session_key: runtime::platform::SessionKey::new(
+                "wechat_ilink",
+                "o9cq8003hLBXjG9UUzafDuDSS1hM@im.wechat",
+            ),
+            text: "hello".to_string(),
+            sender_name: None,
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            message_type: runtime::platform::MessageType::Text,
+            message_id: Some("msg-1".to_string()),
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
+        };
+
+        assert_eq!(
+            platform_session_id(&message),
+            "channel-wechat_ilink-o9cq8003hLBXjG9UUzafDuDSS1hM_im_wechat"
+        );
+    }
+
+    #[test]
+    fn assistant_reply_text_merges_text_blocks_only() {
+        let messages = vec![ConversationMessage::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "hidden".to_string(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "hello".to_string(),
+            },
+            ContentBlock::Text {
+                text: " world".to_string(),
+            },
+        ])];
+
+        assert_eq!(
+            assistant_reply_text(&messages).as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]

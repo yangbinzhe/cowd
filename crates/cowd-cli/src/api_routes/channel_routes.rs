@@ -254,7 +254,19 @@ fn qr_svg(scan_data: &str) -> Option<String> {
     })
 }
 
-async fn wechat_ilink_accounts_handler() -> impl IntoResponse {
+async fn wechat_ilink_accounts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let runtime_bound = if let Some(runtime) = &state.platform_runtime {
+        runtime.has_bound_adapter("wechat_ilink").await
+    } else {
+        false
+    };
+    let bound_adapters = if let Some(runtime) = &state.platform_runtime {
+        runtime.list_bound_adapters().await
+    } else {
+        Vec::new()
+    };
     let accounts = runtime::platform::wechat_ilink::list_wechat_qr_accounts(None)
         .unwrap_or_default()
         .into_iter()
@@ -267,8 +279,12 @@ async fn wechat_ilink_accounts_handler() -> impl IntoResponse {
             })
         })
         .collect::<Vec<_>>();
+    let usable = runtime_bound && !accounts.is_empty();
     Json(serde_json::json!({
         "kind": "wechat_ilink_accounts",
+        "runtime_bound": runtime_bound,
+        "usable": usable,
+        "bound_adapters": bound_adapters,
         "accounts": accounts
     }))
 }
