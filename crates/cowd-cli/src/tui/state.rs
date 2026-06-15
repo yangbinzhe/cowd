@@ -808,6 +808,9 @@ impl TuiState {
 
         // 1. Render chat view + sidebar using the layout tree
         {
+            main_ctx
+                .frame_mut()
+                .render_widget(ratatui::widgets::Clear, frame_areas.body);
             self.layout_tree.resize(frame_areas.body);
             let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(frame_areas.body);
             let topic_fullscreen = self.layout_state.sidebar_visible
@@ -897,6 +900,9 @@ impl TuiState {
             }
 
             if self.layout_state.sidebar_visible && sidebar_area.width > 0 {
+                main_ctx
+                    .frame_mut()
+                    .render_widget(ratatui::widgets::Clear, sidebar_area);
                 // Render sidebar: tab bar + active panel
                 let tab_height = 1u16;
                 let tab_area = ratatui::layout::Rect::new(
@@ -1670,15 +1676,6 @@ impl TuiState {
             return self.handle_search_key(key);
         }
 
-        if self.should_open_slash_command_palette(&key) {
-            self.app.input.input(key);
-            let text = self.app.input.lines().join("\n");
-            self.prompt.refresh_suggestions_from_text(&text);
-            self.open_command_palette_with_query("/");
-            self.set_focus_target(FocusTarget::CommandPalette);
-            return ProcessedKey::Nothing;
-        }
-
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
@@ -1705,8 +1702,13 @@ impl TuiState {
                     .prompt
                     .apply_highlighted_suggestion_to_text(&input_text)
                 {
-                    self.replace_input_text(&new_text);
-                    return ProcessedKey::Nothing;
+                    if new_text != input_text {
+                        self.replace_input_text(&new_text);
+                        return ProcessedKey::Nothing;
+                    }
+                    self.prompt.clear_suggestions();
+                } else {
+                    self.prompt.clear_suggestions();
                 }
             }
             if self.app.input.is_empty() {
@@ -2243,6 +2245,21 @@ impl TuiState {
 
         self.open_sidebar_tab(tab, label);
         true
+    }
+
+    pub fn open_surface_for_slash_result(&mut self, command_name: &str) {
+        match command_name {
+            "status" | "model" | "cost" | "sandbox" | "config" | "doctor" | "context" => {
+                self.open_sidebar_tab(0, "Runtime");
+            }
+            "memory" | "closet" => self.open_topic_panel(SidebarTopicPanel::Memory),
+            "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
+            "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
+            "tasks" | "approvals" => self.open_sidebar_tab(2, "Goals"),
+            "session" | "resume" => self.open_sidebar_tab(6, "Sessions"),
+            "gateway" => self.open_sidebar_tab(7, "Gateway"),
+            _ => {}
+        }
     }
 
     fn try_focus_command(&mut self, command: &str) -> bool {
@@ -4474,7 +4491,7 @@ providers:
     }
 
     #[test]
-    fn mid_text_slash_uses_input_suggestions_without_opening_palette() {
+    fn slash_keeps_input_control_without_opening_palette_or_placeholder() {
         let mut state = TuiState::new("m", "s");
         state.replace_input_text("inspect ");
 
@@ -4484,13 +4501,10 @@ providers:
         assert!(!state.command_palette.is_open());
         assert_eq!(state.input_text(), "inspect /");
         assert!(
-            state.prompt.suggestions_visible(),
-            "mid-text slash should use inline suggestions"
+            !state.prompt.suggestions_visible(),
+            "bare slash should not show placeholder suggestions"
         );
-        assert_eq!(
-            state.focus_for_current_surface(),
-            FocusTarget::PromptSuggestions
-        );
+        assert_eq!(state.focus_for_current_surface(), FocusTarget::Input);
     }
 
     #[test]
@@ -4499,6 +4513,7 @@ providers:
         state.context_suggestions.test_show("context side effect");
         state.replace_input_text("inspect ");
         state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert!(state.prompt.suggestions_visible());
 
         let mut terminal = MockTerminal::new(100, 24);
@@ -4512,6 +4527,39 @@ providers:
         assert!(
             !joined.contains("context side effect"),
             "context bar should yield while prompt dropdown is active: {joined}"
+        );
+    }
+
+    #[test]
+    fn exact_slash_command_enter_submits_instead_of_accepting_completion() {
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("/status");
+        state.prompt.refresh_suggestions_from_text_at_cursor(
+            &state.input_text(),
+            state.input_cursor_byte_offset(),
+        );
+        assert!(state.prompt.suggestions_visible());
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Submit(text) if text == "/status"));
+        assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn slash_result_opens_expected_surface() {
+        let mut state = TuiState::new("m", "s");
+
+        state.open_surface_for_slash_result("status");
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.sidebar_active_tab, 0);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+
+        state.open_surface_for_slash_result("memory");
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Memory));
+        assert_eq!(
+            state.focus_target,
+            FocusTarget::TopicPanel(SidebarTopicPanel::Memory)
         );
     }
 

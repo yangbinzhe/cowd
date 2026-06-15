@@ -420,12 +420,16 @@ impl MemoryPanel {
                     _ => "⚪",
                 };
 
-                let content_preview = if entry.content.len() > inner_width.saturating_sub(12) {
-                    let max_len = inner_width.saturating_sub(12);
-                    format!("{}...", &entry.content[..max_len.min(entry.content.len())])
-                } else {
-                    entry.content.clone()
-                };
+                let content_preview =
+                    if entry.content.chars().count() > inner_width.saturating_sub(12) {
+                        let max_len = inner_width.saturating_sub(12);
+                        format!(
+                            "{}...",
+                            entry.content.chars().take(max_len).collect::<String>()
+                        )
+                    } else {
+                        entry.content.clone()
+                    };
 
                 lines.push(Line::from(vec![
                     Span::styled(cursor, cursor_style),
@@ -1228,6 +1232,21 @@ mod tests {
             joined.contains("..."),
             "Long entries should show ellipsis, got: {joined}"
         );
+    }
+
+    #[test]
+    fn entry_preview_handles_multibyte_text() {
+        let mut panel = MemoryPanel::new();
+        panel.entries = vec![MemoryEntry {
+            id: None,
+            layer: "L4".into(),
+            content: "系统架构 - 用户层/服务层/数据层三层".repeat(8),
+            priority: "normal".into(),
+        }];
+
+        let lines = render_panel(&mut panel, 58, 10);
+        let joined = lines.join("\n");
+        assert!(joined.contains("..."), "Should truncate safely: {joined}");
     }
 
     #[test]

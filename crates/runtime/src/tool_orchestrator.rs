@@ -245,21 +245,21 @@ impl ToolResultBudget {
                 )
             }
             TruncationStrategy::TailOnly => {
-                let start = output.len().saturating_sub(max_chars);
+                let start = char_tail_start(output, max_chars);
                 format!(
                     "[truncated: {} chars omitted]\n{}",
-                    output.len().saturating_sub(max_chars),
+                    output.chars().count().saturating_sub(max_chars),
                     &output[start..]
                 )
             }
             TruncationStrategy::HeadAndTail | TruncationStrategy::Summary => {
-                let head_end = self.head_chars.min(output.len());
-                let tail_start = output.len().saturating_sub(self.tail_chars);
+                let head_end = char_prefix_end(output, self.head_chars);
+                let tail_start = char_tail_start(output, self.tail_chars);
                 if tail_start <= head_end {
                     // Output is small enough after all
                     output.to_string()
                 } else {
-                    let omitted = tail_start - head_end;
+                    let omitted = output[head_end..tail_start].chars().count();
                     format!(
                         "{}\n\n... [truncated: {} chars omitted] ...\n\n{}",
                         &output[..head_end],
@@ -270,6 +270,26 @@ impl ToolResultBudget {
             }
         }
     }
+}
+
+fn char_prefix_end(value: &str, max_chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len())
+}
+
+fn char_tail_start(value: &str, max_chars: usize) -> usize {
+    let total = value.chars().count();
+    if total <= max_chars {
+        return 0;
+    }
+    value
+        .char_indices()
+        .nth(total - max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +513,21 @@ mod tests {
         let budget = ToolResultBudget::default();
         let short = "hello world";
         assert_eq!(budget.truncate(short), short);
+    }
+
+    #[test]
+    fn truncation_is_utf8_boundary_safe() {
+        let budget = ToolResultBudget {
+            per_tool_max_tokens: 10,
+            truncation_strategy: TruncationStrategy::HeadAndTail,
+            head_chars: 7,
+            tail_chars: 7,
+            ..ToolResultBudget::default()
+        };
+        let long_text = format!("{}{}{}", "─".repeat(20), "中文内容", "─".repeat(20));
+        let truncated = budget.truncate(&long_text);
+        assert!(truncated.contains("[truncated"));
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     #[test]

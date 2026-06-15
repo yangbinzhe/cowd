@@ -363,6 +363,9 @@ impl AutocompleteEngine {
     }
 
     fn command_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
         slash_command_specs()
             .iter()
             .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
@@ -1013,7 +1016,7 @@ impl Prompt {
     }
 
     /// Clear all suggestion state.
-    fn clear_suggestions(&mut self) {
+    pub fn clear_suggestions(&mut self) {
         self.suggestions.clear();
         self.highlighted = 0;
         self.show_suggestions = false;
@@ -1145,6 +1148,15 @@ impl Prompt {
     pub fn apply_highlighted_suggestion_to_text(&mut self, text: &str) -> Option<String> {
         let suggestion = self.highlighted_suggestion()?.clone();
         let request = self.current_request.clone()?;
+        if request.replace_start > text.len()
+            || request.replace_end > text.len()
+            || request.replace_start > request.replace_end
+            || !text.is_char_boundary(request.replace_start)
+            || !text.is_char_boundary(request.replace_end)
+        {
+            self.clear_suggestions();
+            return None;
+        }
         let next = request.apply_to_text(text, &suggestion.text);
         self.engine.record_use(&suggestion);
         self.clear_suggestions();

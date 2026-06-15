@@ -3300,7 +3300,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let mut state = TuiState::new(&cli.model, &session_id);
     state.app.yolo_mode = cli.yolo_mode;
     state.app.current_task = cli.yolo_task.as_ref().map(current_task_summary_from_record);
-    state.add_message("system", &cli.startup_banner());
+    state.add_message("system", &strip_ansi_for_tui(&cli.startup_banner()));
     state.add_message("system", &format_connected_line(&cli.model));
     let daemon_client = tui::control_client::DaemonControlClient::default_local();
     let mut daemon_session_ids: Vec<String> = Vec::new();
@@ -3597,20 +3597,30 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                                         match parsed {
                                             Some(cmd) => {
-                                                let output = capture_stdout(|| cli.handle_repl_command(cmd));
+                                                let cmd_name = text.strip_prefix('/')
+                                                    .and_then(|s| s.split_whitespace().next())
+                                                    .unwrap_or(&text)
+                                                    .to_string();
+                                                let model_switch_requested = matches!(
+                                                    cmd,
+                                                    SlashCommand::Model { model: Some(_) }
+                                                );
+                                                let output = tokio::task::block_in_place(|| {
+                                                    capture_stdout(|| cli.handle_repl_command(cmd))
+                                                });
                                                 match output {
                                                     Ok((true, captured)) => {
                                                         cli.persist_session()?;
-                                                        let cmd_name = text.strip_prefix('/')
-                                                            .and_then(|s| s.split_whitespace().next())
-                                                            .unwrap_or(&text);
-                                                        state.add_slash_output(cmd_name, &captured);
+                                                        if model_switch_requested {
+                                                            state.app.model = cli.model.clone();
+                                                            state.app.model_dirty = true;
+                                                        }
+                                                        state.add_slash_output(&cmd_name, &captured);
+                                                        state.open_surface_for_slash_result(&cmd_name);
                                                     }
                                                     Ok((false, captured)) => {
-                                                        let cmd_name = text.strip_prefix('/')
-                                                            .and_then(|s| s.split_whitespace().next())
-                                                            .unwrap_or(&text);
-                                                        state.add_slash_output(cmd_name, &captured);
+                                                        state.add_slash_output(&cmd_name, &captured);
+                                                        state.open_surface_for_slash_result(&cmd_name);
                                                     }
                                                     Err(e) => {
                                                         state.add_message("system", &format!("Error: {e}"));
@@ -4940,6 +4950,24 @@ impl HookAbortMonitor {
 
 fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> String {
     format_startup_banner_with_task(model, yolo_mode, session_id, None)
+}
+
+fn strip_ansi_for_tui(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn format_startup_banner_with_task(
@@ -11704,7 +11732,7 @@ mod tests {
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command, session_db_path,
         session_db_resume_context_packet, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
+        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
         workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
@@ -13696,6 +13724,15 @@ mod tests {
 
         assert!(banner.contains("yolo"));
         assert!(banner.contains("session-yolo-test"));
+    }
+
+    #[test]
+    fn tui_startup_banner_strip_removes_ansi_codes() {
+        let banner = format_startup_banner("claude-sonnet-4-6", false, "session-banner-test");
+        let plain = strip_ansi_for_tui(&banner);
+
+        assert!(plain.contains("COWD"));
+        assert!(!plain.contains("\u{1b}["));
     }
 
     #[test]
