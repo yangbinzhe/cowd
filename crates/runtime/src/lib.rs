@@ -270,7 +270,7 @@ pub use policy_engine::{
 pub use profile::{Profile, ProfileManager, ProfileMeta};
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use provider_registry::{
     init_global_providers, list_all_models, list_all_providers, list_models_for_provider,

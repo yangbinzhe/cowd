@@ -38,8 +38,6 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-/// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
@@ -180,8 +178,14 @@ impl SystemPromptBuilder {
             |context| context.current_date.clone(),
         );
         let mut lines = vec!["# Environment context".to_string()];
+        let active_model = self
+            .config
+            .as_ref()
+            .and_then(RuntimeConfig::model)
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or("unknown");
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
+            format!("Active model: {active_model}"),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -908,6 +912,8 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        assert!(prompt.contains("Active model: unknown"));
+        assert!(!prompt.contains("Claude Opus 4.6"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
