@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::http::{header, HeaderValue};
+use axum::http::HeaderValue;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api_routes;
@@ -332,6 +332,51 @@ fn resolve_webui_dir() -> PathBuf {
     crate::gateway_static::resolve_static_webui_source().path
 }
 
+fn build_cors_layer(explicit_origins: Vec<HeaderValue>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            explicit_origins.iter().any(|allowed| allowed == origin)
+                || is_loopback_web_origin(origin)
+        }))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::PATCH,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+}
+
+fn is_loopback_web_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        let Some(end) = stripped.find(']') else {
+            return false;
+        };
+        &stripped[..end]
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
+}
+
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
         let pid_path = crate::server::pid_file();
@@ -479,16 +524,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                 cors_origin_values.push(hv);
             }
         }
-        let cors = CorsLayer::new()
-            .allow_origin(cors_origin_values)
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::PUT,
-                axum::http::Method::PATCH,
-                axum::http::Method::DELETE,
-            ])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+        let cors = build_cors_layer(cors_origin_values);
 
         tracing::info!(path = %webui_dir.display(), "serving WebUI assets");
         api_routes::api_router(app_state.clone())
@@ -1632,6 +1668,36 @@ mod tests {
             message_mirror: None,
         };
         assert!(config.memory_config.is_some());
+    }
+
+    #[test]
+    fn loopback_web_origin_allows_local_webui_ports() {
+        for origin in [
+            "http://127.0.0.1:9241",
+            "http://127.1.2.3:5173",
+            "http://localhost:5173",
+            "https://localhost:3000",
+            "http://[::1]:9241",
+        ] {
+            let value = HeaderValue::from_str(origin).expect("valid origin");
+            assert!(is_loopback_web_origin(&value), "{origin} should be allowed");
+        }
+    }
+
+    #[test]
+    fn loopback_web_origin_rejects_non_local_hosts() {
+        for origin in [
+            "http://127.0.0.1.evil.test:9241",
+            "http://localhost.evil.test:5173",
+            "http://192.168.1.10:9241",
+            "file://127.0.0.1/index.html",
+        ] {
+            let value = HeaderValue::from_str(origin).expect("valid origin");
+            assert!(
+                !is_loopback_web_origin(&value),
+                "{origin} should be rejected"
+            );
+        }
     }
 
     #[test]
