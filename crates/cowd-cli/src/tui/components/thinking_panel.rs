@@ -19,16 +19,14 @@ struct ToolProgress {
     exit_code: Option<i32>,
 }
 
-/// Unified thinking panel showing reasoning + tool progress during a turn.
+/// Unified thinking panel showing reasoning + tool counters during a turn.
 ///
 /// During a turn:
 ///   ┌─ Thinking ────────────────────┐
 ///   │ ⠋ Reasoning...                │
 ///   │ Let me analyze the code...    │
 ///   │                               │
-///   │ Tools:                        │
-///   │   ├── bash: running (5s)      │
-///   │   └── read: ✓ done (2s)       │
+///   │ Tools: 2 tools · 1 done       │
 ///   └───────────────────────────────┘
 ///
 /// After turn complete (collapsed summary):
@@ -188,41 +186,17 @@ impl Component for ThinkingPanel {
                 lines.push(Line::raw(""));
             }
 
-            // ── Tool progress list ────────────────────────────────
+            // ── Tool counters only; detailed process lives in Runtime.
             if !self.tools.is_empty() {
+                let total_tools = self.tools.len();
+                let done_tools = self.tools.iter().filter(|tool| tool.done).count();
+                let running_tools = total_tools.saturating_sub(done_tools);
                 lines.push(Line::from(Span::styled(
-                    "Tools:",
+                    format!("{total_tools} tools · {done_tools} done · {running_tools} running"),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )));
-                for (i, tool) in self.tools.iter().enumerate() {
-                    let tree_char = if i == self.tools.len() - 1 {
-                        "└── "
-                    } else {
-                        "├── "
-                    };
-                    let (icon, icon_color) = if tool.done {
-                        if tool.exit_code == Some(0) {
-                            ("✓", Color::Green)
-                        } else {
-                            ("✗", Color::Red)
-                        }
-                    } else {
-                        (self.spinner_char(), Color::Yellow)
-                    };
-                    let status = if tool.done { "done" } else { "running" };
-
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {tree_char}"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(format!("{} ", tool.name), Style::default().fg(Color::White)),
-                        Span::styled(icon, Style::default().fg(icon_color)),
-                        Span::styled(format!(" {status}"), Style::default().fg(Color::DarkGray)),
-                    ]));
-                }
             }
         }
 
@@ -321,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_progress_in_same_panel() {
+    fn tool_progress_stays_as_counts_only() {
         let mut panel = ThinkingPanel::new();
         panel.visible = true;
         panel.collapsed = false;
@@ -342,13 +316,11 @@ mod tests {
 
         let lines = render_panel(&mut panel, 40, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("Tools"), "Should show Tools header");
-        assert!(joined.contains("bash"), "Should show bash tool");
-        assert!(joined.contains("read"), "Should show read tool");
-        assert!(
-            joined.contains("├──") || joined.contains("└──"),
-            "Should show tree characters"
-        );
+        assert!(joined.contains("2 tools"), "Should show tool count");
+        assert!(joined.contains("1 done"), "Should show done count");
+        assert!(joined.contains("1 running"), "Should show running count");
+        assert!(!joined.contains("bash"), "Should not show tool names");
+        assert!(!joined.contains("read"), "Should not show tool names");
     }
 
     #[test]

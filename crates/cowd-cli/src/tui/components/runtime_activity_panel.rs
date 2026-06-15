@@ -66,6 +66,7 @@ pub struct RuntimeActivityPanel {
     message_count: usize,
     tool_event_count: usize,
     open_tool_count: usize,
+    recent_tools: Vec<String>,
     /// Current turn activity summary.
     turn_activity: TurnActivity,
     /// Scroll offset for long runtime status content.
@@ -215,6 +216,7 @@ impl RuntimeActivityPanel {
         self.message_count = 0;
         self.tool_event_count = 0;
         self.open_tool_count = 0;
+        self.recent_tools.clear();
         self.turn_activity = TurnActivity::default();
         self.turn_activity.active = app.turn_active;
         for entry in &timeline {
@@ -227,7 +229,14 @@ impl RuntimeActivityPanel {
                         self.turn_activity.thinking = true;
                     }
                 }
-                TimelineEntry::ToolCall { name, done, .. } => {
+                TimelineEntry::ToolCall {
+                    name,
+                    preview,
+                    output,
+                    done,
+                    exit_code,
+                    ..
+                } => {
                     self.tool_event_count += 1;
                     if !*done {
                         self.open_tool_count += 1;
@@ -238,6 +247,9 @@ impl RuntimeActivityPanel {
                     } else {
                         self.turn_activity.tool_count += 1;
                     }
+                    self.recent_tools.push(format_tool_process_line(
+                        name, preview, output, *done, *exit_code,
+                    ));
                 }
                 _ => {}
             }
@@ -550,6 +562,22 @@ impl Component for RuntimeActivityPanel {
             },
         ));
 
+        if !self.recent_tools.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Tool Process",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for tool in self.recent_tools.iter().rev().take(8) {
+                lines.push(Line::from(vec![
+                    Span::styled("- ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(tool.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -648,6 +676,30 @@ fn preview(value: &str, max: usize) -> String {
         normalized
     } else {
         normalized.chars().take(max).collect::<String>() + "..."
+    }
+}
+
+fn format_tool_process_line(
+    name: &str,
+    tool_preview: &str,
+    output: &str,
+    done: bool,
+    exit_code: Option<i32>,
+) -> String {
+    let state = if done {
+        format!("done exit:{}", exit_code.unwrap_or(0))
+    } else {
+        "running".to_string()
+    };
+    let detail = if !output.trim().is_empty() {
+        output
+    } else {
+        tool_preview
+    };
+    if detail.trim().is_empty() {
+        format!("{name} {state}")
+    } else {
+        format!("{name} {state} - {}", preview(detail, 72))
     }
 }
 
@@ -794,9 +846,11 @@ mod tests {
         assert!(rendered.contains("2 events"));
         assert!(rendered.contains("1 messages"));
         assert!(rendered.contains("1 tools"));
+        assert!(rendered.contains("Tool Process"));
+        assert!(rendered.contains("bash done exit:0 - ok"));
 
-        // Recent/process details live in ActivityPanel, not Runtime.
-        assert!(!rendered.contains("Recent"));
+        // The runtime panel owns tool process details; the separate Activity
+        // panel remains a manually opened recent-event stream.
         assert!(!rendered.contains("user: ship the runtime console"));
 
         runtime::init_global_providers(runtime::ProvidersConfig::default());

@@ -610,6 +610,8 @@ impl TuiState {
     /// crossterm has no custom event type. Components should check
     /// for this and re-sync from App state as needed.
     pub fn apply_event(&mut self, event: CowdEvent) {
+        let opens_runtime_for_tool = matches!(event, CowdEvent::ToolStart { .. });
+
         // Push toast on errors
         if let CowdEvent::TurnError { ref error } = event {
             self.toast_manager.push(
@@ -623,6 +625,10 @@ impl TuiState {
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
 
+        if opens_runtime_for_tool {
+            self.open_runtime_sidebar_for_tool();
+        }
+
         // Bridge: notify new components that state has changed.
         // Using Resize(0,0) as a sentinel — real resize events always
         // have non-zero dimensions, so this is unambiguous.
@@ -631,6 +637,16 @@ impl TuiState {
 
         // Drain and dispatch to registered components.
         self.event_dispatcher.dispatch(&self.event_bus);
+    }
+
+    fn open_runtime_sidebar_for_tool(&mut self) {
+        self.activity_panel_visible = false;
+        self.active_topic_panel = None;
+        if !self.layout_state.sidebar_visible {
+            self.layout_state.toggle_sidebar(&mut self.layout_tree);
+        }
+        self.sidebar_active_tab = 0;
+        self.set_focus_target(FocusTarget::Sidebar);
     }
 
     // ── Rendering ───────────────────────────────────────────────
@@ -741,8 +757,7 @@ impl TuiState {
             section.content = Some(current_focus.hint().into());
         }
         self.status_bar.tick();
-        let show_activity_panel = (self.app.turn_active || self.activity_panel_visible)
-            && !self.layout_state.sidebar_visible;
+        let show_activity_panel = self.activity_panel_visible && !self.layout_state.sidebar_visible;
         if show_activity_panel {
             self.activity_panel.sync_from_app(&self.app);
         }
@@ -3995,6 +4010,7 @@ providers:
         let mut state = TuiState::new("m", "s");
 
         state.apply_event(CowdEvent::TurnStarted);
+        assert!(!state.layout_state.sidebar_visible);
         state.apply_event(CowdEvent::ToolStart {
             id: "t1".into(),
             name: "bash".into(),
@@ -4004,6 +4020,10 @@ providers:
         assert!(state.timeline_iter().any(
             |(_, e)| matches!(&e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")
         ));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, 0);
+        assert!(!state.activity_panel_visible);
     }
 
     #[test]

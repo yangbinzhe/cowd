@@ -72,6 +72,17 @@ pub struct ChatView {
 }
 
 impl ChatView {
+    fn renders_in_main_chat(entry: &TimelineEntry) -> bool {
+        !matches!(entry, TimelineEntry::ToolCall { .. })
+    }
+
+    fn visible_main_entries(&self) -> impl Iterator<Item = (usize, &TimelineEntry)> {
+        self.timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| Self::renders_in_main_chat(entry))
+    }
+
     /// Create a new empty chat view with default 24-row viewport.
     #[must_use]
     pub fn new() -> Self {
@@ -249,7 +260,11 @@ impl ChatView {
 
     /// Total number of content lines (including separator blanks and spinner).
     pub fn total_lines(&self) -> usize {
-        let n = self.entry_line_counts.len();
+        let n = self
+            .timeline
+            .iter()
+            .filter(|entry| Self::renders_in_main_chat(entry))
+            .count();
         let mut total: usize = self
             .entry_line_counts
             .iter()
@@ -444,7 +459,13 @@ impl ChatView {
     fn compute_entry_line_counts(&self) -> Vec<u16> {
         self.timeline
             .iter()
-            .map(|e| e.expanded_lines() as u16)
+            .map(|e| {
+                if Self::renders_in_main_chat(e) {
+                    e.expanded_lines() as u16
+                } else {
+                    0
+                }
+            })
             .collect()
     }
 
@@ -459,10 +480,12 @@ impl ChatView {
             )));
         }
 
-        for (idx, entry) in self.timeline.iter().enumerate() {
+        let visible: Vec<_> = self.visible_main_entries().collect();
+        let visible_count = visible.len();
+        for (visible_idx, (idx, entry)) in visible.into_iter().enumerate() {
             let is_focused = idx == self.timeline_cursor;
             Self::build_entry(entry, is_focused, &mut lines, &self.theme);
-            if idx < self.timeline.len() - 1 {
+            if visible_idx + 1 < visible_count {
                 lines.push(Line::raw(""));
             }
         }
@@ -611,6 +634,10 @@ impl ChatView {
                 .saturating_add((n.saturating_sub(1)) as u16) as usize;
 
         let last_entry = self.timeline[n - 1].clone();
+        if !Self::renders_in_main_chat(&last_entry) {
+            self.cached_chat_lines = Self::build_new_lines(self);
+            return;
+        }
         let is_focused = (n - 1) == self.timeline_cursor;
         let theme = self.theme;
         let turn_active = self.turn_active;
@@ -652,6 +679,9 @@ impl ChatView {
         }
 
         for (idx, entry) in self.timeline.iter().enumerate() {
+            if !Self::renders_in_main_chat(entry) {
+                continue;
+            }
             let is_last = idx == self.timeline.len() - 1;
             let entry_lines = self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize
                 + if is_last { 0 } else { 1 };
@@ -1226,10 +1256,9 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        assert!(joined.contains("bash"), "Expected tool name 'bash'");
         assert!(
-            joined.contains("exit:0"),
-            "Expected 'exit:0' for success status"
+            !joined.contains("bash") && !joined.contains("output line"),
+            "tool process should stay out of the main chat view, got: {joined}"
         );
     }
 
@@ -1251,13 +1280,10 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        // Tool calls always render collapsed in main view
-        assert!(joined.contains("echo"), "Expected tool name 'echo'");
         assert!(
-            joined.contains("exit:0"),
-            "Expected 'exit:0' for success status"
+            !joined.contains("echo") && !joined.contains("Hello") && !joined.contains("🔧"),
+            "completed tool process should stay out of the main chat view, got: {joined}"
         );
-        assert!(joined.contains("🔧"), "Expected tool icon");
     }
 
     #[test]
@@ -1752,10 +1778,9 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        // Should show subagent navigation label
         assert!(
-            joined.contains("Open Subagent") || joined.contains("nav"),
-            "Expected subagent navigation indicator in output, got: {joined}"
+            !joined.contains("Open Subagent") && !joined.contains("Run subagent"),
+            "task tool details should stay out of the main chat view, got: {joined}"
         );
     }
 
