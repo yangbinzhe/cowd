@@ -2,14 +2,14 @@ use chrono::Utc;
 use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, RuntimeEvent,
-    RuntimeEventScope, RuntimeRef, UnifiedSessionStore,
+    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, RuntimeEvent, RuntimeEventScope,
+    RuntimeRef, UnifiedSessionStore,
 };
 use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
 use runtime::doc_ingestion::{DocumentCategory, DocumentIngestor};
 use runtime::iacc::{
-    IaccIncident, IaccMetricStatus, IaccStore, plan_server_manufacturing_skills,
-    run_server_manufacturing_skill,
+    plan_server_manufacturing_skills, run_server_manufacturing_skill, IaccIncident,
+    IaccMetricStatus, IaccStore,
 };
 use runtime::platform::feishu::doc::{
     DocumentContent, DocumentElement, DocumentMetadata as FeishuDocumentMetadata, DocumentType,
@@ -206,10 +206,13 @@ fn session_record(session_id: &str) -> SessionRecord {
         last_activity: now,
         message_count: 0,
         reset_policy: "manual".to_string(),
-        metadata_json: Some(serde_json::json!({
-            "workspace_root": "/tmp/cowd-full-capability-eval",
-            "scenario": "document_memory_fact_session_agents_iacc"
-        }).to_string()),
+        metadata_json: Some(
+            serde_json::json!({
+                "workspace_root": "/tmp/cowd-full-capability-eval",
+                "scenario": "document_memory_fact_session_agents_iacc"
+            })
+            .to_string(),
+        ),
         input_tokens: 0,
         output_tokens: 0,
         estimated_cost_usd: 0.0,
@@ -320,8 +323,14 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     let analysis = iacc
         .analyze_incident(&incident.incident_id)
         .expect("incident analyzes");
-    assert_eq!(analysis.attribution_candidates[0].cause_type, "supply_constraint");
-    assert_eq!(analysis.recommended_actions[0].action_type, "supplier_recovery");
+    assert_eq!(
+        analysis.attribution_candidates[0].cause_type,
+        "supply_constraint"
+    );
+    assert_eq!(
+        analysis.recommended_actions[0].action_type,
+        "supplier_recovery"
+    );
     let gate = iacc
         .evaluate_evidence_quality(&packet.packet_id)
         .expect("quality gate evaluates");
@@ -334,13 +343,14 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     let skill_plan =
         plan_server_manufacturing_skills(&incident, Some(&analysis), Some(&updated_packet), 3);
     assert!(!skill_plan.planned_agent_nodes.is_empty());
-    assert!(
-        skill_plan
-            .selected_skills
+    assert!(skill_plan.selected_skills.iter().any(|skill| skill
+        .input_metric_keys
+        .iter()
+        .any(|metric| metric == "material_shortage_risk")
+        || skill
+            .output_actions
             .iter()
-            .any(|skill| skill.input_metric_keys.iter().any(|metric| metric == "material_shortage_risk")
-                || skill.output_actions.iter().any(|action| action == "supplier_recovery"))
-    );
+            .any(|action| action == "supplier_recovery")));
     let selected_skill = skill_plan
         .selected_skills
         .first()
@@ -447,8 +457,14 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         .await
         .expect("timeline loads");
     assert_eq!(timeline.total, 4);
-    assert!(timeline.events.iter().any(|event| event.kind == "agent.evidence"));
-    assert!(timeline.events.iter().any(|event| event.kind == "agent.review"));
+    assert!(timeline
+        .events
+        .iter()
+        .any(|event| event.kind == "agent.evidence"));
+    assert!(timeline
+        .events
+        .iter()
+        .any(|event| event.kind == "agent.review"));
 
     let associated = sessions
         .get_session_memories(session_id)
@@ -478,7 +494,10 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         .prepare_context("full capability eval supplier_recovery", &[], None)
         .await
         .expect("context prepares");
-    assert!(prepared.entries.iter().any(|entry| entry.id == reviewer_memory_id));
+    assert!(prepared
+        .entries
+        .iter()
+        .any(|entry| entry.id == reviewer_memory_id));
     assert!(prepared.entries.iter().any(|entry| {
         entry.title.contains("full capability")
             || entry.title.contains("Full capability")

@@ -4184,7 +4184,10 @@ mod tests {
             let packet = store
                 .build_evidence_packet(
                     Some(&attention.attention_id),
-                    Some(&format!("manufacturing scenario eval {}", expected.scenario_id)),
+                    Some(&format!(
+                        "manufacturing scenario eval {}",
+                        expected.scenario_id
+                    )),
                 )
                 .expect("packet builds");
             assert!(!packet.metric_evidence.is_empty());
