@@ -6,6 +6,8 @@ import { useAppStore } from '../stores/app';
 import ChartPanel from '../components/ChartPanel.vue';
 import DataTable from '../components/workbench/DataTable.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import ApiStateBanner from '../components/workbench/ApiStateBanner.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 
 const store = useAppStore();
 const loading = ref(false);
@@ -33,6 +35,7 @@ const sourcePackResult = ref<any>(null);
 const entityResult = ref<any>(null);
 const metricResult = ref<any>(null);
 const evidenceResult = ref<any>(null);
+const iaccLiveQuarantine = true;
 
 function items(collection: any, key: string) {
   return Array.isArray(collection?.[key]) ? collection[key] : Array.isArray(collection?.items) ? collection.items : [];
@@ -57,6 +60,18 @@ const skills = computed(() => items(state.value?.skills, 'items'));
 const room = computed(() => state.value?.room || {});
 const analysis = computed(() => room.value?.analysis || result.value?.analysis || result.value?.operational_analysis);
 const recommendedActions = computed(() => analysis.value?.recommended_actions || []);
+
+function quarantineReceipt(action: string, endpoint: string, payload: Record<string, unknown> = {}) {
+  return {
+    ok: false,
+    endpoint,
+    method: 'POST',
+    status: 'quarantined',
+    error: `${action} is temporarily quarantined until the v0.9.243 governed action flow adds schema validation, impact preview, execution mode, and audit receipt.`,
+    payload_summary: JSON.stringify(payload).slice(0, 280),
+    retryable: false,
+  };
+}
 
 async function refresh() {
   loading.value = true;
@@ -151,6 +166,10 @@ function defaultSourcePack() {
 }
 
 async function upsertSourcePack() {
+  if (iaccLiveQuarantine) {
+    sourcePackResult.value = quarantineReceipt('Source pack upsert', '/api/iacc/source-packs/upsert', defaultSourcePack());
+    return;
+  }
   sourcePackResult.value = await api.iaccSourcePackUpsert(defaultSourcePack());
   await refresh();
 }
@@ -173,6 +192,13 @@ async function planConnectorRun() {
 }
 
 async function executeConnectorRun() {
+  if (iaccLiveQuarantine) {
+    sourcePackResult.value = quarantineReceipt('Connector run', `/api/iacc/source-packs/${sourcePackId.value}/connector-runs/run`, {
+      source_pack_id: sourcePackId.value,
+      mode: 'dry_run',
+    });
+    return;
+  }
   sourcePackResult.value = await api.iaccSourcePackConnectorRun(sourcePackId.value, {
     source_pack_id: sourcePackId.value,
     mode: 'dry_run',
@@ -187,6 +213,13 @@ async function getConnectorRun() {
 }
 
 async function upsertEntity() {
+  if (iaccLiveQuarantine) {
+    entityResult.value = quarantineReceipt('Entity upsert', '/api/iacc/entities/upsert', {
+      entity_id: selectedEntityId.value || 'new',
+      entity_type: 'manufacturing_line',
+    });
+    return;
+  }
   entityResult.value = await api.iaccEntityUpsert({
     entity_id: selectedEntityId.value || undefined,
     entity_type: 'manufacturing_line',
@@ -216,6 +249,13 @@ async function resolveEntitySourceKey() {
 
 async function upsertRelation() {
   if (!selectedEntityId.value || !relationTargetId.value) return;
+  if (iaccLiveQuarantine) {
+    entityResult.value = quarantineReceipt('Relation upsert', '/api/iacc/relations/upsert', {
+      from_entity_id: selectedEntityId.value,
+      to_entity_id: relationTargetId.value,
+    });
+    return;
+  }
   entityResult.value = await api.iaccRelationUpsert({
     relation_type: 'feeds',
     from_entity_id: selectedEntityId.value,
@@ -262,6 +302,12 @@ async function planComputeJob() {
 
 async function runComputeJob() {
   if (!computeJobId.value) return;
+  if (iaccLiveQuarantine) {
+    metricResult.value = quarantineReceipt('Compute job run', `/api/iacc/compute/jobs/${computeJobId.value}/run`, {
+      job_id: computeJobId.value,
+    });
+    return;
+  }
   metricResult.value = await api.iaccComputeJobRun(computeJobId.value);
 }
 
@@ -299,6 +345,13 @@ async function inspectQualityGate() {
 }
 
 async function initializeManufacturingKernel() {
+  if (iaccLiveQuarantine) {
+    result.value = {
+      domain: quarantineReceipt('Domain seed', '/api/iacc/domain/server-manufacturing/seed'),
+      ontology: quarantineReceipt('Ontology seed', '/api/iacc/ontology/server-manufacturing/seed'),
+    };
+    return;
+  }
   result.value = {
     domain: await api.iaccSeedDomain(),
     ontology: await api.iaccSeedOntology(),
@@ -322,6 +375,10 @@ async function ingestManufacturingFacts() {
   const invalid = facts.some((fact: any) => !fact?.source_ref || !fact?.fact_type);
   if (invalid) {
     error.value = 'Each fact must include source_ref and fact_type.';
+    return;
+  }
+  if (iaccLiveQuarantine) {
+    result.value = quarantineReceipt('Manufacturing fact ingest', '/api/iacc/facts/ingest', { facts });
     return;
   }
   result.value = await api.iaccIngestFact(facts as Record<string, unknown>[]);
@@ -390,6 +447,13 @@ async function executeAction() {
 async function bridgeExecution() {
   const executionId = result.value?.execution?.execution_id || room.value?.executions?.[0]?.execution_id;
   if (!executionId) return;
+  if (iaccLiveQuarantine) {
+    result.value = quarantineReceipt('Cross-plane execution bridge', `/api/iacc/executions/${executionId}/cross-plane/execute`, {
+      mode: 'dry_run',
+      requested_capability: 'channel.feishu.send_text',
+    });
+    return;
+  }
   result.value = await api.iaccExecutionBridge(executionId, {
     mode: 'dry_run',
     actor_principal: 'webui-operator',
@@ -422,6 +486,13 @@ async function generateReport() {
 
 async function retryReportDelivery() {
   if (!cockpitReportId.value) return;
+  if (iaccLiveQuarantine) {
+    result.value = quarantineReceipt('Report delivery retry', `/api/iacc/cockpit/reports/${cockpitReportId.value}/delivery/retry`, {
+      mode: 'dry_run',
+      report_id: cockpitReportId.value,
+    });
+    return;
+  }
   result.value = await api.iaccRetryReportDelivery(cockpitReportId.value, {
     mode: 'dry_run',
     force: true,
@@ -447,6 +518,13 @@ onMounted(refresh);
     </header>
 
     <p v-if="error" class="settings-alert">{{ error }}</p>
+    <ApiStateBanner
+      v-if="iaccLiveQuarantine"
+      status="degraded"
+      title="IACC live writes quarantined"
+      detail="High-risk manufacturing writes stay visible but are disabled, dry-run-only, or receipt-wrapped until governed action flows land in v0.9.243."
+      endpoint="/api/iacc/*"
+    />
 
     <section class="metric-row" aria-label="IACC metrics">
       <article class="metric-card" data-tone="success">
@@ -512,18 +590,19 @@ onMounted(refresh);
         </label>
         <div class="button-row">
           <button class="ghost-action" type="button" @click="planDataPlaneIngest">Plan ingest</button>
-          <button class="primary-action" type="button" @click="upsertSourcePack">Upsert source pack</button>
+          <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccSourcePackUpsert" type="button" @click="upsertSourcePack">Upsert source pack</button>
           <button class="ghost-action" type="button" @click="validateSourcePack">Validate</button>
         </div>
         <div class="button-row">
           <button class="ghost-action" type="button" @click="sourcePackDeltaPlan">Delta plan</button>
           <button class="ghost-action" type="button" @click="planConnectorRun">Plan connector run</button>
-          <button class="ghost-action" type="button" @click="executeConnectorRun">Run connector</button>
+          <button class="ghost-action iacc-live-quarantined" type="button" @click="executeConnectorRun">Run connector</button>
         </div>
         <label class="field-line">
           Connector run id
           <input v-model="connectorRunId" type="text" @keydown.enter.prevent="getConnectorRun" />
         </label>
+        <RequestReceipt :receipt="sourcePackResult" title="Source pack receipt" />
         <RawPayload :data="{ data_plane: dataPlaneResult, source_pack: sourcePackResult }" />
       </article>
 
@@ -535,8 +614,9 @@ onMounted(refresh);
         <p class="panel-note">Only ingest facts copied from a real source pack or connector output. Demo fixtures are not prefilled here.</p>
         <textarea v-model="factPayload" class="json-input" rows="8" placeholder='[{"fact_type":"...","source_ref":"source-pack://..."}]' />
         <div class="button-row">
-          <button class="ghost-action" type="button" @click="initializeManufacturingKernel">Initialize domain model</button>
-          <button class="primary-action" type="button" @click="ingestManufacturingFacts">Ingest facts</button>
+          <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccSeedDomain" type="button" @click="initializeManufacturingKernel">Initialize domain model</button>
+          <span class="sr-only iacc-live-quarantined" data-iacc-risk="iaccSeedOntology">Ontology seed quarantined</span>
+          <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccIngestFact" type="button" @click="ingestManufacturingFacts">Ingest facts</button>
         </div>
         <DataTable v-if="metrics.length" :rows="metrics.slice(0, 8)" :columns="['metric_id', 'name', 'unit', 'status']" />
         <RawPayload :data="{ metrics: state?.metrics, attention: state?.attention, changes: state?.changes }" />
@@ -556,12 +636,13 @@ onMounted(refresh);
           <input v-model="relationTargetId" type="text" />
         </label>
         <div class="button-row">
-          <button class="primary-action" type="button" @click="upsertEntity">Upsert line entity</button>
+          <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccEntityUpsert" type="button" @click="upsertEntity">Upsert line entity</button>
           <button class="ghost-action" type="button" :disabled="!selectedEntityId" @click="inspectEntity">Inspect</button>
           <button class="ghost-action" type="button" @click="resolveEntitySourceKey">Resolve source key</button>
         </div>
-        <button class="ghost-action" type="button" :disabled="!selectedEntityId || !relationTargetId" @click="upsertRelation">Upsert relation</button>
+        <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccRelationUpsert" type="button" :disabled="!selectedEntityId || !relationTargetId" @click="upsertRelation">Upsert relation</button>
         <DataTable v-if="entities.length" :rows="entities.slice(0, 8)" :columns="['entity_id', 'entity_type', 'canonical_key', 'display_name']" />
+        <RequestReceipt :receipt="entityResult" title="Entity receipt" />
         <RawPayload :data="entityResult || {}" />
       </article>
 
@@ -585,9 +666,10 @@ onMounted(refresh);
         </div>
         <div class="button-row">
           <button class="primary-action" type="button" @click="planComputeJob">Plan compute job</button>
-          <button class="ghost-action" type="button" :disabled="!computeJobId" @click="runComputeJob">Run job</button>
+          <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccComputeJobRun" type="button" :disabled="!computeJobId" @click="runComputeJob">Run job</button>
           <button class="ghost-action" type="button" @click="recomputeMetrics">Recompute all</button>
         </div>
+        <RequestReceipt :receipt="metricResult" title="Metric receipt" />
         <RawPayload :data="metricResult || {}" />
       </article>
 
@@ -659,9 +741,10 @@ onMounted(refresh);
           </select>
         </label>
         <div class="button-row">
-          <button class="primary-action" type="button" :disabled="!selectedActionId" @click="executeAction">Execute dry run</button>
-          <button class="ghost-action" type="button" @click="bridgeExecution">Bridge cross-plane</button>
+          <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccExecuteAction" type="button" :disabled="!selectedActionId" @click="executeAction">Execute dry run</button>
+          <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccExecutionBridge" type="button" @click="bridgeExecution">Bridge cross-plane</button>
         </div>
+        <RequestReceipt :receipt="result" title="Action receipt" />
         <RawPayload :data="{ analysis, executions: room?.executions, playbooks: room?.playbooks }" />
       </article>
 
@@ -706,8 +789,9 @@ onMounted(refresh);
         </label>
         <div class="button-row">
           <button class="primary-action" type="button" @click="generateReport">Generate report</button>
-          <button class="ghost-action" type="button" :disabled="!cockpitReportId" @click="retryReportDelivery">Retry delivery</button>
+          <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccRetryReportDelivery" type="button" :disabled="!cockpitReportId" @click="retryReportDelivery">Retry delivery</button>
         </div>
+        <RequestReceipt :receipt="result" title="Report receipt" />
         <RawPayload :data="result || {}" />
       </article>
     </section>

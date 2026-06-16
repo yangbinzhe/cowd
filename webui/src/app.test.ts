@@ -117,6 +117,88 @@ describe('Cowd Vue WebUI shell', () => {
     }));
   });
 
+  it('wraps write failures with endpoint method payload and retry metadata', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('write failed', { status: 503, statusText: 'Unavailable' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.saveFile('docs/a.md', 'content')).rejects.toMatchObject({
+      endpoint: '/api/workspace/files',
+      method: 'POST',
+      status: 503,
+      retryable: true,
+    });
+    const receipt = await api.writeReceipt('/api/test/write', {
+      method: 'POST',
+      body: JSON.stringify({ hello: 'world' }),
+    });
+    expect(receipt.ok).toBe(false);
+    expect(receipt.endpoint).toBe('/api/test/write');
+    expect(receipt.payload_summary).toContain('hello');
+  });
+
+  it('calls critical Workspace write endpoints through the backend', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ok: true, to: 'docs/b.md' }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.saveFile('docs/a.md', 'hello');
+    await api.renameWorkspacePath('docs/a.md', 'docs/b.md');
+    await api.deleteWorkspacePath('docs/b.md');
+    expect(fetchMock).toHaveBeenCalledWith('/api/workspace/files', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ path: 'docs/a.md', content: 'hello' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/workspace/rename', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ path: 'docs/a.md', to: 'docs/b.md' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/workspace/files?path=docs%2Fb.md', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('calls critical Memory and Skills write endpoints through the backend', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.createMemoryEntry('L2', { title: 'fact' });
+    await api.updateMemoryEntry('mem-1', { title: 'updated' });
+    await api.deleteMemoryEntry('L2', 'mem-1');
+    await api.skillAction('local:test', 'validate', { session_id: 's1' });
+    expect(fetchMock).toHaveBeenCalledWith('/api/memory/L2', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ title: 'fact' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/memory/entry/mem-1', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ title: 'updated' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/memory/L2/mem-1', expect.objectContaining({ method: 'DELETE' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/skills/local%3Atest/actions/validate', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ session_id: 's1' }),
+    }));
+  });
+
+  it('calls critical IACC write endpoints with explicit request bodies', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.iaccSourcePackUpsert({ source_pack_id: 'sp-1' });
+    await api.iaccEntityUpsert({ entity_id: 'entity-1' });
+    await api.iaccRelationUpsert({ relation_type: 'feeds' });
+    await api.iaccComputeJobRun('job-1');
+    await api.iaccExecuteAction('analysis-1', 'action-1', { mode: 'dry_run' });
+    await api.iaccExecutionBridge('exec-1', { mode: 'dry_run' });
+    await api.iaccRetryReportDelivery('report-1', { mode: 'dry_run' });
+    await api.iaccIngestFact([{ fact_type: 'quality', source_ref: 'source-pack://sp-1' }]);
+    await api.iaccSeedDomain();
+    await api.iaccSeedOntology();
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/source-packs/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/entities/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/relations/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/compute/jobs/job-1/run', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/analyses/analysis-1/actions/action-1/execute', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/executions/exec-1/cross-plane/execute', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/cockpit/reports/report-1/delivery/retry', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/facts/ingest', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/domain/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/ontology/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
+  });
+
   it('calls real IACC incident and cockpit report endpoints', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'test.receipt' }), { status: 200 })));
     vi.stubGlobal('fetch', fetchMock);

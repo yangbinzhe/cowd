@@ -17,6 +17,47 @@ export interface EndpointSnapshot extends ApiOffline {
   data: any;
 }
 
+export interface ApiReceipt<T = any> {
+  ok: boolean;
+  endpoint: string;
+  method: string;
+  payload_summary?: string;
+  status?: number;
+  status_text?: string;
+  data?: T;
+  error?: string;
+  retryable?: boolean;
+}
+
+export class ApiWriteError extends Error {
+  endpoint: string;
+  method: string;
+  payload_summary: string;
+  status: number;
+  status_text: string;
+  body: string;
+  retryable: boolean;
+
+  constructor(message: string, options: {
+    endpoint: string;
+    method: string;
+    payload_summary: string;
+    status: number;
+    status_text: string;
+    body: string;
+  }) {
+    super(message);
+    this.name = 'ApiWriteError';
+    this.endpoint = options.endpoint;
+    this.method = options.method;
+    this.payload_summary = options.payload_summary;
+    this.status = options.status;
+    this.status_text = options.status_text;
+    this.body = options.body;
+    this.retryable = options.status === 0 || options.status >= 500 || options.status === 429;
+  }
+}
+
 function headers(init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -56,13 +97,65 @@ async function read<T>(path: string, fallback: T, init: RequestInit = {}): Promi
   }
 }
 
+function payloadSummary(body: BodyInit | null | undefined): string {
+  if (!body) return '';
+  if (body instanceof FormData) {
+    return Array.from(body.keys()).join(', ');
+  }
+  const text = typeof body === 'string' ? body : String(body);
+  return text.length > 280 ? `${text.slice(0, 280)}...` : text;
+}
+
 async function write<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, headers: headers(init) });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `${response.status} ${response.statusText}`);
+    throw new ApiWriteError(body || `${response.status} ${response.statusText}`, {
+      endpoint: path,
+      method: init.method || 'POST',
+      payload_summary: payloadSummary(init.body),
+      status: response.status,
+      status_text: response.statusText,
+      body,
+    });
   }
   return await parseResponse(response, path) as T;
+}
+
+async function writeWithReceipt<T>(path: string, init: RequestInit = {}): Promise<ApiReceipt<T>> {
+  const method = init.method || 'POST';
+  const summary = payloadSummary(init.body);
+  try {
+    const data = await write<T>(path, init);
+    return {
+      ok: true,
+      endpoint: path,
+      method,
+      payload_summary: summary,
+      data,
+    };
+  } catch (error) {
+    if (error instanceof ApiWriteError) {
+      return {
+        ok: false,
+        endpoint: error.endpoint,
+        method: error.method,
+        payload_summary: error.payload_summary,
+        status: error.status,
+        status_text: error.status_text,
+        error: error.body || error.message,
+        retryable: error.retryable,
+      };
+    }
+    return {
+      ok: false,
+      endpoint: path,
+      method,
+      payload_summary: summary,
+      error: error instanceof Error ? error.message : String(error),
+      retryable: true,
+    };
+  }
 }
 
 function countPayload(data: any): number {
@@ -171,6 +264,7 @@ const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: str
 };
 
 export const api = {
+  writeReceipt: writeWithReceipt,
   health: () => read('/api/webui/manifest', {
     kind: 'cowd.webui.manifest',
     status: 'offline',

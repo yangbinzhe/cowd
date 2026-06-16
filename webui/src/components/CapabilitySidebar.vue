@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { capabilitySpecs } from '../data/capabilities';
 import { useAppStore } from '../stores/app';
 import type { NavId } from '../types';
+import EndpointHealthList from './workbench/EndpointHealthList.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -91,15 +92,7 @@ onMounted(() => {
     </nav>
 
     <section v-if="spec" class="sidebar-inspector">
-      <h2>Live endpoints</h2>
-      <dl>
-        <dt>Checked</dt>
-        <dd>{{ snapshots.length }}</dd>
-        <dt>Ready</dt>
-        <dd>{{ snapshots.filter((item) => item.status === 'ready').length }}</dd>
-        <dt>Offline/Error</dt>
-        <dd>{{ snapshots.filter((item) => item.status === 'offline' || item.status === 'error').length }}</dd>
-      </dl>
+      <EndpointHealthList :endpoints="snapshots" />
     </section>
 
     <section v-if="spec" class="sidebar-inspector">
