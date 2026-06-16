@@ -1,0 +1,1 @@
+import{d as s,c as a,t as e,n}from"./index.dev-Dq6duTcM.js";const o=["data-status"],i=s({__name:"StatusPill",props:{status:{}},setup(t){return(c,u)=>(n(),a("span",{class:"status-badge","data-status":t.status},e(t.status),9,o))}});export{i as _};

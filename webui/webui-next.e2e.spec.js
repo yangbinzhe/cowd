@@ -41,6 +41,9 @@ test('tools page exposes current-page management without duplicated primary navi
   await expect(page.getByRole('button', { name: 'Execute command' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
   await expect(page.locator('.raw-payload').first()).toBeVisible();
+  await page.locator('.section-row').filter({ hasText: 'Risk' }).click();
+  await expect(page.locator('.section-row.active')).toContainText('Risk');
+  await expect(page.getByRole('heading', { name: 'Risk preflight' })).toBeFocused();
 });
 
 test('runtime and context pages expose real workbench controls', async ({ page }) => {
