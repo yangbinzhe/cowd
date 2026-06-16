@@ -813,10 +813,6 @@ impl TuiState {
         // Sync status bar from App state
         self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
-        let current_focus = self.focus_for_current_surface();
-        if let Some(section) = self.status_bar.section_mut("input_hint") {
-            section.content = Some(current_focus.hint().into());
-        }
         self.status_bar.tick();
         let show_activity_panel = self.activity_panel_visible && !self.layout_state.sidebar_visible;
         if show_activity_panel {
@@ -1724,6 +1720,15 @@ impl TuiState {
             };
             return ProcessedKey::Nothing;
         }
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && key.modifiers.is_empty()
+            && (self.focus_target == FocusTarget::Input || !self.app.input.is_empty())
+        {
+            self.dispatch_action(Action::HistoryBrowse(matches!(key.code, KeyCode::Up)));
+            self.set_focus_target(FocusTarget::Input);
+            return ProcessedKey::Nothing;
+        }
+
         if self.app.input.is_empty() && self.route_navigation_to_focus(key) {
             return ProcessedKey::Nothing;
         }
@@ -2081,7 +2086,7 @@ impl TuiState {
                 ToastVariant::Info,
                 Some("Focus".into()),
                 format!("{label}: {hint}"),
-                1200,
+                3000,
             );
         }
         self.focus_target = target;
@@ -4788,8 +4793,8 @@ providers:
             "missing top version: {joined}"
         );
         assert!(
-            joined.contains("session session-status-narrow"),
-            "missing top session id: {joined}"
+            joined.contains("session session-"),
+            "missing top abbreviated session id: {joined}"
         );
         assert!(
             joined.contains("deepseek-v4-pro STD"),
@@ -4830,17 +4835,33 @@ providers:
         let joined = terminal.buffer_lines().join("\n");
 
         assert!(
-            joined.contains("think"),
-            "missing inline think label: {joined}"
+            joined.contains("state thinking"),
+            "missing top thinking state: {joined}"
         );
         assert!(
-            joined.contains("details in Process"),
-            "missing process handoff: {joined}"
+            !joined.contains("details in Process"),
+            "thinking handoff should stay out of main body: {joined}"
         );
         assert!(
             !joined.contains("┌💭 Thinking") && !joined.contains("┌ 💭 Thinking"),
             "thinking should not render as a floating panel: {joined}"
         );
+    }
+
+    #[test]
+    fn input_up_down_browses_history_when_input_is_focused() {
+        let mut state = TuiState::new("m", "s");
+        state.app.input_history.push("first".into());
+        state.app.input_history.push("second".into());
+        state.set_focus_target(FocusTarget::Input);
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(state.input_text(), "second");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(state.input_text(), "");
     }
 
     #[test]

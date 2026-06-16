@@ -338,66 +338,8 @@ impl RuntimeActivityPanel {
 
 impl Component for RuntimeActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
-        // ── Compact context header (top section) ──────────────────
-        let pct = if self.context_window > 0 {
-            (self.token_count as f64 / self.context_window as f64 * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-        let bar_color = if pct > 90.0 {
-            Color::Red
-        } else if pct > 70.0 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
-        let bar = Self::progress_bar(self.token_count, self.context_window, 8);
-
         let mut lines: Vec<Line> = Vec::new();
 
-        // Token bar
-        lines.push(Line::from(vec![
-            Span::styled(bar, Style::default().fg(bar_color)),
-            Span::styled(
-                format!(
-                    " {:.0}% {} / {}",
-                    pct,
-                    fmt_tokens(self.token_count),
-                    fmt_tokens(self.context_window)
-                ),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("In:", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                fmt_tokens(self.turn_input_tokens),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(" Out:", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                fmt_tokens(self.turn_output_tokens),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(
-                format!("  {:.4} USD", self.cost_estimate()),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Sess:", Style::default().fg(Color::DarkGray)),
-            Span::styled(self.session_id.clone(), Style::default().fg(Color::White)),
-            Span::styled(
-                format!("  {} {}%", self.profile, self.pressure_pct),
-                Style::default().fg(if self.pressure_pct > 85 {
-                    Color::Red
-                } else if self.pressure_pct > 70 {
-                    Color::Yellow
-                } else {
-                    Color::White
-                }),
-            ),
-        ]));
         if !self.policy_action.is_empty() && self.policy_action != "None" {
             lines.push(Line::from(vec![
                 Span::styled("Policy:", Style::default().fg(Color::DarkGray)),
@@ -410,19 +352,6 @@ impl Component for RuntimeActivityPanel {
                 ),
             ]));
         }
-        lines.push(Line::from(vec![
-            Span::styled("Model:", Style::default().fg(Color::DarkGray)),
-            Span::styled(preview(&self.model, 32), Style::default().fg(Color::White)),
-            Span::styled(
-                format!(
-                    " via {}  {}p/{}m",
-                    preview(&self.provider_route, 28),
-                    self.provider_count,
-                    self.provider_model_count
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
         if self.workgraph_agent_tasks > 0 {
             lines.push(Line::from(vec![
                 Span::styled("WG:", Style::default().fg(Color::DarkGray)),
@@ -449,82 +378,11 @@ impl Component for RuntimeActivityPanel {
                 ),
             ]));
         }
-        lines.push(Line::from(vec![
-            Span::styled("Agent:", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if self.yolo_mode {
-                    "YoloGoal".to_string()
-                } else {
-                    self.runtime_policy_agent.clone()
-                },
-                Style::default().fg(if self.runtime_policy_agent == "Off" {
-                    Color::DarkGray
-                } else {
-                    Color::Cyan
-                }),
-            ),
-            Span::styled(
-                format!(
-                    "  policy {} score:{} review:{} signals:{}",
-                    self.runtime_policy_level,
-                    self.runtime_policy_score,
-                    if self.runtime_policy_review { "required" } else { "clear" },
-                    self.runtime_policy_signals
-                ),
-                Style::default().fg(match (self.yolo_mode, self.runtime_policy_review) {
-                    (true, _) => Color::Magenta,
-                    (_, true) => Color::Yellow,
-                    _ => Color::Yellow,
-                }),
-            ),
-        ]));
-
-        lines.push(Line::raw(""));
-        lines.push(metric_line(
-            "Runtime:",
-            &self.control_plane_status,
-            &preview(&self.control_plane_reason, 72),
-            match self.control_plane_status.as_str() {
-                "healthy" => Color::Green,
-                "degraded" => Color::Red,
-                _ => Color::Yellow,
-            },
-        ));
-        lines.push(metric_line(
-            "Workgraph:",
-            &self.workgraph_status,
-            &format!(
-                "graph {} board {} candidates {} conflicts {}",
-                self.workgraph_graph_id,
-                self.workgraph_board_id,
-                self.workgraph_candidates,
-                self.workgraph_conflicts
-            ),
-            if self.workgraph_conflicts > 0 {
-                Color::Yellow
-            } else {
-                Color::White
-            },
-        ));
-        lines.push(metric_line(
-            "Activity:",
-            &format!("{} events", self.event_count),
-            &format!(
-                "{} messages {} tools {} open last {}",
-                self.message_count,
-                self.tool_event_count,
-                self.open_tool_count,
-                preview(&self.turn_activity.last_phase, 32)
-            ),
-            if self.open_tool_count > 0 {
-                Color::Yellow
-            } else {
-                Color::White
-            },
-        ));
 
         if !self.recent_process.is_empty() {
-            lines.push(Line::raw(""));
+            if !lines.is_empty() {
+                lines.push(Line::raw(""));
+            }
             lines.push(Line::from(Span::styled(
                 "Process",
                 Style::default()
@@ -536,16 +394,18 @@ impl Component for RuntimeActivityPanel {
                 .saturating_sub(lines.len() as u16)
                 .saturating_sub(3)
                 .max(6) as usize;
-            let start = self.recent_process.len().saturating_sub(remaining_rows);
-            for item in &self.recent_process[start..] {
+            for (idx, item) in self.recent_process.iter().rev().take(remaining_rows).enumerate() {
                 lines.push(process_line(item));
+                if idx + 1 < remaining_rows && matches!(item.kind, ProcessKind::Output) {
+                    lines.push(process_separator_line());
+                }
             }
         }
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Runtime ");
+            .title(" Process ");
         self.scroll
             .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
         ctx.frame_mut().render_widget(
@@ -663,6 +523,13 @@ fn process_line(item: &ProcessEvent) -> Line<'static> {
             }),
         ),
     ])
+}
+
+fn process_separator_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "──────── turn boundary",
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn preview(value: &str, max: usize) -> String {
@@ -822,23 +689,12 @@ mod tests {
         panel.sync_from_app(&app);
         let rendered = render_panel(&mut panel, 96, 27);
 
-        // Verify context token info is shown
-        assert!(rendered.contains("42.0k"));
-        assert!(rendered.contains("200.0k"));
-        assert!(rendered.contains("12.0k"));
-        assert!(rendered.contains("3.0k"));
-
-        // Verify runtime status summary
-        assert!(rendered.contains("YoloGoal"));
-        assert!(rendered.contains("Parallel"));
-        assert!(rendered.contains("Runtime"));
-        assert!(rendered.contains("Model:"));
-        assert!(rendered.contains("Agent:"));
-        assert!(rendered.contains("Workgraph:"));
-        assert!(rendered.contains("Activity:"));
-        assert!(rendered.contains("2 events"));
-        assert!(rendered.contains("1 messages"));
-        assert!(rendered.contains("1 tools"));
+        // Runtime header/model/token duplication is intentionally omitted here.
+        assert!(!rendered.contains("42.0k"));
+        assert!(!rendered.contains("200.0k"));
+        assert!(!rendered.contains("Model:"));
+        assert!(!rendered.contains("Activity:"));
+        assert!(rendered.contains("WG:"));
         assert!(rendered.contains("Process"));
         assert!(rendered.contains("bash done exit:0 - ok"));
 

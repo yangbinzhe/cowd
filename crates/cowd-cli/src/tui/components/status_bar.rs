@@ -104,6 +104,12 @@ impl StatusBar {
             width: SectionWidth::Fixed(36),
         });
         sb.add_section(StatusSection {
+            id: "turn_tokens".into(),
+            content: None,
+            style: Style::default().fg(Color::Yellow),
+            width: SectionWidth::Fixed(24),
+        });
+        sb.add_section(StatusSection {
             id: "approvals".into(),
             content: None,
             style: Style::default().fg(Color::Yellow),
@@ -112,12 +118,6 @@ impl StatusBar {
         sb.add_section(Self::permission_status_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
-        sb.add_section(StatusSection {
-            id: "input_hint".into(),
-            content: None,
-            style: Style::default().fg(Color::DarkGray),
-            width: SectionWidth::Fill,
-        });
         sb
     }
 
@@ -346,6 +346,11 @@ impl StatusBar {
                     section.style = Style::default().fg(context_color(pct));
                     token_bar(app).map(|bar| format!("ctx {bar}"))
                 }
+                "turn_tokens" => Some(format!(
+                    "in:{} out:{}",
+                    fmt_tokens(app.turn_input_tokens),
+                    fmt_tokens(app.turn_output_tokens)
+                )),
                 "approvals" => {
                     let count = app
                         .daemon_pending_approvals
@@ -370,9 +375,6 @@ impl StatusBar {
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
                 "permission_status" => Some(format!("perm:{}", app.permission_count)),
-                "input_hint" => {
-                    Some("Enter send · Alt+Enter/Ctrl+J newline · Ctrl+B panels".into())
-                }
                 _ => None,
             };
         }
@@ -596,6 +598,7 @@ mod tests {
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"model"));
         assert!(ids.contains(&"context"));
+        assert!(ids.contains(&"turn_tokens"));
         assert!(ids.contains(&"approvals"));
         assert!(ids.contains(&"permission_status"));
         assert!(!ids.contains(&"version"));
@@ -603,7 +606,7 @@ mod tests {
         assert!(!ids.contains(&"focus"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
-        assert!(ids.contains(&"input_hint"));
+        assert!(!ids.contains(&"input_hint"));
     }
 
     // ── Notification ─────────────────────────────────────────────
@@ -855,15 +858,17 @@ mod tests {
     }
 
     #[test]
-    fn input_hint_shows_core_interactions() {
-        let app = App::new("test-model", "test-session");
+    fn turn_tokens_show_after_context() {
+        let mut app = App::new("test-model", "test-session");
+        app.turn_input_tokens = 1200;
+        app.turn_output_tokens = 3400;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("input_hint").unwrap();
+        let section = bar.section_mut("turn_tokens").unwrap();
         let content = section.content.as_deref().unwrap();
-        assert!(content.contains("Enter send"));
-        assert!(content.contains("Ctrl+B"));
+        assert!(content.contains("in:1k"));
+        assert!(content.contains("out:3k"));
     }
 
     #[test]

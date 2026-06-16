@@ -103,11 +103,6 @@ impl SystemStatusBar {
 
 impl Component for SystemStatusBar {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
-        let runtime_color = match self.runtime.as_str() {
-            "ready" => Color::Green,
-            "blocked" | "degraded" => Color::Red,
-            _ => Color::Yellow,
-        };
         let turn_color = match self.turn.as_str() {
             "idle" => Color::DarkGray,
             "thinking" => Color::Yellow,
@@ -124,17 +119,15 @@ impl Component for SystemStatusBar {
             ),
             Span::styled("session ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                preview(&self.session_id, 32),
+                short_session(&self.session_id),
                 Style::default().fg(Color::White),
             ),
-            sep(),
-            Span::styled(self.runtime.clone(), Style::default().fg(runtime_color)),
             sep(),
             Span::styled("state ", Style::default().fg(Color::DarkGray)),
             Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
             Span::styled(
                 format!(
-                    "  think:{} tool:{} reply:{}",
+                    "  ◌:{} ⚙:{} ↳:{}",
                     u8::from(self.turn == "thinking"),
                     self.tool_count,
                     self.reply_count
@@ -212,6 +205,23 @@ fn preview(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+fn short_session(id: &str) -> String {
+    let chars = id.chars().count();
+    if chars <= 14 {
+        return id.to_string();
+    }
+    let head: String = id.chars().take(8).collect();
+    let tail: String = id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 fn fit_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
