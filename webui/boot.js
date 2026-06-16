@@ -80,6 +80,12 @@ function bindUiEvents(){
     });
   });
 
+  document.querySelectorAll('#nav-rail .rail-item[data-view]').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      UI.switchPanel(this.dataset.view);
+    });
+  });
+
   document.getElementById('btn-toggle-panel').addEventListener('click',function(){
     const panel=document.getElementById('right-panel');
     panel.classList.toggle('hidden');
@@ -101,12 +107,18 @@ function bindUiEvents(){
 function restorePanelState(){
   const state=localStorage.getItem('cowd-panel-open');
   const panel=document.getElementById('right-panel');
-  if(state==='open')panel.classList.remove('hidden');
-  else panel.classList.add('hidden');
+  if(state==='open'){
+    panel.classList.remove('hidden');
+    UI.syncRail('workspace');
+  }else{
+    panel.classList.add('hidden');
+    UI.syncRail('chat');
+  }
 }
 
 function applyTheme(){
   const theme=localStorage.getItem('cowd-theme')||'dark';
+  const skin=localStorage.getItem('cowd-skin')||'graphite';
   const media = typeof window.matchMedia === 'function'
     ? window.matchMedia('(prefers-color-scheme:dark)')
     : null;
@@ -116,6 +128,7 @@ function applyTheme(){
   }else{
     document.documentElement.dataset.theme=theme;
   }
+  document.documentElement.dataset.skin=skin;
   if(media&&typeof media.addEventListener==='function'){
     media.addEventListener('change',function(){
       if(localStorage.getItem('cowd-theme')==='system')applyTheme();
@@ -128,6 +141,8 @@ async function loadModelSelector(){
   sel.innerHTML='';
   try{
     const cfg=await Api.getConfig();
+    const versionEl=document.getElementById('version');
+    if(versionEl&&cfg.version)versionEl.textContent=cfg.version;
     const models=[
       cfg.model||'claude-sonnet-4-6',
       'claude-haiku-4-5',

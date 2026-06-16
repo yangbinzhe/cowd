@@ -22,13 +22,30 @@
 <script>
 (function(){
   var t=(localStorage.getItem('cowd-theme')||'dark');
+  var skin=(localStorage.getItem('cowd-skin')||'graphite');
   if(t==='light')document.documentElement.dataset.theme='light';
   else if(t==='system'&&window.matchMedia('(prefers-color-scheme:dark)').matches){}
   else{document.documentElement.dataset.theme='dark';}
+  document.documentElement.dataset.skin=skin;
 })();
 </script>
 </head>
 <body>
+<div id="app-shell">
+<nav id="nav-rail" aria-label="Cowd primary navigation">
+  <button class="rail-item active" data-view="chat" data-panel="chat" title="Chat" aria-label="Chat">C</button>
+  <button class="rail-item" data-view="workspace" data-panel="workspace" title="Workspace" aria-label="Workspace">W</button>
+  <button class="rail-item" data-view="runtime" data-panel="runtime" title="Runtime" aria-label="Runtime">R</button>
+  <button class="rail-item" data-view="context" data-panel="context" title="Context" aria-label="Context">X</button>
+  <button class="rail-item" data-view="memory" data-panel="memory" title="Memory" aria-label="Memory">M</button>
+  <button class="rail-item" data-view="skills" data-panel="skills" title="Skills" aria-label="Skills">S</button>
+  <button class="rail-item" data-view="agents" data-panel="agents" title="Agents" aria-label="Agents">A</button>
+  <button class="rail-item" data-view="tools" data-panel="tools" title="Tools" aria-label="Tools">T</button>
+  <button class="rail-item" data-view="gateway" data-panel="gateway" title="Gateway" aria-label="Gateway">G</button>
+  <button class="rail-item" data-view="iacc" data-panel="iacc" title="IACC" aria-label="IACC">I</button>
+  <button class="rail-item" data-view="audit" data-panel="audit" title="Audit" aria-label="Audit">L</button>
+  <button class="rail-item rail-item-bottom" data-view="settings" data-panel="settings" title="Settings" aria-label="Settings">&#9881;</button>
+</nav>
 <aside id="sidebar">
   <div id="sidebar-header">
     <button id="btn-new-session" class="btn-primary">+ New Session</button>
@@ -37,11 +54,11 @@
   <ul id="session-list"></ul>
   <div id="sidebar-footer">
     <button id="btn-control-center" class="btn-icon" title="Control Center">&xvee;</button>
-    <small>Cowd v<span id="version">0.7.4</span></small>
+    <small>Cowd v<span id="version">0.9.200</span></small>
   </div>
 </aside>
 
-<main id="chat">
+<main id="chat" class="main-workspace">
   <div id="chat-header">
   <div id="chat-header-left">
     <select id="model-selector" class="model-picker" title="Select model"></select>
@@ -84,6 +101,7 @@
   </div>
   <div id="panel-content"></div>
 </aside>
+</div>
 
 <div id="control-center" class="modal-overlay hidden">
   <div class="modal-box">

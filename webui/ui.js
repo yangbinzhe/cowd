@@ -54,6 +54,14 @@ window.UI = (()=>{
     if(window.Prism)Prism.highlightAllUnder(el);
   }
 
+  function syncRail(name){
+    const view=name||'chat';
+    document.querySelectorAll('#nav-rail .rail-item[data-view]').forEach(b=>{
+      b.classList.toggle('active',b.dataset.view===view);
+      b.setAttribute('aria-current',b.dataset.view===view?'page':'false');
+    });
+  }
+
   function addToolCard(id,name,status){
     const wrapper=el('div','tool-card');
     wrapper.id='tool-'+id;
@@ -106,10 +114,23 @@ window.UI = (()=>{
   }
 
   function switchPanel(name){
-    if(activePanel===name){$('right-panel').classList.add('hidden');activePanel=null;return}
+    if(!name||name==='chat'){
+      const panel=$('right-panel');
+      if(panel)panel.classList.add('hidden');
+      activePanel=null;
+      syncRail('chat');
+      return;
+    }
+    if(activePanel===name){
+      $('right-panel').classList.add('hidden');
+      activePanel=null;
+      syncRail('chat');
+      return;
+    }
     const panel=$('right-panel');
     panel.classList.remove('hidden');
     activePanel=name;
+    syncRail(name);
     document.querySelectorAll('#panel-tabs button[data-panel]').forEach(b=>{
       b.classList.toggle('tab-active',b.dataset.panel===name);
     });
@@ -152,5 +173,5 @@ window.UI = (()=>{
 
   function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
-  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,updateThinkCard,switchPanel,openModal,closeModal,switchCCTab,esc};
+  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,updateThinkCard,switchPanel,syncRail,openModal,closeModal,switchCCTab,esc};
 })();

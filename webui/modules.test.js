@@ -29,6 +29,31 @@ describe('WebUI single implementation boundary', () => {
     expect(html).not.toContain('assets/js/');
   });
 
+  it('index exposes the v0.9.201 app shell and primary rail contract', () => {
+    const html = fs.readFileSync('index.html', 'utf8');
+    const expectedViews = [
+      'chat',
+      'workspace',
+      'runtime',
+      'context',
+      'memory',
+      'skills',
+      'agents',
+      'tools',
+      'gateway',
+      'iacc',
+      'audit',
+      'settings',
+    ];
+
+    expect(html).toContain('id="app-shell"');
+    expect(html).toContain('id="nav-rail"');
+    expect(html).toContain('class="main-workspace"');
+    for (const view of expectedViews) {
+      expect(html).toContain(`data-view="${view}"`);
+    }
+  });
+
   it('service worker caches only canonical root modules and static assets', () => {
     const sw = fs.readFileSync('sw.js', 'utf8');
 

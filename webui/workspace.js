@@ -51,7 +51,7 @@ window.Workspace = (()=>{
     items.forEach(f=>{
       const item=UI.el('div','panel-item');
       const icon=UI.el('span','pi-icon');
-      icon.textContent=f.is_dir?'&xodot; ':'&xodot; ';
+      icon.textContent=f.is_dir?'[D]':'[F]';
       const name=UI.el('span','pi-name');
       name.textContent=f.name||f.path||'';
       item.appendChild(icon);item.appendChild(name);
