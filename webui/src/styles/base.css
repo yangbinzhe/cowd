@@ -147,6 +147,15 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .management-panel h2 { margin: 0; font-size: 14px; }
 .management-panel header span { color: var(--text-faint); font-size: 12px; }
 .management-panel p { color: var(--text-muted); line-height: 1.5; margin: 0 0 12px; }
+.detail-list { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 8px 12px; margin: 0; }
+.detail-list dt { color: var(--text-faint); font-size: 12px; }
+.detail-list dd { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.field-line { display: grid; gap: 6px; margin: 10px 0; color: var(--text-muted); font-size: 12px; }
+.field-line input, .field-line select { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 9px 10px; }
+.button-row { display: flex; gap: 8px; align-items: center; }
+.approval-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 8px; }
+.approval-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty-note { color: var(--text-muted); }
 .action-grid { display: grid; gap: 8px; }
 .action-button { min-height: 46px; display: grid; grid-template-columns: 18px minmax(0, 1fr); column-gap: 8px; row-gap: 2px; align-items: center; text-align: left; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 8px 10px; }
 .action-button small { grid-column: 2; color: var(--text-faint); overflow-wrap: anywhere; }

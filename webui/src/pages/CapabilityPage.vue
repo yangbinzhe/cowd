@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { AlertTriangle, CheckCircle2, Database, RefreshCw, WifiOff } from 'lucide-vue-next';
+import { api } from '../api/client';
 import { capabilitySpecs } from '../data/capabilities';
 import { useAppStore } from '../stores/app';
 import ChartPanel from '../components/ChartPanel.vue';
@@ -15,13 +16,81 @@ const readyCount = computed(() => snapshots.value.filter((item) => item.status =
 const offlineCount = computed(() => snapshots.value.filter((item) => item.status === 'offline' || item.status === 'error').length);
 const totalRows = computed(() => snapshots.value.reduce((sum, item) => sum + item.count, 0));
 const chartData = computed(() => snapshots.value.map((item) => ({ name: item.label, value: Math.max(1, item.count) })));
+const runtimeLeases = ref<any>(null);
+const runtimeApprovals = ref<any[]>([]);
+const leaseOwner = ref('webui');
+const leaseMode = ref('shared');
+const workbenchError = ref('');
+const contextQuery = ref('');
+const contextProfile = ref('main_turn');
+const contextEnvelope = ref<any>(null);
+const contextHistory = ref<any>(null);
+const contextRecommendations = ref<any>(null);
+const evidenceRef = ref('workspace://changed-file/README.md');
+const evidenceResult = ref<any>(null);
 
-function refresh() {
-  store.loadCapability(props.page);
+async function refresh() {
+  await store.loadCapability(props.page);
+  if (props.page === 'runtime') await loadRuntimeWorkbench();
+  if (props.page === 'context') await loadContextWorkbench();
 }
 
 function preview(data: any) {
   return JSON.stringify(data, null, 2).slice(0, 1800);
+}
+
+async function loadRuntimeWorkbench() {
+  workbenchError.value = '';
+  try {
+    const [leases, approvals] = await Promise.all([api.runtimeSessionLeases(), api.approvalPending()]);
+    runtimeLeases.value = leases;
+    runtimeApprovals.value = Array.isArray(approvals) ? approvals : (approvals as any).pending || [];
+  } catch (error) {
+    workbenchError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function reloadProviders() {
+  await store.reloadProviders();
+  await refresh();
+}
+
+async function acquireLease() {
+  if (!store.activeSessionId) await store.createSession();
+  await api.acquireRuntimeLease(store.activeSessionId, leaseOwner.value, leaseMode.value);
+  await loadRuntimeWorkbench();
+}
+
+async function releaseLease() {
+  if (!store.activeSessionId) return;
+  await api.releaseRuntimeLease(store.activeSessionId, leaseOwner.value);
+  await loadRuntimeWorkbench();
+}
+
+async function respondApproval(id: string, approved: boolean) {
+  await api.approvalRespond(id, approved, approved ? 'approved from WebUI runtime workbench' : 'rejected from WebUI runtime workbench');
+  await loadRuntimeWorkbench();
+}
+
+async function loadContextWorkbench() {
+  workbenchError.value = '';
+  try {
+    const sessionId = store.activeSessionId || 'api-context';
+    const [current, history, recommendations] = await Promise.all([
+      api.contextCurrent(sessionId, contextQuery.value, contextProfile.value),
+      api.contextHistory(sessionId),
+      api.contextRecommendations(sessionId),
+    ]);
+    contextEnvelope.value = current;
+    contextHistory.value = history;
+    contextRecommendations.value = recommendations;
+  } catch (error) {
+    workbenchError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function resolveEvidence() {
+  evidenceResult.value = await api.resolveEvidence(evidenceRef.value);
 }
 
 onMounted(refresh);
@@ -97,6 +166,107 @@ watch(() => props.page, refresh);
         </table>
       </section>
     </div>
+
+    <p v-if="workbenchError" class="settings-alert">{{ workbenchError }}</p>
+
+    <section v-if="props.page === 'runtime'" class="management-grid runtime-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Control plane</h2>
+          <button class="ghost-action" type="button" @click="reloadProviders">Reload providers</button>
+        </header>
+        <dl class="detail-list">
+          <dt>Configured model</dt>
+          <dd>{{ store.controlPlane?.configured_model || 'unknown' }}</dd>
+          <dt>Provider count</dt>
+          <dd>{{ store.providers?.provider_count ?? store.controlPlane?.provider_count ?? 0 }}</dd>
+          <dt>Session</dt>
+          <dd>{{ store.activeSessionId || 'none' }}</dd>
+          <dt>Degraded</dt>
+          <dd>{{ store.controlPlane?.degraded ? 'yes' : 'no' }}</dd>
+        </dl>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Session lease</h2>
+          <span>{{ runtimeLeases?.leases?.length || runtimeLeases?.count || 0 }} leases</span>
+        </header>
+        <label class="field-line">
+          Owner
+          <input v-model="leaseOwner" type="text" />
+        </label>
+        <label class="field-line">
+          Mode
+          <select v-model="leaseMode">
+            <option value="shared">shared</option>
+            <option value="exclusive">exclusive</option>
+          </select>
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="acquireLease">Acquire</button>
+          <button class="ghost-action" type="button" @click="releaseLease">Release</button>
+        </div>
+        <pre class="action-result">{{ preview(runtimeLeases || {}) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Approvals</h2>
+          <span>{{ runtimeApprovals.length }} pending</span>
+        </header>
+        <div v-if="!runtimeApprovals.length" class="empty-note">No pending approval requests.</div>
+        <article v-for="approval in runtimeApprovals" :key="approval.id" class="approval-row">
+          <span>{{ approval.summary || approval.id }}</span>
+          <button class="ghost-action" type="button" @click="respondApproval(approval.id, false)">Reject</button>
+          <button class="primary-action" type="button" @click="respondApproval(approval.id, true)">Approve</button>
+        </article>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'context'" class="management-grid context-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Context builder</h2>
+          <span>{{ store.activeSessionId || 'api-context' }}</span>
+        </header>
+        <label class="field-line">
+          Query
+          <input v-model="contextQuery" type="text" placeholder="Summarize current task evidence" @keydown.enter.prevent="loadContextWorkbench" />
+        </label>
+        <label class="field-line">
+          Profile
+          <select v-model="contextProfile">
+            <option value="main_turn">main_turn</option>
+            <option value="yolo_goal">yolo_goal</option>
+            <option value="collaboration">collaboration</option>
+          </select>
+        </label>
+        <button class="primary-action" type="button" @click="loadContextWorkbench">Build packet</button>
+        <pre class="action-result">{{ preview(contextEnvelope || {}) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Evidence resolve</h2>
+          <span>ref</span>
+        </header>
+        <label class="field-line">
+          Evidence ref
+          <input v-model="evidenceRef" type="text" @keydown.enter.prevent="resolveEvidence" />
+        </label>
+        <button class="ghost-action" type="button" @click="resolveEvidence">Resolve evidence</button>
+        <pre class="action-result">{{ preview(evidenceResult || {}) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>History and recommendations</h2>
+          <span>active session</span>
+        </header>
+        <pre class="action-result">{{ preview({ history: contextHistory, recommendations: contextRecommendations }) }}</pre>
+      </article>
+    </section>
 
     <section class="management-grid live-management">
       <article v-for="item in snapshots" :key="`${item.id}:preview`" class="management-panel">

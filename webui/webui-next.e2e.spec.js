@@ -38,6 +38,18 @@ test('capability pages include visual charts instead of numeric-only cards', asy
   await expect(page.locator('.action-result').first()).toBeVisible();
 });
 
+test('runtime and context pages expose real workbench controls', async ({ page }) => {
+  await page.goto('/index.html#/runtime');
+  await expect(page.getByRole('heading', { name: 'Session lease' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Acquire' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Reload providers' })).toBeVisible();
+
+  await page.goto('/index.html#/context');
+  await expect(page.getByRole('heading', { name: 'Context builder' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Build packet' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Evidence resolve' })).toBeVisible();
+});
+
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();

@@ -95,7 +95,7 @@ async function endpoint(label: string, path: string, init: RequestInit = {}): Pr
 }
 
 const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: string) => {
-  const sid = encodeURIComponent(sessionId || '');
+  const sid = encodeURIComponent(sessionId || 'api-context');
   const routes: Record<Exclude<NavId, 'chat' | 'settings'>, Array<[string, string]>> = {
     runtime: [
       ['Control plane', '/api/runtime/control-plane'],
@@ -107,7 +107,7 @@ const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: str
     ],
     context: [
       ['Current context', '/api/context/current'],
-      ['Context history', `/api/sessions/${sid}/context/history`],
+      ['Context history', `/api/sessions/${sid}/context`],
       ['Session runs', `/api/sessions/${sid}/runs`],
       ['Session stats', `/api/sessions/${sid}/stats`],
     ],
@@ -236,7 +236,28 @@ export const api = {
   }),
   toggleSolo: () => write('/api/approval/solo', { method: 'POST' }),
   approvalPending: () => read('/api/approval/pending', []),
+  approvalRespond: (id: string, approved: boolean, reason = '') => write('/api/approval/respond', {
+    method: 'POST',
+    body: JSON.stringify({ id, approved, reason }),
+  }),
   approvalHistory: () => read('/api/approval/history?limit=20', []),
+  runtimeSessionLeases: () => read('/api/runtime/session-leases', {}),
+  acquireRuntimeLease: (sessionId: string, owner: string, mode = 'shared') => write('/api/runtime/session-leases/acquire', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, owner, mode }),
+  }),
+  releaseRuntimeLease: (sessionId: string, owner: string) => write('/api/runtime/session-leases/release', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, owner }),
+  }),
+  contextCurrent: (sessionId: string, q = '', profile = 'main_turn') => read(`/api/context/current?session_id=${encodeURIComponent(sessionId)}&q=${encodeURIComponent(q)}&profile=${encodeURIComponent(profile)}`, {}),
+  contextHistory: (sessionId: string) => read(`/api/sessions/${encodeURIComponent(sessionId)}/context?limit=20&include_envelopes=true`, {}),
+  contextRecommendations: (sessionId: string) => read(`/api/sessions/${encodeURIComponent(sessionId)}/context/recommendations?limit=20`, {}),
+  recordContextRecommendation: (sessionId: string, envelopeId: string, recommendation: string, action = 'acknowledged') => write(`/api/sessions/${encodeURIComponent(sessionId)}/context/recommendations`, {
+    method: 'POST',
+    body: JSON.stringify({ envelope_id: envelopeId, recommendation, action }),
+  }),
+  resolveEvidence: (ref: string) => read(`/api/evidence/resolve?ref=${encodeURIComponent(ref)}`, {}),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',
