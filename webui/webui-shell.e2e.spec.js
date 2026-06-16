@@ -55,6 +55,14 @@ async function routeShellApis(page) {
     if (path === '/api/context/ctx-webui') return json({ context: { envelope_id: 'ctx-webui', selected: [] } });
     if (path === '/api/sessions/webui-runtime-console/context/recommendations') return json({ recommendations: [] });
     if (path === '/api/memory/maintenance') return json({ candidates: [] });
+    if (path === '/api/memory/status') return json({ enabled: true, status: 'ready', total_entries: 12, degraded: false });
+    if (path === '/api/memory/stats') return json({ entries: 12, entities: 2, triples: 2 });
+    if (path === '/api/memory/links') return json({ links: [{ kind: 'Supports', from: 'SessionKernel', to: 'TaskKernel' }] });
+    if (path === '/api/memory/entities') return json({ entities: [{ id: 'SessionKernel', name: 'SessionKernel' }, { id: 'TaskKernel', name: 'TaskKernel' }] });
+    if (path === '/api/memory/triples') return json({ triples: [{ subject: 'SessionKernel', predicate: 'owns', object: 'sessions' }] });
+    if (path === '/api/memory/layers') return json({ layers: [{ name: 'semantic' }, { name: 'episodic' }] });
+    if (path === '/api/memory/runtime') return json({ clusters: [], status: 'ready' });
+    if (path === '/api/memory/clusters') return json({ clusters: [{ id: 'cluster-1', label: 'Runtime' }] });
     return json({});
   });
 }
@@ -203,6 +211,34 @@ test('v0.9.205 runtime and context render as full-page kernel workbenches', asyn
   await page.click('#nav-rail [data-view="runtime"]');
   await expect(page.locator('#workbench-content')).toContainText('MainTurn');
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.205-runtime-mobile.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.206 memory renders as a full-page knowledge workbench', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+  await page.click('#nav-rail [data-view="memory"]');
+
+  await expect(page.locator('#workbench-content.workbench-page-memory')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Memory');
+  await expect(page.locator('#workbench-content')).toContainText(/ready|Memory/i);
+  await expect(page.locator('#workbench-content')).toContainText('SessionKernel');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.206-memory-desktop.png' });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.206-memory-mobile.png' });
 
   expect(errors).toEqual([]);
 });
