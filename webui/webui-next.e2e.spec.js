@@ -37,8 +37,9 @@ test('capability pages expose current-page sections instead of duplicated primar
   await expect(page.locator('.chart-panel canvas, .chart-panel svg, .chart-panel div').first()).toBeVisible();
   await expect(page.locator('.work-table table')).toBeVisible();
   await expect(page.locator('.action-button')).toHaveCount(0);
+  await expect(page.locator('pre.action-result')).toHaveCount(0);
+  await expect(page.locator('.raw-payload').first()).toBeVisible();
   await expect(page.locator('.status-badge')).toContainText(['offline']);
-  await expect(page.locator('.action-result').first()).toBeVisible();
 });
 
 test('runtime and context pages expose real workbench controls', async ({ page }) => {

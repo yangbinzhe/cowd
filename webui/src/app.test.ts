@@ -71,6 +71,8 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Memory');
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Settings');
     expect(wrapper.findAll('.action-button').length).toBe(0);
+    expect(wrapper.findAll('pre.action-result').length).toBe(0);
+    expect(wrapper.find('.raw-payload').exists()).toBe(true);
     expect(wrapper.text()).toContain('Live endpoint contract');
     expect(wrapper.text()).toContain('Offline/Error');
   });

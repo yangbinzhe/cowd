@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import { capabilitySpecs } from '../data/capabilities';
 import { useAppStore } from '../stores/app';
 import ChartPanel from '../components/ChartPanel.vue';
+import RawPayload from '../components/workbench/RawPayload.vue';
 
 const props = defineProps<{ page: keyof typeof capabilitySpecs }>();
 const store = useAppStore();
@@ -74,10 +75,6 @@ async function refresh() {
   if (props.page === 'gateway') await loadGatewayWorkbench();
   if (props.page === 'iacc') await loadIaccWorkbench();
   if (props.page === 'audit') await loadAuditWorkbench();
-}
-
-function preview(data: any) {
-  return JSON.stringify(data, null, 2).slice(0, 1800);
 }
 
 async function loadRuntimeWorkbench() {
@@ -590,7 +587,7 @@ watch(() => props.page, refresh);
           <button class="primary-action" type="button" @click="acquireLease">Acquire</button>
           <button class="ghost-action" type="button" @click="releaseLease">Release</button>
         </div>
-        <pre class="action-result">{{ preview(runtimeLeases || {}) }}</pre>
+        <RawPayload :data="runtimeLeases || {}" />
       </article>
 
       <article class="management-panel">
@@ -626,7 +623,7 @@ watch(() => props.page, refresh);
           </select>
         </label>
         <button class="primary-action" type="button" @click="loadContextWorkbench">Build packet</button>
-        <pre class="action-result">{{ preview(contextEnvelope || {}) }}</pre>
+        <RawPayload :data="contextEnvelope || {}" />
       </article>
 
       <article class="management-panel">
@@ -639,7 +636,7 @@ watch(() => props.page, refresh);
           <input v-model="evidenceRef" type="text" @keydown.enter.prevent="resolveEvidence" />
         </label>
         <button class="ghost-action" type="button" @click="resolveEvidence">Resolve evidence</button>
-        <pre class="action-result">{{ preview(evidenceResult || {}) }}</pre>
+        <RawPayload :data="evidenceResult || {}" />
       </article>
 
       <article class="management-panel">
@@ -647,7 +644,7 @@ watch(() => props.page, refresh);
           <h2>History and recommendations</h2>
           <span>active session</span>
         </header>
-        <pre class="action-result">{{ preview({ history: contextHistory, recommendations: contextRecommendations }) }}</pre>
+        <RawPayload :data="{ history: contextHistory, recommendations: contextRecommendations }" />
       </article>
     </section>
 
@@ -662,7 +659,7 @@ watch(() => props.page, refresh);
           <input v-model="memoryQuery" type="text" @keydown.enter.prevent="loadMemoryWorkbench" />
         </label>
         <button class="primary-action" type="button" @click="loadMemoryWorkbench">Search and build packet</button>
-        <pre class="action-result">{{ preview({ search: memoryResult, packet: memoryPacket }) }}</pre>
+        <RawPayload :data="{ search: memoryResult, packet: memoryPacket }" />
       </article>
 
       <article class="management-panel">
@@ -701,7 +698,7 @@ watch(() => props.page, refresh);
           <input v-model="structuredFactType" type="text" />
         </label>
         <button class="ghost-action" type="button" @click="planStructuredIngest">Plan manufacturing ingest</button>
-        <pre class="action-result">{{ preview({ plan: structuredPlan, collections: structuredCollections }) }}</pre>
+        <RawPayload :data="{ plan: structuredPlan, collections: structuredCollections }" />
       </article>
 
       <article class="management-panel">
@@ -710,7 +707,7 @@ watch(() => props.page, refresh);
           <span>scan/update</span>
         </header>
         <button class="ghost-action" type="button" @click="scanMaintenance">Scan candidates</button>
-        <pre class="action-result">{{ preview(maintenanceResult || {}) }}</pre>
+        <RawPayload :data="maintenanceResult || {}" />
       </article>
     </section>
 
@@ -731,14 +728,14 @@ watch(() => props.page, refresh);
           <button class="ghost-action" type="button" @click="runSkillAction('plan')">Plan</button>
           <button class="primary-action" type="button" @click="runSkillAction('run')">Run</button>
         </div>
-        <pre class="action-result">{{ preview(skillActionResult || skillState || {}) }}</pre>
+        <RawPayload :data="skillActionResult || skillState || {}" />
       </article>
       <article class="management-panel">
         <header>
           <h2>Projection and runs</h2>
           <span>webui</span>
         </header>
-        <pre class="action-result">{{ preview({ projection: skillState?.projection, runs: skillState?.runs }) }}</pre>
+        <RawPayload :data="{ projection: skillState?.projection, runs: skillState?.runs }" />
       </article>
     </section>
 
@@ -756,14 +753,14 @@ watch(() => props.page, refresh);
           <button class="primary-action" type="button" @click="startTask">Start task</button>
           <button class="ghost-action" type="button" @click="addTaskPhase">Add phase</button>
         </div>
-        <pre class="action-result">{{ preview(taskActionResult || taskState || {}) }}</pre>
+        <RawPayload :data="taskActionResult || taskState || {}" />
       </article>
       <article class="management-panel">
         <header>
           <h2>Task registry</h2>
           <span>current</span>
         </header>
-        <pre class="action-result">{{ preview(taskState || {}) }}</pre>
+        <RawPayload :data="taskState || {}" />
       </article>
     </section>
 
@@ -773,14 +770,14 @@ watch(() => props.page, refresh);
           <h2>Tool registry</h2>
           <span>{{ toolState?.tools?.count || toolState?.tools?.tools?.length || 0 }} tools</span>
         </header>
-        <pre class="action-result">{{ preview(toolState?.tools || {}) }}</pre>
+        <RawPayload :data="toolState?.tools || {}" />
       </article>
       <article class="management-panel">
         <header>
           <h2>Command and risk history</h2>
           <span>{{ toolState?.history?.total || toolState?.history?.history?.length || 0 }} events</span>
         </header>
-        <pre class="action-result">{{ preview({ history: toolState?.history, capabilities: toolState?.capabilities }) }}</pre>
+        <RawPayload :data="{ history: toolState?.history, capabilities: toolState?.capabilities }" />
       </article>
     </section>
 
@@ -790,7 +787,7 @@ watch(() => props.page, refresh);
           <h2>Platforms and connectors</h2>
           <span>{{ gatewayState?.summary?.connector_count || gatewayState?.accounts?.accounts?.length || 0 }} connectors</span>
         </header>
-        <pre class="action-result">{{ preview({ platforms: gatewayState?.platforms, summary: gatewayState?.summary, accounts: gatewayState?.accounts, capabilities: gatewayState?.capabilities, mcp: gatewayState?.mcp }) }}</pre>
+        <RawPayload :data="{ platforms: gatewayState?.platforms, summary: gatewayState?.summary, accounts: gatewayState?.accounts, capabilities: gatewayState?.capabilities, mcp: gatewayState?.mcp }" />
       </article>
 
       <article class="management-panel">
@@ -806,7 +803,7 @@ watch(() => props.page, refresh);
           <button class="ghost-action" type="button" :disabled="!resourceRef" @click="revalidateResource">Revalidate</button>
           <button class="primary-action" type="button" :disabled="!resourceRef" @click="promoteResourceMemory">Promote memory</button>
         </div>
-        <pre class="action-result">{{ preview(gatewayState?.resources || {}) }}</pre>
+        <RawPayload :data="gatewayState?.resources || {}" />
       </article>
 
       <article class="management-panel">
@@ -815,7 +812,7 @@ watch(() => props.page, refresh);
           <span>preflight/audit</span>
         </header>
         <button class="primary-action" type="button" @click="runCrossPlanePreflight">Run preflight</button>
-        <pre class="action-result">{{ preview(crossPlaneResult || { summary: gatewayState?.crossPlane, audit: gatewayState?.audit, adapters: gatewayState?.adapters, executions: gatewayState?.executions }) }}</pre>
+        <RawPayload :data="crossPlaneResult || { summary: gatewayState?.crossPlane, audit: gatewayState?.audit, adapters: gatewayState?.adapters, executions: gatewayState?.executions }" />
       </article>
     </section>
 
@@ -846,7 +843,7 @@ watch(() => props.page, refresh);
         </header>
         <p>IACC is an upper application. This action seeds manufacturing ontology/domain data and writes a real manufacturing fact through IACC APIs.</p>
         <button class="primary-action" type="button" @click="seedIaccManufacturing">Seed manufacturing fact</button>
-        <pre class="action-result">{{ preview({ metrics: iaccState?.metrics, attention: iaccState?.attention, changes: iaccState?.changes }) }}</pre>
+        <RawPayload :data="{ metrics: iaccState?.metrics, attention: iaccState?.attention, changes: iaccState?.changes }" />
       </article>
 
       <article class="management-panel">
@@ -871,7 +868,7 @@ watch(() => props.page, refresh);
             </option>
           </select>
         </label>
-        <pre class="action-result">{{ preview({ room: iaccRoom, entities: iaccEntities.slice(0, 8), attention: iaccAttention.slice(0, 8) }) }}</pre>
+        <RawPayload :data="{ room: iaccRoom, entities: iaccEntities.slice(0, 8), attention: iaccAttention.slice(0, 8) }" />
       </article>
 
       <article class="management-panel">
@@ -897,7 +894,7 @@ watch(() => props.page, refresh);
           <button class="primary-action" type="button" :disabled="!selectedActionId" @click="executeIaccAction">Execute dry run</button>
           <button class="ghost-action" type="button" @click="bridgeIaccExecution">Bridge cross-plane</button>
         </div>
-        <pre class="action-result">{{ preview({ analysis: iaccAnalysis, executions: iaccRoom?.executions, playbooks: iaccRoom?.playbooks }) }}</pre>
+        <RawPayload :data="{ analysis: iaccAnalysis, executions: iaccRoom?.executions, playbooks: iaccRoom?.playbooks }" />
       </article>
 
       <article class="management-panel">
@@ -918,7 +915,7 @@ watch(() => props.page, refresh);
           <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="planIaccSkills">Plan skills</button>
           <button class="primary-action" type="button" :disabled="!selectedIncidentId || !selectedIaccSkillId" @click="runIaccSkill">Run skill</button>
         </div>
-        <pre class="action-result">{{ preview({ skills: iaccState?.skills, skill_runs: iaccRoom?.skill_runs || iaccResult?.skill_run }) }}</pre>
+        <RawPayload :data="{ skills: iaccState?.skills, skill_runs: iaccRoom?.skill_runs || iaccResult?.skill_run }" />
       </article>
 
       <article class="management-panel">
@@ -942,7 +939,7 @@ watch(() => props.page, refresh);
           <button class="primary-action" type="button" @click="generateIaccReport">Generate report</button>
           <button class="ghost-action" type="button" :disabled="!cockpitReportId" @click="retryIaccReportDelivery">Retry delivery</button>
         </div>
-        <pre class="action-result">{{ preview(iaccResult || {}) }}</pre>
+        <RawPayload :data="iaccResult || {}" />
       </article>
     </section>
 
@@ -974,7 +971,7 @@ watch(() => props.page, refresh);
           </label>
         </div>
         <button class="primary-action" type="button" @click="loadAuditWorkbench">Refresh audit</button>
-        <pre class="action-result">{{ preview(auditState?.audit || {}) }}</pre>
+        <RawPayload :data="auditState?.audit || {}" />
       </article>
 
       <article class="management-panel">
@@ -992,7 +989,7 @@ watch(() => props.page, refresh);
           <dt>Cost</dt>
           <dd>{{ Number(auditState?.usage?.estimated_cost_usd || 0).toFixed(6) }}</dd>
         </dl>
-        <pre class="action-result">{{ preview({ by_platform: auditState?.usage?.by_platform, by_model: auditState?.usage?.by_model, sessions: usageSessions.slice(0, 12) }) }}</pre>
+        <RawPayload :data="{ by_platform: auditState?.usage?.by_platform, by_model: auditState?.usage?.by_model, sessions: usageSessions.slice(0, 12) }" />
       </article>
 
       <article class="management-panel">
@@ -1008,7 +1005,7 @@ watch(() => props.page, refresh);
             <option value="cli">cli</option>
           </select>
         </label>
-        <pre class="action-result">{{ preview({ capabilities: auditState?.capabilities, projection: auditState?.projection, surfaces: auditState?.surfaces, release_gate: auditState?.releaseGate }) }}</pre>
+        <RawPayload :data="{ capabilities: auditState?.capabilities, projection: auditState?.projection, surfaces: auditState?.surfaces, release_gate: auditState?.releaseGate }" />
       </article>
 
       <article class="management-panel">
@@ -1016,7 +1013,7 @@ watch(() => props.page, refresh);
           <h2>Governance evidence</h2>
           <span>approval/cross-plane</span>
         </header>
-        <pre class="action-result">{{ preview({ approval: auditState?.approvalHistory, cross_plane_audit: auditState?.crossPlaneAudit, executions: auditState?.executions }) }}</pre>
+        <RawPayload :data="{ approval: auditState?.approvalHistory, cross_plane_audit: auditState?.crossPlaneAudit, executions: auditState?.executions }" />
       </article>
     </section>
 
@@ -1027,7 +1024,7 @@ watch(() => props.page, refresh);
           <span>{{ item.status }}</span>
         </header>
         <p v-if="item.__error">{{ item.__error }}</p>
-        <pre class="action-result">{{ preview(item.data) }}</pre>
+        <RawPayload :data="item.data" />
       </article>
     </section>
   </section>

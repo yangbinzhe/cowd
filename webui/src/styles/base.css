@@ -162,7 +162,20 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .action-button small { grid-column: 2; color: var(--text-faint); overflow-wrap: anywhere; }
 .action-button[data-kind="primary"] { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); }
 .action-button[data-kind="danger"] { border-color: color-mix(in srgb, var(--danger) 58%, var(--border)); }
-.action-result { margin: 12px 0 0; max-height: 180px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); padding: 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
+.raw-payload { margin: 12px 0 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); overflow: hidden; }
+.raw-payload summary { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 10px; cursor: pointer; color: var(--text); }
+.raw-payload summary small { color: var(--text-faint); font-size: 11px; }
+.raw-payload-toolbar { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--border); }
+.raw-payload-toolbar .ghost-action { min-height: 28px; font-size: 12px; }
+.raw-payload-body { margin: 0; max-height: 260px; overflow: auto; border-top: 1px solid var(--border); color: var(--text-muted); padding: 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table th, .data-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.empty-state { border: 1px dashed var(--border); border-radius: 8px; background: var(--bg); padding: 14px; color: var(--text-muted); }
+.empty-state strong { color: var(--text); }
+.empty-state p { margin: 4px 0 0; }
+.timeline-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.timeline-list li { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 10px; display: grid; gap: 4px; }
+.timeline-list span { color: var(--text-faint); font-size: 12px; }
 .live-management { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .status-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: var(--bg); font-size: 12px; }
 .status-badge[data-status="ready"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 36%, var(--border)); }
