@@ -10,7 +10,8 @@ test('new shell uses icon rail and right Activity/Workspace companion tabs', asy
   await expect(page.locator('.transcript')).toBeVisible();
   await expect(page.locator('.composer textarea')).toBeVisible();
   await expect(page.locator('.turn-role')).toHaveCount(0);
-  await expect(page.locator('.status-strip')).toContainText('offline');
+  await expect(page.locator('.status-strip')).toContainText('local');
+  await expect(page.locator('.status-strip')).toContainText('Select model');
 });
 
 test('workspace tab supports folder browsing and editable preview surface', async ({ page }) => {
@@ -92,6 +93,16 @@ test('iacc page exposes manufacturing application workbench controls', async ({ 
   await expect(page.getByRole('button', { name: 'Seed manufacturing fact' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Create incident' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Generate report' })).toBeVisible();
+});
+
+test('audit page exposes usage and release gate governance controls', async ({ page }) => {
+  await page.goto('/index.html#/audit');
+  await expect(page.getByRole('heading', { name: 'Audit export' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Usage summary' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Release gate', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Governance evidence' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Refresh audit' })).toBeVisible();
+  await expect(page.getByRole('combobox').filter({ hasText: /webui|tui|cli/ })).toBeVisible();
 });
 
 test('settings page is reachable and theme control is usable', async ({ page }) => {

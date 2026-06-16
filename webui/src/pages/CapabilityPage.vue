@@ -57,6 +57,11 @@ const selectedActionId = ref('');
 const cockpitProfileId = ref('webui-manufacturing');
 const cockpitOwnerRef = ref('user:webui-operator');
 const cockpitReportId = ref('');
+const auditState = ref<any>(null);
+const auditSource = ref('all');
+const auditLimit = ref(50);
+const auditOffset = ref(0);
+const releaseSurface = ref('webui');
 
 async function refresh() {
   await store.loadCapability(props.page);
@@ -68,6 +73,7 @@ async function refresh() {
   if (props.page === 'tools') await loadToolsWorkbench();
   if (props.page === 'gateway') await loadGatewayWorkbench();
   if (props.page === 'iacc') await loadIaccWorkbench();
+  if (props.page === 'audit') await loadAuditWorkbench();
 }
 
 function preview(data: any) {
@@ -280,6 +286,28 @@ const iaccSkills = computed(() => iaccItems(iaccState.value?.skills, 'items'));
 const iaccRoom = computed(() => iaccState.value?.room || {});
 const iaccAnalysis = computed(() => iaccRoom.value?.analysis || iaccResult.value?.analysis || iaccResult.value?.operational_analysis);
 const iaccRecommendedActions = computed(() => iaccAnalysis.value?.recommended_actions || []);
+const auditRecords = computed(() => iaccItems(auditState.value?.audit, 'records'));
+const usageSessions = computed(() => iaccItems(auditState.value?.usage, 'sessions'));
+const releaseChecks = computed(() => iaccItems(auditState.value?.releaseGate, 'checks'));
+const usageChart = computed(() => {
+  const byPlatform = auditState.value?.usage?.by_platform || {};
+  const points = Object.entries(byPlatform).map(([name, value]: [string, any]) => ({
+    name,
+    value: Math.max(1, Number(value.total_tokens || value.message_count || value.session_count || 0)),
+  }));
+  return points.length ? points : [{ name: 'usage', value: Math.max(1, Number(auditState.value?.usage?.tokens?.total || 0)) }];
+});
+const releaseChart = computed(() => {
+  const checks = releaseChecks.value;
+  if (checks.length) {
+    return checks.map((check: any) => ({ name: check.name || check.id || check.kind || 'check', value: check.status === 'pass' || check.passed ? 100 : 20 }));
+  }
+  return [
+    { name: 'capabilities', value: Math.max(1, Number(auditState.value?.capabilities?.capability_count || auditState.value?.capabilities?.capabilities?.length || 0)) },
+    { name: 'projection', value: Math.max(1, Number(auditState.value?.projection?.capability_count || auditState.value?.projection?.capabilities?.length || 0)) },
+    { name: 'surfaces', value: Math.max(1, Number(auditState.value?.surfaces?.surfaces?.length || Object.keys(auditState.value?.surfaces || {}).length || 0)) },
+  ];
+});
 
 async function loadIaccWorkbench() {
   workbenchError.value = '';
@@ -426,6 +454,26 @@ async function retryIaccReportDelivery() {
     actor_principal: 'webui-operator',
     source_channel: 'iacc.report.retry',
   });
+}
+
+async function loadAuditWorkbench() {
+  workbenchError.value = '';
+  try {
+    const [audit, usage, capabilities, projection, surfaces, releaseGate, approvalHistory, crossPlaneAudit, executions] = await Promise.all([
+      api.auditExport(auditSource.value, auditLimit.value, auditOffset.value),
+      api.usageSummary(),
+      api.cowdCapabilities(),
+      api.cowdProjection(releaseSurface.value),
+      api.cowdSurfaces(),
+      api.cowdReleaseGate(),
+      api.approvalHistory(),
+      api.crossPlaneAudit(),
+      api.crossPlaneExecutions(),
+    ]);
+    auditState.value = { audit, usage, capabilities, projection, surfaces, releaseGate, approvalHistory, crossPlaneAudit, executions };
+  } catch (error) {
+    workbenchError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 onMounted(refresh);
@@ -895,6 +943,80 @@ watch(() => props.page, refresh);
           <button class="ghost-action" type="button" :disabled="!cockpitReportId" @click="retryIaccReportDelivery">Retry delivery</button>
         </div>
         <pre class="action-result">{{ preview(iaccResult || {}) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'audit'" class="management-grid audit-workbench">
+      <ChartPanel title="Usage by platform" kind="bar" :data="usageChart" />
+      <ChartPanel title="Release gate coverage" kind="radar" :data="releaseChart" />
+
+      <article class="management-panel">
+        <header>
+          <h2>Audit export</h2>
+          <span>{{ auditRecords.length }} records</span>
+        </header>
+        <div class="button-row">
+          <label class="field-line">
+            Source
+            <select v-model="auditSource" @change="loadAuditWorkbench">
+              <option value="all">all</option>
+              <option value="approval">approval</option>
+              <option value="memory">memory</option>
+            </select>
+          </label>
+          <label class="field-line">
+            Limit
+            <input v-model.number="auditLimit" type="number" min="1" max="500" @change="loadAuditWorkbench" />
+          </label>
+          <label class="field-line">
+            Offset
+            <input v-model.number="auditOffset" type="number" min="0" @change="loadAuditWorkbench" />
+          </label>
+        </div>
+        <button class="primary-action" type="button" @click="loadAuditWorkbench">Refresh audit</button>
+        <pre class="action-result">{{ preview(auditState?.audit || {}) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Usage summary</h2>
+          <span>{{ usageSessions.length }} sessions</span>
+        </header>
+        <dl class="detail-list">
+          <dt>Status</dt>
+          <dd>{{ auditState?.usage?.status || 'unknown' }}</dd>
+          <dt>Messages</dt>
+          <dd>{{ auditState?.usage?.message_count || 0 }}</dd>
+          <dt>Tokens</dt>
+          <dd>{{ auditState?.usage?.tokens?.total || 0 }}</dd>
+          <dt>Cost</dt>
+          <dd>{{ Number(auditState?.usage?.estimated_cost_usd || 0).toFixed(6) }}</dd>
+        </dl>
+        <pre class="action-result">{{ preview({ by_platform: auditState?.usage?.by_platform, by_model: auditState?.usage?.by_model, sessions: usageSessions.slice(0, 12) }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Release gate</h2>
+          <span>{{ auditState?.releaseGate?.status || auditState?.releaseGate?.result || 'unknown' }}</span>
+        </header>
+        <label class="field-line">
+          Surface
+          <select v-model="releaseSurface" @change="loadAuditWorkbench">
+            <option value="webui">webui</option>
+            <option value="tui">tui</option>
+            <option value="cli">cli</option>
+          </select>
+        </label>
+        <pre class="action-result">{{ preview({ capabilities: auditState?.capabilities, projection: auditState?.projection, surfaces: auditState?.surfaces, release_gate: auditState?.releaseGate }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Governance evidence</h2>
+          <span>approval/cross-plane</span>
+        </header>
+        <pre class="action-result">{{ preview({ approval: auditState?.approvalHistory, cross_plane_audit: auditState?.crossPlaneAudit, executions: auditState?.executions }) }}</pre>
       </article>
     </section>
 

@@ -109,4 +109,15 @@ describe('Cowd Vue WebUI shell', () => {
       body: JSON.stringify({ report: { cadence: 'daily' } }),
     }));
   });
+
+  it('loads audit, usage, and release gate from real governance endpoints', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'governance.test' }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.auditExport('approval', 25, 5);
+    await api.usageSummary();
+    await api.cowdReleaseGate();
+    expect(fetchMock).toHaveBeenCalledWith('/api/audit/export?source=approval&limit=25&offset=5', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/usage', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cowd/release-gate', expect.any(Object));
+  });
 });
