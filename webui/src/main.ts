@@ -16,7 +16,7 @@ const routes = [
   { path: '/agents', component: () => import('./pages/AgentsPage.vue') },
   { path: '/tools', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'tools' } },
   { path: '/gateway', component: () => import('./pages/GatewayPage.vue') },
-  { path: '/iacc', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'iacc' } },
+  { path: '/iacc', component: () => import('./pages/IaccPage.vue') },
   { path: '/audit', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'audit' } },
   { path: '/settings', component: () => import('./pages/SettingsPage.vue') },
 ];
