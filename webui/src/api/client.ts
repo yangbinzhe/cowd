@@ -265,8 +265,31 @@ export const api = {
     body: JSON.stringify({ envelope_id: envelopeId, recommendation, action }),
   }),
   resolveEvidence: (ref: string) => read(`/api/evidence/resolve?ref=${encodeURIComponent(ref)}`, {}),
+  memoryStatus: () => read('/api/memory/status', {}),
+  memoryStats: () => read('/api/memory/stats', {}),
+  memoryLayers: () => read('/api/memory/layers', { layers: [] }),
+  memoryLayer: (layer: string) => read(`/api/memory/${encodeURIComponent(layer)}`, { entries: [] }),
+  memoryRuntime: () => read('/api/memory/runtime', {}),
+  memoryClusters: (limit = 24) => read(`/api/memory/clusters?limit=${limit}`, { clusters: [] }),
+  memoryLinks: () => read('/api/memory/links', { links: [] }),
+  memoryEntities: () => read('/api/memory/entities', { entities: [] }),
+  memoryTriples: () => read('/api/memory/triples', { triples: [] }),
+  memoryPerformance: () => read('/api/memory/performance', {}),
+  memoryMaintenance: (status = '', kind = '', limit = 100) => {
+    const query = new URLSearchParams();
+    if (status) query.set('status', status);
+    if (kind) query.set('kind', kind);
+    query.set('limit', String(limit));
+    return read(`/api/memory/maintenance?${query.toString()}`, { candidates: [] });
+  },
   memorySearch: (q: string) => read(`/api/memory/search?q=${encodeURIComponent(q)}`, {}),
-  memoryPacket: (q: string) => read(`/api/memory/packet?q=${encodeURIComponent(q)}`, {}),
+  memoryRecallExplain: (q: string, limit = 10) => read(`/api/memory/recall/explain?q=${encodeURIComponent(q)}&limit=${limit}`, { results: [] }),
+  memoryPacket: (q: string, maxItems = 12, maxTokens = 2000) => read(`/api/memory/packet?q=${encodeURIComponent(q)}&max_items=${maxItems}&max_tokens=${maxTokens}`, {}),
+  memorySymbolLinks: (symbol: string) => read(`/api/memory/symbol-links?q=${encodeURIComponent(symbol)}`, { entries: [] }),
+  createMemorySymbolLink: (body: Record<string, unknown>) => write('/api/memory/symbol-links', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   createMemoryEntry: (layer: string, body: Record<string, unknown>) => write(`/api/memory/${encodeURIComponent(layer)}`, {
     method: 'POST',
     body: JSON.stringify(body),

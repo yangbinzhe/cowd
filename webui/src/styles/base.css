@@ -202,6 +202,31 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .status-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: var(--bg); font-size: 12px; }
 .status-badge[data-status="ready"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 36%, var(--border)); }
 .status-badge[data-status="offline"], .status-badge[data-status="error"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.status-badge[data-status="degraded"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 42%, var(--border)); }
+
+.memory-page { overflow: auto; }
+.memory-workbench { display: grid; grid-template-columns: 168px minmax(0, 1fr); gap: 16px; padding: 18px 24px 28px; }
+.memory-sections { position: sticky; top: 18px; align-self: start; display: grid; gap: 7px; }
+.memory-sections a { min-height: 36px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text-muted); text-decoration: none; }
+.memory-sections a:hover { color: var(--text); background: var(--surface-2); border-color: var(--border-2); }
+.memory-main { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-content: start; }
+.memory-panel { min-width: 0; }
+.memory-panel.wide { grid-column: 1 / -1; }
+.memory-split { display: grid; grid-template-columns: minmax(260px, .85fr) minmax(0, 1.15fr); gap: 14px; }
+.memory-list { min-width: 0; display: grid; gap: 8px; align-content: start; }
+.memory-entry-row { width: 100%; display: grid; gap: 4px; text-align: left; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); padding: 9px 10px; }
+.memory-entry-row:hover, .memory-entry-row.active { background: var(--surface-2); color: var(--text); border-color: var(--border-2); }
+.memory-entry-row strong { color: var(--text); }
+.memory-entry-row span, .memory-entry-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-entry-row small { color: var(--text-faint); }
+.memory-detail { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 12px; }
+.memory-form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.memory-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.memory-tabs h3 { margin: 0 0 8px; font-size: 13px; }
+.maintenance-list { display: grid; gap: 8px; }
+.maintenance-list article { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 10px; }
+.maintenance-list strong { color: var(--text); }
+.maintenance-list p { margin: 3px 0 0; color: var(--text-muted); overflow-wrap: anywhere; }
 
 .modal-scrim { position: fixed; inset: 0; z-index: 30; display: grid; place-items: end center; padding: 20px; background: rgba(0,0,0,.28); }
 .command-modal { width: min(680px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 42px)); overflow: auto; border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: 0 16px 42px rgba(0,0,0,.28); padding: 14px; }
@@ -244,7 +269,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .rail { position: sticky; top: 0; z-index: 3; flex-direction: row; justify-content: flex-start; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .main-surface { min-height: 70vh; }
   .companion-panel { min-height: 460px; border-left: 0; border-top: 1px solid var(--border); }
-  .page-header, .composer-bar, .capability-grid, .settings-grid, .management-grid, .modal-columns { grid-template-columns: 1fr; flex-direction: column; align-items: stretch; }
+  .page-header, .composer-bar, .capability-grid, .settings-grid, .management-grid, .modal-columns, .memory-workbench, .memory-main, .memory-split, .memory-tabs, .memory-form-row { grid-template-columns: 1fr; flex-direction: column; align-items: stretch; }
   .skills-console, .skills-detail { grid-template-columns: 1fr; }
   .metric-row { grid-template-columns: 1fr; }
   .turn { grid-template-columns: 1fr; gap: 6px; }

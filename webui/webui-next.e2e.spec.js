@@ -27,11 +27,11 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
 });
 
 test('capability pages expose current-page sections instead of duplicated primary navigation', async ({ page }) => {
-  await page.goto('/index.html#/memory');
+  await page.goto('/index.html#/runtime');
   await expect(page.locator('.session-sidebar')).toHaveCount(0);
   await expect(page.locator('.capability-sidebar')).toBeVisible();
   await expect(page.locator('.section-row')).toHaveCount(4);
-  await expect(page.locator('.capability-sidebar')).not.toContainText('Runtime');
+  await expect(page.locator('.capability-sidebar')).not.toContainText('Memory Graph');
   await expect(page.locator('.capability-sidebar')).not.toContainText('Settings');
   await expect(page.locator('.metric-card')).toHaveCount(3);
   await expect(page.locator('.chart-panel canvas, .chart-panel svg, .chart-panel div').first()).toBeVisible();
@@ -56,11 +56,16 @@ test('runtime and context pages expose real workbench controls', async ({ page }
 
 test('memory page exposes memory and structured-data kernel controls', async ({ page }) => {
   await page.goto('/index.html#/memory');
+  await expect(page.getByRole('heading', { name: 'Memory Graph', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Layer entries' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Search, recall, packet' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Register memory fact' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Structured memory graph' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Maintenance' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Structured data core' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Plan manufacturing ingest' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Scan candidates' })).toBeVisible();
+  await expect(page.locator('.memory-sections')).toBeVisible();
 });
 
 test('skills agents and tools pages expose lifecycle workbenches', async ({ page }) => {

@@ -11,7 +11,7 @@ const routes = [
   { path: '/chat', component: ChatPage, meta: { label: 'Chat' } },
   { path: '/runtime', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'runtime' } },
   { path: '/context', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'context' } },
-  { path: '/memory', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'memory' } },
+  { path: '/memory', component: () => import('./pages/MemoryPage.vue') },
   { path: '/skills', component: () => import('./pages/SkillsPage.vue') },
   { path: '/agents', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'agents' } },
   { path: '/tools', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'tools' } },
