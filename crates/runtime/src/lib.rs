@@ -102,6 +102,7 @@ pub mod tool_cache;
 pub mod tool_dispatch;
 pub mod tool_execution_plan;
 pub mod tool_invocation;
+pub mod tool_ledger;
 pub mod tool_memory;
 pub mod tool_orchestrator;
 pub mod trust_resolver;

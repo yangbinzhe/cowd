@@ -56,6 +56,7 @@ use crate::tool_execution_plan::ToolExecutionPlan;
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
+use crate::tool_ledger::{tool_event_idempotency_key, TurnToolLedger};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -3294,42 +3295,14 @@ where
         kind: &'static str,
         sequence: usize,
     ) {
-        let Some(ref store) = self.session_store else {
-            return;
-        };
-        let session_id = record.session_id.clone();
         let event = record.to_runtime_event(sequence, kind);
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    event_kind = kind,
-                    "tool invocation runtime event append failed"
-                );
-            }
-        });
+        self.append_tool_runtime_events(record.turn_index, kind, vec![event]);
     }
 
     fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, sequence: usize) {
-        let Some(ref store) = self.session_store else {
-            return;
-        };
         let session_id = self.session().session_id;
         let event = plan.to_runtime_event(session_id.clone(), sequence, now_ms());
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    "tool execution plan event append failed"
-                );
-            }
-        });
+        self.append_tool_runtime_events(sequence, "tool.execution.plan.created", vec![event]);
     }
 
     fn record_tool_schedule(
@@ -3338,20 +3311,47 @@ where
         requests: &[crate::tool_dispatch::ToolRequest],
         sequence: usize,
     ) {
+        let session_id = self.session().session_id;
+        let event = schedule.to_runtime_event(session_id.clone(), sequence, now_ms(), requests);
+        self.append_tool_runtime_events(sequence, "tool.schedule.created", vec![event]);
+    }
+
+    fn append_tool_runtime_events(
+        &self,
+        turn_index: usize,
+        event_label: &'static str,
+        events: Vec<memory::RuntimeEvent>,
+    ) {
         let Some(ref store) = self.session_store else {
             return;
         };
         let session_id = self.session().session_id;
-        let event = schedule.to_runtime_event(session_id.clone(), sequence, now_ms(), requests);
+        let use_ledger = std::env::var("COWD_TOOL_LEDGER_V2").ok().as_deref() == Some("1");
+        let events = if use_ledger {
+            let mut ledger = TurnToolLedger::new(session_id.to_string(), turn_index);
+            for event in events {
+                let idempotency_key = tool_event_idempotency_key(&event);
+                ledger.append_runtime_event(idempotency_key, event);
+            }
+            ledger.flush().events
+        } else {
+            events
+        };
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    "tool schedule event append failed"
-                );
+            for event in events {
+                let sequence = event.sequence;
+                let kind = event.kind.clone();
+                if let Err(error) = store.append_runtime_event(&event).await {
+                    tracing::warn!(
+                        %error,
+                        session_id,
+                        sequence,
+                        event_kind = kind,
+                        event_label,
+                        "tool runtime event append failed"
+                    );
+                }
             }
         });
     }
@@ -3743,9 +3743,14 @@ mod tests {
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
     fn to_stream(
@@ -3948,6 +3953,106 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn conversation_tool_events_can_use_ledger_bridge() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("COWD_TOOL_LEDGER_V2", "1");
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+            let session = Session::new();
+            let session_id = session.session_id.clone();
+            let now = "2026-06-16T00:00:00Z".to_string();
+            store
+                .create_session(&memory::SessionRecord {
+                    session_id: session_id.clone(),
+                    platform: "test".to_string(),
+                    chat_id: session_id.clone(),
+                    user_id: None,
+                    model: Some("test-model".to_string()),
+                    created_at: now.clone(),
+                    last_activity: now,
+                    message_count: 0,
+                    reset_policy: "none".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+
+            let tool_executor = StaticToolExecutor::new().register("add", |input| {
+                let total = input
+                    .split(',')
+                    .map(|part| part.parse::<i32>().expect("input must be valid integer"))
+                    .sum::<i32>();
+                Ok(total.to_string())
+            });
+            let mut runtime = ConversationRuntime::new(
+                session,
+                ScriptedApiClient { call_count: 0 },
+                tool_executor,
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            )
+            .with_session_store(Arc::clone(&store));
+
+            runtime
+                .run_turn_async(
+                    "what is 2 + 2?",
+                    &SharedPrompter::new(Box::new(PromptAllowOnce)),
+                )
+                .await
+                .expect("tool turn should succeed");
+
+            for _ in 0..40 {
+                let events = store.get_events(&session_id, 0).await.unwrap();
+                let runtime_kinds = events
+                    .iter()
+                    .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                    .map(|event| event.kind)
+                    .collect::<Vec<_>>();
+                if runtime_kinds
+                    .iter()
+                    .any(|kind| kind == "tool.execution_plan.created")
+                    && runtime_kinds
+                        .iter()
+                        .any(|kind| kind == "tool.schedule.created")
+                    && runtime_kinds
+                        .iter()
+                        .any(|kind| kind == "tool.invocation.started")
+                    && runtime_kinds
+                        .iter()
+                        .any(|kind| kind == "tool.invocation.completed")
+                {
+                    unsafe {
+                        std::env::remove_var("COWD_TOOL_LEDGER_V2");
+                    }
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let events = store.get_events(&session_id, 0).await.unwrap();
+            let runtime_kinds = events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            unsafe {
+                std::env::remove_var("COWD_TOOL_LEDGER_V2");
+            }
+            panic!("missing expected tool runtime events: {runtime_kinds:?}");
+        });
     }
 
     #[test]
