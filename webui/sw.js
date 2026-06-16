@@ -1,51 +1,30 @@
-const CACHE = 'cowd-v4';
-const ASSETS = [
-  '/',
-  'index.html',
-  'style.css',
-  'api.js',
-  'ui.js',
-  'messages.js',
-  'sessions.js',
-  'workspace.js',
-  'panels.js',
-  'commands.js',
-  'boot.js',
-  'assets/logo.svg',
-  'assets/favicon.svg'
-];
+const CACHE = 'cowd-vue-v1';
 
-self.addEventListener('install', e => {
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key))))
+      .then(() => self.clients.claim())
   );
 });
 
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  const url = new URL(e.request.url);
-  const networkFirst = ['.html', '.js', '.css'].some(ext => url.pathname.endsWith(ext)) || url.pathname === '/';
-  if (networkFirst) {
-    e.respondWith(
-      fetch(e.request)
-        .then(response => {
-          const copy = response.clone();
-          caches.open(CACHE).then(c => c.put(e.request, copy));
-          return response;
-        })
-        .catch(() => caches.match(e.request))
-    );
-    return;
-  }
-  e.respondWith(
-    caches.match(e.request).then(r => r || fetch(e.request))
-  );
-});
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
+  if (url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
 
-self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
+  event.respondWith(
+    fetch(request)
+      .then(response => {
+        const copy = response.clone();
+        caches.open(CACHE).then(cache => cache.put(request, copy)).catch(() => {});
+        return response;
+      })
+      .catch(() => caches.match(request).then(hit => hit || caches.match('./index.html')))
   );
 });
