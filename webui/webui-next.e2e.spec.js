@@ -73,6 +73,14 @@ test('skills agents and tools pages expose lifecycle workbenches', async ({ page
   await expect(page.getByRole('heading', { name: 'Command and risk history' })).toBeVisible();
 });
 
+test('gateway page exposes connector and cross-plane controls', async ({ page }) => {
+  await page.goto('/index.html#/gateway');
+  await expect(page.getByRole('heading', { name: 'Platforms and connectors' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Resources and memory promotion' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Cross-plane governance' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
+});
+
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();

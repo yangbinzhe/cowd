@@ -310,6 +310,28 @@ export const api = {
     body: JSON.stringify({ result, completed }),
   }),
   toolRegistry: () => read('/api/tools', {}),
+  platforms: () => read('/api/platforms', {}),
+  connectorsSummary: () => read('/api/connectors/summary', {}),
+  connectorAccounts: () => read('/api/connectors/accounts', {}),
+  connectorCapabilities: () => read('/api/connectors/capabilities', {}),
+  connectorResources: () => read('/api/connectors/resources', {}),
+  connectorMcpServers: () => read('/api/connectors/mcp/servers', {}),
+  connectorRevalidateResource: (resource_ref: string) => write('/api/connectors/resources/revalidate', {
+    method: 'POST',
+    body: JSON.stringify({ resource_ref }),
+  }),
+  connectorPromoteMemory: (resource_ref: string) => write('/api/connectors/resources/promote-memory', {
+    method: 'POST',
+    body: JSON.stringify({ resource_ref }),
+  }),
+  crossPlaneSummary: () => read('/api/cross-plane/summary', {}),
+  crossPlaneAudit: () => read('/api/cross-plane/audit', {}),
+  crossPlaneAdapters: () => read('/api/cross-plane/action/adapters', {}),
+  crossPlaneExecutions: () => read('/api/cross-plane/action/executions', {}),
+  crossPlanePreflight: (body: Record<string, unknown>) => write('/api/cross-plane/action/preflight', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',

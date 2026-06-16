@@ -45,6 +45,9 @@ const taskObjective = ref('Restore full WebUI capability with tested runtime evi
 const taskState = ref<any>(null);
 const taskActionResult = ref<any>(null);
 const toolState = ref<any>(null);
+const gatewayState = ref<any>(null);
+const crossPlaneResult = ref<any>(null);
+const resourceRef = ref('');
 
 async function refresh() {
   await store.loadCapability(props.page);
@@ -54,6 +57,7 @@ async function refresh() {
   if (props.page === 'skills') await loadSkillsWorkbench();
   if (props.page === 'agents') await loadAgentsWorkbench();
   if (props.page === 'tools') await loadToolsWorkbench();
+  if (props.page === 'gateway') await loadGatewayWorkbench();
 }
 
 function preview(data: any) {
@@ -196,6 +200,51 @@ async function addTaskPhase() {
 async function loadToolsWorkbench() {
   const [tools, history, capabilities] = await Promise.all([api.toolRegistry(), api.commandHistory(), api.loadCapabilityPage('tools', store.activeSessionId)]);
   toolState.value = { tools, history, capabilities };
+}
+
+async function loadGatewayWorkbench() {
+  const [platforms, summary, accounts, capabilities, resources, mcp, crossPlane, audit, adapters, executions] = await Promise.all([
+    api.platforms(),
+    api.connectorsSummary(),
+    api.connectorAccounts(),
+    api.connectorCapabilities(),
+    api.connectorResources(),
+    api.connectorMcpServers(),
+    api.crossPlaneSummary(),
+    api.crossPlaneAudit(),
+    api.crossPlaneAdapters(),
+    api.crossPlaneExecutions(),
+  ]);
+  gatewayState.value = { platforms, summary, accounts, capabilities, resources, mcp, crossPlane, audit, adapters, executions };
+  const firstRef = (resources as any).resources?.[0]?.reference || (resources as any).items?.[0]?.reference;
+  if (!resourceRef.value && firstRef) resourceRef.value = firstRef;
+}
+
+async function revalidateResource() {
+  if (!resourceRef.value) return;
+  crossPlaneResult.value = await api.connectorRevalidateResource(resourceRef.value);
+  await loadGatewayWorkbench();
+}
+
+async function promoteResourceMemory() {
+  if (!resourceRef.value) return;
+  crossPlaneResult.value = await api.connectorPromoteMemory(resourceRef.value);
+  await loadGatewayWorkbench();
+}
+
+async function runCrossPlanePreflight() {
+  crossPlaneResult.value = await api.crossPlanePreflight({
+    actor_principal: 'webui-operator',
+    source_channel: 'channel://webui/local',
+    session_id: store.activeSessionId || 'webui',
+    requested_capability: 'service.read',
+    provider_account: 'webui-local',
+    target_ref: null,
+    resource_ref: resourceRef.value || null,
+    risk: 'medium',
+    data_classification: 'internal',
+    identity_trust: 'unknown',
+  });
 }
 
 onMounted(refresh);
@@ -503,6 +552,41 @@ watch(() => props.page, refresh);
           <span>{{ toolState?.history?.total || toolState?.history?.history?.length || 0 }} events</span>
         </header>
         <pre class="action-result">{{ preview({ history: toolState?.history, capabilities: toolState?.capabilities }) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'gateway'" class="management-grid gateway-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Platforms and connectors</h2>
+          <span>{{ gatewayState?.summary?.connector_count || gatewayState?.accounts?.accounts?.length || 0 }} connectors</span>
+        </header>
+        <pre class="action-result">{{ preview({ platforms: gatewayState?.platforms, summary: gatewayState?.summary, accounts: gatewayState?.accounts, capabilities: gatewayState?.capabilities, mcp: gatewayState?.mcp }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Resources and memory promotion</h2>
+          <span>{{ gatewayState?.resources?.count || gatewayState?.resources?.resources?.length || 0 }} resources</span>
+        </header>
+        <label class="field-line">
+          Resource ref
+          <input v-model="resourceRef" type="text" placeholder="service://..." />
+        </label>
+        <div class="button-row">
+          <button class="ghost-action" type="button" :disabled="!resourceRef" @click="revalidateResource">Revalidate</button>
+          <button class="primary-action" type="button" :disabled="!resourceRef" @click="promoteResourceMemory">Promote memory</button>
+        </div>
+        <pre class="action-result">{{ preview(gatewayState?.resources || {}) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Cross-plane governance</h2>
+          <span>preflight/audit</span>
+        </header>
+        <button class="primary-action" type="button" @click="runCrossPlanePreflight">Run preflight</button>
+        <pre class="action-result">{{ preview(crossPlaneResult || { summary: gatewayState?.crossPlane, audit: gatewayState?.audit, adapters: gatewayState?.adapters, executions: gatewayState?.executions }) }}</pre>
       </article>
     </section>
 
