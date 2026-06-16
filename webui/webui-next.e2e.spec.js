@@ -65,7 +65,9 @@ test('memory page exposes memory and structured-data kernel controls', async ({ 
 
 test('skills agents and tools pages expose lifecycle workbenches', async ({ page }) => {
   await page.goto('/index.html#/skills');
-  await expect(page.getByRole('heading', { name: 'Skill lifecycle' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Skills Console' })).toBeVisible();
+  await expect(page.locator('.skills-catalog')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Files' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Validate' })).toBeVisible();
 
   await page.goto('/index.html#/agents');

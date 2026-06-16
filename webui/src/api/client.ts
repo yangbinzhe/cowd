@@ -295,6 +295,10 @@ export const api = {
   skillCatalog: () => read('/api/skills/catalog', {}),
   skillProjection: () => read('/api/skills/projection?surface=webui', {}),
   skillRuns: () => read('/api/skills/runs', {}),
+  skillRunDetail: (id: string) => read(`/api/skills/runs/${encodeURIComponent(id)}`, {}),
+  skillDetail: (id: string) => read(`/api/skills/${encodeURIComponent(id)}`, {}),
+  skillFiles: (id: string) => read(`/api/skills/${encodeURIComponent(id)}/files`, {}),
+  skillFileRaw: (id: string, path = 'SKILL.md') => read(`/api/skills/${encodeURIComponent(id)}/files/raw?path=${encodeURIComponent(path)}`, {}),
   skillAction: (id: string, action: 'validate' | 'plan' | 'run', body: Record<string, unknown> = {}) => write(`/api/skills/${encodeURIComponent(id)}/actions/${action}`, {
     method: 'POST',
     body: JSON.stringify(body),

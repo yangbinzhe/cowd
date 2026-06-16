@@ -8,6 +8,7 @@ import { api } from './api/client';
 import ChatPage from './pages/ChatPage.vue';
 import CapabilityPage from './pages/CapabilityPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
+import SkillsPage from './pages/SkillsPage.vue';
 
 vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
 vi.mock('vue-echarts', () => ({ default: { template: '<div class="chart"></div>' } }));
@@ -21,7 +22,7 @@ function mountApp(path = '/chat') {
       { path: '/runtime', component: CapabilityPage, props: { page: 'runtime' } },
       { path: '/context', component: CapabilityPage, props: { page: 'context' } },
       { path: '/memory', component: CapabilityPage, props: { page: 'memory' } },
-      { path: '/skills', component: CapabilityPage, props: { page: 'skills' } },
+      { path: '/skills', component: SkillsPage },
       { path: '/agents', component: CapabilityPage, props: { page: 'agents' } },
       { path: '/tools', component: CapabilityPage, props: { page: 'tools' } },
       { path: '/gateway', component: CapabilityPage, props: { page: 'gateway' } },
@@ -38,6 +39,12 @@ async function settle() {
   await Promise.resolve();
   await Promise.resolve();
   await nextTick();
+}
+
+async function settleAsync() {
+  await settle();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await settle();
 }
 
 describe('Cowd Vue WebUI shell', () => {
@@ -136,5 +143,36 @@ describe('Cowd Vue WebUI shell', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/audit/export?source=approval&limit=25&offset=5', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/usage', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/cowd/release-gate', expect.any(Object));
+  });
+
+  it('loads skill detail and files from real skill management endpoints', async () => {
+    const fetchMock = vi.fn((path: RequestInfo | URL) => {
+      const url = String(path);
+      if (url === '/api/webui/manifest') return Promise.resolve(new Response(JSON.stringify({ status: 'test' })));
+      if (url.startsWith('/api/sessions?')) return Promise.resolve(new Response(JSON.stringify({ sessions: [] })));
+      if (url === '/api/config') return Promise.resolve(new Response(JSON.stringify({ version: 'test' })));
+      if (url === '/api/runtime/control-plane') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/commands') return Promise.resolve(new Response(JSON.stringify({ commands: [] })));
+      if (url === '/api/config/providers') return Promise.resolve(new Response(JSON.stringify({ providers: [], models: [] })));
+      if (url === '/api/profiles') return Promise.resolve(new Response(JSON.stringify({ profiles: [], active_profile: 'default' })));
+      if (url === '/api/workspace') return Promise.resolve(new Response(JSON.stringify({ workspace_root: '', workspace_canonical: '' })));
+      if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
+      if (url === '/api/skills/catalog') return Promise.resolve(new Response(JSON.stringify({ items: [{ id: 'local:test', name: 'test', scope: 'local', status: 'ready', risk: 'review', tags: [] }] })));
+      if (url === '/api/skills/projection?surface=webui') return Promise.resolve(new Response(JSON.stringify({ facets: { scopes: ['local'], statuses: ['ready'], risks: ['review'] } })));
+      if (url === '/api/skills/runs') return Promise.resolve(new Response(JSON.stringify({ items: [] })));
+      if (url === '/api/skills/local%3Atest') return Promise.resolve(new Response(JSON.stringify({ skill: { id: 'local:test', name: 'test', scope: 'local' } })));
+      if (url === '/api/skills/local%3Atest/files') return Promise.resolve(new Response(JSON.stringify({ primary: 'SKILL.md', files: [{ path: 'SKILL.md', kind: 'file', primary: true }] })));
+      if (url === '/api/skills/local%3Atest/files/raw?path=SKILL.md') return Promise.resolve(new Response(JSON.stringify({ path: 'SKILL.md', content: '# test' })));
+      return Promise.resolve(new Response(JSON.stringify({})));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = await mountApp('/skills');
+    await settleAsync();
+    await settleAsync();
+    expect(wrapper.text()).toContain('Skills Console');
+    expect(wrapper.text()).toContain('SKILL.md');
+    expect(wrapper.text()).toContain('# test');
+    expect(fetchMock).toHaveBeenCalledWith('/api/skills/local%3Atest/files/raw?path=SKILL.md', expect.any(Object));
   });
 });
