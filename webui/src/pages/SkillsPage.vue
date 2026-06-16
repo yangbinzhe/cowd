@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import { FileText, RefreshCw, Search } from 'lucide-vue-next';
+import MarkdownIt from 'markdown-it';
 import { api } from '../api/client';
 import RawPayload from '../components/workbench/RawPayload.vue';
 
+const markdown = new MarkdownIt({ html: false, linkify: true, typographer: true });
 const loading = ref(false);
 const error = ref('');
 const query = ref('');
 const scope = ref('all');
+const source = ref('all');
+const domain = ref('all');
+const tag = ref('all');
 const status = ref('all');
 const risk = ref('all');
 const catalog = ref<any>({});
@@ -16,8 +21,10 @@ const runs = ref<any>({});
 const detail = ref<any>({});
 const files = ref<any>({});
 const rawFile = ref<any>({});
+const runDetail = ref<any>({});
 const selectedSkillId = ref('');
 const selectedFile = ref('SKILL.md');
+const selectedRunId = ref('');
 const actionResult = ref<any>(null);
 
 const items = computed(() => Array.isArray(catalog.value?.items) ? catalog.value.items : []);
@@ -25,14 +32,19 @@ const filteredItems = computed(() => items.value.filter((skill: any) => {
   const text = `${skill.id} ${skill.name} ${skill.description || ''} ${(skill.tags || []).join(' ')}`.toLowerCase();
   if (query.value && !text.includes(query.value.toLowerCase())) return false;
   if (scope.value !== 'all' && skill.scope !== scope.value) return false;
+  if (source.value !== 'all' && String(skill.source || '') !== source.value) return false;
+  if (domain.value !== 'all' && String(skill.domain || '') !== domain.value) return false;
+  if (tag.value !== 'all' && !(skill.tags || []).includes(tag.value)) return false;
   if (status.value !== 'all' && skill.status !== status.value) return false;
   if (risk.value !== 'all' && skill.risk !== risk.value) return false;
   return true;
 }));
 const facets = computed(() => projection.value?.facets || {});
+const sourceFacet = computed(() => Array.from(new Set(items.value.map((skill: any) => skill.source).filter(Boolean))));
 const skill = computed(() => detail.value?.skill || filteredItems.value.find((item: any) => item.id === selectedSkillId.value) || {});
 const fileItems = computed(() => Array.isArray(files.value?.files) ? files.value.files : []);
 const runItems = computed(() => Array.isArray(runs.value?.items) ? runs.value.items : []);
+const markdownHtml = computed(() => markdown.render(rawFile.value?.content || ''));
 
 async function refresh() {
   loading.value = true;
@@ -81,6 +93,13 @@ async function runAction(action: 'validate' | 'plan' | 'run') {
   await refresh();
 }
 
+async function loadRunDetail(run: any) {
+  const id = run.run_id || run.skill_run_id || run.id;
+  if (!id) return;
+  selectedRunId.value = id;
+  runDetail.value = await api.skillRunDetail(id);
+}
+
 watch(selectedSkillId, loadSelectedSkill);
 onMounted(refresh);
 </script>
@@ -111,6 +130,18 @@ onMounted(refresh);
             <select v-model="scope">
               <option value="all">all scopes</option>
               <option v-for="item in facets.scopes || []" :key="item" :value="item">{{ item }}</option>
+            </select>
+            <select v-model="source">
+              <option value="all">all sources</option>
+              <option v-for="item in sourceFacet" :key="item" :value="item">{{ item }}</option>
+            </select>
+            <select v-model="domain">
+              <option value="all">all domains</option>
+              <option v-for="item in facets.domains || []" :key="item" :value="item">{{ item }}</option>
+            </select>
+            <select v-model="tag">
+              <option value="all">all tags</option>
+              <option v-for="item in facets.tags || []" :key="item" :value="item">{{ item }}</option>
             </select>
             <select v-model="status">
               <option value="all">all statuses</option>
@@ -186,7 +217,8 @@ onMounted(refresh);
             <header>
               <strong>{{ rawFile.path || selectedFile }}</strong>
             </header>
-            <pre>{{ rawFile.content || '' }}</pre>
+            <div v-if="rawFile.content" class="markdown-body" v-html="markdownHtml"></div>
+            <pre v-else>{{ rawFile.content || '' }}</pre>
           </article>
         </section>
 
@@ -196,11 +228,20 @@ onMounted(refresh);
             <span>{{ runItems.length }} runs</span>
           </header>
           <div class="run-list">
-            <article v-for="run in runItems.slice(0, 8)" :key="run.run_id || run.skill_run_id || run.id">
+            <article
+              v-for="run in runItems.slice(0, 20)"
+              :key="run.run_id || run.skill_run_id || run.id"
+              :class="{ active: selectedRunId === (run.run_id || run.skill_run_id || run.id) }"
+              role="button"
+              tabindex="0"
+              @click="loadRunDetail(run)"
+              @keydown.enter.prevent="loadRunDetail(run)"
+            >
               <strong>{{ run.skill_id || run.skill_name || run.id }}</strong>
               <span>{{ run.status || run.outcome || 'recorded' }}</span>
             </article>
           </div>
+          <RawPayload title="Run detail" :data="runDetail || {}" />
           <RawPayload title="Action result" :data="actionResult || { projection, runs }" />
         </section>
       </main>

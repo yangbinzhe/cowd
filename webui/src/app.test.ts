@@ -194,8 +194,9 @@ describe('Cowd Vue WebUI shell', () => {
       if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
       if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
       if (url === '/api/skills/catalog') return Promise.resolve(new Response(JSON.stringify({ items: [{ id: 'local:test', name: 'test', scope: 'local', status: 'ready', risk: 'review', tags: [] }] })));
-      if (url === '/api/skills/projection?surface=webui') return Promise.resolve(new Response(JSON.stringify({ facets: { scopes: ['local'], statuses: ['ready'], risks: ['review'] } })));
-      if (url === '/api/skills/runs') return Promise.resolve(new Response(JSON.stringify({ items: [] })));
+      if (url === '/api/skills/projection?surface=webui') return Promise.resolve(new Response(JSON.stringify({ facets: { scopes: ['local'], domains: ['test-domain'], tags: ['test-tag'], statuses: ['ready'], risks: ['review'] } })));
+      if (url === '/api/skills/runs') return Promise.resolve(new Response(JSON.stringify({ items: [{ run_id: 'run-1', skill_id: 'local:test', status: 'done' }] })));
+      if (url === '/api/skills/runs/run-1') return Promise.resolve(new Response(JSON.stringify({ run: { run_id: 'run-1', status: 'done' } })));
       if (url === '/api/skills/local%3Atest') return Promise.resolve(new Response(JSON.stringify({ skill: { id: 'local:test', name: 'test', scope: 'local' } })));
       if (url === '/api/skills/local%3Atest/files') return Promise.resolve(new Response(JSON.stringify({ primary: 'SKILL.md', files: [{ path: 'SKILL.md', kind: 'file', primary: true }] })));
       if (url === '/api/skills/local%3Atest/files/raw?path=SKILL.md') return Promise.resolve(new Response(JSON.stringify({ path: 'SKILL.md', content: '# test' })));
@@ -207,7 +208,10 @@ describe('Cowd Vue WebUI shell', () => {
     await settleAsync();
     expect(wrapper.text()).toContain('Skills Console');
     expect(wrapper.text()).toContain('SKILL.md');
-    expect(wrapper.text()).toContain('# test');
+    expect(wrapper.find('.markdown-body h1').text()).toBe('test');
+    await wrapper.find('.run-list article').trigger('click');
+    await settleAsync();
+    expect(fetchMock).toHaveBeenCalledWith('/api/skills/runs/run-1', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/skills/local%3Atest/files/raw?path=SKILL.md', expect.any(Object));
   });
 

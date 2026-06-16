@@ -83,8 +83,11 @@ test('skills agents and tools pages expose lifecycle workbenches', async ({ page
   await page.goto('/index.html#/skills');
   await expect(page.getByRole('heading', { name: 'Skills Console' })).toBeVisible();
   await expect(page.locator('.skills-catalog')).toBeVisible();
+  await expect(page.locator('.filter-row select')).toHaveCount(6);
   await expect(page.getByRole('heading', { name: 'Files' })).toBeVisible();
+  await expect(page.locator('.markdown-body, .skill-markdown pre')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Validate' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Runs and governance' })).toBeVisible();
 
   await page.goto('/index.html#/agents');
   await expect(page.getByRole('heading', { name: 'Agents Workbench' })).toBeVisible();
