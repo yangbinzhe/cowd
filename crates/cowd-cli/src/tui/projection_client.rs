@@ -133,6 +133,19 @@ impl DaemonProjectionClient {
         self.get_json("/api/runtime/config/effective").await
     }
 
+    pub async fn runtime_timeline(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json(&format!(
+            "/api/runtime/timeline?session_id={}&limit={}",
+            url_encode(session_id),
+            limit
+        ))
+        .await
+    }
+
     pub async fn current_context(
         &self,
         session_id: Option<&str>,
@@ -301,6 +314,140 @@ impl DaemonProjectionClient {
     ) -> Result<serde_json::Value, ProjectionError> {
         self.post_json("/api/cross-plane/action/execute", request)
             .await
+    }
+
+    pub async fn cross_plane_policy_simulate(
+        &self,
+        action: serde_json::Value,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json("/api/cross-plane/policy/simulate", action)
+            .await
+    }
+
+    pub async fn tool_registry(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/tools").await
+    }
+
+    pub async fn tool_execute(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        mode: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/execute",
+            serde_json::json!({
+                "name": name,
+                "input": input,
+                "mode": mode,
+            }),
+        )
+        .await
+    }
+
+    pub async fn tool_cache_stats(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/tools/cache").await
+    }
+
+    pub async fn tool_batch_readonly(
+        &self,
+        calls: Vec<serde_json::Value>,
+        max_concurrency: usize,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/batch-readonly",
+            serde_json::json!({
+                "calls": calls,
+                "max_concurrency": max_concurrency,
+            }),
+        )
+        .await
+    }
+
+    pub async fn tool_mutation_preview(
+        &self,
+        edits: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/mutations/preview",
+            serde_json::json!({ "edits": edits }),
+        )
+        .await
+    }
+
+    pub async fn tool_mutation_apply(
+        &self,
+        edits: Vec<serde_json::Value>,
+        expected_hashes: serde_json::Value,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/mutations/apply",
+            serde_json::json!({
+                "edits": edits,
+                "expected_hashes": expected_hashes,
+            }),
+        )
+        .await
+    }
+
+    pub async fn tool_checkpoints(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/tools/checkpoints").await
+    }
+
+    pub async fn tool_checkpoint_create(
+        &self,
+        label: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/checkpoints",
+            serde_json::json!({ "label": label }),
+        )
+        .await
+    }
+
+    pub async fn tool_checkpoint_diff(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json(&format!("/api/tools/checkpoints/{}/diff", url_encode(id)))
+            .await
+    }
+
+    pub async fn tool_checkpoint_restore(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            &format!("/api/tools/checkpoints/{}/restore", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn tool_intent_plan(
+        &self,
+        prompt: &str,
+        selected_tools: Vec<String>,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/intent-plan",
+            serde_json::json!({
+                "prompt": prompt,
+                "selected_tools": selected_tools,
+            }),
+        )
+        .await
+    }
+
+    pub async fn tool_context_fanout_plan(
+        &self,
+        prompt: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/tools/context-fanout/plan",
+            serde_json::json!({ "prompt": prompt }),
+        )
+        .await
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, ProjectionError> {
@@ -737,6 +884,182 @@ mod tests {
             .await
             .expect("execute");
         assert_eq!(result["ok"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn tool_operations_routes_use_management_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let checks: Vec<(&str, &str, Vec<&str>)> = vec![
+                ("GET", "/api/tools", vec![]),
+                (
+                    "POST",
+                    "/api/tools/execute",
+                    vec!["\"name\":\"tool_cache_stats\"", "\"mode\":\"read_only\""],
+                ),
+                ("GET", "/api/tools/cache", vec![]),
+                (
+                    "POST",
+                    "/api/tools/batch-readonly",
+                    vec!["\"max_concurrency\":3", "\"name\":\"tool_cache_stats\""],
+                ),
+                (
+                    "POST",
+                    "/api/tools/mutations/preview",
+                    vec!["\"path\":\"README.md\""],
+                ),
+                (
+                    "POST",
+                    "/api/tools/mutations/apply",
+                    vec!["\"expected_hashes\"", "\"README.md\":\"hash-1\""],
+                ),
+                ("GET", "/api/tools/checkpoints", vec![]),
+                (
+                    "POST",
+                    "/api/tools/checkpoints",
+                    vec!["\"label\":\"before edit\""],
+                ),
+                ("GET", "/api/tools/checkpoints/cp-1/diff", vec![]),
+                ("POST", "/api/tools/checkpoints/cp-1/restore", vec![]),
+                (
+                    "POST",
+                    "/api/tools/intent-plan",
+                    vec!["\"prompt\":\"inspect\"", "\"selected_tools\""],
+                ),
+                (
+                    "POST",
+                    "/api/tools/context-fanout/plan",
+                    vec!["\"prompt\":\"fanout\""],
+                ),
+                (
+                    "GET",
+                    "/api/runtime/timeline?session_id=session%20a%2Fb&limit=25",
+                    vec![],
+                ),
+                (
+                    "POST",
+                    "/api/cross-plane/policy/simulate",
+                    vec!["\"requested_capability\":\"service.read\""],
+                ),
+            ];
+
+            for (method, path, needles) in checks {
+                let (mut socket, _) = listener.accept().await.expect("accept tool ops");
+                let mut buf = vec![0; 8192];
+                let n = socket.read(&mut buf).await.expect("read tool ops");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with(&format!("{method} {path} HTTP/1.1")),
+                    "unexpected request for {method} {path}: {req}"
+                );
+                for needle in needles {
+                    assert!(req.contains(needle), "missing `{needle}` in request: {req}");
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                    )
+                    .await
+                    .expect("write tool ops");
+            }
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        assert_eq!(client.tool_registry().await.expect("registry")["ok"], true);
+        assert_eq!(
+            client
+                .tool_execute("tool_cache_stats", serde_json::json!({}), "read_only")
+                .await
+                .expect("execute")["ok"],
+            true
+        );
+        assert_eq!(client.tool_cache_stats().await.expect("cache")["ok"], true);
+        assert_eq!(
+            client
+                .tool_batch_readonly(
+                    vec![serde_json::json!({ "name": "tool_cache_stats", "input": {} })],
+                    3,
+                )
+                .await
+                .expect("batch")["ok"],
+            true
+        );
+        let edits = vec![serde_json::json!({
+            "path": "README.md",
+            "old_string": "A",
+            "new_string": "B"
+        })];
+        assert_eq!(
+            client
+                .tool_mutation_preview(edits.clone())
+                .await
+                .expect("preview")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_mutation_apply(edits, serde_json::json!({ "README.md": "hash-1" }))
+                .await
+                .expect("apply")["ok"],
+            true
+        );
+        assert_eq!(
+            client.tool_checkpoints().await.expect("checkpoints")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_checkpoint_create("before edit")
+                .await
+                .expect("checkpoint create")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_checkpoint_diff("cp-1")
+                .await
+                .expect("checkpoint diff")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_checkpoint_restore("cp-1")
+                .await
+                .expect("checkpoint restore")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_intent_plan("inspect", vec!["tool_cache_stats".to_string()])
+                .await
+                .expect("intent")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .tool_context_fanout_plan("fanout")
+                .await
+                .expect("fanout")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .runtime_timeline("session a/b", 25)
+                .await
+                .expect("timeline")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .cross_plane_policy_simulate(serde_json::json!({
+                    "requested_capability": "service.read"
+                }))
+                .await
+                .expect("policy simulate")["ok"],
+            true
+        );
         server.await.expect("server task");
     }
 

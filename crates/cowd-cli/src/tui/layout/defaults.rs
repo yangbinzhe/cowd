@@ -10,16 +10,17 @@ use ratatui::layout::Rect;
 use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
 use super::LayoutTree;
 use crate::tui::components::agent_team_panel::AgentTeamPanel;
-use crate::tui::components::agents_overlay::AgentsOverlay;
-use crate::tui::components::context_panel::ContextPanel;
+use crate::tui::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::tui::components::diff_viewer::DiffViewer;
 use crate::tui::components::discussion_thread_view::DiscussionThreadView;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::gateway_panel::GatewayPanel;
-use crate::tui::components::memory_panel::MemoryPanel;
-use crate::tui::components::skills_panel::SkillsPanel;
+use crate::tui::components::goal_workbench_panel::GoalWorkbenchPanel;
+use crate::tui::components::runtime_activity_panel::RuntimeActivityPanel;
+use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::todo_panel::TodoPanel;
+use crate::tui::components::tool_ops_panel::ToolOpsPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 // ── Placeholder Component ──────────────────────────────────────────
@@ -52,54 +53,31 @@ impl Component for PlaceholderComponent {
 /// ```text
 /// Split(Horizontal, 0.7)
 ///   ├── Leaf("chat_view")           — 70 % of width
-///   └── TabGroup (8 panel tabs)     — 30 % of width
-///         ├── Tab 0: "gateway"      (🌐)
-///         ├── Tab 1: "files"        (📁)
-///         ├── Tab 2: "memory"       (🧠)
-///         ├── Tab 3: "skills"       (⚙️)
-///         ├── Tab 4: "delegates"    (📋)
-///         ├── Tab 5: "context"      (📊)
-///         ├── Tab 6: "changes"      (📄)
-///         └── Tab 7: "todo"         (☑)
+///   └── TabGroup (9 panel tabs)     — 30 % of width
+///         ├── Tab 0: "runtime"      (▶)
+///         ├── Tab 1: "tools"        (⚒)
+///         ├── Tab 2: "changes"      (📄)
+///         ├── Tab 3: "goals"        (◎)
+///         ├── Tab 4: "approvals"    (!)
+///         ├── Tab 5: "todo"         (☑)
+///         ├── Tab 6: "files"        (📁)
+///         ├── Tab 7: "sessions"     (◫)
+///         └── Tab 8: "gateway"      (🌐)
 /// ```
 #[must_use]
 pub fn build_default_layout() -> LayoutTree {
     let sidebar_tabs = vec![
         TabDef {
-            id: "gateway".to_string(),
-            label: "Gateway".to_string(),
-            icon: Some("🌐".to_string()),
-            content: Box::new(GatewayPanel::new()),
+            id: "runtime".to_string(),
+            label: "Runtime".to_string(),
+            icon: Some("▶".to_string()),
+            content: Box::new(RuntimeActivityPanel::new()),
         },
         TabDef {
-            id: "files".to_string(),
-            label: "Files".to_string(),
-            icon: Some("📁".to_string()),
-            content: Box::new(FileTree::new()),
-        },
-        TabDef {
-            id: "memory".to_string(),
-            label: "Memory".to_string(),
-            icon: Some("🧠".to_string()),
-            content: Box::new(MemoryPanel::new()),
-        },
-        TabDef {
-            id: "skills".to_string(),
-            label: "Skills".to_string(),
-            icon: Some("⚙️".to_string()),
-            content: Box::new(SkillsPanel::new()),
-        },
-        TabDef {
-            id: "delegates".to_string(),
-            label: "Delegates".to_string(),
-            icon: Some("📋".to_string()),
-            content: Box::new(AgentsOverlay::new()),
-        },
-        TabDef {
-            id: "context".to_string(),
-            label: "Context".to_string(),
-            icon: Some("📊".to_string()),
-            content: Box::new(ContextPanel::new()),
+            id: "tools".to_string(),
+            label: "Tools".to_string(),
+            icon: Some("⚒".to_string()),
+            content: Box::new(ToolOpsPanel::new()),
         },
         TabDef {
             id: "changes".to_string(),
@@ -108,10 +86,40 @@ pub fn build_default_layout() -> LayoutTree {
             content: Box::new(FileChangesPanel::new()),
         },
         TabDef {
+            id: "goals".to_string(),
+            label: "Goals".to_string(),
+            icon: Some("◎".to_string()),
+            content: Box::new(GoalWorkbenchPanel::new()),
+        },
+        TabDef {
+            id: "approvals".to_string(),
+            label: "Approvals".to_string(),
+            icon: Some("!".to_string()),
+            content: Box::new(ApprovalCockpitPanel::new()),
+        },
+        TabDef {
             id: "todo".to_string(),
             label: "Todo".to_string(),
             icon: Some("☑".to_string()),
             content: Box::new(TodoPanel::new()),
+        },
+        TabDef {
+            id: "files".to_string(),
+            label: "Files".to_string(),
+            icon: Some("📁".to_string()),
+            content: Box::new(FileTree::new()),
+        },
+        TabDef {
+            id: "sessions".to_string(),
+            label: "Sessions".to_string(),
+            icon: Some("◫".to_string()),
+            content: Box::new(SessionSidebar::new("")),
+        },
+        TabDef {
+            id: "gateway".to_string(),
+            label: "Gateway".to_string(),
+            icon: Some("🌐".to_string()),
+            content: Box::new(GatewayPanel::new()),
         },
     ];
 
@@ -376,21 +384,22 @@ mod tests {
                     "first child should be Panel (chat_view)"
                 );
 
-                // Second child: TabGroup with 5 tabs
+                // Second child: TabGroup with panel tabs
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs.len(), 8, "expected 8 panel tabs");
+                        assert_eq!(tg.tabs.len(), 9, "expected 9 panel tabs");
                         assert_eq!(tg.active, 0, "first tab should be active by default");
 
                         let expected: &[(&str, &str)] = &[
-                            ("gateway", "Gateway"),
-                            ("files", "Files"),
-                            ("memory", "Memory"),
-                            ("skills", "Skills"),
-                            ("delegates", "Delegates"),
-                            ("context", "Context"),
+                            ("runtime", "Runtime"),
+                            ("tools", "Tools"),
                             ("changes", "Changes"),
+                            ("goals", "Goals"),
+                            ("approvals", "Approvals"),
                             ("todo", "Todo"),
+                            ("files", "Files"),
+                            ("sessions", "Sessions"),
+                            ("gateway", "Gateway"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
                             assert_eq!(
@@ -649,35 +658,39 @@ mod tests {
                 match &mut split.children[1] {
                     LayoutNode::TabGroup(ref mut tg) => {
                         assert_eq!(tg.active, 0);
-                        assert_eq!(tg.active_tab().unwrap().id, "gateway");
+                        assert_eq!(tg.active_tab().unwrap().id, "runtime");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 1);
-                        assert_eq!(tg.active_tab().unwrap().id, "files");
+                        assert_eq!(tg.active_tab().unwrap().id, "tools");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 2);
-                        assert_eq!(tg.active_tab().unwrap().id, "memory");
-
-                        tg.next_tab();
-                        assert_eq!(tg.active, 3);
-                        assert_eq!(tg.active_tab().unwrap().id, "skills");
-
-                        tg.next_tab();
-                        assert_eq!(tg.active, 4);
-                        assert_eq!(tg.active_tab().unwrap().id, "delegates");
-
-                        tg.next_tab();
-                        assert_eq!(tg.active, 5);
-                        assert_eq!(tg.active_tab().unwrap().id, "context");
-
-                        tg.next_tab();
-                        assert_eq!(tg.active, 6);
                         assert_eq!(tg.active_tab().unwrap().id, "changes");
 
                         tg.next_tab();
-                        assert_eq!(tg.active, 7);
+                        assert_eq!(tg.active, 3);
+                        assert_eq!(tg.active_tab().unwrap().id, "goals");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 4);
+                        assert_eq!(tg.active_tab().unwrap().id, "approvals");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 5);
                         assert_eq!(tg.active_tab().unwrap().id, "todo");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 6);
+                        assert_eq!(tg.active_tab().unwrap().id, "files");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 7);
+                        assert_eq!(tg.active_tab().unwrap().id, "sessions");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 8);
+                        assert_eq!(tg.active_tab().unwrap().id, "gateway");
 
                         // Wrap around
                         tg.next_tab();
@@ -685,7 +698,7 @@ mod tests {
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 7);
+                        assert_eq!(tg.active, 8);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -702,14 +715,15 @@ mod tests {
         match &tree.root {
             LayoutNode::Split(split) => match &split.children[1] {
                 LayoutNode::TabGroup(tg) => {
-                    assert_eq!(tg.tabs[0].icon.as_deref(), Some("🌐"));
-                    assert_eq!(tg.tabs[1].icon.as_deref(), Some("📁"));
-                    assert_eq!(tg.tabs[2].icon.as_deref(), Some("🧠"));
-                    assert_eq!(tg.tabs[3].icon.as_deref(), Some("⚙️"));
-                    assert_eq!(tg.tabs[4].icon.as_deref(), Some("📋"));
-                    assert_eq!(tg.tabs[5].icon.as_deref(), Some("📊"));
-                    assert_eq!(tg.tabs[6].icon.as_deref(), Some("📄"));
-                    assert_eq!(tg.tabs[7].icon.as_deref(), Some("☑"));
+                    assert_eq!(tg.tabs[0].icon.as_deref(), Some("▶"));
+                    assert_eq!(tg.tabs[1].icon.as_deref(), Some("⚒"));
+                    assert_eq!(tg.tabs[2].icon.as_deref(), Some("📄"));
+                    assert_eq!(tg.tabs[3].icon.as_deref(), Some("◎"));
+                    assert_eq!(tg.tabs[4].icon.as_deref(), Some("!"));
+                    assert_eq!(tg.tabs[5].icon.as_deref(), Some("☑"));
+                    assert_eq!(tg.tabs[6].icon.as_deref(), Some("📁"));
+                    assert_eq!(tg.tabs[7].icon.as_deref(), Some("◫"));
+                    assert_eq!(tg.tabs[8].icon.as_deref(), Some("🌐"));
                 }
                 _ => panic!("expected TabGroup as second child"),
             },
@@ -761,11 +775,11 @@ mod tests {
         let mut tree = build_default_layout();
         let mut state = LayoutState::new();
 
-        // Switch to tab 2 (memory)
+        // Switch to tab 3 (goals)
         match &mut tree.root {
             LayoutNode::Split(split) => match &mut split.children[1] {
                 LayoutNode::TabGroup(ref mut tg) => {
-                    tg.active = 2;
+                    tg.active = 3;
                 }
                 _ => {}
             },
@@ -778,7 +792,7 @@ mod tests {
         match &tree.root {
             LayoutNode::Split(split) => match &split.children[1] {
                 LayoutNode::TabGroup(tg) => {
-                    assert_eq!(tg.active, 2, "active tab index should be preserved");
+                    assert_eq!(tg.active, 3, "active tab index should be preserved");
                 }
                 _ => panic!("expected TabGroup"),
             },

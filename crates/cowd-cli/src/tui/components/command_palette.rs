@@ -209,6 +209,11 @@ fn default_entries() -> Vec<CommandEntry> {
         Action::Execute("/activity".into()),
     ));
     entries.push(CommandEntry::new(
+        "Open Tools Ops",
+        "Operate tool registry, cache, checkpoints, ledger, and risk checks",
+        Action::Execute("/tools".into()),
+    ));
+    entries.push(CommandEntry::new(
         "Open Files Panel",
         "Browse workspace files in the sidebar",
         Action::Execute("/files".into()),
@@ -1152,6 +1157,7 @@ mod tests {
         for (name, action) in [
             ("Open Runtime Panel", Action::Execute("/runtime".into())),
             ("Open Activity Panel", Action::Execute("/activity".into())),
+            ("Open Tools Ops", Action::Execute("/tools".into())),
             ("Open Files Panel", Action::Execute("/files".into())),
             ("Open Sessions Panel", Action::Execute("/sessions".into())),
             ("Open Gateway Panel", Action::Execute("/gateway".into())),

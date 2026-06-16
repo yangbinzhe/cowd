@@ -53,6 +53,7 @@ use crate::tui::components::system_status_bar::SystemStatusBar;
 use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
 use crate::tui::components::todo_panel::TodoPanel;
+use crate::tui::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
 use crate::tui::components::{Component, RenderContext};
 use crate::tui::context_tokens::validate_context_tokens;
 use crate::tui::error_recovery::{self, RenderResult};
@@ -75,7 +76,16 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 8;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 9;
+pub(crate) const TAB_RUNTIME: usize = 0;
+pub(crate) const TAB_TOOLS: usize = 1;
+pub(crate) const TAB_CHANGES: usize = 2;
+pub(crate) const TAB_GOALS: usize = 3;
+pub(crate) const TAB_APPROVALS: usize = 4;
+pub(crate) const TAB_TODO: usize = 5;
+pub(crate) const TAB_FILES: usize = 6;
+pub(crate) const TAB_SESSIONS: usize = 7;
+pub(crate) const TAB_GATEWAY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -146,10 +156,13 @@ impl SidebarTopicPanel {
 
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {
-        vec!["Run", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Gate"]
+        vec![
+            "Run", "Tool", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Gate",
+        ]
     } else {
         vec![
             "Run",
+            "Tools",
             "Changes",
             "Goals",
             "Approvals",
@@ -425,6 +438,9 @@ pub struct TuiState {
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
+    /// Tool operations console for registry, execution, mutations, ledger, and risk checks.
+    pub tool_ops_panel: ToolOpsPanel,
+
     /// Top system status strip for runtime/network/service health.
     pub system_status_bar: SystemStatusBar,
 
@@ -432,7 +448,8 @@ pub struct TuiState {
     pub activity_panel: ActivityPanel,
     pub activity_panel_visible: bool,
 
-    /// Active tab index in the sidebar (0=Runtime, 1=Changes, 2=Goals, 3=Approvals, 4=Todo, 5=Files, 6=Sessions, 7=Gateway).
+    /// Active tab index in the sidebar.
+    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Gateway.
     pub sidebar_active_tab: usize,
 
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
@@ -545,6 +562,7 @@ impl TuiState {
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
+        let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
         let activity_panel = ActivityPanel::new();
 
@@ -590,6 +608,7 @@ impl TuiState {
             skills_panel,
             gateway_panel,
             runtime_activity_panel,
+            tool_ops_panel,
             system_status_bar,
             activity_panel,
             activity_panel_visible: false,
@@ -709,7 +728,7 @@ impl TuiState {
         if !self.layout_state.sidebar_visible {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
-        self.sidebar_active_tab = 0;
+        self.sidebar_active_tab = TAB_RUNTIME;
         self.set_focus_target(FocusTarget::Sidebar);
     }
 
@@ -762,30 +781,31 @@ impl TuiState {
                 }
             } else {
                 match self.sidebar_active_tab {
-                    0 => self.runtime_activity_panel.sync_from_app(&self.app),
-                    1 => {
+                    TAB_RUNTIME => self.runtime_activity_panel.sync_from_app(&self.app),
+                    TAB_TOOLS => {}
+                    TAB_CHANGES => {
                         let timeline = self.app.timeline_clone_vec();
                         self.file_changes_panel.sync_from_timeline(&timeline);
                     }
-                    2 => self.goal_workbench_panel.sync_from_app(&self.app),
-                    3 => self.approval_cockpit_panel.sync_from_app(&self.app),
-                    4 => {
+                    TAB_GOALS => self.goal_workbench_panel.sync_from_app(&self.app),
+                    TAB_APPROVALS => self.approval_cockpit_panel.sync_from_app(&self.app),
+                    TAB_TODO => {
                         let timeline = self.app.timeline_clone_vec();
                         self.todo_panel.sync_from_timeline(&timeline);
                     }
-                    5 => {
+                    TAB_FILES => {
                         if !self.app.file_entries.is_empty() {
                             self.file_tree.rebuild(&self.app.file_entries);
                         }
                     }
-                    6 => {
+                    TAB_SESSIONS => {
                         if !self.app.picker_sessions.is_empty() {
                             self.session_sidebar.load(self.app.picker_sessions.clone());
                         }
                         self.session_sidebar
                             .set_current_session(&self.app.session_id);
                     }
-                    7 => self.gateway_panel.sync_from_app(&self.app),
+                    TAB_GATEWAY => self.gateway_panel.sync_from_app(&self.app),
                     _ => {}
                 }
             }
@@ -1065,7 +1085,7 @@ impl TuiState {
                     }
                 } else {
                     match self.sidebar_active_tab {
-                        0 => {
+                        TAB_RUNTIME => {
                             let _ = error_recovery::catch_render_panic(
                                 "runtime_activity_panel",
                                 AssertUnwindSafe(|| {
@@ -1074,7 +1094,15 @@ impl TuiState {
                                 }),
                             );
                         }
-                        1 => {
+                        TAB_TOOLS => {
+                            let _ = error_recovery::catch_render_panic(
+                                "tool_ops_panel",
+                                AssertUnwindSafe(|| {
+                                    self.tool_ops_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        TAB_CHANGES => {
                             let _ = error_recovery::catch_render_panic(
                                 "file_changes_panel",
                                 AssertUnwindSafe(|| {
@@ -1082,7 +1110,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        2 => {
+                        TAB_GOALS => {
                             let _ = error_recovery::catch_render_panic(
                                 "goal_workbench_panel",
                                 AssertUnwindSafe(|| {
@@ -1090,7 +1118,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        3 => {
+                        TAB_APPROVALS => {
                             let _ = error_recovery::catch_render_panic(
                                 "approval_cockpit_panel",
                                 AssertUnwindSafe(|| {
@@ -1099,7 +1127,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        4 => {
+                        TAB_TODO => {
                             let _ = error_recovery::catch_render_panic(
                                 "todo_panel",
                                 AssertUnwindSafe(|| {
@@ -1107,7 +1135,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        5 => {
+                        TAB_FILES => {
                             let _guard = self.render_profiler.guard("file_tree");
                             let _ = error_recovery::catch_render_panic(
                                 "file_tree",
@@ -1116,7 +1144,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        6 => {
+                        TAB_SESSIONS => {
                             let _guard = self.render_profiler.guard("session_sidebar");
                             let _ = error_recovery::catch_render_panic(
                                 "session_sidebar",
@@ -1125,7 +1153,7 @@ impl TuiState {
                                 }),
                             );
                         }
-                        7 => {
+                        TAB_GATEWAY => {
                             let _ = error_recovery::catch_render_panic(
                                 "gateway_panel",
                                 AssertUnwindSafe(|| {
@@ -2204,19 +2232,242 @@ impl TuiState {
 
     fn route_navigation_to_sidebar(&mut self, event: crossterm::event::Event) -> bool {
         let consumed = match self.sidebar_active_tab {
-            0 => self.runtime_activity_panel.handle_event(&event),
-            1 => self.file_changes_panel.handle_event(&event),
-            2 => self.goal_workbench_panel.handle_event(&event),
-            4 => self.todo_panel.handle_event(&event),
-            5 => self.file_tree.handle_event(&event),
-            6 => self.session_sidebar.handle_event(&event),
-            7 => self.gateway_panel.handle_event(&event),
+            TAB_RUNTIME => self.runtime_activity_panel.handle_event(&event),
+            TAB_TOOLS => {
+                if self.handle_tool_ops_action(&event) {
+                    crate::tui::components::EventResult::Consumed
+                } else {
+                    self.tool_ops_panel.handle_event(&event)
+                }
+            }
+            TAB_CHANGES => self.file_changes_panel.handle_event(&event),
+            TAB_GOALS => self.goal_workbench_panel.handle_event(&event),
+            TAB_APPROVALS => self.approval_cockpit_panel.handle_event(&event),
+            TAB_TODO => self.todo_panel.handle_event(&event),
+            TAB_FILES => self.file_tree.handle_event(&event),
+            TAB_SESSIONS => self.session_sidebar.handle_event(&event),
+            TAB_GATEWAY => self.gateway_panel.handle_event(&event),
             _ => crate::tui::components::EventResult::NotConsumed,
         } == crate::tui::components::EventResult::Consumed;
         if consumed {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    fn handle_tool_ops_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+
+        match (self.tool_ops_panel.mode, key.code) {
+            (_, KeyCode::Char('U')) => {
+                self.refresh_tool_ops_panel_overview();
+                true
+            }
+            (ToolOpsMode::Registry, KeyCode::Char('x')) => {
+                let Some(tool_name) = self.tool_ops_panel.selected_tool_name().map(str::to_string)
+                else {
+                    self.tool_ops_panel
+                        .set_status("No selected tool to execute");
+                    return true;
+                };
+                self.record_tool_ops_result(run_daemon_projection_blocking(move |client| {
+                    let name = tool_name;
+                    async move {
+                        client
+                            .tool_execute(&name, serde_json::json!({}), "read_only")
+                            .await
+                    }
+                }));
+                true
+            }
+            (ToolOpsMode::Operations, KeyCode::Char('i')) => {
+                let prompt = self.tool_ops_panel.intent_prompt.clone();
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_intent_plan(&prompt, Vec::new()).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Operations, KeyCode::Char('f')) => {
+                let prompt = self.tool_ops_panel.fanout_prompt.clone();
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_context_fanout_plan(&prompt).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Operations, KeyCode::Char('b')) => {
+                let calls = match serde_json::from_str::<Vec<serde_json::Value>>(
+                    &self.tool_ops_panel.batch_buffer,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.tool_ops_panel
+                            .set_status(format!("Invalid batch JSON: {error}"));
+                        return true;
+                    }
+                };
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_batch_readonly(calls, 4).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Mutations, KeyCode::Char('v')) => {
+                let edits = match serde_json::from_str::<Vec<serde_json::Value>>(
+                    &self.tool_ops_panel.edits_buffer,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.tool_ops_panel
+                            .set_status(format!("Invalid edits JSON: {error}"));
+                        return true;
+                    }
+                };
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_mutation_preview(edits).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Mutations, KeyCode::Char('A')) => {
+                if !self.tool_ops_panel.arm_apply_mutation() {
+                    return true;
+                }
+                if self.tool_ops_panel.expected_hashes.is_empty() {
+                    self.tool_ops_panel.set_status(
+                        "Mutation apply blocked: run preview first and verify expected hashes",
+                    );
+                    return true;
+                }
+                let edits = match serde_json::from_str::<Vec<serde_json::Value>>(
+                    &self.tool_ops_panel.edits_buffer,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.tool_ops_panel
+                            .set_status(format!("Invalid edits JSON: {error}"));
+                        return true;
+                    }
+                };
+                let expected_hashes = serde_json::to_value(&self.tool_ops_panel.expected_hashes)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move {
+                        client.tool_mutation_apply(edits, expected_hashes).await
+                    },
+                ));
+                true
+            }
+            (ToolOpsMode::Checkpoints, KeyCode::Char('n')) => {
+                self.record_tool_ops_result(run_daemon_projection_blocking(|client| async move {
+                    client.tool_checkpoint_create("tui checkpoint").await
+                }));
+                self.refresh_tool_ops_panel_overview();
+                true
+            }
+            (ToolOpsMode::Checkpoints, KeyCode::Char('d')) => {
+                let Some(id) = self
+                    .tool_ops_panel
+                    .selected_checkpoint_id()
+                    .map(str::to_string)
+                else {
+                    self.tool_ops_panel
+                        .set_status("No selected checkpoint to diff");
+                    return true;
+                };
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_checkpoint_diff(&id).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Checkpoints, KeyCode::Char('R')) => {
+                let Some(id) = self
+                    .tool_ops_panel
+                    .selected_checkpoint_id()
+                    .map(str::to_string)
+                else {
+                    self.tool_ops_panel
+                        .set_status("No selected checkpoint to restore");
+                    return true;
+                };
+                if !self.tool_ops_panel.arm_restore_checkpoint(id.clone()) {
+                    return true;
+                }
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.tool_checkpoint_restore(&id).await },
+                ));
+                self.refresh_tool_ops_panel_overview();
+                true
+            }
+            (ToolOpsMode::Risk, KeyCode::Char('s')) => {
+                let action = serde_json::json!({
+                    "plane": "tui",
+                    "operation": "tool_ops.simulate",
+                    "actor": "tui-operator",
+                    "inputs": { "mode": "risk" }
+                });
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.cross_plane_policy_simulate(action).await },
+                ));
+                true
+            }
+            (ToolOpsMode::Risk, KeyCode::Char('p')) => {
+                let action = serde_json::json!({
+                    "actor_principal": "user:tui-operator",
+                    "actor_identity_ref": null,
+                    "source_channel": "tui",
+                    "session_id": self.app.session_id,
+                    "requested_capability": "cowd.tools.operate",
+                    "provider_account": null,
+                    "target_ref": "tool-ops",
+                    "resource_ref": null,
+                    "risk": "medium",
+                    "data_classification": "internal",
+                    "identity_trust": "verified"
+                });
+                self.record_tool_ops_result(run_daemon_projection_blocking(
+                    move |client| async move { client.preflight_cross_plane_action(action).await },
+                ));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn refresh_tool_ops_panel_overview(&mut self) {
+        match run_daemon_projection_blocking(|client| async move { client.tool_registry().await }) {
+            Ok(payload) => self.tool_ops_panel.sync_registry(&payload),
+            Err(error) => self
+                .tool_ops_panel
+                .set_status(format!("Registry refresh failed: {error}")),
+        }
+        if let Ok(payload) =
+            run_daemon_projection_blocking(|client| async move { client.tool_cache_stats().await })
+        {
+            self.tool_ops_panel.sync_cache(&payload);
+        }
+        if let Ok(payload) =
+            run_daemon_projection_blocking(|client| async move { client.tool_checkpoints().await })
+        {
+            self.tool_ops_panel.sync_checkpoints(&payload);
+        }
+        let session_id = self.app.session_id.clone();
+        if let Ok(payload) = run_daemon_projection_blocking(move |client| async move {
+            client.runtime_timeline(&session_id, 50).await
+        }) {
+            self.tool_ops_panel.sync_ledger(&payload);
+        }
+    }
+
+    fn record_tool_ops_result(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => self.tool_ops_panel.record_receipt(payload),
+            Err(error) => self
+                .tool_ops_panel
+                .set_status(format!("Tool operation failed: {error}")),
+        }
     }
 
     pub fn handle_mouse_scroll(&mut self, down: bool) -> bool {
@@ -2307,6 +2558,9 @@ impl TuiState {
         }
         self.sidebar_active_tab = tab.min(SIDEBAR_TAB_COUNT.saturating_sub(1));
         self.set_focus_target(FocusTarget::Sidebar);
+        if self.sidebar_active_tab == TAB_TOOLS {
+            self.refresh_tool_ops_panel_overview();
+        }
         self.toast_manager.push(
             ToastVariant::Info,
             Some("Panel".into()),
@@ -2380,14 +2634,15 @@ impl TuiState {
         }
 
         let Some((tab, label)) = (match name {
-            "context" | "runtime" => Some((0, "Runtime")),
-            "changes" => Some((1, "Changes")),
-            "tasks" | "goals" => Some((2, "Goals")),
-            "approvals" | "approve" => Some((3, "Approvals")),
-            "todo" => Some((4, "Todo")),
-            "files" => Some((5, "Files")),
-            "sessions" => Some((6, "Sessions")),
-            "gateway" => Some((7, "Gateway")),
+            "context" | "runtime" => Some((TAB_RUNTIME, "Runtime")),
+            "tools" | "toolops" | "tool-ops" => Some((TAB_TOOLS, "Tools")),
+            "changes" => Some((TAB_CHANGES, "Changes")),
+            "tasks" | "goals" => Some((TAB_GOALS, "Goals")),
+            "approvals" | "approve" => Some((TAB_APPROVALS, "Approvals")),
+            "todo" => Some((TAB_TODO, "Todo")),
+            "files" => Some((TAB_FILES, "Files")),
+            "sessions" => Some((TAB_SESSIONS, "Sessions")),
+            "gateway" => Some((TAB_GATEWAY, "Gateway")),
             _ => None,
         }) else {
             return false;
@@ -2400,14 +2655,16 @@ impl TuiState {
     pub fn open_surface_for_slash_result(&mut self, command_name: &str) {
         match command_name {
             "status" | "model" | "cost" | "sandbox" | "config" | "doctor" | "context" => {
-                self.open_sidebar_tab(0, "Runtime");
+                self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
             }
             "memory" | "closet" => self.open_topic_panel(SidebarTopicPanel::Memory),
             "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
             "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
-            "tasks" | "approvals" => self.open_sidebar_tab(2, "Goals"),
-            "session" | "resume" => self.open_sidebar_tab(6, "Sessions"),
-            "gateway" => self.open_sidebar_tab(7, "Gateway"),
+            "tools" | "toolops" | "tool-ops" => self.open_sidebar_tab(TAB_TOOLS, "Tools"),
+            "tasks" => self.open_sidebar_tab(TAB_GOALS, "Goals"),
+            "approvals" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
+            "session" | "resume" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
+            "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             _ => {}
         }
     }
@@ -2421,7 +2678,7 @@ impl TuiState {
             self.toast_manager.push(
                 ToastVariant::Info,
                 Some("Focus".into()),
-                "Use /focus chat|input|activity|runtime|files|sessions|gateway|diff|memory|skills"
+                "Use /focus chat|input|activity|runtime|tools|files|sessions|gateway|diff|memory|skills"
                     .into(),
                 2400,
             );
@@ -2454,14 +2711,15 @@ impl TuiState {
                 self.activity_panel_visible = false;
                 self.set_focus_target(FocusTarget::Sidebar);
             }
-            "runtime" | "status" => self.open_sidebar_tab(0, "Runtime"),
-            "changes" => self.open_sidebar_tab(1, "Changes"),
-            "tasks" | "goals" => self.open_sidebar_tab(2, "Goals"),
-            "approvals" | "approve" => self.open_sidebar_tab(3, "Approvals"),
-            "todo" => self.open_sidebar_tab(4, "Todo"),
-            "files" => self.open_sidebar_tab(5, "Files"),
-            "sessions" => self.open_sidebar_tab(6, "Sessions"),
-            "gateway" => self.open_sidebar_tab(7, "Gateway"),
+            "runtime" | "status" => self.open_sidebar_tab(TAB_RUNTIME, "Runtime"),
+            "tools" | "toolops" | "tool-ops" => self.open_sidebar_tab(TAB_TOOLS, "Tools"),
+            "changes" => self.open_sidebar_tab(TAB_CHANGES, "Changes"),
+            "tasks" | "goals" => self.open_sidebar_tab(TAB_GOALS, "Goals"),
+            "approvals" | "approve" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
+            "todo" => self.open_sidebar_tab(TAB_TODO, "Todo"),
+            "files" => self.open_sidebar_tab(TAB_FILES, "Files"),
+            "sessions" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
+            "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
             "memory" => self.open_topic_panel(SidebarTopicPanel::Memory),
             "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
@@ -2773,14 +3031,14 @@ impl TuiState {
                     self.layout_state.toggle_sidebar(&mut self.layout_tree);
                 }
                 self.active_topic_panel = None;
-                self.sidebar_active_tab = 5;
+                self.sidebar_active_tab = TAB_FILES;
             }
             Action::FocusSessions => {
                 if !self.layout_state.sidebar_visible {
                     self.layout_state.toggle_sidebar(&mut self.layout_tree);
                 }
                 self.active_topic_panel = None;
-                self.sidebar_active_tab = 6;
+                self.sidebar_active_tab = TAB_SESSIONS;
             }
             Action::Execute(ref cmd) => {
                 if self.try_open_sidebar_for_panel_command(cmd) {
@@ -4151,7 +4409,7 @@ providers:
         ));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 0);
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
         assert!(!state.activity_panel_visible);
     }
 
@@ -4401,14 +4659,16 @@ providers:
 
         assert_eq!(compact.len(), SIDEBAR_TAB_COUNT);
         assert_eq!(full.len(), SIDEBAR_TAB_COUNT);
-        assert_eq!(compact[0], "Run");
-        assert_eq!(compact[3], "Appr");
-        assert_eq!(compact[5], "File");
+        assert_eq!(compact[TAB_RUNTIME], "Run");
+        assert_eq!(compact[TAB_TOOLS], "Tool");
+        assert_eq!(compact[TAB_APPROVALS], "Appr");
+        assert_eq!(compact[TAB_FILES], "File");
         assert!(!compact.contains(&"Mem"));
         assert!(!compact.contains(&"Skill"));
-        assert_eq!(full[0], "Run");
-        assert_eq!(full[3], "Approvals");
-        assert_eq!(full[5], "Files");
+        assert_eq!(full[TAB_RUNTIME], "Run");
+        assert_eq!(full[TAB_TOOLS], "Tools");
+        assert_eq!(full[TAB_APPROVALS], "Approvals");
+        assert_eq!(full[TAB_FILES], "Files");
         assert!(!full.contains(&"Memory"));
         assert!(!full.contains(&"Skills"));
     }
@@ -4445,13 +4705,13 @@ providers:
         state.dispatch_action(Action::FocusFileTree);
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 5);
+        assert_eq!(state.sidebar_active_tab, TAB_FILES);
 
         state.layout_state.toggle_sidebar(&mut state.layout_tree);
         state.dispatch_action(Action::FocusSessions);
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 6);
+        assert_eq!(state.sidebar_active_tab, TAB_SESSIONS);
     }
 
     #[test]
@@ -4464,7 +4724,7 @@ providers:
         assert!(matches!(result, ProcessedKey::Nothing));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 5);
+        assert_eq!(state.sidebar_active_tab, TAB_FILES);
         assert_eq!(state.input_text(), "");
     }
 
@@ -4547,7 +4807,7 @@ providers:
 
         assert!(matches!(result, ProcessedKey::Nothing));
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 1);
+        assert_eq!(state.sidebar_active_tab, TAB_TOOLS);
     }
 
     #[test]
@@ -4601,14 +4861,38 @@ providers:
         state.dispatch_action(Action::Execute("/runtime".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 0);
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+
+        state.dispatch_action(Action::Execute("/tools".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, TAB_TOOLS);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
 
         state.dispatch_action(Action::Execute("/gateway".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, 7);
+        assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn tool_ops_mutation_apply_requires_preview_hashes_before_confirmed_apply() {
+        let mut state = TuiState::new("m", "s");
+        state.sidebar_active_tab = TAB_TOOLS;
+        state.tool_ops_panel.set_mode(ToolOpsMode::Mutations);
+        state.tool_ops_panel.armed_action =
+            Some(crate::tui::components::tool_ops_panel::ToolOpsArmedAction::ApplyMutation);
+
+        let consumed = state.handle_tool_ops_action(&crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(consumed);
+        assert!(state.tool_ops_panel.status.contains("run preview first"));
+        assert!(state.tool_ops_panel.last_receipt.is_none());
     }
 
     #[test]
@@ -4714,7 +4998,7 @@ providers:
 
         state.open_surface_for_slash_result("status");
         assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.sidebar_active_tab, 0);
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
 
         state.open_surface_for_slash_result("memory");
@@ -4996,7 +5280,7 @@ providers:
     fn render_bridge_projects_runtime_command_center_to_gateway_tab() {
         let mut state = TuiState::new("m", "scenario-session");
         state.layout_state.toggle_sidebar(&mut state.layout_tree);
-        state.sidebar_active_tab = 7;
+        state.sidebar_active_tab = TAB_GATEWAY;
         state.app.server_running = true;
         state.app.server_uptime_secs = Some(61);
         state.app.active_api_sessions = 2;

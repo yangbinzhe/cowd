@@ -36,6 +36,7 @@ pub mod task_decomposition_view;
 pub mod thinking_panel;
 pub mod toast;
 pub mod todo_panel;
+pub mod tool_ops_panel;
 
 #[cfg(test)]
 mod base_test;
