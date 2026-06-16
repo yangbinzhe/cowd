@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability::CowdCapabilityRegistry;
-use crate::iacc::manufacturing_app_descriptor;
+use crate::iacc::manufacturing_app_descriptor as iacc_manufacturing_app_descriptor;
+use crate::mfg::manufacturing_app_descriptor as mfg_manufacturing_app_descriptor;
 use crate::surface_contract::CowdSurfaceParityContract;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +58,8 @@ impl CowdReleaseGateReport {
     pub fn evaluate_with(evidence: CowdReleaseGateRuntimeEvidence) -> Self {
         let registry = CowdCapabilityRegistry::core();
         let surface = CowdSurfaceParityContract::from_registry(&registry);
-        let iacc = manufacturing_app_descriptor();
+        let iacc = iacc_manufacturing_app_descriptor();
+        let mfg = mfg_manufacturing_app_descriptor();
         let checks = vec![
             check(
                 "capability.registry.unique_ids",
@@ -68,6 +70,22 @@ impl CowdReleaseGateReport {
                 "structured_data.core.registered",
                 registry.capability("cowd.structured_data.core").is_some(),
                 "Structured data core is registered as cowd kernel capability.",
+            ),
+            check(
+                "matrix.kernel.registered",
+                registry.capability("cowd.matrix.runtime").is_some(),
+                "Matrix structured fact engine is registered as a kernel capability.",
+            ),
+            check(
+                "mfg.application.boundary",
+                registry
+                    .capability("mfg.manufacturing.application")
+                    .is_some()
+                    && mfg.layer == "application"
+                    && mfg
+                        .cowd_capabilities
+                        .contains(&"cowd.matrix.runtime".to_string()),
+                "MFG is an application descriptor over Matrix, Memory and runtime capabilities.",
             ),
             check(
                 "iacc.application.boundary",
@@ -150,6 +168,14 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.check_id == "structured_data.core.registered"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.check_id == "matrix.kernel.registered"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.check_id == "mfg.application.boundary"));
         assert!(report.checks.iter().all(|check| check.status == "pass"));
     }
 
