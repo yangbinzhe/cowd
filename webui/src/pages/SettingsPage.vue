@@ -5,10 +5,14 @@ import { useAppStore } from '../stores/app';
 
 const store = useAppStore();
 const profileName = ref('');
+const defaultModel = ref('');
 const settingsError = ref('');
 const busyAction = ref('');
 const authState = computed(() => localStorage.getItem('cowd-auth-token') ? 'stored in browser' : 'not stored');
 const origin = computed(() => location.origin);
+const providerModels = computed(() => store.providers?.models || []);
+const providerRows = computed(() => store.providers?.providers || []);
+const configuredModel = computed(() => store.providers?.configured_model || store.controlPlane?.configured_model || store.settings?.model || '');
 
 const theme = computed({
   get: () => document.documentElement.dataset.theme || 'dark',
@@ -44,6 +48,12 @@ async function addProfile() {
   });
 }
 
+async function saveDefaultModel() {
+  const model = defaultModel.value || configuredModel.value;
+  if (!model) return;
+  await run('model-save', () => store.saveDefaultModel(model));
+}
+
 async function saveApprovalFromText(event: Event) {
   const value = (event.target as HTMLTextAreaElement).value;
   await run('approval-save', async () => {
@@ -57,7 +67,7 @@ async function saveApprovalFromText(event: Event) {
     <header class="page-header">
       <div>
         <h1>Settings</h1>
-        <p>只保留当前后端真实支持的配置入口：外观、本地鉴权状态、runtime providers、profile 和 approval policy。</p>
+        <p>模型、provider、profile、approval 和安全状态均接后端真实接口，失败会显示后端错误。</p>
       </div>
       <button class="primary-action" type="button" :disabled="busyAction === 'providers'" @click="run('providers', store.reloadProviders)">
         <RefreshCw :size="15" />
@@ -80,15 +90,32 @@ async function saveApprovalFromText(event: Event) {
         <h2>Runtime model source</h2>
         <dl class="contract-list">
           <dt>Configured model</dt>
-          <dd>{{ store.controlPlane?.configured_model || store.settings?.model || 'unknown' }}</dd>
+          <dd>{{ configuredModel || 'unknown' }}</dd>
           <dt>Provider status</dt>
-          <dd>{{ store.controlPlane?.provider_status || 'unknown' }}</dd>
+          <dd>{{ store.providers?.configured_model_resolved === false ? 'degraded' : (store.controlPlane?.provider_status || 'unknown') }}</dd>
           <dt>Providers</dt>
-          <dd>{{ (store.controlPlane?.provider_names || []).join(', ') || 'none reported' }}</dd>
+          <dd>{{ providerRows.map((provider) => provider.name).join(', ') || 'none reported' }}</dd>
           <dt>Model count</dt>
-          <dd>{{ store.controlPlane?.provider_model_count ?? 0 }}</dd>
+          <dd>{{ store.providers?.provider_model_count ?? store.controlPlane?.provider_model_count ?? 0 }}</dd>
         </dl>
-        <p class="modal-note">当前后端没有 `/api/config` 写接口；全局默认模型在这里只读展示。聊天中的模型选择会真实 PATCH 当前 session。</p>
+        <label>
+          Default model
+          <select v-model="defaultModel">
+            <option value="">Keep {{ configuredModel || 'current' }}</option>
+            <option v-for="model in providerModels" :key="model.id || model.name" :value="model.id || model.name">
+              {{ model.id || model.name }} · {{ model.provider }}
+            </option>
+          </select>
+        </label>
+        <button class="ghost-action" type="button" :disabled="!defaultModel && !configuredModel" @click="saveDefaultModel">Save default model</button>
+        <div class="profile-list">
+          <article v-for="provider in providerRows" :key="provider.name" class="profile-row">
+            <div>
+              <strong>{{ provider.name }}</strong>
+              <span>{{ provider.protocol || 'openai-compat' }} · {{ provider.model_count }} models · credential {{ provider.credential_present ? 'present' : 'missing' }}</span>
+            </div>
+          </article>
+        </div>
       </section>
 
       <section class="settings-section">

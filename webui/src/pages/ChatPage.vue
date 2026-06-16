@@ -9,13 +9,6 @@ const draft = ref('');
 const sending = ref(false);
 const contextUsage = computed(() => Math.min(88, 42 + store.turns.length * 6));
 const modelLabel = computed(() => store.selectedModel || 'Select model');
-const commands = [
-  { name: '/status', detail: 'Show runtime, session, memory, and gateway status.' },
-  { name: '/model', detail: 'Switch the model for the current conversation.' },
-  { name: '/memory', detail: 'Open memory recall and fact tools.' },
-  { name: '/agents', detail: 'Open agent lanes and work graph.' },
-  { name: '/gateway', detail: 'Open channel and connector controls.' },
-];
 
 async function submit() {
   const text = draft.value.trim();
@@ -40,6 +33,23 @@ async function submit() {
   await store.send(text);
   sending.value = false;
   await nextTick();
+}
+
+async function chooseCommand(command: any) {
+  const name = command.name || command;
+  if (name === '/model') {
+    store.closeModal();
+    store.openModal('model');
+    return;
+  }
+  if (name === '/workspace') {
+    store.closeModal();
+    store.openModal('workspace');
+    return;
+  }
+  await store.executeCommand(name, { session_id: store.activeSessionId });
+  draft.value = `${name} `;
+  store.closeModal();
 }
 </script>
 
@@ -122,9 +132,10 @@ async function submit() {
           <h2>Commands</h2>
           <button type="button" @click="store.closeModal">Close</button>
         </header>
-        <button v-for="command in commands" :key="command.name" class="command-row" type="button" @click="draft = command.name + ' '; store.closeModal()">
+        <p v-if="!store.commands.length" class="modal-note">后端未报告 command registry。</p>
+        <button v-for="command in store.commands" :key="command.name" class="command-row" type="button" @click="chooseCommand(command)">
           <Boxes :size="15" />
-          <span><strong>{{ command.name }}</strong><small>{{ command.detail }}</small></span>
+          <span><strong>{{ command.name }}</strong><small>{{ command.description || command.detail }}</small></span>
         </button>
       </section>
     </div>

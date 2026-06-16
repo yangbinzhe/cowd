@@ -57,6 +57,5 @@ test('composer model workspace and command controls are clickable', async ({ pag
 
   await page.getByRole('button', { name: /Commands/ }).click();
   await expect(page.getByRole('heading', { name: 'Commands' })).toBeVisible();
-  await page.locator('.command-row').filter({ hasText: '/status' }).click();
-  await expect(page.locator('.composer textarea')).toHaveValue('/status ');
+  await expect(page.locator('.command-modal')).toContainText('后端未报告 command registry');
 });

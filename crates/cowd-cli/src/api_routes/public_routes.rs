@@ -19,6 +19,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/webui/manifest", get(webui_manifest_handler))
         .route("/api/auth/login", post(login_handler))
         .route("/api/auth/verify", get(verify_handler))
+        .route("/api/auth/logout", post(logout_handler))
 }
 
 async fn health_handler() -> &'static str {
@@ -124,4 +125,11 @@ async fn verify_handler(
             }),
         )),
     }
+}
+
+async fn logout_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "success": true,
+        "token_cleared": true,
+    }))
 }

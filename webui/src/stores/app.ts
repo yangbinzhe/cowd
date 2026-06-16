@@ -10,11 +10,17 @@ function blockText(block: any): string {
 }
 
 export const useAppStore = defineStore('app', () => {
+  let sessionStream: EventSource | null = null;
+  let sessionStreamId = '';
+  let streamingAssistantId = '';
   const booted = ref(false);
   const health = ref<any>(null);
   const settings = ref<any>(null);
   const controlPlane = ref<any>(null);
+  const providers = ref<any>(null);
   const profiles = ref<any[]>([]);
+  const commands = ref<any[]>([]);
+  const commandHistory = ref<any[]>([]);
   const approvalConfig = ref<any>(null);
   const sessions = ref<SessionSummary[]>([]);
   const activeSessionId = ref('');
@@ -55,7 +61,7 @@ export const useAppStore = defineStore('app', () => {
     return sessions.value.filter((session) => `${session.title} ${session.model} ${session.status}`.toLowerCase().includes(query));
   });
   const availableModels = computed(() => {
-    const models = providerModels(controlPlane.value, settings.value);
+    const models = providerModels(controlPlane.value, providers.value || settings.value);
     return models.length ? models : (selectedModel.value ? [selectedModel.value] : []);
   });
   const availableProfiles = computed(() => profiles.value.map((profile: any) => profile.id || profile.name).filter(Boolean));
@@ -63,19 +69,23 @@ export const useAppStore = defineStore('app', () => {
   async function boot() {
     if (booted.value) return;
     busy.value = true;
-    const [manifest, sessionData, config, runtime, profileData, workspace, approvals] = await Promise.all([
+    const [manifest, sessionData, config, runtime, providerData, profileData, commandData, workspace, approvals] = await Promise.all([
       api.health(),
       api.sessions(),
       api.settings(),
       api.runtimeControlPlane(),
+      api.providers(),
       api.profiles(),
+      api.commands(),
       api.workspace(),
       api.approvalConfig(),
     ]);
     health.value = manifest;
     settings.value = config;
     controlPlane.value = runtime;
+    providers.value = providerData;
     profiles.value = profileData.profiles || [];
+    commands.value = commandData.commands || [];
     approvalConfig.value = approvals;
     const reportedModel = runtime.configured_model || config.model || '';
     selectedModel.value = reportedModel && reportedModel !== 'unknown' ? reportedModel : selectedModel.value;
@@ -104,6 +114,14 @@ export const useAppStore = defineStore('app', () => {
       activity: [],
     }));
     if (!turns.value.length) turns.value = [{ id: 'empty', role: 'system', content: '当前 session 暂无消息。', status: 'complete' }];
+    connectSessionStream(sessionId);
+  }
+
+  async function refreshSessions(query = sessionQuery.value) {
+    const data = await api.searchSessions(query.trim());
+    sessions.value = data.sessions || [];
+    if (!activeSessionId.value && sessions.value[0]) activeSessionId.value = sessions.value[0].id;
+    return data;
   }
 
   async function createSession() {
@@ -112,6 +130,23 @@ export const useAppStore = defineStore('app', () => {
     activeSessionId.value = session.id;
     selectedModel.value = session.model || selectedModel.value;
     turns.value = [{ id: `system-${Date.now()}`, role: 'system', content: '新会话已创建。', status: 'complete' }];
+    connectSessionStream(session.id);
+  }
+
+  async function deleteSession(sessionId: string) {
+    await api.deleteSession(sessionId);
+    sessions.value = sessions.value.filter((session) => session.id !== sessionId);
+    if (activeSessionId.value === sessionId) {
+      activeSessionId.value = sessions.value[0]?.id || '';
+      if (activeSessionId.value) await loadMessages(activeSessionId.value);
+      else turns.value = [];
+    }
+  }
+
+  async function compactSession(sessionId: string) {
+    const result = await api.compactSession(sessionId);
+    activity.value.unshift({ id: `compact-${Date.now()}`, kind: 'runtime', title: 'Session compacted', detail: JSON.stringify(result).slice(0, 220), status: 'complete' });
+    await loadActivity();
   }
 
   async function send(content: string) {
@@ -120,6 +155,7 @@ export const useAppStore = defineStore('app', () => {
       await createSession();
     }
     turns.value.push({ id: `local-${Date.now()}`, role: 'user', content, status: 'complete' });
+    ensureStreamingAssistantTurn();
     companionTab.value = 'activity';
     activity.value.unshift({ id: `send-${Date.now()}`, kind: 'runtime', title: 'Message queued', detail: content.slice(0, 140), status: 'pending' });
     try {
@@ -144,6 +180,141 @@ export const useAppStore = defineStore('app', () => {
     }
     const data: any = await api.runtimeTimeline(activeSessionId.value);
     activity.value = normalizeActivity(data.events || data.timeline || []);
+  }
+
+  function connectSessionStream(sessionId: string) {
+    if (!sessionId || (sessionStream && sessionStreamId === sessionId)) return;
+    if (sessionStream) sessionStream.close();
+    sessionStreamId = sessionId;
+    streamingAssistantId = '';
+    try {
+      sessionStream = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/stream`);
+      sessionStream.onmessage = (event) => handleSessionEvent(event.data);
+      sessionStream.onerror = () => {
+        if (sessionStreamId === sessionId) {
+          sessionStream?.close();
+          sessionStream = null;
+          sessionStreamId = '';
+          activity.value.unshift({
+            id: `stream-error-${Date.now()}`,
+            kind: 'error',
+            title: 'Live stream disconnected',
+            detail: 'SSE connection closed. The page will still refresh completed messages through the API.',
+            status: 'error',
+          });
+        }
+      };
+    } catch (error) {
+      activity.value.unshift({
+        id: `stream-open-error-${Date.now()}`,
+        kind: 'error',
+        title: 'Live stream unavailable',
+        detail: error instanceof Error ? error.message : String(error),
+        status: 'error',
+      });
+    }
+  }
+
+  function handleSessionEvent(raw: string) {
+    let event: any;
+    try {
+      event = JSON.parse(raw);
+    } catch {
+      event = { type: 'RuntimeEvent', content: raw };
+    }
+    const type = event.type || 'RuntimeEvent';
+    if (type === 'Connected') return;
+
+    if (type === 'TurnStarted') {
+      ensureStreamingAssistantTurn();
+      recordLiveActivity('runtime', 'Turn started', '', 'running');
+      return;
+    }
+
+    if (type === 'TextDelta') {
+      appendAssistantDelta(event.content || event.text || '');
+      return;
+    }
+
+    if (type === 'ThinkingDelta') {
+      recordLiveActivity('think', 'Thinking', event.content || event.thinking || '', 'running');
+      return;
+    }
+
+    if (type === 'ToolStart' || type === 'ToolProgress' || type === 'ToolComplete') {
+      companionTab.value = 'activity';
+      recordLiveActivity(
+        'tool',
+        event.name || type,
+        event.summary || event.progress || event.preview || event.id || '',
+        type === 'ToolComplete' ? 'complete' : 'running',
+      );
+      return;
+    }
+
+    if (type === 'ContextEnvelope') {
+      recordLiveActivity('context', 'Context envelope', event.envelope_id || event.run_id || '', 'complete');
+      return;
+    }
+
+    if (type === 'TurnComplete') {
+      completeAssistantTurn(event.response || event.text || '');
+      recordLiveActivity('runtime', 'Turn complete', event.iterations ? `${event.iterations} iterations` : '', 'complete');
+      return;
+    }
+
+    if (type === 'TurnError') {
+      completeAssistantTurn(event.error || 'Turn failed', 'error');
+      recordLiveActivity('error', 'Turn failed', event.error || '', 'error');
+      return;
+    }
+
+    recordLiveActivity('runtime', type, event.summary || event.content || JSON.stringify(event).slice(0, 220), event.status || 'observed');
+  }
+
+  function ensureStreamingAssistantTurn() {
+    const current = streamingAssistantId ? turns.value.find((turn) => turn.id === streamingAssistantId) : null;
+    if (current && current.status === 'streaming') return current;
+    streamingAssistantId = `assistant-stream-${Date.now()}`;
+    const turn = { id: streamingAssistantId, role: 'assistant' as const, content: '', status: 'streaming' as const, activity: [] };
+    turns.value.push(turn);
+    return turn;
+  }
+
+  function appendAssistantDelta(delta: string) {
+    if (!delta) return;
+    const turn = ensureStreamingAssistantTurn();
+    turn.content += delta;
+  }
+
+  function completeAssistantTurn(content: string, status: 'complete' | 'error' = 'complete') {
+    const turn = streamingAssistantId ? turns.value.find((item) => item.id === streamingAssistantId) : null;
+    if (turn) {
+      if (content && turn.content !== content && !turn.content.endsWith(content)) turn.content = content;
+      turn.status = status;
+    } else if (content) {
+      const alreadyShown = turns.value.some((item) => item.role === 'assistant' && item.content === content);
+      if (!alreadyShown) turns.value.push({ id: `assistant-${Date.now()}`, role: status === 'error' ? 'system' : 'assistant', content, status });
+    }
+    streamingAssistantId = '';
+  }
+
+  function recordLiveActivity(kind: ActivityEvent['kind'], title: string, detail: string, status: string) {
+    const id = `live-${title}-${status}`;
+    const event = {
+      id: `${id}-${Date.now()}`,
+      kind,
+      title,
+      detail: String(detail || '').slice(0, 240),
+      status,
+    };
+    const existingIndex = activity.value.findIndex((item) => item.title === title && item.kind === kind && item.status !== 'complete' && item.status !== 'error');
+    if (existingIndex >= 0) {
+      activity.value.splice(existingIndex, 1, event);
+    } else {
+      activity.value.unshift(event);
+    }
+    activity.value = activity.value.slice(0, 80);
   }
 
   async function loadWorkspace(dir = workspaceDir.value) {
@@ -222,9 +393,18 @@ export const useAppStore = defineStore('app', () => {
 
   async function reloadProviders() {
     const result = await api.reloadProviders();
-    controlPlane.value = await api.runtimeControlPlane();
+    const [runtime, providerData] = await Promise.all([api.runtimeControlPlane(), api.providers()]);
+    controlPlane.value = runtime;
+    providers.value = providerData;
     activity.value.unshift({ id: `providers-${Date.now()}`, kind: 'runtime', title: 'Providers reloaded', detail: JSON.stringify(result).slice(0, 240), status: 'complete' });
     return result;
+  }
+
+  async function saveDefaultModel(model: string) {
+    settings.value = await api.saveConfig({ model });
+    providers.value = await api.providers();
+    selectedModel.value = model;
+    settingsSavedAt.value = new Date().toLocaleTimeString();
   }
 
   async function refreshProfiles() {
@@ -266,6 +446,25 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  async function refreshCommands() {
+    const [registry, history] = await Promise.all([api.commands(), api.commandHistory()]);
+    commands.value = registry.commands || [];
+    commandHistory.value = history.history || [];
+  }
+
+  async function executeCommand(command: string, args: Record<string, unknown> = {}) {
+    const result: any = await api.executeCommand(command, args);
+    commandHistory.value = [result, ...commandHistory.value];
+    activity.value.unshift({
+      id: `command-${Date.now()}`,
+      kind: 'runtime',
+      title: `Command ${result.command || command}`,
+      detail: JSON.stringify(result).slice(0, 220),
+      status: result.ok ? 'complete' : 'error',
+    });
+    return result;
+  }
+
   async function runCapabilityAction(page: string, label: string, endpoint?: string) {
     if (!endpoint) return;
     const id = `${page}:${label}`;
@@ -299,7 +498,10 @@ export const useAppStore = defineStore('app', () => {
     health,
     settings,
     controlPlane,
+    providers,
     profiles,
+    commands,
+    commandHistory,
     approvalConfig,
     sessions,
     activeSessionId,
@@ -333,8 +535,11 @@ export const useAppStore = defineStore('app', () => {
     busy,
     activeSession,
     boot,
+    refreshSessions,
     loadMessages,
     createSession,
+    deleteSession,
+    compactSession,
     send,
     loadActivity,
     loadWorkspace,
@@ -348,12 +553,15 @@ export const useAppStore = defineStore('app', () => {
     chooseModel,
     chooseProfile,
     reloadProviders,
+    saveDefaultModel,
     refreshProfiles,
     createProfile,
     deleteProfile,
     saveApprovalConfig,
     toggleSolo,
     loadCapability,
+    refreshCommands,
+    executeCommand,
     runCapabilityAction,
   };
 });

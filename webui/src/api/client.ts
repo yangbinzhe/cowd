@@ -170,10 +170,14 @@ export const api = {
     static_webui: 'local vite fallback',
   }),
   sessions: () => read<{ sessions: SessionSummary[] }>('/api/sessions?limit=24', { sessions: [] }),
+  searchSessions: (query: string) => read<{ sessions: SessionSummary[] }>(`/api/sessions?limit=24${query ? `&q=${encodeURIComponent(query)}` : ''}`, { sessions: [] }),
   createSession: (model?: string) => write<SessionSummary>('/api/sessions', {
     method: 'POST',
     body: JSON.stringify({ model }),
   }),
+  deleteSession: (sessionId: string) => write(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+  compactSession: (sessionId: string) => write(`/api/sessions/${encodeURIComponent(sessionId)}/compact`, { method: 'POST' }),
+  sessionStats: (sessionId: string) => read(`/api/sessions/${encodeURIComponent(sessionId)}/stats`, {}),
   updateSession: (sessionId: string, patch: Record<string, unknown>) => write(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: 'PATCH',
     body: JSON.stringify(patch),
@@ -199,6 +203,7 @@ export const api = {
   }),
   runtimeTimeline: (sessionId: string) => read(`/api/runtime/timeline?session_id=${encodeURIComponent(sessionId)}&limit=50`, { events: [] }),
   runtimeControlPlane: () => read('/api/runtime/control-plane', {}),
+  providers: () => read('/api/config/providers', { providers: [], models: [] }),
   effectiveConfig: () => read('/api/runtime/config/effective', {}),
   reloadProviders: () => write('/api/runtime/providers/reload', { method: 'POST' }),
   approvalConfig: () => read('/api/approval/config', {}),
@@ -210,6 +215,16 @@ export const api = {
   approvalPending: () => read('/api/approval/pending', []),
   approvalHistory: () => read('/api/approval/history?limit=20', []),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
+  saveConfig: (config: Record<string, unknown>) => write('/api/config', {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  }),
+  commands: () => read('/api/commands', { commands: [] }),
+  commandHistory: () => read('/api/commands/history', { history: [] }),
+  executeCommand: (command: string, args: Record<string, unknown> = {}) => write('/api/commands/execute', {
+    method: 'POST',
+    body: JSON.stringify({ command, args }),
+  }),
   profiles: () => read('/api/profiles', { profiles: [], active_profile: '', runtime_profile: '' }),
   createProfile: (name: string) => write('/api/profiles', {
     method: 'POST',
@@ -240,6 +255,11 @@ async function readText(path: string, fallback = ''): Promise<string> {
 }
 
 export function providerModels(controlPlane: any, config: any): string[] {
+  if (Array.isArray(config?.models) && config.models.length) {
+    return config.models
+      .map((model: any) => model.id || model.name || model)
+      .filter((model: any) => typeof model === 'string' && model.trim() && model !== 'unknown');
+  }
   const models = new Set<string>();
   const configured = controlPlane?.configured_model || config?.model;
   const normalized = typeof configured === 'string' ? configured.trim() : '';

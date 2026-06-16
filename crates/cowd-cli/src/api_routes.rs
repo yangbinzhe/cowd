@@ -3725,6 +3725,159 @@ providers:
     }
 
     #[tokio::test]
+    async fn config_providers_and_update_config_are_real_and_redacted() {
+        let root = test_temp_dir("system-config-providers");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "model-a"
+providers:
+  local:
+    base_url: "https://local.example/v1"
+    api_key: "secret-local-key"
+    models: ["model-a", "model-b"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["provider_count"], 1);
+        assert_eq!(json["provider_model_count"], 2);
+        assert_eq!(json["configured_model"], "model-a");
+        assert_eq!(json["models"][1]["id"], "model-b");
+        assert_eq!(json["providers"][0]["credential_present"], true);
+        assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["providers"]["local"]["api_key"], "[redacted]");
+        assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"model-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let written = std::fs::read_to_string(config_home.join("config.yaml")).unwrap();
+        assert!(written.contains("model-b"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"missing-model"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn commands_registry_execute_and_history_are_available() {
+        let root = test_temp_dir("system-commands");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "/status"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"command":"/status","args":{"session_id":"s1"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["command"], "/status");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/commands/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+    }
+
+    #[tokio::test]
     #[serial_test::serial(provider_registry)]
     async fn runtime_provider_reload_replaces_global_registry_from_config() {
         runtime::init_global_providers(runtime::ProvidersConfig::default());
