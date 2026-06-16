@@ -63,6 +63,16 @@ async function routeShellApis(page) {
     if (path === '/api/memory/layers') return json({ layers: [{ name: 'semantic' }, { name: 'episodic' }] });
     if (path === '/api/memory/runtime') return json({ clusters: [], status: 'ready' });
     if (path === '/api/memory/clusters') return json({ clusters: [{ id: 'cluster-1', label: 'Runtime' }] });
+    if (path === '/api/skills/projection') return json({
+      catalog_count: 1,
+      capabilities: ['plan', 'run', 'validate'],
+      governance: { evidence_model: 'required', tool_fact_model: 'structured', approval_model: 'policy' },
+      items: [{ id: 'runtime.inspect', name: 'runtime.inspect', scope: 'core', domain: 'runtime', risk: 'low', status: 'ready', description: 'Inspect runtime state', tags: ['cowd'] }],
+      facets: { scopes: ['core'], domains: ['runtime'], risks: ['low'], statuses: ['ready'] },
+      queue: { supports_watch: true },
+    });
+    if (path === '/api/skills/runs') return json({ items: [{ skill_id: 'runtime.inspect', status: 'completed', summary: 'validated runtime' }] });
+    if (path === '/api/agents/runs') return json({ runs: [{ status: 'completed', objective: 'Parallel review', nodes: [{ id: 'n1', role: 'reviewer', status: 'done', title: 'Review UI' }], evidence: [], reviews: [], merge_decisions: [] }] });
     return json({});
   });
 }
@@ -239,6 +249,39 @@ test('v0.9.206 memory renders as a full-page knowledge workbench', async ({ page
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.206-memory-mobile.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.207 skills agents and tools render as full-page capability workbenches', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await page.click('#nav-rail [data-view="skills"]');
+  await expect(page.locator('#workbench-content.workbench-page-skills')).toBeVisible();
+  await expect(page.locator('#workbench-content')).toContainText('runtime.inspect');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.207-skills-desktop.png' });
+
+  await page.click('#nav-rail [data-view="agents"]');
+  await expect(page.locator('#workbench-content.workbench-page-agents')).toBeVisible();
+  await expect(page.locator('#workbench-content')).toContainText('Task Registry');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.207-agents-desktop.png' });
+
+  await page.click('#nav-rail [data-view="tools"]');
+  await expect(page.locator('#workbench-content.workbench-page-tools')).toBeVisible();
+  await expect(page.locator('#workbench-content')).toContainText('Available Tools');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.207-tools-desktop.png' });
 
   expect(errors).toEqual([]);
 });
