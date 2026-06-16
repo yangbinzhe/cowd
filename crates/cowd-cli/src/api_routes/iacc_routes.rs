@@ -36,6 +36,7 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(matrix_kernel_router())
+        .merge(mfg_app_router())
         .route("/api/iacc/app", get(iacc_app_handler))
         .route("/api/iacc/health", get(iacc_health_handler))
         .route(
@@ -287,6 +288,29 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
 }
 
+fn mfg_app_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/apps/mfg/app", get(mfg_app_handler))
+        .route("/api/apps/mfg/skills", get(iacc_skills_handler))
+        .route("/api/apps/mfg/skills/:id", get(iacc_skill_get_handler))
+        .route(
+            "/api/apps/mfg/domain/server-manufacturing",
+            get(iacc_server_manufacturing_domain_handler),
+        )
+        .route(
+            "/api/apps/mfg/domain/server-manufacturing/seed",
+            post(iacc_server_manufacturing_seed_handler),
+        )
+        .route(
+            "/api/apps/mfg/ontology/server-manufacturing",
+            get(iacc_server_manufacturing_ontology_handler),
+        )
+        .route(
+            "/api/apps/mfg/ontology/server-manufacturing/seed",
+            post(iacc_server_manufacturing_ontology_seed_handler),
+        )
+}
+
 fn matrix_kernel_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/matrix/health", get(iacc_health_handler))
@@ -422,6 +446,10 @@ fn matrix_kernel_router() -> Router<Arc<AppState>> {
 
 async fn iacc_app_handler() -> impl IntoResponse {
     Json(runtime::iacc::manufacturing_app_descriptor())
+}
+
+async fn mfg_app_handler() -> impl IntoResponse {
+    Json(runtime::mfg::manufacturing_app_descriptor())
 }
 
 #[derive(Debug, Deserialize)]

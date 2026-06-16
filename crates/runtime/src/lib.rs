@@ -76,6 +76,7 @@ pub mod iacc;
 pub mod intent_planner;
 pub mod joint_problem_solving;
 pub mod matrix;
+pub mod mfg;
 pub mod mirror;
 pub mod model_registry;
 pub mod mutation_plan;

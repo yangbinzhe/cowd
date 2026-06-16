@@ -1123,6 +1123,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_app_route_projects_manufacturing_as_mfg_application() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["app_id"], "mfg.manufacturing");
+        assert_eq!(json["layer"], "application");
+        assert!(json["cowd_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "cowd.matrix.runtime"));
+        assert!(json["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|surface| surface["entrypoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entrypoint| entrypoint == "/api/apps/mfg/app")));
+    }
+
+    #[tokio::test]
     async fn cowd_structured_routes_expose_contract_and_ingest_plan_adapter() {
         let workspace = test_temp_dir("cowd-structured-index");
         let config_home = test_temp_dir("cowd-structured-config");

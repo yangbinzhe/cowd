@@ -151,6 +151,20 @@ impl CowdCapabilityRegistry {
                     &["read:connector", "write:connector"],
                 ),
                 application_capability(
+                    "mfg.manufacturing.application",
+                    "MFG Manufacturing Application",
+                    CowdCapabilityKind::Manufacturing,
+                    "runtime::mfg",
+                    "Manufacturing upper application over Matrix structured facts, memory, context and skill capabilities.",
+                    &[
+                        "cowd.matrix.runtime",
+                        "cowd.structured_data.core",
+                        "cowd.context.runtime",
+                        "cowd.memory.runtime",
+                        "cowd.skill.lifecycle",
+                    ],
+                ),
+                application_capability(
                     "iacc.manufacturing.application",
                     "IACC Manufacturing Application",
                     CowdCapabilityKind::Manufacturing,
@@ -326,6 +340,18 @@ mod tests {
             .depends_on
             .contains(&"cowd.structured_data.core".to_string()));
         assert_eq!(iacc.owner_module, "runtime::iacc");
+    }
+
+    #[test]
+    fn capability_registry_declares_mfg_as_application_over_matrix() {
+        let registry = CowdCapabilityRegistry::core();
+        let mfg = registry
+            .capability("mfg.manufacturing.application")
+            .expect("mfg app capability should exist");
+
+        assert_eq!(mfg.layer, CowdCapabilityLayer::Application);
+        assert_eq!(mfg.owner_module, "runtime::mfg");
+        assert!(mfg.depends_on.contains(&"cowd.matrix.runtime".to_string()));
     }
 
     #[test]
