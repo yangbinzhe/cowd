@@ -38,12 +38,22 @@ const structuredSourceRef = ref('service://iacc/manufacturing/demo-line-a');
 const structuredFactType = ref('manufacturing_quality_event');
 const structuredPlan = ref<any>(null);
 const structuredCollections = ref<any>(null);
+const skillState = ref<any>(null);
+const selectedSkillId = ref('');
+const skillActionResult = ref<any>(null);
+const taskObjective = ref('Restore full WebUI capability with tested runtime evidence');
+const taskState = ref<any>(null);
+const taskActionResult = ref<any>(null);
+const toolState = ref<any>(null);
 
 async function refresh() {
   await store.loadCapability(props.page);
   if (props.page === 'runtime') await loadRuntimeWorkbench();
   if (props.page === 'context') await loadContextWorkbench();
   if (props.page === 'memory') await loadMemoryWorkbench();
+  if (props.page === 'skills') await loadSkillsWorkbench();
+  if (props.page === 'agents') await loadAgentsWorkbench();
+  if (props.page === 'tools') await loadToolsWorkbench();
 }
 
 function preview(data: any) {
@@ -146,6 +156,46 @@ async function planStructuredIngest() {
     raw_checksum: 'sha256:manufacturing-demo-v0.9.220',
     metric_ids: ['torque_deviation_rate', 'station_quality_escape'],
   });
+}
+
+async function loadSkillsWorkbench() {
+  const [catalog, projection, runs] = await Promise.all([api.skillCatalog(), api.skillProjection(), api.skillRuns()]);
+  skillState.value = { catalog, projection, runs };
+  const first = (catalog as any).items?.[0]?.id;
+  if (!selectedSkillId.value && first) selectedSkillId.value = first;
+}
+
+async function runSkillAction(action: 'validate' | 'plan' | 'run') {
+  if (!selectedSkillId.value) return;
+  skillActionResult.value = await api.skillAction(selectedSkillId.value, action, { session_id: store.activeSessionId || 'webui' });
+  await loadSkillsWorkbench();
+}
+
+async function loadAgentsWorkbench() {
+  taskState.value = await api.tasks();
+}
+
+async function startTask() {
+  taskActionResult.value = await api.startTask(taskObjective.value, false);
+  await loadAgentsWorkbench();
+}
+
+async function addTaskPhase() {
+  const id = taskActionResult.value?.id || taskState.value?.current?.id;
+  if (!id) return;
+  taskActionResult.value = await api.startTaskPhase(id, {
+    name: 'Implementation',
+    objective: 'Implement and verify the next WebUI workbench capability',
+    plan: ['wire backend API', 'add UI controls', 'run E2E'],
+    acceptance: ['tests pass', 'screenshot saved'],
+    test_commands: ['npm run test:e2e --prefix webui'],
+  });
+  await loadAgentsWorkbench();
+}
+
+async function loadToolsWorkbench() {
+  const [tools, history, capabilities] = await Promise.all([api.toolRegistry(), api.commandHistory(), api.loadCapabilityPage('tools', store.activeSessionId)]);
+  toolState.value = { tools, history, capabilities };
 }
 
 onMounted(refresh);
@@ -383,6 +433,76 @@ watch(() => props.page, refresh);
         </header>
         <button class="ghost-action" type="button" @click="scanMaintenance">Scan candidates</button>
         <pre class="action-result">{{ preview(maintenanceResult || {}) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'skills'" class="management-grid skills-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Skill lifecycle</h2>
+          <span>{{ skillState?.catalog?.items?.length || 0 }} skills</span>
+        </header>
+        <label class="field-line">
+          Skill
+          <select v-model="selectedSkillId">
+            <option v-for="skill in skillState?.catalog?.items || []" :key="skill.id" :value="skill.id">{{ skill.name || skill.id }}</option>
+          </select>
+        </label>
+        <div class="button-row">
+          <button class="ghost-action" type="button" @click="runSkillAction('validate')">Validate</button>
+          <button class="ghost-action" type="button" @click="runSkillAction('plan')">Plan</button>
+          <button class="primary-action" type="button" @click="runSkillAction('run')">Run</button>
+        </div>
+        <pre class="action-result">{{ preview(skillActionResult || skillState || {}) }}</pre>
+      </article>
+      <article class="management-panel">
+        <header>
+          <h2>Projection and runs</h2>
+          <span>webui</span>
+        </header>
+        <pre class="action-result">{{ preview({ projection: skillState?.projection, runs: skillState?.runs }) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'agents'" class="management-grid agents-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Task control</h2>
+          <span>{{ taskState?.tasks?.length || 0 }} tasks</span>
+        </header>
+        <label class="field-line">
+          Objective
+          <textarea v-model="taskObjective" rows="3" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="startTask">Start task</button>
+          <button class="ghost-action" type="button" @click="addTaskPhase">Add phase</button>
+        </div>
+        <pre class="action-result">{{ preview(taskActionResult || taskState || {}) }}</pre>
+      </article>
+      <article class="management-panel">
+        <header>
+          <h2>Task registry</h2>
+          <span>current</span>
+        </header>
+        <pre class="action-result">{{ preview(taskState || {}) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'tools'" class="management-grid tools-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Tool registry</h2>
+          <span>{{ toolState?.tools?.count || toolState?.tools?.tools?.length || 0 }} tools</span>
+        </header>
+        <pre class="action-result">{{ preview(toolState?.tools || {}) }}</pre>
+      </article>
+      <article class="management-panel">
+        <header>
+          <h2>Command and risk history</h2>
+          <span>{{ toolState?.history?.total || toolState?.history?.history?.length || 0 }} events</span>
+        </header>
+        <pre class="action-result">{{ preview({ history: toolState?.history, capabilities: toolState?.capabilities }) }}</pre>
       </article>
     </section>
 

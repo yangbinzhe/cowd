@@ -285,6 +285,31 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body),
   }),
+  skillCatalog: () => read('/api/skills/catalog', {}),
+  skillProjection: () => read('/api/skills/projection?surface=webui', {}),
+  skillRuns: () => read('/api/skills/runs', {}),
+  skillAction: (id: string, action: 'validate' | 'plan' | 'run', body: Record<string, unknown> = {}) => write(`/api/skills/${encodeURIComponent(id)}/actions/${action}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  tasks: () => read('/api/tasks', {}),
+  startTask: (objective: string, yoloMode = false) => write('/api/tasks/start', {
+    method: 'POST',
+    body: JSON.stringify({ objective, yolo_mode: yoloMode }),
+  }),
+  startTaskPhase: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/phases`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  recordTaskArtifact: (id: string, phaseId: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/phases/${encodeURIComponent(phaseId)}/artifacts`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  reviewTaskPhase: (id: string, phaseId: string, result: string, completed = true) => write(`/api/tasks/${encodeURIComponent(id)}/phases/${encodeURIComponent(phaseId)}/review`, {
+    method: 'POST',
+    body: JSON.stringify({ result, completed }),
+  }),
+  toolRegistry: () => read('/api/tools', {}),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',

@@ -59,6 +59,20 @@ test('memory page exposes memory and structured-data kernel controls', async ({ 
   await expect(page.getByRole('button', { name: 'Scan candidates' })).toBeVisible();
 });
 
+test('skills agents and tools pages expose lifecycle workbenches', async ({ page }) => {
+  await page.goto('/index.html#/skills');
+  await expect(page.getByRole('heading', { name: 'Skill lifecycle' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Validate' })).toBeVisible();
+
+  await page.goto('/index.html#/agents');
+  await expect(page.getByRole('heading', { name: 'Task control' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Start task' })).toBeVisible();
+
+  await page.goto('/index.html#/tools');
+  await expect(page.getByRole('heading', { name: 'Tool registry' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Command and risk history' })).toBeVisible();
+});
+
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
