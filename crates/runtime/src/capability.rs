@@ -15,6 +15,7 @@ pub enum CowdCapabilityKind {
     Context,
     Memory,
     StructuredData,
+    Matrix,
     Event,
     Graph,
     Skill,
@@ -118,6 +119,14 @@ impl CowdCapabilityRegistry {
                     &["read:structured_data", "write:structured_data"],
                 ),
                 kernel_capability(
+                    "cowd.matrix.runtime",
+                    "Matrix Runtime",
+                    CowdCapabilityKind::Matrix,
+                    "runtime::matrix",
+                    "Structured fact engine for entities, relations, facts, metrics, evidence, lineage and compute.",
+                    &["read:matrix", "write:matrix"],
+                ),
+                kernel_capability(
                     "cowd.runtime.event",
                     "Runtime Event",
                     CowdCapabilityKind::Event,
@@ -146,8 +155,9 @@ impl CowdCapabilityRegistry {
                     "IACC Manufacturing Application",
                     CowdCapabilityKind::Manufacturing,
                     "runtime::iacc",
-                    "Manufacturing upper application over cowd structured data, context, memory and skill capabilities.",
+                    "Manufacturing upper application over Matrix structured facts, memory, context and skill capabilities.",
                     &[
+                        "cowd.matrix.runtime",
                         "cowd.structured_data.core",
                         "cowd.context.runtime",
                         "cowd.memory.runtime",
@@ -286,7 +296,21 @@ mod tests {
         assert!(registry.capability("cowd.runtime.session").is_some());
         assert!(registry.capability("cowd.context.runtime").is_some());
         assert!(registry.capability("cowd.memory.runtime").is_some());
+        assert!(registry.capability("cowd.matrix.runtime").is_some());
         assert!(registry.capability("cowd.structured_data.core").is_some());
+    }
+
+    #[test]
+    fn capability_registry_declares_matrix_as_kernel_fact_engine() {
+        let registry = CowdCapabilityRegistry::core();
+        let matrix = registry
+            .capability("cowd.matrix.runtime")
+            .expect("matrix runtime capability should exist");
+
+        assert_eq!(matrix.layer, CowdCapabilityLayer::Kernel);
+        assert_eq!(matrix.kind, CowdCapabilityKind::Matrix);
+        assert_eq!(matrix.owner_module, "runtime::matrix");
+        assert!(matrix.description.contains("Structured fact engine"));
     }
 
     #[test]
@@ -297,6 +321,7 @@ mod tests {
             .expect("iacc app capability should exist");
 
         assert_eq!(iacc.layer, CowdCapabilityLayer::Application);
+        assert!(iacc.depends_on.contains(&"cowd.matrix.runtime".to_string()));
         assert!(iacc
             .depends_on
             .contains(&"cowd.structured_data.core".to_string()));

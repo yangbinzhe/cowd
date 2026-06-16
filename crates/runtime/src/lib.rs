@@ -75,6 +75,7 @@ pub mod execution_scheduler;
 pub mod iacc;
 pub mod intent_planner;
 pub mod joint_problem_solving;
+pub mod matrix;
 pub mod mirror;
 pub mod model_registry;
 pub mod mutation_plan;
@@ -235,6 +236,32 @@ pub use joint_problem_solving::{
 pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass,
+};
+pub use matrix::{
+    matrix_reference, MatrixActionExecution, MatrixActionExecutionRequest, MatrixActionFeedback,
+    MatrixAttentionItem, MatrixAttributionCandidate, MatrixChangeEvent, MatrixCockpitProfile,
+    MatrixCockpitProfileInput, MatrixCockpitProjection, MatrixCockpitReportDeliveryPayload,
+    MatrixCockpitReportDeliveryPayloadRequest, MatrixCockpitReportDeliveryReceipt,
+    MatrixCockpitReportDeliveryState, MatrixCockpitReportRequest, MatrixCockpitReportSnapshot,
+    MatrixCockpitWidget, MatrixComputeJob, MatrixComputeJobInput, MatrixComputePlan,
+    MatrixConnectorQualityReport, MatrixConnectorReceipt, MatrixConnectorRun,
+    MatrixConnectorRunInput, MatrixCrossPlaneBridgeReceipt, MatrixDataPlane,
+    MatrixDataPlaneCapability, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
+    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixDomainPack,
+    MatrixDomainScenario, MatrixDomainSeedPlan, MatrixDomainSeedResult, MatrixEntity,
+    MatrixEntityConflictDecision, MatrixEntityInput, MatrixEntityMatchCandidate,
+    MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact, MatrixFactInput, MatrixHealth,
+    MatrixImpactHop, MatrixImpactPath, MatrixImpactTrace, MatrixIncident, MatrixMemoryCase,
+    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
+    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixMetricLineage,
+    MatrixMetricRecomputeResult, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
+    MatrixMetricStatus, MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack,
+    MatrixOntologyRelation, MatrixOperationalAnalysis, MatrixPlaybook, MatrixPlaybookStep,
+    MatrixQualityGateDecision, MatrixRecommendedAction, MatrixRelation, MatrixRelationInput,
+    MatrixSeverity, MatrixSkillManifest, MatrixSkillPlan, MatrixSkillRun, MatrixSourceDeltaPlan,
+    MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKey, MatrixSourceKind,
+    MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSqliteDataPlane,
+    MatrixStore, MatrixStoreError,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
