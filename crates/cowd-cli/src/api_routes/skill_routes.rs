@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -25,6 +25,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/skills/projection", get(skills_projection_handler))
         .route("/api/skills/runs", get(skill_runs_handler))
         .route("/api/skills/runs/:id", get(skill_run_get_handler))
+        .route("/api/skills/:id/files", get(skill_files_handler))
+        .route("/api/skills/:id/files/raw", get(skill_file_raw_handler))
         .route(
             "/api/skills/:id/actions/validate",
             post(skill_validate_handler),
@@ -60,6 +62,12 @@ struct SkillActionRequest {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SkillFileQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SkillCatalogItem {
     id: String,
@@ -76,6 +84,15 @@ struct SkillCatalogItem {
     capabilities: Vec<String>,
     path: Option<String>,
     shadowed_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillFileEntry {
+    path: String,
+    name: String,
+    kind: &'static str,
+    size: Option<u64>,
+    primary: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +209,69 @@ async fn skill_get_handler(
         "kind": "skills.detail",
         "schema_version": 1,
         "skill": item,
+    })))
+}
+
+async fn skill_files_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let item = find_catalog_item(&state, &id)?;
+    if item.scope == "iacc" {
+        return Ok(Json(iacc_virtual_files(&item)));
+    }
+
+    let root = local_skill_root(&item)?;
+    let files = list_skill_files(&root)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let primary = files
+        .iter()
+        .find(|file| file.primary)
+        .map(|file| file.path.clone());
+
+    Ok(Json(serde_json::json!({
+        "kind": "skills.files",
+        "schema_version": 1,
+        "skill": item,
+        "root": root.display().to_string(),
+        "primary": primary,
+        "files": files,
+    })))
+}
+
+async fn skill_file_raw_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<SkillFileQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let item = find_catalog_item(&state, &id)?;
+    let requested = query.path.unwrap_or_else(|| "SKILL.md".to_string());
+
+    if item.scope == "iacc" {
+        if requested != "SKILL.md" {
+            return Err(api_error(StatusCode::NOT_FOUND, "skill file not found"));
+        }
+        return Ok(Json(serde_json::json!({
+            "kind": "skills.file.raw",
+            "schema_version": 1,
+            "skill": item,
+            "path": "SKILL.md",
+            "content_type": "text/markdown",
+            "content": iacc_virtual_skill_markdown(&item),
+        })));
+    }
+
+    let root = local_skill_root(&item)?;
+    let file_path = safe_skill_file_path(&root, &requested)?;
+    let content = fs::read_to_string(&file_path)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.file.raw",
+        "schema_version": 1,
+        "skill": item,
+        "path": requested,
+        "content_type": "text/markdown",
+        "content": content,
     })))
 }
 
@@ -507,6 +587,142 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
     }
 }
 
+fn local_skill_root(item: &SkillCatalogItem) -> Result<PathBuf, (StatusCode, Json<ErrorResponse>)> {
+    let Some(path) = item.path.as_ref() else {
+        return Err(api_error(StatusCode::NOT_FOUND, "skill path unavailable"));
+    };
+    let path = PathBuf::from(path);
+    let root = if path.is_file() {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        path
+    };
+    root.canonicalize().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("skill root unavailable: {error}"),
+        )
+    })
+}
+
+fn safe_skill_file_path(
+    root: &Path,
+    requested: &str,
+) -> Result<PathBuf, (StatusCode, Json<ErrorResponse>)> {
+    if requested.trim().is_empty() || requested.starts_with('/') || requested.contains('\\') {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid skill file path",
+        ));
+    }
+    let candidate = root.join(requested);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "skill file not found"))?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "skill file path escapes skill root",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn list_skill_files(root: &Path) -> std::io::Result<Vec<SkillFileEntry>> {
+    let mut files = Vec::new();
+    collect_skill_files(root, root, &mut files, 0)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn collect_skill_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<SkillFileEntry>,
+    depth: usize,
+) -> std::io::Result<()> {
+    if depth > 3 || files.len() >= 240 {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == "node_modules" || name == "target" {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            files.push(SkillFileEntry {
+                path: relative.clone(),
+                name,
+                kind: "directory",
+                size: None,
+                primary: false,
+            });
+            collect_skill_files(root, &path, files, depth + 1)?;
+        } else if metadata.is_file() {
+            files.push(SkillFileEntry {
+                primary: relative == "SKILL.md",
+                path: relative,
+                name,
+                kind: "file",
+                size: Some(metadata.len()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn iacc_virtual_files(item: &SkillCatalogItem) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "skills.files",
+        "schema_version": 1,
+        "skill": item,
+        "root": "virtual://iacc/server-manufacturing",
+        "primary": "SKILL.md",
+        "files": [{
+            "path": "SKILL.md",
+            "name": "SKILL.md",
+            "kind": "file",
+            "size": iacc_virtual_skill_markdown(item).len(),
+            "primary": true
+        }],
+    })
+}
+
+fn iacc_virtual_skill_markdown(item: &SkillCatalogItem) -> String {
+    format!(
+        "# {}\n\n{}\n\n- Scope: {}\n- Source: {}\n- Domain: {}\n- Status: {}\n- Risk: {}\n\n## Tools\n{}\n\n## Required Evidence\n{}\n\n## Capabilities\n{}\n",
+        item.name,
+        item.description.as_deref().unwrap_or("IACC manufacturing skill."),
+        item.scope,
+        item.source,
+        item.domain.as_deref().unwrap_or("manufacturing"),
+        item.status,
+        item.risk,
+        markdown_list(&item.tools),
+        markdown_list(&item.required_evidence),
+        markdown_list(&item.capabilities),
+    )
+}
+
+fn markdown_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "- none".to_string();
+    }
+    values
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn iacc_risk(skill: &IaccSkillManifest) -> &'static str {
     if skill
         .output_actions
@@ -678,5 +894,41 @@ fn activation_projection(
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.contains(&value) {
         values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_skill_file_path_rejects_escape() {
+        let root = std::env::current_dir().unwrap();
+        let result = safe_skill_file_path(&root, "../Cargo.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn iacc_virtual_markdown_includes_skill_fields() {
+        let item = SkillCatalogItem {
+            id: "iacc:test".to_string(),
+            name: "test".to_string(),
+            description: Some("desc".to_string()),
+            scope: "iacc".to_string(),
+            source: "runtime".to_string(),
+            domain: Some("manufacturing".to_string()),
+            status: "ready".to_string(),
+            risk: "review".to_string(),
+            tags: vec![],
+            tools: vec!["tool.a".to_string()],
+            required_evidence: vec!["evidence.a".to_string()],
+            capabilities: vec!["cap.a".to_string()],
+            path: None,
+            shadowed_by: None,
+        };
+        let markdown = iacc_virtual_skill_markdown(&item);
+        assert!(markdown.contains("# test"));
+        assert!(markdown.contains("tool.a"));
+        assert!(markdown.contains("evidence.a"));
     }
 }

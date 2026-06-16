@@ -2,7 +2,9 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、IACC 结构化运营智能和生产 Release Gate。
 
-当前版本：`0.9.200`
+当前内核版本：`0.9.200`
+
+当前 WebUI 重构验收版本：`v0.9.245`
 
 当前安装约定：
 
@@ -347,31 +349,32 @@ install <path>
 
 ## 4. WebUI 结构
 
-WebUI 位于 `webui/`，由 Gateway 静态服务直接提供。
+WebUI 位于 `webui/`，由 Vue 3 + Vite 构建，并由 Gateway 静态服务直接提供。源码目录和构建产物分离：
 
 | 文件 | 说明 |
 |---|---|
-| `index.html` | 页面骨架、侧栏、聊天区、右侧 panel、控制中心 |
-| `api.js` | 所有 HTTP API client |
-| `boot.js` | DOMContentLoaded、登录、模型选择、panel 恢复 |
-| `state.js` | 浏览器状态 |
-| `sessions.js` | session 列表、创建、搜索 |
-| `messages.js` | 消息发送、stream、渲染 |
-| `workspace.js` | 文件树和 workspace API |
-| `panels.js` | 右侧功能面板，Memory、Runtime、Context、Skills、IACC、Cowd IACC Workbench 等 |
-| `commands.js` | WebUI slash command autocomplete 和执行 |
-| `ui.js` | 通用 UI helper、toast、modal、markdown |
-| `style.css` | 设计系统和全部面板样式 |
-| `modules.test.js` | Vitest 单元测试 |
-| `*.e2e.spec.js` | Playwright E2E 测试 |
+| `src/App.vue` | 应用 shell、左侧 icon 导航、右侧 Companion、全局布局 |
+| `src/api/client.ts` | 统一 HTTP API client、写操作回执、错误结构 |
+| `src/stores/app.ts` | session、workspace、settings、runtime activity 等前端状态 |
+| `src/pages/*.vue` | Chat、Runtime、Context、Memory、Skills、Agents、Tools、Gateway、IACC、Audit、Settings 页面 |
+| `src/components/workbench/*` | 表格、详情、RawPayload、回执、治理动作、Schema 表单等管理组件 |
+| `src/data/capabilities.ts` | 模块能力说明、二级分区、动作和 endpoint 投影 |
+| `src/data/iaccWriteContracts.json` | IACC 高风险写操作治理契约 |
+| `scripts/api-matrix.mjs` | WebUI API client、页面调用、后端 route 三方矩阵门禁 |
+| `scripts/capability-parity.mjs` | WebUI/TUI/CLI/backend 能力对齐审计 |
+| `scripts/raw-payload-audit.mjs` | 原始 JSON 展示位置审计 |
+| `scripts/visual-audit.mjs` | 响应式截图和视觉冒烟审计 |
+| `assets/app/` | 已构建并随 Gateway 服务的前端静态资源 |
 
 WebUI 的定位：
 
-- 浏览器端管理面
-- 适合复杂状态、表格、过滤、详情、批量操作
-- 当前 Skills 面板已经支持 catalog、projection、detail、validate、plan、run、runs、watch
-- IACC 面板用于领域运营智能的 command center、incident、report、cockpit
-- Cowd IACC Workbench 面板用于 manufacturing 应用的全闭环运营
+- 浏览器端最强管理面，承担复杂状态、表格、过滤、详情、批量操作、证据 drill-down 和治理回执展示。
+- 左侧一级 icon 是全局模块入口；一级模块不重复展示假二级菜单。
+- 只有页面内部确实复杂时才使用模块内二级分区，例如 Skills 的 Catalog/Projection/Runs/Governance，IACC 的 Data Plane/Entities/Metrics/Incidents/Actions/Reports。
+- 右侧 Companion 只承载与主区域互补的 Activity、Thinking、Workspace、Inspector；Workspace 支持目录浏览、预览、编辑、上传、重命名和删除。
+- Chat 只保留对话主流程，用户消息右侧、系统/助手消息左侧，正文使用 Markdown 渲染。
+- 所有写操作尽量返回 `RequestReceipt`，包含 request id、status、changed refs、audit ref、warnings 和 next actions。
+- 原始 JSON 只能作为具名调试/证据/结果详情折叠展示，不能替代主管理界面。
 
 ---
 
@@ -663,24 +666,25 @@ Skills panel 控制台操作：
 http://127.0.0.1:8642/
 ```
 
-WebUI 适合浏览器增强管理：
+WebUI 是 cowd 的浏览器增强管理面：
 
 - session 浏览和搜索
 - 聊天和 stream
-- 文件浏览
-- memory / context 可视化
-- runtime timeline
-- skills 管理
-- IACC command center
-- Cowd IACC Workbench（manufacturing 全闭环运营）
-- connector console
-- cross-plane governance
-- approvals
-- settings
+- Workspace 文件浏览、预览、编辑、上传、重命名、删除
+- Runtime timeline、provider reload、session lease、approval cockpit
+- Context packet、预算、证据解析、recommendation
+- Memory recall、entity/triple、fact check、maintenance、Structured Data Core
+- Skills catalog、projection、validate、plan、run、runs、governance
+- Agents team profile、task、phase、review、graph、persistent run evidence
+- Tools registry、command history、risk preflight、tool action result
+- Gateway connector、resource、identity、grant、cross-plane execution
+- IACC manufacturing 应用全链路管理
+- Audit、usage、release gate、governance evidence
+- Settings token verify/clear、manifest、endpoint 状态
 
 ### 8.1 Skills 面板
 
-入口：右侧 panel 中的 `Skills`。
+入口：左侧 `Skills` icon。
 
 能力：
 
@@ -699,6 +703,8 @@ WebUI 适合浏览器增强管理：
 - Runs 过滤
 - Watch 自动刷新
 - Run detail 展开
+- RequestReceipt 展示 validate/plan/run 的后端回执
+- RawPayload 仅作为 run/detail/action result 的折叠证据
 
 IACC skill 执行流程：
 
@@ -710,40 +716,73 @@ IACC skill 执行流程：
 6. 在 Runs 区域过滤、查看、展开详情。
 7. 开启 `Watch` 观察后续运行记录。
 
-### 8.2 IACC 面板
+### 8.2 Memory 面板
 
-入口：右侧 panel 中的 `IACC`。
-
-用途：
-
-- IACC health
-- command center
-- cockpit report
-- retry report
-- incident / report 状态检查
-
-### 8.3 Cowd IACC Workbench 面板
-
-入口：右侧 panel 中的 `Cowd IACC Workbench`。
+入口：左侧 `Memory` icon。
 
 用途：
 
-- Manufacturing 应用的完整运营视图
-- Structured Data（Source、Fact、Evidence、Watermark）
-- Execution Outcome 列表和详情
-- Skill Activation 状态
-- Release Gate 报告
-- 全闭环运营数据浏览
+- Recall：搜索和构建当前上下文 packet
+- Entities：实体、符号、关系、集群和链接
+- Facts：事实注册、事实判断、冲突和证据
+- Structured Core：`/api/cowd/structured/*` 的数据源、事实、证据、水位和 ingest plan
+- Maintenance：过期候选、维护任务、压缩和修复
 
-### 8.4 Control Center
+Structured Data Core 属于 cowd 内核，不属于 IACC。IACC 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
-左下角控制中心入口用于：
+### 8.3 Agents 面板
 
-- config
-- providers
-- approval
-- history
-- usage
+入口：左侧 `Agents` icon。
+
+用途：
+
+- 自动组队和 team profile 持久化
+- task 启动、phase 启动、phase review、cancel/complete/failure
+- agent graph 和 execution lane 查看
+- review evidence 和 action result 回执
+- profile create/copy/reuse/delete 写操作回执
+
+### 8.4 Gateway 面板
+
+入口：左侧 `Gateway` icon。
+
+用途：
+
+- connector summary、accounts、resources、MCP servers
+- cross-plane readiness、identity binding、grant
+- action preflight、dry-run/live execution
+- audit 记录和 RequestReceipt
+
+### 8.5 IACC 面板
+
+入口：左侧 `IACC` icon。
+
+IACC 是 manufacturing application layer on top of the cowd kernel。当前页面按真实业务分区：
+
+- Overview：health、operating load、contract summary
+- Data Plane：source pack、connector run、delta plan、ingest plan
+- Manufacturing Ingestion：fact ingest、domain seed、metric/change/attention 结果
+- Entities：entity upsert、source key resolve、relation upsert、impact graph
+- Metrics：lineage、materialize、attention plan、compute job
+- Evidence：evidence packet、quality gate
+- Incident Room：incident create/open、room detail
+- Actions：analysis、playbook、case promotion、cross-plane bridge
+- Skills：manufacturing skill plan/run
+- Reports：cockpit report generate/retry
+
+高风险 live 写操作通过 `iaccWriteContracts.json` 治理，页面展示 execution mode、impact preview、payload editor、schema plan、receipt/audit 约束。当前审计要求所有写操作都必须有后端 route、UI 调用、测试证据或明确隔离策略。
+
+### 8.6 Settings 面板
+
+入口：左侧 `Settings` icon。
+
+用途：
+
+- 查看 WebUI manifest 和 Gateway endpoint
+- 设置 API token
+- 验证 token
+- 清除 token
+- 查看本地存储和连接状态
 
 ---
 
@@ -1035,6 +1074,24 @@ cargo build --release -p cowd-cli --no-default-features
 cd webui
 npm ci
 npm test
+npm run test:e2e
+npm run build
+```
+
+`npm test` 会执行：
+
+- Vitest 单元测试
+- API matrix gate：WebUI client、UI 调用、后端 route、测试证据
+- IACC write contract gate
+- Capability parity gate：WebUI/TUI/CLI/backend 对齐
+- RawPayload audit gate
+
+视觉审计：
+
+```bash
+cd webui
+npm run dev -- --port 5195
+COWD_VERSION=v0.9.245 COWD_VISUAL_BASE_URL=http://127.0.0.1:5195 npm run test:visual-audit
 ```
 
 ### 17.3 场景脚本
@@ -1123,14 +1180,18 @@ cp -a webui/. ~/AI/webui/
 - WebUI Cowd IACC Workbench 面板
 - TUI 结构化摘要、inline thinking、流式输出稳定
 - TUI 启动状态和记忆面板稳定
+- WebUI Vue/Vite 重构：左侧模块 icon、右侧 Companion、Workspace、Inspector、模块化管理页面
+- WebUI 写操作回执体系：runtime、context、memory、skills、agents、tools、gateway、IACC
+- Agents team profile 后端持久化 CRUD
+- IACC governed action workbench 和高风险写操作契约
+- API matrix / capability parity / RawPayload / visual audit 最终门禁
 
-仍需后续增强：
+后续增强不属于当前五版必须项，但可以继续提升：
 
-- TUI 直接调用 Skills Action API 的完整交互流
-- WebUI skill runs 的更强批量操作和对比视图
-- candidate skills 的 promote/reject/archive
-- local skills 的安全扫描和 manifest 校验报告
-- IACC action 与 memory case/playbook 的更完整闭环展示
+- TUI 的 Skills Action API 快捷交互可以进一步减少按键路径。
+- WebUI skill runs 可以增加批量对比、归档和跨 incident 分析。
+- local skills 可以增加更细的安全扫描和 manifest 修复建议。
+- IACC action 与 memory case/playbook 的闭环可以增加更丰富的趋势视图。
 
 ---
 

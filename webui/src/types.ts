@@ -1,7 +1,7 @@
 import type { Component } from 'vue';
 
 export type NavId = 'chat' | 'runtime' | 'context' | 'memory' | 'skills' | 'agents' | 'tools' | 'gateway' | 'iacc' | 'audit' | 'settings';
-export type CompanionTab = 'activity' | 'workspace';
+export type CompanionTab = 'activity' | 'thinking' | 'workspace' | 'inspector';
 export type Tone = 'neutral' | 'info' | 'success' | 'warn' | 'danger';
 
 export interface NavItem {

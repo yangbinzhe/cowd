@@ -7,7 +7,7 @@ import MarkdownBlock from '../components/MarkdownBlock.vue';
 const store = useAppStore();
 const draft = ref('');
 const sending = ref(false);
-const contextUsage = computed(() => Math.min(88, 42 + store.turns.length * 6));
+const contextUsage = computed(() => store.contextUsagePercent);
 const modelLabel = computed(() => store.selectedModel || 'Select model');
 
 async function submit() {
@@ -79,8 +79,8 @@ async function chooseCommand(command: any) {
           <button type="button" class="composer-chip" @click="store.openModal('workspace')"><Folder :size="14" /> {{ store.workspaceDir || 'root' }}</button>
           <button type="button" class="composer-chip" @click="store.openModal('model')"><Bot :size="14" /> {{ store.selectedProfile }}</button>
           <button v-if="store.attachments.length" type="button" class="composer-chip" @click="store.openCompanion('workspace')"><Paperclip :size="14" /> {{ store.attachments.length }} sources</button>
-          <span>Context {{ contextUsage }}%</span>
-          <div class="context-meter"><i :style="{ width: `${contextUsage}%` }" /></div>
+          <span>Context {{ contextUsage === null ? store.contextUsageSource : `${contextUsage}%` }}</span>
+          <div class="context-meter"><i :style="{ width: `${contextUsage || 0}%` }" /></div>
         </div>
         <div class="composer-actions">
           <button class="icon-action" type="button" @click="store.openCompanion('workspace')"><Paperclip :size="16" /></button>

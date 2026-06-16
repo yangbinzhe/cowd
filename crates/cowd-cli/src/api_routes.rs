@@ -2270,6 +2270,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_team_profiles_crud_persists_receipts() {
+        let workspace = test_temp_dir("agent-team-profiles");
+        let config_home = test_temp_dir("agent-team-profiles-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/agents/team-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "qa-review-team",
+                            "name": "QA Review Team",
+                            "objective": "review manufacturing quality incidents",
+                            "leader": "planner",
+                            "members": ["planner", "executor", "reviewer"],
+                            "policy": { "max_parallel_agents": 3 },
+                            "evaluation": { "success_metric": "accepted_review" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["profile"]["id"], "qa-review-team");
+        assert_eq!(
+            created["receipt"]["changed_refs"][0],
+            "agent-team-profile:qa-review-team"
+        );
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/team-profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["count"], 1);
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/team-profiles/qa-review-team")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/agents/team-profiles/qa-review-team")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "QA Review Team",
+                            "objective": "review incident and release evidence",
+                            "leader": "reviewer",
+                            "members": ["planner", "reviewer"],
+                            "policy": { "max_parallel_agents": 2 },
+                            "evaluation": { "quality_gate": "all_tests_pass" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let body = to_bytes(update.into_body(), usize::MAX).await.unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated["profile"]["leader"], "reviewer");
+        assert_eq!(updated["receipt"]["status"], "ok");
+
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/agents/team-profiles/qa-review-team")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/team-profiles/qa-review-team")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
     async fn workspace_api_reports_profile_and_lists_files() {
         let workspace = test_temp_dir("workspace-list");
         let config_home = test_temp_dir("workspace-config");

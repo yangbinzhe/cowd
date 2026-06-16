@@ -17,6 +17,47 @@ export interface EndpointSnapshot extends ApiOffline {
   data: any;
 }
 
+export interface ApiReceipt<T = any> {
+  ok: boolean;
+  endpoint: string;
+  method: string;
+  payload_summary?: string;
+  status?: number;
+  status_text?: string;
+  data?: T;
+  error?: string;
+  retryable?: boolean;
+}
+
+export class ApiWriteError extends Error {
+  endpoint: string;
+  method: string;
+  payload_summary: string;
+  status: number;
+  status_text: string;
+  body: string;
+  retryable: boolean;
+
+  constructor(message: string, options: {
+    endpoint: string;
+    method: string;
+    payload_summary: string;
+    status: number;
+    status_text: string;
+    body: string;
+  }) {
+    super(message);
+    this.name = 'ApiWriteError';
+    this.endpoint = options.endpoint;
+    this.method = options.method;
+    this.payload_summary = options.payload_summary;
+    this.status = options.status;
+    this.status_text = options.status_text;
+    this.body = options.body;
+    this.retryable = options.status === 0 || options.status >= 500 || options.status === 429;
+  }
+}
+
 function headers(init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -25,12 +66,19 @@ function headers(init: RequestInit = {}) {
   return headers;
 }
 
-async function parseResponse(response: Response) {
+async function parseResponse(response: Response, path = '') {
   const text = await response.text();
   if (!text) return {};
+  const contentType = response.headers.get('content-type') || '';
+  const trimmed = text.trim().toLowerCase();
+  const isApi = path.startsWith('/api/') || response.url.includes('/api/');
+  if (isApi && (trimmed.startsWith('<!doctype html') || trimmed.startsWith('<html'))) {
+    throw new Error(`Expected JSON from API but received ${contentType || 'unknown content type'}`);
+  }
   try {
     return JSON.parse(text);
   } catch {
+    if (isApi) throw new Error('Expected JSON from API but received non-JSON body');
     return text;
   }
 }
@@ -39,7 +87,7 @@ async function read<T>(path: string, fallback: T, init: RequestInit = {}): Promi
   try {
     const response = await fetch(path, { ...init, headers: headers(init) });
     if (!response.ok) throw new Error(await response.text());
-    return await parseResponse(response) as T;
+    return await parseResponse(response, path) as T;
   } catch (error) {
     return {
       ...(fallback as any),
@@ -49,13 +97,65 @@ async function read<T>(path: string, fallback: T, init: RequestInit = {}): Promi
   }
 }
 
+function payloadSummary(body: BodyInit | null | undefined): string {
+  if (!body) return '';
+  if (body instanceof FormData) {
+    return Array.from(body.keys()).join(', ');
+  }
+  const text = typeof body === 'string' ? body : String(body);
+  return text.length > 280 ? `${text.slice(0, 280)}...` : text;
+}
+
 async function write<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, headers: headers(init) });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `${response.status} ${response.statusText}`);
+    throw new ApiWriteError(body || `${response.status} ${response.statusText}`, {
+      endpoint: path,
+      method: init.method || 'POST',
+      payload_summary: payloadSummary(init.body),
+      status: response.status,
+      status_text: response.statusText,
+      body,
+    });
   }
-  return await parseResponse(response) as T;
+  return await parseResponse(response, path) as T;
+}
+
+async function writeWithReceipt<T>(path: string, init: RequestInit = {}): Promise<ApiReceipt<T>> {
+  const method = init.method || 'POST';
+  const summary = payloadSummary(init.body);
+  try {
+    const data = await write<T>(path, init);
+    return {
+      ok: true,
+      endpoint: path,
+      method,
+      payload_summary: summary,
+      data,
+    };
+  } catch (error) {
+    if (error instanceof ApiWriteError) {
+      return {
+        ok: false,
+        endpoint: error.endpoint,
+        method: error.method,
+        payload_summary: error.payload_summary,
+        status: error.status,
+        status_text: error.status_text,
+        error: error.body || error.message,
+        retryable: error.retryable,
+      };
+    }
+    return {
+      ok: false,
+      endpoint: path,
+      method,
+      payload_summary: summary,
+      error: error instanceof Error ? error.message : String(error),
+      retryable: true,
+    };
+  }
 }
 
 function countPayload(data: any): number {
@@ -164,11 +264,13 @@ const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: str
 };
 
 export const api = {
+  writeReceipt: writeWithReceipt,
   health: () => read('/api/webui/manifest', {
     kind: 'cowd.webui.manifest',
     status: 'offline',
     static_webui: 'local vite fallback',
   }),
+  authVerify: () => read('/api/auth/verify', { authenticated: false, status: 'offline' }),
   sessions: () => read<{ sessions: SessionSummary[] }>('/api/sessions?limit=24', { sessions: [] }),
   searchSessions: (query: string) => read<{ sessions: SessionSummary[] }>(`/api/sessions?limit=24${query ? `&q=${encodeURIComponent(query)}` : ''}`, { sessions: [] }),
   createSession: (model?: string) => write<SessionSummary>('/api/sessions', {
@@ -258,8 +360,31 @@ export const api = {
     body: JSON.stringify({ envelope_id: envelopeId, recommendation, action }),
   }),
   resolveEvidence: (ref: string) => read(`/api/evidence/resolve?ref=${encodeURIComponent(ref)}`, {}),
+  memoryStatus: () => read('/api/memory/status', {}),
+  memoryStats: () => read('/api/memory/stats', {}),
+  memoryLayers: () => read('/api/memory/layers', { layers: [] }),
+  memoryLayer: (layer: string) => read(`/api/memory/${encodeURIComponent(layer)}`, { entries: [] }),
+  memoryRuntime: () => read('/api/memory/runtime', {}),
+  memoryClusters: (limit = 24) => read(`/api/memory/clusters?limit=${limit}`, { clusters: [] }),
+  memoryLinks: () => read('/api/memory/links', { links: [] }),
+  memoryEntities: () => read('/api/memory/entities', { entities: [] }),
+  memoryTriples: () => read('/api/memory/triples', { triples: [] }),
+  memoryPerformance: () => read('/api/memory/performance', {}),
+  memoryMaintenance: (status = '', kind = '', limit = 100) => {
+    const query = new URLSearchParams();
+    if (status) query.set('status', status);
+    if (kind) query.set('kind', kind);
+    query.set('limit', String(limit));
+    return read(`/api/memory/maintenance?${query.toString()}`, { candidates: [] });
+  },
   memorySearch: (q: string) => read(`/api/memory/search?q=${encodeURIComponent(q)}`, {}),
-  memoryPacket: (q: string) => read(`/api/memory/packet?q=${encodeURIComponent(q)}`, {}),
+  memoryRecallExplain: (q: string, limit = 10) => read(`/api/memory/recall/explain?q=${encodeURIComponent(q)}&limit=${limit}`, { results: [] }),
+  memoryPacket: (q: string, maxItems = 12, maxTokens = 2000) => read(`/api/memory/packet?q=${encodeURIComponent(q)}&max_items=${maxItems}&max_tokens=${maxTokens}`, {}),
+  memorySymbolLinks: (symbol: string) => read(`/api/memory/symbol-links?q=${encodeURIComponent(symbol)}`, { entries: [] }),
+  createMemorySymbolLink: (body: Record<string, unknown>) => write('/api/memory/symbol-links', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   createMemoryEntry: (layer: string, body: Record<string, unknown>) => write(`/api/memory/${encodeURIComponent(layer)}`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -288,6 +413,10 @@ export const api = {
   skillCatalog: () => read('/api/skills/catalog', {}),
   skillProjection: () => read('/api/skills/projection?surface=webui', {}),
   skillRuns: () => read('/api/skills/runs', {}),
+  skillRunDetail: (id: string) => read(`/api/skills/runs/${encodeURIComponent(id)}`, {}),
+  skillDetail: (id: string) => read(`/api/skills/${encodeURIComponent(id)}`, {}),
+  skillFiles: (id: string) => read(`/api/skills/${encodeURIComponent(id)}/files`, {}),
+  skillFileRaw: (id: string, path = 'SKILL.md') => read(`/api/skills/${encodeURIComponent(id)}/files/raw?path=${encodeURIComponent(path)}`, {}),
   skillAction: (id: string, action: 'validate' | 'plan' | 'run', body: Record<string, unknown> = {}) => write(`/api/skills/${encodeURIComponent(id)}/actions/${action}`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -296,6 +425,12 @@ export const api = {
   startTask: (objective: string, yoloMode = false) => write('/api/tasks/start', {
     method: 'POST',
     body: JSON.stringify({ objective, yolo_mode: yoloMode }),
+  }),
+  cancelTask: (id: string) => write(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  completeTask: (id: string) => write(`/api/tasks/${encodeURIComponent(id)}/complete`, { method: 'POST' }),
+  recordTaskFailure: (id: string, reason: string) => write(`/api/tasks/${encodeURIComponent(id)}/failure`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
   }),
   startTaskPhase: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/phases`, {
     method: 'POST',
@@ -309,6 +444,31 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ result, completed }),
   }),
+  agentCatalog: () => read('/api/agents/catalog', { agents: [], summary: {} }),
+  agentDirectory: () => read('/api/agents/directory', { agents: [], summary: {} }),
+  agentDiscover: (task: string) => read(`/api/agents/discover?task=${encodeURIComponent(task)}`, { agents: [], team: null }),
+  agentAssemble: (task: string) => write('/api/agents/assemble', {
+    method: 'POST',
+    body: JSON.stringify({ task }),
+  }),
+  agentReputation: () => read('/api/agents/reputation', { items: [], summary: {} }),
+  agentRuns: () => read('/api/agents/runs', { runs: [] }),
+  agentTeamProfiles: () => read('/api/agents/team-profiles', { profiles: [] }),
+  agentTeamProfile: (id: string) => read(`/api/agents/team-profiles/${encodeURIComponent(id)}`, {}),
+  createAgentTeamProfile: (body: Record<string, unknown>) => write('/api/agents/team-profiles', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  updateAgentTeamProfile: (id: string, body: Record<string, unknown>) => write(`/api/agents/team-profiles/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  }),
+  deleteAgentTeamProfile: (id: string) => write(`/api/agents/team-profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  taskAgentGraph: (id: string) => read(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, { nodes: [] }),
+  upsertTaskAgentGraph: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   toolRegistry: () => read('/api/tools', {}),
   platforms: () => read('/api/platforms', {}),
   connectorsSummary: () => read('/api/connectors/summary', {}),
@@ -316,21 +476,45 @@ export const api = {
   connectorCapabilities: () => read('/api/connectors/capabilities', {}),
   connectorResources: () => read('/api/connectors/resources', {}),
   connectorMcpServers: () => read('/api/connectors/mcp/servers', {}),
-  connectorRevalidateResource: (resource_ref: string) => write('/api/connectors/resources/revalidate', {
+  connectorRevalidateResource: (reference: string) => write('/api/connectors/resources/revalidate', {
     method: 'POST',
-    body: JSON.stringify({ resource_ref }),
+    body: JSON.stringify({ reference }),
   }),
-  connectorPromoteMemory: (resource_ref: string) => write('/api/connectors/resources/promote-memory', {
+  connectorPromoteMemory: (reference: string) => write('/api/connectors/resources/promote-memory', {
     method: 'POST',
-    body: JSON.stringify({ resource_ref }),
+    body: JSON.stringify({ reference }),
   }),
   crossPlaneSummary: () => read('/api/cross-plane/summary', {}),
+  crossPlaneIdentities: () => read('/api/cross-plane/identities', {}),
+  crossPlaneCreateIdentity: (body: Record<string, unknown>) => write('/api/cross-plane/identities', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  crossPlaneRevokeIdentity: (id: string) => write(`/api/cross-plane/identities/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  crossPlaneGrants: () => read('/api/cross-plane/grants', {}),
+  crossPlaneCreateGrant: (body: Record<string, unknown>) => write('/api/cross-plane/grants', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  crossPlaneRevokeGrant: (id: string) => write(`/api/cross-plane/grants/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   crossPlaneAudit: () => read('/api/cross-plane/audit', {}),
   crossPlaneAdapters: () => read('/api/cross-plane/action/adapters', {}),
   crossPlaneExecutions: () => read('/api/cross-plane/action/executions', {}),
+  crossPlanePolicySimulate: (body: Record<string, unknown>) => write('/api/cross-plane/policy/simulate', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   crossPlanePreflight: (body: Record<string, unknown>) => write('/api/cross-plane/action/preflight', {
     method: 'POST',
     body: JSON.stringify(body),
+  }),
+  crossPlaneExecute: (action: Record<string, unknown>, mode = 'dry_run', idempotency_key?: string) => write('/api/cross-plane/action/execute', {
+    method: 'POST',
+    body: JSON.stringify({ action, mode, idempotency_key }),
+  }),
+  crossPlaneResolveIdentity: (identity_ref: string) => write('/api/cross-plane/identity/resolve', {
+    method: 'POST',
+    body: JSON.stringify({ identity_ref }),
   }),
   auditExport: (source = 'all', limit = 50, offset = 0) => read(`/api/audit/export?source=${encodeURIComponent(source)}&limit=${limit}&offset=${offset}`, {}),
   usageSummary: () => read('/api/usage', {}),
@@ -340,8 +524,34 @@ export const api = {
   cowdReleaseGate: () => read('/api/cowd/release-gate', {}),
   iaccApp: () => read('/api/iacc/app', {}),
   iaccHealth: () => read('/api/iacc/health', {}),
+  iaccProductionGovernance: () => read('/api/iacc/production/governance', {}),
+  iaccDataPlaneHealth: () => read('/api/iacc/data-plane/health', {}),
+  iaccDataPlaneIngestPlan: (ingest: Record<string, unknown>) => write('/api/iacc/data-plane/ingest-plan', {
+    method: 'POST',
+    body: JSON.stringify({ ingest, session_id: 'webui-iacc' }),
+  }),
   iaccCommandCenter: () => read('/api/iacc/command-center', {}),
   iaccCommandCenterLive: () => read('/api/iacc/command-center/live', {}),
+  iaccSourcePackUpsert: (source_pack: Record<string, unknown>) => write('/api/iacc/source-packs/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ source_pack, session_id: 'webui-iacc' }),
+  }),
+  iaccSourcePack: (id: string) => read(`/api/iacc/source-packs/${encodeURIComponent(id)}`, {}),
+  iaccSourcePackValidate: (id: string) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/validate`, { method: 'POST' }),
+  iaccSourcePackDeltaPlan: (id: string) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/delta-plan`, { method: 'POST' }),
+  iaccSourcePackIngestFile: (id: string, facts: Record<string, unknown>[]) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/ingest-file`, {
+    method: 'POST',
+    body: JSON.stringify({ facts, session_id: 'webui-iacc' }),
+  }),
+  iaccSourcePackConnectorPlan: (id: string, run?: Record<string, unknown>) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/connector-runs/plan`, {
+    method: 'POST',
+    body: JSON.stringify({ run, session_id: 'webui-iacc' }),
+  }),
+  iaccSourcePackConnectorRun: (id: string, run?: Record<string, unknown>) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/connector-runs/run`, {
+    method: 'POST',
+    body: JSON.stringify({ run, session_id: 'webui-iacc' }),
+  }),
+  iaccConnectorRun: (id: string) => read(`/api/iacc/connector-runs/${encodeURIComponent(id)}`, {}),
   iaccMetrics: () => read('/api/iacc/metrics', {}),
   iaccMetricDetail: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}`, {}),
   iaccMetricLineage: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}/lineage`, {}),
@@ -349,11 +559,63 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body),
   }),
+  iaccMetricSnapshotMaterialize: (metric_ids: string[], scope_ref?: string) => write('/api/iacc/metrics/snapshots/materialize', {
+    method: 'POST',
+    body: JSON.stringify({ metric_ids, scope_ref, session_id: 'webui-iacc' }),
+  }),
+  iaccMetricRecompute: () => write('/api/iacc/metrics/recompute', { method: 'POST' }),
+  iaccMetricDependencyUpsert: (dependency: Record<string, unknown>) => write('/api/iacc/metric-dependencies/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ dependency, session_id: 'webui-iacc' }),
+  }),
+  iaccMetricAffectedByFactType: (fact_type: string) => write('/api/iacc/metric-dependencies/affected-by-fact-type', {
+    method: 'POST',
+    body: JSON.stringify({ fact_type, session_id: 'webui-iacc' }),
+  }),
+  iaccComputeJobPlan: (job: Record<string, unknown>) => write('/api/iacc/compute/jobs/plan', {
+    method: 'POST',
+    body: JSON.stringify({ job, session_id: 'webui-iacc' }),
+  }),
+  iaccComputeJob: (id: string) => read(`/api/iacc/compute/jobs/${encodeURIComponent(id)}`, {}),
+  iaccComputeJobRun: (id: string) => write(`/api/iacc/compute/jobs/${encodeURIComponent(id)}/run`, { method: 'POST' }),
   iaccEntities: () => read('/api/iacc/entities', {}),
+  iaccEntity: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}`, {}),
+  iaccEntityUpsert: (entity: Record<string, unknown>) => write('/api/iacc/entities/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ entity, session_id: 'webui-iacc' }),
+  }),
+  iaccEntityResolveSourceKey: (source_system: string, source_key: string) => write('/api/iacc/entities/resolve-source-key', {
+    method: 'POST',
+    body: JSON.stringify({ source_system, source_key, session_id: 'webui-iacc' }),
+  }),
+  iaccEntityMatchCandidate: (left_entity_id: string, right_entity_id: string) => write('/api/iacc/entities/match-candidate', {
+    method: 'POST',
+    body: JSON.stringify({ left_entity_id, right_entity_id, session_id: 'webui-iacc' }),
+  }),
+  iaccEntityConflictDecision: (body: Record<string, unknown>) => write('/api/iacc/entities/conflict-decision', {
+    method: 'POST',
+    body: JSON.stringify({ ...body, session_id: 'webui-iacc' }),
+  }),
+  iaccEntityRelations: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}/relations`, {}),
+  iaccEntityImpactPath: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}/impact-path`, {}),
+  iaccRelationUpsert: (relation: Record<string, unknown>) => write('/api/iacc/relations/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ relation, session_id: 'webui-iacc' }),
+  }),
   iaccChanges: () => read('/api/iacc/changes', {}),
   iaccAttentionHot: () => read('/api/iacc/attention/hot', {}),
+  iaccEvidenceBuild: (body: Record<string, unknown>) => write('/api/iacc/evidence/build', {
+    method: 'POST',
+    body: JSON.stringify({ ...body, session_id: 'webui-iacc' }),
+  }),
+  iaccEvidence: (id: string) => read(`/api/iacc/evidence/${encodeURIComponent(id)}`, {}),
+  iaccEvidenceQualityGate: (id: string) => write(`/api/iacc/evidence/${encodeURIComponent(id)}/quality-gate`, { method: 'POST' }),
+  iaccEvidenceContext: (id: string) => read(`/api/iacc/evidence/${encodeURIComponent(id)}/context`, {}),
+  iaccQualityGate: (id: string) => read(`/api/iacc/quality-gates/${encodeURIComponent(id)}`, {}),
   iaccIncidents: () => read('/api/iacc/incidents', {}),
+  iaccIncident: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}`, {}),
   iaccSkills: () => read('/api/iacc/skills', {}),
+  iaccSkill: (id: string) => read(`/api/iacc/skills/${encodeURIComponent(id)}`, {}),
   iaccCreateIncident: (body: Record<string, unknown>) => write('/api/iacc/incidents', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -395,6 +657,11 @@ export const api = {
     body: JSON.stringify({ report }),
   }),
   iaccReportDeliveryState: (reportId: string) => read(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery-state`, {}),
+  iaccReport: (reportId: string) => read(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}`, {}),
+  iaccDeliverReport: (reportId: string, body: Record<string, unknown>) => write(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/deliver`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   iaccRetryReportDelivery: (reportId: string, body: Record<string, unknown>) => write(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery/retry`, {
     method: 'POST',
     body: JSON.stringify(body),

@@ -8,6 +8,7 @@ const profileName = ref('');
 const defaultModel = ref('');
 const settingsError = ref('');
 const busyAction = ref('');
+const authResult = ref<any>(null);
 const authState = computed(() => localStorage.getItem('cowd-auth-token') ? 'stored in browser' : 'not stored');
 const origin = computed(() => location.origin);
 const providerModels = computed(() => store.providers?.models || []);
@@ -59,6 +60,17 @@ async function saveApprovalFromText(event: Event) {
   await run('approval-save', async () => {
     await store.saveApprovalConfig(JSON.parse(value));
   });
+}
+
+async function verifyAuth() {
+  await run('auth-verify', async () => {
+    authResult.value = await store.verifyAuth();
+  });
+}
+
+function clearToken() {
+  localStorage.removeItem('cowd-auth-token');
+  authResult.value = { authenticated: false, status: 'cleared' };
 }
 </script>
 
@@ -158,6 +170,16 @@ async function saveApprovalFromText(event: Event) {
         <h2>Security</h2>
         <p class="security-note"><Shield :size="16" /> Auth token: {{ authState }}</p>
         <p class="security-note">Origin: {{ origin }}</p>
+        <div class="button-row">
+          <button class="ghost-action" type="button" @click="verifyAuth">Verify token</button>
+          <button class="ghost-action" type="button" @click="clearToken">Clear token</button>
+        </div>
+        <dl v-if="authResult" class="contract-list">
+          <dt>Status</dt>
+          <dd>{{ authResult.status || authResult.authenticated || 'unknown' }}</dd>
+          <dt>Error</dt>
+          <dd>{{ authResult.__error || authResult.error || '-' }}</dd>
+        </dl>
       </section>
     </div>
   </section>
