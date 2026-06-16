@@ -57,13 +57,14 @@ const usageChart = computed(() => {
   const byPlatform = state.value.usage?.by_platform || {};
   const points = Object.entries(byPlatform).map(([name, value]: [string, any]) => ({
     name,
-    value: Math.max(1, Number(value.total_tokens || value.message_count || value.session_count || 0)),
+    value: Number(value.total_tokens || value.message_count || value.session_count || 0),
   }));
-  return points.length ? points : [{ name: 'usage', value: Math.max(1, Number(state.value.usage?.tokens?.total || 0)) }];
+  const total = Number(state.value.usage?.tokens?.total || 0);
+  return points.length ? points : total > 0 ? [{ name: 'usage', value: total }] : [];
 });
 const releaseChart = computed(() => releaseRows.value.length
   ? releaseRows.value.map((check) => ({ name: check.name || 'check', value: check.status === 'pass' ? 100 : 25 }))
-  : [{ name: 'release', value: 1 }]);
+  : []);
 
 async function refresh() {
   loading.value = true;
@@ -157,7 +158,8 @@ onMounted(refresh);
           <h2>Usage summary</h2>
           <span>{{ state.usage?.status || 'usage' }}</span>
         </header>
-        <ChartPanel title="Usage by platform" kind="bar" :data="usageChart" />
+        <ChartPanel v-if="usageChart.length" title="Usage by platform" kind="bar" :data="usageChart" />
+        <EmptyState v-else title="No usage data" detail="后端返回使用统计后再展示平台分布图。" />
         <dl class="detail-list">
           <dt>Messages</dt>
           <dd>{{ state.usage?.message_count || 0 }}</dd>
@@ -181,7 +183,8 @@ onMounted(refresh);
             <option value="cli">cli</option>
           </select>
         </label>
-        <ChartPanel title="Release gate coverage" kind="radar" :data="releaseChart" />
+        <ChartPanel v-if="releaseChart.length" title="Release gate coverage" kind="radar" :data="releaseChart" />
+        <EmptyState v-else title="No release checks" detail="发布门禁返回检查项后再展示覆盖图。" />
         <DataTable v-if="releaseRows.length" :rows="releaseRows" :columns="['name', 'status', 'detail']" />
       </section>
 
