@@ -814,10 +814,6 @@ impl TuiState {
         self.system_status_bar.sync_from_app(&self.app);
         self.status_bar.sync_from_app(&self.app);
         let current_focus = self.focus_for_current_surface();
-        let focus_label = current_focus.label();
-        if let Some(section) = self.status_bar.section_mut("focus") {
-            section.content = Some(format!("focus:{focus_label}"));
-        }
         if let Some(section) = self.status_bar.section_mut("input_hint") {
             section.content = Some(current_focus.hint().into());
         }
@@ -2078,6 +2074,16 @@ impl TuiState {
     }
 
     fn set_focus_target(&mut self, target: FocusTarget) {
+        if self.focus_target != target {
+            let label = target.label().to_string();
+            let hint = target.hint().to_string();
+            self.toast_manager.push(
+                ToastVariant::Info,
+                Some("Focus".into()),
+                format!("{label}: {hint}"),
+                1200,
+            );
+        }
         self.focus_target = target;
     }
 

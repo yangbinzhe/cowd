@@ -12,6 +12,7 @@ use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
 use crate::platform::feishu::types::{
     CreateReactionRequest, CreateReactionResponse, DeleteReactionResponse, ReactionType,
 };
+use crate::platform::feishu::decode_feishu_response;
 use crate::platform::types::{MessageType, Platform, SessionKey};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
@@ -277,10 +278,8 @@ impl ProcessingReactions {
             )));
         }
 
-        let result: CreateReactionResponse = response
-            .json()
-            .await
-            .map_err(|e| PlatformError::SendFailed(format!("parse reaction response: {e}")))?;
+        let result: CreateReactionResponse =
+            decode_feishu_response(response, "create reaction").await?;
 
         if result.code != 0 {
             return Err(PlatformError::SendFailed(format!(
@@ -324,9 +323,8 @@ impl ProcessingReactions {
             )));
         }
 
-        let result: DeleteReactionResponse = response.json().await.map_err(|e| {
-            PlatformError::SendFailed(format!("parse delete reaction response: {e}"))
-        })?;
+        let result: DeleteReactionResponse =
+            decode_feishu_response(response, "delete reaction").await?;
 
         if result.code != 0 {
             return Err(PlatformError::SendFailed(format!(

@@ -7,13 +7,17 @@ use ratatui::{
 
 use runtime;
 
-use crate::tui::app::App;
+use crate::tui::app::{App, TimelineEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemStatusBar {
     runtime: String,
     turn: String,
+    tool_count: u32,
+    reply_count: u32,
+    last_phase: String,
+    session_id: String,
     daemon: String,
     gateway: String,
     provider: String,
@@ -30,14 +34,48 @@ impl SystemStatusBar {
     pub fn sync_from_app(&mut self, app: &App) {
         self.runtime = runtime_health(app).to_string();
         self.turn = if app.turn_active {
-            if app.is_loading {
+            if app.timeline_iter().any(|(_, entry)| {
+                matches!(entry, TimelineEntry::Thinking { complete: false, .. })
+            }) {
                 "thinking".to_string()
+            } else if app.timeline_iter().any(|(_, entry)| {
+                matches!(entry, TimelineEntry::ToolCall { done: false, .. })
+            }) {
+                "tool".to_string()
             } else {
                 "running".to_string()
             }
         } else {
             "idle".to_string()
         };
+        self.session_id = app.session_id.clone();
+        self.tool_count = 0;
+        self.reply_count = 0;
+        self.last_phase = "idle".to_string();
+        for (_, entry) in app.timeline_iter() {
+            match entry {
+                TimelineEntry::Thinking { complete, .. } => {
+                    self.last_phase = if *complete { "thought saved" } else { "thinking" }.into();
+                }
+                TimelineEntry::ToolCall { name, done, .. } => {
+                    self.tool_count += 1;
+                    self.last_phase = if *done {
+                        format!("tool {name} done")
+                    } else {
+                        format!("tool {name} running")
+                    };
+                }
+                TimelineEntry::Message { role, .. } => {
+                    if role == "assistant" {
+                        self.reply_count += 1;
+                    }
+                    self.last_phase = format!("{role} message");
+                }
+                TimelineEntry::SlashOutput { command, .. } => {
+                    self.last_phase = format!("/{command} output");
+                }
+            }
+        }
         self.daemon = app
             .daemon_runtime_readiness
             .clone()
@@ -73,26 +111,40 @@ impl Component for SystemStatusBar {
         let turn_color = match self.turn.as_str() {
             "idle" => Color::DarkGray,
             "thinking" => Color::Yellow,
+            "tool" => Color::Cyan,
             _ => Color::White,
         };
 
         let mut spans = vec![
             Span::styled(
-                "cowd ",
+                format!("cowd v{} ", env!("CARGO_PKG_VERSION")),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(self.runtime.clone(), Style::default().fg(runtime_color)),
-            sep(),
-            Span::styled("provider ", Style::default().fg(Color::DarkGray)),
+            Span::styled("session ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                preview(&self.provider, 24),
+                preview(&self.session_id, 32),
                 Style::default().fg(Color::White),
             ),
             sep(),
-            Span::styled("turn ", Style::default().fg(Color::DarkGray)),
+            Span::styled(self.runtime.clone(), Style::default().fg(runtime_color)),
+            sep(),
+            Span::styled("state ", Style::default().fg(Color::DarkGray)),
             Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
+            Span::styled(
+                format!(
+                    "  think:{} tool:{} reply:{}",
+                    u8::from(self.turn == "thinking"),
+                    self.tool_count,
+                    self.reply_count
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("  {}", preview(&self.last_phase, 28)),
+                Style::default().fg(turn_color),
+            ),
         ];
 
         if let Some(issue) = &self.issue {

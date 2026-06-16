@@ -431,7 +431,7 @@ async fn test_feishu_ws_register_pin_live() {
     section("Cowd Feishu — register_pin Live Test");
     println!("   APP_ID: {}", app_id());
 
-    match register_pin(&app_id(), &app_secret()).await {
+    match register_pin(&app_id(), &app_secret(), "https://open.feishu.cn").await {
         Ok(result) => {
             ok("register_pin", &format!("WS URL: {}", result.ws_url));
             println!("   ping_interval:     {:?}", result.ping_interval);

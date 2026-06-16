@@ -2952,7 +2952,7 @@ impl CognitiveContextManager {
                 // Extract title from first line or truncate
                 let first_line = text.lines().next().unwrap_or("");
                 let title = if first_line.len() > 60 {
-                    format!("{}...", &first_line[..60])
+                    truncate_summary(first_line, 60)
                 } else {
                     first_line.to_string()
                 };
@@ -3341,7 +3341,13 @@ fn truncate_summary(content: &str, max_len: usize) -> String {
     if content.len() <= max_len {
         content.to_string()
     } else {
-        format!("{}...", &content[..max_len])
+        let end = content
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= max_len)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &content[..end])
     }
 }
 
@@ -3418,7 +3424,7 @@ fn format_code_context(symbols: &[CodeSymbol]) -> String {
             .trim()
             .to_string();
         let desc_short = if desc.len() > 80 {
-            format!("{}...", &desc[..77])
+            truncate_summary(&desc, 77)
         } else {
             desc
         };
@@ -3458,6 +3464,22 @@ mod tests {
     #[test]
     fn truncate_summary_long_content_cut() {
         assert_eq!(truncate_summary(&"a".repeat(200), 10), "aaaaaaaaaa...");
+    }
+
+    #[test]
+    fn truncate_summary_unicode_boundary_safe() {
+        let content = "项目概述：这是中文内容，用于验证 UTF-8 边界截断不会 panic";
+        let truncated = truncate_summary(content, 12);
+        assert!(truncated.ends_with("..."));
+        assert!(content.starts_with(truncated.trim_end_matches("...")));
+    }
+
+    #[test]
+    fn truncate_summary_emoji_boundary_safe() {
+        let content = "状态正常 ✅ 继续处理后续任务";
+        let truncated = truncate_summary(content, 17);
+        assert!(truncated.ends_with("..."));
+        assert!(content.starts_with(truncated.trim_end_matches("...")));
     }
 
     #[test]

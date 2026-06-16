@@ -375,6 +375,50 @@ impl Theme {
             Self::Light => ratatui::style::Color::DarkGray,
         }
     }
+    /// Secondary / dimmed text (used for muted labels, timestamps, truncation notices).
+    /// Higher contrast than DarkGray for readability on dark backgrounds.
+    pub fn muted_color(&self) -> ratatui::style::Color {
+        match self {
+            Self::Dark => ratatui::style::Color::Rgb(150, 150, 150),
+            Self::Light => ratatui::style::Color::Rgb(100, 100, 100),
+        }
+    }
+    /// Warning / attention color.
+    pub fn warn_color(&self) -> ratatui::style::Color {
+        match self {
+            Self::Dark => ratatui::style::Color::Yellow,
+            Self::Light => ratatui::style::Color::Rgb(180, 130, 0),
+        }
+    }
+    /// Success / positive color.
+    pub fn success_color(&self) -> ratatui::style::Color {
+        match self {
+            Self::Dark => ratatui::style::Color::Green,
+            Self::Light => ratatui::style::Color::Rgb(0, 130, 0),
+        }
+    }
+    /// Error / negative color.
+    pub fn error_color(&self) -> ratatui::style::Color {
+        ratatui::style::Color::Red
+    }
+    /// Code block background color.
+    pub fn code_bg_color(&self) -> ratatui::style::Color {
+        match self {
+            Self::Dark => ratatui::style::Color::Rgb(35, 35, 45),
+            Self::Light => ratatui::style::Color::Rgb(235, 235, 240),
+        }
+    }
+    /// Inline code color.
+    pub fn inline_code_color(&self) -> ratatui::style::Color {
+        self.warn_color()
+    }
+    /// Link color.
+    pub fn link_color(&self) -> ratatui::style::Color {
+        match self {
+            Self::Dark => ratatui::style::Color::Cyan,
+            Self::Light => ratatui::style::Color::Blue,
+        }
+    }
     pub fn toggle(&mut self) {
         *self = match self {
             Self::Dark => Self::Light,

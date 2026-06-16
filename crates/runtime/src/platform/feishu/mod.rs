@@ -5,6 +5,10 @@
 
 use std::sync::OnceLock;
 
+use serde::de::DeserializeOwned;
+
+pub use super::{PlatformError, PlatformResult};
+
 /// Shared Feishu API base URL, set once during adapter initialization.
 /// Defaults to `https://open.feishu.cn` for China; set to `https://open.larksuite.com` for Lark.
 static FEISHU_API_BASE: OnceLock<String> = OnceLock::new();
@@ -61,6 +65,39 @@ pub(crate) fn is_feishu_domain(url_str: &str) -> bool {
         || host.ends_with(".larksuite.com")
 }
 
+/// Decode a Feishu API response with rich error context.
+///
+/// Unlike plain `.json()`, this helper reads the raw body first and
+/// includes HTTP status, content-type, and a truncated body preview in
+/// the error message when deserialization fails. This avoids losing
+/// diagnostic information when the Feishu API returns non-JSON errors.
+pub(crate) async fn decode_feishu_response<T>(
+    response: reqwest::Response,
+    operation: &str,
+) -> PlatformResult<T>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| PlatformError::SendFailed(format!("{operation}: read response: {e}")))?;
+
+    serde_json::from_str::<T>(&body).map_err(|e| {
+        let preview: String = body.chars().take(500).collect();
+        PlatformError::SendFailed(format!(
+            "{operation}: decode response failed: {e}; status={status}; content_type={content_type}; body={preview}"
+        ))
+    })
+}
+
 pub mod adapter;
 pub mod approval;
 pub mod auth;
@@ -103,9 +140,6 @@ pub use reactions::*;
 pub use rules::{RoutingRule, RuleAction, RuleCondition, RuleMatch, RulesEngine};
 pub use types::*;
 pub use ws::*;
-
-// Re-export from parent module (platform)
-pub use super::{PlatformError, PlatformResult};
 
 /// Create a Feishu adapter from config settings.
 pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<FeishuAdapter> {

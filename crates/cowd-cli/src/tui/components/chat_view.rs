@@ -39,6 +39,8 @@ pub struct ChatView {
 
     // ── Turn state ──
     pub turn_active: bool,
+    turn_input_tokens: u64,
+    turn_output_tokens: u64,
     spinner_idx: usize,
 
     // ── Message menu (Task 5) ──
@@ -91,6 +93,8 @@ impl ChatView {
             timeline_cursor: 0,
             scroll_state: ScrollState::new(),
             turn_active: false,
+            turn_input_tokens: 0,
+            turn_output_tokens: 0,
             spinner_idx: 0,
             pending_message_menu: false,
             pending_menu_entry_idx: 0,
@@ -161,6 +165,8 @@ impl ChatView {
         self.scroll_state.auto_scroll = app.auto_scroll;
         self.scroll_state.viewport_height = app.viewport_height;
         self.turn_active = app.turn_active;
+        self.turn_input_tokens = app.turn_input_tokens;
+        self.turn_output_tokens = app.turn_output_tokens;
         self.spinner_idx = app.spinner_idx;
         self.theme = app.theme;
         self.msg_version = app.msg_version;
@@ -476,7 +482,7 @@ impl ChatView {
         if self.timeline.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Type to start. /help /resume /exit",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.muted_color()),
             )));
         }
 
@@ -494,7 +500,7 @@ impl ChatView {
             let spinner = self.spinner_char();
             lines.push(Line::from(vec![Span::styled(
                 format!("{spinner} Processing..."),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(self.theme.accent()),
             )]));
         }
 
@@ -506,12 +512,13 @@ impl ChatView {
         if self.timeline.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Type to start. /help /resume /exit",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.muted_color()),
             )));
             return lines;
         }
 
         let mut tool_count = 0u32;
+        let mut thinking_rounds = 0u32;
         let mut thinking_active = false;
         let mut thinking_preview = String::new();
         let mut last_assistant: Option<&str> = None;
@@ -528,6 +535,7 @@ impl ChatView {
                 TimelineEntry::Thinking {
                     content, complete, ..
                 } => {
+                    thinking_rounds += 1;
                     if !complete {
                         thinking_active = true;
                         thinking_preview = content.chars().take(120).collect();
@@ -547,9 +555,9 @@ impl ChatView {
 
         if thinking_active && !thinking_preview.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("⚡ ", Style::default().fg(Color::Yellow).bold()),
-                Span::styled("Thinking: ", Style::default().fg(Color::Cyan).bold()),
-                Span::styled(thinking_preview, Style::default().fg(Color::White)),
+                Span::styled("⚡ ", Style::default().fg(self.theme.warn_color()).bold()),
+                Span::styled("Thinking: ", Style::default().fg(self.theme.accent()).bold()),
+                Span::styled(thinking_preview, Style::default().fg(self.theme.fg())),
             ]));
             lines.push(Line::raw(""));
         }
@@ -561,13 +569,13 @@ impl ChatView {
                 format!("{}  ─────────────────────────────────────", label),
                 Style::default()
                     .fg(if is_focused {
-                        Color::Cyan
+                        self.theme.accent()
                     } else {
-                        Color::Green
+                        self.theme.success_color()
                     })
                     .bold(),
             )));
-            let md_lines = md_renderer::render_markdown_lines(content, Color::White);
+            let md_lines = md_renderer::render_markdown_lines(content, &self.theme);
             let max_lines = 800usize;
             for line in md_lines.into_iter().take(max_lines) {
                 lines.push(line);
@@ -576,7 +584,7 @@ impl ChatView {
             if total > max_lines {
                 lines.push(Line::from(Span::styled(
                     format!("  ... ({} more lines)", total.saturating_sub(max_lines)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.muted_color()),
                 )));
             }
             lines.push(Line::raw(""));
@@ -584,38 +592,33 @@ impl ChatView {
 
         lines.push(Line::from(Span::styled(
             "─".repeat(60),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.muted_color()),
         )));
 
         let mut stats_parts: Vec<String> = Vec::new();
         if tool_count > 0 {
             stats_parts.push(format!("Tools: {}", tool_count));
         }
+        if thinking_rounds > 0 {
+            stats_parts.push(format!("Think: {}", thinking_rounds));
+        }
         if user_messages > 0 {
             stats_parts.push(format!("Msgs: {}", user_messages));
         }
         stats_parts.push(format!(
-            "Tokens: {}/{}",
-            if self
-                .timeline
-                .iter()
-                .any(|e| matches!(e, TimelineEntry::Message { role, .. } if role == "assistant"))
-            {
-                "—"
-            } else {
-                "—"
-            },
-            "—"
+            "Tokens: in {} / out {}",
+            fmt_tokens(self.turn_input_tokens),
+            fmt_tokens(self.turn_output_tokens)
         ));
         stats_parts.push(format!("Turn: {:.1}s", 0.0));
         lines.push(Line::from(Span::styled(
             format!("  {}", stats_parts.join(" · ")),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(self.theme.warn_color()),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  v:expand full timeline · ↑↓:scroll · /:search",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.muted_color()),
         )));
 
         lines
@@ -659,7 +662,7 @@ impl ChatView {
         if let Some(spinner) = spinner_str {
             self.cached_chat_lines.push(Line::from(vec![Span::styled(
                 format!("{spinner} Processing..."),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(self.theme.accent()),
             )]));
         }
     }
@@ -673,7 +676,7 @@ impl ChatView {
         if self.timeline.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Type to start. /help /resume /exit",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.muted_color()),
             )));
             return lines;
         }
@@ -705,7 +708,7 @@ impl ChatView {
             let spinner = self.spinner_char();
             lines.push(Line::from(vec![Span::styled(
                 format!("{spinner} Processing..."),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(self.theme.accent()),
             )]));
         }
 
@@ -713,7 +716,8 @@ impl ChatView {
     }
 
     /// Highlight inline markdown spans in a message line.
-    fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color) {
+    fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color, theme: &Theme) {
+        let code_color = theme.inline_code_color();
         let mut remaining = line;
         while !remaining.is_empty() {
             let bt = remaining.find('`');
@@ -743,13 +747,13 @@ impl ChatView {
                         if let Some(end) = remaining.find('`') {
                             spans.push(Span::styled(
                                 remaining[..end].to_string(),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(code_color),
                             ));
                             remaining = &remaining[end + 1..];
                         } else {
                             spans.push(Span::styled(
                                 remaining.to_string(),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(code_color),
                             ));
                             remaining = "";
                         }
@@ -879,14 +883,14 @@ impl ChatView {
             TimelineEntry::Message { role, content, .. } => {
                 let (color, prefix) = match role.as_str() {
                     "user" => (theme.user_color(), "> "),
-                    "system" => (Color::DarkGray, "  "),
+                    "system" => (theme.muted_color(), "  "),
                     _ => (theme.fg(), ""),
                 };
                 let total_lines = content.lines().count();
                 const MAX_LINES: usize = 500;
 
                 if role == "assistant" {
-                    let md_lines = md_renderer::render_markdown_lines(content, color);
+                    let md_lines = md_renderer::render_markdown_lines(content, theme);
                     for line in md_lines.into_iter().take(MAX_LINES) {
                         lines.push(line);
                     }
@@ -896,7 +900,7 @@ impl ChatView {
                                 "  ... ({} more lines truncated)",
                                 total_lines.saturating_sub(MAX_LINES)
                             ),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.muted_color()),
                         )));
                     }
                     return;
@@ -909,7 +913,7 @@ impl ChatView {
                                 "  ... ({} more lines truncated)",
                                 total_lines.saturating_sub(MAX_LINES)
                             ),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.muted_color()),
                         )));
                         break;
                     }
@@ -917,67 +921,46 @@ impl ChatView {
                         prefix.to_string(),
                         Style::default().fg(color).bold(),
                     )];
-                    Self::highlight_line(line, &mut spans, color);
+                    Self::highlight_line(line, &mut spans, color, theme);
                     lines.push(Line::from(spans));
                 }
             }
 
             TimelineEntry::Thinking {
-                id: _,
+                id,
                 content,
                 complete,
                 expanded: _,
             } => {
                 let focus_marker = if is_focused { "● " } else { "  " };
-                let label = if *complete { "thought" } else { "thinking" };
                 let status = if *complete { "saved" } else { "streaming" };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{focus_marker}think "),
-                        Style::default().fg(Color::Cyan).bold(),
-                    ),
-                    Span::styled(label.to_string(), Style::default().fg(Color::Gray).bold()),
-                    Span::styled(
-                        format!(" · {status}"),
-                        Style::default().fg(if *complete {
-                            Color::DarkGray
-                        } else {
-                            Color::Yellow
-                        }),
-                    ),
-                ]));
-
-                let max_lines = if *complete { 3 } else { 8 };
-                let mut shown = 0usize;
-                for line in content.lines().filter(|line| !line.trim().is_empty()) {
-                    if shown >= max_lines {
-                        break;
-                    }
-                    let trimmed: String = line.chars().take(120).collect();
-                    let more = if line.chars().count() > 120 {
-                        "..."
-                    } else {
-                        ""
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled("  ".to_string(), Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{trimmed}{more}"),
-                            Style::default().fg(if *complete { Color::Gray } else { Color::White }),
-                        ),
-                    ]));
-                    shown += 1;
-                }
                 let total_non_empty = content
                     .lines()
                     .filter(|line| !line.trim().is_empty())
                     .count();
-                if total_non_empty > shown {
-                    lines.push(Line::from(Span::styled(
-                        format!("  ... {} more thinking lines", total_non_empty - shown),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
+                let words = content.split_whitespace().count();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{focus_marker}think "),
+                        Style::default().fg(theme.accent()).bold(),
+                    ),
+                    Span::styled(
+                        format!("#{id}"),
+                        Style::default().fg(theme.muted_color()).bold(),
+                    ),
+                    Span::styled(
+                        format!(" · {status}"),
+                        Style::default().fg(if *complete {
+                            theme.muted_color()
+                        } else {
+                            theme.warn_color()
+                        }),
+                    ),
+                    Span::styled(
+                        format!(" · {total_non_empty} lines · {words} words · details in Process"),
+                        Style::default().fg(theme.muted_color()),
+                    ),
+                ]));
             }
 
             TimelineEntry::ToolCall {
@@ -991,12 +974,12 @@ impl ChatView {
             } => {
                 let status_style = if *done {
                     if exit_code == &Some(0) {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(theme.success_color())
                     } else {
-                        Style::default().fg(Color::Red)
+                        Style::default().fg(theme.error_color())
                     }
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme.warn_color())
                 };
                 let status_icon = if *done {
                     if exit_code == &Some(0) {
@@ -1025,11 +1008,11 @@ impl ChatView {
                 let mut tool_line = vec![
                     Span::styled(
                         format!("{focus_marker}🔧 {name}"),
-                        Style::default().fg(Color::Yellow).bold(),
+                        Style::default().fg(theme.warn_color()).bold(),
                     ),
                     Span::styled(
                         format!(": {short_preview}{more}"),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme.muted_color()),
                     ),
                     Span::styled(format!(" [{status_icon} {status_text}]"), status_style),
                 ];
@@ -1045,7 +1028,7 @@ impl ChatView {
                         if has_sid && is_focused {
                             tool_line.push(Span::styled(
                                 " [Open Subagent]".to_string(),
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(theme.link_color()),
                             ));
                         }
                     }
@@ -1065,7 +1048,7 @@ impl ChatView {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{focus_marker}┌─ /{command} ({total_lines} lines)"),
-                            Style::default().fg(Color::Magenta).bold(),
+                            Style::default().fg(theme.accent()).bold(),
                         ),
                         Span::styled(
                             if is_focused {
@@ -1073,24 +1056,24 @@ impl ChatView {
                             } else {
                                 String::new()
                             },
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.muted_color()),
                         ),
                     ]));
                     for line in output.lines().take(100) {
                         lines.push(Line::from(vec![
-                            Span::styled("│  ".to_string(), Style::default().fg(Color::Magenta)),
-                            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                            Span::styled("│  ".to_string(), Style::default().fg(theme.accent())),
+                            Span::styled(line.to_string(), Style::default().fg(theme.fg())),
                         ]));
                     }
                     if total_lines > 100 {
                         lines.push(Line::from(Span::styled(
                             format!("│ ... ({} more lines)", total_lines - 100),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.muted_color()),
                         )));
                     }
                     lines.push(Line::from(Span::styled(
                         "└─".to_string(),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(theme.accent()),
                     )));
                 } else {
                     let preview: String = output.chars().take(80).collect();
@@ -1098,7 +1081,7 @@ impl ChatView {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{focus_marker}/ {command} ({total_lines}L): {preview}{more}"),
-                            Style::default().fg(Color::Magenta).bold(),
+                            Style::default().fg(theme.accent()).bold(),
                         ),
                         Span::styled(
                             if is_focused {
@@ -1106,12 +1089,22 @@ impl ChatView {
                             } else {
                                 String::new()
                             },
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.muted_color()),
                         ),
                     ]));
                 }
             }
         }
+    }
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -1681,8 +1674,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Hello"), "Expected user message");
         assert!(joined.contains("Hi there!"), "Expected assistant message");
-        assert!(joined.contains("Thinking"), "Expected thinking entry");
-        assert!(joined.contains("bash"), "Expected tool call entry");
+        assert!(joined.contains("think thought"), "Expected thinking entry");
     }
 
     // ── tick / spinner ────────────────────────────────────────────

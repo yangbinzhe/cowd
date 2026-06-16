@@ -7,7 +7,7 @@
 //!
 //! # Messaging
 //! - `send_message()` → POST /im/v1/messages (plain text)
-//! - `send_internal()` → POST /im/v1/messages + PUT /im/v1/messages/{id}/reply
+//! - `send_internal()` → POST /im/v1/messages + POST /im/v1/messages/{id}/reply
 //!   with post→text fallback
 //! - `send_card_message()` → POST /im/v1/messages (interactive card)
 //!
@@ -300,23 +300,27 @@ impl FeishuAdapter {
         #[derive(Deserialize)]
         #[allow(dead_code)]
         struct WebhookEvent {
-            schema: String,
-            header: WebhookHeader,
+            schema: Option<String>,
+            header: Option<WebhookHeader>,
+            #[serde(rename = "type")]
+            event_type: Option<String>,
             #[serde(rename = "event")]
             event_data: Option<serde_json::Value>,
             #[serde(rename = "message")]
             message_data: Option<serde_json::Value>,
+            #[serde(rename = "data")]
+            data: Option<serde_json::Value>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         #[allow(dead_code)]
         struct WebhookHeader {
-            event_id: String,
-            event_type: String,
-            create_time: String,
-            token: String,
-            app_id: String,
-            tenant_key: String,
+            event_id: Option<String>,
+            event_type: Option<String>,
+            create_time: Option<String>,
+            token: Option<String>,
+            app_id: Option<String>,
+            tenant_key: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -325,21 +329,23 @@ impl FeishuAdapter {
             message_id: String,
             root_id: Option<String>,
             parent_id: Option<String>,
-            create_time: String,
+            create_time: Option<String>,
             chat_id: String,
-            sender: SenderInfo,
-            body: MessageBody,
+            chat_type: Option<String>,
+            sender: Option<SenderInfo>,
+            body: Option<MessageBody>,
+            content: Option<String>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         #[allow(dead_code)]
         struct SenderInfo {
             sender_id: SenderId,
-            sender_type: String,
-            tenant_key: String,
+            sender_type: Option<String>,
+            tenant_key: Option<String>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         struct SenderId {
             open_id: Option<String>,
             user_id: Option<String>,
@@ -352,13 +358,47 @@ impl FeishuAdapter {
 
         let event: WebhookEvent = serde_json::from_slice(payload)
             .map_err(|e| PlatformError::Unknown(format!("failed to parse webhook event: {}", e)))?;
+        let event_type = event
+            .header
+            .as_ref()
+            .and_then(|header| header.event_type.as_deref())
+            .or(event.event_type.as_deref())
+            .or_else(|| {
+                event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("type"))
+                    .and_then(|value| value.as_str())
+            })
+            .ok_or_else(|| PlatformError::Unknown("missing feishu event type".to_string()))?;
 
         // Handle different event types
-        match event.header.event_type.as_str() {
+        match event_type {
             "im.message.receive_v1" => {
                 let content = event
                     .message_data
                     .as_ref()
+                    .or_else(|| {
+                        event
+                            .event_data
+                            .as_ref()
+                            .and_then(|data| data.get("message"))
+                    })
+                    .or_else(|| event.data.as_ref().and_then(|data| data.get("message")))
+                    .or_else(|| {
+                        event
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("event"))
+                            .and_then(|data| data.get("message"))
+                    })
+                    .or_else(|| {
+                        event.data.as_ref().filter(|data| {
+                            data.get("message_id").is_some()
+                                || data.get("body").is_some()
+                                || data.get("content").is_some()
+                        })
+                    })
                     .ok_or_else(|| PlatformError::Unknown("missing message data".to_string()))?;
 
                 let msg_content: MessageContent =
@@ -367,21 +407,63 @@ impl FeishuAdapter {
                     })?;
 
                 // Parse the message body (it's a JSON string)
-                let text = serde_json::from_str::<serde_json::Value>(&msg_content.body.content)
+                let raw_content = msg_content
+                    .body
+                    .as_ref()
+                    .map(|body| body.content.as_str())
+                    .or(msg_content.content.as_deref())
+                    .unwrap_or("");
+                let text = serde_json::from_str::<serde_json::Value>(raw_content)
                     .ok()
                     .and_then(|v| {
                         v.get("text")
                             .and_then(|t| t.as_str().map(|s| s.to_string()))
                     })
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| raw_content.to_string());
 
+                let event_sender = event
+                    .event_data
+                    .as_ref()
+                    .and_then(|data| data.get("sender"))
+                    .or_else(|| event.data.as_ref().and_then(|data| data.get("sender")))
+                    .or_else(|| {
+                        event
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("event"))
+                            .and_then(|data| data.get("sender"))
+                    });
+                let event_sender_id = event_sender.and_then(|sender| sender.get("sender_id"));
                 let open_id = msg_content
                     .sender
-                    .sender_id
-                    .open_id
                     .as_ref()
-                    .or_else(|| msg_content.sender.sender_id.user_id.as_ref())
+                    .and_then(|sender| {
+                        sender
+                            .sender_id
+                            .open_id
+                            .as_deref()
+                            .or(sender.sender_id.user_id.as_deref())
+                    })
+                    .or_else(|| {
+                        event_sender_id
+                            .and_then(|sender_id| sender_id.get("open_id"))
+                            .and_then(|value| value.as_str())
+                    })
+                    .or_else(|| {
+                        event_sender_id
+                            .and_then(|sender_id| sender_id.get("user_id"))
+                            .and_then(|value| value.as_str())
+                    })
                     .ok_or_else(|| PlatformError::Unknown("missing sender open_id".to_string()))?;
+                let sender_type = msg_content
+                    .sender
+                    .as_ref()
+                    .and_then(|sender| sender.sender_type.as_deref())
+                    .or_else(|| {
+                        event_sender
+                            .and_then(|sender| sender.get("sender_type"))
+                            .and_then(|value| value.as_str())
+                    });
 
                 let session_key = SessionKey::with_thread("feishu", open_id, &msg_content.chat_id);
 
@@ -394,6 +476,8 @@ impl FeishuAdapter {
                     metadata: serde_json::json!({
                         "message_id": msg_content.message_id,
                         "chat_id": msg_content.chat_id,
+                        "chat_type": msg_content.chat_type,
+                        "sender_type": sender_type,
                     }),
                     message_type: MessageType::Text,
                     message_id: Some(msg_content.message_id),
@@ -406,6 +490,8 @@ impl FeishuAdapter {
                 let action_data = event
                     .event_data
                     .as_ref()
+                    .or(event.data.as_ref())
+                    .or(event.message_data.as_ref())
                     .ok_or_else(|| PlatformError::Unknown("missing card action data".into()))?;
                 let message_id = action_data
                     .get("open_message_id")
@@ -427,7 +513,7 @@ impl FeishuAdapter {
                 ));
             }
             _ => {
-                tracing::debug!(event_type = %event.header.event_type, "unhandled feishu event type");
+                tracing::debug!(event_type = %event_type, "unhandled feishu event type");
             }
         }
 
@@ -500,10 +586,8 @@ impl FeishuAdapter {
             message_id: Option<String>,
         }
 
-        let resp: CardSendResponse = response
-            .json()
-            .await
-            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        let resp: CardSendResponse =
+            decode_feishu_response(response, "send card message").await?;
 
         if resp.code != 0 {
             return Err(PlatformError::SendFailed(resp.msg));
@@ -583,16 +667,15 @@ impl FeishuAdapter {
                 msg_type: "post".to_string(),
                 content: post_content.clone(),
             };
-            let post_resp: ReplyMessageResponse = client
-                .put(&reply_url)
+            let response = client
+                .post(&reply_url)
                 .header("Authorization", format!("Bearer {}", &token))
                 .json(&post_req)
                 .send()
                 .await
-                .map_err(|e| PlatformError::SendFailed(e.to_string()))?
-                .json()
-                .await
                 .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+            let post_resp: ReplyMessageResponse =
+                decode_feishu_response(response, "reply post message").await?;
 
             if post_resp.code == 0 {
                 return Ok(SendResult::success(
@@ -613,16 +696,15 @@ impl FeishuAdapter {
                     msg_type: "text".to_string(),
                     content: build_text_payload(&fallback_text),
                 };
-                let text_resp: ReplyMessageResponse = client
-                    .put(&reply_url)
+                let response = client
+                    .post(&reply_url)
                     .header("Authorization", format!("Bearer {}", &token))
                     .json(&text_req)
                     .send()
                     .await
-                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?
-                    .json()
-                    .await
                     .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+                let text_resp: ReplyMessageResponse =
+                    decode_feishu_response(response, "reply text message").await?;
 
                 if text_resp.code == 0 {
                     tracing::debug!("feishu text fallback reply succeeded");
@@ -658,16 +740,15 @@ impl FeishuAdapter {
             msg_type: "post".to_string(),
             content: post_content.clone(),
         };
-        let post_resp: SendMessageResponse = client
+        let response = client
             .post(&send_url)
             .header("Authorization", format!("Bearer {}", &token))
             .json(&post_req)
             .send()
             .await
-            .map_err(|e| PlatformError::SendFailed(e.to_string()))?
-            .json()
-            .await
             .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        let post_resp: SendMessageResponse =
+            decode_feishu_response(response, "send post message").await?;
 
         if post_resp.code == 0 {
             tracing::debug!(to = %receive_id, "feishu post message sent");
@@ -687,16 +768,15 @@ impl FeishuAdapter {
                 msg_type: "text".to_string(),
                 content: build_text_payload(&fallback_text),
             };
-            let text_resp: SendMessageResponse = client
+            let response = client
                 .post(send_url)
                 .header("Authorization", format!("Bearer {}", &token))
                 .json(&text_req)
                 .send()
                 .await
-                .map_err(|e| PlatformError::SendFailed(e.to_string()))?
-                .json()
-                .await
                 .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+            let text_resp: SendMessageResponse =
+                decode_feishu_response(response, "send text message").await?;
 
             if text_resp.code != 0 {
                 return Err(PlatformError::SendFailed(text_resp.msg));
@@ -743,10 +823,8 @@ impl FeishuAdapter {
             .await
             .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
 
-        let resp: SendMessageResponse = response
-            .json()
-            .await
-            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        let resp: SendMessageResponse =
+            decode_feishu_response(response, "send typed message").await?;
 
         if resp.code != 0 {
             return Err(PlatformError::SendFailed(resp.msg));
@@ -798,6 +876,8 @@ impl CardAction {
     }
 }
 
+use super::decode_feishu_response;
+
 impl FeishuAdapter {
     pub fn next_approval_id(&self) -> u64 {
         self.approval_id_counter.fetch_add(1, Ordering::Relaxed)
@@ -839,10 +919,8 @@ impl FeishuAdapter {
             .send()
             .await
             .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
-        let resp: super::types::UpdateMessageResponse = response
-            .json()
-            .await
-            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        let resp: super::types::UpdateMessageResponse =
+            decode_feishu_response(response, "update approval card").await?;
         if resp.code != 0 {
             return Err(PlatformError::SendFailed(resp.msg));
         }
@@ -1339,6 +1417,7 @@ mod tests {
     use super::*;
     use crate::platform::feishu::card_handler::CardActionHandler;
     use crate::platform::feishu::processing::ProcessingDecision;
+    use httpmock::prelude::{MockServer, POST};
 
     #[test]
     fn test_feishu_config() {
@@ -1499,6 +1578,49 @@ mod tests {
         assert_ne!(231003, 0);
     }
 
+    #[tokio::test]
+    async fn test_send_reply_uses_post_method() {
+        let server = MockServer::start();
+        let token_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/open-apis/auth/v3/tenant_access_token/internal");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "tenant_access_token": "tenant-token",
+                    "expire": 3600
+                }));
+        });
+        let reply_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/open-apis/im/v1/messages/om_reply/reply");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 0,
+                    "msg": "success",
+                    "data": {"message_id": "om_sent"}
+                }));
+        });
+
+        let config = FeishuConfig::new("app_id", "app_secret").with_base_url(server.base_url());
+        let adapter = FeishuAdapter::new(config);
+        let outbound = OutboundMessage {
+            session_key: SessionKey::with_thread("feishu", "ou_user", "oc_chat"),
+            text: "hello reply".to_string(),
+            reply_to: Some("om_reply".to_string()),
+            metadata: serde_json::json!({}),
+        };
+
+        let result = adapter.send(&outbound).await.expect("reply should send");
+
+        assert_eq!(result.message_id.as_deref(), Some("om_sent"));
+        token_mock.assert_hits(1);
+        reply_mock.assert_hits(1);
+    }
+
     // ------------------------------------------------------------------
     // Module integration tests
     // ------------------------------------------------------------------
@@ -1589,6 +1711,103 @@ mod tests {
         assert_eq!(msg.platform, Platform::Feishu);
         assert!(msg.text.starts_with("/card button "));
         assert!(msg.text.contains("approve"));
+    }
+
+    #[test]
+    fn test_process_webhook_event_accepts_nested_v2_message() {
+        let config = FeishuConfig::new("app_id", "app_secret");
+        let adapter = FeishuAdapter::new(config);
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_001",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {"open_id": "ou_sender"},
+                    "sender_type": "user"
+                },
+                "message": {
+                    "message_id": "om_001",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "body": {"content": "{\"text\":\"hello nested\"}"}
+                }
+            }
+        });
+
+        let msg = adapter
+            .process_webhook_event(payload.to_string().as_bytes())
+            .expect("event parses")
+            .expect("message produced");
+
+        assert_eq!(msg.text, "hello nested");
+        assert_eq!(msg.session_key.user_id, "ou_sender");
+        assert_eq!(msg.session_key.thread_id.as_deref(), Some("oc_chat"));
+        assert_eq!(msg.message_id.as_deref(), Some("om_001"));
+    }
+
+    #[test]
+    fn test_process_webhook_event_accepts_missing_schema_message() {
+        let config = FeishuConfig::new("app_id", "app_secret");
+        let adapter = FeishuAdapter::new(config);
+        let payload = serde_json::json!({
+            "header": {
+                "event_id": "evt_002",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {"user_id": "user_sender"},
+                    "sender_type": "user"
+                },
+                "message": {
+                    "message_id": "om_002",
+                    "chat_id": "oc_chat",
+                    "content": "{\"text\":\"hello no schema\"}"
+                }
+            }
+        });
+
+        let msg = adapter
+            .process_webhook_event(payload.to_string().as_bytes())
+            .expect("event parses")
+            .expect("message produced");
+
+        assert_eq!(msg.text, "hello no schema");
+        assert_eq!(msg.session_key.user_id, "user_sender");
+    }
+
+    #[test]
+    fn test_process_webhook_event_accepts_type_data_wrapper() {
+        let config = FeishuConfig::new("app_id", "app_secret");
+        let adapter = FeishuAdapter::new(config);
+        let payload = serde_json::json!({
+            "type": "im.message.receive_v1",
+            "data": {
+                "event": {
+                    "sender": {
+                        "sender_id": {"open_id": "ou_data_sender"},
+                        "sender_type": "user"
+                    },
+                    "message": {
+                        "message_id": "om_003",
+                        "chat_id": "oc_data_chat",
+                        "body": {"content": "{\"text\":\"hello data\"}"}
+                    }
+                }
+            }
+        });
+
+        let msg = adapter
+            .process_webhook_event(payload.to_string().as_bytes())
+            .expect("event parses")
+            .expect("message produced");
+
+        assert_eq!(msg.text, "hello data");
+        assert_eq!(msg.session_key.user_id, "ou_data_sender");
+        assert_eq!(msg.session_key.thread_id.as_deref(), Some("oc_data_chat"));
     }
 
     #[tokio::test]

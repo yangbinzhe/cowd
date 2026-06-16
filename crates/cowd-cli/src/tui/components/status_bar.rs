@@ -92,36 +92,16 @@ impl StatusBar {
     pub fn with_default_sections() -> Self {
         let mut sb = Self::new();
         sb.add_section(StatusSection {
-            id: "version".into(),
-            content: None,
-            style: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            width: SectionWidth::Fixed(10),
-        });
-        sb.add_section(StatusSection {
             id: "model".into(),
             content: None,
             style: Style::default().fg(Color::White),
-            width: SectionWidth::Fixed(24),
-        });
-        sb.add_section(StatusSection {
-            id: "session".into(),
-            content: None,
-            style: Style::default().fg(Color::Cyan),
-            width: SectionWidth::Fixed(16),
-        });
-        sb.add_section(StatusSection {
-            id: "focus".into(),
-            content: None,
-            style: Style::default().fg(Color::Cyan),
-            width: SectionWidth::Fixed(16),
+            width: SectionWidth::Fixed(22),
         });
         sb.add_section(StatusSection {
             id: "context".into(),
             content: None,
-            style: Style::default().fg(Color::DarkGray),
-            width: SectionWidth::Fixed(18),
+            style: Style::default().fg(Color::Green),
+            width: SectionWidth::Fixed(36),
         });
         sb.add_section(StatusSection {
             id: "approvals".into(),
@@ -355,7 +335,7 @@ impl StatusBar {
                 "version" => Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 "model" => {
                     let mode = if app.yolo_mode { "YOLO" } else { "STD" };
-                    Some(format!("model:{} {mode}", preview(&app.model, 14)))
+                    Some(format!("{} {mode}", preview(&app.model, 18)))
                 }
                 "context" => {
                     let pct = if app.context_window > 0 {
@@ -363,12 +343,8 @@ impl StatusBar {
                     } else {
                         0.0
                     };
-                    Some(format!(
-                        "ctx:{}/{} {:.0}%",
-                        fmt_tokens(app.token_count),
-                        fmt_tokens(app.context_window),
-                        pct
-                    ))
+                    section.style = Style::default().fg(context_color(pct));
+                    token_bar(app).map(|bar| format!("ctx {bar}"))
                 }
                 "approvals" => {
                     let count = app
@@ -394,7 +370,6 @@ impl StatusBar {
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
                 "permission_status" => Some(format!("perm:{}", app.permission_count)),
-                "session" => Some(format!("session:{}", short_id(&app.session_id))),
                 "input_hint" => {
                     Some("Enter send · Alt+Enter/Ctrl+J newline · Ctrl+B panels".into())
                 }
@@ -499,8 +474,7 @@ impl Component for StatusBar {
 
 fn status_section_visible_for_width(id: &str, available: u16) -> bool {
     match id {
-        "version" | "model" | "session" | "focus" => true,
-        "context" => available >= 96,
+        "model" | "context" => true,
         "approvals" | "permission_status" => available >= 120,
         "input_hint" => available >= 150,
         _ => available >= 132,
@@ -527,6 +501,16 @@ fn short_id(value: &str) -> String {
         value.to_string()
     } else {
         value.chars().take(10).collect()
+    }
+}
+
+fn context_color(pct: f64) -> Color {
+    if pct >= 85.0 {
+        Color::Red
+    } else if pct >= 65.0 {
+        Color::Yellow
+    } else {
+        Color::Green
     }
 }
 

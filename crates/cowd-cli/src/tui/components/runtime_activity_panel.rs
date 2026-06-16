@@ -20,6 +20,21 @@ struct TurnActivity {
     last_phase: String,
 }
 
+#[derive(Debug, Clone)]
+enum ProcessKind {
+    Thinking,
+    Tool,
+    Output,
+    Slash,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessEvent {
+    kind: ProcessKind,
+    text: String,
+    complete: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeActivityPanel {
     // ── Context / Ctx fields ───────────────────────────────────────
@@ -67,6 +82,7 @@ pub struct RuntimeActivityPanel {
     tool_event_count: usize,
     open_tool_count: usize,
     recent_tools: Vec<String>,
+    recent_process: Vec<ProcessEvent>,
     /// Current turn activity summary.
     turn_activity: TurnActivity,
     /// Scroll offset for long runtime status content.
@@ -217,17 +233,41 @@ impl RuntimeActivityPanel {
         self.tool_event_count = 0;
         self.open_tool_count = 0;
         self.recent_tools.clear();
+        self.recent_process.clear();
         self.turn_activity = TurnActivity::default();
         self.turn_activity.active = app.turn_active;
         for entry in &timeline {
             match entry {
-                TimelineEntry::Message { .. } => {
+                TimelineEntry::Message { role, content, .. } => {
                     self.message_count += 1;
+                    if role == "assistant" {
+                        self.recent_process.push(ProcessEvent {
+                            kind: ProcessKind::Output,
+                            text: preview(content, 96),
+                            complete: true,
+                        });
+                    }
                 }
-                TimelineEntry::Thinking { complete, .. } => {
+                TimelineEntry::Thinking {
+                    content, complete, ..
+                } => {
                     if !complete {
                         self.turn_activity.thinking = true;
                     }
+                    let lines = content
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count();
+                    let detail = if content.trim().is_empty() {
+                        format!("{} lines", lines)
+                    } else {
+                        format!("{} lines - {}", lines, preview(content, 96))
+                    };
+                    self.recent_process.push(ProcessEvent {
+                        kind: ProcessKind::Thinking,
+                        text: detail,
+                        complete: *complete,
+                    });
                 }
                 TimelineEntry::ToolCall {
                     name,
@@ -250,9 +290,24 @@ impl RuntimeActivityPanel {
                     self.recent_tools.push(format_tool_process_line(
                         name, preview, output, *done, *exit_code,
                     ));
+                    self.recent_process.push(ProcessEvent {
+                        kind: ProcessKind::Tool,
+                        text: format_tool_process_line(name, preview, output, *done, *exit_code),
+                        complete: *done,
+                    });
                 }
-                _ => {}
+                TimelineEntry::SlashOutput { command, output, .. } => {
+                    self.recent_process.push(ProcessEvent {
+                        kind: ProcessKind::Slash,
+                        text: format!("/{command} - {}", preview(output, 96)),
+                        complete: true,
+                    });
+                }
             }
+        }
+        if self.recent_process.len() > 80 {
+            let overflow = self.recent_process.len().saturating_sub(80);
+            self.recent_process.drain(0..overflow);
         }
         if let Some(entry) = timeline.last() {
             self.turn_activity.last_phase = match entry {
@@ -300,47 +355,6 @@ impl Component for RuntimeActivityPanel {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // ── Turn activity status (what's happening now) ──
-        if self.turn_activity.active {
-            let mut status_parts: Vec<Span> = Vec::new();
-            status_parts.push(Span::styled(
-                "● ",
-                Style::default().fg(Color::Yellow).bold(),
-            ));
-            if self.turn_activity.thinking {
-                status_parts.push(Span::styled(
-                    "Thinking ",
-                    Style::default().fg(Color::Cyan).bold(),
-                ));
-            }
-            if self.turn_activity.tool_count > 0 {
-                status_parts.push(Span::styled(
-                    format!("Tools:{} ", self.turn_activity.tool_count),
-                    Style::default().fg(Color::Yellow),
-                ));
-                let names: String = self
-                    .turn_activity
-                    .tool_names
-                    .iter()
-                    .take(3)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if !names.is_empty() {
-                    status_parts.push(Span::styled(
-                        format!("[{}]", names),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-            }
-            status_parts.push(Span::styled(
-                format!(" {}", self.turn_activity.last_phase),
-                Style::default().fg(Color::White),
-            ));
-            lines.push(Line::from(status_parts));
-            lines.push(Line::raw(""));
-        }
-
         // Token bar
         lines.push(Line::from(vec![
             Span::styled(bar, Style::default().fg(bar_color)),
@@ -372,10 +386,7 @@ impl Component for RuntimeActivityPanel {
         ]));
         lines.push(Line::from(vec![
             Span::styled("Sess:", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                short_id(&self.session_id),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(self.session_id.clone(), Style::default().fg(Color::White)),
             Span::styled(
                 format!("  {} {}%", self.profile, self.pressure_pct),
                 Style::default().fg(if self.pressure_pct > 85 {
@@ -403,7 +414,12 @@ impl Component for RuntimeActivityPanel {
             Span::styled("Model:", Style::default().fg(Color::DarkGray)),
             Span::styled(preview(&self.model, 32), Style::default().fg(Color::White)),
             Span::styled(
-                format!("  sel:{} omi:{}", self.selected_count, self.omitted_count),
+                format!(
+                    " via {}  {}p/{}m",
+                    preview(&self.provider_route, 28),
+                    self.provider_count,
+                    self.provider_model_count
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -436,7 +452,11 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::from(vec![
             Span::styled("Agent:", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}", self.runtime_policy_agent),
+                if self.yolo_mode {
+                    "YoloGoal".to_string()
+                } else {
+                    self.runtime_policy_agent.clone()
+                },
                 Style::default().fg(if self.runtime_policy_agent == "Off" {
                     Color::DarkGray
                 } else {
@@ -445,24 +465,21 @@ impl Component for RuntimeActivityPanel {
             ),
             Span::styled(
                 format!(
-                    "  kernel {} provider {}",
-                    self.control_plane_status, self.provider_status
+                    "  policy {} score:{} review:{} signals:{}",
+                    self.runtime_policy_level,
+                    self.runtime_policy_score,
+                    if self.runtime_policy_review { "required" } else { "clear" },
+                    self.runtime_policy_signals
                 ),
-                Style::default().fg(match self.control_plane_status.as_str() {
-                    "healthy" => Color::Green,
-                    "degraded" => Color::Red,
+                Style::default().fg(match (self.yolo_mode, self.runtime_policy_review) {
+                    (true, _) => Color::Magenta,
+                    (_, true) => Color::Yellow,
                     _ => Color::Yellow,
                 }),
             ),
         ]));
 
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Status",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
         lines.push(metric_line(
             "Runtime:",
             &self.control_plane_status,
@@ -471,62 +488,6 @@ impl Component for RuntimeActivityPanel {
                 "healthy" => Color::Green,
                 "degraded" => Color::Red,
                 _ => Color::Yellow,
-            },
-        ));
-        lines.push(metric_line(
-            "Provider:",
-            &self.provider_status,
-            &format!(
-                "{} providers {} models route {}",
-                self.provider_count,
-                self.provider_model_count,
-                preview(&self.provider_route, 28)
-            ),
-            if self.provider_status == "available" {
-                Color::Green
-            } else if self.provider_status == "degraded" {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            },
-        ));
-        lines.push(metric_line(
-            "Context:",
-            &self.pressure_level,
-            &format!(
-                "pressure {}% path {} hashes {}/{}/{}",
-                self.pressure_pct,
-                self.degradation_path,
-                self.stable_hash,
-                self.runtime_hash,
-                self.dynamic_hash
-            ),
-            if self.pressure_pct > 85 {
-                Color::Red
-            } else if self.pressure_pct > 70 {
-                Color::Yellow
-            } else {
-                Color::Green
-            },
-        ));
-        lines.push(metric_line(
-            "Policy:",
-            &self.runtime_policy_level,
-            &format!(
-                "score {} agent {} review {} signals {}",
-                self.runtime_policy_score,
-                self.runtime_policy_agent,
-                if self.runtime_policy_review {
-                    "required"
-                } else {
-                    "clear"
-                },
-                self.runtime_policy_signals
-            ),
-            if self.runtime_policy_review {
-                Color::Yellow
-            } else {
-                Color::White
             },
         ));
         lines.push(metric_line(
@@ -562,26 +523,29 @@ impl Component for RuntimeActivityPanel {
             },
         ));
 
-        if !self.recent_tools.is_empty() {
+        if !self.recent_process.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Tool Process",
+                "Process",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )));
-            for tool in self.recent_tools.iter().rev().take(8) {
-                lines.push(Line::from(vec![
-                    Span::styled("- ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(tool.clone(), Style::default().fg(Color::White)),
-                ]));
+            let remaining_rows = area
+                .height
+                .saturating_sub(lines.len() as u16)
+                .saturating_sub(3)
+                .max(6) as usize;
+            let start = self.recent_process.len().saturating_sub(remaining_rows);
+            for item in &self.recent_process[start..] {
+                lines.push(process_line(item));
             }
         }
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Runtime Status ");
+            .title(" Runtime ");
         self.scroll
             .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
         ctx.frame_mut().render_widget(
@@ -666,6 +630,37 @@ fn metric_line(
         Span::styled(
             format!("  {}", detail.into()),
             Style::default().fg(Color::White),
+        ),
+    ])
+}
+
+fn process_line(item: &ProcessEvent) -> Line<'static> {
+    let (icon, label, color) = match item.kind {
+        ProcessKind::Thinking => (
+            if item.complete { "◌" } else { "●" },
+            "think",
+            if item.complete { Color::DarkGray } else { Color::Yellow },
+        ),
+        ProcessKind::Tool => (
+            if item.complete { "✓" } else { "⚙" },
+            "tool",
+            if item.complete { Color::Green } else { Color::Cyan },
+        ),
+        ProcessKind::Output => ("↳", "reply", Color::White),
+        ProcessKind::Slash => ("/", "cmd", Color::Magenta),
+    };
+    Line::from(vec![
+        Span::styled(format!("{icon} "), Style::default().fg(color).bold()),
+        Span::styled(
+            format!("{label:<5} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            preview(&item.text, 88),
+            Style::default().fg(match item.kind {
+                ProcessKind::Output => Color::Gray,
+                _ => Color::White,
+            }),
         ),
     ])
 }
