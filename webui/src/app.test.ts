@@ -7,7 +7,7 @@ import App from './App.vue';
 import { api } from './api/client';
 import ChatPage from './pages/ChatPage.vue';
 import AgentsPage from './pages/AgentsPage.vue';
-import CapabilityPage from './pages/CapabilityPage.vue';
+import AuditPage from './pages/AuditPage.vue';
 import MemoryPage from './pages/MemoryPage.vue';
 import RuntimePage from './pages/RuntimePage.vue';
 import ContextPage from './pages/ContextPage.vue';
@@ -15,6 +15,7 @@ import GatewayPage from './pages/GatewayPage.vue';
 import IaccPage from './pages/IaccPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
+import ToolsPage from './pages/ToolsPage.vue';
 
 vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
 vi.mock('vue-echarts', () => ({ default: { template: '<div class="chart"></div>' } }));
@@ -30,10 +31,10 @@ function mountApp(path = '/chat') {
       { path: '/memory', component: MemoryPage },
       { path: '/skills', component: SkillsPage },
       { path: '/agents', component: AgentsPage },
-      { path: '/tools', component: CapabilityPage, props: { page: 'tools' } },
+      { path: '/tools', component: ToolsPage },
       { path: '/gateway', component: GatewayPage },
       { path: '/iacc', component: IaccPage },
-      { path: '/audit', component: CapabilityPage, props: { page: 'audit' } },
+      { path: '/audit', component: AuditPage },
       { path: '/settings', component: SettingsPage },
     ],
   });
@@ -71,23 +72,18 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.get('.chat-page').exists()).toBe(true);
   });
 
-  it('renders capability pages with module sections instead of duplicated primary navigation', async () => {
+  it('renders tools management page with real registry controls', async () => {
     const wrapper = await mountApp('/tools');
     await settle();
     expect(wrapper.text()).toContain('Tools Registry');
     expect(wrapper.findAll('.metric-card').length).toBe(3);
-    expect(wrapper.find('.chart-panel').exists()).toBe(true);
-    expect(wrapper.find('.work-table table').exists()).toBe(true);
     expect(wrapper.find('.capability-sidebar').exists()).toBe(true);
     expect(wrapper.find('.session-sidebar').exists()).toBe(false);
-    expect(wrapper.findAll('.section-row').length).toBe(4);
+    expect(wrapper.text()).toContain('Command execution');
+    expect(wrapper.text()).toContain('Risk preflight');
+    expect(wrapper.text()).toContain('Command and risk history');
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Memory');
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Settings');
-    expect(wrapper.findAll('.action-button').length).toBe(0);
-    expect(wrapper.findAll('pre.action-result').length).toBe(0);
-    expect(wrapper.find('.raw-payload').exists()).toBe(true);
-    expect(wrapper.text()).toContain('Live endpoint contract');
-    expect(wrapper.text()).toContain('Offline/Error');
   });
 
   it('marks HTML API fallback as offline instead of successful data', async () => {

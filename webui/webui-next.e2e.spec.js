@@ -26,7 +26,7 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
   await expect(page.locator('.preview-pane')).toHaveCount(0);
 });
 
-test('capability pages expose current-page sections instead of duplicated primary navigation', async ({ page }) => {
+test('tools page exposes current-page management without duplicated primary navigation', async ({ page }) => {
   await page.goto('/index.html#/tools');
   await expect(page.locator('.session-sidebar')).toHaveCount(0);
   await expect(page.locator('.capability-sidebar')).toBeVisible();
@@ -34,12 +34,13 @@ test('capability pages expose current-page sections instead of duplicated primar
   await expect(page.locator('.capability-sidebar')).not.toContainText('Memory Graph');
   await expect(page.locator('.capability-sidebar')).not.toContainText('Settings');
   await expect(page.locator('.metric-card')).toHaveCount(3);
-  await expect(page.locator('.chart-panel canvas, .chart-panel svg, .chart-panel div').first()).toBeVisible();
-  await expect(page.locator('.work-table table')).toBeVisible();
-  await expect(page.locator('.action-button')).toHaveCount(0);
-  await expect(page.locator('pre.action-result')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Tool registry' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Command execution' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Risk preflight' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Command and risk history' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Execute command' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
   await expect(page.locator('.raw-payload').first()).toBeVisible();
-  await expect(page.locator('.status-badge')).toContainText(['offline']);
 });
 
 test('runtime and context pages expose real workbench controls', async ({ page }) => {

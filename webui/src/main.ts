@@ -14,10 +14,10 @@ const routes = [
   { path: '/memory', component: () => import('./pages/MemoryPage.vue') },
   { path: '/skills', component: () => import('./pages/SkillsPage.vue') },
   { path: '/agents', component: () => import('./pages/AgentsPage.vue') },
-  { path: '/tools', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'tools' } },
+  { path: '/tools', component: () => import('./pages/ToolsPage.vue') },
   { path: '/gateway', component: () => import('./pages/GatewayPage.vue') },
   { path: '/iacc', component: () => import('./pages/IaccPage.vue') },
-  { path: '/audit', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'audit' } },
+  { path: '/audit', component: () => import('./pages/AuditPage.vue') },
   { path: '/settings', component: () => import('./pages/SettingsPage.vue') },
 ];
 

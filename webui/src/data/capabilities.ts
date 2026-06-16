@@ -1,328 +1,220 @@
 import type { CapabilitySpec, NavId } from '../types';
 
-export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, CapabilitySpec> = {
-  runtime: {
-    id: 'runtime',
-    title: 'Runtime Control',
-    subtitle: '会话租约、工具流水、价值闭环和控制面健康集中在一个运行视图。',
-    primaryAction: 'Refresh runtime',
-    metrics: [
-      { label: 'Readiness', value: '92%', delta: '+4%', tone: 'success' },
-      { label: 'Open runs', value: 7, delta: '2 active', tone: 'info' },
-      { label: 'Blocked checks', value: 1, delta: 'policy', tone: 'warn' },
-    ],
-    chartKind: 'line',
-    chartTitle: 'Runtime event pressure',
-    chartData: [{ name: '09:00', value: 18 }, { name: '10:00', value: 32 }, { name: '11:00', value: 26 }, { name: '12:00', value: 44 }, { name: '13:00', value: 31 }],
-    tableTitle: 'Recent runtime signals',
-    rows: [
-      { kind: 'ToolStart', status: 'observed', surface: 'webui' },
-      { kind: 'ContextPacket', status: 'ready', surface: 'webui,tui' },
-      { kind: 'Approval', status: 'none', surface: 'kernel' },
-    ],
-    sections: [
+type CapabilityId = Exclude<NavId, 'chat' | 'settings'>;
+
+function spec(
+  id: CapabilityId,
+  title: string,
+  subtitle: string,
+  sections: Array<{ id: string; label: string; description: string }>,
+  actions: Array<{ label: string; kind: 'primary' | 'secondary' | 'danger'; endpoint?: string }>,
+  inspector: Array<{ label: string; value: string }>,
+): CapabilitySpec {
+  return {
+    id,
+    title,
+    subtitle,
+    primaryAction: actions[0]?.label || 'Refresh',
+    metrics: [],
+    chartKind: 'bar',
+    chartTitle: '',
+    chartData: [],
+    tableTitle: '',
+    rows: [],
+    sections,
+    actions,
+    inspector,
+  };
+}
+
+export const capabilitySpecs: Record<CapabilityId, CapabilitySpec> = {
+  runtime: spec(
+    'runtime',
+    'Runtime Control',
+    '会话租约、工具流水、价值闭环和控制面健康集中在一个运行视图。',
+    [
       { id: 'overview', label: 'Overview', description: 'Health, readiness, blocked checks, and current control-plane state.' },
       { id: 'runs', label: 'Runs', description: 'Session runs, value-loop stages, leases, and active execution history.' },
       { id: 'policy', label: 'Policy', description: 'Runtime policy, observability switches, provider reload, and production gates.' },
       { id: 'timeline', label: 'Timeline', description: 'Chronological runtime events with tool/context/approval boundaries.' },
     ],
-    actions: [
+    [
       { label: 'Refresh runtime', kind: 'primary', endpoint: '/api/runtime/timeline' },
       { label: 'Reload providers', kind: 'secondary', endpoint: '/api/runtime/providers/reload' },
       { label: 'Acquire lease', kind: 'secondary', endpoint: '/api/runtime/session-leases/acquire' },
     ],
-    inspector: [
+    [
       { label: 'API', value: '/api/runtime/control-plane' },
       { label: 'Parity', value: 'WebUI and TUI full control surface' },
       { label: 'CLI', value: 'core-only status and import commands' },
     ],
-  },
-  context: {
-    id: 'context',
-    title: 'Context Studio',
-    subtitle: '把上下文预算、证据来源、压缩策略和注入效果用可审计视图展开。',
-    primaryAction: 'Build packet',
-    metrics: [
-      { label: 'Budget used', value: '63%', delta: 'stable', tone: 'info' },
-      { label: 'Evidence', value: 42, delta: '+8', tone: 'success' },
-      { label: 'Pressure', value: 'Low', delta: '84 bp', tone: 'neutral' },
-    ],
-    chartKind: 'donut',
-    chartTitle: 'Context source mix',
-    chartData: [{ name: 'Memory', value: 38 }, { name: 'Workspace', value: 24 }, { name: 'Session', value: 29 }, { name: 'Tools', value: 9 }],
-    tableTitle: 'Evidence queue',
-    rows: [
-      { source: 'memory', confidence: '0.91', action: 'inject' },
-      { source: 'workspace', confidence: '0.86', action: 'preview' },
-      { source: 'session', confidence: '0.79', action: 'summarize' },
-    ],
-    sections: [
+  ),
+  context: spec(
+    'context',
+    'Context Studio',
+    '把上下文预算、证据来源、压缩策略和注入效果用可审计视图展开。',
+    [
       { id: 'packet', label: 'Packet builder', description: 'Build and preview current context packets before a turn.' },
       { id: 'budget', label: 'Budget', description: 'Token pressure, source mix, compression barriers, and reuse strategy.' },
       { id: 'evidence', label: 'Evidence', description: 'Resolve evidence refs, source confidence, and injection decisions.' },
       { id: 'history', label: 'History', description: 'Persisted envelopes and recommendations for the active session.' },
     ],
-    actions: [
+    [
       { label: 'Build packet', kind: 'primary', endpoint: '/api/context/current' },
       { label: 'Resolve evidence', kind: 'secondary', endpoint: '/api/evidence/resolve' },
       { label: 'Record recommendation', kind: 'secondary', endpoint: '/api/sessions/:id/context/recommendations' },
     ],
-    inspector: [
+    [
       { label: 'API', value: '/api/context/current' },
       { label: 'Kernel role', value: 'Context orchestration and evidence routing' },
       { label: 'Memory link', value: 'Recall packets and facts feed context packets' },
     ],
-  },
-  memory: {
-    id: 'memory',
-    title: 'Memory Graph',
-    subtitle: '长期记忆、事实判断、实体关系和维护任务在统一知识层协作。',
-    primaryAction: 'Scan memory',
-    metrics: [
-      { label: 'Entities', value: 216, delta: '+12', tone: 'success' },
-      { label: 'Triples', value: 804, delta: '+31', tone: 'info' },
-      { label: 'Conflicts', value: 3, delta: 'review', tone: 'warn' },
-    ],
-    chartKind: 'graph',
-    chartTitle: 'Memory relation graph',
-    chartData: [{ name: 'Facts', value: 34 }, { name: 'Entities', value: 46 }, { name: 'Sources', value: 20 }],
-    tableTitle: 'Fact checks',
-    rows: [
-      { fact: 'cowd kernel owns structured data', result: 'supported', confidence: '0.93' },
-      { fact: 'iacc is upper application', result: 'supported', confidence: '0.91' },
-      { fact: 'workspace is left rail page', result: 'rejected', confidence: '0.98' },
-    ],
-    sections: [
+  ),
+  memory: spec(
+    'memory',
+    'Memory Graph',
+    '长期记忆、事实判断、实体关系和维护任务在统一知识层协作。',
+    [
       { id: 'recall', label: 'Recall', description: 'Search, explain, and assemble memory packets for current work.' },
       { id: 'entities', label: 'Entities', description: 'Detected entities, symbols, triples, and links.' },
       { id: 'facts', label: 'Facts', description: 'Fact registration, checking, conflict detection, and audit.' },
       { id: 'maintenance', label: 'Maintenance', description: 'Stale candidates, lifecycle review, and repair actions.' },
     ],
-    actions: [
+    [
       { label: 'Scan memory', kind: 'primary', endpoint: '/api/memory/maintenance' },
       { label: 'Check facts', kind: 'secondary', endpoint: '/api/memory/facts/check' },
       { label: 'Build memory packet', kind: 'secondary', endpoint: '/api/memory/packet' },
     ],
-    inspector: [
+    [
       { label: 'API', value: '/api/memory/status' },
       { label: 'Long memory', value: 'Facts, entities, triples, clusters, links' },
       { label: 'Structured data', value: 'Facts can be grounded by structured evidence' },
     ],
-  },
-  skills: {
-    id: 'skills',
-    title: 'Skills Console',
-    subtitle: '技能全集、投影、运行记录和 WebUI/TUI 能力对齐集中管理。',
-    primaryAction: 'Validate skill',
-    metrics: [
-      { label: 'Installed', value: 37, delta: 'all indexed', tone: 'success' },
-      { label: 'Runnable', value: 31, delta: '+3', tone: 'info' },
-      { label: 'Needs review', value: 2, delta: 'manifest', tone: 'warn' },
-    ],
-    chartKind: 'bar',
-    chartTitle: 'Skill coverage by surface',
-    chartData: [{ name: 'WebUI', value: 37 }, { name: 'TUI', value: 37 }, { name: 'CLI', value: 8 }, { name: 'IACC', value: 11 }],
-    tableTitle: 'Skill projection',
-    rows: [
-      { skill: 'frontend-app-builder', surface: 'webui', status: 'ready' },
-      { skill: 'gitnexus-debugging', surface: 'kernel', status: 'ready' },
-      { skill: 'manufacturing-cockpit', surface: 'iacc', status: 'planned' },
-    ],
-    sections: [
+  ),
+  skills: spec(
+    'skills',
+    'Skills Console',
+    '技能全集、投影、运行记录和 WebUI/TUI 能力对齐集中管理。',
+    [
       { id: 'catalog', label: 'Catalog', description: 'Installed and discovered skills with manifest health.' },
       { id: 'projection', label: 'Projection', description: 'WebUI/TUI/CLI/IACC surface mapping and capability parity.' },
       { id: 'runs', label: 'Runs', description: 'Skill run history, validation, planning, and execution results.' },
       { id: 'governance', label: 'Governance', description: 'Permissions, evidence model, approval needs, and risk.' },
     ],
-    actions: [
+    [
       { label: 'Validate skill', kind: 'primary', endpoint: '/api/skills/:id/actions/validate' },
       { label: 'Plan run', kind: 'secondary', endpoint: '/api/skills/:id/actions/plan' },
       { label: 'Run skill', kind: 'secondary', endpoint: '/api/skills/:id/actions/run' },
     ],
-    inspector: [
+    [
       { label: 'API', value: '/api/skills/projection' },
       { label: 'Parity', value: 'WebUI and TUI capability全集' },
       { label: 'CLI', value: 'Install, list, invoke core only' },
     ],
-  },
-  agents: {
-    id: 'agents',
-    title: 'Agents Workbench',
-    subtitle: '多 agent 分工、执行状态、审阅结果和并行路线以工作流方式呈现。',
-    primaryAction: 'Spawn lane',
-    metrics: [
-      { label: 'Running', value: 4, delta: 'parallel', tone: 'info' },
-      { label: 'Completed', value: 18, delta: '+5', tone: 'success' },
-      { label: 'Blocked', value: 1, delta: 'needs input', tone: 'warn' },
-    ],
-    chartKind: 'graph',
-    chartTitle: 'Agent execution flow',
-    chartData: [{ name: 'Plan', value: 1 }, { name: 'Build', value: 3 }, { name: 'Review', value: 2 }],
-    tableTitle: 'Agent lanes',
-    rows: [
-      { lane: 'shell', owner: 'frontend', status: 'done' },
-      { lane: 'workspace', owner: 'frontend', status: 'active' },
-      { lane: 'audit', owner: 'qa', status: 'queued' },
-    ],
-    sections: [
+  ),
+  agents: spec(
+    'agents',
+    'Agents Workbench',
+    '多 agent 分工、执行状态、审阅结果和并行路线以工作流方式呈现。',
+    [
       { id: 'lanes', label: 'Lanes', description: 'Parallel execution lanes, owners, blocker status, and outputs.' },
       { id: 'graph', label: 'Work graph', description: 'Dependencies, review handoff, and current execution topology.' },
       { id: 'review', label: 'Review', description: 'Agent result review, merge readiness, and evidence quality.' },
       { id: 'terminal', label: 'Terminal state', description: 'Spawn manifests, running status, and persisted outputs.' },
     ],
-    actions: [
+    [
       { label: 'Spawn lane', kind: 'primary', endpoint: '/api/tasks/:id/agent-graph' },
       { label: 'Review phase', kind: 'secondary', endpoint: '/api/tasks/:id/phases/:phase/review' },
       { label: 'Cancel task', kind: 'danger', endpoint: '/api/tasks/:id/cancel' },
     ],
-    inspector: [
+    [
       { label: 'API', value: '/api/agents/runs' },
       { label: 'Execution', value: 'Parallel lanes with review gate' },
       { label: 'Output', value: 'Manifests and artifacts are persisted' },
     ],
-  },
-  tools: {
-    id: 'tools',
-    title: 'Tools Registry',
-    subtitle: '工具目录、调用历史、风险分级和输出路径联动到 Activity 与 Workspace。',
-    primaryAction: 'Run preflight',
-    metrics: [
-      { label: 'Registered', value: 128, delta: '+6', tone: 'success' },
-      { label: 'High risk', value: 9, delta: 'guarded', tone: 'warn' },
-      { label: 'Failures', value: '1.8%', delta: '-0.4%', tone: 'success' },
-    ],
-    chartKind: 'heatmap',
-    chartTitle: 'Tool usage heatmap',
-    chartData: [{ name: 'Read', value: 46 }, { name: 'Write', value: 18 }, { name: 'Shell', value: 22 }, { name: 'Network', value: 8 }],
-    tableTitle: 'Tool activity',
-    rows: [
-      { tool: 'read_file', risk: 'low', status: 'ready' },
-      { tool: 'apply_patch', risk: 'medium', status: 'guarded' },
-      { tool: 'exec_command', risk: 'medium', status: 'ready' },
-    ],
-    sections: [
+  ),
+  tools: spec(
+    'tools',
+    'Tools Registry',
+    '工具目录、调用历史、风险分级和输出路径联动到 Activity 与 Workspace。',
+    [
       { id: 'registry', label: 'Registry', description: 'Tool catalog, schemas, permissions, and availability.' },
       { id: 'history', label: 'History', description: 'Recent calls, outputs, errors, and path references.' },
       { id: 'risk', label: 'Risk', description: 'Approval policy, destructive actions, and preflight checks.' },
       { id: 'links', label: 'Path links', description: 'Tool outputs that can jump into Workspace preview/edit.' },
     ],
-    actions: [
+    [
       { label: 'Run preflight', kind: 'primary', endpoint: '/api/cross-plane/action/preflight' },
       { label: 'Simulate policy', kind: 'secondary', endpoint: '/api/cross-plane/policy/simulate' },
       { label: 'Open history', kind: 'secondary', endpoint: '/api/commands/history' },
     ],
-    inspector: [
-      { label: 'API', value: '/api/cowd/capabilities' },
+    [
+      { label: 'API', value: '/api/tools' },
       { label: 'Safety', value: 'Approval-aware actions' },
       { label: 'Workspace', value: 'Path outputs open right Workspace tab' },
     ],
-  },
-  gateway: {
-    id: 'gateway',
-    title: 'Gateway Channels',
-    subtitle: '个人微信、飞书、MCP 和服务连接器的账号、能力、审计与健康集中治理。',
-    primaryAction: 'Recheck channels',
-    metrics: [
-      { label: 'Accounts', value: 5, delta: '3 ready', tone: 'info' },
-      { label: 'Connectors', value: 14, delta: '+2', tone: 'success' },
-      { label: 'Blocked', value: 1, delta: 'auth', tone: 'warn' },
+  ),
+  gateway: spec(
+    'gateway',
+    'Gateway and Cross-plane',
+    '外部平台、连接器资源、MCP 服务、身份授权和跨平面执行统一管理。',
+    [
+      { id: 'connectors', label: 'Connectors', description: 'Platform accounts, connector capabilities, and MCP server bindings.' },
+      { id: 'resources', label: 'Resources', description: 'Resource directory validation and promotion into memory.' },
+      { id: 'identities', label: 'Identities', description: 'Identity bindings, grants, policy simulation, and revocation.' },
+      { id: 'executions', label: 'Executions', description: 'Cross-plane action preflight, dry-run/live execution, and receipts.' },
     ],
-    chartKind: 'bar',
-    chartTitle: 'Channel readiness',
-    chartData: [{ name: 'Wechat', value: 71 }, { name: 'Feishu', value: 88 }, { name: 'MCP', value: 64 }, { name: 'HTTP', value: 93 }],
-    tableTitle: 'Channel checks',
-    rows: [
-      { channel: 'wechat-ilink', status: 'needs qr', capability: 'message' },
-      { channel: 'feishu', status: 'ready', capability: 'docs' },
-      { channel: 'mcp', status: 'ready', capability: 'tools' },
+    [
+      { label: 'Run preflight', kind: 'primary', endpoint: '/api/cross-plane/action/preflight' },
+      { label: 'Create identity', kind: 'secondary', endpoint: '/api/cross-plane/identities' },
+      { label: 'Create grant', kind: 'secondary', endpoint: '/api/cross-plane/grants' },
     ],
-    sections: [
-      { id: 'accounts', label: 'Accounts', description: 'Wechat, Feishu, MCP, and connector account readiness.' },
-      { id: 'capabilities', label: 'Capabilities', description: 'Available operations by platform and service connector.' },
-      { id: 'composer', label: 'Composer', description: 'Message or document delivery test surface.' },
-      { id: 'audit', label: 'Audit', description: 'External action evidence, resource promotion, and policy trace.' },
+    [
+      { label: 'API', value: '/api/cross-plane/summary' },
+      { label: 'Connectors', value: '/api/connectors/resources' },
+      { label: 'Governance', value: 'Identities, grants, audit, executions' },
     ],
-    actions: [
-      { label: 'Recheck channels', kind: 'primary', endpoint: '/api/connectors/summary' },
-      { label: 'Start WeChat QR', kind: 'secondary', endpoint: '/api/channels/wechat-ilink/qr' },
-      { label: 'Promote resource', kind: 'secondary', endpoint: '/api/connectors/resources/promote-memory' },
+  ),
+  iacc: spec(
+    'iacc',
+    'IACC Manufacturing Application',
+    'IACC 是制造领域上层应用，运行在 cowd 内核的数据、记忆、上下文与跨平面能力之上。',
+    [
+      { id: 'data-plane', label: 'Data plane', description: 'Manufacturing data ingest planning, source packs, and connector runs.' },
+      { id: 'entities', label: 'Entities', description: 'Manufacturing entities, source key resolution, relations, and impact paths.' },
+      { id: 'metrics', label: 'Metrics', description: 'Metric lineage, materialization, attention plans, and compute jobs.' },
+      { id: 'incidents', label: 'Incidents', description: 'Incident room, evidence quality, playbooks, skills, and actions.' },
     ],
-    inspector: [
-      { label: 'API', value: '/api/connectors/summary' },
-      { label: 'Wechat', value: 'QR login and message receive loop' },
-      { label: 'Feishu', value: 'Read-only docs and reaction runtime' },
+    [
+      { label: 'Seed manufacturing fact', kind: 'primary', endpoint: '/api/iacc/facts/ingest' },
+      { label: 'Plan compute job', kind: 'secondary', endpoint: '/api/iacc/compute/jobs/plan' },
+      { label: 'Generate report', kind: 'secondary', endpoint: '/api/iacc/cockpit/profiles/:id/reports/generate' },
     ],
-  },
-  iacc: {
-    id: 'iacc',
-    title: 'IACC Manufacturing',
-    subtitle: '制造领域作为 cowd 上层应用，使用底层结构化数据、记忆和网关能力完成业务闭环。',
-    primaryAction: 'Generate report',
-    metrics: [
-      { label: 'Profiles', value: 12, delta: '+2', tone: 'success' },
-      { label: 'Source packs', value: 28, delta: 'fresh', tone: 'info' },
-      { label: 'Risks', value: 4, delta: 'review', tone: 'warn' },
+    [
+      { label: 'API', value: '/api/iacc/app' },
+      { label: 'Boundary', value: 'Application layer, not cowd kernel' },
+      { label: 'Kernel dependency', value: 'Structured data, memory, context, cross-plane' },
     ],
-    chartKind: 'radar',
-    chartTitle: 'Manufacturing cockpit maturity',
-    chartData: [{ name: 'Quality', value: 82 }, { name: 'Delivery', value: 74 }, { name: 'Cost', value: 68 }, { name: 'Safety', value: 91 }, { name: 'Evidence', value: 77 }],
-    tableTitle: 'Cockpit reports',
-    rows: [
-      { report: 'quality-weekly', cadence: 'weekly', status: 'ready' },
-      { report: 'risk-daily', cadence: 'daily', status: 'scheduled' },
-      { report: 'supplier-monthly', cadence: 'monthly', status: 'draft' },
+  ),
+  audit: spec(
+    'audit',
+    'Audit and Governance',
+    '审计导出、使用统计、发布门禁、审批历史和跨平面回执集中核查。',
+    [
+      { id: 'export', label: 'Export', description: 'Approval and memory audit records with filters and pagination.' },
+      { id: 'usage', label: 'Usage', description: 'Usage rollups by platform, session, tokens, and estimated cost.' },
+      { id: 'release', label: 'Release gate', description: 'Surface capability projection and release gate checks.' },
+      { id: 'evidence', label: 'Evidence', description: 'Approval history, cross-plane audit, and execution receipts.' },
     ],
-    sections: [
-      { id: 'cockpit', label: 'Cockpit', description: 'Manufacturing cockpit profiles, readiness, and scheduled reports.' },
-      { id: 'sources', label: 'Source packs', description: 'Manufacturing source packs, ingestion, and structured evidence.' },
-      { id: 'reports', label: 'Reports', description: 'Report generation, delivery state, retry, and review.' },
-      { id: 'governance', label: 'Governance', description: 'Thresholds, ownership, risk, and audit for manufacturing workflows.' },
+    [
+      { label: 'Refresh audit', kind: 'primary', endpoint: '/api/audit/export' },
+      { label: 'Load release gate', kind: 'secondary', endpoint: '/api/cowd/release-gate' },
+      { label: 'Load cross-plane audit', kind: 'secondary', endpoint: '/api/cross-plane/audit' },
     ],
-    actions: [
-      { label: 'Generate report', kind: 'primary', endpoint: '/api/iacc/cockpit/reports/:id' },
-      { label: 'Run schedule', kind: 'secondary', endpoint: '/api/iacc/cockpit/reports/schedules/run' },
-      { label: 'Retry delivery', kind: 'secondary', endpoint: '/api/iacc/cockpit/reports/:id/delivery/retry' },
-    ],
-    inspector: [
-      { label: 'Boundary', value: 'IACC is upper application, cowd is kernel' },
-      { label: 'API', value: '/api/iacc/health' },
-      { label: 'Data', value: 'Structured evidence stays in kernel' },
-    ],
-  },
-  audit: {
-    id: 'audit',
-    title: 'Audit Trail',
-    subtitle: '所有配置、能力调用、跨平面动作和外部连接都必须留下可导出的证据。',
-    primaryAction: 'Export audit',
-    metrics: [
-      { label: 'Events', value: '2.4k', delta: '+184', tone: 'info' },
-      { label: 'Policy pass', value: '97%', delta: '+1%', tone: 'success' },
-      { label: 'Review', value: 6, delta: 'open', tone: 'warn' },
-    ],
-    chartKind: 'line',
-    chartTitle: 'Audit events over time',
-    chartData: [{ name: 'Mon', value: 120 }, { name: 'Tue', value: 182 }, { name: 'Wed', value: 150 }, { name: 'Thu', value: 211 }, { name: 'Fri', value: 168 }],
-    tableTitle: 'Recent audit events',
-    rows: [
-      { event: 'workspace.file.preview', actor: 'webui', result: 'allowed' },
-      { event: 'gateway.wechat.qr', actor: 'operator', result: 'pending' },
-      { event: 'skill.run', actor: 'agent', result: 'allowed' },
-    ],
-    sections: [
-      { id: 'events', label: 'Events', description: 'All policy, tool, connector, and configuration events.' },
-      { id: 'export', label: 'Export', description: 'Filter, export, and attach audit evidence to review.' },
-      { id: 'policy', label: 'Policy', description: 'Allowed, blocked, pending, and escalated decisions.' },
-      { id: 'cross-plane', label: 'Cross-plane', description: 'Identity grants, action adapters, and external execution trace.' },
-    ],
-    actions: [
-      { label: 'Export audit', kind: 'primary', endpoint: '/api/audit/export' },
-      { label: 'Resolve identity', kind: 'secondary', endpoint: '/api/cross-plane/identity/resolve' },
-      { label: 'Revoke grant', kind: 'danger', endpoint: '/api/cross-plane/grants/:id' },
-    ],
-    inspector: [
+    [
       { label: 'API', value: '/api/audit/export' },
-      { label: 'Governance', value: 'Every external action should be explainable' },
-      { label: 'Evidence', value: 'Exportable for review and reports' },
+      { label: 'Governance', value: 'Approval, memory, cross-plane, release gate' },
+      { label: 'Evidence', value: 'Receipts and checks are shown as first-class records' },
     ],
-  },
+  ),
 };
