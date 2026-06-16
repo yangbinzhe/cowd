@@ -50,6 +50,15 @@ test('runtime and context pages expose real workbench controls', async ({ page }
   await expect(page.getByRole('heading', { name: 'Evidence resolve' })).toBeVisible();
 });
 
+test('memory page exposes memory and structured-data kernel controls', async ({ page }) => {
+  await page.goto('/index.html#/memory');
+  await expect(page.getByRole('heading', { name: 'Search, recall, packet' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Register memory fact' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Structured data core' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Plan manufacturing ingest' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Scan candidates' })).toBeVisible();
+});
+
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();

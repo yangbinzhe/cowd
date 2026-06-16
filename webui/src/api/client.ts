@@ -258,6 +258,33 @@ export const api = {
     body: JSON.stringify({ envelope_id: envelopeId, recommendation, action }),
   }),
   resolveEvidence: (ref: string) => read(`/api/evidence/resolve?ref=${encodeURIComponent(ref)}`, {}),
+  memorySearch: (q: string) => read(`/api/memory/search?q=${encodeURIComponent(q)}`, {}),
+  memoryPacket: (q: string) => read(`/api/memory/packet?q=${encodeURIComponent(q)}`, {}),
+  createMemoryEntry: (layer: string, body: Record<string, unknown>) => write(`/api/memory/${encodeURIComponent(layer)}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  updateMemoryEntry: (id: string, body: Record<string, unknown>) => write(`/api/memory/entry/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  }),
+  deleteMemoryEntry: (layer: string, id: string) => write(`/api/memory/${encodeURIComponent(layer)}/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  scanMemoryMaintenance: (body: Record<string, unknown> = {}) => write('/api/memory/maintenance', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  updateMemoryMaintenance: (id: string, status: string) => write(`/api/memory/maintenance/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  }),
+  structuredSources: () => read('/api/cowd/structured/sources', {}),
+  structuredFacts: () => read('/api/cowd/structured/facts', {}),
+  structuredEvidence: () => read('/api/cowd/structured/evidence', {}),
+  structuredWatermarks: () => read('/api/cowd/structured/watermarks', {}),
+  structuredIngestPlan: (body: Record<string, unknown>) => write('/api/cowd/structured/ingest-plan', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',

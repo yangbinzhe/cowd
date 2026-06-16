@@ -28,11 +28,22 @@ const contextHistory = ref<any>(null);
 const contextRecommendations = ref<any>(null);
 const evidenceRef = ref('workspace://changed-file/README.md');
 const evidenceResult = ref<any>(null);
+const memoryQuery = ref('manufacturing quality anomaly');
+const memoryLayer = ref('L2');
+const memoryContent = ref('Manufacturing line A reported repeated torque deviation on station 3 with batch QA-2026-0616.');
+const memoryResult = ref<any>(null);
+const memoryPacket = ref<any>(null);
+const maintenanceResult = ref<any>(null);
+const structuredSourceRef = ref('service://iacc/manufacturing/demo-line-a');
+const structuredFactType = ref('manufacturing_quality_event');
+const structuredPlan = ref<any>(null);
+const structuredCollections = ref<any>(null);
 
 async function refresh() {
   await store.loadCapability(props.page);
   if (props.page === 'runtime') await loadRuntimeWorkbench();
   if (props.page === 'context') await loadContextWorkbench();
+  if (props.page === 'memory') await loadMemoryWorkbench();
 }
 
 function preview(data: any) {
@@ -91,6 +102,50 @@ async function loadContextWorkbench() {
 
 async function resolveEvidence() {
   evidenceResult.value = await api.resolveEvidence(evidenceRef.value);
+}
+
+async function loadMemoryWorkbench() {
+  workbenchError.value = '';
+  try {
+    const [search, packet, sources, facts, evidence, watermarks] = await Promise.all([
+      api.memorySearch(memoryQuery.value),
+      api.memoryPacket(memoryQuery.value),
+      api.structuredSources(),
+      api.structuredFacts(),
+      api.structuredEvidence(),
+      api.structuredWatermarks(),
+    ]);
+    memoryResult.value = search;
+    memoryPacket.value = packet;
+    structuredCollections.value = { sources, facts, evidence, watermarks };
+  } catch (error) {
+    workbenchError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function createMemoryFact() {
+  memoryResult.value = await api.createMemoryEntry(memoryLayer.value, {
+    title: 'Manufacturing quality signal',
+    content: memoryContent.value,
+    category: 'reference',
+    priority: 'high',
+    tags: ['manufacturing', 'quality', 'v0.9.220'],
+  });
+  await loadMemoryWorkbench();
+}
+
+async function scanMaintenance() {
+  maintenanceResult.value = await api.scanMemoryMaintenance({ max_candidates: 20 });
+}
+
+async function planStructuredIngest() {
+  structuredPlan.value = await api.structuredIngestPlan({
+    source_ref: structuredSourceRef.value,
+    fact_type: structuredFactType.value,
+    estimated_rows: 128,
+    raw_checksum: 'sha256:manufacturing-demo-v0.9.220',
+    metric_ids: ['torque_deviation_rate', 'station_quality_escape'],
+  });
 }
 
 onMounted(refresh);
@@ -265,6 +320,69 @@ watch(() => props.page, refresh);
           <span>active session</span>
         </header>
         <pre class="action-result">{{ preview({ history: contextHistory, recommendations: contextRecommendations }) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'memory'" class="management-grid memory-workbench">
+      <article class="management-panel">
+        <header>
+          <h2>Search, recall, packet</h2>
+          <span>memory kernel</span>
+        </header>
+        <label class="field-line">
+          Query
+          <input v-model="memoryQuery" type="text" @keydown.enter.prevent="loadMemoryWorkbench" />
+        </label>
+        <button class="primary-action" type="button" @click="loadMemoryWorkbench">Search and build packet</button>
+        <pre class="action-result">{{ preview({ search: memoryResult, packet: memoryPacket }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Memory entry</h2>
+          <span>create/update/delete APIs</span>
+        </header>
+        <label class="field-line">
+          Layer
+          <select v-model="memoryLayer">
+            <option>L0</option>
+            <option>L1</option>
+            <option>L2</option>
+            <option>L3</option>
+            <option>L4</option>
+          </select>
+        </label>
+        <label class="field-line">
+          Manufacturing fact
+          <textarea v-model="memoryContent" rows="4" />
+        </label>
+        <button class="primary-action" type="button" @click="createMemoryFact">Register memory fact</button>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Structured data core</h2>
+          <span>cowd kernel</span>
+        </header>
+        <label class="field-line">
+          Source ref
+          <input v-model="structuredSourceRef" type="text" />
+        </label>
+        <label class="field-line">
+          Fact type
+          <input v-model="structuredFactType" type="text" />
+        </label>
+        <button class="ghost-action" type="button" @click="planStructuredIngest">Plan manufacturing ingest</button>
+        <pre class="action-result">{{ preview({ plan: structuredPlan, collections: structuredCollections }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Maintenance</h2>
+          <span>scan/update</span>
+        </header>
+        <button class="ghost-action" type="button" @click="scanMaintenance">Scan candidates</button>
+        <pre class="action-result">{{ preview(maintenanceResult || {}) }}</pre>
       </article>
     </section>
 

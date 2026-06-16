@@ -151,7 +151,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .detail-list dt { color: var(--text-faint); font-size: 12px; }
 .detail-list dd { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .field-line { display: grid; gap: 6px; margin: 10px 0; color: var(--text-muted); font-size: 12px; }
-.field-line input, .field-line select { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 9px 10px; }
+.field-line input, .field-line select, .field-line textarea { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 9px 10px; }
+.field-line textarea { resize: vertical; font-family: inherit; line-height: 1.45; }
 .button-row { display: flex; gap: 8px; align-items: center; }
 .approval-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 8px; }
 .approval-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
