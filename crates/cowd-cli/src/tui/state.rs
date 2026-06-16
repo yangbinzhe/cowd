@@ -1722,7 +1722,8 @@ impl TuiState {
         }
         if matches!(key.code, KeyCode::Up | KeyCode::Down)
             && key.modifiers.is_empty()
-            && (self.focus_target == FocusTarget::Input || !self.app.input.is_empty())
+            && self.focus_target == FocusTarget::Input
+            && (self.input_text().trim().is_empty() || self.app.history_idx.is_some())
         {
             self.dispatch_action(Action::HistoryBrowse(matches!(key.code, KeyCode::Up)));
             self.set_focus_target(FocusTarget::Input);
@@ -1963,7 +1964,14 @@ impl TuiState {
         // Non-char textarea keys
         matches!(
             event.code,
-            KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+            KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
         )
     }
 
@@ -2602,11 +2610,19 @@ impl TuiState {
                 self.app.toggle_expand_current();
             }
             Action::Copy => {
-                if self.app.copy_focused_content() {
+                let focus = self.focus_for_current_surface();
+                let copied = if matches!(focus, FocusTarget::Activity)
+                    || (matches!(focus, FocusTarget::Sidebar) && self.sidebar_active_tab == 0)
+                {
+                    self.runtime_activity_panel.copy_text()
+                } else {
+                    self.app.copy_focused_content()
+                };
+                if copied {
                     self.toast_manager.push(
                         ToastVariant::Success,
                         Some("Copied".into()),
-                        "Entry content copied to clipboard".into(),
+                        "Focused content copied to clipboard".into(),
                         2000,
                     );
                 } else {
@@ -4560,7 +4576,10 @@ providers:
         assert!(joined.contains("Memory"));
         assert!(joined.contains("topic panel"));
         assert!(joined.contains("Input"));
-        assert!(joined.contains("focus:memory"));
+        assert!(
+            !joined.contains("focus:memory"),
+            "focus should not be pinned in footer: {joined}"
+        );
     }
 
     #[test]
@@ -4835,8 +4854,12 @@ providers:
         let joined = terminal.buffer_lines().join("\n");
 
         assert!(
-            joined.contains("state thinking"),
-            "missing top thinking state: {joined}"
+            joined.contains("|  thinking"),
+            "missing top thinking state after stats: {joined}"
+        );
+        assert!(
+            !joined.contains("state "),
+            "top bar should not render the word state: {joined}"
         );
         assert!(
             !joined.contains("details in Process"),
@@ -4862,6 +4885,19 @@ providers:
         let result = state.process_raw_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(result, ProcessedKey::Nothing));
         assert_eq!(state.input_text(), "");
+    }
+
+    #[test]
+    fn input_up_down_moves_cursor_when_input_has_content() {
+        let mut state = TuiState::new("m", "s");
+        state.app.input_history.push("history".into());
+        state.replace_input_text("first\nsecond");
+        state.set_focus_target(FocusTarget::Input);
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert_eq!(state.input_text(), "first\nsecond");
+        assert_eq!(state.app.history_idx, None);
     }
 
     #[test]

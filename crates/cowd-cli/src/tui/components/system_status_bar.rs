@@ -14,8 +14,12 @@ use crate::tui::components::{Component, EventResult, RenderContext};
 pub struct SystemStatusBar {
     runtime: String,
     turn: String,
+    thinking_count: u32,
     tool_count: u32,
     reply_count: u32,
+    event_count: u32,
+    approval_count: u64,
+    permission_count: usize,
     last_phase: String,
     session_id: String,
     daemon: String,
@@ -35,12 +39,19 @@ impl SystemStatusBar {
         self.runtime = runtime_health(app).to_string();
         self.turn = if app.turn_active {
             if app.timeline_iter().any(|(_, entry)| {
-                matches!(entry, TimelineEntry::Thinking { complete: false, .. })
+                matches!(
+                    entry,
+                    TimelineEntry::Thinking {
+                        complete: false,
+                        ..
+                    }
+                )
             }) {
                 "thinking".to_string()
-            } else if app.timeline_iter().any(|(_, entry)| {
-                matches!(entry, TimelineEntry::ToolCall { done: false, .. })
-            }) {
+            } else if app
+                .timeline_iter()
+                .any(|(_, entry)| matches!(entry, TimelineEntry::ToolCall { done: false, .. }))
+            {
                 "tool".to_string()
             } else {
                 "running".to_string()
@@ -49,16 +60,29 @@ impl SystemStatusBar {
             "idle".to_string()
         };
         self.session_id = app.session_id.clone();
-        self.tool_count = 0;
-        self.reply_count = 0;
+        let stats = app.session_activity_stats();
+        self.thinking_count = stats.thinking_count as u32;
+        self.tool_count = stats.tool_count as u32;
+        self.reply_count = stats.message_count as u32;
+        self.event_count = stats.event_count as u32;
+        self.approval_count = app
+            .daemon_pending_approvals
+            .unwrap_or_default()
+            .max(app.permission_count as u64)
+            + u64::from(app.approval.is_some());
+        self.permission_count = app.permission_count;
         self.last_phase = "idle".to_string();
         for (_, entry) in app.timeline_iter() {
             match entry {
                 TimelineEntry::Thinking { complete, .. } => {
-                    self.last_phase = if *complete { "thought saved" } else { "thinking" }.into();
+                    self.last_phase = if *complete {
+                        "thought saved"
+                    } else {
+                        "thinking"
+                    }
+                    .into();
                 }
                 TimelineEntry::ToolCall { name, done, .. } => {
-                    self.tool_count += 1;
                     self.last_phase = if *done {
                         format!("tool {name} done")
                     } else {
@@ -66,9 +90,6 @@ impl SystemStatusBar {
                     };
                 }
                 TimelineEntry::Message { role, .. } => {
-                    if role == "assistant" {
-                        self.reply_count += 1;
-                    }
                     self.last_phase = format!("{role} message");
                 }
                 TimelineEntry::SlashOutput { command, .. } => {
@@ -123,17 +144,23 @@ impl Component for SystemStatusBar {
                 Style::default().fg(Color::White),
             ),
             sep(),
-            Span::styled("state ", Style::default().fg(Color::DarkGray)),
-            Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
+            Span::styled(
+                format!("approvals:{} ", self.approval_count),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("perm:{} ", self.permission_count),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled(
                 format!(
-                    "  ◌:{} ⚙:{} ↳:{}",
-                    u8::from(self.turn == "thinking"),
-                    self.tool_count,
-                    self.reply_count
+                    "🧠:{} ⚙:{} 💬:{} ◇:{}",
+                    self.thinking_count, self.tool_count, self.reply_count, self.event_count
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
+            sep(),
+            Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
             Span::styled(
                 format!("  {}", preview(&self.last_phase, 28)),
                 Style::default().fg(turn_color),
@@ -296,7 +323,7 @@ mod tests {
         let joined = terminal.buffer_lines().join("\n");
         assert!(joined.contains("cowd"));
         assert!(joined.contains("session"));
-        assert!(joined.contains("state"));
+        assert!(!joined.contains("state"));
         assert!(!joined.contains("provider"));
         assert!(!joined.contains("gateway"));
         assert!(!joined.contains("connectors"));

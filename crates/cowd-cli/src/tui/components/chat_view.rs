@@ -41,6 +41,9 @@ pub struct ChatView {
     pub turn_active: bool,
     turn_input_tokens: u64,
     turn_output_tokens: u64,
+    session_input_tokens: u64,
+    session_output_tokens: u64,
+    memory_total_entries: usize,
     spinner_idx: usize,
 
     // ── Message menu (Task 5) ──
@@ -73,6 +76,12 @@ pub struct ChatView {
     pub search_current: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ChatTurnStats {
+    thinking_count: usize,
+    tool_count: usize,
+}
+
 impl ChatView {
     fn renders_in_main_chat(entry: &TimelineEntry) -> bool {
         matches!(
@@ -98,6 +107,9 @@ impl ChatView {
             turn_active: false,
             turn_input_tokens: 0,
             turn_output_tokens: 0,
+            session_input_tokens: 0,
+            session_output_tokens: 0,
+            memory_total_entries: 0,
             spinner_idx: 0,
             pending_message_menu: false,
             pending_menu_entry_idx: 0,
@@ -170,6 +182,9 @@ impl ChatView {
         self.turn_active = app.turn_active;
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
+        self.session_input_tokens = app.input_tokens;
+        self.session_output_tokens = app.output_tokens;
+        self.memory_total_entries = app.memory_total_entries.unwrap_or(app.memory_entries.len());
         self.spinner_idx = app.spinner_idx;
         self.theme = app.theme;
         self.msg_version = app.msg_version;
@@ -491,15 +506,16 @@ impl ChatView {
 
         let visible: Vec<_> = self.visible_main_entries().collect();
         let visible_count = visible.len();
-        let final_assistant_idx = self
-            .timeline
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, entry)| {
-                matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
-                    .then_some(idx)
-            });
+        let final_assistant_idx =
+            self.timeline
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, entry)| {
+                    matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
+                        .then_some(idx)
+                });
+        let current_turn_stats = self.current_turn_stats();
         for (visible_idx, (idx, entry)) in visible.into_iter().enumerate() {
             let is_focused = idx == self.timeline_cursor;
             Self::build_entry_with_meta(
@@ -510,14 +526,9 @@ impl ChatView {
                 &self.theme,
                 self.turn_input_tokens,
                 self.turn_output_tokens,
-                self.timeline
-                    .iter()
-                    .filter(|entry| matches!(entry, TimelineEntry::ToolCall { done: true, .. }))
-                    .count(),
-                self.timeline
-                    .iter()
-                    .filter(|entry| matches!(entry, TimelineEntry::Thinking { .. }))
-                    .count(),
+                current_turn_stats.tool_count,
+                current_turn_stats.thinking_count,
+                self.memory_total_entries,
             );
             if visible_idx + 1 < visible_count {
                 lines.push(Line::raw(""));
@@ -575,11 +586,15 @@ impl ChatView {
             let is_final = pos + 1 == assistant_messages.len();
             let is_focused = *entry_idx == self.timeline_cursor;
             let label = if is_final {
-                if is_focused { "● ╰─ FINAL" } else { "  ╰─ FINAL" }
+                if is_focused {
+                    "● ├─ FINAL REPLY"
+                } else {
+                    "  ├─ FINAL REPLY"
+                }
             } else if is_focused {
-                "● ├─ reply"
+                "● ├─"
             } else {
-                "  ├─ reply"
+                "  ├─"
             };
             lines.push(Line::from(Span::styled(
                 label,
@@ -625,8 +640,8 @@ impl ChatView {
         }
         stats_parts.push(format!(
             "Tokens: in {} / out {}",
-            fmt_tokens(self.turn_input_tokens),
-            fmt_tokens(self.turn_output_tokens)
+            fmt_tokens(self.session_input_tokens),
+            fmt_tokens(self.session_output_tokens)
         ));
         stats_parts.push(format!("Turn: {:.1}s", 0.0));
         lines.push(Line::from(Span::styled(
@@ -636,6 +651,26 @@ impl ChatView {
 
         lines
     }
+
+    fn current_turn_stats(&self) -> ChatTurnStats {
+        let start = self
+            .timeline
+            .iter()
+            .rposition(
+                |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "user"),
+            )
+            .unwrap_or(0);
+        let mut stats = ChatTurnStats::default();
+        for entry in self.timeline.iter().skip(start) {
+            match entry {
+                TimelineEntry::Thinking { .. } => stats.thinking_count += 1,
+                TimelineEntry::ToolCall { .. } => stats.tool_count += 1,
+                _ => {}
+            }
+        }
+        stats
+    }
+
     fn rebuild_streaming_tail(&mut self) {
         let n = self.timeline.len();
         if n == 0 || n > self.timeline.len() {
@@ -729,7 +764,12 @@ impl ChatView {
     }
 
     /// Highlight inline markdown spans in a message line.
-    fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color, theme: &Theme) {
+    fn highlight_line(
+        line: &str,
+        spans: &mut Vec<Span<'static>>,
+        base_color: Color,
+        theme: &Theme,
+    ) {
         let code_color = theme.inline_code_color();
         let mut remaining = line;
         while !remaining.is_empty() {
@@ -892,7 +932,7 @@ impl ChatView {
         lines: &mut Vec<Line<'static>>,
         theme: &Theme,
     ) {
-        Self::build_entry_with_meta(entry, is_focused, false, lines, theme, 0, 0, 0, 0);
+        Self::build_entry_with_meta(entry, is_focused, false, lines, theme, 0, 0, 0, 0, 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -906,6 +946,7 @@ impl ChatView {
         turn_output_tokens: u64,
         tool_count: usize,
         thinking_rounds: usize,
+        memory_count: usize,
     ) {
         match entry {
             TimelineEntry::Message { role, content, .. } => {
@@ -918,22 +959,29 @@ impl ChatView {
                 const MAX_LINES: usize = 500;
 
                 if role == "assistant" {
-                    let header = if is_final_assistant {
-                        "╰─ FINAL REPLY"
-                    } else {
-                        "├─ reply"
-                    };
-                    lines.push(Line::from(Span::styled(
-                        header,
-                        Style::default()
-                            .fg(if is_final_assistant {
-                                theme.success_color()
-                            } else {
-                                theme.muted_color()
-                            })
-                            .bold(),
-                    )));
-                    let md_lines = md_renderer::render_markdown_lines(content, theme);
+                    if is_final_assistant {
+                        lines.push(Line::from(Span::styled(
+                            "├─ FINAL REPLY",
+                            Style::default().fg(theme.success_color()).bold(),
+                        )));
+                    }
+                    let mut md_lines = md_renderer::render_markdown_lines(content, theme);
+                    if !is_final_assistant {
+                        if let Some(first) = md_lines.first_mut() {
+                            first.spans.insert(
+                                0,
+                                Span::styled(
+                                    "├─ ",
+                                    Style::default().fg(theme.muted_color()).bold(),
+                                ),
+                            );
+                        } else {
+                            md_lines.push(Line::from(Span::styled(
+                                "├─",
+                                Style::default().fg(theme.muted_color()).bold(),
+                            )));
+                        }
+                    }
                     for line in md_lines.into_iter().take(MAX_LINES) {
                         lines.push(line);
                     }
@@ -948,14 +996,18 @@ impl ChatView {
                     }
                     if is_final_assistant {
                         lines.push(Line::from(vec![
-                            Span::styled("╰─ usage ", Style::default().fg(theme.warn_color()).bold()),
+                            Span::styled(
+                                "└─ usage ",
+                                Style::default().fg(theme.warn_color()).bold(),
+                            ),
                             Span::styled(
                                 format!(
-                                    "in:{} out:{} tools:{} think:{}",
+                                    "in:{} out:{} think:{} tools:{} memory:{}",
                                     fmt_tokens(turn_input_tokens),
                                     fmt_tokens(turn_output_tokens),
+                                    thinking_rounds,
                                     tool_count,
-                                    thinking_rounds
+                                    memory_count
                                 ),
                                 Style::default().fg(theme.muted_color()),
                             ),
@@ -1718,7 +1770,10 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Hello"), "Expected user message");
         assert!(joined.contains("Hi there!"), "Expected assistant message");
-        assert!(joined.contains("FINAL REPLY"), "Expected final reply marker");
+        assert!(
+            joined.contains("FINAL REPLY"),
+            "Expected final reply marker"
+        );
         assert!(
             !joined.contains("Let me think") && !joined.contains("bash"),
             "Thinking and tools should stay in Process, not main chat: {joined}"

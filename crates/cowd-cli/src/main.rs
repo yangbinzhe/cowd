@@ -3279,6 +3279,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         .unwrap_or(false);
 
     let raw_mode_enabled = std::env::var("COWD_TUI_SKIP_RAW_MODE").is_err();
+    let mouse_capture_enabled = std::env::var("COWD_TUI_MOUSE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
     if raw_mode_enabled {
         tracing::debug!("run_tui_repl: enabling raw mode");
         enable_raw_mode()?;
@@ -3287,7 +3290,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     }
     let mut stdout = io::stdout();
     tracing::debug!("run_tui_repl: entering alternate screen");
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    if mouse_capture_enabled {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     tracing::debug!("run_tui_repl: creating terminal");
     let mut terminal = Terminal::new(backend)?;
@@ -3759,11 +3765,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     if raw_mode_enabled {
         disable_raw_mode()?;
     }
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    if mouse_capture_enabled {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
 }

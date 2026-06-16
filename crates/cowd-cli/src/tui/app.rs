@@ -49,6 +49,14 @@ pub enum TimelineEntry {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionActivityStats {
+    pub thinking_count: usize,
+    pub tool_count: usize,
+    pub message_count: usize,
+    pub event_count: usize,
+}
+
 impl TimelineEntry {
     pub fn expanded_lines(&self) -> usize {
         match self {
@@ -173,6 +181,9 @@ pub struct App {
     pub skill_list: Vec<SkillSummary>,
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
+    pub memory_total_entries: Option<usize>,
+    pub memory_vector_count: Option<usize>,
+    pub memory_layer_counts: [usize; 5],
 
     /// Reputation score of the currently selected agent (if any).
     pub selected_agent_reputation: Option<f64>,
@@ -468,6 +479,9 @@ impl App {
             skill_list: Vec::new(),
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
+            memory_total_entries: None,
+            memory_vector_count: None,
+            memory_layer_counts: [0; 5],
 
             selected_agent_reputation: None,
             mcp_count: 0,
@@ -879,6 +893,24 @@ impl App {
         crate::tui::osc52::write_osc52_clipboard(&text)
     }
 
+    pub fn session_activity_stats(&self) -> SessionActivityStats {
+        let mut stats = SessionActivityStats::default();
+        stats.event_count = self.timeline_len();
+        for (_, entry) in self.timeline_iter() {
+            match entry {
+                TimelineEntry::Thinking { .. } => stats.thinking_count += 1,
+                TimelineEntry::ToolCall { .. } => stats.tool_count += 1,
+                TimelineEntry::Message { role, .. } => {
+                    if role == "user" || role == "assistant" {
+                        stats.message_count += 1;
+                    }
+                }
+                TimelineEntry::SlashOutput { .. } => {}
+            }
+        }
+        stats
+    }
+
     pub fn execute_search(&mut self, query: &str) {
         self.search_query = query.to_string();
         self.search_matches.clear();
@@ -1230,27 +1262,11 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::MemoryEntry {
-                layer,
-                content,
-                relevance,
-            } => {
-                self.timeline_push(TimelineEntry::Message {
-                    role: "system".into(),
-                    content: format!("[Memory:{layer}] (rel={relevance:.2}) {content}"),
-                    timestamp: App::format_timestamp(),
-                });
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+            CowdEvent::MemoryEntry { .. } => {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::MemoryUpdate { entries, status } => {
-                self.timeline_push(TimelineEntry::Message {
-                    role: "system".into(),
-                    content: format!("[Memory] {status}: {} entries updated", entries.len()),
-                    timestamp: App::format_timestamp(),
-                });
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+            CowdEvent::MemoryUpdate { .. } => {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
@@ -1259,15 +1275,9 @@ impl App {
                 vector_count,
                 layers,
             } => {
-                self.timeline_push(TimelineEntry::Message {
-                    role: "system".into(),
-                    content: format!(
-                        "[Memory] total={total_entries}, vectors={vector_count}, layers={}",
-                        layers.join(", ")
-                    ),
-                    timestamp: App::format_timestamp(),
-                });
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.memory_total_entries = Some(total_entries);
+                self.memory_vector_count = Some(vector_count);
+                self.memory_layer_counts = memory_layer_counts_from_strings(&layers);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
@@ -1298,6 +1308,39 @@ impl App {
             _ => {}
         }
     }
+}
+
+fn memory_layer_counts_from_strings(layers: &[String]) -> [usize; 5] {
+    let mut counts = [0; 5];
+    for (fallback_idx, layer) in layers.iter().enumerate() {
+        let Some(count) = first_usize_after(layer, "entry_count")
+            .or_else(|| first_usize_after(layer, "count"))
+            .or_else(|| first_usize_after(layer, ":"))
+            .or_else(|| layer.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let idx = layer
+            .find('L')
+            .and_then(|pos| layer[pos + 1..].chars().next())
+            .and_then(|ch| ch.to_digit(10))
+            .map(|value| value as usize)
+            .unwrap_or(fallback_idx);
+        if idx < counts.len() {
+            counts[idx] = count;
+        }
+    }
+    counts
+}
+
+fn first_usize_after(value: &str, marker: &str) -> Option<usize> {
+    let start = value.find(marker)? + marker.len();
+    let digits = value[start..]
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -1418,6 +1461,35 @@ mod tests {
         assert_eq!(app.timeline_len(), 0);
         assert!(app.timeline_get(0).is_none());
         assert_eq!(app.timeline_iter().count(), 0);
+    }
+
+    #[test]
+    fn session_activity_stats_cover_current_conversation() {
+        let mut app = App::new("test", "sess");
+        app.add_message("user", "hi");
+        app.add_message("system", "memory update");
+        app.timeline_push(TimelineEntry::Thinking {
+            id: 1,
+            content: "reasoning".to_string(),
+            complete: true,
+            expanded: false,
+        });
+        app.timeline_push(TimelineEntry::ToolCall {
+            id: "tool-1".to_string(),
+            name: "bash".to_string(),
+            preview: "echo ok".to_string(),
+            output: "ok".to_string(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        });
+        app.add_message("assistant", "done");
+
+        let stats = app.session_activity_stats();
+        assert_eq!(stats.thinking_count, 1);
+        assert_eq!(stats.tool_count, 1);
+        assert_eq!(stats.message_count, 2);
+        assert_eq!(stats.event_count, 5);
     }
 
     #[test]

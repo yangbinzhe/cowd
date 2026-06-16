@@ -101,6 +101,9 @@ pub struct RuntimeControlSnapshot {
     pub lease_owner: Option<String>,
     pub lease_mode: Option<String>,
     pub memory_status: Option<String>,
+    pub memory_total_entries: Option<usize>,
+    pub memory_vector_count: Option<usize>,
+    pub memory_layer_counts: [usize; 5],
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
     pub connector_accounts: Vec<ConnectorAccountSummary>,
@@ -151,6 +154,9 @@ impl RuntimeControlSnapshot {
             lease_owner: app.daemon_lease_owner.clone(),
             lease_mode: app.daemon_lease_mode.clone(),
             memory_status: app.memory_status.clone(),
+            memory_total_entries: app.memory_total_entries,
+            memory_vector_count: app.memory_vector_count,
+            memory_layer_counts: app.memory_layer_counts,
             cross_plane_grants_active: app.daemon_cross_plane_grants_active,
             cross_plane_actions_24h: app.daemon_cross_plane_actions_24h,
             connector_accounts: app.daemon_connector_accounts.clone(),
@@ -181,6 +187,9 @@ impl RuntimeControlSnapshot {
         app.daemon_pending_approvals = self.pending_approvals;
         app.daemon_approval_items = self.approval_items.clone();
         app.memory_status = self.memory_status.clone();
+        app.memory_total_entries = self.memory_total_entries;
+        app.memory_vector_count = self.memory_vector_count;
+        app.memory_layer_counts = self.memory_layer_counts;
         app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
         app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.daemon_connector_accounts = self.connector_accounts.clone();
@@ -247,6 +256,27 @@ impl RuntimeControlSnapshot {
             .or_else(|| value.pointer("/memory/status"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        self.memory_total_entries = value
+            .get("total_entries")
+            .or_else(|| value.pointer("/memory/total_entries"))
+            .or_else(|| {
+                value
+                    .get("entries")
+                    .and_then(|entries| entries.get("total"))
+            })
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize);
+        self.memory_vector_count = value
+            .get("vector_count")
+            .or_else(|| value.pointer("/memory/vector_count"))
+            .or_else(|| {
+                value
+                    .get("vectors")
+                    .and_then(|vectors| vectors.get("total"))
+            })
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize);
+        self.memory_layer_counts = memory_layer_counts_from_json(value);
     }
 
     pub fn ingest_cross_plane_summary(&mut self, value: &serde_json::Value) {
@@ -464,6 +494,51 @@ fn truncate_receipt_field(value: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn memory_layer_counts_from_json(value: &serde_json::Value) -> [usize; 5] {
+    let mut counts = [0; 5];
+    let layers = value
+        .get("layers")
+        .or_else(|| value.pointer("/memory/layers"))
+        .and_then(serde_json::Value::as_array);
+    if let Some(layers) = layers {
+        for (fallback_idx, layer) in layers.iter().enumerate() {
+            let count = layer
+                .get("entry_count")
+                .or_else(|| layer.get("count"))
+                .or_else(|| layer.get("entries"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default() as usize;
+            let idx = layer
+                .get("layer")
+                .or_else(|| layer.get("name"))
+                .or_else(|| layer.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(memory_layer_index_from_str)
+                .unwrap_or(fallback_idx);
+            if idx < counts.len() {
+                counts[idx] = count;
+            }
+        }
+    }
+    counts
+}
+
+fn memory_layer_index_from_str(value: &str) -> Option<usize> {
+    let normalized = value.trim().to_ascii_uppercase();
+    let mut chars = normalized.chars();
+    while let Some(ch) = chars.next() {
+        if ch == 'L' {
+            if let Some(digit) = chars.next().and_then(|next| next.to_digit(10)) {
+                let idx = digit as usize;
+                if idx < 5 {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary> {
@@ -1147,14 +1222,29 @@ mod tests {
         let mut app = App::new("claude-sonnet-4-6", "session-memory-status");
         let mut snapshot = RuntimeControlSnapshot::from_status(&status());
         snapshot.ingest_memory_status(&serde_json::json!({
-            "status": "available"
+            "status": "available",
+            "total_entries": 42,
+            "vector_count": 17,
+            "layers": [
+                {"layer": "L0", "entry_count": 1},
+                {"layer": "L1", "entry_count": 2},
+                {"layer": "L2", "entry_count": 3},
+                {"layer": "L3", "entry_count": 4},
+                {"layer": "L4", "entry_count": 5}
+            ]
         }));
 
         snapshot.apply_to_app(&mut app);
         assert_eq!(app.memory_status.as_deref(), Some("available"));
+        assert_eq!(app.memory_total_entries, Some(42));
+        assert_eq!(app.memory_vector_count, Some(17));
+        assert_eq!(app.memory_layer_counts, [1, 2, 3, 4, 5]);
 
         let restored = RuntimeControlSnapshot::from_app(&app);
         assert_eq!(restored.memory_status.as_deref(), Some("available"));
+        assert_eq!(restored.memory_total_entries, Some(42));
+        assert_eq!(restored.memory_vector_count, Some(17));
+        assert_eq!(restored.memory_layer_counts, [1, 2, 3, 4, 5]);
     }
 
     #[test]

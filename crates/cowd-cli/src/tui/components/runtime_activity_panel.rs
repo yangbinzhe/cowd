@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
@@ -33,6 +33,8 @@ struct ProcessEvent {
     kind: ProcessKind,
     text: String,
     complete: bool,
+    exit_code: Option<i32>,
+    turn_index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -236,15 +238,21 @@ impl RuntimeActivityPanel {
         self.recent_process.clear();
         self.turn_activity = TurnActivity::default();
         self.turn_activity.active = app.turn_active;
+        let mut turn_index = 0usize;
         for entry in &timeline {
             match entry {
                 TimelineEntry::Message { role, content, .. } => {
                     self.message_count += 1;
+                    if role == "user" {
+                        turn_index += 1;
+                    }
                     if role == "assistant" {
                         self.recent_process.push(ProcessEvent {
                             kind: ProcessKind::Output,
                             text: preview(content, 96),
                             complete: true,
+                            exit_code: None,
+                            turn_index: turn_index.max(1),
                         });
                     }
                 }
@@ -267,6 +275,8 @@ impl RuntimeActivityPanel {
                         kind: ProcessKind::Thinking,
                         text: detail,
                         complete: *complete,
+                        exit_code: None,
+                        turn_index: turn_index.max(1),
                     });
                 }
                 TimelineEntry::ToolCall {
@@ -294,20 +304,22 @@ impl RuntimeActivityPanel {
                         kind: ProcessKind::Tool,
                         text: format_tool_process_line(name, preview, output, *done, *exit_code),
                         complete: *done,
+                        exit_code: *exit_code,
+                        turn_index: turn_index.max(1),
                     });
                 }
-                TimelineEntry::SlashOutput { command, output, .. } => {
+                TimelineEntry::SlashOutput {
+                    command, output, ..
+                } => {
                     self.recent_process.push(ProcessEvent {
                         kind: ProcessKind::Slash,
                         text: format!("/{command} - {}", preview(output, 96)),
                         complete: true,
+                        exit_code: None,
+                        turn_index: turn_index.max(1),
                     });
                 }
             }
-        }
-        if self.recent_process.len() > 80 {
-            let overflow = self.recent_process.len().saturating_sub(80);
-            self.recent_process.drain(0..overflow);
         }
         if let Some(entry) = timeline.last() {
             self.turn_activity.last_phase = match entry {
@@ -383,29 +395,28 @@ impl Component for RuntimeActivityPanel {
             if !lines.is_empty() {
                 lines.push(Line::raw(""));
             }
-            lines.push(Line::from(Span::styled(
-                "Process",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
             let remaining_rows = area
                 .height
                 .saturating_sub(lines.len() as u16)
                 .saturating_sub(3)
                 .max(6) as usize;
-            for (idx, item) in self.recent_process.iter().rev().take(remaining_rows).enumerate() {
-                lines.push(process_line(item));
-                if idx + 1 < remaining_rows && matches!(item.kind, ProcessKind::Output) {
-                    lines.push(process_separator_line());
+            let start = self.recent_process.len().saturating_sub(remaining_rows);
+            let mut last_turn = 0usize;
+            for item in self.recent_process.iter().skip(start) {
+                if item.turn_index != last_turn {
+                    last_turn = item.turn_index;
+                    lines.push(process_separator_line(
+                        last_turn,
+                        area.width.saturating_sub(2),
+                    ));
                 }
+                lines.push(process_line(item));
             }
         }
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Process ");
+            .border_style(Style::default().fg(Color::DarkGray));
         self.scroll
             .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
         ctx.frame_mut().render_widget(
@@ -418,20 +429,21 @@ impl Component for RuntimeActivityPanel {
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
-        let Event::Key(key) = event else {
-            return EventResult::NotConsumed;
-        };
-        if key.kind != KeyEventKind::Press {
-            return EventResult::NotConsumed;
-        }
-
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.scroll.line_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll.line_up(),
-            KeyCode::PageDown => self.scroll.page_down(),
-            KeyCode::PageUp => self.scroll.page_up(),
-            KeyCode::Home => self.scroll.top(),
-            KeyCode::End => self.scroll.bottom(),
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll.line_down(),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll.line_up(),
+                KeyCode::PageDown => self.scroll.page_down(),
+                KeyCode::PageUp => self.scroll.page_up(),
+                KeyCode::Home => self.scroll.top(),
+                KeyCode::End => self.scroll.bottom(),
+                _ => return EventResult::NotConsumed,
+            },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollDown => self.scroll.line_down(),
+                MouseEventKind::ScrollUp => self.scroll.line_up(),
+                _ => return EventResult::NotConsumed,
+            },
             _ => return EventResult::NotConsumed,
         }
         EventResult::Consumed
@@ -471,6 +483,22 @@ impl RuntimeActivityPanel {
         let output_cost = self.turn_output_tokens as f64 * 15.0 / 1_000_000.0;
         input_cost + output_cost
     }
+
+    pub fn copy_text(&self) -> bool {
+        let mut out = String::new();
+        let mut last_turn = 0usize;
+        for item in &self.recent_process {
+            if item.turn_index != last_turn {
+                last_turn = item.turn_index;
+                out.push_str(&format!("\n#{}\n", last_turn));
+            }
+            out.push_str(&format!("{}\n", item.text));
+        }
+        if out.trim().is_empty() {
+            return false;
+        }
+        crate::tui::osc52::write_osc52_clipboard(out.trim())
+    }
 }
 
 // ── Free functions ───────────────────────────────────────────────────
@@ -495,24 +523,36 @@ fn metric_line(
 }
 
 fn process_line(item: &ProcessEvent) -> Line<'static> {
-    let (icon, label, color) = match item.kind {
+    let (branch, icon, color) = match item.kind {
         ProcessKind::Thinking => (
-            if item.complete { "◌" } else { "●" },
-            "think",
-            if item.complete { Color::DarkGray } else { Color::Yellow },
+            "├─ ",
+            "🧠",
+            if item.complete {
+                Color::DarkGray
+            } else {
+                Color::Yellow
+            },
         ),
         ProcessKind::Tool => (
-            if item.complete { "✓" } else { "⚙" },
-            "tool",
-            if item.complete { Color::Green } else { Color::Cyan },
+            "├─ ",
+            "⚙",
+            if item.complete && item.exit_code.unwrap_or(0) != 0 {
+                Color::Red
+            } else {
+                Color::Green
+            },
         ),
-        ProcessKind::Output => ("↳", "reply", Color::White),
-        ProcessKind::Slash => ("/", "cmd", Color::Magenta),
+        ProcessKind::Output => ("└─ ", "", Color::Green),
+        ProcessKind::Slash => ("├─ ", "⌘", Color::Magenta),
     };
     Line::from(vec![
-        Span::styled(format!("{icon} "), Style::default().fg(color).bold()),
+        Span::styled(branch.to_string(), Style::default().fg(color).bold()),
         Span::styled(
-            format!("{label:<5} "),
+            if icon.is_empty() {
+                String::new()
+            } else {
+                format!("{icon} ")
+            },
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -525,9 +565,13 @@ fn process_line(item: &ProcessEvent) -> Line<'static> {
     ])
 }
 
-fn process_separator_line() -> Line<'static> {
+fn process_separator_line(turn: usize, width: u16) -> Line<'static> {
+    let label = format!(" #{} ", turn);
+    let width = width.max(label.len() as u16) as usize;
+    let side = width.saturating_sub(label.len()) / 2;
+    let right = width.saturating_sub(label.len()).saturating_sub(side);
     Line::from(Span::styled(
-        "──────── turn boundary",
+        format!("{}{}{}", "─".repeat(side), label, "─".repeat(right)),
         Style::default().fg(Color::DarkGray),
     ))
 }
@@ -695,7 +739,8 @@ mod tests {
         assert!(!rendered.contains("Model:"));
         assert!(!rendered.contains("Activity:"));
         assert!(rendered.contains("WG:"));
-        assert!(rendered.contains("Process"));
+        assert!(!rendered.contains("Process"));
+        assert!(rendered.contains("#1"));
         assert!(rendered.contains("bash done exit:0 - ok"));
 
         // The runtime panel owns tool process details; the separate Activity
@@ -715,5 +760,38 @@ mod tests {
 
         assert_eq!(panel.handle_event(&event), EventResult::Consumed);
         assert!(!panel.focusable());
+    }
+
+    #[test]
+    fn process_lines_start_with_tree_branch_and_icons() {
+        let line = process_line(&ProcessEvent {
+            kind: ProcessKind::Tool,
+            text: "bash done exit:0".to_string(),
+            complete: true,
+            exit_code: Some(0),
+            turn_index: 1,
+        });
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.starts_with("├─ ⚙ bash"), "{rendered}");
+        assert!(!rendered.contains("tool"), "{rendered}");
+
+        let line = process_line(&ProcessEvent {
+            kind: ProcessKind::Thinking,
+            text: "1 lines".to_string(),
+            complete: true,
+            exit_code: None,
+            turn_index: 1,
+        });
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.starts_with("├─ 🧠 1 lines"), "{rendered}");
+        assert!(!rendered.contains("think"), "{rendered}");
     }
 }

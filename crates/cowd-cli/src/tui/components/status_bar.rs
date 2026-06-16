@@ -110,12 +110,11 @@ impl StatusBar {
             width: SectionWidth::Fixed(24),
         });
         sb.add_section(StatusSection {
-            id: "approvals".into(),
+            id: "memory_stats".into(),
             content: None,
-            style: Style::default().fg(Color::Yellow),
-            width: SectionWidth::Fixed(14),
+            style: Style::default().fg(Color::Gray),
+            width: SectionWidth::Fixed(18),
         });
-        sb.add_section(Self::permission_status_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
         sb
@@ -348,17 +347,19 @@ impl StatusBar {
                 }
                 "turn_tokens" => Some(format!(
                     "in:{} out:{}",
-                    fmt_tokens(app.turn_input_tokens),
-                    fmt_tokens(app.turn_output_tokens)
+                    fmt_tokens(app.input_tokens),
+                    fmt_tokens(app.output_tokens)
                 )),
-                "approvals" => {
-                    let count = app
-                        .daemon_pending_approvals
-                        .unwrap_or_default()
-                        .max(app.permission_count as u64)
-                        + u64::from(app.approval.is_some());
-                    Some(format!("approvals:{count}"))
-                }
+                "memory_stats" => Some(format!(
+                    "mem:{} vec:{} [{},{},{},{},{}]",
+                    fmt_tokens(app.memory_total_entries.unwrap_or(app.memory_entries.len()) as u64),
+                    fmt_tokens(app.memory_vector_count.unwrap_or_default() as u64),
+                    fmt_tokens(app.memory_layer_counts[0] as u64),
+                    fmt_tokens(app.memory_layer_counts[1] as u64),
+                    fmt_tokens(app.memory_layer_counts[2] as u64),
+                    fmt_tokens(app.memory_layer_counts[3] as u64),
+                    fmt_tokens(app.memory_layer_counts[4] as u64)
+                )),
                 "search" => {
                     if app.search_active {
                         Some(format!("/{}", app.search_query))
@@ -374,7 +375,7 @@ impl StatusBar {
                     }
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
-                "permission_status" => Some(format!("perm:{}", app.permission_count)),
+                "permission_status" => None,
                 _ => None,
             };
         }
@@ -477,7 +478,7 @@ impl Component for StatusBar {
 fn status_section_visible_for_width(id: &str, available: u16) -> bool {
     match id {
         "model" | "context" => true,
-        "approvals" | "permission_status" => available >= 120,
+        "memory_stats" | "permission_status" => available >= 120,
         "input_hint" => available >= 150,
         "search" | "history" | "compaction" | "cache" | "task" | "lease" | "wave"
         | "reputation" | "mcp_status" | "lsp_status" => available >= 132,
@@ -599,8 +600,9 @@ mod tests {
         assert!(ids.contains(&"model"));
         assert!(ids.contains(&"context"));
         assert!(ids.contains(&"turn_tokens"));
-        assert!(ids.contains(&"approvals"));
-        assert!(ids.contains(&"permission_status"));
+        assert!(ids.contains(&"memory_stats"));
+        assert!(!ids.contains(&"approvals"));
+        assert!(!ids.contains(&"permission_status"));
         assert!(!ids.contains(&"version"));
         assert!(!ids.contains(&"session"));
         assert!(!ids.contains(&"focus"));
@@ -685,16 +687,18 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_app_shows_approval_count() {
+    fn sync_from_app_shows_memory_stats() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.daemon_pending_approvals = Some(2);
+        app.memory_total_entries = Some(12);
+        app.memory_vector_count = Some(7);
+        app.memory_layer_counts = [1, 2, 3, 4, 5];
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("approvals").unwrap();
+        let section = bar.section_mut("memory_stats").unwrap();
         let content = section.content.as_ref().unwrap();
-        assert_eq!(content, "approvals:2");
+        assert_eq!(content, "mem:12 vec:7 [1,2,3,4,5]");
     }
 
     #[test]
@@ -846,22 +850,20 @@ mod tests {
     // ── Notification render ──────────────────────────────────────
 
     #[test]
-    fn permission_status_shows() {
+    fn permission_status_is_not_in_footer() {
         let mut app = App::new("test-model", "test-session");
         app.permission_count = 2;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("permission_status").unwrap();
-        let content = section.content.as_deref().unwrap();
-        assert_eq!(content, "perm:2");
+        assert!(bar.section_mut("permission_status").is_none());
     }
 
     #[test]
-    fn turn_tokens_show_after_context() {
+    fn session_tokens_show_after_context() {
         let mut app = App::new("test-model", "test-session");
-        app.turn_input_tokens = 1200;
-        app.turn_output_tokens = 3400;
+        app.input_tokens = 1200;
+        app.output_tokens = 3400;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
@@ -875,13 +877,13 @@ mod tests {
     fn with_default_sections_includes_footer_sections() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
-        assert!(
-            ids.contains(&"permission_status"),
-            "Should have permission_status section"
-        );
+        assert!(!ids.contains(&"permission_status"));
         assert!(ids.contains(&"model"), "Should have model section");
         assert!(ids.contains(&"context"), "Should have context section");
-        assert!(ids.contains(&"approvals"), "Should have approvals section");
+        assert!(
+            ids.contains(&"memory_stats"),
+            "Should have memory_stats section"
+        );
     }
 
     #[test]
