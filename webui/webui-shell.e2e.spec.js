@@ -73,6 +73,10 @@ async function routeShellApis(page) {
     });
     if (path === '/api/skills/runs') return json({ items: [{ skill_id: 'runtime.inspect', status: 'completed', summary: 'validated runtime' }] });
     if (path === '/api/agents/runs') return json({ runs: [{ status: 'completed', objective: 'Parallel review', nodes: [{ id: 'n1', role: 'reviewer', status: 'done', title: 'Review UI' }], evidence: [], reviews: [], merge_decisions: [] }] });
+    if (path === '/api/platforms') return json({ platforms: [{ name: 'wechat', configured: true, running: true, capabilities: ['send_text', 'receive'] }] });
+    if (path === '/api/platforms/wechat') return json({ sessions: [{ id: 'wx-1', status: 'bound' }] });
+    if (path === '/api/channels/wechat-ilink/accounts') return json({ accounts: [{ id: 'wx-account', nickname: 'Cowd WeChat', runtime_bound: true }] });
+    if (path === '/api/audit/export') return json({ records: [{ id: 'audit-1', source: 'gateway', action: 'send_text', status: 'ok', target: 'wechat' }], total: 1 });
     return json({});
   });
 }
@@ -282,6 +286,36 @@ test('v0.9.207 skills agents and tools render as full-page capability workbenche
   await expect(page.locator('#workbench-content.workbench-page-tools')).toBeVisible();
   await expect(page.locator('#workbench-content')).toContainText('Available Tools');
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.207-tools-desktop.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.208 gateway and audit render as full-page operations workbenches', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await page.click('#nav-rail [data-view="gateway"]');
+  await expect(page.locator('#workbench-content.workbench-page-gateway')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Gateway');
+  await expect(page.locator('#workbench-content')).toContainText(/Gateway|Connector|wechat/i);
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.208-gateway-desktop.png' });
+
+  await page.click('#nav-rail [data-view="audit"]');
+  await expect(page.locator('#workbench-content.workbench-page-audit')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Audit');
+  await expect(page.locator('#workbench-content')).toContainText(/Audit|gateway|send_text/i);
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.208-audit-desktop.png' });
 
   expect(errors).toEqual([]);
 });

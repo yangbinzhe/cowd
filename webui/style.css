@@ -155,6 +155,15 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .workbench-page-skills .skill-row,
 .workbench-page-agents .panel-item,
 .workbench-page-tools .panel-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+.workbench-page-gateway,
+.workbench-page-audit{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:1220px}
+.workbench-page-gateway>.panel-section,
+.workbench-page-audit>.panel-section{border:1px solid var(--border);border-radius:10px;background:var(--surface-subtle);padding:12px;margin-bottom:0;min-width:0}
+.workbench-page-gateway>.panel-section:first-child,
+.workbench-page-audit>.audit-controls,
+.workbench-page-audit>.audit-summary{grid-column:1/-1}
+.workbench-page-gateway .panel-item,
+.workbench-page-audit .panel-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
 #chat-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);min-height:44px}
 #chat-header-left{display:flex;align-items:center;gap:12px;min-width:0}
 #chat-header-right{display:flex;gap:4px}
@@ -525,6 +534,8 @@ pre,code{font-family:var(--font-mono);font-size:13px}
   .workbench-page-memory,
   .workbench-page-memory .memory-grid{grid-template-columns:1fr}
   .workbench-page-skills .skill-summary{grid-template-columns:1fr}
+  .workbench-page-gateway,
+  .workbench-page-audit{grid-template-columns:1fr}
   #chat-header{padding:8px 10px;gap:8px}
   .chat-title-block{min-width:0}
   .chat-title-block span{display:none}
