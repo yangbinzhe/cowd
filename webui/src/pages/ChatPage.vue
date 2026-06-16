@@ -8,8 +8,7 @@ const store = useAppStore();
 const draft = ref('');
 const sending = ref(false);
 const contextUsage = computed(() => Math.min(88, 42 + store.turns.length * 6));
-const models = ['claude-sonnet-4-6', 'claude-opus-4-6', 'qwen3-coder-next', 'deepseek-v4-pro', 'grok-3-mini'];
-const profiles = ['default', 'review', 'builder', 'research', 'iacc'];
+const modelLabel = computed(() => store.selectedModel || 'Select model');
 const commands = [
   { name: '/status', detail: 'Show runtime, session, memory, and gateway status.' },
   { name: '/model', detail: 'Switch the model for the current conversation.' },
@@ -21,6 +20,21 @@ const commands = [
 async function submit() {
   const text = draft.value.trim();
   if (!text || sending.value) return;
+  if (text === '/model') {
+    store.openModal('model');
+    draft.value = '';
+    return;
+  }
+  if (text === '/workspace') {
+    store.openModal('workspace');
+    draft.value = '';
+    return;
+  }
+  if (text === '/status') {
+    store.openCompanion('activity');
+    draft.value = '';
+    return;
+  }
   sending.value = true;
   draft.value = '';
   await store.send(text);
@@ -38,7 +52,7 @@ async function submit() {
       </div>
       <div class="status-strip">
         <span>{{ store.health?.status || 'local' }}</span>
-        <button type="button" @click="store.openModal('model')">{{ store.selectedModel }}</button>
+        <button type="button" @click="store.openModal('model')">{{ modelLabel }}</button>
       </div>
     </header>
 
@@ -75,17 +89,20 @@ async function submit() {
         <div class="modal-columns">
           <div>
             <h3>Model</h3>
-            <button v-for="model in models" :key="model" class="choice-row" :class="{ active: store.selectedModel === model }" type="button" @click="store.chooseModel(model)">
+            <p v-if="!store.availableModels.length" class="modal-note">后端未报告可切换模型。请检查 runtime provider 配置。</p>
+            <button v-for="model in store.availableModels" :key="model" class="choice-row" :class="{ active: store.selectedModel === model }" type="button" @click="store.chooseModel(model)">
               {{ model }}
             </button>
           </div>
           <div>
             <h3>Profile</h3>
-            <button v-for="profile in profiles" :key="profile" class="choice-row" :class="{ active: store.selectedProfile === profile }" type="button" @click="store.chooseProfile(profile)">
+            <p v-if="!store.availableProfiles.length" class="modal-note">后端未报告 profile。</p>
+            <button v-for="profile in store.availableProfiles" :key="profile" class="choice-row" :class="{ active: store.selectedProfile === profile }" type="button" @click="store.chooseProfile(profile)">
               {{ profile }}
             </button>
           </div>
         </div>
+        <p v-if="store.commandError" class="file-error">{{ store.commandError }}</p>
       </section>
 
       <section v-else-if="store.activeModal === 'workspace'" class="command-modal">

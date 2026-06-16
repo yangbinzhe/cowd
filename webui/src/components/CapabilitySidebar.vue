@@ -14,7 +14,7 @@ const store = useAppStore();
 
 const pageId = computed(() => route.path.replace('/', '') as Exclude<NavId, 'chat' | 'settings'>);
 const spec = computed(() => capabilitySpecs[pageId.value]);
-const activeSection = computed(() => store.activeSectionByPage[pageId.value] || spec.value?.sections[0]?.id || '');
+const snapshots = computed(() => store.capabilitySnapshots[pageId.value] || []);
 
 const capabilityNav = [
   { id: 'runtime', label: 'Runtime', route: '/runtime', icon: Activity },
@@ -50,23 +50,20 @@ const capabilityNav = [
       </RouterLink>
     </nav>
 
-    <section v-if="spec" class="secondary-sections">
-      <h2>Sections</h2>
-      <button
-        v-for="section in spec.sections"
-        :key="section.id"
-        type="button"
-        class="section-row"
-        :class="{ active: activeSection === section.id }"
-        @click="store.selectSection(pageId, section.id)"
-      >
-        <strong>{{ section.label }}</strong>
-        <span>{{ section.description }}</span>
-      </button>
+    <section v-if="spec" class="sidebar-inspector">
+      <h2>API coverage</h2>
+      <dl>
+        <dt>Checked</dt>
+        <dd>{{ snapshots.length }}</dd>
+        <dt>Ready</dt>
+        <dd>{{ snapshots.filter((item) => item.status === 'ready').length }}</dd>
+        <dt>Offline/Error</dt>
+        <dd>{{ snapshots.filter((item) => item.status === 'offline' || item.status === 'error').length }}</dd>
+      </dl>
     </section>
 
     <section v-if="spec" class="sidebar-inspector">
-      <h2>Inspector</h2>
+      <h2>Contract</h2>
       <dl>
         <template v-for="item in spec.inspector" :key="item.label">
           <dt>{{ item.label }}</dt>

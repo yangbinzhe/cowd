@@ -1,121 +1,264 @@
-import type { ActivityEvent, SessionSummary, WorkspaceFile } from '../types';
+import type { ActivityEvent, NavId, SessionSummary, WorkspaceFile } from '../types';
 
 const authToken = () => localStorage.getItem('cowd-auth-token') || '';
 
-async function request<T>(path: string, init: RequestInit = {}, fallback: T): Promise<T> {
+export interface ApiOffline {
+  __offline?: boolean;
+  __error?: string;
+}
+
+export interface EndpointSnapshot extends ApiOffline {
+  id: string;
+  label: string;
+  path: string;
+  method: string;
+  status: 'ready' | 'empty' | 'offline' | 'error';
+  count: number;
+  data: any;
+}
+
+function headers(init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  if (!headers.has('Content-Type') && init.body) headers.set('Content-Type', 'application/json');
+  const token = authToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return headers;
+}
+
+async function parseResponse(response: Response) {
+  const text = await response.text();
+  if (!text) return {};
   try {
-    const headers = new Headers(init.headers);
-    if (!headers.has('Content-Type') && init.body) headers.set('Content-Type', 'application/json');
-    const token = authToken();
-    if (token) headers.set('Authorization', `Bearer ${token}`);
-    const response = await fetch(path, { ...init, headers });
-    if (!response.ok) throw new Error(await response.text());
-    return await response.json() as T;
+    return JSON.parse(text);
   } catch {
-    return fallback;
+    return text;
   }
 }
 
-async function requestText(path: string, fallback = ''): Promise<string> {
+async function read<T>(path: string, fallback: T, init: RequestInit = {}): Promise<T & ApiOffline> {
   try {
-    const headers = new Headers();
-    const token = authToken();
-    if (token) headers.set('Authorization', `Bearer ${token}`);
-    const response = await fetch(path, { headers });
+    const response = await fetch(path, { ...init, headers: headers(init) });
     if (!response.ok) throw new Error(await response.text());
-    return await response.text();
-  } catch {
-    return fallback;
+    return await parseResponse(response) as T;
+  } catch (error) {
+    return {
+      ...(fallback as any),
+      __offline: true,
+      __error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
+
+async function write<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, { ...init, headers: headers(init) });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `${response.status} ${response.statusText}`);
+  }
+  return await parseResponse(response) as T;
+}
+
+function countPayload(data: any): number {
+  if (Array.isArray(data)) return data.length;
+  if (!data || typeof data !== 'object') return data ? 1 : 0;
+  for (const key of ['sessions', 'messages', 'events', 'timeline', 'tools', 'skills', 'runs', 'tasks', 'entries', 'files', 'profiles', 'accounts', 'resources', 'facts', 'incidents', 'playbooks', 'cases', 'executions']) {
+    if (Array.isArray(data[key])) return data[key].length;
+  }
+  if (typeof data.count === 'number') return data.count;
+  if (typeof data.total === 'number') return data.total;
+  return Object.keys(data).filter((key) => !key.startsWith('__')).length;
+}
+
+function endpointStatus(data: any): EndpointSnapshot['status'] {
+  if (data?.__offline) return 'offline';
+  if (data?.error) return 'error';
+  return countPayload(data) > 0 ? 'ready' : 'empty';
+}
+
+async function endpoint(label: string, path: string, init: RequestInit = {}): Promise<EndpointSnapshot> {
+  const method = init.method || 'GET';
+  const data = method === 'GET' ? await read(path, {}) : await write(path, init).catch((error) => ({
+    __offline: true,
+    __error: error instanceof Error ? error.message : String(error),
+  }));
+  return {
+    id: `${method}:${path}`,
+    label,
+    path,
+    method,
+    status: endpointStatus(data),
+    count: countPayload(data),
+    data,
+    __offline: data?.__offline,
+    __error: data?.__error,
+  };
+}
+
+const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: string) => {
+  const sid = encodeURIComponent(sessionId || '');
+  const routes: Record<Exclude<NavId, 'chat' | 'settings'>, Array<[string, string]>> = {
+    runtime: [
+      ['Control plane', '/api/runtime/control-plane'],
+      ['Effective config', '/api/runtime/config/effective'],
+      ['Session leases', '/api/runtime/session-leases'],
+      ['Timeline', `/api/runtime/timeline?session_id=${sid}&limit=80`],
+      ['Approvals pending', '/api/approval/pending'],
+      ['Tasks', '/api/tasks'],
+    ],
+    context: [
+      ['Current context', '/api/context/current'],
+      ['Context history', `/api/sessions/${sid}/context/history`],
+      ['Session runs', `/api/sessions/${sid}/runs`],
+      ['Session stats', `/api/sessions/${sid}/stats`],
+    ],
+    memory: [
+      ['Status', '/api/memory/status'],
+      ['Stats', '/api/memory/stats'],
+      ['Layers', '/api/memory/layers'],
+      ['Runtime', '/api/memory/runtime'],
+      ['Maintenance', '/api/memory/maintenance'],
+      ['Clusters', '/api/memory/clusters'],
+    ],
+    skills: [
+      ['Catalog', '/api/skills/catalog'],
+      ['Projection', '/api/skills/projection'],
+      ['Runs', '/api/skills/runs'],
+    ],
+    agents: [
+      ['Agent runs', '/api/agents/runs'],
+      ['Tasks', '/api/tasks'],
+      ['Task graph', '/api/tasks/current/agent-graph'],
+    ],
+    tools: [
+      ['Registry', '/api/tools'],
+      ['Commands history', '/api/commands/history'],
+      ['Cowd capabilities', '/api/cowd/capabilities'],
+      ['Cross-plane summary', '/api/cross-plane/summary'],
+    ],
+    gateway: [
+      ['Connectors summary', '/api/connectors/summary'],
+      ['Connector accounts', '/api/connectors/accounts'],
+      ['Connector capabilities', '/api/connectors/capabilities'],
+      ['MCP servers', '/api/connectors/mcp/servers'],
+      ['Platforms', '/api/platforms'],
+      ['WeChat accounts', '/api/channels/wechat-ilink/accounts'],
+    ],
+    iacc: [
+      ['App descriptor', '/api/iacc/app'],
+      ['Health', '/api/iacc/health'],
+      ['Metrics', '/api/iacc/metrics'],
+      ['Entities', '/api/iacc/entities'],
+      ['Changes', '/api/iacc/changes'],
+      ['Incidents', '/api/iacc/incidents'],
+      ['Skills', '/api/iacc/skills'],
+      ['Command center', '/api/iacc/command-center'],
+    ],
+    audit: [
+      ['Audit export', '/api/audit/export?limit=50'],
+      ['Approval history', '/api/approval/history?limit=50'],
+      ['Cross-plane audit', '/api/cross-plane/audit'],
+      ['Action executions', '/api/cross-plane/action/executions'],
+    ],
+  };
+  return routes[page];
+};
 
 export const api = {
-  health: () => request('/api/webui/manifest', {}, {
+  health: () => read('/api/webui/manifest', {
     kind: 'cowd.webui.manifest',
     status: 'offline',
     static_webui: 'local vite fallback',
   }),
-  sessions: () => request<{ sessions: SessionSummary[] }>('/api/sessions?limit=24', {}, {
-    sessions: [
-      { id: 'demo-main', title: 'WebUI refactor review', model: 'claude-sonnet-4-6', status: 'active' },
-      { id: 'demo-runtime', title: 'Runtime alignment check', model: 'qwen3-coder-next', status: 'idle' },
-    ],
-  }),
-  messages: (sessionId: string) => request<{ messages: any[] }>(`/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=50`, {}, {
-    messages: [
-      { id: 'u1', role: 'user', content: '请检查当前结构化数据和 WebUI 能力是否完整对齐。' },
-      { id: 'a1', role: 'assistant', content: '已完成初步检查。下面是当前风险、证据和下一步执行计划。\n\n- Runtime 已接入统一控制面。\n- Workspace 已进入右侧 companion tab。\n- 需要补齐图表化验收。', blocks: [] },
-    ],
-  }),
-  sendMessage: (sessionId: string, content: string) => request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+  sessions: () => read<{ sessions: SessionSummary[] }>('/api/sessions?limit=24', { sessions: [] }),
+  createSession: (model?: string) => write<SessionSummary>('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ role: 'user', content }),
-  }, { ok: true }),
-  workspace: () => request('/api/workspace', {}, {
-    workspace_root: '/media/yi/Datas/workspace/dev-iacc',
-    workspace_canonical: '/media/yi/Datas/workspace/dev-iacc',
-    profile_id: 'default',
+    body: JSON.stringify({ model }),
   }),
-  files: (dir = '') => request<{ dir: string; files: WorkspaceFile[] }>(`/api/workspace/files${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`, {}, {
+  updateSession: (sessionId: string, patch: Record<string, unknown>) => write(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  }),
+  messages: (sessionId: string) => read<{ messages: any[] }>(`/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=50`, { messages: [] }),
+  sendMessage: (sessionId: string, content: string) => write(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  }),
+  workspace: () => read('/api/workspace', {
+    workspace_root: '',
+    workspace_canonical: '',
+    profile_id: '',
+  }),
+  files: (dir = '') => read<{ dir: string; files: WorkspaceFile[] }>(`/api/workspace/files${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`, {
     dir,
-    files: [
-      { name: 'README.md', path: 'README.md', kind: 'file', size: 12400 },
-      { name: 'webui', path: 'webui', kind: 'dir' },
-      { name: 'crates', path: 'crates', kind: 'dir' },
-      { name: 'Cargo.toml', path: 'Cargo.toml', kind: 'file', size: 4200 },
-    ],
+    files: [],
   }),
-  rawFile: (path: string) => requestText(`/api/file/raw?path=${encodeURIComponent(path)}`, `# ${path}\n\n当前文件可预览。连接 gateway 后会展示真实内容。`),
-  saveFile: (path: string, content: string) => request('/api/workspace/files', {
+  rawFile: (path: string) => readText(`/api/file/raw?path=${encodeURIComponent(path)}`),
+  saveFile: (path: string, content: string) => write('/api/workspace/files', {
     method: 'POST',
     body: JSON.stringify({ path, content }),
-  }, { path, saved: true }),
-  runtimeTimeline: () => request('/api/runtime/timeline?limit=50', {}, { events: [], value_loop: { status: 'ready' } }),
-  memoryStatus: () => request('/api/memory/status', {}, { status: 'ready', enabled: true }),
-  skills: () => request('/api/skills/catalog', {}, { skills: [] }),
-  agents: () => request('/api/agents/runs', {}, { runs: [] }),
-  tools: () => request('/api/tools', {}, { tools: [] }),
-  gateway: () => request('/api/connectors/summary', {}, { status: 'ready', accounts: [] }),
-  iacc: () => request('/api/iacc/health', {}, { status: 'ready', readiness: { ready: true } }),
-  audit: () => request('/api/audit/export?limit=20', {}, { entries: [] }),
-  settings: () => request('/api/config', {}, { model: 'claude-sonnet-4-6', profile: 'default', version: '0.9.212' }),
-  saveSettings: (config: Record<string, unknown>) => request('/api/config', {
+  }),
+  runtimeTimeline: (sessionId: string) => read(`/api/runtime/timeline?session_id=${encodeURIComponent(sessionId)}&limit=50`, { events: [] }),
+  runtimeControlPlane: () => read('/api/runtime/control-plane', {}),
+  effectiveConfig: () => read('/api/runtime/config/effective', {}),
+  reloadProviders: () => write('/api/runtime/providers/reload', { method: 'POST' }),
+  approvalConfig: () => read('/api/approval/config', {}),
+  updateApprovalConfig: (config: Record<string, unknown>) => write('/api/approval/config', {
     method: 'PUT',
     body: JSON.stringify(config),
-  }, { ok: true, config }),
-  executeCapabilityAction: (endpoint: string, label: string) => {
-    const normalized = endpoint
-      .replace(':id', 'demo-main')
-      .replace(':phase', 'review')
-      .replace(':profile', 'default');
-    const method = /reload|acquire|record|validate|plan|run|preflight|simulate|qr|promote|retry|resolve|revoke|cancel/i.test(label)
-      ? 'POST'
-      : 'GET';
-    return request(normalized, method === 'POST' ? {
-      method,
-      body: JSON.stringify({ source: 'webui', action: label }),
-    } : { method }, {
-      ok: true,
-      endpoint: normalized,
-      label,
-      mode: 'fallback',
-      message: 'Gateway unavailable or endpoint requires runtime context; action was recorded locally.',
-    });
-  },
+  }),
+  toggleSolo: () => write('/api/approval/solo', { method: 'POST' }),
+  approvalPending: () => read('/api/approval/pending', []),
+  approvalHistory: () => read('/api/approval/history?limit=20', []),
+  settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
+  profiles: () => read('/api/profiles', { profiles: [], active_profile: '', runtime_profile: '' }),
+  createProfile: (name: string) => write('/api/profiles', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  }),
+  switchProfile: (profile: string) => write('/api/profiles/switch', {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  }),
+  deleteProfile: (id: string) => write(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  loadCapabilityPage: async (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: string) => Promise.all(
+    pageEndpoints(page, sessionId).map(([label, path]) => endpoint(label, path)),
+  ),
+  executeCapabilityAction: (path: string, body: Record<string, unknown> = {}) => write(path, {
+    method: 'POST',
+    body: JSON.stringify({ source: 'webui', ...body }),
+  }),
 };
 
-export function normalizeActivity(raw: any[]): ActivityEvent[] {
-  if (!Array.isArray(raw) || raw.length === 0) {
-    return [
-      { id: 'act-tool', kind: 'tool', title: 'Workspace scan', detail: '右侧 Workspace 可直接定位和预览文件', status: 'complete' },
-      { id: 'act-context', kind: 'context', title: 'Context budget', detail: '当前上下文压力处于可控区间', status: 'ready' },
-    ];
+async function readText(path: string, fallback = ''): Promise<string> {
+  try {
+    const response = await fetch(path, { headers: headers() });
+    if (!response.ok) throw new Error(await response.text());
+    return await response.text();
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : String(error));
   }
-  return raw.slice(0, 20).map((event, index) => ({
+}
+
+export function providerModels(controlPlane: any, config: any): string[] {
+  const models = new Set<string>();
+  const configured = controlPlane?.configured_model || config?.model;
+  const normalized = typeof configured === 'string' ? configured.trim() : '';
+  if (normalized && normalized !== 'unknown') models.add(normalized);
+  const providerNames = controlPlane?.provider_names || [];
+  const count = Number(controlPlane?.provider_model_count || 0);
+  if (count > 0 && models.size === 0) {
+    providerNames.forEach((name: string) => models.add(`${name}:default`));
+  }
+  return Array.from(models);
+}
+
+export function normalizeActivity(raw: any[]): ActivityEvent[] {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return raw.slice(0, 50).map((event, index) => ({
     id: String(event.id || event.sequence || index),
     kind: event.kind || event.type || 'runtime',
     title: event.title || event.type || event.kind || 'Runtime event',
-    detail: event.detail || event.message || JSON.stringify(event.payload || event).slice(0, 240),
-    status: event.status || 'observed',
+    detail: event.detail || event.message || event.summary || JSON.stringify(event.payload || event).slice(0, 240),
+    status: event.status || event.phase || 'observed',
   }));
 }

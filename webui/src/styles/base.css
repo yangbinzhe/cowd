@@ -123,8 +123,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .chart-panel header span, .work-table header span { color: var(--text-faint); font-size: 12px; }
 .chart { height: 360px; width: 100%; }
 .work-table table { width: 100%; border-collapse: collapse; }
-.work-table th, .work-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.work-table th, .work-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
 .work-table th { color: var(--text-muted); font-weight: 600; }
+.work-table td strong, .work-table td small { display: block; }
+.work-table td small { margin-top: 3px; color: var(--text-faint); font-family: var(--font-mono); overflow-wrap: anywhere; }
 .management-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .7fr); gap: 16px; padding: 0 24px 28px; }
 .management-panel { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 14px; min-width: 0; }
 .management-panel header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -137,6 +139,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .action-button[data-kind="primary"] { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); }
 .action-button[data-kind="danger"] { border-color: color-mix(in srgb, var(--danger) 58%, var(--border)); }
 .action-result { margin: 12px 0 0; max-height: 180px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); padding: 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
+.live-management { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.status-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: var(--bg); font-size: 12px; }
+.status-badge[data-status="ready"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 36%, var(--border)); }
+.status-badge[data-status="offline"], .status-badge[data-status="error"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 
 .modal-scrim { position: fixed; inset: 0; z-index: 30; display: grid; place-items: end center; padding: 20px; background: rgba(0,0,0,.28); }
 .command-modal { width: min(680px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 42px)); overflow: auto; border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: 0 16px 42px rgba(0,0,0,.28); padding: 14px; }
@@ -153,6 +159,16 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .settings-section { padding: 14px; display: grid; gap: 12px; }
 .settings-section label { display: grid; gap: 6px; color: var(--text-muted); }
 .settings-section input:not([type="checkbox"]) { min-height: 34px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 0 10px; }
+.settings-section textarea { min-height: 240px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 10px; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; resize: vertical; }
+.settings-alert { margin: 14px 24px 0; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 9%, var(--surface)); color: var(--danger); padding: 10px 12px; }
+.profile-create-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.profile-list { display: grid; gap: 8px; }
+.profile-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 9px; }
+.profile-row > div:first-child { min-width: 0; display: grid; gap: 2px; }
+.profile-row strong, .profile-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile-row span { color: var(--text-faint); font-size: 12px; }
+.profile-row > div:last-child { display: flex; gap: 6px; align-items: center; }
+.icon-action.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
 .segmented { display: inline-flex; gap: 6px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); width: fit-content; }
 .segmented button { min-height: 32px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-muted); padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; }
 .segmented button.active { background: var(--surface-2); color: var(--text); border-color: var(--border); }

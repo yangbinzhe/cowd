@@ -66,7 +66,9 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.find('.work-table table').exists()).toBe(true);
     expect(wrapper.find('.capability-sidebar').exists()).toBe(true);
     expect(wrapper.find('.session-sidebar').exists()).toBe(false);
-    expect(wrapper.findAll('.section-row').length).toBeGreaterThan(1);
-    expect(wrapper.findAll('.action-button').length).toBeGreaterThan(1);
+    expect(wrapper.findAll('.section-row').length).toBe(0);
+    expect(wrapper.findAll('.action-button').length).toBe(0);
+    expect(wrapper.text()).toContain('Live endpoint contract');
+    expect(wrapper.text()).toContain('Offline/Error');
   });
 });
