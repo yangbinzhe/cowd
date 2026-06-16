@@ -16,6 +16,7 @@ import IaccPage from './pages/IaccPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 import ToolsPage from './pages/ToolsPage.vue';
+import { pluginRoutes, webuiPagePlugins } from './plugins/registry';
 import { useAppStore } from './stores/app';
 import iaccWriteContracts from './data/iaccWriteContracts.json';
 
@@ -35,6 +36,7 @@ function mountApp(path = '/chat') {
       { path: '/agents', component: AgentsPage },
       { path: '/tools', component: ToolsPage },
       { path: '/gateway', component: GatewayPage },
+      ...pluginRoutes,
       { path: '/iacc', component: IaccPage },
       { path: '/audit', component: AuditPage },
       { path: '/settings', component: SettingsPage },
@@ -57,6 +59,19 @@ async function settleAsync() {
 }
 
 describe('Cowd Vue WebUI shell', () => {
+  it('registers MFG as a pluggable page instead of a hard-coded IACC nav item', async () => {
+    const plugin = webuiPagePlugins.find((item) => item.id === 'mfg');
+    expect(plugin).toBeTruthy();
+    expect(plugin?.route).toBe('/apps/mfg');
+    expect(plugin?.apiNamespace).toBe('/api/apps/mfg');
+    expect(plugin?.requiredCapabilities).toContain('cowd.matrix.runtime');
+
+    const wrapper = await mountApp('/chat');
+    const railButtons = wrapper.findAll('.rail-button');
+    expect(railButtons.some((button) => button.attributes('aria-label') === 'MFG')).toBe(true);
+    expect(railButtons.some((button) => button.attributes('aria-label') === 'IACC')).toBe(false);
+  });
+
   it('keeps Workspace out of the left rail and inside the right companion panel', async () => {
     const wrapper = await mountApp('/chat');
     const rail = wrapper.get('.rail').text();

@@ -2,11 +2,12 @@
 import { computed, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
-  Activity, Brain, Boxes, ClipboardCheck, Factory, Layers, MessageSquare,
+  Activity, Brain, Boxes, ClipboardCheck, Layers, MessageSquare,
   Network, RadioTower, Settings, Wrench,
 } from 'lucide-vue-next';
 import { useAppStore } from './stores/app';
 import type { NavItem } from './types';
+import { pluginNavItems } from './plugins/registry';
 import CompanionPanel from './components/CompanionPanel.vue';
 import CapabilitySidebar from './components/CapabilitySidebar.vue';
 import SessionSidebar from './components/SessionSidebar.vue';
@@ -24,7 +25,7 @@ const nav: NavItem[] = [
   { id: 'agents', label: 'Agents', route: '/agents', icon: Network, group: 'Automation' },
   { id: 'tools', label: 'Tools', route: '/tools', icon: Wrench, group: 'Automation' },
   { id: 'gateway', label: 'Gateway', route: '/gateway', icon: RadioTower, group: 'Channels' },
-  { id: 'iacc', label: 'IACC', route: '/iacc', icon: Factory, group: 'Apps' },
+  ...pluginNavItems,
   { id: 'audit', label: 'Audit', route: '/audit', icon: ClipboardCheck, group: 'System' },
   { id: 'settings', label: 'Settings', route: '/settings', icon: Settings, group: 'System' },
 ];
