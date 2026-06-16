@@ -77,6 +77,49 @@ async function routeShellApis(page) {
     if (path === '/api/platforms/wechat') return json({ sessions: [{ id: 'wx-1', status: 'bound' }] });
     if (path === '/api/channels/wechat-ilink/accounts') return json({ accounts: [{ id: 'wx-account', nickname: 'Cowd WeChat', runtime_bound: true }] });
     if (path === '/api/audit/export') return json({ records: [{ id: 'audit-1', source: 'gateway', action: 'send_text', status: 'ok', target: 'wechat' }], total: 1 });
+    if (path === '/api/iacc/app') return json({
+      app_id: 'iacc.manufacturing',
+      layer: 'application',
+      domains: [{ domain_id: 'server_manufacturing', name: 'Server Manufacturing' }],
+      cowd_capabilities: ['cowd.structured_data.core', 'cowd.memory.fact_check', 'cowd.cross_plane.gateway'],
+    });
+    if (path === '/api/iacc/health') return json({
+      schema_version: '2026.06',
+      expected_schema_version: '2026.06',
+      cockpit_profile_count: 2,
+      cockpit_report_count: 3,
+      quality_gate_count: 4,
+      execution_count: 7,
+      attention_count: 1,
+      capabilities: ['iacc.cockpit_report.generate', 'iacc.cockpit_report.deliver'],
+    });
+    if (path === '/api/cowd/structured/sources') return json({ list_status: 'ready', count: 1, items: [{ source_id: 'mes-inventory', source_name: 'MES inventory', high_watermark: '2026-06-16T08:00:00Z' }] });
+    if (path === '/api/cowd/structured/facts') return json({ list_status: 'ready', count: 1, items: [{ fact_id: 'fact-inventory', fact_type: 'inventory_balance', metric_key: 'shortage_rate', confidence: 0.91 }] });
+    if (path === '/api/cowd/structured/evidence') return json({ list_status: 'ready', count: 1, items: [{ evidence_id: 'evidence-risk', problem_statement: 'Inventory balance browser proof', confidence: 0.82, source_refs: [{ reference: 'iacc:fact:fact-inventory' }] }] });
+    if (path === '/api/cowd/structured/watermarks') return json({ list_status: 'ready', count: 1, items: [{ source_ref: 'mes-inventory', fact_type: 'inventory_balance', high_watermark: '2026-06-16T08:00:00Z' }] });
+    if (path === '/api/cowd/structured/ingest-plan') return json({ batch_id: 'ingest-browser', source_ref: 'mes-inventory' });
+    if (path === '/api/iacc/cockpit/reports/cockpit-report-browser') return json({
+      report: {
+        report_id: 'cockpit-report-browser',
+        status: 'ready',
+        cadence: 'daily',
+        owner_ref: 'quality:ops',
+        profile_id: 'daily-risk',
+        delivery_ref: 'wechat:ops',
+        projection: { widgets: [{ id: 'risk' }, { id: 'inventory' }] },
+        delivery_receipts: [{ cross_plane_receipt_id: 'receipt-iacc', cross_plane_status: 'sent', cross_plane_dispatch_status: 'dry_run', delivered_at: '2026-06-16T08:30:00Z' }],
+      },
+    });
+    if (path === '/api/iacc/cockpit/reports/cockpit-report-browser/delivery-state') return json({
+      delivery_state: {
+        classification: 'dry_run_planned',
+        attempt_count: 1,
+        retryable: true,
+        recommended_mode: 'dry_run',
+        latest_receipt: { cross_plane_receipt_id: 'receipt-iacc', cross_plane_status: 'sent', cross_plane_dispatch_status: 'dry_run', audit_record_id: 'audit-iacc' },
+      },
+    });
+    if (path === '/api/iacc/cockpit/reports/cockpit-report-browser/delivery/retry') return json({ after_state: { classification: 'dry_run_planned' } });
     return json({});
   });
 }
@@ -316,6 +359,38 @@ test('v0.9.208 gateway and audit render as full-page operations workbenches', as
   await expect(page.locator('#workbench-title')).toHaveText('Audit');
   await expect(page.locator('#workbench-content')).toContainText(/Audit|gateway|send_text/i);
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.208-audit-desktop.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.209 iacc renders as manufacturing application workbench on cowd data kernel', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(() => localStorage.setItem('cowd-iacc-report-id', 'cockpit-report-browser'));
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await page.click('#nav-rail [data-view="iacc"]');
+  await expect(page.locator('#workbench-content.workbench-page-iacc')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('IACC');
+  await expect(page.locator('#workbench-content')).toContainText('IACC Workbench');
+  await expect(page.locator('#workbench-content')).toContainText('iacc.manufacturing');
+  await expect(page.locator('#workbench-content')).toContainText('cowd.structured_data.core');
+  await expect(page.locator('#workbench-content')).toContainText('inventory_balance');
+  await expect(page.locator('#workbench-content')).toContainText('dry_run_planned');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.209-iacc-desktop.png' });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.209-iacc-mobile.png' });
 
   expect(errors).toEqual([]);
 });

@@ -465,6 +465,25 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .iacc-report-controls input:focus{outline:none;border-color:var(--accent)}
 .iacc-report-state .runtime-workgraph-detail{margin-top:8px}
 .iacc-delivery-receipts{margin-top:8px}
+.workbench-page-iacc{display:grid;grid-template-columns:minmax(0,1fr) minmax(340px,.82fr);gap:14px;max-width:1240px;align-items:start}
+.workbench-page-iacc>.panel-section,
+.workbench-page-iacc>.iacc-app-mount,
+.workbench-page-iacc>.iacc-report-mount{min-width:0}
+.workbench-page-iacc>.panel-section{border:1px solid var(--border);border-radius:10px;background:var(--surface-subtle);padding:12px;margin-bottom:0}
+.workbench-page-iacc>.iacc-app-mount>.panel-section,
+.workbench-page-iacc>.iacc-report-mount>.panel-section{border:1px solid var(--border);border-radius:10px;background:var(--surface-subtle);padding:12px;margin-bottom:0}
+.workbench-page-iacc>.iacc-console,
+.workbench-page-iacc>.iacc-app-mount,
+.workbench-page-iacc>.iacc-structured{grid-column:1/-1}
+.workbench-page-iacc>.iacc-console{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.workbench-page-iacc>.iacc-console h3{margin:0;flex:0 0 auto}
+.workbench-page-iacc .iacc-report-controls{flex:1;max-width:620px;margin-left:auto}
+.workbench-page-iacc .structured-workbench{grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.workbench-page-iacc .structured-collection{background:var(--bg);border-radius:8px;padding:10px}
+.workbench-page-iacc .structured-row b{font-size:13px}
+.workbench-page-iacc .structured-row small{font-size:11px;line-height:1.35;white-space:normal}
+.workbench-page-iacc .structured-ingest-form .panel-form{grid-template-columns:repeat(5,minmax(0,1fr)) auto}
+.workbench-page-iacc .iacc-report-state{min-height:230px}
 .dispatch-target-preview{margin-top:8px}
 .dispatch-target-preview:empty{display:none}
 .cross-plane-composer{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:9px;margin-top:10px}
@@ -536,6 +555,11 @@ pre,code{font-family:var(--font-mono);font-size:13px}
   .workbench-page-skills .skill-summary{grid-template-columns:1fr}
   .workbench-page-gateway,
   .workbench-page-audit{grid-template-columns:1fr}
+  .workbench-page-iacc{grid-template-columns:1fr}
+  .workbench-page-iacc>.iacc-console{display:block}
+  .workbench-page-iacc .iacc-report-controls{grid-template-columns:1fr;max-width:none;margin-left:0;margin-top:10px}
+  .workbench-page-iacc .structured-workbench{grid-template-columns:1fr}
+  .workbench-page-iacc .structured-ingest-form .panel-form{grid-template-columns:1fr}
   #chat-header{padding:8px 10px;gap:8px}
   .chat-title-block{min-width:0}
   .chat-title-block span{display:none}
