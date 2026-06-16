@@ -11,6 +11,7 @@ import CapabilityPage from './pages/CapabilityPage.vue';
 import MemoryPage from './pages/MemoryPage.vue';
 import RuntimePage from './pages/RuntimePage.vue';
 import ContextPage from './pages/ContextPage.vue';
+import GatewayPage from './pages/GatewayPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 
@@ -29,7 +30,7 @@ function mountApp(path = '/chat') {
       { path: '/skills', component: SkillsPage },
       { path: '/agents', component: AgentsPage },
       { path: '/tools', component: CapabilityPage, props: { page: 'tools' } },
-      { path: '/gateway', component: CapabilityPage, props: { page: 'gateway' } },
+      { path: '/gateway', component: GatewayPage },
       { path: '/iacc', component: CapabilityPage, props: { page: 'iacc' } },
       { path: '/audit', component: CapabilityPage, props: { page: 'audit' } },
       { path: '/settings', component: SettingsPage },

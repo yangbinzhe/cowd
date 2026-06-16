@@ -364,13 +364,13 @@ export const api = {
   connectorCapabilities: () => read('/api/connectors/capabilities', {}),
   connectorResources: () => read('/api/connectors/resources', {}),
   connectorMcpServers: () => read('/api/connectors/mcp/servers', {}),
-  connectorRevalidateResource: (resource_ref: string) => write('/api/connectors/resources/revalidate', {
+  connectorRevalidateResource: (reference: string) => write('/api/connectors/resources/revalidate', {
     method: 'POST',
-    body: JSON.stringify({ resource_ref }),
+    body: JSON.stringify({ reference }),
   }),
-  connectorPromoteMemory: (resource_ref: string) => write('/api/connectors/resources/promote-memory', {
+  connectorPromoteMemory: (reference: string) => write('/api/connectors/resources/promote-memory', {
     method: 'POST',
-    body: JSON.stringify({ resource_ref }),
+    body: JSON.stringify({ reference }),
   }),
   crossPlaneSummary: () => read('/api/cross-plane/summary', {}),
   crossPlaneAudit: () => read('/api/cross-plane/audit', {}),
