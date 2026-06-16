@@ -25,12 +25,19 @@ function headers(init: RequestInit = {}) {
   return headers;
 }
 
-async function parseResponse(response: Response) {
+async function parseResponse(response: Response, path = '') {
   const text = await response.text();
   if (!text) return {};
+  const contentType = response.headers.get('content-type') || '';
+  const trimmed = text.trim().toLowerCase();
+  const isApi = path.startsWith('/api/') || response.url.includes('/api/');
+  if (isApi && (trimmed.startsWith('<!doctype html') || trimmed.startsWith('<html'))) {
+    throw new Error(`Expected JSON from API but received ${contentType || 'unknown content type'}`);
+  }
   try {
     return JSON.parse(text);
   } catch {
+    if (isApi) throw new Error('Expected JSON from API but received non-JSON body');
     return text;
   }
 }
@@ -39,7 +46,7 @@ async function read<T>(path: string, fallback: T, init: RequestInit = {}): Promi
   try {
     const response = await fetch(path, { ...init, headers: headers(init) });
     if (!response.ok) throw new Error(await response.text());
-    return await parseResponse(response) as T;
+    return await parseResponse(response, path) as T;
   } catch (error) {
     return {
       ...(fallback as any),
@@ -55,7 +62,7 @@ async function write<T>(path: string, init: RequestInit = {}): Promise<T> {
     const body = await response.text();
     throw new Error(body || `${response.status} ${response.statusText}`);
   }
-  return await parseResponse(response) as T;
+  return await parseResponse(response, path) as T;
 }
 
 function countPayload(data: any): number {

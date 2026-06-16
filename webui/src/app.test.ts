@@ -58,7 +58,7 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.get('.chat-page').exists()).toBe(true);
   });
 
-  it('renders capability pages with metrics, charts, and tables', async () => {
+  it('renders capability pages with module sections instead of duplicated primary navigation', async () => {
     const wrapper = await mountApp('/runtime');
     await settle();
     expect(wrapper.text()).toContain('Runtime Control');
@@ -67,10 +67,23 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.find('.work-table table').exists()).toBe(true);
     expect(wrapper.find('.capability-sidebar').exists()).toBe(true);
     expect(wrapper.find('.session-sidebar').exists()).toBe(false);
-    expect(wrapper.findAll('.section-row').length).toBe(0);
+    expect(wrapper.findAll('.section-row').length).toBe(4);
+    expect(wrapper.find('.capability-sidebar').text()).not.toContain('Memory');
+    expect(wrapper.find('.capability-sidebar').text()).not.toContain('Settings');
     expect(wrapper.findAll('.action-button').length).toBe(0);
     expect(wrapper.text()).toContain('Live endpoint contract');
     expect(wrapper.text()).toContain('Offline/Error');
+  });
+
+  it('marks HTML API fallback as offline instead of successful data', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('<!doctype html><html></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+    const manifest = await api.health();
+    expect(manifest.__offline).toBe(true);
+    expect(manifest.__error).toContain('Expected JSON');
   });
 
   it('uploads files as multipart form data without fake success', async () => {

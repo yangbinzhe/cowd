@@ -10,7 +10,7 @@ test('new shell uses icon rail and right Activity/Workspace companion tabs', asy
   await expect(page.locator('.transcript')).toBeVisible();
   await expect(page.locator('.composer textarea')).toBeVisible();
   await expect(page.locator('.turn-role')).toHaveCount(0);
-  await expect(page.locator('.status-strip')).toContainText('local');
+  await expect(page.locator('.status-strip')).toContainText(/local|offline/);
   await expect(page.locator('.status-strip')).toContainText('Select model');
 });
 
@@ -26,11 +26,13 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
   await expect(page.locator('.preview-pane')).toHaveCount(0);
 });
 
-test('capability pages include visual charts instead of numeric-only cards', async ({ page }) => {
+test('capability pages expose current-page sections instead of duplicated primary navigation', async ({ page }) => {
   await page.goto('/index.html#/memory');
   await expect(page.locator('.session-sidebar')).toHaveCount(0);
   await expect(page.locator('.capability-sidebar')).toBeVisible();
-  await expect(page.locator('.section-row')).toHaveCount(0);
+  await expect(page.locator('.section-row')).toHaveCount(4);
+  await expect(page.locator('.capability-sidebar')).not.toContainText('Runtime');
+  await expect(page.locator('.capability-sidebar')).not.toContainText('Settings');
   await expect(page.locator('.metric-card')).toHaveCount(3);
   await expect(page.locator('.chart-panel canvas, .chart-panel svg, .chart-panel div').first()).toBeVisible();
   await expect(page.locator('.work-table table')).toBeVisible();
