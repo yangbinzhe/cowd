@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, reactive } from 'vue';
 import { Moon, Save, Shield, Sun } from 'lucide-vue-next';
 import { useAppStore } from '../stores/app';
 
 const store = useAppStore();
+const form = reactive({
+  model: store.settings?.model || 'claude-sonnet-4-6',
+  profile: store.settings?.profile || 'default',
+});
 const theme = computed({
   get: () => document.documentElement.dataset.theme || 'dark',
   set: (value: string) => {
@@ -20,7 +24,7 @@ const theme = computed({
         <h1>Settings</h1>
         <p>模型、外观、profile、运行策略、渠道和安全控制集中管理。</p>
       </div>
-      <button class="primary-action" type="button"><Save :size="15" /> Save changes</button>
+      <button class="primary-action" type="button" @click="store.saveSettings(form)"><Save :size="15" /> Save changes</button>
     </header>
 
     <div class="settings-grid">
@@ -34,8 +38,9 @@ const theme = computed({
 
       <section class="settings-section">
         <h2>Model and profile</h2>
-        <label>Default model<input :value="store.settings?.model || 'claude-sonnet-4-6'" /></label>
-        <label>Profile<input :value="store.settings?.profile || 'default'" /></label>
+        <label>Default model<input v-model="form.model" /></label>
+        <label>Profile<input v-model="form.profile" /></label>
+        <p v-if="store.settingsSavedAt" class="save-state">Saved at {{ store.settingsSavedAt }}</p>
       </section>
 
       <section class="settings-section">

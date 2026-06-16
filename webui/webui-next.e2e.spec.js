@@ -17,6 +17,9 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
   await expect(page.locator('.breadcrumbs')).toBeVisible();
   await expect(page.getByRole('button', { name: /Parent folder/ })).toBeVisible();
   await page.locator('.file-row').filter({ hasText: 'README.md' }).first().click();
+  await expect(page.locator('.render-preview')).toBeVisible();
+  await page.getByRole('button', { name: 'Workspace' }).click();
+  await page.locator('.file-row').filter({ hasText: 'Cargo.toml' }).first().click();
   await expect(page.locator('.preview-pane textarea')).toBeVisible();
 });
 

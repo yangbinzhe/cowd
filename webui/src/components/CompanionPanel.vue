@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { ChevronUp, FileText, Folder, RotateCcw, Save, Workflow } from 'lucide-vue-next';
+import { ChevronUp, Eye, FileText, Folder, RotateCcw, Save, Search, Workflow } from 'lucide-vue-next';
 import { useAppStore } from '../stores/app';
+import MarkdownBlock from './MarkdownBlock.vue';
 
 const store = useAppStore();
 
@@ -18,6 +19,13 @@ const parentDir = computed(() => {
   parts.pop();
   return parts.join('/');
 });
+
+const selectedExt = computed(() => store.selectedFile.split('.').pop()?.toLowerCase() || '');
+const isMarkdown = computed(() => ['md', 'markdown'].includes(selectedExt.value));
+const isImage = computed(() => ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(selectedExt.value));
+const isStructured = computed(() => ['json', 'yaml', 'yml', 'toml'].includes(selectedExt.value));
+const rawFileUrl = computed(() => `/api/file/raw?path=${encodeURIComponent(store.selectedFile)}`);
+const canEdit = computed(() => !!store.selectedFile && !isImage.value);
 
 function openFile(path: string, kind: string) {
   if (kind === 'dir') store.loadWorkspace(path);
@@ -69,9 +77,13 @@ function openFile(path: string, kind: string) {
         <ChevronUp :size="15" />
         Parent folder
       </button>
+      <label class="workspace-search">
+        <Search :size="14" />
+        <input v-model="store.workspaceFilter" type="search" placeholder="Filter files" />
+      </label>
       <div class="file-list">
         <button
-          v-for="file in store.workspaceFiles"
+          v-for="file in store.filteredWorkspaceFiles"
           :key="file.path"
           class="file-row"
           type="button"
@@ -87,11 +99,20 @@ function openFile(path: string, kind: string) {
         <div class="preview-head">
           <strong>{{ store.selectedFile }}</strong>
           <div>
-            <button class="icon-action" type="button" :disabled="!store.editorDirty" @click="store.resetFile"><RotateCcw :size="14" /></button>
-            <button class="icon-action" type="button" :disabled="!store.editorDirty" @click="store.saveFile"><Save :size="14" /></button>
+            <button class="icon-action" type="button" :disabled="!store.editorDirty || !canEdit" @click="store.resetFile"><RotateCcw :size="14" /></button>
+            <button class="icon-action" type="button" :disabled="!store.editorDirty || !canEdit" @click="store.saveFile"><Save :size="14" /></button>
           </div>
         </div>
-        <textarea v-model="store.editorContent" spellcheck="false" />
+        <div v-if="isImage" class="image-preview">
+          <img :src="rawFileUrl" alt="" />
+        </div>
+        <div v-else-if="isMarkdown" class="render-preview">
+          <MarkdownBlock :content="store.editorContent" />
+        </div>
+        <textarea v-else-if="isStructured" v-model="store.editorContent" class="structured-preview" spellcheck="false" />
+        <textarea v-else v-model="store.editorContent" spellcheck="false" />
+        <p v-if="store.fileError" class="file-error">{{ store.fileError }}</p>
+        <p v-if="!canEdit" class="readonly-note"><Eye :size="14" /> Preview only</p>
         <span class="dirty-state" :class="{ dirty: store.editorDirty }">{{ store.editorDirty ? 'Unsaved changes' : 'Saved' }}</span>
       </div>
     </section>

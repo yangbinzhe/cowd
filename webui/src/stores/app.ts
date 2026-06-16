@@ -24,7 +24,15 @@ export const useAppStore = defineStore('app', () => {
   const selectedFile = ref('');
   const selectedFileContent = ref('');
   const editorContent = ref('');
+  const workspaceFilter = ref('');
+  const fileError = ref('');
+  const settingsSavedAt = ref('');
   const editorDirty = computed(() => selectedFileContent.value !== editorContent.value);
+  const filteredWorkspaceFiles = computed(() => {
+    const query = workspaceFilter.value.trim().toLowerCase();
+    if (!query) return workspaceFiles.value;
+    return workspaceFiles.value.filter((file) => `${file.name} ${file.path}`.toLowerCase().includes(query));
+  });
   const busy = ref(false);
 
   const activeSession = computed(() => sessions.value.find((item) => item.id === activeSessionId.value) || sessions.value[0]);
@@ -70,12 +78,17 @@ export const useAppStore = defineStore('app', () => {
     companionTab.value = 'activity';
     activity.value.unshift({ id: `send-${Date.now()}`, kind: 'runtime', title: 'Message queued', detail: content.slice(0, 140), status: 'pending' });
     await api.sendMessage(sessionId, content);
-    turns.value.push({
+    const assistantTurn: ChatTurn = {
       id: `assistant-${Date.now()}`,
       role: 'assistant',
       content: '消息已提交。连接运行中的 gateway 后，这里会显示真实流式响应、工具调用和思考状态。',
-      status: 'complete',
-    });
+      status: 'streaming',
+    };
+    turns.value.push(assistantTurn);
+    window.setTimeout(() => {
+      assistantTurn.status = 'complete';
+      activity.value.unshift({ id: `done-${Date.now()}`, kind: 'think', title: 'Assistant turn settled', detail: '正文、工具状态和上下文摘要已归并到当前 turn。', status: 'complete' });
+    }, 250);
   }
 
   async function loadActivity() {
@@ -94,6 +107,7 @@ export const useAppStore = defineStore('app', () => {
 
   async function openFile(path: string) {
     selectedFile.value = path;
+    fileError.value = '';
     selectedFileContent.value = await api.rawFile(path);
     editorContent.value = selectedFileContent.value;
     companionTab.value = 'workspace';
@@ -101,8 +115,13 @@ export const useAppStore = defineStore('app', () => {
 
   async function saveFile() {
     if (!selectedFile.value) return;
-    await api.saveFile(selectedFile.value, editorContent.value);
-    selectedFileContent.value = editorContent.value;
+    try {
+      await api.saveFile(selectedFile.value, editorContent.value);
+      selectedFileContent.value = editorContent.value;
+      fileError.value = '';
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+    }
   }
 
   function resetFile() {
@@ -111,6 +130,12 @@ export const useAppStore = defineStore('app', () => {
 
   function openCompanion(tab: CompanionTab) {
     companionTab.value = tab;
+  }
+
+  async function saveSettings(nextSettings: Record<string, unknown>) {
+    settings.value = { ...settings.value, ...nextSettings };
+    await api.saveSettings(settings.value);
+    settingsSavedAt.value = new Date().toLocaleTimeString();
   }
 
   return {
@@ -125,9 +150,13 @@ export const useAppStore = defineStore('app', () => {
     workspaceRoot,
     workspaceDir,
     workspaceFiles,
+    workspaceFilter,
+    filteredWorkspaceFiles,
     selectedFile,
     selectedFileContent,
     editorContent,
+    fileError,
+    settingsSavedAt,
     editorDirty,
     busy,
     activeSession,
@@ -140,5 +169,6 @@ export const useAppStore = defineStore('app', () => {
     saveFile,
     resetFile,
     openCompanion,
+    saveSettings,
   };
 });

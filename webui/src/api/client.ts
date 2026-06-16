@@ -79,6 +79,10 @@ export const api = {
   iacc: () => request('/api/iacc/health', {}, { status: 'ready', readiness: { ready: true } }),
   audit: () => request('/api/audit/export?limit=20', {}, { entries: [] }),
   settings: () => request('/api/config', {}, { model: 'claude-sonnet-4-6', profile: 'default', version: '0.9.212' }),
+  saveSettings: (config: Record<string, unknown>) => request('/api/config', {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  }, { ok: true, config }),
 };
 
 export function normalizeActivity(raw: any[]): ActivityEvent[] {
