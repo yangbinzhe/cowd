@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { ChevronUp, Eye, FilePlus2, FileText, Folder, FolderPlus, Link2, RotateCcw, Save, Search, Trash2, Upload, Workflow, X } from 'lucide-vue-next';
+import { Brain, ChevronUp, Eye, FilePenLine, FilePlus2, FileText, Folder, FolderPlus, Info, Link2, RotateCcw, Save, Search, Trash2, Upload, Workflow, X } from 'lucide-vue-next';
 import { useAppStore } from '../stores/app';
 import MarkdownBlock from './MarkdownBlock.vue';
 
 const store = useAppStore();
 const newFolderName = ref('');
+const renamePath = ref('');
+const renameTarget = ref('');
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const breadcrumbs = computed(() => {
@@ -28,6 +30,8 @@ const isImage = computed(() => ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].incl
 const isStructured = computed(() => ['json', 'yaml', 'yml', 'toml'].includes(selectedExt.value));
 const rawFileUrl = computed(() => `/api/file/raw?path=${encodeURIComponent(store.selectedFile)}`);
 const canEdit = computed(() => !!store.selectedFile && !isImage.value);
+const thinkingEvents = computed(() => store.activity.filter((event) => event.kind === 'think'));
+const inspectorEvents = computed(() => store.activity.filter((event) => event.kind === 'error' || event.status === 'error'));
 
 function openFile(path: string, kind: string) {
   if (kind === 'dir') store.loadWorkspace(path);
@@ -53,6 +57,18 @@ async function dropUpload(event: DragEvent) {
   event.preventDefault();
   await uploadFiles(event.dataTransfer?.files || null);
 }
+
+function startRename(path: string) {
+  renamePath.value = path;
+  renameTarget.value = path;
+}
+
+async function commitRename() {
+  if (!renamePath.value || !renameTarget.value.trim()) return;
+  await store.renameWorkspacePath(renamePath.value, renameTarget.value.trim());
+  renamePath.value = '';
+  renameTarget.value = '';
+}
 </script>
 
 <template>
@@ -60,11 +76,19 @@ async function dropUpload(event: DragEvent) {
     <div class="companion-tabs" role="tablist">
       <button :class="{ active: store.companionTab === 'activity' }" type="button" @click="store.openCompanion('activity')">
         <Workflow :size="15" />
-        Activity
+        <span>Activity</span>
+      </button>
+      <button :class="{ active: store.companionTab === 'thinking' }" type="button" @click="store.openCompanion('thinking')">
+        <Brain :size="15" />
+        <span>Thinking</span>
       </button>
       <button :class="{ active: store.companionTab === 'workspace' }" type="button" @click="store.openCompanion('workspace')">
         <Folder :size="15" />
-        Workspace
+        <span>Workspace</span>
+      </button>
+      <button :class="{ active: store.companionTab === 'inspector' }" type="button" @click="store.openCompanion('inspector')">
+        <Info :size="15" />
+        <span>Inspector</span>
       </button>
     </div>
 
@@ -84,7 +108,27 @@ async function dropUpload(event: DragEvent) {
       </div>
     </section>
 
-    <section v-else class="companion-body workspace-tab">
+    <section v-else-if="store.companionTab === 'thinking'" class="companion-body">
+      <div class="panel-title">
+        <h2>Thinking stream</h2>
+        <span>{{ thinkingEvents.length }} events</span>
+      </div>
+      <div class="activity-list">
+        <article v-for="event in thinkingEvents" :key="event.id" class="activity-item" data-kind="think">
+          <div>
+            <strong>{{ event.title }}</strong>
+            <p>{{ event.detail || 'No thinking detail reported.' }}</p>
+          </div>
+          <span>{{ event.status || 'seen' }}</span>
+        </article>
+        <div v-if="!thinkingEvents.length" class="empty-state">
+          <strong>No thinking events</strong>
+          <p>Thinking deltas will appear here when the runtime reports them.</p>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="store.companionTab === 'workspace'" class="companion-body workspace-tab">
       <div class="panel-title">
         <h2>Workspace</h2>
         <span>{{ store.workspaceFiles.length }} items</span>
@@ -139,7 +183,13 @@ async function dropUpload(event: DragEvent) {
             <span>{{ file.name }}</span>
           </button>
           <small>{{ file.kind }}</small>
-          <button class="icon-action" type="button" @click="store.deleteWorkspacePath(file.path)"><Trash2 :size="13" /></button>
+          <button class="icon-action" type="button" :aria-label="`Rename ${file.name}`" @click="startRename(file.path)"><FilePenLine :size="13" /></button>
+          <button class="icon-action" type="button" :aria-label="`Delete ${file.name}`" @click="store.deleteWorkspacePath(file.path)"><Trash2 :size="13" /></button>
+          <div v-if="renamePath === file.path" class="rename-row">
+            <input v-model="renameTarget" type="text" @keydown.enter.prevent="commitRename" />
+            <button class="ghost-action" type="button" @click="commitRename">Rename</button>
+            <button class="ghost-action" type="button" @click="renamePath = ''">Cancel</button>
+          </div>
         </article>
       </div>
       <div class="preview-pane" v-if="store.selectedFile">
@@ -162,6 +212,32 @@ async function dropUpload(event: DragEvent) {
         <p v-if="store.fileError" class="file-error">{{ store.fileError }}</p>
         <p v-if="!canEdit" class="readonly-note"><Eye :size="14" /> Preview only</p>
         <span class="dirty-state" :class="{ dirty: store.editorDirty }">{{ store.editorDirty ? 'Unsaved changes' : 'Saved' }}</span>
+      </div>
+    </section>
+
+    <section v-else class="companion-body">
+      <div class="panel-title">
+        <h2>Inspector</h2>
+        <span>{{ inspectorEvents.length }} errors</span>
+      </div>
+      <dl class="detail-list">
+        <dt>Workspace</dt>
+        <dd>{{ store.workspaceRoot || 'not reported' }}</dd>
+        <dt>Selected file</dt>
+        <dd>{{ store.selectedFile || '-' }}</dd>
+        <dt>File error</dt>
+        <dd>{{ store.fileError || '-' }}</dd>
+        <dt>Context</dt>
+        <dd>{{ store.contextUsagePercent === null ? store.contextUsageSource : `${store.contextUsagePercent}%` }}</dd>
+      </dl>
+      <div class="activity-list">
+        <article v-for="event in inspectorEvents" :key="event.id" class="activity-item" data-kind="error">
+          <div>
+            <strong>{{ event.title }}</strong>
+            <p>{{ event.detail || 'No detail available.' }}</p>
+          </div>
+          <span>{{ event.status || 'error' }}</span>
+        </article>
       </div>
     </section>
   </aside>

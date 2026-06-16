@@ -43,6 +43,8 @@ export const useAppStore = defineStore('app', () => {
   const selectedModel = ref('');
   const selectedProfile = ref('default');
   const commandError = ref('');
+  const contextUsagePercent = ref<number | null>(null);
+  const contextUsageSource = ref('not reported');
   const sessionQuery = ref('');
   const actionResults = ref<Record<string, any>>({});
   const capabilitySnapshots = ref<Record<string, EndpointSnapshot[]>>({});
@@ -118,7 +120,26 @@ export const useAppStore = defineStore('app', () => {
     }));
     if (!turns.value.length) turns.value = [{ id: 'empty', role: 'system', content: '当前 session 暂无消息。', status: 'complete' }];
     connectSessionStream(sessionId);
+    await refreshContextUsage(sessionId);
     await loadAttachments(sessionId);
+  }
+
+  async function refreshContextUsage(sessionId = activeSessionId.value) {
+    if (!sessionId) {
+      contextUsagePercent.value = null;
+      contextUsageSource.value = 'no active session';
+      return;
+    }
+    const stats: any = await api.sessionStats(sessionId);
+    const used = Number(stats.input_tokens || stats.output_tokens || stats.total_tokens || stats.token_usage?.total || 0);
+    const limit = Number(stats.context_window || stats.max_context_tokens || stats.token_budget || stats.token_usage?.limit || 0);
+    if (used > 0 && limit > 0) {
+      contextUsagePercent.value = Math.max(0, Math.min(100, Math.round((used / limit) * 100)));
+      contextUsageSource.value = 'session stats';
+    } else {
+      contextUsagePercent.value = null;
+      contextUsageSource.value = 'not reported';
+    }
   }
 
   async function refreshSessions(query = sessionQuery.value) {
@@ -243,6 +264,7 @@ export const useAppStore = defineStore('app', () => {
     }
 
     if (type === 'ThinkingDelta') {
+      companionTab.value = 'thinking';
       recordLiveActivity('think', 'Thinking', event.content || event.thinking || '', 'running');
       return;
     }
@@ -270,11 +292,13 @@ export const useAppStore = defineStore('app', () => {
     }
 
     if (type === 'TurnError') {
+      companionTab.value = 'inspector';
       completeAssistantTurn(event.error || 'Turn failed', 'error');
       recordLiveActivity('error', 'Turn failed', event.error || '', 'error');
       return;
     }
 
+    if (String(type).toLowerCase().includes('error')) companionTab.value = 'inspector';
     recordLiveActivity('runtime', type, event.summary || event.content || JSON.stringify(event).slice(0, 220), event.status || 'observed');
   }
 
@@ -377,6 +401,7 @@ export const useAppStore = defineStore('app', () => {
       return result;
     } catch (error) {
       fileError.value = error instanceof Error ? error.message : String(error);
+      companionTab.value = 'inspector';
       throw error;
     } finally {
       uploadBusy.value = false;
@@ -385,25 +410,46 @@ export const useAppStore = defineStore('app', () => {
 
   async function createWorkspaceDir(name: string) {
     const path = [workspaceDir.value, name.trim()].filter(Boolean).join('/');
-    await api.createDir(path);
-    await loadWorkspace(workspaceDir.value);
+    try {
+      await api.createDir(path);
+      await loadWorkspace(workspaceDir.value);
+      fileError.value = '';
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+      companionTab.value = 'inspector';
+      throw error;
+    }
   }
 
   async function deleteWorkspacePath(path: string) {
-    await api.deleteWorkspacePath(path);
-    if (selectedFile.value === path) {
-      selectedFile.value = '';
-      selectedFileContent.value = '';
-      editorContent.value = '';
+    try {
+      await api.deleteWorkspacePath(path);
+      if (selectedFile.value === path) {
+        selectedFile.value = '';
+        selectedFileContent.value = '';
+        editorContent.value = '';
+      }
+      await loadWorkspace(workspaceDir.value);
+      fileError.value = '';
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+      companionTab.value = 'inspector';
+      throw error;
     }
-    await loadWorkspace(workspaceDir.value);
   }
 
   async function renameWorkspacePath(path: string, to: string) {
-    const result: any = await api.renameWorkspacePath(path, to);
-    if (selectedFile.value === path) selectedFile.value = result.to || to;
-    await loadWorkspace(workspaceDir.value);
-    return result;
+    try {
+      const result: any = await api.renameWorkspacePath(path, to);
+      if (selectedFile.value === path) selectedFile.value = result.to || to;
+      await loadWorkspace(workspaceDir.value);
+      fileError.value = '';
+      return result;
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+      companionTab.value = 'inspector';
+      throw error;
+    }
   }
 
   function renderMessageWithAttachments(content: string) {
@@ -422,6 +468,7 @@ export const useAppStore = defineStore('app', () => {
       fileError.value = '';
     } catch (error) {
       fileError.value = error instanceof Error ? error.message : String(error);
+      companionTab.value = 'inspector';
     }
   }
 
@@ -511,6 +558,10 @@ export const useAppStore = defineStore('app', () => {
 
   async function toggleSolo() {
     approvalConfig.value = await api.toggleSolo();
+  }
+
+  async function verifyAuth() {
+    return api.authVerify();
   }
 
   async function loadCapability(page: Exclude<NavId, 'chat' | 'settings'>) {
@@ -604,6 +655,8 @@ export const useAppStore = defineStore('app', () => {
     activeModal,
     selectedModel,
     selectedProfile,
+    contextUsagePercent,
+    contextUsageSource,
     availableModels,
     availableProfiles,
     commandError,
@@ -619,6 +672,7 @@ export const useAppStore = defineStore('app', () => {
     boot,
     refreshSessions,
     loadMessages,
+    refreshContextUsage,
     createSession,
     deleteSession,
     compactSession,
@@ -648,6 +702,7 @@ export const useAppStore = defineStore('app', () => {
     deleteProfile,
     saveApprovalConfig,
     toggleSolo,
+    verifyAuth,
     loadCapability,
     refreshCommands,
     executeCommand,

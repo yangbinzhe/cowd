@@ -270,6 +270,7 @@ export const api = {
     status: 'offline',
     static_webui: 'local vite fallback',
   }),
+  authVerify: () => read('/api/auth/verify', { authenticated: false, status: 'offline' }),
   sessions: () => read<{ sessions: SessionSummary[] }>('/api/sessions?limit=24', { sessions: [] }),
   searchSessions: (query: string) => read<{ sessions: SessionSummary[] }>(`/api/sessions?limit=24${query ? `&q=${encodeURIComponent(query)}` : ''}`, { sessions: [] }),
   createSession: (model?: string) => write<SessionSummary>('/api/sessions', {

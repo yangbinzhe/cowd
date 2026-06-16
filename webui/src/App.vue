@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   Activity, Brain, Boxes, ClipboardCheck, Factory, Layers, MessageSquare,
@@ -33,6 +33,9 @@ function go(item: NavItem) {
   router.push(item.route);
 }
 
+const currentPage = computed(() => route.path.replace('/', '') || 'chat');
+const activeSection = computed(() => store.activeSectionByPage[currentPage.value] || String(route.query.section || ''));
+
 onMounted(() => {
   store.boot();
 });
@@ -58,7 +61,7 @@ onMounted(() => {
     <SessionSidebar v-if="route.path === '/chat' || route.path === '/'" />
     <CapabilitySidebar v-else-if="route.path !== '/settings'" />
 
-    <main class="main-surface">
+    <main class="main-surface" :data-page="currentPage" :data-active-section="activeSection">
       <RouterView />
     </main>
 

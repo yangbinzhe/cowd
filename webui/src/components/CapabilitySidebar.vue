@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, watch } from 'vue';
+import { computed, onMounted, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { capabilitySpecs } from '../data/capabilities';
 import { useAppStore } from '../stores/app';
@@ -37,34 +37,21 @@ function focusSection(section: CapabilitySection) {
   target.focus({ preventScroll: true });
 }
 
-function applySectionFilter(sectionId: string) {
-  const panels = Array.from(document.querySelectorAll<HTMLElement>('main [data-section]'));
-  if (!panels.length) return;
-  panels.forEach((panel) => {
-    panel.hidden = panel.dataset.section !== sectionId;
-  });
-}
-
 async function selectSection(section: CapabilitySection) {
   store.selectSection(pageId.value, section.id);
   await router.replace({ query: { ...route.query, section: section.id } });
-  await nextTick();
-  applySectionFilter(section.id);
   focusSection(section);
 }
 
 watch(() => route.query.section, async (sectionId) => {
   if (!sectionId || typeof sectionId !== 'string') return;
   store.selectSection(pageId.value, sectionId);
-  await nextTick();
-  applySectionFilter(sectionId);
 });
 
 onMounted(() => {
   const sectionId = route.query.section;
   if (sectionId && typeof sectionId === 'string') {
     store.selectSection(pageId.value, sectionId);
-    applySectionFilter(sectionId);
   }
 });
 </script>

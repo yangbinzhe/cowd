@@ -16,6 +16,7 @@ import IaccPage from './pages/IaccPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 import ToolsPage from './pages/ToolsPage.vue';
+import { useAppStore } from './stores/app';
 
 vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
 vi.mock('vue-echarts', () => ({ default: { template: '<div class="chart"></div>' } }));
@@ -60,7 +61,9 @@ describe('Cowd Vue WebUI shell', () => {
     const rail = wrapper.get('.rail').text();
     expect(rail).not.toContain('Workspace');
     expect(wrapper.get('.companion-tabs').text()).toContain('Activity');
+    expect(wrapper.get('.companion-tabs').text()).toContain('Thinking');
     expect(wrapper.get('.companion-tabs').text()).toContain('Workspace');
+    expect(wrapper.get('.companion-tabs').text()).toContain('Inspector');
   });
 
   it('renders chat, composer, markdown body, and context meter', async () => {
@@ -69,7 +72,25 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.get('.transcript').exists()).toBe(true);
     expect(wrapper.get('.composer textarea').exists()).toBe(true);
     expect(wrapper.get('.context-meter').exists()).toBe(true);
+    expect(wrapper.text()).toContain('Context not reported');
     expect(wrapper.get('.chat-page').exists()).toBe(true);
+  });
+
+  it('renders Workspace rename controls and Inspector tab from real store state', async () => {
+    const wrapper = await mountApp('/chat');
+    await settleAsync();
+    const store = useAppStore();
+    store.workspaceFiles = [{ name: 'a.md', path: 'docs/a.md', kind: 'file' }];
+    store.openCompanion('workspace');
+    await settle();
+    await wrapper.get('button[aria-label="Rename a.md"]').trigger('click');
+    await settle();
+    expect(wrapper.find('.rename-row').exists()).toBe(true);
+    expect(wrapper.find('.rename-row input').element.value).toBe('docs/a.md');
+    store.openCompanion('inspector');
+    await settle();
+    expect(wrapper.text()).toContain('Inspector');
+    expect(wrapper.text()).toContain('Context');
   });
 
   it('renders tools management page with real registry controls', async () => {
@@ -227,6 +248,26 @@ describe('Cowd Vue WebUI shell', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/audit/export?source=approval&limit=25&offset=5', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/usage', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/cowd/release-gate', expect.any(Object));
+  });
+
+  it('verifies auth through the backend instead of showing a fake success', async () => {
+    const fetchMock = vi.fn((path: RequestInfo | URL) => {
+      const url = String(path);
+      if (url === '/api/auth/verify') return Promise.resolve(new Response(JSON.stringify({ authenticated: true, status: 'verified' }), { status: 200 }));
+      if (url.startsWith('/api/sessions?')) return Promise.resolve(new Response(JSON.stringify({ sessions: [] })));
+      if (url === '/api/config/providers') return Promise.resolve(new Response(JSON.stringify({ providers: [], models: [] })));
+      if (url === '/api/profiles') return Promise.resolve(new Response(JSON.stringify({ profiles: [], active_profile: 'default' })));
+      if (url === '/api/commands') return Promise.resolve(new Response(JSON.stringify({ commands: [] })));
+      if (url === '/api/workspace') return Promise.resolve(new Response(JSON.stringify({ workspace_root: '', workspace_canonical: '' })));
+      if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ dir: '', files: [] })));
+      return Promise.resolve(new Response(JSON.stringify({})));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = await mountApp('/settings');
+    await settleAsync();
+    await wrapper.findAll('button.ghost-action').find((button) => button.text().includes('Verify token'))?.trigger('click');
+    await settleAsync();
+    expect(fetchMock).toHaveBeenCalledWith('/api/auth/verify', expect.any(Object));
   });
 
   it('calls real cross-plane identity grant and action endpoints', async () => {
