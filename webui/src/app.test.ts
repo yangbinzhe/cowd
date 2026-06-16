@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import App from './App.vue';
 import { api } from './api/client';
 import ChatPage from './pages/ChatPage.vue';
+import AgentsPage from './pages/AgentsPage.vue';
 import CapabilityPage from './pages/CapabilityPage.vue';
 import MemoryPage from './pages/MemoryPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
@@ -24,7 +25,7 @@ function mountApp(path = '/chat') {
       { path: '/context', component: CapabilityPage, props: { page: 'context' } },
       { path: '/memory', component: MemoryPage },
       { path: '/skills', component: SkillsPage },
-      { path: '/agents', component: CapabilityPage, props: { page: 'agents' } },
+      { path: '/agents', component: AgentsPage },
       { path: '/tools', component: CapabilityPage, props: { page: 'tools' } },
       { path: '/gateway', component: CapabilityPage, props: { page: 'gateway' } },
       { path: '/iacc', component: CapabilityPage, props: { page: 'iacc' } },
@@ -218,5 +219,38 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.text()).toContain('Structured data core');
     expect(fetchMock).toHaveBeenCalledWith('/api/memory/recall/explain?q=manufacturing%20quality%20anomaly&limit=12', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/cowd/structured/sources', expect.any(Object));
+  });
+
+  it('loads agents workbench from real agent and task endpoints', async () => {
+    const fetchMock = vi.fn((path: RequestInfo | URL) => {
+      const url = String(path);
+      if (url === '/api/webui/manifest') return Promise.resolve(new Response(JSON.stringify({ status: 'test' })));
+      if (url.startsWith('/api/sessions?')) return Promise.resolve(new Response(JSON.stringify({ sessions: [] })));
+      if (url === '/api/config') return Promise.resolve(new Response(JSON.stringify({ version: 'test' })));
+      if (url === '/api/runtime/control-plane') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/commands') return Promise.resolve(new Response(JSON.stringify({ commands: [] })));
+      if (url === '/api/config/providers') return Promise.resolve(new Response(JSON.stringify({ providers: [], models: [] })));
+      if (url === '/api/profiles') return Promise.resolve(new Response(JSON.stringify({ profiles: [], active_profile: 'default' })));
+      if (url === '/api/workspace') return Promise.resolve(new Response(JSON.stringify({ workspace_root: '', workspace_canonical: '' })));
+      if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
+      if (url === '/api/agents/catalog') return Promise.resolve(new Response(JSON.stringify({ summary: { total: 1, active: 1 }, agents: [{ name: 'planner', active: true, source: { id: 'project_cowd' }, description: 'Plans work' }] })));
+      if (url.startsWith('/api/agents/discover')) return Promise.resolve(new Response(JSON.stringify({ count: 1, agents: [{ agent_id: 'planner', role: 'planner', status: 'Online' }], team: { leader: { agent_id: 'planner', role: 'planner' }, workers: [] } })));
+      if (url === '/api/agents/runs') return Promise.resolve(new Response(JSON.stringify({ runs: [{ graph_id: 'agent-graph-task-1' }] })));
+      if (url === '/api/tasks') return Promise.resolve(new Response(JSON.stringify({ current: { id: 'task-1', objective: 'Ship UI', status: 'open', phases: [] }, tasks: [{ id: 'task-1', objective: 'Ship UI', status: 'open', phases: [] }] })));
+      if (url === '/api/tasks/task-1/agent-graph') return Promise.resolve(new Response(JSON.stringify({ status: 'running', nodes: [{ id: 'planner', title: 'Plan', role: 'planner', status: 'ready', objective: 'Ship UI', depends_on: [] }] })));
+      return Promise.resolve(new Response(JSON.stringify({})));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = await mountApp('/agents');
+    await settleAsync();
+    await settleAsync();
+    expect(wrapper.text()).toContain('Agents Workbench');
+    expect(wrapper.text()).toContain('Agent catalog');
+    expect(wrapper.text()).toContain('Discover team');
+    expect(wrapper.text()).toContain('Task control');
+    expect(wrapper.text()).toContain('Agent execution graph');
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/catalog', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tasks/task-1/agent-graph', expect.any(Object));
   });
 });

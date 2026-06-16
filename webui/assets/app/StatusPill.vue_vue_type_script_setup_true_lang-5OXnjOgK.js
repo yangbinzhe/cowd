@@ -1,0 +1,6 @@
+import{c as y,d as u,j as e,k as n,F as r,x as l,p as a,l as c,v as _}from"./index.dev-zftIfred.js";/**
+ * @license lucide-vue-next v0.468.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */const f=y("GitBranchIcon",[["line",{x1:"6",x2:"6",y1:"3",y2:"15",key:"17qcm7"}],["circle",{cx:"18",cy:"6",r:"3",key:"1h7g24"}],["circle",{cx:"6",cy:"18",r:"3",key:"fqmcym"}],["path",{d:"M18 9a9 9 0 0 1-9 9",key:"n2h4wq"}]]),h={class:"data-table"},g=u({__name:"DataTable",props:{rows:{},columns:{}},setup(t){return(o,i)=>(a(),e("table",h,[n("thead",null,[n("tr",null,[(a(!0),e(r,null,l(t.columns||Object.keys(t.rows[0]||{}),s=>(a(),e("th",{key:s},c(s),1))),128))])]),n("tbody",null,[(a(!0),e(r,null,l(t.rows,(s,m)=>(a(),e("tr",{key:m},[(a(!0),e(r,null,l(t.columns||Object.keys(s),d=>(a(),e("td",{key:d},c(s[d]),1))),128))]))),128))])]))}}),k={class:"empty-state"},x={key:0},B=u({__name:"EmptyState",props:{title:{},detail:{}},setup(t){return(o,i)=>(a(),e("div",k,[n("strong",null,c(t.title),1),t.detail?(a(),e("p",x,c(t.detail),1)):_("",!0)]))}}),b=["data-status"],$=u({__name:"StatusPill",props:{status:{}},setup(t){return(o,i)=>(a(),e("span",{class:"status-badge","data-status":t.status},c(t.status),9,b))}});export{f as G,$ as _,g as a,B as b};

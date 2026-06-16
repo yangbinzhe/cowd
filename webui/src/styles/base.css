@@ -228,6 +228,18 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .maintenance-list strong { color: var(--text); }
 .maintenance-list p { margin: 3px 0 0; color: var(--text-muted); overflow-wrap: anywhere; }
 
+.agents-page { overflow: auto; }
+.agents-workbench-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 18px 24px 28px; }
+.agents-panel { min-width: 0; }
+.agents-panel.wide { grid-column: 1 / -1; }
+.agents-task-layout { display: grid; grid-template-columns: minmax(260px, .8fr) minmax(0, 1.2fr); gap: 14px; }
+.task-list { min-width: 0; max-height: 420px; overflow: auto; display: grid; gap: 8px; align-content: start; }
+.agent-graph-lanes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.agent-graph-lanes article { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 11px; display: grid; gap: 7px; }
+.agent-graph-lanes strong { color: var(--text); }
+.agent-graph-lanes p { margin: 0; color: var(--text-muted); line-height: 1.45; }
+.agent-graph-lanes small { color: var(--text-faint); overflow-wrap: anywhere; }
+
 .modal-scrim { position: fixed; inset: 0; z-index: 30; display: grid; place-items: end center; padding: 20px; background: rgba(0,0,0,.28); }
 .command-modal { width: min(680px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 42px)); overflow: auto; border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: 0 16px 42px rgba(0,0,0,.28); padding: 14px; }
 .command-modal header { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
@@ -269,7 +281,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .rail { position: sticky; top: 0; z-index: 3; flex-direction: row; justify-content: flex-start; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .main-surface { min-height: 70vh; }
   .companion-panel { min-height: 460px; border-left: 0; border-top: 1px solid var(--border); }
-  .page-header, .composer-bar, .capability-grid, .settings-grid, .management-grid, .modal-columns, .memory-workbench, .memory-main, .memory-split, .memory-tabs, .memory-form-row { grid-template-columns: 1fr; flex-direction: column; align-items: stretch; }
+  .page-header, .composer-bar, .capability-grid, .settings-grid, .management-grid, .modal-columns, .memory-workbench, .memory-main, .memory-split, .memory-tabs, .memory-form-row, .agents-workbench-grid, .agents-task-layout, .agent-graph-lanes { grid-template-columns: 1fr; flex-direction: column; align-items: stretch; }
   .skills-console, .skills-detail { grid-template-columns: 1fr; }
   .metric-row { grid-template-columns: 1fr; }
   .turn { grid-template-columns: 1fr; gap: 6px; }

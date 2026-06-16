@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
@@ -14,6 +14,8 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/agents/catalog", get(agent_catalog_handler))
+        .route("/api/agents/discover", get(agent_discover_handler))
         .route("/api/agents/runs", get(agent_runs_handler))
         .route(
             "/api/tasks/:id/agent-graph",
@@ -27,6 +29,36 @@ struct UpsertAgentGraphRequest {
     objective: Option<String>,
     #[serde(default)]
     nodes: Vec<AgentTaskNode>,
+}
+
+#[derive(Deserialize)]
+struct AgentDiscoverQuery {
+    #[serde(default)]
+    task: String,
+}
+
+async fn agent_catalog_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn agent_discover_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<AgentDiscoverQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = query.task.trim();
+    if task.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "task query is required"));
+    }
+    commands::handle_agents_slash_command_json(
+        Some(&format!("discover {task}")),
+        &state.workspace_root,
+    )
+    .map(Json)
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

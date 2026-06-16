@@ -1,0 +1,369 @@
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue';
+import { GitBranch, Play, RefreshCw, Search, Users } from 'lucide-vue-next';
+import { api } from '../api/client';
+import DataTable from '../components/workbench/DataTable.vue';
+import EmptyState from '../components/workbench/EmptyState.vue';
+import RawPayload from '../components/workbench/RawPayload.vue';
+import StatusPill from '../components/workbench/StatusPill.vue';
+
+const loading = ref(false);
+const error = ref('');
+const catalog = ref<any>({});
+const discovery = ref<any>({});
+const runs = ref<any>({});
+const tasks = ref<any>({});
+const graph = ref<any>({});
+const actionResult = ref<any>(null);
+const selectedTaskId = ref('');
+const objective = ref('Refactor WebUI module management with verified backend parity');
+const discoverQuery = ref('frontend refactor memory agents skills runtime verification');
+const phaseName = ref('Implementation');
+const phaseObjective = ref('Wire real backend APIs and validate with tests');
+const artifactLabel = ref('Validation note');
+const artifactValue = ref('npm run test --prefix webui -- --run passed');
+const reviewResult = ref('Accepted after automated checks and visual review.');
+const failureReason = ref('Blocked by missing backend capability.');
+
+const agentRows = computed(() => (Array.isArray(catalog.value?.agents) ? catalog.value.agents : []).map((agent: any) => ({
+  name: agent.name,
+  active: agent.active,
+  source: agent.source?.id || agent.source || '-',
+  model: agent.model || '-',
+  description: agent.description || '-',
+})));
+const discoveredRows = computed(() => (Array.isArray(discovery.value?.agents) ? discovery.value.agents : []).map((agent: any) => ({
+  agent_id: agent.agent_id,
+  role: agent.role,
+  reputation: agent.reputation ?? '-',
+  status: agent.status,
+})));
+const taskItems = computed(() => Array.isArray(tasks.value?.tasks) ? tasks.value.tasks : []);
+const selectedTask = computed(() => taskItems.value.find((task: any) => task.id === selectedTaskId.value) || tasks.value?.current || taskItems.value[0] || null);
+const phaseItems = computed(() => Array.isArray(selectedTask.value?.phases) ? selectedTask.value.phases : []);
+const currentPhase = computed(() => phaseItems.value.find((phase: any) => phase.id === selectedTask.value?.current_phase) || phaseItems.value[0] || null);
+const graphNodes = computed(() => Array.isArray(graph.value?.nodes) ? graph.value.nodes : []);
+const runItems = computed(() => Array.isArray(runs.value?.runs) ? runs.value.runs : []);
+const openTasks = computed(() => taskItems.value.filter((task: any) => !['completed', 'cancelled'].includes(String(task.status))).length);
+
+async function refresh() {
+  loading.value = true;
+  error.value = '';
+  try {
+    const [nextCatalog, nextDiscovery, nextRuns, nextTasks] = await Promise.all([
+      api.agentCatalog(),
+      api.agentDiscover(discoverQuery.value),
+      api.agentRuns(),
+      api.tasks(),
+    ]);
+    catalog.value = nextCatalog;
+    discovery.value = nextDiscovery;
+    runs.value = nextRuns;
+    tasks.value = nextTasks;
+    if (!selectedTaskId.value) {
+      selectedTaskId.value = nextTasks?.current?.id || nextTasks?.tasks?.[0]?.id || '';
+    }
+    await loadGraph();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function loadGraph() {
+  if (!selectedTaskId.value) {
+    graph.value = {};
+    return;
+  }
+  graph.value = await api.taskAgentGraph(selectedTaskId.value);
+}
+
+async function startTask() {
+  actionResult.value = await api.startTask(objective.value, false);
+  selectedTaskId.value = actionResult.value?.id || selectedTaskId.value;
+  await refresh();
+}
+
+async function addPhase() {
+  const taskId = selectedTaskId.value || selectedTask.value?.id;
+  if (!taskId) return;
+  actionResult.value = await api.startTaskPhase(taskId, {
+    name: phaseName.value,
+    objective: phaseObjective.value,
+    plan: ['bind backend endpoint', 'implement page controls', 'run unit and e2e tests'],
+    acceptance: ['real API call is covered', 'visual screenshot saved'],
+    test_commands: ['npm run test --prefix webui -- --run', 'npm run test:e2e --prefix webui'],
+  });
+  await refresh();
+}
+
+async function recordArtifact() {
+  const taskId = selectedTaskId.value || selectedTask.value?.id;
+  const phaseId = currentPhase.value?.id;
+  if (!taskId || !phaseId) return;
+  actionResult.value = await api.recordTaskArtifact(taskId, phaseId, {
+    kind: 'validation',
+    label: artifactLabel.value,
+    value: artifactValue.value,
+  });
+  await refresh();
+}
+
+async function reviewPhase(completed = true) {
+  const taskId = selectedTaskId.value || selectedTask.value?.id;
+  const phaseId = currentPhase.value?.id;
+  if (!taskId || !phaseId) return;
+  actionResult.value = await api.reviewTaskPhase(taskId, phaseId, reviewResult.value, completed);
+  await refresh();
+}
+
+async function transitionTask(action: 'complete' | 'cancel' | 'failure') {
+  const taskId = selectedTaskId.value || selectedTask.value?.id;
+  if (!taskId) return;
+  if (action === 'complete') actionResult.value = await api.completeTask(taskId);
+  if (action === 'cancel') actionResult.value = await api.cancelTask(taskId);
+  if (action === 'failure') actionResult.value = await api.recordTaskFailure(taskId, failureReason.value);
+  await refresh();
+}
+
+async function discoverAgents() {
+  discovery.value = await api.agentDiscover(discoverQuery.value);
+}
+
+async function upsertGraphTemplate() {
+  const taskId = selectedTaskId.value || selectedTask.value?.id;
+  if (!taskId) return;
+  const now = Date.now();
+  const nodes = [
+    {
+      id: 'planner',
+      role: 'planner',
+      title: 'Plan',
+      objective: objective.value,
+      depends_on: [],
+      status: 'ready',
+      assigned_agent: discovery.value?.team?.leader?.agent_id || null,
+      result: null,
+      error: null,
+      created_at_ms: now,
+      updated_at_ms: now,
+    },
+    {
+      id: 'executor',
+      role: 'executor',
+      title: 'Execute',
+      objective: phaseObjective.value,
+      depends_on: ['planner'],
+      status: 'pending',
+      assigned_agent: discovery.value?.team?.workers?.[0]?.agent_id || null,
+      result: null,
+      error: null,
+      created_at_ms: now,
+      updated_at_ms: now,
+    },
+    {
+      id: 'reviewer',
+      role: 'reviewer',
+      title: 'Review',
+      objective: 'Verify implementation, tests, and user-facing behavior.',
+      depends_on: ['executor'],
+      status: 'pending',
+      assigned_agent: discovery.value?.team?.workers?.[1]?.agent_id || null,
+      result: null,
+      error: null,
+      created_at_ms: now,
+      updated_at_ms: now,
+    },
+  ];
+  actionResult.value = await api.upsertTaskAgentGraph(taskId, { objective: objective.value, nodes });
+  await loadGraph();
+}
+
+function selectTask(id: string) {
+  selectedTaskId.value = id;
+  loadGraph();
+}
+
+onMounted(refresh);
+</script>
+
+<template>
+  <section class="capability-page agents-page">
+    <header class="page-header">
+      <div>
+        <h1>Agents Workbench</h1>
+        <p>Agent 目录、任务生命周期、阶段验收、工件记录和并行执行图统一管理。</p>
+      </div>
+      <button class="primary-action" type="button" :disabled="loading" @click="refresh">
+        <RefreshCw :size="15" />
+        {{ loading ? 'Loading' : 'Refresh agents' }}
+      </button>
+    </header>
+
+    <p v-if="error" class="settings-alert">{{ error }}</p>
+
+    <section class="metric-row">
+      <article class="metric-card">
+        <span>Agents</span>
+        <strong>{{ catalog.summary?.active || 0 }}/{{ catalog.summary?.total || 0 }}</strong>
+        <small>active / total definitions</small>
+      </article>
+      <article class="metric-card" data-tone="info">
+        <span>Open tasks</span>
+        <strong>{{ openTasks }}</strong>
+        <small>{{ taskItems.length }} total task records</small>
+      </article>
+      <article class="metric-card" data-tone="success">
+        <span>Run graphs</span>
+        <strong>{{ runItems.length }}</strong>
+        <small>{{ graphNodes.length }} selected graph nodes</small>
+      </article>
+    </section>
+
+    <section class="agents-workbench-grid">
+      <section class="management-panel agents-panel">
+        <header>
+          <h2>Agent catalog</h2>
+          <span>{{ agentRows.length }} definitions</span>
+        </header>
+        <DataTable v-if="agentRows.length" :rows="agentRows" :columns="['name', 'active', 'source', 'model', 'description']" />
+        <EmptyState v-else title="No agents registered" detail="后端没有发现 .cowd/agents、~/.cowd/agents 或 $CC_CONFIG_HOME/agents 定义。" />
+      </section>
+
+      <section class="management-panel agents-panel">
+        <header>
+          <h2>Discover team</h2>
+          <span>{{ discovery.count || 0 }} matches</span>
+        </header>
+        <label class="search-field">
+          <Search :size="15" />
+          <input v-model="discoverQuery" type="search" placeholder="Task for team discovery" @keyup.enter="discoverAgents" />
+        </label>
+        <button class="primary-action" type="button" @click="discoverAgents">Discover agents</button>
+        <DataTable v-if="discoveredRows.length" :rows="discoveredRows" :columns="['agent_id', 'role', 'reputation', 'status']" />
+        <EmptyState v-else title="No matching team" detail="发现协议没有找到满足任务描述的 agent。" />
+        <RawPayload title="Auto assembled team" :data="discovery.team || {}" />
+      </section>
+
+      <section class="management-panel agents-panel wide">
+        <header>
+          <h2>Task control</h2>
+          <span>{{ selectedTask?.status || 'no task' }}</span>
+        </header>
+        <div class="agents-task-layout">
+          <aside class="task-list">
+            <button
+              v-for="task in taskItems"
+              :key="task.id"
+              class="memory-entry-row"
+              :class="{ active: selectedTaskId === task.id }"
+              type="button"
+              @click="selectTask(task.id)"
+            >
+              <strong>{{ task.objective || task.id }}</strong>
+              <span>{{ task.id }}</span>
+              <small>{{ task.status }} · failures {{ task.failure_count || 0 }}</small>
+            </button>
+            <EmptyState v-if="!taskItems.length" title="No tasks" detail="创建任务后会在这里管理阶段、工件和验收。" />
+          </aside>
+          <main>
+            <label class="field-line">
+              Objective
+              <textarea v-model="objective" rows="3" />
+            </label>
+            <div class="button-row">
+              <button class="primary-action" type="button" @click="startTask"><Play :size="15" /> Start task</button>
+              <button class="ghost-action" type="button" :disabled="!selectedTask" @click="transitionTask('complete')">Complete</button>
+              <button class="ghost-action" type="button" :disabled="!selectedTask" @click="transitionTask('cancel')">Cancel</button>
+              <button class="ghost-action" type="button" :disabled="!selectedTask" @click="transitionTask('failure')">Record failure</button>
+            </div>
+            <label class="field-line">
+              Failure reason
+              <input v-model="failureReason" type="text" />
+            </label>
+          </main>
+        </div>
+      </section>
+
+      <section class="management-panel agents-panel">
+        <header>
+          <h2>Phase gate</h2>
+          <span>{{ phaseItems.length }} phases</span>
+        </header>
+        <label class="field-line">
+          Phase name
+          <input v-model="phaseName" type="text" />
+        </label>
+        <label class="field-line">
+          Phase objective
+          <textarea v-model="phaseObjective" rows="3" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" :disabled="!selectedTask" @click="addPhase">Add phase</button>
+          <button class="ghost-action" type="button" :disabled="!currentPhase" @click="reviewPhase(true)">Review complete</button>
+        </div>
+        <DataTable v-if="phaseItems.length" :rows="phaseItems" />
+        <EmptyState v-else title="No phases" detail="阶段用于 TDD 目标、计划、验收和测试命令闭环。" />
+      </section>
+
+      <section class="management-panel agents-panel">
+        <header>
+          <h2>Artifacts and review</h2>
+          <span>{{ currentPhase?.id || 'no phase' }}</span>
+        </header>
+        <label class="field-line">
+          Artifact label
+          <input v-model="artifactLabel" type="text" />
+        </label>
+        <label class="field-line">
+          Artifact value
+          <textarea v-model="artifactValue" rows="3" />
+        </label>
+        <label class="field-line">
+          Review result
+          <textarea v-model="reviewResult" rows="3" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" :disabled="!currentPhase" @click="recordArtifact">Record artifact</button>
+          <button class="ghost-action" type="button" :disabled="!currentPhase" @click="reviewPhase(false)">Save review</button>
+        </div>
+      </section>
+
+      <section class="management-panel agents-panel wide">
+        <header>
+          <h2>Agent execution graph</h2>
+          <span><StatusPill :status="graph.status || 'offline'" /></span>
+        </header>
+        <div class="button-row">
+          <button class="primary-action" type="button" :disabled="!selectedTask" @click="upsertGraphTemplate">
+            <GitBranch :size="15" />
+            Upsert planner/executor/reviewer graph
+          </button>
+          <button class="ghost-action" type="button" :disabled="!selectedTask" @click="loadGraph">
+            <Users :size="15" />
+            Reload graph
+          </button>
+        </div>
+        <div class="agent-graph-lanes">
+          <article v-for="node in graphNodes" :key="node.id">
+            <strong>{{ node.title }}</strong>
+            <StatusPill :status="node.status" />
+            <p>{{ node.objective }}</p>
+            <small>{{ node.role }} · {{ node.assigned_agent || 'unassigned' }} · depends {{ (node.depends_on || []).join(', ') || '-' }}</small>
+          </article>
+        </div>
+        <EmptyState v-if="!graphNodes.length" title="No agent graph" detail="选择任务后可以生成 planner/executor/reviewer 执行图。" />
+      </section>
+
+      <section class="management-panel agents-panel wide">
+        <header>
+          <h2>Runs and evidence</h2>
+          <span>{{ runItems.length }} graphs</span>
+        </header>
+        <RawPayload title="Agent runs" :data="runs" />
+        <RawPayload title="Action result" :data="actionResult || graph" />
+      </section>
+    </section>
+  </section>
+</template>

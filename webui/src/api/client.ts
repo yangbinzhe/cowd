@@ -331,6 +331,12 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ objective, yolo_mode: yoloMode }),
   }),
+  cancelTask: (id: string) => write(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  completeTask: (id: string) => write(`/api/tasks/${encodeURIComponent(id)}/complete`, { method: 'POST' }),
+  recordTaskFailure: (id: string, reason: string) => write(`/api/tasks/${encodeURIComponent(id)}/failure`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  }),
   startTaskPhase: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/phases`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -342,6 +348,14 @@ export const api = {
   reviewTaskPhase: (id: string, phaseId: string, result: string, completed = true) => write(`/api/tasks/${encodeURIComponent(id)}/phases/${encodeURIComponent(phaseId)}/review`, {
     method: 'POST',
     body: JSON.stringify({ result, completed }),
+  }),
+  agentCatalog: () => read('/api/agents/catalog', { agents: [], summary: {} }),
+  agentDiscover: (task: string) => read(`/api/agents/discover?task=${encodeURIComponent(task)}`, { agents: [], team: null }),
+  agentRuns: () => read('/api/agents/runs', { runs: [] }),
+  taskAgentGraph: (id: string) => read(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, { nodes: [] }),
+  upsertTaskAgentGraph: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, {
+    method: 'POST',
+    body: JSON.stringify(body),
   }),
   toolRegistry: () => read('/api/tools', {}),
   platforms: () => read('/api/platforms', {}),
