@@ -789,7 +789,7 @@ onMounted(refresh);
           @dry-run="planConnectorRun"
           @live="executeConnectorRun"
         />
-        <RawPayload :data="{ data_plane: dataPlaneResult, source_pack: sourcePackResult }" />
+        <RawPayload title="Data plane result" :data="{ data_plane: dataPlaneResult, source_pack: sourcePackResult }" />
       </article>
 
       <article class="management-panel" data-section="source-pack">
@@ -813,7 +813,7 @@ onMounted(refresh);
           @live="ingestManufacturingFacts"
         />
         <DataTable v-if="metrics.length" :rows="metrics.slice(0, 8)" :columns="['metric_id', 'name', 'unit', 'status']" />
-        <RawPayload :data="{ metrics: state?.metrics, attention: state?.attention, changes: state?.changes }" />
+        <RawPayload title="Manufacturing ingest result" :data="{ metrics: state?.metrics, attention: state?.attention, changes: state?.changes }" />
       </article>
 
       <article class="management-panel" data-section="entities">
@@ -853,7 +853,7 @@ onMounted(refresh);
           @dry-run="inspectEntity"
           @live="upsertRelation"
         />
-        <RawPayload :data="entityResult || {}" />
+        <RawPayload title="Entity action result" :data="entityResult || {}" />
       </article>
 
       <article class="management-panel" data-section="metrics">
@@ -888,7 +888,7 @@ onMounted(refresh);
           @dry-run="planMetricAttention"
           @live="runComputeJob"
         />
-        <RawPayload :data="metricResult || {}" />
+        <RawPayload title="Metric action result" :data="metricResult || {}" />
       </article>
 
       <article class="management-panel" data-section="evidence">
@@ -918,7 +918,7 @@ onMounted(refresh);
           @dry-run="dryRunEvidenceGovernance"
           @live="buildEvidencePacket"
         />
-        <RawPayload :data="evidenceResult || {}" />
+        <RawPayload title="Evidence action result" :data="evidenceResult || {}" />
       </article>
 
       <article class="management-panel" data-section="incident-room">
@@ -952,7 +952,7 @@ onMounted(refresh);
           @dry-run="dryRunIncidentGovernance"
           @live="createIncident"
         />
-        <RawPayload :data="{ room, entities: entities.slice(0, 8), attention: attention.slice(0, 8) }" />
+        <RawPayload title="Incident room result" :data="{ room, entities: entities.slice(0, 8), attention: attention.slice(0, 8) }" />
       </article>
 
       <article class="management-panel" data-section="actions">
@@ -987,7 +987,7 @@ onMounted(refresh);
           @live="bridgeExecution"
         />
         <RequestReceipt :receipt="result" title="Action receipt" />
-        <RawPayload :data="{ analysis, executions: room?.executions, playbooks: room?.playbooks }" />
+        <RawPayload title="Analysis action result" :data="{ analysis, executions: room?.executions, playbooks: room?.playbooks }" />
       </article>
 
       <article class="management-panel" data-section="skills">
@@ -1009,7 +1009,7 @@ onMounted(refresh);
           <button class="primary-action" type="button" :disabled="!selectedIncidentId || !selectedSkillId" @click="runSkill">Run skill</button>
         </div>
         <DataTable v-if="skills.length" :rows="skills.slice(0, 8)" :columns="['skill_id', 'name', 'risk', 'status']" />
-        <RawPayload :data="{ skills: state?.skills, skill_runs: room?.skill_runs || result?.skill_run }" />
+        <RawPayload title="Manufacturing skill run detail" :data="{ skills: state?.skills, skill_runs: room?.skill_runs || result?.skill_run }" />
       </article>
 
       <article class="management-panel" data-section="reports">
@@ -1050,7 +1050,7 @@ onMounted(refresh);
           @live="retryReportDelivery"
         />
         <RequestReceipt :receipt="result" title="Report receipt" />
-        <RawPayload :data="result || {}" />
+        <RawPayload title="Report action result" :data="result || {}" />
       </article>
     </section>
   </section>
