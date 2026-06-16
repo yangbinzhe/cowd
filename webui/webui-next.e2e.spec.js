@@ -27,7 +27,7 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
 });
 
 test('capability pages expose current-page sections instead of duplicated primary navigation', async ({ page }) => {
-  await page.goto('/index.html#/runtime');
+  await page.goto('/index.html#/tools');
   await expect(page.locator('.session-sidebar')).toHaveCount(0);
   await expect(page.locator('.capability-sidebar')).toBeVisible();
   await expect(page.locator('.section-row')).toHaveCount(4);
@@ -44,14 +44,19 @@ test('capability pages expose current-page sections instead of duplicated primar
 
 test('runtime and context pages expose real workbench controls', async ({ page }) => {
   await page.goto('/index.html#/runtime');
+  await expect(page.getByRole('heading', { name: 'Runtime Control', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Control plane' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Session lease' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Acquire' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Reload providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Runtime timeline' })).toBeVisible();
 
   await page.goto('/index.html#/context');
-  await expect(page.getByRole('heading', { name: 'Context builder' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Context Builder', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Context builder', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Build packet' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Evidence resolve' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Recommendation actions' })).toBeVisible();
 });
 
 test('memory page exposes memory and structured-data kernel controls', async ({ page }) => {

@@ -9,8 +9,8 @@ import './styles/base.css';
 const routes = [
   { path: '/', redirect: '/chat' },
   { path: '/chat', component: ChatPage, meta: { label: 'Chat' } },
-  { path: '/runtime', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'runtime' } },
-  { path: '/context', component: () => import('./pages/CapabilityPage.vue'), props: { page: 'context' } },
+  { path: '/runtime', component: () => import('./pages/RuntimePage.vue') },
+  { path: '/context', component: () => import('./pages/ContextPage.vue') },
   { path: '/memory', component: () => import('./pages/MemoryPage.vue') },
   { path: '/skills', component: () => import('./pages/SkillsPage.vue') },
   { path: '/agents', component: () => import('./pages/AgentsPage.vue') },

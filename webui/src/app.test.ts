@@ -9,6 +9,8 @@ import ChatPage from './pages/ChatPage.vue';
 import AgentsPage from './pages/AgentsPage.vue';
 import CapabilityPage from './pages/CapabilityPage.vue';
 import MemoryPage from './pages/MemoryPage.vue';
+import RuntimePage from './pages/RuntimePage.vue';
+import ContextPage from './pages/ContextPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 
@@ -21,8 +23,8 @@ function mountApp(path = '/chat') {
     routes: [
       { path: '/', redirect: '/chat' },
       { path: '/chat', component: ChatPage },
-      { path: '/runtime', component: CapabilityPage, props: { page: 'runtime' } },
-      { path: '/context', component: CapabilityPage, props: { page: 'context' } },
+      { path: '/runtime', component: RuntimePage },
+      { path: '/context', component: ContextPage },
       { path: '/memory', component: MemoryPage },
       { path: '/skills', component: SkillsPage },
       { path: '/agents', component: AgentsPage },
@@ -68,9 +70,9 @@ describe('Cowd Vue WebUI shell', () => {
   });
 
   it('renders capability pages with module sections instead of duplicated primary navigation', async () => {
-    const wrapper = await mountApp('/runtime');
+    const wrapper = await mountApp('/tools');
     await settle();
-    expect(wrapper.text()).toContain('Runtime Control');
+    expect(wrapper.text()).toContain('Tools Registry');
     expect(wrapper.findAll('.metric-card').length).toBe(3);
     expect(wrapper.find('.chart-panel').exists()).toBe(true);
     expect(wrapper.find('.work-table table').exists()).toBe(true);
