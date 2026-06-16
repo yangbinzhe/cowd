@@ -145,7 +145,7 @@ window.UI = (()=>{
     wrapper.id='tool-'+id;
     const hdr=el('div','tool-card-header');
     const st=status||'running';
-    hdr.innerHTML='<span class="tool-name">&xutri; '+esc(name)+'</span><span class="tool-status '+esc(st)+'">'+esc(st)+'</span>';
+    hdr.innerHTML='<span class="tool-name">Tool: '+esc(name)+'</span><span class="tool-status '+esc(st)+'">'+esc(st)+'</span>';
     hdr.onclick=function(){
       const body=wrapper.querySelector('.tool-card-body');
       body.classList.toggle('collapsed');
@@ -173,7 +173,7 @@ window.UI = (()=>{
   function addThinkCard(content){
     const wrapper=el('div','think-card');
     const hdr=el('div','think-card-header');
-    hdr.innerHTML='&xodot; Thinking <span class="think-count">(1)</span>';
+    hdr.innerHTML='Thinking <span class="think-count">(1)</span>';
     hdr.onclick=function(){
       const body=wrapper.querySelector('.think-card-body');
       body.classList.toggle('collapsed');

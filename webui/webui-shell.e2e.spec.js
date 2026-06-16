@@ -60,14 +60,55 @@ test('v0.9.202 shell routes rail views into the central workbench', async ({ pag
   await expect(page.locator('#workbench-title')).toHaveText('Workspace');
   await expect(page.locator('#workbench-content')).toContainText('README.md');
 
-  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.202-workbench-desktop.png', fullPage: true });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.202-workbench-desktop.png' });
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.202-workbench-mobile.png', fullPage: true });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.202-workbench-mobile.png' });
 
   await page.click('#btn-workbench-chat');
   await expect(page.locator('#chat-view')).not.toHaveClass(/hidden/);
   await page.click('#btn-toggle-panel');
   await expect(page.locator('#right-panel')).not.toHaveClass(/hidden/);
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.203 chat chrome and activity metadata stay readable', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await expect(page.locator('.chat-title-block')).toContainText('Cowd');
+  await expect(page.locator('#chat-input')).toBeVisible();
+  await page.evaluate(() => {
+    const mount = document.getElementById('chat-messages');
+    const assistant = document.createElement('div');
+    assistant.className = 'message assistant';
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+    body.textContent = 'Runtime check completed.';
+    assistant.appendChild(body);
+    assistant.appendChild(window.UI.addToolCard('browser-tool', 'workspace.read', 'complete'));
+    assistant.appendChild(window.UI.addThinkCard('Checked shell state and route contract.'));
+    mount.appendChild(assistant);
+  });
+  await expect(page.locator('.tool-card')).toContainText('Tool: workspace.read');
+  await expect(page.locator('.think-card')).toContainText('Thinking');
+  await expect(page.locator('body')).not.toContainText('&xutri;');
+  await expect(page.locator('body')).not.toContainText('&xodot;');
+
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.203-chat-desktop.png' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.203-chat-mobile.png' });
 
   expect(errors).toEqual([]);
 });

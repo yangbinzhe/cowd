@@ -3143,3 +3143,15 @@ describe('API module', () => {
     expect(window.Sessions.createSession).toHaveBeenCalled();
   });
 });
+
+describe('Chat activity cards', () => {
+  it('renders tool and thinking metadata without broken entity text', () => {
+    const tool = window.UI.addToolCard('unit-tool', 'workspace.read', 'running');
+    const think = window.UI.addThinkCard('checking workspace');
+
+    expect(tool.textContent).toContain('Tool: workspace.read');
+    expect(tool.textContent).not.toContain('&xutri;');
+    expect(think.textContent).toContain('Thinking');
+    expect(think.textContent).not.toContain('&xodot;');
+  });
+});

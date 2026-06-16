@@ -62,11 +62,15 @@
   <section id="chat-view" class="view-page active" aria-label="Chat workspace">
   <div id="chat-header">
   <div id="chat-header-left">
+    <div class="chat-title-block">
+      <strong>Cowd</strong>
+      <span>Kernel conversation</span>
+    </div>
     <select id="model-selector" class="model-picker" title="Select model"></select>
   </div>
   <div id="chat-header-right">
     <span id="connection-status" style="font-size:11px;margin-right:12px">Disconnected</span>
-    <button id="btn-toggle-panel" class="btn-icon" title="Toggle Panel">&xllcor;</button>
+    <button id="btn-toggle-panel" class="btn-icon panel-toggle-btn" title="Toggle legacy panel" aria-label="Toggle legacy panel">P</button>
   </div>
   </div>
   <div id="chat-messages"></div>
