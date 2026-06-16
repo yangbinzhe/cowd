@@ -1,7 +1,26 @@
 window.UI = (()=>{
   let activePanel = null, activeCC = null;
+  let panelMountOverride = null;
 
-  function $(id){return document.getElementById(id)}
+  const VIEW_META = {
+    workspace: ['Workspace', 'Files, previews, and working directory operations.'],
+    runtime: ['Runtime', 'Control plane, leases, runs, approvals, and timeline.'],
+    context: ['Context', 'Current context packet, budget, evidence, and history.'],
+    memory: ['Memory', 'Long-term memory, facts, entities, links, and maintenance.'],
+    skills: ['Skills', 'Skill inventory, sources, status, and run history.'],
+    crons: ['Crons', 'Scheduled jobs, delivery state, and execution history.'],
+    agents: ['Agents', 'Tasks, workgraph, phases, evidence, and review state.'],
+    tools: ['Tools', 'Tool registry, schemas, permissions, and execution traces.'],
+    gateway: ['Gateway', 'Connector accounts, capabilities, delivery, and receipts.'],
+    iacc: ['IACC', 'Manufacturing application workbench built on Cowd kernel data.'],
+    audit: ['Audit', 'Runtime, connector, and cross-plane audit records.'],
+    settings: ['Settings', 'Appearance, model, provider, profile, and security controls.'],
+  };
+
+  function $(id){
+    if(id==='panel-content'&&panelMountOverride)return panelMountOverride;
+    return document.getElementById(id);
+  }
   function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className=cls;if(html)e.innerHTML=html;return e}
   function clear(id){const e=$(id);if(e)e.innerHTML=''}
 
@@ -60,6 +79,65 @@ window.UI = (()=>{
       b.classList.toggle('active',b.dataset.view===view);
       b.setAttribute('aria-current',b.dataset.view===view?'page':'false');
     });
+  }
+
+  function syncWorkbenchTitle(name){
+    const meta=VIEW_META[name]||[name.charAt(0).toUpperCase()+name.slice(1),'Manage Cowd capability.'];
+    const title=$('workbench-title');
+    const subtitle=$('workbench-subtitle');
+    if(title)title.textContent=meta[0];
+    if(subtitle)subtitle.textContent=meta[1];
+  }
+
+  async function renderPanelToWorkbench(name){
+    const mount=$('workbench-content');
+    if(!mount)return;
+    mount.innerHTML='';
+    panelMountOverride=mount;
+    try{
+      if(typeof Workspace!=='undefined'&&name==='workspace')await Workspace.render();
+      if(typeof Panels!=='undefined'){
+        if(name==='memory')await Panels.renderMemory();
+        else if(name==='runtime')await Panels.renderRuntimeConsole();
+        else if(name==='context')await Panels.renderContext();
+        else if(name==='skills')await Panels.renderSkills();
+        else if(name==='crons')await Panels.renderCrons();
+        else if(name==='agents')await Panels.renderAgents();
+        else if(name==='tools')await Panels.renderTools();
+        else if(name==='iacc')await Panels.renderIacc();
+        else if(name==='gateway')await Panels.renderGateway();
+        else if(name==='audit')await Panels.renderAudit();
+        else if(name==='settings')await Panels.renderSettings();
+      }
+    }finally{
+      panelMountOverride=null;
+      const right=$('right-panel');
+      if(right)right.classList.add('hidden');
+    }
+  }
+
+  async function switchView(name){
+    const view=name||'chat';
+    const chat=$('chat-view');
+    const workbench=$('workbench-view');
+    const shell=$('app-shell');
+    if(view==='chat'){
+      if(shell)shell.classList.remove('workbench-mode');
+      if(chat)chat.classList.remove('hidden');
+      if(workbench)workbench.classList.add('hidden');
+      const right=$('right-panel');
+      if(right)right.classList.add('hidden');
+      activePanel=null;
+      syncRail('chat');
+      return;
+    }
+    if(shell)shell.classList.add('workbench-mode');
+    if(chat)chat.classList.add('hidden');
+    if(workbench)workbench.classList.remove('hidden');
+    activePanel=view;
+    syncRail(view);
+    syncWorkbenchTitle(view);
+    await renderPanelToWorkbench(view);
   }
 
   function addToolCard(id,name,status){
@@ -173,5 +251,5 @@ window.UI = (()=>{
 
   function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
-  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,updateThinkCard,switchPanel,syncRail,openModal,closeModal,switchCCTab,esc};
+  return {$,el,clear,showToast,renderMd,highlightCode,previewMedia,addToolCard,updateToolCard,addThinkCard,updateThinkCard,switchPanel,switchView,syncRail,openModal,closeModal,switchCCTab,esc};
 })();

@@ -53,6 +53,7 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--font-sans);height:100vh;overflow:hidden;background:var(--app-bg);letter-spacing:0}
 #app-shell{display:flex;height:100vh;min-width:0;background:var(--app-bg);color:var(--text)}
+#app-shell.workbench-mode #sidebar{display:none}
 #nav-rail{width:56px;min-width:56px;background:var(--rail-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 8px;z-index:3}
 .rail-item{width:38px;height:38px;display:flex;align-items:center;justify-content:center;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--text2);font-size:12px;font-weight:650;line-height:1;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
 .rail-item:hover{background:var(--surface-hover);color:var(--text);border-color:var(--border)}
@@ -84,6 +85,17 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 #sidebar-footer small{opacity:.7}
 
 #chat{flex:1;display:flex;flex-direction:column;min-width:0}
+.view-page{flex:1;min-height:0;min-width:0}
+#chat-view{display:flex;flex-direction:column}
+#chat-view.hidden,#workbench-view.hidden{display:none!important}
+#workbench-view{display:flex;flex-direction:column;background:var(--bg);overflow:hidden}
+#workbench-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;background:var(--surface);border-bottom:1px solid var(--border);min-height:76px}
+#workbench-header h1{font-size:18px;line-height:1.25;font-weight:650;color:var(--text);letter-spacing:0}
+#workbench-header p{margin-top:3px;font-size:12px;color:var(--text2);line-height:1.4}
+.workbench-content{flex:1;overflow:auto;padding:20px 24px;font-size:13px;background:var(--bg)}
+.workbench-content .panel-section{max-width:1120px}
+.workbench-content .panel-section h3{font-size:14px}
+.workbench-content .panel-empty{text-align:left}
 #chat-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);min-height:44px}
 #chat-header-left{display:flex;align-items:center;gap:12px}
 #chat-header-right{display:flex;gap:4px}
@@ -436,6 +448,10 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 @media(max-width:768px){
   #nav-rail{width:48px;min-width:48px;padding:8px 5px}
   .rail-item{width:36px;height:36px}
+  #workbench-header{padding:14px 14px;align-items:flex-start}
+  #workbench-header h1{font-size:16px}
+  #workbench-header p{font-size:11px}
+  .workbench-content{padding:14px}
   #sidebar{position:fixed;left:48px;top:0;height:100%;transform:translateX(-110%);transition:transform .2s;z-index:50}
   #sidebar.open{transform:translateX(0)}
   #right-panel{position:fixed;right:0;top:0;height:100%;width:100%;max-width:360px;z-index:50}

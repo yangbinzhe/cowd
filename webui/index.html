@@ -59,6 +59,7 @@
 </aside>
 
 <main id="chat" class="main-workspace">
+  <section id="chat-view" class="view-page active" aria-label="Chat workspace">
   <div id="chat-header">
   <div id="chat-header-left">
     <select id="model-selector" class="model-picker" title="Select model"></select>
@@ -81,6 +82,17 @@
       <button id="btn-send" class="btn-primary">Send</button>
     </div>
   </div>
+  </section>
+  <section id="workbench-view" class="view-page hidden" aria-label="Cowd workbench">
+    <header id="workbench-header">
+      <div>
+        <h1 id="workbench-title">Workspace</h1>
+        <p id="workbench-subtitle">Manage Cowd runtime capabilities.</p>
+      </div>
+      <button id="btn-workbench-chat" class="btn-secondary" type="button">Back to Chat</button>
+    </header>
+    <div id="workbench-content" class="workbench-content"></div>
+  </section>
 </main>
 
 <aside id="right-panel" class="hidden">

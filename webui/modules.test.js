@@ -48,6 +48,9 @@ describe('WebUI single implementation boundary', () => {
 
     expect(html).toContain('id="app-shell"');
     expect(html).toContain('id="nav-rail"');
+    expect(html).toContain('id="chat-view"');
+    expect(html).toContain('id="workbench-view"');
+    expect(html).toContain('id="workbench-content"');
     expect(html).toContain('class="main-workspace"');
     for (const view of expectedViews) {
       expect(html).toContain(`data-view="${view}"`);

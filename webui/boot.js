@@ -82,8 +82,15 @@ function bindUiEvents(){
 
   document.querySelectorAll('#nav-rail .rail-item[data-view]').forEach(function(btn){
     btn.addEventListener('click',function(){
-      UI.switchPanel(this.dataset.view);
+      UI.switchView(this.dataset.view);
+      localStorage.setItem('cowd-active-view',this.dataset.view);
     });
+  });
+
+  var backToChat=document.getElementById('btn-workbench-chat');
+  if(backToChat)backToChat.addEventListener('click',function(){
+    UI.switchView('chat');
+    localStorage.setItem('cowd-active-view','chat');
   });
 
   document.getElementById('btn-toggle-panel').addEventListener('click',function(){
@@ -113,6 +120,10 @@ function restorePanelState(){
   }else{
     panel.classList.add('hidden');
     UI.syncRail('chat');
+  }
+  const activeView=localStorage.getItem('cowd-active-view');
+  if(activeView&&activeView!=='chat'){
+    UI.switchView(activeView);
   }
 }
 
