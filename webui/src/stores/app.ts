@@ -32,6 +32,7 @@ export const useAppStore = defineStore('app', () => {
   const selectedModel = ref('claude-sonnet-4-6');
   const selectedProfile = ref('default');
   const sessionQuery = ref('');
+  const actionResults = ref<Record<string, any>>({});
   const editorDirty = computed(() => selectedFileContent.value !== editorContent.value);
   const filteredWorkspaceFiles = computed(() => {
     const query = workspaceFilter.value.trim().toLowerCase();
@@ -184,6 +185,28 @@ export const useAppStore = defineStore('app', () => {
     settingsSavedAt.value = new Date().toLocaleTimeString();
   }
 
+  async function runCapabilityAction(page: string, label: string, endpoint?: string) {
+    if (!endpoint) return;
+    const id = `${page}:${label}`;
+    companionTab.value = 'activity';
+    activity.value.unshift({
+      id: `${id}:${Date.now()}`,
+      kind: 'tool',
+      title: label,
+      detail: endpoint,
+      status: 'running',
+    });
+    const result = await api.executeCapabilityAction(endpoint, label);
+    actionResults.value = { ...actionResults.value, [id]: result };
+    activity.value.unshift({
+      id: `${id}:done:${Date.now()}`,
+      kind: 'tool',
+      title: `${label} completed`,
+      detail: JSON.stringify(result).slice(0, 220),
+      status: 'complete',
+    });
+  }
+
   return {
     booted,
     health,
@@ -209,6 +232,7 @@ export const useAppStore = defineStore('app', () => {
     selectedProfile,
     sessionQuery,
     filteredSessions,
+    actionResults,
     editorDirty,
     busy,
     activeSession,
@@ -228,5 +252,6 @@ export const useAppStore = defineStore('app', () => {
     chooseModel,
     chooseProfile,
     saveSettings,
+    runCapabilityAction,
   };
 });

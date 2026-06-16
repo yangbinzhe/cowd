@@ -35,6 +35,9 @@ test('capability pages include visual charts instead of numeric-only cards', asy
   await expect(page.locator('.chart-panel canvas, .chart-panel svg, .chart-panel div').first()).toBeVisible();
   await expect(page.locator('.work-table table')).toBeVisible();
   await expect(page.locator('.action-button')).toHaveCount(3);
+  await page.locator('.action-button').filter({ hasText: 'Scan memory' }).click();
+  await expect(page.locator('.action-result')).toBeVisible();
+  await expect(page.locator('.companion-tabs button.active')).toContainText('Activity');
 });
 
 test('settings page is reachable and theme control is usable', async ({ page }) => {

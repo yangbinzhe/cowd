@@ -136,6 +136,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .action-button small { grid-column: 2; color: var(--text-faint); overflow-wrap: anywhere; }
 .action-button[data-kind="primary"] { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); }
 .action-button[data-kind="danger"] { border-color: color-mix(in srgb, var(--danger) 58%, var(--border)); }
+.action-result { margin: 12px 0 0; max-height: 180px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); padding: 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
 
 .modal-scrim { position: fixed; inset: 0; z-index: 30; display: grid; place-items: end center; padding: 20px; background: rgba(0,0,0,.28); }
 .command-modal { width: min(680px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 42px)); overflow: auto; border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: 0 16px 42px rgba(0,0,0,.28); padding: 14px; }

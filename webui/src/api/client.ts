@@ -83,6 +83,25 @@ export const api = {
     method: 'PUT',
     body: JSON.stringify(config),
   }, { ok: true, config }),
+  executeCapabilityAction: (endpoint: string, label: string) => {
+    const normalized = endpoint
+      .replace(':id', 'demo-main')
+      .replace(':phase', 'review')
+      .replace(':profile', 'default');
+    const method = /reload|acquire|record|validate|plan|run|preflight|simulate|qr|promote|retry|resolve|revoke|cancel/i.test(label)
+      ? 'POST'
+      : 'GET';
+    return request(normalized, method === 'POST' ? {
+      method,
+      body: JSON.stringify({ source: 'webui', action: label }),
+    } : { method }, {
+      ok: true,
+      endpoint: normalized,
+      label,
+      mode: 'fallback',
+      message: 'Gateway unavailable or endpoint requires runtime context; action was recorded locally.',
+    });
+  },
 };
 
 export function normalizeActivity(raw: any[]): ActivityEvent[] {

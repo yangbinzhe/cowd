@@ -66,12 +66,14 @@ const activeSectionDetail = computed(() => spec.value.sections.find((section) =>
             class="action-button"
             :data-kind="action.kind"
             type="button"
+            @click="store.runCapabilityAction(props.page, action.label, action.endpoint)"
           >
             <Play :size="14" />
             <span>{{ action.label }}</span>
             <small>{{ action.endpoint }}</small>
           </button>
         </div>
+        <pre v-if="store.actionResults[`${props.page}:${spec.actions[0].label}`]" class="action-result">{{ store.actionResults[`${props.page}:${spec.actions[0].label}`] }}</pre>
       </article>
 
       <article class="management-panel">
