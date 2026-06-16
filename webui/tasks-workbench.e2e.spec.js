@@ -173,7 +173,7 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await page.click('#btn-toggle-panel');
   await expect(page.locator('#right-panel')).not.toHaveClass(/hidden/);
 
-  await page.click('[data-panel="agents"]');
+  await page.click('#panel-tabs button[data-panel="agents"]');
   await expect(page.locator('#right-panel')).not.toHaveClass(/hidden/);
   await expect(page.locator('#panel-content')).toContainText('Task Registry');
   await expect(page.locator('#panel-content')).toContainText('running');
@@ -184,7 +184,7 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(page.locator('#panel-content')).toContainText('accepted');
   await expect(page.locator('#panel-content')).toContainText('Session kernel migration');
 
-  await page.click('[data-panel="memory"]');
+  await page.click('#panel-tabs button[data-panel="memory"]');
   await expect(page.locator('#panel-content')).toContainText('degraded');
   await expect(page.locator('#panel-content')).toContainText('vector store unavailable');
   await expect(page.locator('#panel-content')).toContainText('Memory Links');
@@ -211,7 +211,7 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await graph.locator('[data-node-id="TaskKernel"]').click();
   await expect(graph.locator('.memory-network-detail')).toContainText('TaskKernel');
 
-  await page.click('[data-panel="context"]');
+  await page.click('#panel-tabs button[data-panel="context"]');
   await expect(page.locator('#panel-content')).toContainText('Context Runtime');
   await expect(page.locator('#panel-content')).toContainText('runtime');
   await expect(page.locator('#panel-content')).toContainText('SessionKernel owns durable sessions');

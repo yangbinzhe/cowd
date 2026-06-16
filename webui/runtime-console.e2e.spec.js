@@ -307,7 +307,7 @@ test('runtime console opens timeline context refs in browser', async ({ page }) 
   await page.getByText('Runtime Evidence Session').click();
   await page.click('#btn-toggle-panel');
   await expect(page.locator('#right-panel')).not.toHaveClass(/hidden/);
-  await page.click('[data-panel="runtime"]');
+  await page.click('#panel-tabs button[data-panel="runtime"]');
 
   await expect(page.locator('#panel-content')).toContainText('Runtime Console');
   await expect(page.locator('#panel-content')).toContainText('Control Plane');

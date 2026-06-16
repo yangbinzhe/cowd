@@ -126,7 +126,7 @@ test('cowd iacc workbench renders kernel overview structured data and ingest com
   await page.getByText('Cowd IACC Browser').click();
   await page.click('#btn-toggle-panel');
 
-  await page.click('[data-panel="runtime"]');
+  await page.click('#panel-tabs button[data-panel="runtime"]');
   await expect(page.locator('#panel-content')).toContainText('Cowd Kernel');
   await expect(page.locator('#panel-content')).toContainText('parity');
   await expect(page.locator('#panel-content')).toContainText('Structured fact captured');
@@ -134,7 +134,7 @@ test('cowd iacc workbench renders kernel overview structured data and ingest com
   const runtimeShot = await page.locator('#right-panel').screenshot();
   expect(runtimeShot.length).toBeGreaterThan(10_000);
 
-  await page.click('[data-panel="iacc"]');
+  await page.click('#panel-tabs button[data-panel="iacc"]');
   await expect(page.locator('#panel-content')).toContainText('IACC Workbench');
   await expect(page.locator('#panel-content')).toContainText('iacc.manufacturing');
   await expect(page.locator('#panel-content')).toContainText('Structured Data');
