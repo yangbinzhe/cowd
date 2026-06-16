@@ -31,6 +31,7 @@ plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2 = "0.10"
 toml = "0.8"
 syntect = "5"
 thiserror = "2"

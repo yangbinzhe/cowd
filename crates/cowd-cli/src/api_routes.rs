@@ -2380,6 +2380,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_upload_meta_delete_and_attachments_are_real() {
+        let workspace = test_temp_dir("workspace-upload");
+        let config_home = test_temp_dir("workspace-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let mkdir_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workspace/dirs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"uploads"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mkdir_response.status(), StatusCode::CREATED);
+
+        let boundary = "cowd-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"dir\"\r\n\r\nuploads\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.md\"\r\nContent-Type: text/markdown\r\n\r\n# uploaded\r\n\r\n--{boundary}--\r\n"
+        );
+        let upload_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_response.status(), StatusCode::CREATED);
+        let body = to_bytes(upload_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "uploads/sample.md");
+        assert!(json["sha256"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("uploads/sample.md")).unwrap(),
+            "# uploaded\r\n"
+        );
+
+        let meta_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/meta?path=uploads%2Fsample.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta_response.status(), StatusCode::OK);
+        let body = to_bytes(meta_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["item"]["path"], "uploads/sample.md");
+
+        let add_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/session-1/attachments")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"path":"uploads/sample.md","label":"Uploaded markdown"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_attachment.status(), StatusCode::CREATED);
+        let body = to_bytes(add_attachment.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ref_id = json["attachment"]["ref_id"].as_str().unwrap().to_string();
+        assert_eq!(json["attachment"]["path"], "uploads/sample.md");
+
+        let list_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/session-1/attachments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_attachment.status(), StatusCode::OK);
+        let body = to_bytes(list_attachment.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["count"], 1);
+
+        let delete_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/session-1/attachments/{ref_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_attachment.status(), StatusCode::OK);
+
+        let delete_file = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/workspace/files?path=uploads%2Fsample.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_file.status(), StatusCode::OK);
+        assert!(!workspace.join("uploads/sample.md").exists());
+    }
+
+    #[tokio::test]
     async fn profile_api_creates_switches_and_deletes_profiles() {
         let app = api_router(test_state());
 
@@ -3725,6 +3862,159 @@ providers:
     }
 
     #[tokio::test]
+    async fn config_providers_and_update_config_are_real_and_redacted() {
+        let root = test_temp_dir("system-config-providers");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "model-a"
+providers:
+  local:
+    base_url: "https://local.example/v1"
+    api_key: "secret-local-key"
+    models: ["model-a", "model-b"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["provider_count"], 1);
+        assert_eq!(json["provider_model_count"], 2);
+        assert_eq!(json["configured_model"], "model-a");
+        assert_eq!(json["models"][1]["id"], "model-b");
+        assert_eq!(json["providers"][0]["credential_present"], true);
+        assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["providers"]["local"]["api_key"], "[redacted]");
+        assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"model-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let written = std::fs::read_to_string(config_home.join("config.yaml")).unwrap();
+        assert!(written.contains("model-b"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"missing-model"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn commands_registry_execute_and_history_are_available() {
+        let root = test_temp_dir("system-commands");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "/status"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"command":"/status","args":{"session_id":"s1"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["command"], "/status");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/commands/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+    }
+
+    #[tokio::test]
     #[serial_test::serial(provider_registry)]
     async fn runtime_provider_reload_replaces_global_registry_from_config() {
         runtime::init_global_providers(runtime::ProvidersConfig::default());
@@ -3834,9 +4124,8 @@ providers:
         let _ = std::fs::remove_dir_all(invalid_root);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn runtime_control_plane_emits_structured_trace_event() {
-        use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
 
         let root = test_temp_dir("runtime-control-plane-trace");
@@ -3854,9 +4143,8 @@ providers:
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
-        let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state))
-            .with_subscriber(subscriber)
-            .await;
+        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
+        let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
         let lines = capture.lines();
         let joined = lines.join("\n");
@@ -4208,9 +4496,8 @@ providers:
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn session_context_history_emits_structured_trace_events() {
-        use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
 
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
@@ -4237,49 +4524,46 @@ providers:
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
+        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
         let state = test_state_with_store(store);
         let app = api_router(state);
-        async {
-            let history_response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!(
-                            "/api/sessions/{session_id}/context?include_envelopes=false"
-                        ))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(history_response.status(), StatusCode::OK);
-            let history_body = to_bytes(history_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
-            assert_eq!(history_json["session_id"], session_id);
-            assert_eq!(history_json["include_envelopes"], false);
-            assert_eq!(history_json["total"], 1);
-            assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
+        let history_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?include_envelopes=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_body = to_bytes(history_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+        assert_eq!(history_json["session_id"], session_id);
+        assert_eq!(history_json["include_envelopes"], false);
+        assert_eq!(history_json["total"], 1);
+        assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
 
-            let detail_response = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/api/context/env-log-1")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(detail_response.status(), StatusCode::OK);
-            let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
-            assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
-        }
-        .with_subscriber(subscriber)
-        .await;
+        let detail_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/env-log-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
 
         let lines = capture.lines();
         let joined = lines.join("\n");

@@ -224,20 +224,23 @@ fn integration_command_palette() {
 }
 
 #[test]
-fn integration_slash_opens_command_palette_and_prepares_command() {
+fn integration_slash_keeps_input_control_without_opening_palette() {
     let mut state = TuiState::new("test-model", "test-session");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-    assert!(state.command_palette.is_open());
+    assert!(!state.command_palette.is_open());
+    assert_eq!(state.app.input.lines().join("\n"), "/");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-    state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(!state.command_palette.is_open());
+    assert_eq!(state.app.input.lines().join("\n"), "/statu");
+
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
     assert_eq!(state.app.input.lines().join("\n"), "/status");
 }
 

@@ -586,8 +586,7 @@ impl FeishuAdapter {
             message_id: Option<String>,
         }
 
-        let resp: CardSendResponse =
-            decode_feishu_response(response, "send card message").await?;
+        let resp: CardSendResponse = decode_feishu_response(response, "send card message").await?;
 
         if resp.code != 0 {
             return Err(PlatformError::SendFailed(resp.msg));

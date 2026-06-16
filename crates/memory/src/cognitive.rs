@@ -254,12 +254,9 @@ impl CognitiveContextManager {
 
         // Build the vector index with persistence support.
         // Use VectorIndex::load to restore previously persisted vectors.
-        let dimension = if config.store.vector.dimension > 0 {
-            config.store.vector.dimension as u32
-        } else {
-            // Default embedding dimension (text-embedding-3-small / OpenAI).
-            1536
-        };
+        // Dimension 0 means "auto": reuse an existing persisted index dimension,
+        // falling back to the store default only when the index is empty.
+        let dimension = config.store.vector.dimension as u32;
         let persist_path = config.store.blob_dir.join("vector_index.json");
         let vector_index = Mutex::new(
             VectorIndex::load(persist_path, dimension)

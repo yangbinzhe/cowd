@@ -95,7 +95,9 @@ impl<'a> Renderer<'a> {
         Style::default().fg(self.theme.accent())
     }
     fn accent_bold(&self) -> Style {
-        Style::default().fg(self.theme.accent()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.theme.accent())
+            .add_modifier(Modifier::BOLD)
     }
     fn code_style(&self) -> Style {
         Style::default().fg(self.theme.inline_code_color())
@@ -225,10 +227,8 @@ impl<'a> Renderer<'a> {
                         HeadingLevel::H5 => "##### ",
                         HeadingLevel::H6 => "###### ",
                     };
-                    self.current_spans.push(Span::styled(
-                        prefix.to_string(),
-                        self.accent_bold(),
-                    ));
+                    self.current_spans
+                        .push(Span::styled(prefix.to_string(), self.accent_bold()));
                 }
                 Event::End(TagEnd::Heading(_)) => {
                     self.flush_paragraph();
@@ -247,10 +247,8 @@ impl<'a> Renderer<'a> {
                 // ---- Horizontal rule ----
                 Event::Rule => {
                     self.flush_paragraph();
-                    self.lines.push(Line::from(Span::styled(
-                        "───",
-                        self.muted_style(),
-                    )));
+                    self.lines
+                        .push(Line::from(Span::styled("───", self.muted_style())));
                 }
 
                 // ---- Lists (ordered / unordered) ----
@@ -275,16 +273,12 @@ impl<'a> Renderer<'a> {
                         Some(ListKind::Ordered { next }) => {
                             let n = *next;
                             *next += 1;
-                            self.current_spans.push(Span::styled(
-                                format!("{n}. "),
-                                self.muted_style(),
-                            ));
+                            self.current_spans
+                                .push(Span::styled(format!("{n}. "), self.muted_style()));
                         }
                         _ => {
-                            self.current_spans.push(Span::styled(
-                                "• ".to_string(),
-                                self.muted_style(),
-                            ));
+                            self.current_spans
+                                .push(Span::styled("• ".to_string(), self.muted_style()));
                         }
                     }
                 }
@@ -303,18 +297,14 @@ impl<'a> Renderer<'a> {
 
                 // ---- Inline code ----
                 Event::Code(code) => {
-                    self.current_spans.push(Span::styled(
-                        code.to_string(),
-                        self.code_style(),
-                    ));
+                    self.current_spans
+                        .push(Span::styled(code.to_string(), self.code_style()));
                 }
 
                 // ---- Plain text ----
                 Event::Text(text) => {
-                    self.current_spans.push(Span::styled(
-                        text.to_string(),
-                        self.fg_style(),
-                    ));
+                    self.current_spans
+                        .push(Span::styled(text.to_string(), self.fg_style()));
                 }
 
                 // ---- Links ----
@@ -430,10 +420,7 @@ impl<'a> Renderer<'a> {
                     self.fg_style().add_modifier(Modifier::BOLD),
                 ));
             } else {
-                spans.push(Span::styled(
-                    cell_text.to_string(),
-                    self.fg_style(),
-                ));
+                spans.push(Span::styled(cell_text.to_string(), self.fg_style()));
             }
             let pad = w.saturating_sub(UnicodeWidthStr::width(cell_text));
             if pad > 0 {
