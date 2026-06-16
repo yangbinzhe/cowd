@@ -99,7 +99,13 @@ test('gateway page exposes connector and cross-plane controls', async ({ page })
   await expect(page.getByRole('heading', { name: 'Platforms and connectors' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Resources and memory promotion' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Cross-plane governance' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Identities and grants' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Action execution' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Simulate policy' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create identity' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create grant' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Execute action' })).toBeVisible();
 });
 
 test('iacc page exposes manufacturing application workbench controls', async ({ page }) => {

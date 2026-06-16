@@ -373,12 +373,36 @@ export const api = {
     body: JSON.stringify({ reference }),
   }),
   crossPlaneSummary: () => read('/api/cross-plane/summary', {}),
+  crossPlaneIdentities: () => read('/api/cross-plane/identities', {}),
+  crossPlaneCreateIdentity: (body: Record<string, unknown>) => write('/api/cross-plane/identities', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  crossPlaneRevokeIdentity: (id: string) => write(`/api/cross-plane/identities/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  crossPlaneGrants: () => read('/api/cross-plane/grants', {}),
+  crossPlaneCreateGrant: (body: Record<string, unknown>) => write('/api/cross-plane/grants', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  crossPlaneRevokeGrant: (id: string) => write(`/api/cross-plane/grants/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   crossPlaneAudit: () => read('/api/cross-plane/audit', {}),
   crossPlaneAdapters: () => read('/api/cross-plane/action/adapters', {}),
   crossPlaneExecutions: () => read('/api/cross-plane/action/executions', {}),
+  crossPlanePolicySimulate: (body: Record<string, unknown>) => write('/api/cross-plane/policy/simulate', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   crossPlanePreflight: (body: Record<string, unknown>) => write('/api/cross-plane/action/preflight', {
     method: 'POST',
     body: JSON.stringify(body),
+  }),
+  crossPlaneExecute: (action: Record<string, unknown>, mode = 'dry_run', idempotency_key?: string) => write('/api/cross-plane/action/execute', {
+    method: 'POST',
+    body: JSON.stringify({ action, mode, idempotency_key }),
+  }),
+  crossPlaneResolveIdentity: (identity_ref: string) => write('/api/cross-plane/identity/resolve', {
+    method: 'POST',
+    body: JSON.stringify({ identity_ref }),
   }),
   auditExport: (source = 'all', limit = 50, offset = 0) => read(`/api/audit/export?source=${encodeURIComponent(source)}&limit=${limit}&offset=${offset}`, {}),
   usageSummary: () => read('/api/usage', {}),

@@ -14,12 +14,19 @@ const actionResult = ref<any>(null);
 const resourceRef = ref('');
 const actor = ref('webui-operator');
 const capability = ref('service.read');
+const identityRef = ref('user:webui-operator');
+const identityId = ref('');
+const grantId = ref('');
+const executeMode = ref('dry_run');
+const idempotencyKey = ref('');
 
 const accounts = computed(() => Array.isArray(state.value.accounts?.accounts) ? state.value.accounts.accounts : []);
 const capabilities = computed(() => Array.isArray(state.value.capabilities?.capabilities) ? state.value.capabilities.capabilities : []);
 const resources = computed(() => Array.isArray(state.value.resources?.resources) ? state.value.resources.resources : Array.isArray(state.value.resources?.items) ? state.value.resources.items : []);
 const mcpServers = computed(() => Array.isArray(state.value.mcp?.servers) ? state.value.mcp.servers : []);
 const executions = computed(() => Array.isArray(state.value.executions?.executions) ? state.value.executions.executions : []);
+const identities = computed(() => Array.isArray(state.value.identities?.identities) ? state.value.identities.identities : []);
+const grants = computed(() => Array.isArray(state.value.grants?.grants) ? state.value.grants.grants : []);
 const accountRows = computed(() => accounts.value.map((item: any) => ({
   provider: item.provider || item.provider_id || item.id,
   account: item.account_id || item.id || '-',
@@ -44,12 +51,40 @@ const executionRows = computed(() => executions.value.slice(0, 12).map((item: an
   capability: item.requested_capability || item.capability || '-',
   provider: item.provider_account || item.provider || '-',
 })));
+const identityRows = computed(() => identities.value.slice(0, 12).map((item: any) => ({
+  id: item.id,
+  principal: item.principal_id,
+  identity: item.identity_ref,
+  trust: item.trust,
+})));
+const grantRows = computed(() => grants.value.slice(0, 12).map((item: any) => ({
+  id: item.id,
+  principal: item.principal_id,
+  capability: item.capability,
+  type: item.grant_type,
+})));
+
+function crossPlaneAction() {
+  return {
+    actor_principal: actor.value,
+    actor_identity_ref: identityRef.value || null,
+    source_channel: 'channel://webui/local',
+    session_id: 'webui-gateway',
+    requested_capability: capability.value,
+    provider_account: accounts.value[0]?.account_id || accounts.value[0]?.id || 'webui-local',
+    target_ref: null,
+    resource_ref: resourceRef.value || null,
+    risk: 'medium',
+    data_classification: 'internal',
+    identity_trust: 'unknown',
+  };
+}
 
 async function refresh() {
   loading.value = true;
   error.value = '';
   try {
-    const [platforms, summary, nextAccounts, nextCapabilities, nextResources, mcp, crossPlane, audit, adapters, nextExecutions] = await Promise.all([
+    const [platforms, summary, nextAccounts, nextCapabilities, nextResources, mcp, crossPlane, identitiesData, grantsData, audit, adapters, nextExecutions] = await Promise.all([
       api.platforms(),
       api.connectorsSummary(),
       api.connectorAccounts(),
@@ -57,14 +92,18 @@ async function refresh() {
       api.connectorResources(),
       api.connectorMcpServers(),
       api.crossPlaneSummary(),
+      api.crossPlaneIdentities(),
+      api.crossPlaneGrants(),
       api.crossPlaneAudit(),
       api.crossPlaneAdapters(),
       api.crossPlaneExecutions(),
     ]);
-    state.value = { platforms, summary, accounts: nextAccounts, capabilities: nextCapabilities, resources: nextResources, mcp, crossPlane, audit, adapters, executions: nextExecutions };
+    state.value = { platforms, summary, accounts: nextAccounts, capabilities: nextCapabilities, resources: nextResources, mcp, crossPlane, identities: identitiesData, grants: grantsData, audit, adapters, executions: nextExecutions };
     if (!resourceRef.value) {
       resourceRef.value = resources.value[0]?.reference || resources.value[0]?.resource_ref || '';
     }
+    identityId.value = identityId.value || identities.value[0]?.id || '';
+    grantId.value = grantId.value || grants.value[0]?.id || '';
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -85,18 +124,69 @@ async function promoteResourceMemory() {
 }
 
 async function runPreflight() {
-  actionResult.value = await api.crossPlanePreflight({
-    actor_principal: actor.value,
-    source_channel: 'channel://webui/local',
-    session_id: 'webui-gateway',
-    requested_capability: capability.value,
-    provider_account: accounts.value[0]?.account_id || accounts.value[0]?.id || 'webui-local',
+  actionResult.value = await api.crossPlanePreflight(crossPlaneAction());
+  await refresh();
+}
+
+async function simulatePolicy() {
+  actionResult.value = await api.crossPlanePolicySimulate(crossPlaneAction());
+  await refresh();
+}
+
+async function executeCrossPlaneAction() {
+  actionResult.value = await api.crossPlaneExecute(crossPlaneAction(), executeMode.value, idempotencyKey.value || undefined);
+  await refresh();
+}
+
+async function createIdentity() {
+  actionResult.value = await api.crossPlaneCreateIdentity({
+    id: identityId.value || `idb-webui-${Date.now()}`,
+    principal_id: actor.value,
+    identity_ref: identityRef.value,
+    trust: 'verified',
+    source: 'webui',
+    created_at: new Date().toISOString(),
+    expires_at: null,
+  });
+  identityId.value = actionResult.value?.identity?.id || identityId.value;
+  await refresh();
+}
+
+async function revokeIdentity() {
+  if (!identityId.value) return;
+  actionResult.value = await api.crossPlaneRevokeIdentity(identityId.value);
+  identityId.value = '';
+  await refresh();
+}
+
+async function resolveIdentity() {
+  actionResult.value = await api.crossPlaneResolveIdentity(identityRef.value);
+  await refresh();
+}
+
+async function createGrant() {
+  actionResult.value = await api.crossPlaneCreateGrant({
+    id: grantId.value || `grant-webui-${Date.now()}`,
+    principal_id: actor.value,
+    capability: capability.value,
+    account_id: accounts.value[0]?.account_id || accounts.value[0]?.id || null,
     target_ref: null,
     resource_ref: resourceRef.value || null,
-    risk: 'medium',
-    data_classification: 'internal',
-    identity_trust: 'unknown',
+    source_channel: 'channel://webui/local',
+    grant_type: 'persistent',
+    expires_at: null,
+    remaining_uses: null,
+    created_by: 'webui',
+    approval_id: null,
   });
+  grantId.value = actionResult.value?.grant?.id || grantId.value;
+  await refresh();
+}
+
+async function revokeGrant() {
+  if (!grantId.value) return;
+  actionResult.value = await api.crossPlaneRevokeGrant(grantId.value);
+  grantId.value = '';
   await refresh();
 }
 
@@ -133,6 +223,11 @@ onMounted(refresh);
         <span>Cross-plane</span>
         <strong>{{ executions.length }}</strong>
         <small>executions recorded</small>
+      </article>
+      <article class="metric-card" data-tone="info">
+        <span>Identity/Grants</span>
+        <strong>{{ identities.length }}/{{ grants.length }}</strong>
+        <small>control-plane bindings</small>
       </article>
     </section>
 
@@ -194,11 +289,66 @@ onMounted(refresh);
           Capability
           <input v-model="capability" type="text" />
         </label>
-        <button class="primary-action" type="button" @click="runPreflight">
-          <ShieldCheck :size="15" />
-          Run preflight
-        </button>
+        <label class="field-line">
+          Identity ref
+          <input v-model="identityRef" type="text" />
+        </label>
+        <div class="button-row">
+          <button class="ghost-action" type="button" @click="simulatePolicy">Simulate policy</button>
+          <button class="primary-action" type="button" @click="runPreflight">
+            <ShieldCheck :size="15" />
+            Run preflight
+          </button>
+        </div>
         <RawPayload title="Cross-plane summary" :data="state.crossPlane || {}" />
+      </section>
+
+      <section class="management-panel gateway-panel">
+        <header>
+          <h2>Identities and grants</h2>
+          <span>{{ identities.length }} identities</span>
+        </header>
+        <label class="field-line">
+          Identity binding id
+          <input v-model="identityId" type="text" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="createIdentity">Create identity</button>
+          <button class="ghost-action" type="button" @click="resolveIdentity">Resolve identity</button>
+          <button class="ghost-action" type="button" :disabled="!identityId" @click="revokeIdentity">Revoke identity</button>
+        </div>
+        <DataTable v-if="identityRows.length" :rows="identityRows" :columns="['id', 'principal', 'identity', 'trust']" />
+        <EmptyState v-else title="No identities" detail="创建身份绑定后，跨平面动作会使用可信主体判定。" />
+        <label class="field-line">
+          Grant id
+          <input v-model="grantId" type="text" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="createGrant">Create grant</button>
+          <button class="ghost-action" type="button" :disabled="!grantId" @click="revokeGrant">Revoke grant</button>
+        </div>
+        <DataTable v-if="grantRows.length" :rows="grantRows" :columns="['id', 'principal', 'capability', 'type']" />
+        <EmptyState v-else title="No grants" detail="授权为空时，高风险动作会被策略门禁拦截或要求审批。" />
+      </section>
+
+      <section class="management-panel gateway-panel">
+        <header>
+          <h2>Action execution</h2>
+          <span>{{ executeMode }}</span>
+        </header>
+        <label class="field-line">
+          Mode
+          <select v-model="executeMode">
+            <option value="dry_run">dry_run</option>
+            <option value="commit">commit</option>
+          </select>
+        </label>
+        <label class="field-line">
+          Idempotency key
+          <input v-model="idempotencyKey" type="text" placeholder="optional" />
+        </label>
+        <button class="primary-action" type="button" @click="executeCrossPlaneAction">Execute action</button>
+        <RawPayload title="Action readiness or receipt" :data="actionResult || {}" />
       </section>
 
       <section class="management-panel gateway-panel">

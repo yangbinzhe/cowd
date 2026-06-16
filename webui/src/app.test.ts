@@ -151,6 +151,39 @@ describe('Cowd Vue WebUI shell', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/cowd/release-gate', expect.any(Object));
   });
 
+  it('calls real cross-plane identity grant and action endpoints', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'cross-plane.test' }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    const action = {
+      actor_principal: 'webui-operator',
+      requested_capability: 'service.read',
+      risk: 'medium',
+      data_classification: 'internal',
+      identity_trust: 'unknown',
+    };
+    await api.crossPlaneCreateIdentity({ id: 'idb-1', principal_id: 'webui-operator', identity_ref: 'user:webui-operator' });
+    await api.crossPlaneCreateGrant({ id: 'grant-1', principal_id: 'webui-operator', capability: 'service.read' });
+    await api.crossPlanePolicySimulate(action);
+    await api.crossPlaneExecute(action, 'dry_run', 'key-1');
+    await api.crossPlaneRevokeIdentity('idb-1');
+    await api.crossPlaneRevokeGrant('grant-1');
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/identities', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ id: 'idb-1', principal_id: 'webui-operator', identity_ref: 'user:webui-operator' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/grants', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ id: 'grant-1', principal_id: 'webui-operator', capability: 'service.read' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/policy/simulate', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/action/execute', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ action, mode: 'dry_run', idempotency_key: 'key-1' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/identities/idb-1', expect.objectContaining({ method: 'DELETE' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/cross-plane/grants/grant-1', expect.objectContaining({ method: 'DELETE' }));
+  });
+
   it('loads skill detail and files from real skill management endpoints', async () => {
     const fetchMock = vi.fn((path: RequestInfo | URL) => {
       const url = String(path);
