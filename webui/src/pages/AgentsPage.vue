@@ -16,14 +16,14 @@ const tasks = ref<any>({});
 const graph = ref<any>({});
 const actionResult = ref<any>(null);
 const selectedTaskId = ref('');
-const objective = ref('Refactor WebUI module management with verified backend parity');
-const discoverQuery = ref('frontend refactor memory agents skills runtime verification');
-const phaseName = ref('Implementation');
-const phaseObjective = ref('Wire real backend APIs and validate with tests');
-const artifactLabel = ref('Validation note');
-const artifactValue = ref('npm run test --prefix webui -- --run passed');
-const reviewResult = ref('Accepted after automated checks and visual review.');
-const failureReason = ref('Blocked by missing backend capability.');
+const objective = ref('');
+const discoverQuery = ref('');
+const phaseName = ref('');
+const phaseObjective = ref('');
+const artifactLabel = ref('');
+const artifactValue = ref('');
+const reviewResult = ref('');
+const failureReason = ref('');
 
 const agentRows = computed(() => (Array.isArray(catalog.value?.agents) ? catalog.value.agents : []).map((agent: any) => ({
   name: agent.name,
@@ -80,6 +80,10 @@ async function loadGraph() {
 }
 
 async function startTask() {
+  if (!objective.value.trim()) {
+    error.value = 'Objective is required before starting a task.';
+    return;
+  }
   actionResult.value = await api.startTask(objective.value, false);
   selectedTaskId.value = actionResult.value?.id || selectedTaskId.value;
   await refresh();
@@ -88,12 +92,16 @@ async function startTask() {
 async function addPhase() {
   const taskId = selectedTaskId.value || selectedTask.value?.id;
   if (!taskId) return;
+  if (!phaseName.value.trim() || !phaseObjective.value.trim()) {
+    error.value = 'Phase name and objective are required.';
+    return;
+  }
   actionResult.value = await api.startTaskPhase(taskId, {
     name: phaseName.value,
     objective: phaseObjective.value,
-    plan: ['bind backend endpoint', 'implement page controls', 'run unit and e2e tests'],
-    acceptance: ['real API call is covered', 'visual screenshot saved'],
-    test_commands: ['npm run test --prefix webui -- --run', 'npm run test:e2e --prefix webui'],
+    plan: [],
+    acceptance: [],
+    test_commands: [],
   });
   await refresh();
 }
@@ -102,6 +110,10 @@ async function recordArtifact() {
   const taskId = selectedTaskId.value || selectedTask.value?.id;
   const phaseId = currentPhase.value?.id;
   if (!taskId || !phaseId) return;
+  if (!artifactLabel.value.trim() || !artifactValue.value.trim()) {
+    error.value = 'Artifact label and value are required.';
+    return;
+  }
   actionResult.value = await api.recordTaskArtifact(taskId, phaseId, {
     kind: 'validation',
     label: artifactLabel.value,
@@ -114,6 +126,10 @@ async function reviewPhase(completed = true) {
   const taskId = selectedTaskId.value || selectedTask.value?.id;
   const phaseId = currentPhase.value?.id;
   if (!taskId || !phaseId) return;
+  if (!reviewResult.value.trim()) {
+    error.value = 'Review result is required.';
+    return;
+  }
   actionResult.value = await api.reviewTaskPhase(taskId, phaseId, reviewResult.value, completed);
   await refresh();
 }
@@ -123,17 +139,31 @@ async function transitionTask(action: 'complete' | 'cancel' | 'failure') {
   if (!taskId) return;
   if (action === 'complete') actionResult.value = await api.completeTask(taskId);
   if (action === 'cancel') actionResult.value = await api.cancelTask(taskId);
-  if (action === 'failure') actionResult.value = await api.recordTaskFailure(taskId, failureReason.value);
+  if (action === 'failure') {
+    if (!failureReason.value.trim()) {
+      error.value = 'Failure reason is required.';
+      return;
+    }
+    actionResult.value = await api.recordTaskFailure(taskId, failureReason.value);
+  }
   await refresh();
 }
 
 async function discoverAgents() {
+  if (!discoverQuery.value.trim()) {
+    error.value = 'Task description is required before discovering agents.';
+    return;
+  }
   discovery.value = await api.agentDiscover(discoverQuery.value);
 }
 
 async function upsertGraphTemplate() {
   const taskId = selectedTaskId.value || selectedTask.value?.id;
   if (!taskId) return;
+  if (!objective.value.trim() || !phaseObjective.value.trim()) {
+    error.value = 'Objective and phase objective are required before generating an agent graph.';
+    return;
+  }
   const now = Date.now();
   const nodes = [
     {
@@ -166,7 +196,7 @@ async function upsertGraphTemplate() {
       id: 'reviewer',
       role: 'reviewer',
       title: 'Review',
-      objective: 'Verify implementation, tests, and user-facing behavior.',
+      objective: reviewResult.value || 'Review the selected task phase and attached artifacts.',
       depends_on: ['executor'],
       status: 'pending',
       assigned_agent: discovery.value?.team?.workers?.[1]?.agent_id || null,
@@ -222,7 +252,7 @@ onMounted(refresh);
     </section>
 
     <section class="agents-workbench-grid">
-      <section class="management-panel agents-panel">
+      <section class="management-panel agents-panel" data-section="catalog">
         <header>
           <h2>Agent catalog</h2>
           <span>{{ agentRows.length }} definitions</span>
@@ -231,7 +261,7 @@ onMounted(refresh);
         <EmptyState v-else title="No agents registered" detail="后端没有发现 .cowd/agents、~/.cowd/agents 或 $CC_CONFIG_HOME/agents 定义。" />
       </section>
 
-      <section class="management-panel agents-panel">
+      <section class="management-panel agents-panel" data-section="discovery">
         <header>
           <h2>Discover team</h2>
           <span>{{ discovery.count || 0 }} matches</span>
@@ -246,7 +276,7 @@ onMounted(refresh);
         <RawPayload title="Auto assembled team" :data="discovery.team || {}" />
       </section>
 
-      <section class="management-panel agents-panel wide">
+      <section class="management-panel agents-panel wide" data-section="tasks">
         <header>
           <h2>Task control</h2>
           <span>{{ selectedTask?.status || 'no task' }}</span>
@@ -286,7 +316,7 @@ onMounted(refresh);
         </div>
       </section>
 
-      <section class="management-panel agents-panel">
+      <section class="management-panel agents-panel" data-section="tasks">
         <header>
           <h2>Phase gate</h2>
           <span>{{ phaseItems.length }} phases</span>
@@ -307,7 +337,7 @@ onMounted(refresh);
         <EmptyState v-else title="No phases" detail="阶段用于 TDD 目标、计划、验收和测试命令闭环。" />
       </section>
 
-      <section class="management-panel agents-panel">
+      <section class="management-panel agents-panel" data-section="reviews">
         <header>
           <h2>Artifacts and review</h2>
           <span>{{ currentPhase?.id || 'no phase' }}</span>
@@ -330,7 +360,7 @@ onMounted(refresh);
         </div>
       </section>
 
-      <section class="management-panel agents-panel wide">
+      <section class="management-panel agents-panel wide" data-section="graph">
         <header>
           <h2>Agent execution graph</h2>
           <span><StatusPill :status="graph.status || 'offline'" /></span>
@@ -356,7 +386,7 @@ onMounted(refresh);
         <EmptyState v-if="!graphNodes.length" title="No agent graph" detail="选择任务后可以生成 planner/executor/reviewer 执行图。" />
       </section>
 
-      <section class="management-panel agents-panel wide">
+      <section class="management-panel agents-panel wide" data-section="runs">
         <header>
           <h2>Runs and evidence</h2>
           <span>{{ runItems.length }} graphs</span>

@@ -27,6 +27,7 @@ const evidenceId = ref('');
 const qualityGateId = ref('');
 const computeJobId = ref('');
 const connectorRunId = ref('');
+const factPayload = ref('');
 const dataPlaneResult = ref<any>(null);
 const sourcePackResult = ref<any>(null);
 const entityResult = ref<any>(null);
@@ -45,7 +46,7 @@ const metricChart = computed(() => {
     { name: 'attention', value: Number(health.attention_count || 0) },
     { name: 'incidents', value: Number(health.incident_count || 0) },
     { name: 'executions', value: Number(health.execution_count || 0) },
-  ].map((item) => ({ ...item, value: Math.max(1, item.value) }));
+  ];
 });
 
 const incidents = computed(() => items(state.value?.incidents, 'items'));
@@ -297,20 +298,33 @@ async function inspectQualityGate() {
   evidenceResult.value = await api.iaccQualityGate(qualityGateId.value);
 }
 
-async function seedManufacturing() {
+async function initializeManufacturingKernel() {
   result.value = {
     domain: await api.iaccSeedDomain(),
     ontology: await api.iaccSeedOntology(),
-    fact: await api.iaccIngestFact([{
-      fact_type: 'manufacturing_quality_event',
-      entity_refs: ['line:A', 'station:torque-03'],
-      metric_key: 'torque_deviation_rate',
-      dimensions: { line: 'A', station: 'torque-03', batch: 'QA-2026-0616' },
-      measures: { deviation_rate: 0.18, affected_units: 42 },
-      source_ref: 'webui://iacc/simulated-manufacturing-quality',
-      confidence: 0.93,
-    }]),
   };
+  await refresh();
+}
+
+async function ingestManufacturingFacts() {
+  if (!factPayload.value.trim()) {
+    error.value = 'Fact payload is required. Paste a JSON object or array from a real source pack.';
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(factPayload.value);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+    return;
+  }
+  const facts = Array.isArray(parsed) ? parsed : [parsed];
+  const invalid = facts.some((fact: any) => !fact?.source_ref || !fact?.fact_type);
+  if (invalid) {
+    error.value = 'Each fact must include source_ref and fact_type.';
+    return;
+  }
+  result.value = await api.iaccIngestFact(facts as Record<string, unknown>[]);
   await refresh();
 }
 
@@ -458,9 +472,9 @@ onMounted(refresh);
     </section>
 
     <section class="management-grid iacc-workbench">
-      <ChartPanel title="IACC operating load" kind="bar" :data="metricChart" />
+      <ChartPanel data-section="overview" title="IACC operating load" kind="bar" :data="metricChart" />
 
-      <article class="management-panel iacc-command-panel">
+      <article class="management-panel iacc-command-panel" data-section="overview">
         <header>
           <h2>Manufacturing command center</h2>
           <span>{{ state?.health?.status || 'unknown' }}</span>
@@ -477,7 +491,7 @@ onMounted(refresh);
         </dl>
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="data-plane">
         <header>
           <h2>Data plane and source packs</h2>
           <span>{{ state?.dataPlane?.status || 'unknown' }}</span>
@@ -513,17 +527,22 @@ onMounted(refresh);
         <RawPayload :data="{ data_plane: dataPlaneResult, source_pack: sourcePackResult }" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="source-pack">
         <header>
-          <h2>Manufacturing data seed</h2>
+          <h2>Manufacturing data ingestion</h2>
           <span>{{ metrics.length }} metrics</span>
         </header>
-        <button class="primary-action" type="button" @click="seedManufacturing">Seed manufacturing fact</button>
+        <p class="panel-note">Only ingest facts copied from a real source pack or connector output. Demo fixtures are not prefilled here.</p>
+        <textarea v-model="factPayload" class="json-input" rows="8" placeholder='[{"fact_type":"...","source_ref":"source-pack://..."}]' />
+        <div class="button-row">
+          <button class="ghost-action" type="button" @click="initializeManufacturingKernel">Initialize domain model</button>
+          <button class="primary-action" type="button" @click="ingestManufacturingFacts">Ingest facts</button>
+        </div>
         <DataTable v-if="metrics.length" :rows="metrics.slice(0, 8)" :columns="['metric_id', 'name', 'unit', 'status']" />
         <RawPayload :data="{ metrics: state?.metrics, attention: state?.attention, changes: state?.changes }" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="entities">
         <header>
           <h2>Entities and impact graph</h2>
           <span>{{ entities.length }} entities</span>
@@ -546,7 +565,7 @@ onMounted(refresh);
         <RawPayload :data="entityResult || {}" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="metrics">
         <header>
           <h2>Metrics and compute</h2>
           <span>{{ metrics.length }} metrics</span>
@@ -572,7 +591,7 @@ onMounted(refresh);
         <RawPayload :data="metricResult || {}" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="evidence">
         <header>
           <h2>Evidence and quality</h2>
           <span>{{ state?.health?.evidence_count || 0 }} packets</span>
@@ -594,7 +613,7 @@ onMounted(refresh);
         <RawPayload :data="evidenceResult || {}" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="incident-room">
         <header>
           <h2>Incident room</h2>
           <span>{{ incidents.length }} incidents</span>
@@ -620,7 +639,7 @@ onMounted(refresh);
         <RawPayload :data="{ room, entities: entities.slice(0, 8), attention: attention.slice(0, 8) }" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="actions">
         <header>
           <h2>Analysis, playbook, actions</h2>
           <span>{{ recommendedActions.length }} actions</span>
@@ -646,7 +665,7 @@ onMounted(refresh);
         <RawPayload :data="{ analysis, executions: room?.executions, playbooks: room?.playbooks }" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="skills">
         <header>
           <h2>Manufacturing skills</h2>
           <span>{{ skills.length }} skills</span>
@@ -668,7 +687,7 @@ onMounted(refresh);
         <RawPayload :data="{ skills: state?.skills, skill_runs: room?.skill_runs || result?.skill_run }" />
       </article>
 
-      <article class="management-panel">
+      <article class="management-panel" data-section="reports">
         <header>
           <h2>Cockpit reports</h2>
           <span>delivery/retry</span>

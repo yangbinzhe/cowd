@@ -121,7 +121,7 @@ onMounted(refresh);
     </section>
 
     <section class="gateway-grid">
-      <section class="management-panel gateway-panel wide">
+      <section class="management-panel gateway-panel wide" data-section="registry">
         <header>
           <h2>Tool registry</h2>
           <span>{{ tools.length }} tools</span>
@@ -130,7 +130,7 @@ onMounted(refresh);
         <EmptyState v-else title="No tools" detail="后端工具注册表为空或服务未启动。" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="history">
         <header>
           <h2>Command execution</h2>
           <span>{{ selectedCommand }}</span>
@@ -148,7 +148,7 @@ onMounted(refresh);
         <DataTable v-if="commandRows.length" :rows="commandRows" :columns="['name', 'action', 'target', 'description']" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="risk">
         <header>
           <h2>Risk preflight</h2>
           <span>{{ selectedCapability }}</span>
@@ -170,7 +170,7 @@ onMounted(refresh);
         </div>
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="path-links">
         <header>
           <h2>Command and risk history</h2>
           <span>{{ historyRows.length }} shown</span>

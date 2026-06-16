@@ -56,7 +56,7 @@ onMounted(() => {
     </nav>
 
     <SessionSidebar v-if="route.path === '/chat' || route.path === '/'" />
-    <CapabilitySidebar v-else />
+    <CapabilitySidebar v-else-if="route.path !== '/settings'" />
 
     <main class="main-surface">
       <RouterView />

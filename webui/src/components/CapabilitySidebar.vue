@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick } from 'vue';
-import { useRoute } from 'vue-router';
+import { computed, nextTick, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { capabilitySpecs } from '../data/capabilities';
 import { useAppStore } from '../stores/app';
 import type { NavId } from '../types';
 
 const route = useRoute();
+const router = useRouter();
 const store = useAppStore();
 
 const pageId = computed(() => route.path.replace('/', '') as Exclude<NavId, 'chat' | 'settings'>);
@@ -13,7 +14,7 @@ const spec = computed(() => capabilitySpecs[pageId.value]);
 const snapshots = computed(() => store.capabilitySnapshots[pageId.value] || []);
 type CapabilitySection = NonNullable<(typeof spec.value)>['sections'][number];
 
-const activeSection = computed(() => store.activeSectionByPage[pageId.value] || spec.value?.sections?.[0]?.id || 'overview');
+const activeSection = computed(() => store.activeSectionByPage[pageId.value] || String(route.query.section || ''));
 
 function normalizeText(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -35,11 +36,36 @@ function focusSection(section: CapabilitySection) {
   target.focus({ preventScroll: true });
 }
 
+function applySectionFilter(sectionId: string) {
+  const panels = Array.from(document.querySelectorAll<HTMLElement>('main [data-section]'));
+  if (!panels.length) return;
+  panels.forEach((panel) => {
+    panel.hidden = panel.dataset.section !== sectionId;
+  });
+}
+
 async function selectSection(section: CapabilitySection) {
   store.selectSection(pageId.value, section.id);
+  await router.replace({ query: { ...route.query, section: section.id } });
   await nextTick();
+  applySectionFilter(section.id);
   focusSection(section);
 }
+
+watch(() => route.query.section, async (sectionId) => {
+  if (!sectionId || typeof sectionId !== 'string') return;
+  store.selectSection(pageId.value, sectionId);
+  await nextTick();
+  applySectionFilter(sectionId);
+});
+
+onMounted(() => {
+  const sectionId = route.query.section;
+  if (sectionId && typeof sectionId === 'string') {
+    store.selectSection(pageId.value, sectionId);
+    applySectionFilter(sectionId);
+  }
+});
 </script>
 
 <template>

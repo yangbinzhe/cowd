@@ -43,7 +43,9 @@ test('tools page exposes current-page management without duplicated primary navi
   await expect(page.locator('.raw-payload').first()).toBeVisible();
   await page.locator('.section-row').filter({ hasText: 'Risk' }).click();
   await expect(page.locator('.section-row.active')).toContainText('Risk');
-  await expect(page.getByRole('heading', { name: 'Risk preflight' })).toBeFocused();
+  await expect(page).toHaveURL(/section=risk/);
+  await expect(page.getByRole('heading', { name: 'Tool registry' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Risk preflight' })).toBeVisible();
 });
 
 test('runtime and context pages expose real workbench controls', async ({ page }) => {
@@ -116,7 +118,7 @@ test('iacc page exposes manufacturing application workbench controls', async ({ 
   await page.goto('/index.html#/iacc');
   await expect(page.getByRole('heading', { name: 'Manufacturing command center' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Data plane and source packs' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Manufacturing data seed' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Manufacturing data ingestion' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Entities and impact graph' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Metrics and compute' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Evidence and quality' })).toBeVisible();
@@ -127,7 +129,7 @@ test('iacc page exposes manufacturing application workbench controls', async ({ 
   await expect(page.getByRole('button', { name: 'Plan ingest' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Upsert source pack' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Build packet' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Seed manufacturing fact' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Ingest facts' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Create incident' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Generate report' })).toBeVisible();
 });
@@ -145,6 +147,7 @@ test('audit page exposes usage and release gate governance controls', async ({ p
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page.locator('.capability-sidebar')).toHaveCount(0);
   await page.getByRole('button', { name: 'Light' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
 });

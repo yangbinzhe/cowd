@@ -186,7 +186,7 @@ export const capabilitySpecs: Record<CapabilityId, CapabilitySpec> = {
       { id: 'incidents', label: 'Incidents', description: 'Incident room, evidence quality, playbooks, skills, and actions.' },
     ],
     [
-      { label: 'Seed manufacturing fact', kind: 'primary', endpoint: '/api/iacc/facts/ingest' },
+      { label: 'Ingest manufacturing facts', kind: 'primary', endpoint: '/api/iacc/facts/ingest' },
       { label: 'Plan compute job', kind: 'secondary', endpoint: '/api/iacc/compute/jobs/plan' },
       { label: 'Generate report', kind: 'secondary', endpoint: '/api/iacc/cockpit/profiles/:id/reports/generate' },
     ],

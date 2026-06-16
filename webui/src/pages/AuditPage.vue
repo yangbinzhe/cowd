@@ -126,7 +126,7 @@ onMounted(refresh);
     </section>
 
     <section class="gateway-grid">
-      <section class="management-panel gateway-panel wide">
+      <section class="management-panel gateway-panel wide" data-section="logs">
         <header>
           <h2>Audit export</h2>
           <span>{{ state.audit?.total || 0 }} total</span>
@@ -153,7 +153,7 @@ onMounted(refresh);
         <EmptyState v-else title="No audit records" detail="审批或记忆审计产生后会在这里展示。" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="usage">
         <header>
           <h2>Usage summary</h2>
           <span>{{ state.usage?.status || 'usage' }}</span>
@@ -170,7 +170,7 @@ onMounted(refresh);
         </dl>
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="release">
         <header>
           <h2>Release gate</h2>
           <span>{{ releaseSurface }}</span>
@@ -188,7 +188,7 @@ onMounted(refresh);
         <DataTable v-if="releaseRows.length" :rows="releaseRows" :columns="['name', 'status', 'detail']" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="approvals">
         <header>
           <h2>Approval history</h2>
           <span>{{ approvalRows.length }} shown</span>
@@ -197,7 +197,7 @@ onMounted(refresh);
         <EmptyState v-else title="No approvals" detail="审批记录为空或 approval gate 未启用。" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="cross-plane">
         <header>
           <h2>Governance evidence</h2>
           <span>{{ crossPlaneRows.length }} records</span>
@@ -206,7 +206,7 @@ onMounted(refresh);
         <EmptyState v-else title="No cross-plane audit" detail="跨平面动作执行后会产生治理证据。" />
       </section>
 
-      <section class="management-panel gateway-panel">
+      <section class="management-panel gateway-panel" data-section="cross-plane">
         <header>
           <h2>Execution receipts</h2>
           <span>{{ executionRows.length }} receipts</span>
