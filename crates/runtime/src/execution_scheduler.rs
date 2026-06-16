@@ -1,7 +1,10 @@
 //! Conservative execution scheduler for model-requested tool calls.
 
+use std::collections::BTreeMap;
+
 use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan};
@@ -23,6 +26,14 @@ pub struct ExecutionBatch {
     pub indices: Vec<usize>,
     pub max_concurrency: usize,
     pub reason: String,
+    #[serde(default)]
+    pub scope_groups: Vec<ExecutionScopeGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionScopeGroup {
+    pub scope: String,
+    pub indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +123,7 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
         wave,
         8,
         "dependency constrained tools run through wave orchestration",
+        requests,
     );
     push_batch(
         &mut batches,
@@ -119,6 +131,7 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
         parallel_read,
         usize::MAX,
         "read-only idempotent tools can run concurrently",
+        requests,
     );
     push_batch(
         &mut batches,
@@ -126,6 +139,7 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
         limited_network,
         ToolSafetyCategory::Network.max_concurrency(),
         "network tools are rate limited",
+        requests,
     );
     push_batch(
         &mut batches,
@@ -133,6 +147,7 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
         limited_write,
         ToolSafetyCategory::WriteLocal.max_concurrency(),
         "local mutation tools require resource-aware limits",
+        requests,
     );
     push_batch(
         &mut batches,
@@ -140,6 +155,7 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
         serial_destructive,
         ToolSafetyCategory::Destructive.max_concurrency(),
         "runtime side-effect tools are serialized",
+        requests,
     );
 
     ToolSchedule { batches }
@@ -151,14 +167,53 @@ fn push_batch(
     indices: Vec<usize>,
     max_concurrency: usize,
     reason: &str,
+    requests: &[ToolRequest],
 ) {
     if !indices.is_empty() {
+        let scope_groups = build_scope_groups(&indices, requests);
         batches.push(ExecutionBatch {
             mode,
             indices,
             max_concurrency,
             reason: reason.to_string(),
+            scope_groups,
         });
+    }
+}
+
+fn build_scope_groups(indices: &[usize], requests: &[ToolRequest]) -> Vec<ExecutionScopeGroup> {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for index in indices {
+        let Some(request) = requests.get(*index) else {
+            continue;
+        };
+        groups
+            .entry(request_scope(request))
+            .or_default()
+            .push(*index);
+    }
+    groups
+        .into_iter()
+        .map(|(scope, indices)| ExecutionScopeGroup { scope, indices })
+        .collect()
+}
+
+fn request_scope(request: &ToolRequest) -> String {
+    let input = serde_json::from_str::<Value>(&request.input).unwrap_or(Value::Null);
+    match request.tool_name.as_str() {
+        "read_file" | "write_file" | "edit_file" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("file:{path}"))
+            .unwrap_or_else(|| "file:unknown".to_string()),
+        "read_many" => "files:batch".to_string(),
+        "glob_search" | "grep_search" | "glob_many" | "grep_many" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("directory:{path}"))
+            .unwrap_or_else(|| "workspace:.".to_string()),
+        "workspace_snapshot" | "tool_batch_readonly" => "workspace:.".to_string(),
+        tool => format!("tool:{tool}"),
     }
 }
 
@@ -226,5 +281,30 @@ mod tests {
         assert_eq!(event.kind, "tool.schedule.created");
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["batch_count"], 2);
+    }
+
+    #[test]
+    fn scheduler_projects_resource_scope_groups() {
+        let schedule = schedule_tool_requests(&[
+            request("read-1", "read_file", r#"{"path":"README.md"}"#),
+            request("grep-1", "grep_search", r#"{"pattern":"fn","path":"src"}"#),
+            request(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+            ),
+        ]);
+
+        let parallel = &schedule.batches[0];
+        assert_eq!(parallel.mode, ExecutionBatchMode::ParallelRead);
+        assert_eq!(parallel.scope_groups.len(), 2);
+        assert_eq!(parallel.scope_groups[0].scope, "directory:src");
+        assert_eq!(parallel.scope_groups[0].indices, vec![1]);
+        assert_eq!(parallel.scope_groups[1].scope, "file:README.md");
+        assert_eq!(parallel.scope_groups[1].indices, vec![0]);
+
+        let write = &schedule.batches[1];
+        assert_eq!(write.mode, ExecutionBatchMode::LimitedWrite);
+        assert_eq!(write.scope_groups[0].scope, "file:src/lib.rs");
     }
 }

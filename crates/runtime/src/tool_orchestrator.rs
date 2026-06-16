@@ -33,6 +33,26 @@ pub enum ToolSafetyCategory {
     Destructive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCachePolicy {
+    ScopedRead,
+    GlobalRead,
+    ScopeInvalidatingWrite,
+    GlobalInvalidatingWrite,
+    Uncached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionProfile {
+    pub name: String,
+    pub safety_category: ToolSafetyCategory,
+    pub max_concurrency: usize,
+    pub timeout_secs: u64,
+    pub cache_policy: ToolCachePolicy,
+    pub prepared_readonly_supported: bool,
+}
+
 impl ToolSafetyCategory {
     /// Classify a tool by name using a built-in mapping.
     pub fn from_tool_name(name: &str) -> Self {
@@ -125,6 +145,45 @@ impl ToolSafetyCategory {
             Self::WriteLocal | Self::Network | Self::Destructive => 120,
         }
     }
+}
+
+#[must_use]
+pub fn tool_execution_profile(tool_name: &str) -> ToolExecutionProfile {
+    let normalized = normalize_tool_name_for_safety(tool_name);
+    let safety_category = ToolSafetyCategory::from_tool_name(&normalized);
+    ToolExecutionProfile {
+        name: normalized.clone(),
+        safety_category,
+        max_concurrency: safety_category.max_concurrency(),
+        timeout_secs: safety_category.default_timeout_secs(),
+        cache_policy: cache_policy_for_tool(&normalized, safety_category),
+        prepared_readonly_supported: prepared_readonly_supported(&normalized),
+    }
+}
+
+fn cache_policy_for_tool(
+    normalized_name: &str,
+    safety_category: ToolSafetyCategory,
+) -> ToolCachePolicy {
+    match normalized_name {
+        "read_file" | "glob_search" | "grep_search" | "workspace_snapshot" => {
+            ToolCachePolicy::ScopedRead
+        }
+        "tool_cache_stats" => ToolCachePolicy::GlobalRead,
+        "write_file" | "edit_file" | "apply_patch_transaction" => {
+            ToolCachePolicy::ScopeInvalidatingWrite
+        }
+        "checkpoint_restore" => ToolCachePolicy::GlobalInvalidatingWrite,
+        _ if safety_category == ToolSafetyCategory::ReadOnly => ToolCachePolicy::Uncached,
+        _ => ToolCachePolicy::Uncached,
+    }
+}
+
+fn prepared_readonly_supported(normalized_name: &str) -> bool {
+    matches!(
+        normalized_name,
+        "read_file" | "glob_search" | "grep_search" | "workspace_snapshot" | "tool_cache_stats"
+    )
 }
 
 fn normalize_tool_name_for_safety(name: &str) -> String {
@@ -756,5 +815,25 @@ mod tests {
         assert_eq!(ToolSafetyCategory::ReadOnly.max_concurrency(), usize::MAX);
         assert_eq!(ToolSafetyCategory::Network.max_concurrency(), 3);
         assert_eq!(ToolSafetyCategory::Destructive.max_concurrency(), 1);
+    }
+
+    #[test]
+    fn execution_profile_exposes_cache_and_prepared_capabilities() {
+        let read = tool_execution_profile("read_file");
+        assert_eq!(read.safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(read.cache_policy, ToolCachePolicy::ScopedRead);
+        assert!(read.prepared_readonly_supported);
+        assert_eq!(read.max_concurrency, usize::MAX);
+
+        let write = tool_execution_profile("write_file");
+        assert_eq!(write.safety_category, ToolSafetyCategory::WriteLocal);
+        assert_eq!(write.cache_policy, ToolCachePolicy::ScopeInvalidatingWrite);
+        assert!(!write.prepared_readonly_supported);
+
+        let restore = tool_execution_profile("checkpoint_restore");
+        assert_eq!(
+            restore.cache_policy,
+            ToolCachePolicy::GlobalInvalidatingWrite
+        );
     }
 }

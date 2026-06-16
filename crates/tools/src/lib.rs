@@ -381,6 +381,7 @@ pub(crate) use executor::*;
 pub use executor::{execute_tool, ToolSearchOutput};
 pub mod lane_completion;
 pub mod pdf_extract;
+pub(crate) mod prepared;
 pub mod sandbox_exec;
 pub mod tool_specs;
 pub mod web_tools;

@@ -13,6 +13,7 @@ use api::{
 };
 use base64::Engine;
 use reqwest::blocking::Client;
+use runtime::tool_orchestrator::tool_execution_profile;
 use runtime::{
     check_freshness, checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore,
     dedupe_superseded_commit_events, edit_file, execute_bash,
@@ -23,7 +24,8 @@ use runtime::{
     read_file,
     summary_compression::compress_summary_text,
     tool_cache::{
-        get_cached_tool_result, invalidate_tool_cache, put_cached_tool_result, tool_cache_stats,
+        get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
+        put_cached_tool_result_scoped, tool_cache_stats,
     },
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
@@ -37,6 +39,10 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::prepared::{
+    prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedToolCall, PreparedToolInvocation,
+    ToolExecutionContext,
+};
 use crate::tool_specs::{mvp_tool_specs, ToolSpec};
 use crate::{
     global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry,
@@ -1222,7 +1228,8 @@ fn branch_divergence_output(
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     let fingerprint = file_fingerprint(&input.path);
-    cached_json_tool("read_file", &input, &fingerprint, || {
+    let scope = file_cache_scope(&input.path);
+    cached_json_tool("read_file", &input, &fingerprint, &scope, || {
         read_file(&input.path, input.offset, input.limit).map_err(io_to_string)
     })
 }
@@ -1243,15 +1250,19 @@ fn run_read_many(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
+    let scope = file_cache_scope(&input.path);
+    create_auto_checkpoint("write_file")?;
     let output = to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?);
     if output.is_ok() {
-        invalidate_tool_cache();
+        invalidate_tool_cache_scope(&scope);
     }
     output
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+    let scope = file_cache_scope(&input.path);
+    create_auto_checkpoint("edit_file")?;
     let output = to_pretty_json(
         edit_file(
             &input.path,
@@ -1262,7 +1273,7 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
         .map_err(io_to_string)?,
     );
     if output.is_ok() {
-        invalidate_tool_cache();
+        invalidate_tool_cache_scope(&scope);
     }
     output
 }
@@ -1274,16 +1285,28 @@ fn run_mutation_preview(input: MutationPreviewInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_apply_patch_transaction(input: MutationApplyInput) -> Result<String, String> {
-    let output = to_pretty_json(apply_mutations(input).map_err(io_to_string)?);
-    if output.is_ok() {
-        invalidate_tool_cache();
+    create_auto_checkpoint("apply_patch_transaction")?;
+    let applied = apply_mutations(input).map_err(io_to_string)?;
+    for file in &applied.applied {
+        invalidate_tool_cache_scope(&file_cache_scope(&file.path));
     }
-    output
+    to_pretty_json(applied)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_checkpoint_create(input: CheckpointCreateInput) -> Result<String, String> {
     to_pretty_json(checkpoint_create(input).map_err(io_to_string)?)
+}
+
+fn create_auto_checkpoint(tool_name: &str) -> Result<(), String> {
+    if std::env::var("COWD_AUTO_CHECKPOINT").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    checkpoint_create(CheckpointCreateInput {
+        label: Some(format!("auto-before-{tool_name}")),
+    })
+    .map(|_| ())
+    .map_err(io_to_string)
 }
 
 fn run_checkpoint_list() -> Result<String, String> {
@@ -1307,7 +1330,8 @@ fn run_checkpoint_restore(input: CheckpointRestoreInput) -> Result<String, Strin
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
     let fingerprint = scope_fingerprint(input.path.as_deref());
-    cached_json_tool("glob_search", &input, &fingerprint, || {
+    let scope = directory_cache_scope(input.path.as_deref());
+    cached_json_tool("glob_search", &input, &fingerprint, &scope, || {
         glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)
     })
 }
@@ -1331,7 +1355,8 @@ fn run_glob_many(
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
     let fingerprint = scope_fingerprint(input.path.as_deref());
-    cached_json_tool("grep_search", &input, &fingerprint, || {
+    let scope = directory_cache_scope(input.path.as_deref());
+    cached_json_tool("grep_search", &input, &fingerprint, &scope, || {
         grep_search(&input).map_err(io_to_string)
     })
 }
@@ -1354,9 +1379,13 @@ fn run_grep_many(
 fn run_workspace_snapshot(input: WorkspaceSnapshotInput) -> Result<String, String> {
     let snapshot_input = input.clone();
     let fingerprint = workspace_snapshot_fingerprint(&input);
-    cached_json_tool("workspace_snapshot", &input, &fingerprint, || {
-        workspace_snapshot_value(snapshot_input)
-    })
+    cached_json_tool(
+        "workspace_snapshot",
+        &input,
+        &fingerprint,
+        "workspace:.",
+        || workspace_snapshot_value(snapshot_input),
+    )
 }
 
 fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, String> {
@@ -1410,6 +1439,7 @@ fn cached_json_tool<T, F, O>(
     tool_name: &str,
     input: &T,
     fingerprint: &str,
+    scope: &str,
     operation: F,
 ) -> Result<String, String>
 where
@@ -1423,12 +1453,23 @@ where
         return to_pretty_json(operation()?);
     }
     let cache_input = format!("{input_json}::fingerprint::{fingerprint}");
-    if let Some(cached) = get_cached_tool_result(tool_name, &cache_input) {
+    if let Some(cached) = get_cached_tool_result_scoped(tool_name, &cache_input, scope) {
         return Ok(cached);
     }
     let output = to_pretty_json(operation()?)?;
-    put_cached_tool_result(tool_name, &cache_input, &output);
+    put_cached_tool_result_scoped(tool_name, &cache_input, scope, &output);
     Ok(output)
+}
+
+fn file_cache_scope(path: &str) -> String {
+    format!("file:{}", absolutize_path(path).to_string_lossy())
+}
+
+fn directory_cache_scope(path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!("directory:{}", absolutize_path(path).to_string_lossy()),
+        None => "workspace:.".to_string(),
+    }
 }
 
 fn file_fingerprint(path: &str) -> String {
@@ -1591,11 +1632,79 @@ fn run_tool_batch_readonly(
         }
     }
 
+    if gate_evaluator.is_none() {
+        let prepared_calls = input
+            .calls
+            .iter()
+            .map(|call| PreparedToolCall {
+                name: call.name.clone(),
+                input: call.input.clone(),
+            })
+            .collect::<Vec<_>>();
+        let context = ToolExecutionContext::from_current_dir("tool_batch_readonly")?;
+        if calls_support_prepared_readonly(&input.calls) {
+            let prepared = prepare_readonly_invocations(&context, &prepared_calls)
+                .map_err(|error| error.message)?;
+            let results = run_ordered_batch(prepared, input.max_concurrency, |prepared| {
+                maybe_enforce_permission_check(
+                    enforcer,
+                    &prepared.normalized_name,
+                    prepared_leaf_input(&prepared),
+                )?;
+                execute_prepared_readonly_leaf(prepared)
+            });
+            return to_pretty_json(batch_output_with_mode(
+                "tool_batch_readonly",
+                "prepared_readonly",
+                results,
+            ));
+        }
+    }
+
     let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
         let output = execute_tool_with_enforcer(enforcer, gate_evaluator, &call.name, &call.input)?;
         Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
     });
-    to_pretty_json(batch_output("tool_batch_readonly", results))
+    to_pretty_json(batch_output_with_mode(
+        "tool_batch_readonly",
+        "compat_recursive",
+        results,
+    ))
+}
+
+fn calls_support_prepared_readonly(calls: &[ToolBatchReadonlyCallInput]) -> bool {
+    calls
+        .iter()
+        .all(|call| tool_execution_profile(&call.name).prepared_readonly_supported)
+}
+
+fn prepared_leaf_input(prepared: &PreparedToolInvocation) -> &Value {
+    match &prepared.leaf {
+        PreparedReadonlyLeaf::ReadFile(input)
+        | PreparedReadonlyLeaf::GlobSearch(input)
+        | PreparedReadonlyLeaf::GrepSearch(input)
+        | PreparedReadonlyLeaf::WorkspaceSnapshot(input) => input,
+        PreparedReadonlyLeaf::ToolCacheStats => &Value::Null,
+    }
+}
+
+fn execute_prepared_readonly_leaf(prepared: PreparedToolInvocation) -> Result<Value, String> {
+    let output = match prepared.leaf {
+        PreparedReadonlyLeaf::ReadFile(input) => {
+            from_value::<ReadFileInput>(&input).and_then(run_read_file)?
+        }
+        PreparedReadonlyLeaf::GlobSearch(input) => {
+            from_value::<GlobSearchInputValue>(&input).and_then(run_glob_search)?
+        }
+        PreparedReadonlyLeaf::GrepSearch(input) => {
+            from_value::<GrepSearchInput>(&input).and_then(run_grep_search)?
+        }
+        PreparedReadonlyLeaf::WorkspaceSnapshot(input) => {
+            from_value::<WorkspaceSnapshotInput>(&input).and_then(run_workspace_snapshot)?
+        }
+        PreparedReadonlyLeaf::ToolCacheStats => to_pretty_json(tool_cache_stats())?,
+    };
+    Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
 }
 
 fn is_allowed_readonly_batch_tool(name: &str) -> bool {
@@ -1656,6 +1765,9 @@ fn should_skip_snapshot_dir(path: &Path) -> bool {
 struct BatchToolOutput {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(rename = "executionMode")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<String>,
     count: usize,
     #[serde(rename = "successCount")]
     success_count: usize,
@@ -1677,6 +1789,22 @@ struct BatchToolItemOutput {
 }
 
 fn batch_output(kind: &str, results: Vec<BatchToolItemOutput>) -> BatchToolOutput {
+    batch_output_internal(kind, None, results)
+}
+
+fn batch_output_with_mode(
+    kind: &str,
+    execution_mode: &str,
+    results: Vec<BatchToolItemOutput>,
+) -> BatchToolOutput {
+    batch_output_internal(kind, Some(execution_mode.to_string()), results)
+}
+
+fn batch_output_internal(
+    kind: &str,
+    execution_mode: Option<String>,
+    results: Vec<BatchToolItemOutput>,
+) -> BatchToolOutput {
     let success_count = results
         .iter()
         .filter(|item| item.status == "success")
@@ -1684,6 +1812,7 @@ fn batch_output(kind: &str, results: Vec<BatchToolItemOutput>) -> BatchToolOutpu
     let error_count = results.len().saturating_sub(success_count);
     BatchToolOutput {
         kind: kind.to_string(),
+        execution_mode,
         count: results.len(),
         success_count,
         error_count,
@@ -8172,7 +8301,10 @@ mod tests {
         let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats after write");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["invalidations"], 1);
-        assert_eq!(stats_value["entries"], 0);
+        assert_eq!(stats_value["scopeEpochs"], 1);
+        let reread = execute_tool("read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("reread should not use stale cache");
+        assert!(reread.contains("omega"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
@@ -8205,6 +8337,44 @@ mod tests {
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
         runtime::tool_cache::reset_tool_cache_for_tests();
+    }
+
+    #[test]
+    fn auto_checkpoint_can_guard_mutations_when_enabled() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("auto-checkpoint-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        fs::write(root.join("src/lib.rs"), "alpha\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_auto_checkpoint = std::env::var("COWD_AUTO_CHECKPOINT").ok();
+        std::env::set_current_dir(&root).expect("set cwd");
+        std::env::set_var("COWD_AUTO_CHECKPOINT", "1");
+
+        execute_tool(
+            "write_file",
+            &json!({ "path": "src/lib.rs", "content": "omega\n" }),
+        )
+        .expect("write should create checkpoint first");
+        let checkpoints = execute_tool("checkpoint_list", &json!({})).expect("list checkpoints");
+        let value: serde_json::Value = serde_json::from_str(&checkpoints).expect("json");
+        let labels = value["checkpoints"]
+            .as_array()
+            .expect("checkpoints")
+            .iter()
+            .filter_map(|checkpoint| checkpoint["label"].as_str())
+            .collect::<Vec<_>>();
+        assert!(labels
+            .iter()
+            .any(|label| *label == "auto-before-write_file"));
+
+        match original_auto_checkpoint {
+            Some(value) => std::env::set_var("COWD_AUTO_CHECKPOINT", value),
+            None => std::env::remove_var("COWD_AUTO_CHECKPOINT"),
+        }
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8479,6 +8649,7 @@ mod tests {
         .expect("tool_batch_readonly should succeed");
         let value: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_eq!(value["type"], "tool_batch_readonly");
+        assert_eq!(value["executionMode"], "prepared_readonly");
         assert_eq!(value["successCount"], 3);
         assert_eq!(value["errorCount"], 0);
         assert_eq!(value["results"][0]["index"], 0);
@@ -8488,6 +8659,45 @@ mod tests {
         );
         assert_eq!(value["results"][1]["index"], 1);
         assert_eq!(value["results"][2]["index"], 2);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_batch_readonly_falls_back_for_readonly_aggregate_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("tool-batch-readonly-compat-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        fs::write(root.join("src/a.rs"), "alpha\n").expect("write a");
+        fs::write(root.join("src/b.rs"), "beta\n").expect("write b");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "tool_batch_readonly",
+            &json!({
+                "calls": [
+                    {
+                        "name": "read_many",
+                        "input": {
+                            "files": [
+                                { "path": "src/a.rs" },
+                                { "path": "src/b.rs" }
+                            ],
+                            "max_concurrency": 2
+                        }
+                    }
+                ]
+            }),
+        )
+        .expect("tool_batch_readonly should keep aggregate compatibility");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(value["executionMode"], "compat_recursive");
+        assert_eq!(value["successCount"], 1);
+        assert_eq!(value["results"][0]["output"]["type"], "read_many");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);

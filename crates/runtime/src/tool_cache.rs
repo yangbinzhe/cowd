@@ -12,11 +12,15 @@ pub struct ToolCacheStats {
     pub invalidations: usize,
     pub entries: usize,
     pub epoch: u64,
+    #[serde(rename = "scopeEpochs")]
+    pub scope_epochs: usize,
 }
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
     epoch: u64,
+    scope_epoch: u64,
+    scope: String,
     value: String,
 }
 
@@ -27,19 +31,27 @@ struct ToolCacheState {
     misses: usize,
     invalidations: usize,
     entries: HashMap<String, CacheEntry>,
+    scope_epochs: HashMap<String, u64>,
 }
 
 static TOOL_CACHE: OnceLock<Mutex<ToolCacheState>> = OnceLock::new();
 
 #[must_use]
 pub fn get_cached_tool_result(tool_name: &str, input: &str) -> Option<String> {
+    get_cached_tool_result_scoped(tool_name, input, "*")
+}
+
+#[must_use]
+pub fn get_cached_tool_result_scoped(tool_name: &str, input: &str, scope: &str) -> Option<String> {
     let key = cache_key(tool_name, input);
     let mut guard = cache_state().lock().ok()?;
     let epoch = guard.epoch;
+    let scope_epoch = guard.scope_epoch(scope);
     let value = guard
         .entries
         .get(&key)
         .filter(|entry| entry.epoch == epoch)
+        .filter(|entry| entry.scope == scope && entry.scope_epoch == scope_epoch)
         .map(|entry| entry.value.clone());
     if value.is_some() {
         guard.hits += 1;
@@ -50,16 +62,31 @@ pub fn get_cached_tool_result(tool_name: &str, input: &str) -> Option<String> {
 }
 
 pub fn put_cached_tool_result(tool_name: &str, input: &str, value: &str) {
+    put_cached_tool_result_scoped(tool_name, input, "*", value);
+}
+
+pub fn put_cached_tool_result_scoped(tool_name: &str, input: &str, scope: &str, value: &str) {
     let key = cache_key(tool_name, input);
     if let Ok(mut guard) = cache_state().lock() {
         let epoch = guard.epoch;
+        let scope_epoch = guard.scope_epoch(scope);
         guard.entries.insert(
             key,
             CacheEntry {
                 epoch,
+                scope_epoch,
+                scope: scope.to_string(),
                 value: value.to_string(),
             },
         );
+    }
+}
+
+pub fn invalidate_tool_cache_scope(scope: &str) {
+    if let Ok(mut guard) = cache_state().lock() {
+        let next_epoch = guard.scope_epoch(scope).saturating_add(1);
+        guard.scope_epochs.insert(scope.to_string(), next_epoch);
+        guard.invalidations = guard.invalidations.saturating_add(1);
     }
 }
 
@@ -82,6 +109,7 @@ pub fn tool_cache_stats() -> ToolCacheStats {
         invalidations: guard.invalidations,
         entries: guard.entries.len(),
         epoch: guard.epoch,
+        scope_epochs: guard.scope_epochs.len(),
     }
 }
 
@@ -93,6 +121,12 @@ pub fn reset_tool_cache_for_tests() {
 
 fn cache_state() -> &'static Mutex<ToolCacheState> {
     TOOL_CACHE.get_or_init(|| Mutex::new(ToolCacheState::default()))
+}
+
+impl ToolCacheState {
+    fn scope_epoch(&self, scope: &str) -> u64 {
+        self.scope_epochs.get(scope).copied().unwrap_or_default()
+    }
 }
 
 fn cache_key(tool_name: &str, input: &str) -> String {
@@ -127,5 +161,24 @@ mod tests {
         let stats = tool_cache_stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.invalidations, 1);
+    }
+
+    #[test]
+    fn scoped_cache_invalidation_only_expires_matching_scope() {
+        reset_tool_cache_for_tests();
+        put_cached_tool_result_scoped("read_file", r#"{"path":"a"}"#, "file:a", "a");
+        put_cached_tool_result_scoped("read_file", r#"{"path":"b"}"#, "file:b", "b");
+
+        invalidate_tool_cache_scope("file:a");
+
+        assert!(get_cached_tool_result_scoped("read_file", r#"{"path":"a"}"#, "file:a").is_none());
+        assert_eq!(
+            get_cached_tool_result_scoped("read_file", r#"{"path":"b"}"#, "file:b").as_deref(),
+            Some("b")
+        );
+        let stats = tool_cache_stats();
+        assert_eq!(stats.invalidations, 1);
+        assert_eq!(stats.scope_epochs, 1);
+        reset_tool_cache_for_tests();
     }
 }

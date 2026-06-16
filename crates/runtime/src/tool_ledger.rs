@@ -129,6 +129,36 @@ pub struct ToolLedgerFlush {
     pub stats: ToolLedgerStats,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolLedgerToolProjection {
+    pub tool_name: String,
+    pub invocation_count: usize,
+    pub failure_count: usize,
+    pub denied_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolLedgerProjectionEvent {
+    pub sequence: usize,
+    pub kind: ToolLedgerEventKind,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolLedgerProjection {
+    pub session_id: String,
+    pub turn_index: usize,
+    pub event_count: usize,
+    pub duplicate_count: usize,
+    pub failure_count: usize,
+    pub denied_count: usize,
+    pub kind_counts: BTreeMap<String, usize>,
+    pub tools: Vec<ToolLedgerToolProjection>,
+    pub recent_events: Vec<ToolLedgerProjectionEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnToolLedger {
     session_id: String,
@@ -197,6 +227,89 @@ impl TurnToolLedger {
             event_count: self.events.len(),
             duplicate_count: self.duplicate_count,
             kind_counts,
+        }
+    }
+
+    #[must_use]
+    pub fn projection(&self, recent_limit: usize) -> ToolLedgerProjection {
+        let stats = self.stats();
+        let mut tool_counts: BTreeMap<String, ToolLedgerToolProjection> = BTreeMap::new();
+        let mut failure_count = 0usize;
+        let mut denied_count = 0usize;
+
+        for (_, event) in &self.events {
+            match event.kind {
+                ToolLedgerEventKind::InvocationFailed => {
+                    failure_count = failure_count.saturating_add(1);
+                }
+                ToolLedgerEventKind::InvocationDenied => {
+                    denied_count = denied_count.saturating_add(1);
+                }
+                _ => {}
+            }
+
+            let Some(tool_name) = event.tool_name.as_ref() else {
+                continue;
+            };
+            let entry =
+                tool_counts
+                    .entry(tool_name.clone())
+                    .or_insert_with(|| ToolLedgerToolProjection {
+                        tool_name: tool_name.clone(),
+                        invocation_count: 0,
+                        failure_count: 0,
+                        denied_count: 0,
+                    });
+            if matches!(
+                event.kind,
+                ToolLedgerEventKind::InvocationStarted
+                    | ToolLedgerEventKind::InvocationCompleted
+                    | ToolLedgerEventKind::InvocationFailed
+                    | ToolLedgerEventKind::InvocationDenied
+            ) {
+                entry.invocation_count = entry.invocation_count.saturating_add(1);
+            }
+            if event.kind == ToolLedgerEventKind::InvocationFailed {
+                entry.failure_count = entry.failure_count.saturating_add(1);
+            }
+            if event.kind == ToolLedgerEventKind::InvocationDenied {
+                entry.denied_count = entry.denied_count.saturating_add(1);
+            }
+        }
+
+        let mut ordered_events = self.events.clone();
+        ordered_events.sort_by(|left, right| {
+            let left_event = &left.1;
+            let right_event = &right.1;
+            left_event
+                .sequence
+                .cmp(&right_event.sequence)
+                .then(left_event.created_at_ms.cmp(&right_event.created_at_ms))
+                .then(left.0.cmp(&right.0))
+        });
+        let recent_events = ordered_events
+            .into_iter()
+            .rev()
+            .take(recent_limit)
+            .map(|(_, event)| ToolLedgerProjectionEvent {
+                sequence: event.sequence,
+                kind: event.kind,
+                tool_call_id: event.tool_call_id,
+                tool_name: event.tool_name,
+                created_at_ms: event.created_at_ms,
+            })
+            .collect();
+
+        ToolLedgerProjection {
+            session_id: self.session_id.clone(),
+            turn_index: self.turn_index,
+            event_count: stats.event_count,
+            duplicate_count: stats.duplicate_count,
+            failure_count,
+            denied_count,
+            kind_counts: stats.kind_counts,
+            tools: tool_counts.into_values().collect(),
+            recent_events,
         }
     }
 
@@ -315,5 +428,40 @@ mod tests {
         assert_eq!(stats.duplicate_count, 1);
         assert_eq!(stats.kind_counts.get("plan"), Some(&1));
         assert_eq!(stats.kind_counts.get("schedule"), Some(&1));
+    }
+
+    #[test]
+    fn tool_ledger_projection_preserves_runtime_view_fields() {
+        let mut ledger = TurnToolLedger::new("session-1", 9);
+        ledger.append_runtime_event("started", event(1, "tool.invocation.started", 100));
+        ledger.append_runtime_event("failed", event(2, "tool.invocation.failed", 110));
+        ledger.append_runtime_event("denied", event(3, "tool.invocation.denied", 120));
+        ledger.append_runtime_event("denied", event(3, "tool.invocation.denied", 120));
+
+        let projection = ledger.projection(2);
+
+        assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.turn_index, 9);
+        assert_eq!(projection.event_count, 3);
+        assert_eq!(projection.duplicate_count, 1);
+        assert_eq!(projection.failure_count, 1);
+        assert_eq!(projection.denied_count, 1);
+        assert_eq!(projection.kind_counts.get("invocation_started"), Some(&1));
+        assert_eq!(projection.kind_counts.get("invocation_failed"), Some(&1));
+        assert_eq!(projection.kind_counts.get("invocation_denied"), Some(&1));
+        assert_eq!(projection.tools.len(), 1);
+        assert_eq!(projection.tools[0].tool_name, "read_file");
+        assert_eq!(projection.tools[0].invocation_count, 3);
+        assert_eq!(projection.tools[0].failure_count, 1);
+        assert_eq!(projection.tools[0].denied_count, 1);
+        assert_eq!(projection.recent_events.len(), 2);
+        assert_eq!(
+            projection.recent_events[0].kind,
+            ToolLedgerEventKind::InvocationDenied
+        );
+        assert_eq!(
+            projection.recent_events[1].kind,
+            ToolLedgerEventKind::InvocationFailed
+        );
     }
 }
