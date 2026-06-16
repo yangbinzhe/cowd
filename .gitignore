@@ -17,6 +17,7 @@ Thumbs.db
 
 # Node.js dependencies (should be installed via npm, never committed)
 node_modules/
+.vite/
 
 # Playwright test artifacts
 webui/test-results/
