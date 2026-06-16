@@ -491,15 +491,15 @@ impl ChatView {
 
         let visible: Vec<_> = self.visible_main_entries().collect();
         let visible_count = visible.len();
-        let final_assistant_idx = self
-            .timeline
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, entry)| {
-                matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
-                    .then_some(idx)
-            });
+        let final_assistant_idx =
+            self.timeline
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, entry)| {
+                    matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
+                        .then_some(idx)
+                });
         for (visible_idx, (idx, entry)) in visible.into_iter().enumerate() {
             let is_focused = idx == self.timeline_cursor;
             Self::build_entry_with_meta(
@@ -575,7 +575,11 @@ impl ChatView {
             let is_final = pos + 1 == assistant_messages.len();
             let is_focused = *entry_idx == self.timeline_cursor;
             let label = if is_final {
-                if is_focused { "● ╰─ FINAL" } else { "  ╰─ FINAL" }
+                if is_focused {
+                    "● ╰─ FINAL"
+                } else {
+                    "  ╰─ FINAL"
+                }
             } else if is_focused {
                 "● ├─ reply"
             } else {
@@ -729,7 +733,12 @@ impl ChatView {
     }
 
     /// Highlight inline markdown spans in a message line.
-    fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color, theme: &Theme) {
+    fn highlight_line(
+        line: &str,
+        spans: &mut Vec<Span<'static>>,
+        base_color: Color,
+        theme: &Theme,
+    ) {
         let code_color = theme.inline_code_color();
         let mut remaining = line;
         while !remaining.is_empty() {
@@ -948,7 +957,10 @@ impl ChatView {
                     }
                     if is_final_assistant {
                         lines.push(Line::from(vec![
-                            Span::styled("╰─ usage ", Style::default().fg(theme.warn_color()).bold()),
+                            Span::styled(
+                                "╰─ usage ",
+                                Style::default().fg(theme.warn_color()).bold(),
+                            ),
                             Span::styled(
                                 format!(
                                     "in:{} out:{} tools:{} think:{}",
@@ -1718,7 +1730,10 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Hello"), "Expected user message");
         assert!(joined.contains("Hi there!"), "Expected assistant message");
-        assert!(joined.contains("FINAL REPLY"), "Expected final reply marker");
+        assert!(
+            joined.contains("FINAL REPLY"),
+            "Expected final reply marker"
+        );
         assert!(
             !joined.contains("Let me think") && !joined.contains("bash"),
             "Thinking and tools should stay in Process, not main chat: {joined}"

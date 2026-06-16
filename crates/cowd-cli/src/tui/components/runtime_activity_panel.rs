@@ -296,7 +296,9 @@ impl RuntimeActivityPanel {
                         complete: *done,
                     });
                 }
-                TimelineEntry::SlashOutput { command, output, .. } => {
+                TimelineEntry::SlashOutput {
+                    command, output, ..
+                } => {
                     self.recent_process.push(ProcessEvent {
                         kind: ProcessKind::Slash,
                         text: format!("/{command} - {}", preview(output, 96)),
@@ -394,7 +396,13 @@ impl Component for RuntimeActivityPanel {
                 .saturating_sub(lines.len() as u16)
                 .saturating_sub(3)
                 .max(6) as usize;
-            for (idx, item) in self.recent_process.iter().rev().take(remaining_rows).enumerate() {
+            for (idx, item) in self
+                .recent_process
+                .iter()
+                .rev()
+                .take(remaining_rows)
+                .enumerate()
+            {
                 lines.push(process_line(item));
                 if idx + 1 < remaining_rows && matches!(item.kind, ProcessKind::Output) {
                     lines.push(process_separator_line());
@@ -499,12 +507,20 @@ fn process_line(item: &ProcessEvent) -> Line<'static> {
         ProcessKind::Thinking => (
             if item.complete { "◌" } else { "●" },
             "think",
-            if item.complete { Color::DarkGray } else { Color::Yellow },
+            if item.complete {
+                Color::DarkGray
+            } else {
+                Color::Yellow
+            },
         ),
         ProcessKind::Tool => (
             if item.complete { "✓" } else { "⚙" },
             "tool",
-            if item.complete { Color::Green } else { Color::Cyan },
+            if item.complete {
+                Color::Green
+            } else {
+                Color::Cyan
+            },
         ),
         ProcessKind::Output => ("↳", "reply", Color::White),
         ProcessKind::Slash => ("/", "cmd", Color::Magenta),

@@ -98,12 +98,14 @@ describe('Cowd Vue WebUI shell', () => {
     vi.stubGlobal('fetch', fetchMock);
     await api.iaccCreateIncident({ title: 'Line A deviation' });
     await api.iaccAnalyzeIncident('incident-1');
+    await api.iaccSkills();
     await api.iaccGenerateReport('profile-1', { cadence: 'daily' });
     expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ title: 'Line A deviation' }),
     }));
     expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents/incident-1/analyze', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/skills', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/iacc/cockpit/profiles/profile-1/reports/generate', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ report: { cadence: 'daily' } }),

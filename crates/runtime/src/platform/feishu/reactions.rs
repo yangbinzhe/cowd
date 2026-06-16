@@ -9,10 +9,10 @@
 //! and prevent memory leaks from abandoned message IDs.
 
 use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
+use crate::platform::feishu::decode_feishu_response;
 use crate::platform::feishu::types::{
     CreateReactionRequest, CreateReactionResponse, DeleteReactionResponse, ReactionType,
 };
-use crate::platform::feishu::decode_feishu_response;
 use crate::platform::types::{MessageType, Platform, SessionKey};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};

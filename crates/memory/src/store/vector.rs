@@ -99,10 +99,12 @@ impl VectorIndex {
         dimension: u32,
         sqlite_store: Option<SqliteStore>,
     ) -> Result<Self, MemoryError> {
+        let auto_dimension = dimension == 0;
+        let initial_dimension = if auto_dimension { 1536 } else { dimension };
         let mut idx = Self {
             vectors: HashMap::new(),
             persist_path,
-            dimension,
+            dimension: initial_dimension,
             max_entries: 50_000,
             insert_order: VecDeque::new(),
             sqlite_store,
@@ -112,9 +114,12 @@ impl VectorIndex {
             match store.load_vectors_from_sqlite() {
                 Ok(vectors) if !vectors.is_empty() => {
                     let dim = vectors.values().next().map_or(0, |v| v.len() as u32);
-                    if dim != dimension {
+                    if auto_dimension {
+                        idx.dimension = dim;
+                    } else if dim != idx.dimension {
                         return Err(MemoryError::InvalidArgument(format!(
-                            "dimension mismatch: index has {dim}, requested {dimension}"
+                            "dimension mismatch: index has {dim}, requested {}",
+                            idx.dimension
                         )));
                     }
                     idx.vectors = vectors;
@@ -134,7 +139,9 @@ impl VectorIndex {
             Ok(json) => {
                 let snap: IndexSnapshot = serde_json::from_str(&json)
                     .map_err(|e| MemoryError::Store(format!("deserialise vector index: {e}")))?;
-                if snap.dimension != idx.dimension {
+                if auto_dimension {
+                    idx.dimension = snap.dimension;
+                } else if snap.dimension != idx.dimension {
                     return Err(MemoryError::InvalidArgument(format!(
                         "dimension mismatch: index has {}, requested {}",
                         snap.dimension, idx.dimension
@@ -446,6 +453,33 @@ mod tests {
         assert_eq!(idx2.count(), 1);
         let results = idx2.search(&[0.6, 0.8], 1).unwrap();
         assert_eq!(results[0].0, id);
+    }
+
+    #[test]
+    fn load_zero_dimension_reuses_persisted_json_dimension() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("idx.json");
+        let id = MemoryId::new_v4();
+
+        {
+            let mut idx = VectorIndex::new(path.clone(), 1024).unwrap();
+            idx.upsert(id, vec![0.25; 1024]).unwrap();
+            idx.persist().unwrap();
+        }
+
+        let idx2 = VectorIndex::load(path, 0).unwrap();
+        assert_eq!(idx2.dimension, 1024);
+        assert_eq!(idx2.count(), 1);
+    }
+
+    #[test]
+    fn load_zero_dimension_uses_default_for_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("idx.json");
+
+        let idx = VectorIndex::load(path, 0).unwrap();
+        assert_eq!(idx.dimension, 1536);
+        assert_eq!(idx.count(), 0);
     }
 
     #[test]

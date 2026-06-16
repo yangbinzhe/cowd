@@ -28,12 +28,12 @@
 //! Drop the receiver returned by [`FeishuWsClient::connect`]; the background task exits
 //! after the next send attempt fails.
 
+use super::decode_feishu_response;
 use crate::platform::adapter::{PlatformError, PlatformResult};
 use crate::platform::feishu::proto::{
     Frame, Header, FRAME_CONTROL, FRAME_DATA, HEADER_BIZ_RT, HEADER_MESSAGE_ID, HEADER_SEQ,
     HEADER_SUM, HEADER_TYPE, MSG_PING, MSG_PONG,
 };
-use super::decode_feishu_response;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use serde::Deserialize;
@@ -218,8 +218,7 @@ pub async fn register_pin(
             PlatformError::ConnectionFailed(format!("pin register request failed: {e}"))
         })?;
 
-    let body: EndpointResponse =
-        decode_feishu_response(resp, "register pin").await?;
+    let body: EndpointResponse = decode_feishu_response(resp, "register pin").await?;
 
     if body.code != 0 {
         return Err(PlatformError::ConnectionFailed(format!(

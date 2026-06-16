@@ -85,34 +85,40 @@ async fn context_current_handler(
         .unwrap_or(ContextProfile::MainTurn);
 
     if let Some(runtime_entry) = state.active_runtime(&session_id) {
-        let runtime = runtime_entry.lock().await;
-        if let Some(envelope) = runtime.last_context_envelope() {
-            let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
-            let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
-            let mode_coverage = ContextRuntimeKernel::mode_coverage_report(
-                envelope.identity.session_id.clone(),
-                envelope.intent.clone(),
-                envelope.assembled.stable_head.clone(),
-                envelope.selected.clone(),
-                envelope.budget.total_tokens,
+        if let Ok(runtime) = runtime_entry.try_lock() {
+            if let Some(envelope) = runtime.last_context_envelope() {
+                let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
+                let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
+                let mode_coverage = ContextRuntimeKernel::mode_coverage_report(
+                    envelope.identity.session_id.clone(),
+                    envelope.intent.clone(),
+                    envelope.assembled.stable_head.clone(),
+                    envelope.selected.clone(),
+                    envelope.budget.total_tokens,
+                );
+                let cache_stability =
+                    ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
+                let snapshot = ContextRuntimeKernel::snapshot(&envelope);
+                let budget_explanation = ContextRuntimeKernel::budget_explanation(&envelope);
+                let agent_view = context_agent_view_from_params(&params, &envelope);
+                return Json(serde_json::json!({
+                    "enabled": true,
+                    "source": "runtime",
+                    "envelope": envelope,
+                    "lean_probe": lean_probe,
+                    "policy_decision": policy_decision,
+                    "cache_stability": cache_stability,
+                    "mode_coverage": mode_coverage,
+                    "snapshot": snapshot,
+                    "budget_explanation": budget_explanation,
+                    "agent_view": agent_view,
+                }));
+            }
+        } else {
+            tracing::debug!(
+                %session_id,
+                "runtime context envelope skipped because active runtime is busy"
             );
-            let cache_stability =
-                ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
-            let snapshot = ContextRuntimeKernel::snapshot(&envelope);
-            let budget_explanation = ContextRuntimeKernel::budget_explanation(&envelope);
-            let agent_view = context_agent_view_from_params(&params, &envelope);
-            return Json(serde_json::json!({
-                "enabled": true,
-                "source": "runtime",
-                "envelope": envelope,
-                "lean_probe": lean_probe,
-                "policy_decision": policy_decision,
-                "cache_stability": cache_stability,
-                "mode_coverage": mode_coverage,
-                "snapshot": snapshot,
-                "budget_explanation": budget_explanation,
-                "agent_view": agent_view,
-            }));
         }
     }
 

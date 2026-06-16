@@ -4124,9 +4124,8 @@ providers:
         let _ = std::fs::remove_dir_all(invalid_root);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn runtime_control_plane_emits_structured_trace_event() {
-        use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
 
         let root = test_temp_dir("runtime-control-plane-trace");
@@ -4144,9 +4143,8 @@ providers:
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
-        let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state))
-            .with_subscriber(subscriber)
-            .await;
+        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
+        let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
         let lines = capture.lines();
         let joined = lines.join("\n");
@@ -4498,9 +4496,8 @@ providers:
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn session_context_history_emits_structured_trace_events() {
-        use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
 
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
@@ -4527,49 +4524,46 @@ providers:
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
+        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
         let state = test_state_with_store(store);
         let app = api_router(state);
-        async {
-            let history_response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!(
-                            "/api/sessions/{session_id}/context?include_envelopes=false"
-                        ))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(history_response.status(), StatusCode::OK);
-            let history_body = to_bytes(history_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
-            assert_eq!(history_json["session_id"], session_id);
-            assert_eq!(history_json["include_envelopes"], false);
-            assert_eq!(history_json["total"], 1);
-            assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
+        let history_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?include_envelopes=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_body = to_bytes(history_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+        assert_eq!(history_json["session_id"], session_id);
+        assert_eq!(history_json["include_envelopes"], false);
+        assert_eq!(history_json["total"], 1);
+        assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
 
-            let detail_response = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/api/context/env-log-1")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(detail_response.status(), StatusCode::OK);
-            let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
-            assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
-        }
-        .with_subscriber(subscriber)
-        .await;
+        let detail_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/env-log-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
 
         let lines = capture.lines();
         let joined = lines.join("\n");

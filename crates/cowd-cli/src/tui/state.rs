@@ -4560,7 +4560,8 @@ providers:
         assert!(joined.contains("Memory"));
         assert!(joined.contains("topic panel"));
         assert!(joined.contains("Input"));
-        assert!(joined.contains("focus:memory"));
+        assert!(joined.contains("Enter detail"));
+        assert!(!joined.contains("focus:memory"));
     }
 
     #[test]

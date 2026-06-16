@@ -35,12 +35,19 @@ impl SystemStatusBar {
         self.runtime = runtime_health(app).to_string();
         self.turn = if app.turn_active {
             if app.timeline_iter().any(|(_, entry)| {
-                matches!(entry, TimelineEntry::Thinking { complete: false, .. })
+                matches!(
+                    entry,
+                    TimelineEntry::Thinking {
+                        complete: false,
+                        ..
+                    }
+                )
             }) {
                 "thinking".to_string()
-            } else if app.timeline_iter().any(|(_, entry)| {
-                matches!(entry, TimelineEntry::ToolCall { done: false, .. })
-            }) {
+            } else if app
+                .timeline_iter()
+                .any(|(_, entry)| matches!(entry, TimelineEntry::ToolCall { done: false, .. }))
+            {
                 "tool".to_string()
             } else {
                 "running".to_string()
@@ -55,7 +62,12 @@ impl SystemStatusBar {
         for (_, entry) in app.timeline_iter() {
             match entry {
                 TimelineEntry::Thinking { complete, .. } => {
-                    self.last_phase = if *complete { "thought saved" } else { "thinking" }.into();
+                    self.last_phase = if *complete {
+                        "thought saved"
+                    } else {
+                        "thinking"
+                    }
+                    .into();
                 }
                 TimelineEntry::ToolCall { name, done, .. } => {
                     self.tool_count += 1;

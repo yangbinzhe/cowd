@@ -353,6 +353,7 @@ export const api = {
   iaccChanges: () => read('/api/iacc/changes', {}),
   iaccAttentionHot: () => read('/api/iacc/attention/hot', {}),
   iaccIncidents: () => read('/api/iacc/incidents', {}),
+  iaccSkills: () => read('/api/iacc/skills', {}),
   iaccCreateIncident: (body: Record<string, unknown>) => write('/api/iacc/incidents', {
     method: 'POST',
     body: JSON.stringify(body),
