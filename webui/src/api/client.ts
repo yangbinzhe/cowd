@@ -350,7 +350,13 @@ export const api = {
     body: JSON.stringify({ result, completed }),
   }),
   agentCatalog: () => read('/api/agents/catalog', { agents: [], summary: {} }),
+  agentDirectory: () => read('/api/agents/directory', { agents: [], summary: {} }),
   agentDiscover: (task: string) => read(`/api/agents/discover?task=${encodeURIComponent(task)}`, { agents: [], team: null }),
+  agentAssemble: (task: string) => write('/api/agents/assemble', {
+    method: 'POST',
+    body: JSON.stringify({ task }),
+  }),
+  agentReputation: () => read('/api/agents/reputation', { items: [], summary: {} }),
   agentRuns: () => read('/api/agents/runs', { runs: [] }),
   taskAgentGraph: (id: string) => read(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, { nodes: [] }),
   upsertTaskAgentGraph: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, {

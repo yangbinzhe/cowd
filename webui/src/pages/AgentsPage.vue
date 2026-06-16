@@ -10,7 +10,9 @@ import StatusPill from '../components/workbench/StatusPill.vue';
 const loading = ref(false);
 const error = ref('');
 const catalog = ref<any>({});
+const directory = ref<any>({});
 const discovery = ref<any>({});
+const reputation = ref<any>({});
 const runs = ref<any>({});
 const tasks = ref<any>({});
 const graph = ref<any>({});
@@ -25,7 +27,7 @@ const artifactValue = ref('');
 const reviewResult = ref('');
 const failureReason = ref('');
 
-const agentRows = computed(() => (Array.isArray(catalog.value?.agents) ? catalog.value.agents : []).map((agent: any) => ({
+const agentRows = computed(() => (Array.isArray(directory.value?.agents) ? directory.value.agents : Array.isArray(catalog.value?.agents) ? catalog.value.agents : []).map((agent: any) => ({
   name: agent.name,
   active: agent.active,
   source: agent.source?.id || agent.source || '-',
@@ -44,20 +46,27 @@ const phaseItems = computed(() => Array.isArray(selectedTask.value?.phases) ? se
 const currentPhase = computed(() => phaseItems.value.find((phase: any) => phase.id === selectedTask.value?.current_phase) || phaseItems.value[0] || null);
 const graphNodes = computed(() => Array.isArray(graph.value?.nodes) ? graph.value.nodes : []);
 const runItems = computed(() => Array.isArray(runs.value?.runs) ? runs.value.runs : []);
+const reputationRows = computed(() => (Array.isArray(reputation.value?.items) ? reputation.value.items : []).map((item: any) => ({
+  agent_id: item.agent_id || item.name || '-',
+  reputation: item.reputation ?? '-',
+  status: item.status ?? '-',
+})));
 const openTasks = computed(() => taskItems.value.filter((task: any) => !['completed', 'cancelled'].includes(String(task.status))).length);
 
 async function refresh() {
   loading.value = true;
   error.value = '';
   try {
-    const [nextCatalog, nextDiscovery, nextRuns, nextTasks] = await Promise.all([
+    const [nextCatalog, nextDirectory, nextReputation, nextRuns, nextTasks] = await Promise.all([
       api.agentCatalog(),
-      api.agentDiscover(discoverQuery.value),
+      api.agentDirectory(),
+      api.agentReputation(),
       api.agentRuns(),
       api.tasks(),
     ]);
     catalog.value = nextCatalog;
-    discovery.value = nextDiscovery;
+    directory.value = nextDirectory;
+    reputation.value = nextReputation;
     runs.value = nextRuns;
     tasks.value = nextTasks;
     if (!selectedTaskId.value) {
@@ -154,7 +163,7 @@ async function discoverAgents() {
     error.value = 'Task description is required before discovering agents.';
     return;
   }
-  discovery.value = await api.agentDiscover(discoverQuery.value);
+  discovery.value = await api.agentAssemble(discoverQuery.value);
 }
 
 async function upsertGraphTemplate() {
@@ -254,7 +263,7 @@ onMounted(refresh);
     <section class="agents-workbench-grid">
       <section class="management-panel agents-panel" data-section="catalog">
         <header>
-          <h2>Agent catalog</h2>
+          <h2>Agent directory</h2>
           <span>{{ agentRows.length }} definitions</span>
         </header>
         <DataTable v-if="agentRows.length" :rows="agentRows" :columns="['name', 'active', 'source', 'model', 'description']" />
@@ -270,10 +279,11 @@ onMounted(refresh);
           <Search :size="15" />
           <input v-model="discoverQuery" type="search" placeholder="Task for team discovery" @keyup.enter="discoverAgents" />
         </label>
-        <button class="primary-action" type="button" @click="discoverAgents">Discover agents</button>
+        <button class="primary-action" type="button" @click="discoverAgents">Assemble team</button>
         <DataTable v-if="discoveredRows.length" :rows="discoveredRows" :columns="['agent_id', 'role', 'reputation', 'status']" />
         <EmptyState v-else title="No matching team" detail="发现协议没有找到满足任务描述的 agent。" />
         <RawPayload title="Auto assembled team" :data="discovery.team || {}" />
+        <DataTable v-if="reputationRows.length" :rows="reputationRows" :columns="['agent_id', 'reputation', 'status']" />
       </section>
 
       <section class="management-panel agents-panel wide" data-section="tasks">

@@ -272,7 +272,8 @@ describe('Cowd Vue WebUI shell', () => {
       if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
       if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
       if (url === '/api/agents/catalog') return Promise.resolve(new Response(JSON.stringify({ summary: { total: 1, active: 1 }, agents: [{ name: 'planner', active: true, source: { id: 'project_cowd' }, description: 'Plans work' }] })));
-      if (url.startsWith('/api/agents/discover')) return Promise.resolve(new Response(JSON.stringify({ count: 1, agents: [{ agent_id: 'planner', role: 'planner', status: 'Online' }], team: { leader: { agent_id: 'planner', role: 'planner' }, workers: [] } })));
+      if (url === '/api/agents/directory') return Promise.resolve(new Response(JSON.stringify({ summary: { total: 1, active: 1 }, agents: [{ name: 'planner', active: true, source: { id: 'project_cowd' }, description: 'Plans work' }] })));
+      if (url === '/api/agents/reputation') return Promise.resolve(new Response(JSON.stringify({ items: [{ agent_id: 'planner', reputation: 91, status: 'active' }] })));
       if (url === '/api/agents/runs') return Promise.resolve(new Response(JSON.stringify({ runs: [{ graph_id: 'agent-graph-task-1' }] })));
       if (url === '/api/tasks') return Promise.resolve(new Response(JSON.stringify({ current: { id: 'task-1', objective: 'Ship UI', status: 'open', phases: [] }, tasks: [{ id: 'task-1', objective: 'Ship UI', status: 'open', phases: [] }] })));
       if (url === '/api/tasks/task-1/agent-graph') return Promise.resolve(new Response(JSON.stringify({ status: 'running', nodes: [{ id: 'planner', title: 'Plan', role: 'planner', status: 'ready', objective: 'Ship UI', depends_on: [] }] })));
@@ -283,11 +284,23 @@ describe('Cowd Vue WebUI shell', () => {
     await settleAsync();
     await settleAsync();
     expect(wrapper.text()).toContain('Agents Workbench');
-    expect(wrapper.text()).toContain('Agent catalog');
+    expect(wrapper.text()).toContain('Agent directory');
     expect(wrapper.text()).toContain('Discover team');
     expect(wrapper.text()).toContain('Task control');
     expect(wrapper.text()).toContain('Agent execution graph');
     expect(fetchMock).toHaveBeenCalledWith('/api/agents/catalog', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/directory', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/reputation', expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith('/api/tasks/task-1/agent-graph', expect.any(Object));
+  });
+
+  it('posts agent assemble requests through the backend contract', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'agents.assemble', team: {} }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.agentAssemble('build a review team');
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/assemble', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ task: 'build a review team' }),
+    }));
   });
 });

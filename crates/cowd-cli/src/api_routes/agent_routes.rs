@@ -4,18 +4,22 @@ use axum::{
     extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use runtime::{AgentRunGraph, AgentTaskNode};
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/agents/catalog", get(agent_catalog_handler))
+        .route("/api/agents/directory", get(agent_directory_handler))
         .route("/api/agents/discover", get(agent_discover_handler))
+        .route("/api/agents/assemble", post(agent_assemble_handler))
+        .route("/api/agents/reputation", get(agent_reputation_handler))
         .route("/api/agents/runs", get(agent_runs_handler))
         .route(
             "/api/tasks/:id/agent-graph",
@@ -37,12 +41,36 @@ struct AgentDiscoverQuery {
     task: String,
 }
 
+#[derive(Deserialize)]
+struct AgentAssembleRequest {
+    #[serde(default)]
+    task: String,
+}
+
 async fn agent_catalog_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn agent_directory_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let catalog = commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let agents = catalog
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "kind": "agents.directory",
+        "agents": agents,
+        "summary": catalog.get("summary").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "source": "agents.catalog",
+    })))
 }
 
 async fn agent_discover_handler(
@@ -59,6 +87,59 @@ async fn agent_discover_handler(
     )
     .map(Json)
     .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn agent_assemble_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<AgentAssembleRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = body.task.trim();
+    if task.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "task is required"));
+    }
+    let discovery = commands::handle_agents_slash_command_json(
+        Some(&format!("discover {task}")),
+        &state.workspace_root,
+    )
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "agents.assemble",
+        "task": task,
+        "agents": discovery.get("agents").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "team": discovery.get("team").cloned().unwrap_or_else(|| serde_json::json!(null)),
+        "source": "agents.discover",
+    })))
+}
+
+async fn agent_reputation_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let catalog = commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let agents = catalog
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let reputation: Vec<Value> = agents
+        .iter()
+        .map(|agent| {
+            serde_json::json!({
+                "agent_id": agent.get("id").or_else(|| agent.get("name")).cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+                "name": agent.get("name").cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+                "reputation": agent.get("reputation").cloned().unwrap_or_else(|| serde_json::json!(null)),
+                "status": agent.get("status").or_else(|| agent.get("active")).cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "kind": "agents.reputation",
+        "items": reputation,
+        "summary": {
+            "total": agents.len(),
+            "scored": reputation.iter().filter(|item| !item.get("reputation").unwrap_or(&Value::Null).is_null()).count(),
+        },
+    })))
 }
 
 async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

@@ -91,9 +91,10 @@ test('skills agents and tools pages expose lifecycle workbenches', async ({ page
 
   await page.goto('/index.html#/agents');
   await expect(page.getByRole('heading', { name: 'Agents Workbench' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Agent catalog' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Agent directory' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Discover team' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Task control' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Assemble team' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Start task' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Phase gate' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Agent execution graph' })).toBeVisible();
