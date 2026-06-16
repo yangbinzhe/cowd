@@ -1687,6 +1687,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_routes_alias_iacc_structured_fact_engine() {
+        let workspace = test_temp_dir("matrix-foundation");
+        let config_home = test_temp_dir("matrix-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let matrix_health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/matrix/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let iacc_health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matrix_health.status(), StatusCode::OK);
+        assert_eq!(iacc_health.status(), StatusCode::OK);
+        let matrix_health_body = to_bytes(matrix_health.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let iacc_health_body = to_bytes(iacc_health.into_body(), usize::MAX).await.unwrap();
+        let matrix_health_json: serde_json::Value =
+            serde_json::from_slice(&matrix_health_body).unwrap();
+        let iacc_health_json: serde_json::Value =
+            serde_json::from_slice(&iacc_health_body).unwrap();
+        assert_eq!(matrix_health_json, iacc_health_json);
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/matrix/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "matrix-test-1",
+                            "session_id": "session-matrix",
+                            "facts": [{
+                                "fact_id": "fact-matrix-gpu-shortage",
+                                "snapshot_id": "snapshot-week-24",
+                                "fact_type": "supply.material_shortage",
+                                "entity_refs": ["component:gpu-a"],
+                                "metric_key": "material_shortage_risk",
+                                "dimensions": {"week": "2026-W24"},
+                                "measures": {"short_qty": 42},
+                                "source_ref": "connector:mock.docs:gpu-shortage",
+                                "confidence": 0.91
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+        let body = to_bytes(ingest.into_body(), usize::MAX).await.unwrap();
+        let ingest_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ingest_json["ingested"], 1);
+        let attention_id = ingest_json["attention"][0]["attention_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/matrix/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "attention_id": attention_id,
+                            "problem_statement": "Matrix evidence should share IACC compatibility storage"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let packet_id = evidence_json["packet"]["packet_id"].as_str().unwrap();
+
+        let fetched = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/matrix/evidence/{packet_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        assert!(workspace.join(".cowd").join("iacc.sqlite").exists());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn iacc_fact_and_evidence_append_execution_outcomes_to_runtime_timeline() {
         let workspace = test_temp_dir("iacc-outcome-timeline");
         let config_home = test_temp_dir("iacc-outcome-config");

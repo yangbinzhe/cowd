@@ -35,6 +35,7 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(matrix_kernel_router())
         .route("/api/iacc/app", get(iacc_app_handler))
         .route("/api/iacc/health", get(iacc_health_handler))
         .route(
@@ -283,6 +284,139 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/executions/:id/feedback",
             post(iacc_execution_feedback_handler),
+        )
+}
+
+fn matrix_kernel_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/matrix/health", get(iacc_health_handler))
+        .route(
+            "/api/matrix/data-plane/health",
+            get(iacc_data_plane_health_handler),
+        )
+        .route(
+            "/api/matrix/data-plane/ingest-plan",
+            post(iacc_data_plane_ingest_plan_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/upsert",
+            post(iacc_source_pack_upsert_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id",
+            get(iacc_source_pack_get_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/validate",
+            post(iacc_source_pack_validate_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/ingest-file",
+            post(iacc_source_pack_ingest_file_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/delta-plan",
+            post(iacc_source_pack_delta_plan_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/connector-runs/plan",
+            post(iacc_source_pack_connector_run_plan_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/connector-runs/run",
+            post(iacc_source_pack_connector_run_execute_handler),
+        )
+        .route(
+            "/api/matrix/connector-runs/:id",
+            get(iacc_connector_run_get_handler),
+        )
+        .route("/api/matrix/entities", get(iacc_entities_handler))
+        .route(
+            "/api/matrix/entities/upsert",
+            post(iacc_entity_upsert_handler),
+        )
+        .route(
+            "/api/matrix/entities/resolve-source-key",
+            post(iacc_entity_resolve_source_key_handler),
+        )
+        .route(
+            "/api/matrix/entities/match-candidate",
+            post(iacc_entity_match_candidate_handler),
+        )
+        .route(
+            "/api/matrix/entities/conflict-decision",
+            post(iacc_entity_conflict_decision_handler),
+        )
+        .route("/api/matrix/entities/:id", get(iacc_entity_get_handler))
+        .route(
+            "/api/matrix/entities/:id/relations",
+            get(iacc_entity_relations_handler),
+        )
+        .route(
+            "/api/matrix/entities/:id/impact-path",
+            get(iacc_entity_impact_path_handler),
+        )
+        .route(
+            "/api/matrix/relations/upsert",
+            post(iacc_relation_upsert_handler),
+        )
+        .route("/api/matrix/facts/ingest", post(iacc_fact_ingest_handler))
+        .route("/api/matrix/metrics", get(iacc_metrics_handler))
+        .route("/api/matrix/metrics/:id", get(iacc_metric_detail_handler))
+        .route(
+            "/api/matrix/metrics/:id/lineage",
+            get(iacc_metric_lineage_handler),
+        )
+        .route(
+            "/api/matrix/metrics/attention-plan",
+            post(iacc_metric_attention_plan_handler),
+        )
+        .route(
+            "/api/matrix/metrics/snapshots/materialize",
+            post(iacc_metric_snapshot_materialize_handler),
+        )
+        .route(
+            "/api/matrix/metrics/recompute",
+            post(iacc_metric_recompute_handler),
+        )
+        .route(
+            "/api/matrix/metric-dependencies/upsert",
+            post(iacc_metric_dependency_upsert_handler),
+        )
+        .route(
+            "/api/matrix/metric-dependencies/affected-by-fact-type",
+            post(iacc_metric_affected_by_fact_type_handler),
+        )
+        .route(
+            "/api/matrix/compute/jobs/plan",
+            post(iacc_compute_job_plan_handler),
+        )
+        .route(
+            "/api/matrix/compute/jobs/:id",
+            get(iacc_compute_job_get_handler),
+        )
+        .route(
+            "/api/matrix/compute/jobs/:id/run",
+            post(iacc_compute_job_run_handler),
+        )
+        .route("/api/matrix/changes", get(iacc_changes_handler))
+        .route("/api/matrix/attention/hot", get(iacc_attention_hot_handler))
+        .route(
+            "/api/matrix/evidence/build",
+            post(iacc_evidence_build_handler),
+        )
+        .route("/api/matrix/evidence/:id", get(iacc_evidence_get_handler))
+        .route(
+            "/api/matrix/evidence/:id/quality-gate",
+            post(iacc_evidence_quality_gate_handler),
+        )
+        .route(
+            "/api/matrix/evidence/:id/context",
+            get(iacc_evidence_context_handler),
+        )
+        .route(
+            "/api/matrix/quality-gates/:id",
+            get(iacc_quality_gate_get_handler),
         )
 }
 
