@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
@@ -12,19 +14,25 @@ use api::{
 use base64::Engine;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash,
+    check_freshness, checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore,
+    dedupe_superseded_commit_events, edit_file, execute_bash,
     gates::{GateContext, GateEvaluator},
     glob_search, grep_search, load_system_prompt,
+    mutation_plan::{apply_mutations, preview_mutations},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
+    tool_cache::{
+        get_cached_tool_result, invalidate_tool_cache, put_cached_tool_result, tool_cache_stats,
+    },
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, SharedPrompter, TaskPacket,
-    ToolError, ToolExecutor,
+    BranchFreshness, CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
+    ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
+    LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, MutationApplyInput, MutationPreviewInput,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError, Session, SharedPrompter,
+    TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,6 +121,10 @@ pub(crate) fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(run_read_file)
         }
+        "read_many" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReadManyInput>(input).and_then(|parsed| run_read_many(enforcer, parsed))
+        }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WriteFileInput>(input).and_then(run_write_file)
@@ -121,13 +133,58 @@ pub(crate) fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(run_edit_file)
         }
+        "mutation_preview" | "edit_many_preview" | "patch_plan" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<MutationPreviewInput>(input).and_then(run_mutation_preview)
+        }
+        "apply_patch_transaction" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<MutationApplyInput>(input).and_then(run_apply_patch_transaction)
+        }
+        "checkpoint_create" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<CheckpointCreateInput>(input).and_then(run_checkpoint_create)
+        }
+        "checkpoint_list" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            run_checkpoint_list()
+        }
+        "checkpoint_diff" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<CheckpointDiffInput>(input).and_then(run_checkpoint_diff)
+        }
+        "checkpoint_restore" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<CheckpointRestoreInput>(input).and_then(run_checkpoint_restore)
+        }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
         }
+        "glob_many" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GlobManyInput>(input).and_then(|parsed| run_glob_many(enforcer, parsed))
+        }
         "grep_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
+        }
+        "grep_many" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(enforcer, parsed))
+        }
+        "workspace_snapshot" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WorkspaceSnapshotInput>(input).and_then(run_workspace_snapshot)
+        }
+        "tool_batch_readonly" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ToolBatchReadonlyInput>(input)
+                .and_then(|parsed| run_tool_batch_readonly(enforcer, gate_evaluator, parsed))
+        }
+        "tool_cache_stats" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            to_pretty_json(tool_cache_stats())
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
@@ -1164,17 +1221,38 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let fingerprint = file_fingerprint(&input.path);
+    cached_json_tool("read_file", &input, &fingerprint, || {
+        read_file(&input.path, input.offset, input.limit).map_err(io_to_string)
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_many(
+    enforcer: Option<&PermissionEnforcer>,
+    input: ReadManyInput,
+) -> Result<String, String> {
+    let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
+        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
+        maybe_enforce_permission_check(enforcer, "read_file", &value)?;
+        serde_json::to_value(read_file(&item.path, item.offset, item.limit).map_err(io_to_string)?)
+            .map_err(|error| error.to_string())
+    });
+    to_pretty_json(batch_output("read_many", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let output = to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?);
+    if output.is_ok() {
+        invalidate_tool_cache();
+    }
+    output
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
+    let output = to_pretty_json(
         edit_file(
             &input.path,
             &input.old_string,
@@ -1182,17 +1260,515 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
             input.replace_all.unwrap_or(false),
         )
         .map_err(io_to_string)?,
-    )
+    );
+    if output.is_ok() {
+        invalidate_tool_cache();
+    }
+    output
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_mutation_preview(input: MutationPreviewInput) -> Result<String, String> {
+    to_pretty_json(preview_mutations(input).map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_apply_patch_transaction(input: MutationApplyInput) -> Result<String, String> {
+    let output = to_pretty_json(apply_mutations(input).map_err(io_to_string)?);
+    if output.is_ok() {
+        invalidate_tool_cache();
+    }
+    output
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_checkpoint_create(input: CheckpointCreateInput) -> Result<String, String> {
+    to_pretty_json(checkpoint_create(input).map_err(io_to_string)?)
+}
+
+fn run_checkpoint_list() -> Result<String, String> {
+    to_pretty_json(checkpoint_list().map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_checkpoint_diff(input: CheckpointDiffInput) -> Result<String, String> {
+    to_pretty_json(checkpoint_diff(input).map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_checkpoint_restore(input: CheckpointRestoreInput) -> Result<String, String> {
+    let output = to_pretty_json(checkpoint_restore(input).map_err(io_to_string)?);
+    if output.is_ok() {
+        invalidate_tool_cache();
+    }
+    output
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+    let fingerprint = scope_fingerprint(input.path.as_deref());
+    cached_json_tool("glob_search", &input, &fingerprint, || {
+        glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_glob_many(
+    enforcer: Option<&PermissionEnforcer>,
+    input: GlobManyInput,
+) -> Result<String, String> {
+    let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
+        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
+        maybe_enforce_permission_check(enforcer, "glob_search", &value)?;
+        serde_json::to_value(
+            glob_search(&item.pattern, item.path.as_deref()).map_err(io_to_string)?,
+        )
+        .map_err(|error| error.to_string())
+    });
+    to_pretty_json(batch_output("glob_many", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+    let fingerprint = scope_fingerprint(input.path.as_deref());
+    cached_json_tool("grep_search", &input, &fingerprint, || {
+        grep_search(&input).map_err(io_to_string)
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_grep_many(
+    enforcer: Option<&PermissionEnforcer>,
+    input: GrepManyInput,
+) -> Result<String, String> {
+    let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
+        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
+        maybe_enforce_permission_check(enforcer, "grep_search", &value)?;
+        serde_json::to_value(grep_search(&item).map_err(io_to_string)?)
+            .map_err(|error| error.to_string())
+    });
+    to_pretty_json(batch_output("grep_many", results))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_workspace_snapshot(input: WorkspaceSnapshotInput) -> Result<String, String> {
+    let snapshot_input = input.clone();
+    let fingerprint = workspace_snapshot_fingerprint(&input);
+    cached_json_tool("workspace_snapshot", &input, &fingerprint, || {
+        workspace_snapshot_value(snapshot_input)
+    })
+}
+
+fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, String> {
+    let include_git = input.include_git.unwrap_or(true);
+    let include_files = input.include_files.unwrap_or(true);
+    let max_files = input.max_files.unwrap_or(500).clamp(1, 5000);
+    let cwd = std::env::current_dir().map_err(io_to_string)?;
+
+    let git = if include_git {
+        Some(json!({
+            "branch": git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"]),
+            "status": git_stdout(&["status", "--short", "--branch"]),
+            "head": git_stdout(&["rev-parse", "--short", "HEAD"])
+        }))
+    } else {
+        None
+    };
+
+    let files = if include_files {
+        let roots = input.roots.unwrap_or_else(|| vec![String::from(".")]);
+        let mut files = Vec::new();
+        for root in roots {
+            if files.len() >= max_files {
+                break;
+            }
+            let root_path = if Path::new(&root).is_absolute() {
+                PathBuf::from(root)
+            } else {
+                cwd.join(root)
+            };
+            collect_snapshot_files(&root_path, max_files, &mut files);
+        }
+        files.sort();
+        files.dedup();
+        files.truncate(max_files);
+        Some(files)
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "type": "workspace_snapshot",
+        "cwd": cwd.to_string_lossy(),
+        "git": git,
+        "files": files,
+        "maxFiles": max_files
+    }))
+}
+
+fn cached_json_tool<T, F, O>(
+    tool_name: &str,
+    input: &T,
+    fingerprint: &str,
+    operation: F,
+) -> Result<String, String>
+where
+    T: Serialize,
+    F: FnOnce() -> Result<O, String>,
+    O: Serialize,
+{
+    const UNCACHEABLE_FINGERPRINT: &str = "uncacheable";
+    let input_json = serde_json::to_string(input).map_err(|error| error.to_string())?;
+    if fingerprint == UNCACHEABLE_FINGERPRINT {
+        return to_pretty_json(operation()?);
+    }
+    let cache_input = format!("{input_json}::fingerprint::{fingerprint}");
+    if let Some(cached) = get_cached_tool_result(tool_name, &cache_input) {
+        return Ok(cached);
+    }
+    let output = to_pretty_json(operation()?)?;
+    put_cached_tool_result(tool_name, &cache_input, &output);
+    Ok(output)
+}
+
+fn file_fingerprint(path: &str) -> String {
+    let resolved = absolutize_path(path);
+    let content_hash = match std::fs::File::open(&resolved) {
+        Ok(mut file) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break format!("{:016x}", hasher.finish()),
+                    Ok(read) => buffer[..read].hash(&mut hasher),
+                    Err(_) => break String::from("unreadable"),
+                }
+            }
+        }
+        Err(_) => String::from("missing"),
+    };
+    let Ok(metadata) = std::fs::metadata(&resolved) else {
+        return format!("missing:{}", resolved.to_string_lossy());
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "file:{}:{}:{}",
+        resolved.to_string_lossy(),
+        metadata.len(),
+        modified
+    ) + &format!(":{content_hash}")
+}
+
+fn scope_fingerprint(path: Option<&str>) -> String {
+    let root = path
+        .map(absolutize_path)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.to_string_lossy().hash(&mut hasher);
+    let complete = hash_path_scope(&root, &mut hasher, &mut 0usize);
+    if !complete {
+        return String::from("uncacheable");
+    }
+    format!("scope:{:016x}", hasher.finish())
+}
+
+fn workspace_snapshot_fingerprint(input: &WorkspaceSnapshotInput) -> String {
+    let mut parts = Vec::new();
+    if input.include_git.unwrap_or(true) {
+        parts.push(git_stdout(&["rev-parse", "HEAD"]).unwrap_or_default());
+        parts.push(git_stdout(&["status", "--short"]).unwrap_or_default());
+    }
+    if input.include_files.unwrap_or(true) {
+        let roots = input
+            .roots
+            .clone()
+            .unwrap_or_else(|| vec![String::from(".")]);
+        for root in roots {
+            parts.push(scope_fingerprint(Some(&root)));
+        }
+    }
+    parts.join("\n")
+}
+
+fn absolutize_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn hash_path_scope(
+    root: &Path,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    seen: &mut usize,
+) -> bool {
+    const MAX_FINGERPRINT_FILES: usize = 2048;
+    if *seen >= MAX_FINGERPRINT_FILES || should_skip_cache_fingerprint(root) {
+        return *seen < MAX_FINGERPRINT_FILES;
+    }
+    let Ok(metadata) = std::fs::metadata(root) else {
+        "missing".hash(hasher);
+        root.to_string_lossy().hash(hasher);
+        return true;
+    };
+    root.to_string_lossy().hash(hasher);
+    metadata.len().hash(hasher);
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+        .hash(hasher);
+    if metadata.is_file() {
+        if let Ok(mut file) = std::fs::File::open(root) {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => buffer[..read].hash(hasher),
+                    Err(_) => {
+                        "unreadable".hash(hasher);
+                        break;
+                    }
+                }
+            }
+        }
+        *seen += 1;
+        return *seen <= MAX_FINGERPRINT_FILES;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true;
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        if !hash_path_scope(&path, hasher, seen) {
+            return false;
+        }
+        if *seen >= MAX_FINGERPRINT_FILES {
+            return false;
+        }
+    }
+    true
+}
+
+fn should_skip_cache_fingerprint(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                ".git" | ".cowd" | "target" | "node_modules" | "dist" | "build" | ".cache"
+            )
+        })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_tool_batch_readonly(
+    enforcer: Option<&PermissionEnforcer>,
+    gate_evaluator: Option<&GateEvaluator>,
+    input: ToolBatchReadonlyInput,
+) -> Result<String, String> {
+    for call in &input.calls {
+        if !is_allowed_readonly_batch_tool(&call.name) {
+            return Err(format!(
+                "tool_batch_readonly only accepts approved read-only tools; `{}` is not allowed",
+                call.name
+            ));
+        }
+    }
+
+    let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
+        let output = execute_tool_with_enforcer(enforcer, gate_evaluator, &call.name, &call.input)?;
+        Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
+    });
+    to_pretty_json(batch_output("tool_batch_readonly", results))
+}
+
+fn is_allowed_readonly_batch_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_many"
+            | "glob_search"
+            | "glob_many"
+            | "grep_search"
+            | "grep_many"
+            | "workspace_snapshot"
+            | "tool_cache_stats"
+            | "mutation_preview"
+            | "edit_many_preview"
+            | "patch_plan"
+    ) && runtime::tool_orchestrator::ToolSafetyRegistry::global().classify(name)
+        == runtime::tool_orchestrator::ToolSafetyCategory::ReadOnly
+}
+
+fn collect_snapshot_files(root: &Path, max_files: usize, files: &mut Vec<String>) {
+    if files.len() >= max_files {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return;
+    };
+    if metadata.is_file() {
+        files.push(root.to_string_lossy().into_owned());
+        return;
+    }
+    if !metadata.is_dir() || should_skip_snapshot_dir(root) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= max_files {
+            break;
+        }
+        collect_snapshot_files(&entry.path(), max_files, files);
+    }
+}
+
+fn should_skip_snapshot_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                ".git" | "target" | "node_modules" | "dist" | "build" | ".cache" | "coverage"
+            )
+        })
+}
+
+#[derive(Debug, Serialize)]
+struct BatchToolOutput {
+    #[serde(rename = "type")]
+    kind: String,
+    count: usize,
+    #[serde(rename = "successCount")]
+    success_count: usize,
+    #[serde(rename = "errorCount")]
+    error_count: usize,
+    #[serde(rename = "partialSuccess")]
+    partial_success: bool,
+    results: Vec<BatchToolItemOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchToolItemOutput {
+    index: usize,
+    status: String,
+    #[serde(rename = "durationMs")]
+    duration_ms: u128,
+    output: Option<Value>,
+    error: Option<String>,
+}
+
+fn batch_output(kind: &str, results: Vec<BatchToolItemOutput>) -> BatchToolOutput {
+    let success_count = results
+        .iter()
+        .filter(|item| item.status == "success")
+        .count();
+    let error_count = results.len().saturating_sub(success_count);
+    BatchToolOutput {
+        kind: kind.to_string(),
+        count: results.len(),
+        success_count,
+        error_count,
+        partial_success: success_count > 0 && error_count > 0,
+        results,
+    }
+}
+
+fn run_ordered_batch<T, F>(
+    items: Vec<T>,
+    max_concurrency: Option<usize>,
+    operation: F,
+) -> Vec<BatchToolItemOutput>
+where
+    T: Clone + Send,
+    F: Fn(T) -> Result<Value, String> + Sync,
+{
+    let concurrency = max_concurrency.unwrap_or(8).clamp(1, 32);
+    let mut results: Vec<Option<BatchToolItemOutput>> =
+        std::iter::repeat_with(|| None).take(items.len()).collect();
+
+    for chunk_start in (0..items.len()).step_by(concurrency) {
+        let chunk_end = chunk_start.saturating_add(concurrency).min(items.len());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (offset, item) in items[chunk_start..chunk_end].iter().cloned().enumerate() {
+                let operation = &operation;
+                handles.push(scope.spawn(move || {
+                    let started = Instant::now();
+                    let result = operation(item);
+                    let duration_ms = started.elapsed().as_millis();
+                    (offset, duration_ms, result)
+                }));
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok((offset, duration_ms, Ok(output))) => {
+                        results[chunk_start + offset] = Some(BatchToolItemOutput {
+                            index: chunk_start + offset,
+                            status: String::from("success"),
+                            duration_ms,
+                            output: Some(output),
+                            error: None,
+                        });
+                    }
+                    Ok((offset, duration_ms, Err(error))) => {
+                        results[chunk_start + offset] = Some(BatchToolItemOutput {
+                            index: chunk_start + offset,
+                            status: String::from("error"),
+                            duration_ms,
+                            output: None,
+                            error: Some(error),
+                        });
+                    }
+                    Err(_) => {
+                        let offset = results[chunk_start..chunk_end]
+                            .iter()
+                            .position(Option::is_none)
+                            .unwrap_or(0);
+                        results[chunk_start + offset] = Some(BatchToolItemOutput {
+                            index: chunk_start + offset,
+                            status: String::from("error"),
+                            duration_ms: 0,
+                            output: None,
+                            error: Some(String::from("batch item panicked")),
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.unwrap_or(BatchToolItemOutput {
+                index,
+                status: String::from("error"),
+                duration_ms: 0,
+                output: None,
+                error: Some(String::from("batch item did not complete")),
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1377,11 +1953,17 @@ fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadManyInput {
+    files: Vec<ReadFileInput>,
+    max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1398,10 +1980,42 @@ struct EditFileInput {
     replace_all: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GlobSearchInputValue {
     pattern: String,
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobManyInput {
+    patterns: Vec<GlobSearchInputValue>,
+    max_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepManyInput {
+    searches: Vec<GrepSearchInput>,
+    max_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceSnapshotInput {
+    include_git: Option<bool>,
+    include_files: Option<bool>,
+    roots: Option<Vec<String>>,
+    max_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolBatchReadonlyInput {
+    calls: Vec<ToolBatchReadonlyCallInput>,
+    max_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolBatchReadonlyCallInput {
+    name: String,
+    input: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7484,6 +8098,415 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_many_preserves_order_and_reports_partial_failures() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("read-many-suite");
+        fs::create_dir_all(root.join("nested")).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        fs::write(root.join("nested/a.txt"), "alpha\nbeta\n").expect("write a");
+        fs::write(root.join("nested/b.txt"), "gamma\n").expect("write b");
+
+        let output = execute_tool(
+            "read_many",
+            &json!({
+                "files": [
+                    { "path": "nested/a.txt", "offset": 1, "limit": 1 },
+                    { "path": "missing.txt" },
+                    { "path": "nested/b.txt" }
+                ],
+                "max_concurrency": 2
+            }),
+        )
+        .expect("read_many should return structured batch output");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json");
+
+        assert_eq!(value["type"], "read_many");
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["successCount"], 2);
+        assert_eq!(value["errorCount"], 1);
+        assert_eq!(value["partialSuccess"], true);
+        assert_eq!(value["results"][0]["index"], 0);
+        assert_eq!(value["results"][0]["status"], "success");
+        assert_eq!(value["results"][0]["output"]["file"]["content"], "beta");
+        assert_eq!(value["results"][1]["index"], 1);
+        assert_eq!(value["results"][1]["status"], "error");
+        assert_eq!(value["results"][2]["index"], 2);
+        assert_eq!(value["results"][2]["output"]["file"]["content"], "gamma");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_tool_cache_hits_and_invalidates_after_write() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime::tool_cache::reset_tool_cache_for_tests();
+        let root = temp_path("tool-cache-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "alpha\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first read");
+        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second read");
+        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
+        assert_eq!(stats_value["hits"], 1);
+        assert_eq!(stats_value["entries"], 1);
+
+        execute_tool(
+            "write_file",
+            &json!({ "path": "src/lib.rs", "content": "omega\n" }),
+        )
+        .expect("write invalidates cache");
+        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats after write");
+        let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
+        assert_eq!(stats_value["invalidations"], 1);
+        assert_eq!(stats_value["entries"], 0);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+        runtime::tool_cache::reset_tool_cache_for_tests();
+    }
+
+    #[test]
+    fn read_tool_cache_misses_after_external_file_change() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime::tool_cache::reset_tool_cache_for_tests();
+        let root = temp_path("tool-cache-external-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "alpha\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let first = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first");
+        assert!(first.contains("alpha"));
+        fs::write(&file, "omega\n").expect("external write");
+        let second = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second");
+        assert!(second.contains("omega"));
+        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
+        assert_eq!(stats_value["hits"], 0);
+        assert_eq!(stats_value["misses"], 2);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+        runtime::tool_cache::reset_tool_cache_for_tests();
+    }
+
+    #[test]
+    fn mutation_preview_and_apply_patch_transaction_cover_conflict_and_success() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("mutation-transaction-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "alpha\nbeta\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let preview = execute_tool(
+            "mutation_preview",
+            &json!({
+                "edits": [
+                    { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
+                ]
+            }),
+        )
+        .expect("mutation preview should succeed");
+        let preview_value: serde_json::Value = serde_json::from_str(&preview).expect("json");
+        assert_eq!(preview_value["type"], "mutation_preview");
+        assert_eq!(preview_value["conflictCount"], 0);
+        let expected_hash = preview_value["files"][0]["expectedHash"]
+            .as_str()
+            .expect("expected hash")
+            .to_string();
+
+        let applied = execute_tool(
+            "apply_patch_transaction",
+            &json!({
+                "edits": [
+                    { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
+                ],
+                "expected_hashes": {
+                    "src/lib.rs": expected_hash
+                }
+            }),
+        )
+        .expect("apply should succeed");
+        let applied_value: serde_json::Value = serde_json::from_str(&applied).expect("json");
+        assert_eq!(applied_value["type"], "mutation_apply");
+        assert_eq!(
+            fs::read_to_string(&file).expect("read file"),
+            "omega\nbeta\n"
+        );
+
+        fs::write(&file, "alpha\nalpha\n").expect("reset file");
+        let conflict = execute_tool(
+            "patch_plan",
+            &json!({
+                "edits": [
+                    { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
+                ]
+            }),
+        )
+        .expect("patch plan should return conflict report");
+        let conflict_value: serde_json::Value = serde_json::from_str(&conflict).expect("json");
+        assert_eq!(conflict_value["conflictCount"], 1);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_patch_transaction_rejects_stale_expected_hash() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("mutation-stale-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "alpha\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let err = execute_tool(
+            "apply_patch_transaction",
+            &json!({
+                "edits": [
+                    { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
+                ],
+                "expected_hashes": {
+                    "src/lib.rs": "stale"
+                }
+            }),
+        )
+        .expect_err("stale hash should fail");
+        assert!(err.contains("changed before apply"));
+        assert_eq!(fs::read_to_string(&file).expect("read file"), "alpha\n");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_tools_create_diff_and_restore_workspace_files() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("checkpoint-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "alpha\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let created = execute_tool("checkpoint_create", &json!({ "label": "before edit" }))
+            .expect("checkpoint create should succeed");
+        let created_value: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let checkpoint_id = created_value["id"]
+            .as_str()
+            .expect("checkpoint id")
+            .to_string();
+
+        fs::write(&file, "omega\n").expect("mutate file");
+        fs::write(root.join("src/new.rs"), "new\n").expect("add file");
+        fs::remove_file(&file).expect("delete file");
+        let diff = execute_tool("checkpoint_diff", &json!({ "id": checkpoint_id }))
+            .expect("checkpoint diff should succeed");
+        let diff_value: serde_json::Value = serde_json::from_str(&diff).expect("json");
+        assert_eq!(diff_value["type"], "checkpoint_diff");
+        assert!(diff_value["deletedFiles"]
+            .as_array()
+            .expect("deleted files")
+            .iter()
+            .any(|file| file.as_str() == Some("src/lib.rs")));
+        assert!(diff_value["addedFiles"]
+            .as_array()
+            .expect("added files")
+            .iter()
+            .any(|file| file.as_str() == Some("src/new.rs")));
+
+        let checkpoint_id = created_value["id"].as_str().expect("checkpoint id");
+        execute_tool("checkpoint_restore", &json!({ "id": checkpoint_id }))
+            .expect("checkpoint restore should succeed");
+        assert_eq!(fs::read_to_string(&file).expect("read restored"), "alpha\n");
+        assert!(!root.join("src/new.rs").exists());
+
+        let listed = execute_tool("checkpoint_list", &json!({})).expect("checkpoint list");
+        let listed_value: serde_json::Value = serde_json::from_str(&listed).expect("json");
+        assert_eq!(listed_value["type"], "checkpoint_list");
+        assert!(!listed_value["checkpoints"]
+            .as_array()
+            .expect("checkpoints")
+            .is_empty());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_many_and_grep_many_preserve_order() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("search-many-suite");
+        fs::create_dir_all(root.join("nested")).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        fs::write(root.join("nested/lib.rs"), "let alpha = 1;\n").expect("write rs");
+        fs::write(root.join("nested/notes.md"), "alpha\nbeta\n").expect("write md");
+
+        let globbed = execute_tool(
+            "glob_many",
+            &json!({
+                "patterns": [
+                    { "pattern": "nested/*.rs" },
+                    { "pattern": "[" },
+                    { "pattern": "nested/*.md" }
+                ],
+                "max_concurrency": 2
+            }),
+        )
+        .expect("glob_many should return structured batch output");
+        let globbed_value: serde_json::Value = serde_json::from_str(&globbed).expect("json");
+        assert_eq!(globbed_value["successCount"], 2);
+        assert_eq!(globbed_value["errorCount"], 1);
+        assert_eq!(globbed_value["results"][0]["index"], 0);
+        assert_eq!(globbed_value["results"][1]["status"], "error");
+        assert_eq!(globbed_value["results"][2]["index"], 2);
+
+        let grepped = execute_tool(
+            "grep_many",
+            &json!({
+                "searches": [
+                    { "pattern": "alpha", "path": "nested", "glob": "*.rs" },
+                    { "pattern": "(alpha", "path": "nested" },
+                    { "pattern": "beta", "path": "nested", "output_mode": "content" }
+                ],
+                "max_concurrency": 2
+            }),
+        )
+        .expect("grep_many should return structured batch output");
+        let grepped_value: serde_json::Value = serde_json::from_str(&grepped).expect("json");
+        assert_eq!(grepped_value["successCount"], 2);
+        assert_eq!(grepped_value["errorCount"], 1);
+        assert_eq!(grepped_value["results"][0]["index"], 0);
+        assert_eq!(grepped_value["results"][1]["status"], "error");
+        assert_eq!(grepped_value["results"][2]["index"], 2);
+        assert!(grepped_value["results"][2]["output"]["content"]
+            .as_str()
+            .expect("content")
+            .contains("beta"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_snapshot_reports_compact_read_only_state() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("workspace-snapshot-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "workspace_snapshot",
+            &json!({
+                "include_git": false,
+                "include_files": true,
+                "roots": ["src"],
+                "max_files": 10
+            }),
+        )
+        .expect("workspace_snapshot should succeed");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(value["type"], "workspace_snapshot");
+        assert!(value["git"].is_null());
+        assert!(value["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|file| file
+                .as_str()
+                .is_some_and(|path| path.ends_with("src/main.rs"))));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_batch_readonly_runs_allowed_calls_in_order() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("tool-batch-readonly-suite");
+        fs::create_dir_all(root.join("src")).expect("create root");
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write rs");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "tool_batch_readonly",
+            &json!({
+                "calls": [
+                    { "name": "read_file", "input": { "path": "src/lib.rs" } },
+                    { "name": "grep_search", "input": { "pattern": "alpha", "path": "src" } },
+                    { "name": "glob_search", "input": { "pattern": "src/*.rs" } }
+                ],
+                "max_concurrency": 3
+            }),
+        )
+        .expect("tool_batch_readonly should succeed");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(value["type"], "tool_batch_readonly");
+        assert_eq!(value["successCount"], 3);
+        assert_eq!(value["errorCount"], 0);
+        assert_eq!(value["results"][0]["index"], 0);
+        assert_eq!(
+            value["results"][0]["output"]["file"]["content"],
+            "pub fn alpha() {}"
+        );
+        assert_eq!(value["results"][1]["index"], 1);
+        assert_eq!(value["results"][2]["index"], 2);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_batch_readonly_rejects_non_readonly_tools_before_execution() {
+        let output = execute_tool(
+            "tool_batch_readonly",
+            &json!({
+                "calls": [
+                    { "name": "read_file", "input": { "path": "Cargo.toml" } },
+                    { "name": "write_file", "input": { "path": "should-not-exist.txt", "content": "no" } }
+                ]
+            }),
+        )
+        .expect_err("write_file must be rejected");
+        assert!(output.contains("write_file"));
+        assert!(output.contains("not allowed"));
     }
 
     #[test]

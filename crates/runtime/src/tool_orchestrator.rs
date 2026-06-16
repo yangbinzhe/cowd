@@ -36,23 +36,71 @@ pub enum ToolSafetyCategory {
 impl ToolSafetyCategory {
     /// Classify a tool by name using a built-in mapping.
     pub fn from_tool_name(name: &str) -> Self {
-        match name {
-            "read" | "read_file" | "cat" | "head" | "tail" | "grep" | "grep_search" | "rg"
-            | "glob" | "glob_search" | "find" | "ls" | "list_directory" | "file_search"
-            | "git_status" | "git_log" | "git_diff" | "git_show" | "memory_search"
-            | "memory_list" | "memory_get" | "session_list" | "session_get" | "skill_list"
-            | "skill_view" => Self::ReadOnly,
+        match normalize_tool_name_for_safety(name).as_str() {
+            "read"
+            | "read_file"
+            | "read_many"
+            | "cat"
+            | "head"
+            | "tail"
+            | "grep"
+            | "grep_search"
+            | "grep_many"
+            | "rg"
+            | "glob"
+            | "glob_search"
+            | "glob_many"
+            | "find"
+            | "ls"
+            | "list_directory"
+            | "file_search"
+            | "workspace_snapshot"
+            | "tool_batch_readonly"
+            | "tool_cache_stats"
+            | "mutation_preview"
+            | "edit_many_preview"
+            | "patch_plan"
+            | "checkpoint_list"
+            | "checkpoint_diff"
+            | "git_status"
+            | "git_log"
+            | "git_diff"
+            | "git_show"
+            | "memory_search"
+            | "memory_list"
+            | "memory_get"
+            | "session_list"
+            | "session_get"
+            | "skill_list"
+            | "skill_view"
+            | "question"
+            | "ask_user_question"
+            | "tool_search"
+            | "list_mcp_resources"
+            | "read_mcp_resource" => Self::ReadOnly,
 
-            "write" | "write_file" | "edit" | "edit_file" | "bash" | "create_file"
-            | "delete_file" | "memory_create" | "memory_delete" | "session_create" => {
-                Self::WriteLocal
-            }
+            "write"
+            | "write_file"
+            | "edit"
+            | "edit_file"
+            | "create_file"
+            | "delete_file"
+            | "memory_create"
+            | "memory_delete"
+            | "session_create"
+            | "todo_write"
+            | "apply_patch_transaction"
+            | "checkpoint_create"
+            | "checkpoint_restore" => Self::WriteLocal,
 
-            // Network tools
-            "web_search" | "web_fetch" | "http_request" | "mcp_call" => Self::Network,
+            "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            // Destructive tools
-            "rm" | "kill" | "sudo" | "truncate" | "drop" => Self::Destructive,
+            "bash" | "powershell" | "repl" | "mcp" | "mcp_auth" | "remote_trigger" | "agent"
+            | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
+            | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
+            | "team_delete" | "cron_create" | "cron_delete" | "config" | "notebook_edit"
+            | "structured_output" | "execute_code" | "rm" | "kill" | "sudo" | "truncate"
+            | "drop" => Self::Destructive,
 
             // Default: treat unknown tools as WriteLocal (conservative)
             _ => Self::WriteLocal,
@@ -76,6 +124,46 @@ impl ToolSafetyCategory {
             Self::ReadOnly => 30,
             Self::WriteLocal | Self::Network | Self::Destructive => 120,
         }
+    }
+}
+
+fn normalize_tool_name_for_safety(name: &str) -> String {
+    let normalized = name.trim().replace('-', "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "webfetch" => "web_fetch".to_string(),
+        "websearch" => "web_search".to_string(),
+        "todowrite" => "todo_write".to_string(),
+        "askuserquestion" => "ask_user_question".to_string(),
+        "toolsearch" => "tool_search".to_string(),
+        "listmcpresources" => "list_mcp_resources".to_string(),
+        "readmcpresource" => "read_mcp_resource".to_string(),
+        "mcpauth" => "mcp_auth".to_string(),
+        "remotetrigger" => "remote_trigger".to_string(),
+        "notebookedit" => "notebook_edit".to_string(),
+        "structuredoutput" => "structured_output".to_string(),
+        "execute_code" => "execute_code".to_string(),
+        "taskcreate" => "task_create".to_string(),
+        "runtaskpacket" => "run_task_packet".to_string(),
+        "taskget" => "task_get".to_string(),
+        "tasklist" => "task_list".to_string(),
+        "taskstop" => "task_stop".to_string(),
+        "taskupdate" => "task_update".to_string(),
+        "taskoutput" => "task_output".to_string(),
+        "workercreate" => "worker_create".to_string(),
+        "workerget" => "worker_get".to_string(),
+        "workerobserve" => "worker_observe".to_string(),
+        "workerresolvertrust" => "worker_resolve_trust".to_string(),
+        "workerawaitready" => "worker_await_ready".to_string(),
+        "workersendprompt" => "worker_send_prompt".to_string(),
+        "workerrestart" => "worker_restart".to_string(),
+        "workerterminate" => "worker_terminate".to_string(),
+        "workerobservecompletion" => "worker_observe_completion".to_string(),
+        "teamcreate" => "team_create".to_string(),
+        "teamdelete" => "team_delete".to_string(),
+        "croncreate" => "cron_create".to_string(),
+        "crondelete" => "cron_delete".to_string(),
+        "cronlist" => "cron_list".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -106,7 +194,28 @@ impl ToolSafetyRegistry {
 
     /// Create the built-in registry with default prefix-based classification.
     pub fn builtin() -> Self {
-        let explicit = HashMap::new();
+        let mut explicit = HashMap::new();
+        for name in [
+            "mutation_preview",
+            "edit_many_preview",
+            "patch_plan",
+            "checkpoint_list",
+            "checkpoint_diff",
+        ] {
+            explicit.insert(name.to_string(), ToolSafetyCategory::ReadOnly);
+        }
+        explicit.insert(
+            "apply_patch_transaction".to_string(),
+            ToolSafetyCategory::WriteLocal,
+        );
+        explicit.insert(
+            "checkpoint_create".to_string(),
+            ToolSafetyCategory::WriteLocal,
+        );
+        explicit.insert(
+            "checkpoint_restore".to_string(),
+            ToolSafetyCategory::WriteLocal,
+        );
         let patterns = vec![
             ("read".into(), ToolSafetyCategory::ReadOnly),
             ("grep".into(), ToolSafetyCategory::ReadOnly),
@@ -117,14 +226,13 @@ impl ToolSafetyRegistry {
             ("ast_grep".into(), ToolSafetyCategory::WriteLocal),
             ("bash".into(), ToolSafetyCategory::Destructive),
             ("rm".into(), ToolSafetyCategory::Destructive),
-            ("git".into(), ToolSafetyCategory::Destructive),
             ("web_fetch".into(), ToolSafetyCategory::Network),
             ("web_search".into(), ToolSafetyCategory::Network),
         ];
         Self {
             explicit,
             patterns,
-            default: ToolSafetyCategory::ReadOnly,
+            default: ToolSafetyCategory::WriteLocal,
             tool_timeout_secs: HashMap::new(),
         }
     }
@@ -135,20 +243,27 @@ impl ToolSafetyRegistry {
     /// 2. Check prefix patterns in registration order.
     /// 3. Fall back to the default category.
     pub fn classify(&self, tool_name: &str) -> ToolSafetyCategory {
-        if let Some(cat) = self.explicit.get(tool_name) {
+        let normalized = normalize_tool_name_for_safety(tool_name);
+        if let Some(cat) = self.explicit.get(&normalized) {
             return *cat;
         }
         for (prefix, cat) in &self.patterns {
-            if tool_name.starts_with(prefix) {
+            if normalized.starts_with(prefix) {
                 return *cat;
             }
         }
-        self.default
+        let built_in = ToolSafetyCategory::from_tool_name(&normalized);
+        if built_in == ToolSafetyCategory::WriteLocal {
+            self.default
+        } else {
+            built_in
+        }
     }
 
     /// Register a custom tool with an explicit category (for plugin tools).
     pub fn register(&mut self, tool_name: &str, category: ToolSafetyCategory) {
-        self.explicit.insert(tool_name.to_string(), category);
+        self.explicit
+            .insert(normalize_tool_name_for_safety(tool_name), category);
     }
 
     /// Get the timeout in seconds for a tool.
@@ -156,17 +271,18 @@ impl ToolSafetyRegistry {
     /// 1. Check per-tool override in `tool_timeout_secs`.
     /// 2. Fall back to the category default (`ReadOnly` → 30s, others → 120s).
     pub fn get_timeout_secs(&self, tool_name: &str) -> u64 {
-        if let Some(&timeout) = self.tool_timeout_secs.get(tool_name) {
+        let normalized = normalize_tool_name_for_safety(tool_name);
+        if let Some(&timeout) = self.tool_timeout_secs.get(&normalized) {
             return timeout;
         }
-        let cat = self.classify(tool_name);
+        let cat = self.classify(&normalized);
         cat.default_timeout_secs()
     }
 
     /// Set a per-tool timeout override (seconds).
     pub fn set_tool_timeout(&mut self, tool_name: &str, timeout_secs: u64) {
         self.tool_timeout_secs
-            .insert(tool_name.to_string(), timeout_secs);
+            .insert(normalize_tool_name_for_safety(tool_name), timeout_secs);
     }
 }
 
@@ -326,15 +442,17 @@ impl ToolOrchestrator {
 
     /// Override the safety category for a specific tool.
     pub fn set_override(&mut self, tool_name: String, category: ToolSafetyCategory) {
-        self.overrides.insert(tool_name, category);
+        self.overrides
+            .insert(normalize_tool_name_for_safety(&tool_name), category);
     }
 
     /// Get the safety category for a tool (checking overrides first).
     pub fn category_for(&self, tool_name: &str) -> ToolSafetyCategory {
+        let normalized = normalize_tool_name_for_safety(tool_name);
         self.overrides
-            .get(tool_name)
+            .get(&normalized)
             .copied()
-            .unwrap_or_else(|| ToolSafetyCategory::from_tool_name(tool_name))
+            .unwrap_or_else(|| ToolSafetyCategory::from_tool_name(&normalized))
     }
 
     /// Alias for `category_for` — used by concurrency semaphore dispatch.
@@ -439,7 +557,7 @@ mod tests {
         );
         assert_eq!(
             ToolSafetyCategory::from_tool_name("bash"),
-            ToolSafetyCategory::WriteLocal
+            ToolSafetyCategory::Destructive
         );
     }
 
@@ -447,6 +565,14 @@ mod tests {
     fn classifies_network_tools() {
         assert_eq!(
             ToolSafetyCategory::from_tool_name("web_search"),
+            ToolSafetyCategory::Network
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("WebSearch"),
+            ToolSafetyCategory::Network
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("WebFetch"),
             ToolSafetyCategory::Network
         );
     }
@@ -465,6 +591,87 @@ mod tests {
             ToolSafetyCategory::from_tool_name("custom_tool"),
             ToolSafetyCategory::WriteLocal
         );
+        assert_eq!(
+            ToolSafetyRegistry::builtin().classify("custom_tool"),
+            ToolSafetyCategory::WriteLocal
+        );
+    }
+
+    #[test]
+    fn registry_matches_direct_classifier_for_core_aliases() {
+        let registry = ToolSafetyRegistry::builtin();
+        for name in [
+            "read",
+            "read_file",
+            "read_many",
+            "grep",
+            "grep_search",
+            "grep_many",
+            "glob",
+            "glob_search",
+            "glob_many",
+            "workspace_snapshot",
+            "tool_batch_readonly",
+            "tool_cache_stats",
+            "mutation_preview",
+            "edit_many_preview",
+            "patch_plan",
+            "checkpoint_list",
+            "checkpoint_diff",
+            "write",
+            "write_file",
+            "edit",
+            "edit_file",
+            "WebFetch",
+            "WebSearch",
+            "bash",
+            "PowerShell",
+        ] {
+            assert_eq!(
+                registry.classify(name),
+                ToolSafetyCategory::from_tool_name(name),
+                "classification mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_risk_agent_and_runtime_tools_are_not_read_only() {
+        let registry = ToolSafetyRegistry::builtin();
+        for name in [
+            "Agent",
+            "TaskCreate",
+            "RunTaskPacket",
+            "WorkerCreate",
+            "WorkerSendPrompt",
+            "TeamCreate",
+            "MCP",
+            "McpAuth",
+            "REPL",
+            "PowerShell",
+            "Config",
+            "NotebookEdit",
+            "RemoteTrigger",
+            "execute_code",
+        ] {
+            assert_ne!(
+                registry.classify(name),
+                ToolSafetyCategory::ReadOnly,
+                "{name} must not be treated as read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_git_queries_are_not_caught_by_prefix_rules() {
+        let registry = ToolSafetyRegistry::builtin();
+        for name in ["git_status", "git_log", "git_diff", "git_show"] {
+            assert_eq!(
+                registry.classify(name),
+                ToolSafetyCategory::ReadOnly,
+                "{name} should stay read-only"
+            );
+        }
     }
 
     #[test]
@@ -490,6 +697,20 @@ mod tests {
         assert_eq!(
             orch.category_for("custom_read"),
             ToolSafetyCategory::ReadOnly
+        );
+    }
+
+    #[test]
+    fn override_lookup_uses_normalized_tool_names() {
+        let mut orch = ToolOrchestrator::new();
+        orch.set_override("WebFetch".to_string(), ToolSafetyCategory::Destructive);
+        assert_eq!(
+            orch.category_for("web_fetch"),
+            ToolSafetyCategory::Destructive
+        );
+        assert_eq!(
+            orch.category_for("WebFetch"),
+            ToolSafetyCategory::Destructive
         );
     }
 

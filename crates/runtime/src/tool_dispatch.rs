@@ -1,5 +1,6 @@
+use crate::execution_scheduler::schedule_tool_requests;
 use crate::session::ConversationMessage;
-use crate::tool_orchestrator::{ToolSafetyCategory, ToolSafetyRegistry};
+use crate::tool_orchestrator::ToolSafetyCategory;
 use std::collections::HashMap;
 
 pub struct ToolRequest {
@@ -18,16 +19,11 @@ pub struct ToolDispatchResult {
 }
 
 pub fn categorize(requests: &[ToolRequest]) -> (Vec<usize>, Vec<usize>) {
-    let registry = ToolSafetyRegistry::global();
-    let mut read_only: Vec<usize> = Vec::new();
-    let mut rest: Vec<usize> = Vec::new();
-    for (i, req) in requests.iter().enumerate() {
-        match registry.classify(&req.tool_name) {
-            ToolSafetyCategory::ReadOnly => read_only.push(i),
-            _ => rest.push(i),
-        }
-    }
-    (read_only, rest)
+    let schedule = schedule_tool_requests(requests);
+    (
+        schedule.parallel_read_indices(),
+        schedule.remaining_indices(),
+    )
 }
 
 pub fn reorder_in_original(

@@ -2,6 +2,7 @@
 
 use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::tool_dispatch::ToolRequest;
@@ -28,11 +29,90 @@ impl ToolExecutionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPurity {
+    ReadOnlyIdempotent,
+    LocalMutation,
+    Network,
+    RuntimeSideEffect,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResourceScope {
+    pub kind: String,
+    pub paths: Vec<String>,
+    pub network: bool,
+    pub unknown: bool,
+}
+
+impl ToolResourceScope {
+    fn workspace() -> Self {
+        Self {
+            kind: "workspace".to_string(),
+            paths: vec![".".to_string()],
+            network: false,
+            unknown: false,
+        }
+    }
+
+    fn paths(paths: Vec<String>) -> Self {
+        Self {
+            kind: "paths".to_string(),
+            paths,
+            network: false,
+            unknown: false,
+        }
+    }
+
+    fn network() -> Self {
+        Self {
+            kind: "network".to_string(),
+            paths: Vec::new(),
+            network: true,
+            unknown: false,
+        }
+    }
+
+    fn runtime() -> Self {
+        Self {
+            kind: "runtime".to_string(),
+            paths: Vec::new(),
+            network: false,
+            unknown: false,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            kind: "unknown".to_string(),
+            paths: Vec::new(),
+            network: false,
+            unknown: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConflict {
+    pub tool_call_id: String,
+    pub kind: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionPlanTask {
     pub tool_call_id: String,
     pub tool_name: String,
     pub safety_category: ToolSafetyCategory,
+    pub purity: ToolPurity,
+    pub resource_scope: ToolResourceScope,
+    pub authority_set: Vec<String>,
+    pub side_effect_class: String,
+    pub output_budget_class: String,
+    pub conflicts: Vec<ToolConflict>,
+    pub reason: String,
     pub execution_mode: ToolExecutionMode,
     pub depends_on: Vec<String>,
     pub max_concurrency: usize,
@@ -58,10 +138,11 @@ impl ToolExecutionPlan {
         let mut destructive_count = 0;
         let mut wave_count = 0;
 
-        let tasks = requests
+        let mut tasks = requests
             .iter()
             .map(|request| {
                 let safety_category = registry.classify(&request.tool_name);
+                let analysis = analyze_request(request, safety_category);
                 let execution_mode = if !request.depends_on.is_empty() {
                     wave_count += 1;
                     ToolExecutionMode::Wave
@@ -86,6 +167,13 @@ impl ToolExecutionPlan {
                     tool_call_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
                     safety_category,
+                    purity: analysis.purity,
+                    resource_scope: analysis.resource_scope,
+                    authority_set: analysis.authority_set,
+                    side_effect_class: analysis.side_effect_class,
+                    output_budget_class: analysis.output_budget_class,
+                    conflicts: Vec::new(),
+                    reason: analysis.reason,
                     execution_mode,
                     depends_on: request.depends_on.clone(),
                     max_concurrency: match execution_mode {
@@ -95,6 +183,7 @@ impl ToolExecutionPlan {
                 }
             })
             .collect::<Vec<_>>();
+        annotate_conflicts(&mut tasks);
 
         Self {
             plan_id: format!("tool-plan-{}", Uuid::new_v4()),
@@ -144,6 +233,213 @@ impl ToolExecutionPlan {
             .collect();
         event
     }
+}
+
+struct ToolRequestAnalysis {
+    purity: ToolPurity,
+    resource_scope: ToolResourceScope,
+    authority_set: Vec<String>,
+    side_effect_class: String,
+    output_budget_class: String,
+    reason: String,
+}
+
+fn analyze_request(
+    request: &ToolRequest,
+    safety_category: ToolSafetyCategory,
+) -> ToolRequestAnalysis {
+    let input = serde_json::from_str::<Value>(&request.input).unwrap_or(Value::Null);
+    let purity = match safety_category {
+        ToolSafetyCategory::ReadOnly => ToolPurity::ReadOnlyIdempotent,
+        ToolSafetyCategory::WriteLocal => ToolPurity::LocalMutation,
+        ToolSafetyCategory::Network => ToolPurity::Network,
+        ToolSafetyCategory::Destructive => ToolPurity::RuntimeSideEffect,
+    };
+    let resource_scope = resource_scope_for(&request.tool_name, &input, safety_category);
+    let authority_set = match safety_category {
+        ToolSafetyCategory::ReadOnly => vec!["workspace.read".to_string()],
+        ToolSafetyCategory::WriteLocal => vec!["workspace.write".to_string()],
+        ToolSafetyCategory::Network => vec!["network".to_string()],
+        ToolSafetyCategory::Destructive => vec!["runtime.control".to_string()],
+    };
+    let side_effect_class = match purity {
+        ToolPurity::ReadOnlyIdempotent => "none",
+        ToolPurity::LocalMutation => "local_mutation",
+        ToolPurity::Network => "network",
+        ToolPurity::RuntimeSideEffect => "runtime_side_effect",
+        ToolPurity::Unknown => "unknown",
+    }
+    .to_string();
+    let output_budget_class = match request.tool_name.as_str() {
+        "read_many" | "grep_many" | "glob_many" | "tool_batch_readonly" => "batch",
+        "workspace_snapshot" => "summary",
+        _ => match safety_category {
+            ToolSafetyCategory::ReadOnly => "normal",
+            _ => "mutation",
+        },
+    }
+    .to_string();
+    let reason = format!(
+        "{} tool planned as {} with {} resource scope",
+        side_effect_class,
+        ToolExecutionMode::from_safety_and_deps(safety_category, !request.depends_on.is_empty())
+            .as_str(),
+        resource_scope.kind
+    );
+
+    ToolRequestAnalysis {
+        purity,
+        resource_scope,
+        authority_set,
+        side_effect_class,
+        output_budget_class,
+        reason,
+    }
+}
+
+impl ToolExecutionMode {
+    fn from_safety_and_deps(safety_category: ToolSafetyCategory, has_deps: bool) -> Self {
+        if has_deps {
+            return Self::Wave;
+        }
+        match safety_category {
+            ToolSafetyCategory::ReadOnly => Self::ParallelRead,
+            ToolSafetyCategory::Destructive => Self::SerialDestructive,
+            ToolSafetyCategory::WriteLocal | ToolSafetyCategory::Network => Self::LimitedParallel,
+        }
+    }
+}
+
+fn resource_scope_for(
+    tool_name: &str,
+    input: &Value,
+    safety_category: ToolSafetyCategory,
+) -> ToolResourceScope {
+    match tool_name {
+        "read_file" | "write_file" | "edit_file" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| ToolResourceScope::paths(vec![normalize_resource_path(path)]))
+            .unwrap_or_else(ToolResourceScope::unknown),
+        "read_many" => ToolResourceScope::paths(extract_array_paths(input, "files", "path")),
+        "grep_search" | "glob_search" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| ToolResourceScope::paths(vec![normalize_resource_path(path)]))
+            .unwrap_or_else(ToolResourceScope::workspace),
+        "grep_many" => {
+            let paths = extract_array_paths(input, "searches", "path");
+            if paths.is_empty() {
+                ToolResourceScope::workspace()
+            } else {
+                ToolResourceScope::paths(paths)
+            }
+        }
+        "glob_many" => {
+            let paths = extract_array_paths(input, "patterns", "path");
+            if paths.is_empty() {
+                ToolResourceScope::workspace()
+            } else {
+                ToolResourceScope::paths(paths)
+            }
+        }
+        "workspace_snapshot" | "tool_batch_readonly" => ToolResourceScope::workspace(),
+        "WebFetch" | "WebSearch" | "web_fetch" | "web_search" => ToolResourceScope::network(),
+        _ => match safety_category {
+            ToolSafetyCategory::ReadOnly => ToolResourceScope::workspace(),
+            ToolSafetyCategory::Network => ToolResourceScope::network(),
+            ToolSafetyCategory::Destructive => ToolResourceScope::runtime(),
+            ToolSafetyCategory::WriteLocal => ToolResourceScope::unknown(),
+        },
+    }
+}
+
+fn extract_array_paths(input: &Value, array_key: &str, path_key: &str) -> Vec<String> {
+    input
+        .get(array_key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get(path_key).and_then(Value::as_str))
+                .map(normalize_resource_path)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_resource_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.replace('\\', "/")
+    }
+}
+
+fn annotate_conflicts(tasks: &mut [ToolExecutionPlanTask]) {
+    for left in 0..tasks.len() {
+        for right in (left + 1)..tasks.len() {
+            if let Some((kind, reason)) = conflict_between(&tasks[left], &tasks[right]) {
+                let right_id = tasks[right].tool_call_id.clone();
+                let left_id = tasks[left].tool_call_id.clone();
+                tasks[left].conflicts.push(ToolConflict {
+                    tool_call_id: right_id,
+                    kind: kind.clone(),
+                    reason: reason.clone(),
+                });
+                tasks[right].conflicts.push(ToolConflict {
+                    tool_call_id: left_id,
+                    kind,
+                    reason,
+                });
+            }
+        }
+    }
+}
+
+fn conflict_between(
+    left: &ToolExecutionPlanTask,
+    right: &ToolExecutionPlanTask,
+) -> Option<(String, String)> {
+    if left.purity == ToolPurity::ReadOnlyIdempotent
+        && right.purity == ToolPurity::ReadOnlyIdempotent
+    {
+        return None;
+    }
+    if left.resource_scope.unknown || right.resource_scope.unknown {
+        return Some((
+            "unknown_resource".to_string(),
+            "unknown write/runtime resource scope requires conservative scheduling".to_string(),
+        ));
+    }
+    if left.safety_category == ToolSafetyCategory::Destructive
+        || right.safety_category == ToolSafetyCategory::Destructive
+    {
+        return Some((
+            "runtime_side_effect".to_string(),
+            "destructive/runtime side-effect tools must be serialized".to_string(),
+        ));
+    }
+    for left_path in &left.resource_scope.paths {
+        for right_path in &right.resource_scope.paths {
+            if paths_overlap(left_path, right_path) {
+                return Some((
+                    "path_overlap".to_string(),
+                    format!("resource paths overlap: {left_path} <-> {right_path}"),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left == "."
+        || right == "."
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
 }
 
 #[cfg(test)]
@@ -207,5 +503,69 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["task_count"], 2);
+    }
+
+    #[test]
+    fn plan_records_resource_scope_and_authority_metadata() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            ToolRequest {
+                tool_use_id: "read-1".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+            ToolRequest {
+                tool_use_id: "web-1".to_string(),
+                tool_name: "WebSearch".to_string(),
+                input: r#"{"query":"latest rust"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(plan.tasks[0].purity, ToolPurity::ReadOnlyIdempotent);
+        assert_eq!(plan.tasks[0].resource_scope.kind, "paths");
+        assert_eq!(plan.tasks[0].resource_scope.paths, vec!["src/lib.rs"]);
+        assert_eq!(plan.tasks[0].authority_set, vec!["workspace.read"]);
+        assert_eq!(plan.tasks[0].output_budget_class, "normal");
+        assert_eq!(plan.tasks[1].purity, ToolPurity::Network);
+        assert_eq!(plan.tasks[1].resource_scope.kind, "network");
+        assert_eq!(plan.tasks[1].authority_set, vec!["network"]);
+    }
+
+    #[test]
+    fn plan_marks_overlapping_write_conflicts() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            ToolRequest {
+                tool_use_id: "write-1".to_string(),
+                tool_name: "write_file".to_string(),
+                input: r#"{"path":"src/lib.rs","content":"a"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+            ToolRequest {
+                tool_use_id: "edit-1".to_string(),
+                tool_name: "edit_file".to_string(),
+                input: r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(plan.tasks[0].conflicts.len(), 1);
+        assert_eq!(plan.tasks[0].conflicts[0].tool_call_id, "edit-1");
+        assert_eq!(plan.tasks[0].conflicts[0].kind, "path_overlap");
+        assert_eq!(plan.tasks[1].conflicts[0].tool_call_id, "write-1");
+    }
+
+    #[test]
+    fn read_only_batch_tools_get_batch_budget_class() {
+        let plan = ToolExecutionPlan::from_requests(&[ToolRequest {
+            tool_use_id: "batch-1".to_string(),
+            tool_name: "tool_batch_readonly".to_string(),
+            input: r#"{"calls":[]}"#.to_string(),
+            depends_on: Vec::new(),
+        }]);
+
+        assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(plan.tasks[0].output_budget_class, "batch");
+        assert!(plan.tasks[0].conflicts.is_empty());
     }
 }

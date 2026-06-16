@@ -64,6 +64,32 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "read_many",
+            description: "Read multiple text files from the workspace in one ordered batch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "offset": { "type": "integer", "minimum": 0 },
+                                "limit": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                },
+                "required": ["files"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "write_file",
             description: "Write a text file in the workspace.",
             input_schema: json!({
@@ -94,6 +120,162 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
+            name: "mutation_preview",
+            description: "Preview multiple text replacements without writing files.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["path", "old_string", "new_string"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["edits"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "edit_many_preview",
+            description: "Alias for mutation_preview optimized for multi-edit preflight.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["path", "old_string", "new_string"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["edits"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "patch_plan",
+            description: "Build a structured preflight plan for multiple text replacements.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["path", "old_string", "new_string"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["edits"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "apply_patch_transaction",
+            description: "Apply a multi-file mutation plan after expected-hash verification.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["path", "old_string", "new_string"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "expected_hashes": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["edits"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "checkpoint_create",
+            description: "Create a lightweight workspace checkpoint before risky edits.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "checkpoint_list",
+            description: "List local workspace checkpoints.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "checkpoint_diff",
+            description: "Compare the current workspace against a checkpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "checkpoint_restore",
+            description: "Restore files from a local workspace checkpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "glob_search",
             description: "Find files by glob pattern.",
             input_schema: json!({
@@ -103,6 +285,31 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "path": { "type": "string" }
                 },
                 "required": ["pattern"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "glob_many",
+            description: "Run multiple glob searches in one ordered read-only batch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patterns": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string" },
+                                "path": { "type": "string" }
+                            },
+                            "required": ["pattern"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                },
+                "required": ["patterns"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -129,6 +336,93 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "multiline": { "type": "boolean" }
                 },
                 "required": ["pattern"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "grep_many",
+            description: "Run multiple regex searches in one ordered read-only batch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "searches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string" },
+                                "path": { "type": "string" },
+                                "glob": { "type": "string" },
+                                "output_mode": { "type": "string" },
+                                "-B": { "type": "integer", "minimum": 0 },
+                                "-A": { "type": "integer", "minimum": 0 },
+                                "-C": { "type": "integer", "minimum": 0 },
+                                "context": { "type": "integer", "minimum": 0 },
+                                "-n": { "type": "boolean" },
+                                "-i": { "type": "boolean" },
+                                "type": { "type": "string" },
+                                "head_limit": { "type": "integer", "minimum": 1 },
+                                "offset": { "type": "integer", "minimum": 0 },
+                                "multiline": { "type": "boolean" }
+                            },
+                            "required": ["pattern"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                },
+                "required": ["searches"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "workspace_snapshot",
+            description: "Collect a compact read-only snapshot of the current workspace state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "include_git": { "type": "boolean" },
+                    "include_files": { "type": "boolean" },
+                    "roots": { "type": "array", "items": { "type": "string" } },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 5000 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "tool_batch_readonly",
+            description: "Execute multiple approved read-only tool calls in one ordered batch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "calls": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "input": { "type": "object" }
+                            },
+                            "required": ["name", "input"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                },
+                "required": ["calls"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "tool_cache_stats",
+            description: "Report in-process read-only tool cache hit, miss, invalidation, and entry counts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -898,7 +1192,26 @@ pub(crate) fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash"
+                    | "read_file"
+                    | "read_many"
+                    | "write_file"
+                    | "edit_file"
+                    | "mutation_preview"
+                    | "edit_many_preview"
+                    | "patch_plan"
+                    | "apply_patch_transaction"
+                    | "checkpoint_create"
+                    | "checkpoint_list"
+                    | "checkpoint_diff"
+                    | "checkpoint_restore"
+                    | "glob_search"
+                    | "glob_many"
+                    | "grep_search"
+                    | "grep_many"
+                    | "workspace_snapshot"
+                    | "tool_batch_readonly"
+                    | "tool_cache_stats"
             )
         })
         .collect()

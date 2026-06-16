@@ -1770,10 +1770,11 @@ where
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
-                use crate::tool_dispatch::{categorize, ToolRequest};
+                use crate::execution_scheduler::schedule_tool_requests;
+                use crate::tool_dispatch::ToolRequest;
                 use futures::stream::{FuturesUnordered, StreamExt};
 
-                let requests: Vec<ToolRequest> = pending_tool_uses
+                let mut requests: Vec<ToolRequest> = pending_tool_uses
                     .iter()
                     .map(|(id, name, input)| ToolRequest {
                         tool_use_id: id.clone(),
@@ -1782,11 +1783,15 @@ where
                         depends_on: Vec::new(),
                     })
                     .collect();
+                let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
                 let execution_plan = ToolExecutionPlan::from_requests(&requests);
                 self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
-                let (read_indices, rest_indices) = categorize(&requests);
+                let tool_schedule = schedule_tool_requests(&requests);
+                self.record_tool_schedule(&tool_schedule, &requests, self.session().messages.len());
+                let read_indices = tool_schedule.parallel_read_indices();
+                let rest_indices = tool_schedule.remaining_indices();
 
                 let mut result_map: std::collections::HashMap<
                     String,
@@ -1797,7 +1802,16 @@ where
                 let wave_task_indices: Vec<usize> = requests
                     .iter()
                     .enumerate()
-                    .filter(|(_, req)| !req.depends_on.is_empty())
+                    .filter(|(_, req)| {
+                        std::env::var("COWD_ENABLE_LEGACY_WAVE_READONLY")
+                            .ok()
+                            .as_deref()
+                            == Some("1")
+                            && !req.depends_on.is_empty()
+                            && crate::tool_orchestrator::ToolSafetyRegistry::global()
+                                .classify(&req.tool_name)
+                                == crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
+                    })
                     .map(|(i, _)| i)
                     .collect();
 
@@ -3313,6 +3327,30 @@ where
                     session_id,
                     sequence,
                     "tool execution plan event append failed"
+                );
+            }
+        });
+    }
+
+    fn record_tool_schedule(
+        &self,
+        schedule: &crate::execution_scheduler::ToolSchedule,
+        requests: &[crate::tool_dispatch::ToolRequest],
+        sequence: usize,
+    ) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let event = schedule.to_runtime_event(session_id.clone(), sequence, now_ms(), requests);
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "tool schedule event append failed"
                 );
             }
         });

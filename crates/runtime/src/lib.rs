@@ -66,13 +66,18 @@ pub mod agent_kernel;
 pub mod agent_protocol;
 pub mod agent_workgraph;
 pub mod approval_gate;
+pub mod checkpoint;
 pub mod connector;
+pub mod context_fanout;
 pub mod cowd_event;
 pub mod cross_plane_policy;
+pub mod execution_scheduler;
 pub mod iacc;
+pub mod intent_planner;
 pub mod joint_problem_solving;
 pub mod mirror;
 pub mod model_registry;
+pub mod mutation_plan;
 pub mod pairing;
 pub mod profile;
 pub mod projection;
@@ -93,6 +98,7 @@ pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod team_discovery;
+pub mod tool_cache;
 pub mod tool_dispatch;
 pub mod tool_execution_plan;
 pub mod tool_invocation;
@@ -126,6 +132,11 @@ pub use agent_workgraph::{
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
+pub use checkpoint::{
+    checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
+    CheckpointDiffInput, CheckpointDiffOutput, CheckpointListOutput, CheckpointRestoreInput,
+    CheckpointSummary,
+};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
@@ -247,6 +258,10 @@ pub use mcp_stdio::{
 pub use model_registry::{
     global_registry, CircularAliasError, ModelInfo, ModelRegistry, ModelRegistryError,
     ModelResolver, Pricing,
+};
+pub use mutation_plan::{
+    apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
+    MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
