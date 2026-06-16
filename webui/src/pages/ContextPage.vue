@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import DataTable from '../components/workbench/DataTable.vue';
 import EmptyState from '../components/workbench/EmptyState.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 import StatusPill from '../components/workbench/StatusPill.vue';
 import { useAppStore } from '../stores/app';
 
@@ -155,6 +156,7 @@ onMounted(refresh);
           <input v-model="evidenceRef" type="text" @keyup.enter="resolveEvidence" />
         </label>
         <button class="ghost-action" type="button" @click="resolveEvidence">Resolve evidence</button>
+        <RequestReceipt :receipt="evidence" title="Lookup receipt" />
         <RawPayload title="Resolved evidence" :data="evidence" />
       </section>
 
@@ -171,6 +173,7 @@ onMounted(refresh);
           <Check :size="15" />
           Acknowledge
         </button>
+        <RequestReceipt :receipt="actionResult" title="Recommendation receipt" />
         <DataTable v-if="recommendationRows.length" :rows="recommendationRows" :columns="['id', 'action', 'count', 'status']" />
         <EmptyState v-else title="No recommendation stats" detail="推荐动作统计会在后端有历史数据时展示。" />
       </section>

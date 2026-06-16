@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import DataTable from '../components/workbench/DataTable.vue';
 import EmptyState from '../components/workbench/EmptyState.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 import StatusPill from '../components/workbench/StatusPill.vue';
 import { useAppStore } from '../stores/app';
 
@@ -18,6 +19,7 @@ const approvals = ref<any>([]);
 const timeline = ref<any>({});
 const tasks = ref<any>({});
 const reloadResult = ref<any>(null);
+const actionResult = ref<any>(null);
 const leaseOwner = ref('webui');
 const leaseMode = ref('shared');
 const sessionId = computed(() => store.activeSessionId || 'api-context');
@@ -64,23 +66,24 @@ async function refresh() {
 
 async function reloadProviders() {
   reloadResult.value = await api.reloadProviders();
+  actionResult.value = reloadResult.value;
   await refresh();
 }
 
 async function acquireLease() {
   if (!store.activeSessionId) await store.createSession();
-  await api.acquireRuntimeLease(store.activeSessionId, leaseOwner.value, leaseMode.value);
+  actionResult.value = await api.acquireRuntimeLease(store.activeSessionId, leaseOwner.value, leaseMode.value);
   await refresh();
 }
 
 async function releaseLease() {
   if (!store.activeSessionId) return;
-  await api.releaseRuntimeLease(store.activeSessionId, leaseOwner.value);
+  actionResult.value = await api.releaseRuntimeLease(store.activeSessionId, leaseOwner.value);
   await refresh();
 }
 
 async function respondApproval(id: string, approved: boolean) {
-  await api.approvalRespond(id, approved, approved ? 'approved from Runtime Workbench' : 'rejected from Runtime Workbench');
+  actionResult.value = await api.approvalRespond(id, approved, approved ? 'approved from Runtime Workbench' : 'rejected from Runtime Workbench');
   await refresh();
 }
 
@@ -140,6 +143,7 @@ onMounted(refresh);
           <dd>{{ controlPlane.workspace_root || '-' }}</dd>
         </dl>
         <RawPayload title="Effective config" :data="effectiveConfig" />
+        <RequestReceipt :receipt="actionResult" title="Runtime write receipt" />
         <RawPayload title="Reload result" :data="reloadResult || {}" />
       </section>
 
@@ -163,6 +167,7 @@ onMounted(refresh);
           <button class="primary-action" type="button" @click="acquireLease">Acquire</button>
           <button class="ghost-action" type="button" @click="releaseLease">Release</button>
         </div>
+        <RequestReceipt :receipt="actionResult" title="Lease receipt" />
         <RawPayload title="Lease registry" :data="leases" />
       </section>
 
@@ -185,6 +190,7 @@ onMounted(refresh);
           </article>
         </div>
         <EmptyState v-if="!approvalItems.length" title="No pending approvals" detail="需要人工确认的运行时动作会出现在这里。" />
+        <RequestReceipt :receipt="actionResult" title="Approval receipt" />
       </section>
 
       <section class="management-panel runtime-panel">

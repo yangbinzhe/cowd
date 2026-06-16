@@ -457,9 +457,21 @@ describe('Cowd Vue WebUI shell', () => {
     const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'agents.assemble', team: {} }), { status: 200 })));
     vi.stubGlobal('fetch', fetchMock);
     await api.agentAssemble('build a review team');
+    await api.createAgentTeamProfile({ id: 'qa-team', name: 'QA Team', members: ['planner'] });
+    await api.updateAgentTeamProfile('qa-team', { name: 'QA Team', members: ['planner', 'reviewer'] });
+    await api.deleteAgentTeamProfile('qa-team');
     expect(fetchMock).toHaveBeenCalledWith('/api/agents/assemble', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ task: 'build a review team' }),
     }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/team-profiles', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ id: 'qa-team', name: 'QA Team', members: ['planner'] }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/team-profiles/qa-team', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ name: 'QA Team', members: ['planner', 'reviewer'] }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents/team-profiles/qa-team', expect.objectContaining({ method: 'DELETE' }));
   });
 });

@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import DataTable from '../components/workbench/DataTable.vue';
 import EmptyState from '../components/workbench/EmptyState.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 import StatusPill from '../components/workbench/StatusPill.vue';
 
 const loading = ref(false);
@@ -272,6 +273,7 @@ onMounted(refresh);
           <button class="ghost-action" type="button" :disabled="!resourceRef" @click="revalidateResource">Revalidate resource</button>
           <button class="primary-action" type="button" :disabled="!resourceRef" @click="promoteResourceMemory">Promote to memory</button>
         </div>
+        <RequestReceipt :receipt="actionResult" title="Resource receipt" />
         <DataTable v-if="resourceRows.length" :rows="resourceRows" :columns="['reference', 'title', 'kind', 'status']" />
         <EmptyState v-else title="No connector resources" detail="资源桥接和记忆提升需要连接器返回资源。" />
       </section>
@@ -300,6 +302,7 @@ onMounted(refresh);
             Run preflight
           </button>
         </div>
+        <RequestReceipt :receipt="actionResult" title="Cross-plane readiness receipt" />
         <RawPayload title="Cross-plane summary" :data="state.crossPlane || {}" />
       </section>
 
@@ -317,6 +320,7 @@ onMounted(refresh);
           <button class="ghost-action" type="button" @click="resolveIdentity">Resolve identity</button>
           <button class="ghost-action" type="button" :disabled="!identityId" @click="revokeIdentity">Revoke identity</button>
         </div>
+        <RequestReceipt :receipt="actionResult" title="Identity receipt" />
         <DataTable v-if="identityRows.length" :rows="identityRows" :columns="['id', 'principal', 'identity', 'trust']" />
         <EmptyState v-else title="No identities" detail="创建身份绑定后，跨平面动作会使用可信主体判定。" />
         <label class="field-line">
@@ -327,6 +331,7 @@ onMounted(refresh);
           <button class="primary-action" type="button" @click="createGrant">Create grant</button>
           <button class="ghost-action" type="button" :disabled="!grantId" @click="revokeGrant">Revoke grant</button>
         </div>
+        <RequestReceipt :receipt="actionResult" title="Grant receipt" />
         <DataTable v-if="grantRows.length" :rows="grantRows" :columns="['id', 'principal', 'capability', 'type']" />
         <EmptyState v-else title="No grants" detail="授权为空时，高风险动作会被策略门禁拦截或要求审批。" />
       </section>
@@ -348,6 +353,7 @@ onMounted(refresh);
           <input v-model="idempotencyKey" type="text" placeholder="optional" />
         </label>
         <button class="primary-action" type="button" @click="executeCrossPlaneAction">Execute action</button>
+        <RequestReceipt :receipt="actionResult" title="Execution receipt" />
         <RawPayload title="Action readiness or receipt" :data="actionResult || {}" />
       </section>
 
@@ -358,6 +364,7 @@ onMounted(refresh);
         </header>
         <DataTable v-if="executionRows.length" :rows="executionRows" :columns="['id', 'status', 'capability', 'provider']" />
         <EmptyState v-else title="No executions" detail="跨平面动作执行后会在这里展示。" />
+        <RequestReceipt :receipt="actionResult" title="Gateway action receipt" />
         <RawPayload title="Gateway action result" :data="actionResult || state.audit || {}" />
       </section>
     </section>

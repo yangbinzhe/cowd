@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import type { ApiReceipt, ApiWriteError } from '../../api/client';
 import StatusPill from './StatusPill.vue';
 
@@ -10,8 +11,16 @@ const props = withDefaults(defineProps<{
   title: 'Request receipt',
 });
 
+const normalized = computed(() => {
+  const receipt = props.receipt as any;
+  if (!receipt || typeof receipt !== 'object') return null;
+  if (receipt.receipt && typeof receipt.receipt === 'object') return { ...receipt, ...receipt.receipt };
+  if (receipt.data?.receipt && typeof receipt.data.receipt === 'object') return { ...receipt, ...receipt.data.receipt };
+  return receipt;
+});
+
 function value(key: string) {
-  return props.receipt && typeof props.receipt === 'object' ? (props.receipt as any)[key] : undefined;
+  return normalized.value && typeof normalized.value === 'object' ? (normalized.value as any)[key] : undefined;
 }
 </script>
 

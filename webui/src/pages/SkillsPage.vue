@@ -4,6 +4,7 @@ import { FileText, RefreshCw, Search } from 'lucide-vue-next';
 import MarkdownIt from 'markdown-it';
 import { api } from '../api/client';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 
 const markdown = new MarkdownIt({ html: false, linkify: true, typographer: true });
 const loading = ref(false);
@@ -193,6 +194,7 @@ onMounted(refresh);
             <button class="ghost-action" type="button" @click="runAction('plan')">Plan</button>
             <button class="primary-action" type="button" @click="runAction('run')">Run</button>
           </div>
+          <RequestReceipt :receipt="actionResult" title="Skill action receipt" />
         </section>
 
         <section class="management-panel">
@@ -242,6 +244,7 @@ onMounted(refresh);
             </article>
           </div>
           <RawPayload title="Run detail" :data="runDetail || {}" />
+          <RequestReceipt :receipt="actionResult || runDetail" title="Skill run receipt" />
           <RawPayload title="Action result" :data="actionResult || { projection, runs }" />
         </section>
       </main>

@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import DataTable from '../components/workbench/DataTable.vue';
 import EmptyState from '../components/workbench/EmptyState.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 import StatusPill from '../components/workbench/StatusPill.vue';
 
 const loading = ref(false);
@@ -294,6 +295,7 @@ onMounted(refresh);
                 <button class="ghost-action" type="button" :disabled="!selectedEntry" @click="updateEntry">Update selected</button>
                 <button class="ghost-action" type="button" :disabled="!selectedEntry" @click="deleteEntry">Archive selected</button>
               </div>
+              <RequestReceipt :receipt="actionResult" title="Memory layer receipt" />
             </article>
           </div>
         </section>
@@ -346,6 +348,7 @@ onMounted(refresh);
             <span>{{ candidateRows.length }} candidates</span>
           </header>
           <button class="primary-action" type="button" @click="scanMaintenance">Scan candidates</button>
+          <RequestReceipt :receipt="maintenanceScan || actionResult" title="Maintenance receipt" />
           <div class="maintenance-list">
             <article v-for="candidate in candidateRows.slice(0, 12)" :key="candidate.id || candidate.memory_id">
               <div>
@@ -359,6 +362,7 @@ onMounted(refresh);
             </article>
           </div>
           <EmptyState v-if="!candidateRows.length" title="No maintenance candidates" detail="扫描后会列出陈旧、冲突、重复和权威提升候选。" />
+          <RequestReceipt :receipt="actionResult" title="Maintenance action receipt" />
           <RawPayload title="Performance" :data="performance" />
         </section>
 
@@ -379,15 +383,17 @@ onMounted(refresh);
             </label>
           </div>
           <button class="primary-action" type="button" @click="planStructuredIngest">Plan manufacturing ingest</button>
+          <RequestReceipt :receipt="structuredPlan" title="Structured ingest plan receipt" />
           <RawPayload title="Structured collections" :data="structured" />
           <RawPayload title="Ingest plan" :data="structuredPlan || {}" />
         </section>
 
         <section class="management-panel memory-panel">
           <header>
-            <h2>Action evidence</h2>
-            <span>latest write response</span>
-          </header>
+          <h2>Action evidence</h2>
+          <span>latest write response</span>
+        </header>
+          <RequestReceipt :receipt="actionResult || structuredPlan" title="Memory action receipt" />
           <RawPayload title="Action result" :data="actionResult || searchResult" />
         </section>
       </main>

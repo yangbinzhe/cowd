@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import DataTable from '../components/workbench/DataTable.vue';
 import EmptyState from '../components/workbench/EmptyState.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
+import RequestReceipt from '../components/workbench/RequestReceipt.vue';
 
 const loading = ref(false);
 const error = ref('');
@@ -145,6 +146,7 @@ onMounted(refresh);
           <Play :size="15" />
           Execute command
         </button>
+        <RequestReceipt :receipt="result" title="Command receipt" />
         <DataTable v-if="commandRows.length" :rows="commandRows" :columns="['name', 'action', 'target', 'description']" />
       </section>
 
@@ -168,6 +170,7 @@ onMounted(refresh);
             Run preflight
           </button>
         </div>
+        <RequestReceipt :receipt="result" title="Risk receipt" />
       </section>
 
       <section class="management-panel gateway-panel" data-section="path-links">
@@ -177,6 +180,7 @@ onMounted(refresh);
         </header>
         <DataTable v-if="historyRows.length" :rows="historyRows" :columns="['command', 'action', 'target', 'at']" />
         <EmptyState v-else title="No command history" detail="命令执行后会记录在后端历史中。" />
+        <RequestReceipt :receipt="result" title="Tool action receipt" />
         <RawPayload title="Tool action result" :data="result || state.capabilities || {}" />
       </section>
     </section>

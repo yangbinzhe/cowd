@@ -453,6 +453,17 @@ export const api = {
   }),
   agentReputation: () => read('/api/agents/reputation', { items: [], summary: {} }),
   agentRuns: () => read('/api/agents/runs', { runs: [] }),
+  agentTeamProfiles: () => read('/api/agents/team-profiles', { profiles: [] }),
+  agentTeamProfile: (id: string) => read(`/api/agents/team-profiles/${encodeURIComponent(id)}`, {}),
+  createAgentTeamProfile: (body: Record<string, unknown>) => write('/api/agents/team-profiles', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  updateAgentTeamProfile: (id: string, body: Record<string, unknown>) => write(`/api/agents/team-profiles/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  }),
+  deleteAgentTeamProfile: (id: string) => write(`/api/agents/team-profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   taskAgentGraph: (id: string) => read(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, { nodes: [] }),
   upsertTaskAgentGraph: (id: string, body: Record<string, unknown>) => write(`/api/tasks/${encodeURIComponent(id)}/agent-graph`, {
     method: 'POST',
