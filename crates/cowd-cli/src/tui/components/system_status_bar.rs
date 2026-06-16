@@ -285,8 +285,9 @@ mod tests {
 
         let joined = terminal.buffer_lines().join("\n");
         assert!(joined.contains("cowd"));
-        assert!(joined.contains("provider"));
-        assert!(joined.contains("turn"));
+        assert!(joined.contains("session"));
+        assert!(joined.contains("state"));
+        assert!(!joined.contains("provider"));
         assert!(!joined.contains("gateway"));
         assert!(!joined.contains("connectors"));
         assert!(!joined.contains("memory"));

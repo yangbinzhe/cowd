@@ -477,7 +477,9 @@ fn status_section_visible_for_width(id: &str, available: u16) -> bool {
         "model" | "context" => true,
         "approvals" | "permission_status" => available >= 120,
         "input_hint" => available >= 150,
-        _ => available >= 132,
+        "search" | "history" | "compaction" | "cache" | "task" | "lease" | "wave"
+        | "reputation" | "mcp_status" | "lsp_status" => available >= 132,
+        _ => true,
     }
 }
 
@@ -592,12 +594,13 @@ mod tests {
     fn with_default_sections_has_all_parts() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"version"));
         assert!(ids.contains(&"model"));
         assert!(ids.contains(&"context"));
         assert!(ids.contains(&"approvals"));
         assert!(ids.contains(&"permission_status"));
-        assert!(ids.contains(&"session"));
+        assert!(!ids.contains(&"version"));
+        assert!(!ids.contains(&"session"));
+        assert!(!ids.contains(&"focus"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
         assert!(ids.contains(&"input_hint"));
@@ -753,7 +756,9 @@ mod tests {
 
     #[test]
     fn render_default_status_suppresses_low_priority_sections_on_medium_width() {
-        let app = App::new("deepseek-v4-pro", "session-status-medium");
+        let mut app = App::new("deepseek-v4-pro", "session-status-medium");
+        app.context_window = 200_000;
+        app.token_count = 50_000;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
