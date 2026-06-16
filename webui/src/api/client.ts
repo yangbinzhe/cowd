@@ -19,7 +19,7 @@ export interface EndpointSnapshot extends ApiOffline {
 
 function headers(init: RequestInit = {}) {
   const headers = new Headers(init.headers);
-  if (!headers.has('Content-Type') && init.body) headers.set('Content-Type', 'application/json');
+  if (!headers.has('Content-Type') && init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = authToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
   return headers;
@@ -201,6 +201,29 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ path, content }),
   }),
+  uploadFile: (file: File, dir = '', overwrite = false) => {
+    const body = new FormData();
+    body.set('file', file);
+    body.set('dir', dir);
+    body.set('overwrite', overwrite ? 'true' : 'false');
+    return write('/api/upload', { method: 'POST', body });
+  },
+  createDir: (path: string) => write('/api/workspace/dirs', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  }),
+  deleteWorkspacePath: (path: string) => write(`/api/workspace/files?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
+  renameWorkspacePath: (path: string, to: string) => write('/api/workspace/rename', {
+    method: 'POST',
+    body: JSON.stringify({ path, to }),
+  }),
+  workspaceMeta: (path: string) => read(`/api/workspace/meta?path=${encodeURIComponent(path)}`, {}),
+  sessionAttachments: (sessionId: string) => read(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, { attachments: [] }),
+  addSessionAttachment: (sessionId: string, path: string, label = '') => write(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+    method: 'POST',
+    body: JSON.stringify({ path, label: label || path, kind: 'workspace_file' }),
+  }),
+  deleteSessionAttachment: (sessionId: string, refId: string) => write(`/api/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(refId)}`, { method: 'DELETE' }),
   runtimeTimeline: (sessionId: string) => read(`/api/runtime/timeline?session_id=${encodeURIComponent(sessionId)}&limit=50`, { events: [] }),
   runtimeControlPlane: () => read('/api/runtime/control-plane', {}),
   providers: () => read('/api/config/providers', { providers: [], models: [] }),

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import { api, normalizeActivity, providerModels, type EndpointSnapshot } from '../api/client';
-import type { ActivityEvent, ChatTurn, CompanionTab, NavId, SessionSummary, WorkspaceFile } from '../types';
+import type { ActivityEvent, ChatTurn, CompanionTab, NavId, SessionAttachment, SessionSummary, WorkspaceFile } from '../types';
 
 function blockText(block: any): string {
   if (!block) return '';
@@ -30,11 +30,13 @@ export const useAppStore = defineStore('app', () => {
   const workspaceRoot = ref('');
   const workspaceDir = ref('');
   const workspaceFiles = ref<WorkspaceFile[]>([]);
+  const attachments = ref<SessionAttachment[]>([]);
   const selectedFile = ref('');
   const selectedFileContent = ref('');
   const editorContent = ref('');
   const workspaceFilter = ref('');
   const fileError = ref('');
+  const uploadBusy = ref(false);
   const settingsSavedAt = ref('');
   const activeSectionByPage = ref<Record<string, string>>({});
   const activeModal = ref<'model' | 'workspace' | 'commands' | null>(null);
@@ -96,6 +98,7 @@ export const useAppStore = defineStore('app', () => {
     await Promise.all([
       activeSessionId.value ? loadMessages(activeSessionId.value) : Promise.resolve(),
       loadWorkspace(''),
+      activeSessionId.value ? loadAttachments(activeSessionId.value) : Promise.resolve(),
       loadActivity(),
     ]);
     busy.value = false;
@@ -115,6 +118,7 @@ export const useAppStore = defineStore('app', () => {
     }));
     if (!turns.value.length) turns.value = [{ id: 'empty', role: 'system', content: '当前 session 暂无消息。', status: 'complete' }];
     connectSessionStream(sessionId);
+    await loadAttachments(sessionId);
   }
 
   async function refreshSessions(query = sessionQuery.value) {
@@ -130,6 +134,7 @@ export const useAppStore = defineStore('app', () => {
     activeSessionId.value = session.id;
     selectedModel.value = session.model || selectedModel.value;
     turns.value = [{ id: `system-${Date.now()}`, role: 'system', content: '新会话已创建。', status: 'complete' }];
+    attachments.value = [];
     connectSessionStream(session.id);
   }
 
@@ -159,7 +164,8 @@ export const useAppStore = defineStore('app', () => {
     companionTab.value = 'activity';
     activity.value.unshift({ id: `send-${Date.now()}`, kind: 'runtime', title: 'Message queued', detail: content.slice(0, 140), status: 'pending' });
     try {
-      await api.sendMessage(activeSessionId.value, content);
+      const contentWithAttachments = renderMessageWithAttachments(content);
+      await api.sendMessage(activeSessionId.value, contentWithAttachments);
       await loadMessages(activeSessionId.value);
       await loadActivity();
     } catch (error) {
@@ -332,6 +338,80 @@ export const useAppStore = defineStore('app', () => {
     selectedFileContent.value = await api.rawFile(path);
     editorContent.value = selectedFileContent.value;
     companionTab.value = 'workspace';
+  }
+
+  async function loadAttachments(sessionId = activeSessionId.value) {
+    if (!sessionId) {
+      attachments.value = [];
+      return;
+    }
+    const data: any = await api.sessionAttachments(sessionId);
+    attachments.value = data.attachments || [];
+  }
+
+  async function attachWorkspaceFile(path = selectedFile.value) {
+    if (!path) return;
+    if (!activeSessionId.value) await createSession();
+    try {
+      const result: any = await api.addSessionAttachment(activeSessionId.value, path, path);
+      attachments.value = [result.attachment, ...attachments.value.filter((item) => item.path !== path)];
+      activity.value.unshift({ id: `attachment-${Date.now()}`, kind: 'context', title: 'Attachment added', detail: path, status: 'complete' });
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function removeAttachment(refId: string) {
+    if (!activeSessionId.value) return;
+    await api.deleteSessionAttachment(activeSessionId.value, refId);
+    attachments.value = attachments.value.filter((item) => item.ref_id !== refId);
+  }
+
+  async function uploadWorkspaceFile(file: File, dir = workspaceDir.value) {
+    uploadBusy.value = true;
+    fileError.value = '';
+    try {
+      const result: any = await api.uploadFile(file, dir);
+      await loadWorkspace(dir);
+      activity.value.unshift({ id: `upload-${Date.now()}`, kind: 'context', title: 'File uploaded', detail: `${result.path} (${result.size} bytes)`, status: 'complete' });
+      return result;
+    } catch (error) {
+      fileError.value = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      uploadBusy.value = false;
+    }
+  }
+
+  async function createWorkspaceDir(name: string) {
+    const path = [workspaceDir.value, name.trim()].filter(Boolean).join('/');
+    await api.createDir(path);
+    await loadWorkspace(workspaceDir.value);
+  }
+
+  async function deleteWorkspacePath(path: string) {
+    await api.deleteWorkspacePath(path);
+    if (selectedFile.value === path) {
+      selectedFile.value = '';
+      selectedFileContent.value = '';
+      editorContent.value = '';
+    }
+    await loadWorkspace(workspaceDir.value);
+  }
+
+  async function renameWorkspacePath(path: string, to: string) {
+    const result: any = await api.renameWorkspacePath(path, to);
+    if (selectedFile.value === path) selectedFile.value = result.to || to;
+    await loadWorkspace(workspaceDir.value);
+    return result;
+  }
+
+  function renderMessageWithAttachments(content: string) {
+    if (!attachments.value.length) return content;
+    const refs = attachments.value
+      .map((item) => `- workspace://file/${item.path} (${item.label || item.path}, ${item.sha256})`)
+      .join('\n');
+    return `${content}\n\nContext attachments:\n${refs}`;
   }
 
   async function saveFile() {
@@ -511,12 +591,14 @@ export const useAppStore = defineStore('app', () => {
     workspaceRoot,
     workspaceDir,
     workspaceFiles,
+    attachments,
     workspaceFilter,
     filteredWorkspaceFiles,
     selectedFile,
     selectedFileContent,
     editorContent,
     fileError,
+    uploadBusy,
     settingsSavedAt,
     activeSectionByPage,
     activeModal,
@@ -544,6 +626,13 @@ export const useAppStore = defineStore('app', () => {
     loadActivity,
     loadWorkspace,
     openFile,
+    loadAttachments,
+    attachWorkspaceFile,
+    removeAttachment,
+    uploadWorkspaceFile,
+    createWorkspaceDir,
+    deleteWorkspacePath,
+    renameWorkspacePath,
     saveFile,
     resetFile,
     openCompanion,

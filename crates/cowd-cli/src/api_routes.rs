@@ -2380,6 +2380,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_upload_meta_delete_and_attachments_are_real() {
+        let workspace = test_temp_dir("workspace-upload");
+        let config_home = test_temp_dir("workspace-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let mkdir_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workspace/dirs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"uploads"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mkdir_response.status(), StatusCode::CREATED);
+
+        let boundary = "cowd-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"dir\"\r\n\r\nuploads\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.md\"\r\nContent-Type: text/markdown\r\n\r\n# uploaded\r\n\r\n--{boundary}--\r\n"
+        );
+        let upload_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_response.status(), StatusCode::CREATED);
+        let body = to_bytes(upload_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "uploads/sample.md");
+        assert!(json["sha256"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("uploads/sample.md")).unwrap(),
+            "# uploaded\r\n"
+        );
+
+        let meta_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/meta?path=uploads%2Fsample.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta_response.status(), StatusCode::OK);
+        let body = to_bytes(meta_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["item"]["path"], "uploads/sample.md");
+
+        let add_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/session-1/attachments")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"path":"uploads/sample.md","label":"Uploaded markdown"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_attachment.status(), StatusCode::CREATED);
+        let body = to_bytes(add_attachment.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ref_id = json["attachment"]["ref_id"].as_str().unwrap().to_string();
+        assert_eq!(json["attachment"]["path"], "uploads/sample.md");
+
+        let list_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/session-1/attachments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_attachment.status(), StatusCode::OK);
+        let body = to_bytes(list_attachment.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["count"], 1);
+
+        let delete_attachment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/session-1/attachments/{ref_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_attachment.status(), StatusCode::OK);
+
+        let delete_file = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/workspace/files?path=uploads%2Fsample.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_file.status(), StatusCode::OK);
+        assert!(!workspace.join("uploads/sample.md").exists());
+    }
+
+    #[tokio::test]
     async fn profile_api_creates_switches_and_deletes_profiles() {
         let app = api_router(test_state());
 

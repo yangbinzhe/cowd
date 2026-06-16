@@ -46,6 +46,16 @@ export interface WorkspaceFile {
   modified?: string;
 }
 
+export interface SessionAttachment {
+  ref_id: string;
+  kind: string;
+  path: string;
+  label: string;
+  size: number;
+  sha256: string;
+  added_at_ms: number;
+}
+
 export interface Metric {
   label: string;
   value: string | number;

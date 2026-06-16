@@ -78,6 +78,7 @@ async function chooseCommand(command: any) {
         <div class="composer-context">
           <button type="button" class="composer-chip" @click="store.openModal('workspace')"><Folder :size="14" /> {{ store.workspaceDir || 'root' }}</button>
           <button type="button" class="composer-chip" @click="store.openModal('model')"><Bot :size="14" /> {{ store.selectedProfile }}</button>
+          <button v-if="store.attachments.length" type="button" class="composer-chip" @click="store.openCompanion('workspace')"><Paperclip :size="14" /> {{ store.attachments.length }} sources</button>
           <span>Context {{ contextUsage }}%</span>
           <div class="context-meter"><i :style="{ width: `${contextUsage}%` }" /></div>
         </div>

@@ -17,6 +17,8 @@ test('workspace tab supports folder browsing and editable preview surface', asyn
   await page.goto('/index.html#/chat');
   await page.getByRole('button', { name: 'Workspace' }).click();
   await expect(page.locator('.workspace-root')).toBeVisible();
+  await expect(page.locator('.upload-drop')).toContainText('Drop files here');
+  await expect(page.getByPlaceholder('New folder')).toBeVisible();
   await expect(page.locator('.breadcrumbs')).toBeVisible();
   await expect(page.getByRole('button', { name: /Parent folder/ })).toBeVisible();
   await expect(page.locator('.file-row')).toHaveCount(0);

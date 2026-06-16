@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue';
-import { ChevronUp, Eye, FileText, Folder, RotateCcw, Save, Search, Workflow } from 'lucide-vue-next';
+import { computed, ref } from 'vue';
+import { ChevronUp, Eye, FilePlus2, FileText, Folder, FolderPlus, Link2, RotateCcw, Save, Search, Trash2, Upload, Workflow, X } from 'lucide-vue-next';
 import { useAppStore } from '../stores/app';
 import MarkdownBlock from './MarkdownBlock.vue';
 
 const store = useAppStore();
+const newFolderName = ref('');
+const fileInput = ref<HTMLInputElement | null>(null);
 
 const breadcrumbs = computed(() => {
   const parts = store.workspaceDir.split('/').filter(Boolean);
@@ -30,6 +32,26 @@ const canEdit = computed(() => !!store.selectedFile && !isImage.value);
 function openFile(path: string, kind: string) {
   if (kind === 'dir') store.loadWorkspace(path);
   else store.openFile(path);
+}
+
+async function createFolder() {
+  const name = newFolderName.value.trim();
+  if (!name) return;
+  await store.createWorkspaceDir(name);
+  newFolderName.value = '';
+}
+
+async function uploadFiles(files: FileList | null) {
+  if (!files?.length) return;
+  for (const file of Array.from(files)) {
+    await store.uploadWorkspaceFile(file);
+  }
+  if (fileInput.value) fileInput.value.value = '';
+}
+
+async function dropUpload(event: DragEvent) {
+  event.preventDefault();
+  await uploadFiles(event.dataTransfer?.files || null);
 }
 </script>
 
@@ -68,6 +90,30 @@ function openFile(path: string, kind: string) {
         <span>{{ store.workspaceFiles.length }} items</span>
       </div>
       <div class="workspace-root" :title="store.workspaceRoot">{{ store.workspaceRoot || 'gateway workspace' }}</div>
+      <div class="upload-drop" @dragover.prevent @drop="dropUpload">
+        <Upload :size="16" />
+        <span>{{ store.uploadBusy ? 'Uploading...' : 'Drop files here' }}</span>
+        <button type="button" @click="fileInput?.click()">Choose files</button>
+        <input ref="fileInput" type="file" multiple @change="uploadFiles(($event.target as HTMLInputElement).files)" />
+      </div>
+      <div class="workspace-create">
+        <label>
+          <FolderPlus :size="14" />
+          <input v-model="newFolderName" type="text" placeholder="New folder" @keydown.enter.prevent="createFolder" />
+        </label>
+        <button class="icon-action" type="button" :disabled="!newFolderName.trim()" @click="createFolder"><FilePlus2 :size="14" /></button>
+      </div>
+      <div v-if="store.attachments.length" class="attachment-list">
+        <div class="panel-title compact">
+          <h2>Context sources</h2>
+          <span>{{ store.attachments.length }}</span>
+        </div>
+        <article v-for="attachment in store.attachments" :key="attachment.ref_id" class="attachment-row">
+          <Link2 :size="14" />
+          <span>{{ attachment.label || attachment.path }}</span>
+          <button class="icon-action" type="button" @click="store.removeAttachment(attachment.ref_id)"><X :size="13" /></button>
+        </article>
+      </div>
       <nav class="breadcrumbs" aria-label="Workspace breadcrumbs">
         <button v-for="crumb in breadcrumbs" :key="crumb.path || 'root'" type="button" @click="store.loadWorkspace(crumb.path)">
           {{ crumb.label }}
@@ -82,23 +128,25 @@ function openFile(path: string, kind: string) {
         <input v-model="store.workspaceFilter" type="search" placeholder="Filter files" />
       </label>
       <div class="file-list">
-        <button
+        <article
           v-for="file in store.filteredWorkspaceFiles"
           :key="file.path"
           class="file-row"
-          type="button"
-          @click="openFile(file.path, file.kind)"
         >
-          <Folder v-if="file.kind === 'dir'" :size="16" />
-          <FileText v-else :size="16" />
-          <span>{{ file.name }}</span>
+          <button type="button" @click="openFile(file.path, file.kind)">
+            <Folder v-if="file.kind === 'dir'" :size="16" />
+            <FileText v-else :size="16" />
+            <span>{{ file.name }}</span>
+          </button>
           <small>{{ file.kind }}</small>
-        </button>
+          <button class="icon-action" type="button" @click="store.deleteWorkspacePath(file.path)"><Trash2 :size="13" /></button>
+        </article>
       </div>
       <div class="preview-pane" v-if="store.selectedFile">
         <div class="preview-head">
           <strong>{{ store.selectedFile }}</strong>
           <div>
+            <button class="icon-action" type="button" @click="store.attachWorkspaceFile(store.selectedFile)"><Link2 :size="14" /></button>
             <button class="icon-action" type="button" :disabled="!store.editorDirty || !canEdit" @click="store.resetFile"><RotateCcw :size="14" /></button>
             <button class="icon-action" type="button" :disabled="!store.editorDirty || !canEdit" @click="store.saveFile"><Save :size="14" /></button>
           </div>

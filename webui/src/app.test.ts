@@ -4,6 +4,7 @@ import { nextTick } from 'vue';
 import { createRouter, createWebHashHistory } from 'vue-router';
 import { describe, expect, it, vi } from 'vitest';
 import App from './App.vue';
+import { api } from './api/client';
 import ChatPage from './pages/ChatPage.vue';
 import CapabilityPage from './pages/CapabilityPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
@@ -70,5 +71,25 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.findAll('.action-button').length).toBe(0);
     expect(wrapper.text()).toContain('Live endpoint contract');
     expect(wrapper.text()).toContain('Offline/Error');
+  });
+
+  it('uploads files as multipart form data without fake success', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ uploaded: true, path: 'uploads/sample.md' }), { status: 201 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.uploadFile(new File(['# sample'], 'sample.md', { type: 'text/markdown' }), 'uploads');
+    expect(fetchMock).toHaveBeenCalledWith('/api/upload', expect.objectContaining({ method: 'POST' }));
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.body).toBeInstanceOf(FormData);
+    expect(new Headers(init.headers).has('Content-Type')).toBe(false);
+  });
+
+  it('adds session attachments through the backend endpoint', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ attachment: { ref_id: 'att-1', path: 'docs/a.md' } }), { status: 201 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.addSessionAttachment('session-1', 'docs/a.md', 'A doc');
+    expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1/attachments', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ path: 'docs/a.md', label: 'A doc', kind: 'workspace_file' }),
+    }));
   });
 });
