@@ -31,9 +31,6 @@ pub const REACTION_CROSS_MARK: &str = "CrossMark";
 /// Default maximum number of pending reaction entries before LRU eviction.
 const DEFAULT_MAX_CACHE: usize = 1024;
 
-/// Base URL for Feishu Open API.
-const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
-
 // ---------------------------------------------------------------------------
 // ProcessingReactions
 // ---------------------------------------------------------------------------
@@ -254,7 +251,11 @@ impl ProcessingReactions {
         emoji_type: &str,
     ) -> PlatformResult<String> {
         let client = reqwest::Client::new();
-        let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reactions");
+        let url = format!(
+            "{}/im/v1/messages/{}/reactions",
+            super::api_base_url(),
+            message_id
+        );
         let body = CreateReactionRequest {
             reaction_type: ReactionType {
                 emoji_type: emoji_type.to_string(),
@@ -302,7 +303,12 @@ impl ProcessingReactions {
         reaction_id: &str,
     ) -> PlatformResult<()> {
         let client = reqwest::Client::new();
-        let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reactions/{reaction_id}");
+        let url = format!(
+            "{}/im/v1/messages/{}/reactions/{}",
+            super::api_base_url(),
+            message_id,
+            reaction_id
+        );
 
         let response = client
             .delete(&url)

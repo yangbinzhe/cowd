@@ -167,8 +167,8 @@ impl DocumentClient {
     }
 
     /// Get the base URL for Feishu document API.
-    fn doc_api_base() -> &'static str {
-        "https://open.feishu.cn/open-apis/docx/v1/documents"
+    fn doc_api_base() -> String {
+        format!("{}/docx/v1/documents", super::api_base_url())
     }
 
     /// Get document metadata.
@@ -745,7 +745,10 @@ impl DocumentClient {
         }
 
         let response = client
-            .get("https://open.feishu.cn/open-apis/suite/docs-api/search/object")
+            .get(format!(
+                "{}/suite/docs-api/search/object",
+                super::api_base_url()
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .query(&query_params)
             .send()

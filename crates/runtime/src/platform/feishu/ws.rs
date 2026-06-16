@@ -111,6 +111,7 @@ struct ClientConfigData {
 pub struct FeishuWsClient {
     app_id: String,
     app_secret: String,
+    base_url: String,
     reconnect_max_attempts: u32,
     reconnect_interval_secs: u64,
 }
@@ -122,9 +123,16 @@ impl FeishuWsClient {
         Self {
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
+            base_url: "https://open.feishu.cn".to_string(),
             reconnect_max_attempts: 30,
             reconnect_interval_secs: 120,
         }
+    }
+
+    /// Set the base API domain (e.g. "https://open.larksuite.com" for Lark).
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into().trim_end_matches('/').to_string();
+        self
     }
 
     /// Override reconnect behaviour.
@@ -148,7 +156,7 @@ impl FeishuWsClient {
     /// Drop the receiver to trigger graceful shutdown.
     pub async fn connect(&self) -> PlatformResult<mpsc::UnboundedReceiver<serde_json::Value>> {
         // Register pin — get WebSocket URL and client config
-        let result = register_pin(&self.app_id, &self.app_secret).await?;
+        let result = register_pin(&self.app_id, &self.app_secret, &self.base_url).await?;
         let ws_url = result.ws_url;
         let ping_interval_secs = result.ping_interval.map(|v| v.max(1) as u64).unwrap_or(90);
 
@@ -158,6 +166,7 @@ impl FeishuWsClient {
         // Spawn background reader with reconnect loop
         let app_id = self.app_id.clone();
         let app_secret = self.app_secret.clone();
+        let base_url = self.base_url.clone();
         let max_attempts = self.reconnect_max_attempts;
         let interval_secs = self.reconnect_interval_secs;
 
@@ -166,6 +175,7 @@ impl FeishuWsClient {
                 ws_url,
                 app_id,
                 app_secret,
+                base_url,
                 tx,
                 max_attempts,
                 interval_secs,
@@ -186,11 +196,16 @@ impl FeishuWsClient {
 ///
 /// POST `https://open.feishu.cn/callback/ws/endpoint` with AppID/AppSecret in body
 /// (NO Bearer token).  Returns [`RegisterResult`] with the WS URL and client config.
-pub async fn register_pin(app_id: &str, app_secret: &str) -> PlatformResult<RegisterResult> {
+pub async fn register_pin(
+    app_id: &str,
+    app_secret: &str,
+    base_url: &str,
+) -> PlatformResult<RegisterResult> {
     let client = reqwest::Client::new();
+    let endpoint = format!("{}/callback/ws/endpoint", base_url);
 
     let resp = client
-        .post("https://open.feishu.cn/callback/ws/endpoint")
+        .post(&endpoint)
         .header("locale", "zh")
         .json(&serde_json::json!({
             "AppID": app_id,
@@ -250,6 +265,7 @@ async fn reader_loop(
     mut ws_url: String,
     app_id: String,
     app_secret: String,
+    base_url: String,
     tx: mpsc::UnboundedSender<serde_json::Value>,
     max_attempts: u32,
     interval_secs: u64,
@@ -272,7 +288,7 @@ async fn reader_loop(
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
 
             // Re-register on every reconnect
-            match register_pin(&app_id, &app_secret).await {
+            match register_pin(&app_id, &app_secret, &base_url).await {
                 Ok(result) => {
                     ws_url = result.ws_url;
                     if let Some(pi) = result.ping_interval {

@@ -1,8 +1,8 @@
 # Cowd
 
-Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Connector、Cross-plane 治理和 IACC 结构化运营智能。
+Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、IACC 结构化运营智能和生产 Release Gate。
 
-当前版本：`0.9.108`
+当前版本：`0.9.200`
 
 当前安装约定：
 
@@ -108,7 +108,7 @@ Gateway 静态资源解析顺序：
 
 ## 2. 顶层框架逻辑
 
-Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、WebUI 和外部渠道都只是 runtime 的不同投影。
+Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、WebUI 和外部渠道都只是 runtime 的不同投影。所有能力通过 Capability Registry 注册，按 WebUI/TUI/CLI 三表面投影，并由 Surface Parity Contract 保障一致性。
 
 ```text
 用户入口
@@ -124,8 +124,12 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
   ├─ Memory System
   ├─ Tool Runtime
   ├─ Skill Registry + Skill Action API
+  ├─ Capability Registry + Projection
+  ├─ Structured Data Core
+  ├─ Execution Outcome Bridge
   ├─ Connector Runtime
   ├─ Cross-plane Governance
+  ├─ Release Gate
   └─ IACC Operating Intelligence
 
 持久化
@@ -143,6 +147,7 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
 - CLI 保持极简，不承担复杂状态管理。
 - Skills 的发现、投影、执行统一走 `/api/skills/*`。
 - IACC 的领域能力保留专用 API，同时通过 Skills Action API 对外统一。
+- 所有能力通过 Capability Registry 声明，三表面投影由 Surface Parity Contract 保障。
 
 ---
 
@@ -178,6 +183,8 @@ crates/tools
 - 静态 WebUI 服务
 - Session lifecycle 接入
 - IACC API 接入
+- Capability / Projection / Release Gate API 接入
+- Structured Data API 接入
 - TUI panel 状态构建
 - install / doctor / setup / init / export / import-session 等本地命令
 
@@ -189,6 +196,7 @@ crates/tools
 | `src/daemon/mod.rs` | HTTP daemon / Gateway 服务 |
 | `src/api_routes.rs` | API route 聚合 |
 | `src/api_routes/*.rs` | 各业务域 API |
+| `src/api_routes/cowd_routes.rs` | Capability、Projection、Release Gate、Structured Data API |
 | `src/gateway_static.rs` | WebUI 静态资源解析 |
 | `src/gateway_health.rs` | Gateway 健康和 ready 状态 |
 | `src/session_kernel.rs` | Session 运行时基础 |
@@ -206,15 +214,34 @@ crates/tools
 - 工具调用 runtime 抽象
 - MCP stdio / OAuth / connector 基础
 - 平台和 channel 类型
+- Capability Registry + Surface Projection
+- Structured Data Core（Source、Mapping、Fact、Evidence、Ingest、Watermark）
+- Execution Outcome Bridge（Tool/Agent/Task/Manufacturing）
+- Graph Quality Contracts
+- Tool Execution Plans
+- Tool Memory（工具事实到记忆候选）
+- Release Gate（证据驱动发布门）
 - IACC 领域模型、store、skill pack
-- server manufacturing domain pack
-- skill plan/run 逻辑
+- server manufacturing domain pack + app descriptor
+- skill plan/run/activation/dependency/memory 逻辑
 
 重要目录：
 
 | 路径 | 说明 |
 |---|---|
+| `src/capability.rs` | Capability 注册和声明 |
+| `src/projection.rs` | 按表面投影能力 |
+| `src/surface_contract.rs` | Surface Parity Contract |
+| `src/structured_data.rs` | Structured Data 核心契约 |
+| `src/execution_outcome.rs` | 执行结果统一桥接 |
+| `src/graph_contract.rs` | Graph 质量契约 |
+| `src/tool_execution_plan.rs` | 可解释批量工具执行计划 |
+| `src/tool_memory.rs` | 工具事实到记忆候选的策略转换 |
+| `src/release_gate.rs` | 证据驱动发布门 |
+| `src/gates.rs` | PreFlight/Revision/Escalation/Abort Gate 机制 |
+| `src/green_contract.rs` | Green 合约分级 |
 | `src/iacc/*` | IACC 结构化运营智能 |
+| `src/iacc/app.rs` | IACC 应用描述器 |
 | `src/platform/*` | 平台和 channel 类型 |
 | `src/mcp_stdio.rs` | MCP stdio 管理 |
 | `src/connector.rs` | Connector 基础 |
@@ -331,7 +358,7 @@ WebUI 位于 `webui/`，由 Gateway 静态服务直接提供。
 | `sessions.js` | session 列表、创建、搜索 |
 | `messages.js` | 消息发送、stream、渲染 |
 | `workspace.js` | 文件树和 workspace API |
-| `panels.js` | 右侧功能面板，Memory、Runtime、Context、Skills、IACC、Gateway 等 |
+| `panels.js` | 右侧功能面板，Memory、Runtime、Context、Skills、IACC、Cowd IACC Workbench 等 |
 | `commands.js` | WebUI slash command autocomplete 和执行 |
 | `ui.js` | 通用 UI helper、toast、modal、markdown |
 | `style.css` | 设计系统和全部面板样式 |
@@ -344,6 +371,7 @@ WebUI 的定位：
 - 适合复杂状态、表格、过滤、详情、批量操作
 - 当前 Skills 面板已经支持 catalog、projection、detail、validate、plan、run、runs、watch
 - IACC 面板用于领域运营智能的 command center、incident、report、cockpit
+- Cowd IACC Workbench 面板用于 manufacturing 应用的全闭环运营
 
 ---
 
@@ -444,7 +472,24 @@ curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/r
 
 Local skill 的 action 当前返回 `unsupported_for_local_skill`。这是有意设计：local skill 在 CLI 侧保留 list/view/install/invoke，不承担 IACC 状态管理。
 
-### 5.5 IACC API
+### 5.5 Cowd Capability / Structured Data API
+
+Cowd 自身的能力、投影和结构化数据 API：
+
+| API | 用途 |
+|---|---|
+| `GET /api/cowd/capabilities` | Capability Registry 全集 |
+| `GET /api/cowd/projection?surface=webui` | 按表面投影 |
+| `GET /api/cowd/surfaces` | Surface Parity Contract |
+| `GET /api/cowd/release-gate` | Release Gate 报告 |
+| `GET /api/cowd/structured/sources` | 结构化数据源列表 |
+| `GET /api/cowd/structured/sources/:id` | 结构化数据源详情 |
+| `POST /api/cowd/structured/ingest-plan` | 创建数据摄入计划 |
+| `GET /api/cowd/structured/facts` | 结构化事实列表 |
+| `GET /api/cowd/structured/evidence` | 结构化证据列表 |
+| `GET /api/cowd/structured/watermarks` | 数据水位列表 |
+
+### 5.6 IACC API
 
 IACC API 是结构化运营智能的领域实现层。
 
@@ -554,10 +599,10 @@ TUI 是控制台式全能力入口，适合键盘操作和本地开发循环。
 
 | 区域 | 用途 |
 |---|---|
-| Chat | 对话和任务执行 |
+| Chat | 对话和任务执行（支持 inline thinking、结构化摘要、流式输出） |
 | Files | workspace 文件浏览 |
 | Memory | 记忆条目和上下文 |
-| Runtime | runtime activity |
+| Runtime | runtime activity（含工具进程面板） |
 | Context | 当前上下文、证据、推荐 |
 | Skills | skill 全集、action availability |
 | Agents | agent 和子任务 |
@@ -605,6 +650,8 @@ Skills panel 控制台操作：
 - TUI 当前以控制台方式显示 action availability。
 - 真正的 IACC skill action 通过统一 Skills API 和 incident id 执行。
 - local skills 保持 view/import/invoke 边界，不做状态 run。
+- TUI 支持 inline thinking 渲染和流式输出稳定性。
+- 启动时保持状态和记忆面板稳定性。
 
 ---
 
@@ -625,6 +672,7 @@ WebUI 适合浏览器增强管理：
 - runtime timeline
 - skills 管理
 - IACC command center
+- Cowd IACC Workbench（manufacturing 全闭环运营）
 - connector console
 - cross-plane governance
 - approvals
@@ -674,7 +722,20 @@ IACC skill 执行流程：
 - retry report
 - incident / report 状态检查
 
-### 8.3 Control Center
+### 8.3 Cowd IACC Workbench 面板
+
+入口：右侧 panel 中的 `Cowd IACC Workbench`。
+
+用途：
+
+- Manufacturing 应用的完整运营视图
+- Structured Data（Source、Fact、Evidence、Watermark）
+- Execution Outcome 列表和详情
+- Skill Activation 状态
+- Release Gate 报告
+- 全闭环运营数据浏览
+
+### 8.4 Control Center
 
 左下角控制中心入口用于：
 
@@ -686,7 +747,115 @@ IACC skill 执行流程：
 
 ---
 
-## 9. IACC 核心逻辑
+## 9. Capability 系统
+
+Capability 系统是 v0.9.200 的顶层治理机制，用于声明、投影和验证各表面能力。
+
+### 9.1 Capability Registry
+
+所有能力在 `CowdCapabilityRegistry::core()` 中注册，按层级分类：
+
+| 层级 | 能力 | 状态 |
+|---|---|---|
+| Kernel | Runtime Session | Available |
+| Kernel | Context Runtime | Available |
+| Kernel | Memory Runtime | Available |
+| Kernel | Structured Data Core | Available |
+| Kernel | Runtime Event | Available |
+| Kernel | Skill Lifecycle | Available |
+| Kernel | Connector Runtime | Available |
+| Application | IACC Manufacturing Application | Preview |
+
+### 9.2 Surface Projection
+
+每项能力按 WebUI/TUI/CLI 三表面投影：
+
+- **WebUI**：Enhanced 模式，支持 browse/filter/compare/batch_manage/audit
+- **TUI**：Full 模式，支持 browse/inspect/trigger/diagnose
+- **CLI**：Minimal 模式，支持 list/view/invoke
+
+### 9.3 Surface Parity Contract
+
+`GET /api/cowd/surfaces` 返回 `CowdSurfaceParityContract`，明确声明：
+
+- WebUI 和 TUI 达到 full parity
+- CLI 保持 minimal control 定位
+- 每个表面应承载的能力数量和主要操作
+
+### 9.4 Release Gate
+
+`GET /api/cowd/release-gate` 返回证据驱动的 Release Gate 报告，检查：
+
+- Structured indexes readiness
+- Structured watermark persistence
+- Execution outcome timeline availability
+- Memory context bridge availability
+- Graph skill quality contracts availability
+
+---
+
+## 10. Structured Data Core
+
+Structured Data Core 是 v0.9.200 的通用结构化数据契约层，用于统一管理和运营结构化数据。
+
+核心概念：
+
+| 概念 | 说明 |
+|---|---|
+| Source | 外部数据源定义（name, domain, owner, access_mode, refresh_mode） |
+| Mapping | 源到目标实体/事实的映射（source_ref, collection, target_kind, target_type） |
+| Fact | 结构化事实（fact_type, entity, metric_key, measure_value, confidence） |
+| Evidence | 证据包（refs, score, fact_refs, structured_refs） |
+| Ingest Plan | 数据摄入计划（source_id, mappings, delta_signature, entity_mapping） |
+| Watermark | 数据摄入水位标记（source_id, last_sync, delta_state） |
+
+API 入口：`/api/cowd/structured/*`
+
+---
+
+## 11. Execution Outcome Bridge
+
+Execution Outcome Bridge 将工具调用、Agent 执行、Task 执行和 Manufacturing 操作的运行结果统一桥接到 Runtime Timeline。
+
+支持的执行结果类型：
+
+| 类型 | 说明 |
+|---|---|
+| Tool | 工具调用执行结果 |
+| Agent | Agent 执行结果 |
+| Task | Task 执行结果 |
+| StructuredIngest | 结构化数据摄入结果 |
+| StructuredFact | 结构化事实写入结果 |
+| StructuredEvidence | 结构化证据构建结果 |
+| ManufacturingCompute | 制造领域计算任务结果 |
+| ManufacturingAction | 制造领域动作执行结果 |
+| SkillRun | Skill 执行结果 |
+
+所有执行结果通过 `RuntimeEvent` 写入 runtime timeline，支持 WebUI 和 TUI 面板实时浏览。
+
+---
+
+## 12. Tool Execution & Memory
+
+### 12.1 Tool Execution Plans
+
+`ToolExecutionPlan` 提供可解释的批量工具执行计划：
+
+- 按安全分类（Read / Filesystem / Network / Destructive / Approval）分配执行模式
+- 四种执行模式：ParallelRead、LimitedParallel、SerialDestructive、Wave
+- 显式依赖关系和并发控制
+
+### 12.2 Tool Memory
+
+`ToolMemoryCandidatePolicy` 将工具调用事实策略性转换为记忆候选：
+
+- 捕获失败的工具调用
+- 捕获慢速工具调用（>30s）
+- 写入 MemoryPulse 管道
+
+---
+
+## 13. IACC 核心逻辑
 
 IACC 是 Cowd 的结构化运营智能层，用来把企业运营事实转为可追踪的 evidence、incident、analysis、action、report。
 
@@ -705,6 +874,7 @@ SourceSnapshot
   -> Operational analysis
   -> Skill plan
   -> Skill run
+  -> Execution outcome (→ Timeline)
   -> Cross-plane action
   -> Feedback / Recovery
   -> Memory case / Playbook
@@ -731,6 +901,7 @@ SourceSnapshot
 | execution | dry_run / commit / feedback |
 | cockpit | profile / projection / report / delivery |
 | skill | IACC skill manifest、plan、run |
+| app | IACC 应用描述器（domain, surface, skill pack） |
 | store | IACC SQLite store |
 
 IACC store 默认位置：
@@ -741,11 +912,11 @@ IACC store 默认位置：
 
 ---
 
-## 10. Skills 核心逻辑
+## 14. Skills 核心逻辑
 
 Skills 是 Cowd 当前统一能力管理的核心面。
 
-### 10.1 数据来源
+### 14.1 数据来源
 
 ```text
 IACC skill pack
@@ -758,7 +929,7 @@ IACC skill pack
     + legacy /commands
 ```
 
-### 10.2 三层协议
+### 14.2 三层协议
 
 ```text
 Catalog: 发现和详情
@@ -766,7 +937,7 @@ Projection: 按 WebUI/TUI/CLI 投影能力
 Action: validate / plan / run / runs / run detail
 ```
 
-### 10.3 三端分工
+### 14.3 三端分工
 
 | 入口 | 定位 | 能力 |
 |---|---|---|
@@ -776,7 +947,7 @@ Action: validate / plan / run / runs / run detail
 
 ---
 
-## 11. Connector 和 Cross-plane
+## 15. Connector 和 Cross-plane
 
 Connector runtime 负责外部系统接入。
 
@@ -814,7 +985,7 @@ GET  /api/cross-plane/audit
 
 ---
 
-## 12. 配置
+## 16. 配置
 
 配置文件常见位置：
 
@@ -846,9 +1017,9 @@ gateway:
 
 ---
 
-## 13. 开发和验证
+## 17. 开发和验证
 
-### 13.1 Rust
+### 17.1 Rust
 
 ```bash
 cargo fmt --check
@@ -858,7 +1029,7 @@ cargo build -p cowd-cli --no-default-features
 cargo build --release -p cowd-cli --no-default-features
 ```
 
-### 13.2 WebUI
+### 17.2 WebUI
 
 ```bash
 cd webui
@@ -866,7 +1037,7 @@ npm ci
 npm test
 ```
 
-### 13.3 场景脚本
+### 17.3 场景脚本
 
 Skills 统一面验收：
 
@@ -880,7 +1051,13 @@ COWD_BIN=/path/to/cowd scripts/v09136_skill_surface_unification_scenario.sh
 COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
 ```
 
-### 13.4 浏览器评测
+Release Gate：
+
+```bash
+bash scripts/release_gate.sh
+```
+
+### 17.4 浏览器评测
 
 WebUI E2E 使用 Playwright。若本地 Playwright 浏览器未安装，可指定系统 Chromium：
 
@@ -894,7 +1071,7 @@ chromium.launch({
 
 ---
 
-## 14. 安装和发布
+## 18. 安装和发布
 
 当前推荐安装方式：
 
@@ -922,7 +1099,7 @@ cp -a webui/. ~/AI/webui/
 
 ---
 
-## 15. 当前能力状态
+## 19. 当前能力状态
 
 已完成：
 
@@ -934,6 +1111,18 @@ cp -a webui/. ~/AI/webui/
 - TUI Skills action availability
 - CLI skills 极简化
 - IACC skill pack 接入统一 Skills API
+- Capability Registry + Surface Projection
+- Surface Parity Contract（WebUI=TUI full parity, CLI=minimal）
+- Structured Data Core（Source/Mapping/Fact/Evidence/Ingest/Watermark）
+- Execution Outcome Bridge（Tool/Agent/Task/Manufacturing → Timeline）
+- Release Gate（证据驱动发布门）
+- Graph Quality Contracts
+- Tool Execution Plans（可解释批量执行计划）
+- Tool Memory（工具事实→记忆候选策略转换）
+- IACC Manufacturing Application Descriptor
+- WebUI Cowd IACC Workbench 面板
+- TUI 结构化摘要、inline thinking、流式输出稳定
+- TUI 启动状态和记忆面板稳定
 
 仍需后续增强：
 
@@ -945,7 +1134,7 @@ cp -a webui/. ~/AI/webui/
 
 ---
 
-## 16. 常见问题
+## 20. 常见问题
 
 ### WebUI 打开是 404
 
@@ -977,4 +1166,3 @@ cargo test -p cowd-cli skill --no-default-features -- --test-threads=1
 cd webui && npm test
 COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
 ```
-

@@ -389,7 +389,7 @@ impl App {
         input.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
         );
         input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
 

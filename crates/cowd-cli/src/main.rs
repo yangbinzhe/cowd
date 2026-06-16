@@ -3889,7 +3889,7 @@ fn consume_session_sidebar_actions(state: &mut TuiState, cli: &mut LiveCli, work
                 ta.set_block(
                     ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                        .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
                 );
                 ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
                 state.app.input = ta;

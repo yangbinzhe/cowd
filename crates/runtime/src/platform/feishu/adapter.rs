@@ -56,6 +56,20 @@ pub struct FeishuConfig {
     pub bot_open_id: String,
     /// The bot's display name (for @mention detection).
     pub bot_name: String,
+    /// Base API domain (e.g. "https://open.feishu.cn" or "https://open.larksuite.com").
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+    /// Full API base URL including `/open-apis` path prefix.
+    #[serde(default = "default_api_base_url")]
+    pub api_base_url: String,
+}
+
+fn default_base_url() -> String {
+    "https://open.feishu.cn".to_string()
+}
+
+fn default_api_base_url() -> String {
+    "https://open.feishu.cn/open-apis".to_string()
 }
 
 impl FeishuConfig {
@@ -68,7 +82,18 @@ impl FeishuConfig {
             bot_name: "FeishuBot".to_string(),
             app_id,
             app_secret,
+            base_url: default_base_url(),
+            api_base_url: default_api_base_url(),
         }
+    }
+
+    /// Set the base domain (e.g. "https://open.larksuite.com" for Lark).
+    /// Updates both `base_url` and `api_base_url` to keep them consistent.
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into().trim_end_matches('/').to_string();
+        self.api_base_url = format!("{}/open-apis", url);
+        self.base_url = url;
+        self
     }
 
     /// Set the bot's open_id for self-echo prevention.
@@ -144,7 +169,10 @@ impl FeishuAdapter {
     pub async fn authenticate(&self) -> PlatformResult<String> {
         let client = reqwest::Client::new();
         let response = client
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+            .post(format!(
+                "{}/auth/v3/tenant_access_token/internal",
+                self.api_base_url()
+            ))
             .json(&serde_json::json!({
                 "app_id": self.config.app_id,
                 "app_secret": self.config.app_secret,
@@ -230,7 +258,10 @@ impl FeishuAdapter {
         };
 
         let response = client
-            .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
+            .post(format!(
+                "{}/im/v1/messages?receive_id_type=open_id",
+                self.api_base_url()
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .json(&request)
             .send()
@@ -447,7 +478,10 @@ impl FeishuAdapter {
         };
 
         let response = client
-            .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
+            .post(format!(
+                "{}/im/v1/messages?receive_id_type=open_id",
+                self.api_base_url()
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .json(&request)
             .send()
@@ -540,8 +574,8 @@ impl FeishuAdapter {
         if let Some(reply_msg_id) = reply_to {
             // --- Reply path ---
             let reply_url = format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                reply_msg_id
+                "{}/im/v1/messages/{reply_msg_id}/reply",
+                self.api_base_url()
             );
 
             // Try reply as post
@@ -613,7 +647,10 @@ impl FeishuAdapter {
         }
 
         // --- New-message path ---
-        let send_url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id";
+        let send_url = format!(
+            "{}/im/v1/messages?receive_id_type=open_id",
+            self.api_base_url()
+        );
 
         // Try post first
         let post_req = SendMessageRequest {
@@ -622,7 +659,7 @@ impl FeishuAdapter {
             content: post_content.clone(),
         };
         let post_resp: SendMessageResponse = client
-            .post(send_url)
+            .post(&send_url)
             .header("Authorization", format!("Bearer {}", &token))
             .json(&post_req)
             .send()
@@ -674,8 +711,8 @@ impl FeishuAdapter {
     }
 
     /// Return the Feishu Open API base URL.
-    fn api_base_url(&self) -> &'static str {
-        "https://open.feishu.cn/open-apis"
+    fn api_base_url(&self) -> &str {
+        &self.config.api_base_url
     }
 
     /// Send a typed message to a chat by receive_id.
@@ -844,7 +881,8 @@ impl PlatformAdapter for FeishuAdapter {
         *self.connected.write().await = true;
 
         let ws_client =
-            super::ws::FeishuWsClient::new(&self.config.app_id, &self.config.app_secret);
+            super::ws::FeishuWsClient::new(&self.config.app_id, &self.config.app_secret)
+                .with_base_url(&self.config.base_url);
         match ws_client.connect().await {
             Ok(rx) => {
                 *self.ws_events.lock().await = Some(rx);
@@ -1124,10 +1162,7 @@ impl PlatformAdapter for FeishuAdapter {
     ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!(
-            "https://open.feishu.cn/open-apis/im/v1/messages/{}",
-            message_id
-        );
+        let url = format!("{}/im/v1/messages/{message_id}", self.api_base_url());
 
         let post_reject_re = Regex::new(r"(?i)content format of the post type is incorrect")
             .map_err(|e| PlatformError::Unknown(format!("regex compile: {}", e)))?;
@@ -1196,10 +1231,7 @@ impl PlatformAdapter for FeishuAdapter {
     async fn delete_message(&self, _chat_id: &str, message_id: &str) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!(
-            "https://open.feishu.cn/open-apis/im/v1/messages/{}",
-            message_id
-        );
+        let url = format!("{}/im/v1/messages/{message_id}", self.api_base_url());
 
         self.feishu_send_with_retry(|| {
             let url = url.clone();
@@ -1237,7 +1269,7 @@ impl PlatformAdapter for FeishuAdapter {
     async fn get_chat_info(&self, chat_id: &str) -> PlatformResult<ChatInfo> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!("https://open.feishu.cn/open-apis/im/v1/chats/{}", chat_id);
+        let url = format!("{}/im/v1/chats/{}", self.api_base_url(), chat_id);
 
         let response = client
             .get(&url)

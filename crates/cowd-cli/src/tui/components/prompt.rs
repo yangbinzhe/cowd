@@ -1375,8 +1375,10 @@ impl Prompt {
 
             // ── Enter: submit (propagate) or insert newline ──
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    // Shift+Enter: insert newline
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    // Shift+Enter / Alt+Enter: insert newline
                     self.textarea.input(Event::Key(*key));
                     self.update_suggestions();
                     return EventResult::Consumed;

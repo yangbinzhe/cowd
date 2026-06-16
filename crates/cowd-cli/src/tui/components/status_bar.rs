@@ -395,7 +395,9 @@ impl StatusBar {
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
                 "permission_status" => Some(format!("perm:{}", app.permission_count)),
                 "session" => Some(format!("session:{}", short_id(&app.session_id))),
-                "input_hint" => Some("Enter send · Shift+Enter newline · Ctrl+B panels".into()),
+                "input_hint" => {
+                    Some("Enter send · Alt+Enter/Ctrl+J newline · Ctrl+B panels".into())
+                }
                 _ => None,
             };
         }

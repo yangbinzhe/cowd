@@ -3,6 +3,64 @@
 //! This module provides integration with Feishu (Lark) messaging platform,
 //! supporting both sending and receiving messages through the Feishu Open API.
 
+use std::sync::OnceLock;
+
+/// Shared Feishu API base URL, set once during adapter initialization.
+/// Defaults to `https://open.feishu.cn` for China; set to `https://open.larksuite.com` for Lark.
+static FEISHU_API_BASE: OnceLock<String> = OnceLock::new();
+
+/// Set the global Feishu API base URL. Call once during adapter startup.
+pub(crate) fn set_api_base_url(url: &str) {
+    let _ = FEISHU_API_BASE.set(url.to_string());
+}
+
+/// Get the current Feishu API base URL (e.g. `https://open.feishu.cn/open-apis`).
+pub(crate) fn api_base_url() -> &'static str {
+    FEISHU_API_BASE
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("https://open.feishu.cn/open-apis")
+}
+
+/// Check if a URL string belongs to an allowed Feishu/Lark domain (SSRF protection).
+pub(crate) fn is_feishu_domain(url_str: &str) -> bool {
+    // Quick validation
+    if url_str.is_empty() {
+        return false;
+    }
+
+    // Only allow HTTPS
+    if !url_str.starts_with("https://") {
+        return false;
+    }
+
+    // Extract host
+    let without_protocol = &url_str["https://".len()..];
+    let host = match without_protocol.split('/').next() {
+        Some(h) => h,
+        None => return false,
+    };
+
+    if host.is_empty() {
+        return false;
+    }
+
+    // Block raw IP addresses (IPv4 and IPv6)
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return false;
+    }
+
+    // Check against allowed domains (Feishu China + Lark International)
+    host == "open.feishu.cn"
+        || host.ends_with(".open.feishu.cn")
+        || host == "feishu.cn"
+        || host.ends_with(".feishu.cn")
+        || host == "open.larksuite.com"
+        || host.ends_with(".open.larksuite.com")
+        || host == "larksuite.com"
+        || host.ends_with(".larksuite.com")
+}
+
 pub mod adapter;
 pub mod approval;
 pub mod auth;
@@ -70,6 +128,13 @@ pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<Fei
     if let Some(bot_name) = settings.get("bot_name").and_then(|v| v.as_str()) {
         config = config.with_bot_name(bot_name);
     }
+
+    if let Some(base_url) = settings.get("base_url").and_then(|v| v.as_str()) {
+        config = config.with_base_url(base_url);
+    }
+
+    // Set the global API base URL for sub-modules (media, reactions, doc, comment)
+    set_api_base_url(&config.api_base_url);
 
     let mut adapter = FeishuAdapter::new(config);
 

@@ -108,7 +108,7 @@ impl FocusTarget {
     fn hint(self) -> &'static str {
         match self {
             FocusTarget::Chat => "j/k scroll · / commands · Ctrl+P palette · Ctrl+B panels",
-            FocusTarget::Input => "Enter send · Shift+Enter newline · / commands · Esc clear",
+            FocusTarget::Input => "Enter send · Alt+Enter/Ctrl+J newline · / commands · Esc clear",
             FocusTarget::Activity => "j/k scroll · PgUp/PgDn page · Esc close",
             FocusTarget::Sidebar => "Tab switch · j/k scroll · Esc close · /focus input",
             FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => {
@@ -166,6 +166,67 @@ fn char_col_to_byte_offset(text: &str, col: usize) -> usize {
         .nth(col)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
+}
+
+/// Wrap a single text line to fit within `max_width` display columns.
+/// Uses word boundaries (spaces) for natural breaks, falling back to
+/// character-level breaking for very long words.
+/// Returns a vector of wrapped lines (no line is empty).
+fn wrap_line_to_width(line: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![line.to_string()];
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    let mut remaining = line;
+    while !remaining.is_empty() {
+        let char_count = remaining.chars().count();
+        if char_count <= max_width {
+            result.push(remaining.to_string());
+            break;
+        }
+
+        // Find last space within max_width characters
+        let char_indices: Vec<usize> = remaining.char_indices().map(|(i, _)| i).collect();
+        let break_char_idx = {
+            let slice_end = char_indices
+                .get(max_width)
+                .copied()
+                .unwrap_or(remaining.len());
+            let (visible, _rest) = remaining.split_at(slice_end);
+            // Find last space in visible portion
+            visible.rfind(' ').map(|byte_idx| {
+                // Count chars up to this byte index
+                remaining[..byte_idx].chars().count()
+            })
+        };
+
+        match break_char_idx {
+            Some(idx) if idx > 0 => {
+                let byte_pos = char_indices[idx];
+                let (chunk, rest) = remaining.split_at(byte_pos);
+                result.push(chunk.trim_end().to_string());
+                remaining = rest.trim_start();
+            }
+            _ => {
+                // No word boundary found — break at max_width characters
+                let byte_pos = char_indices
+                    .get(max_width)
+                    .copied()
+                    .unwrap_or(remaining.len());
+                let (chunk, rest) = remaining.split_at(byte_pos);
+                result.push(chunk.to_string());
+                remaining = rest;
+            }
+        }
+    }
+
+    // Ensure no empty strings
+    result.retain(|s| !s.is_empty());
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -417,6 +478,8 @@ pub struct TuiState {
     pending_cancel: bool,
     /// Pending quit: Ctrl+C was pressed once — requires second press
     pending_quit: bool,
+    /// Last known terminal width, used for input line wrapping.
+    last_terminal_width: u16,
 }
 
 impl TuiState {
@@ -542,6 +605,7 @@ impl TuiState {
             dropped_events: 0,
             pending_cancel: false,
             pending_quit: false,
+            last_terminal_width: 80,
         }
     }
 
@@ -653,6 +717,7 @@ impl TuiState {
 
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.last_terminal_width = area.width;
         let skin = self.app.skin.clone();
 
         // Animation tick: advance all active animations
@@ -1107,7 +1172,7 @@ impl TuiState {
             self.app.input.set_block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
-                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                    .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
             );
             // Render app.input widget directly — NOT through prompt
             {
@@ -1679,6 +1744,7 @@ impl TuiState {
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
+            self.wrap_input_to_width();
             self.set_focus_target(FocusTarget::Input);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
             let text = self.input_text();
@@ -1692,8 +1758,12 @@ impl TuiState {
 
         // 5. Enter special case: submit input or toggle expand
         if key.code == KeyCode::Enter {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT)
+            {
                 self.app.input.insert_newline();
+                self.wrap_input_to_width();
                 return ProcessedKey::Nothing;
             }
             if self.prompt.suggestions_visible() {
@@ -1741,9 +1811,16 @@ impl TuiState {
             self.app.input.set_block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
-                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                    .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
             );
             return ProcessedKey::Submit(text);
+        }
+
+        // 5.5 Ctrl+J: insert newline (Ctrl+Enter maps to Ctrl+J on Linux terminals)
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+            self.app.input.insert_newline();
+            self.wrap_input_to_width();
+            return ProcessedKey::Nothing;
         }
 
         // Reset pending cancel/quit on any non-ESC/Ctrl+C key
@@ -1847,6 +1924,7 @@ impl TuiState {
                 }
                 None => {}
             }
+            self.wrap_input_to_width();
             return ProcessedKey::Nothing;
         }
 
@@ -1917,13 +1995,66 @@ impl TuiState {
         input.set_block(
             ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
         );
         input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
         if !text.is_empty() {
             input.insert_str(text);
         }
         self.app.input = input;
+    }
+
+    /// Wrap input lines that exceed the visible text width.
+    /// Called after each text modification to prevent horizontal scrolling.
+    /// Uses simple word-boundary wrapping within the visible area (width - 2 for borders).
+    fn wrap_input_to_width(&mut self) {
+        let text_width = self.last_terminal_width.saturating_sub(2);
+        if text_width < 10 {
+            return; // Too narrow for meaningful wrapping
+        }
+
+        let lines: Vec<String> = self.app.input.lines().to_vec();
+        let needs_wrap = lines
+            .iter()
+            .any(|l| l.chars().count() > text_width as usize);
+        if !needs_wrap {
+            return;
+        }
+
+        // Wrap each line and collect
+        let mut new_lines: Vec<String> = Vec::new();
+        for line in &lines {
+            let wrapped = wrap_line_to_width(line, text_width as usize);
+            for w in wrapped {
+                new_lines.push(w);
+            }
+        }
+
+        // Rebuild textarea with wrapped lines
+        let mut ta = tui_textarea::TextArea::default();
+        ta.set_block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
+        );
+        ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+        ta.set_cursor_line_style(ratatui::style::Style::default());
+
+        if !new_lines.is_empty() {
+            let last_idx = new_lines.len() - 1;
+            for (i, line) in new_lines.into_iter().enumerate() {
+                ta.insert_str(&line);
+                if i < last_idx {
+                    ta.insert_newline();
+                }
+            }
+        }
+
+        // Move cursor to end (normal typing flow; cursor restoration for mid-text editing
+        // would require significantly more complexity and is rare for an input box)
+        ta.move_cursor(tui_textarea::CursorMove::End);
+
+        self.app.input = ta;
     }
 
     fn focus_for_current_surface(&self) -> FocusTarget {
@@ -2575,7 +2706,7 @@ impl TuiState {
                     ta.set_block(
                         ratatui::widgets::Block::default()
                             .borders(ratatui::widgets::Borders::ALL)
-                            .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                            .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
                     );
                     ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
                     if !text.is_empty() {
@@ -2632,7 +2763,7 @@ impl TuiState {
                 input.set_block(
                     ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                        .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
                 );
                 input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
                 input.insert_str(cmd);

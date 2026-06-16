@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 // Constants
 // ---------------------------------------------------------------------------
 
-const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
 const MAX_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -108,38 +107,8 @@ where
 /// Used as SSRF guard on download URLs. Accepts `open.feishu.cn` and
 /// `feishu.cn` (along with any subdomains).
 fn is_feishu_domain(url_str: &str) -> bool {
-    let url_str = url_str.trim();
-    // Quick length checks to reject obviously bad input
-    if url_str.is_empty() || url_str.len() > 2048 {
-        return false;
-    }
-
-    // Parse URL
-    let parsed = match reqwest::Url::parse(url_str) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-
-    // Only allow HTTPS
-    if parsed.scheme() != "https" {
-        return false;
-    }
-
-    let host = parsed.host_str().unwrap_or("");
-    if host.is_empty() {
-        return false;
-    }
-
-    // Block raw IP addresses (IPv4 and IPv6)
-    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
-        return false;
-    }
-
-    // Check against allowed domains
-    host == "open.feishu.cn"
-        || host.ends_with(".open.feishu.cn")
-        || host == "feishu.cn"
-        || host.ends_with(".feishu.cn")
+    // Delegate to the shared SSRF check (supports both Feishu and Lark domains)
+    super::is_feishu_domain(url_str)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +132,7 @@ pub async fn upload_image(
     let image_bytes = image_bytes.to_vec();
     let image_type = image_type.to_string();
     let token = token.to_string();
-    let url = format!("{}/im/v1/images", FEISHU_API_BASE);
+    let url = format!("{}/im/v1/images", super::api_base_url());
 
     let response = request_with_retry(
         || {
@@ -230,7 +199,7 @@ pub async fn upload_file(
     let file_name = file_name.to_string();
     let file_type = file_type.to_string();
     let token = token.to_string();
-    let url = format!("{}/im/v1/files", FEISHU_API_BASE);
+    let url = format!("{}/im/v1/files", super::api_base_url());
 
     let response = request_with_retry(
         || {
@@ -305,7 +274,9 @@ pub async fn download_message_resource(
     // SSRF guard: validate the URL before making the request
     let url = format!(
         "{}/im/v1/messages/{}/resources/{}?type=file",
-        FEISHU_API_BASE, message_id, file_key
+        super::api_base_url(),
+        message_id,
+        file_key
     );
 
     if !is_feishu_domain(&url) {

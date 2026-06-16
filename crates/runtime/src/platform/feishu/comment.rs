@@ -116,8 +116,8 @@ impl CommentHandler {
     }
 
     /// Get the base URL for Feishu document API.
-    fn doc_api_base() -> &'static str {
-        "https://open.feishu.cn/open-apis/docx/v1/documents"
+    fn doc_api_base() -> String {
+        format!("{}/docx/v1/documents", super::api_base_url())
     }
 
     /// List comments for a document.
