@@ -93,7 +93,7 @@ window.UI = (()=>{
     const mount=$('workbench-content');
     if(!mount)return;
     mount.innerHTML='';
-    mount.className='workbench-content';
+    mount.className='workbench-content workbench-page-'+name;
     panelMountOverride=mount;
     try{
       if(typeof Workspace!=='undefined'&&name==='workspace')await Workspace.render();

@@ -979,7 +979,7 @@ window.Panels = (()=>{
     hdr.appendChild(controls);
     c.appendChild(hdr);
 
-    const mount=UI.el('div');
+    const mount=UI.el('div','context-workbench-grid');
     c.appendChild(mount);
     async function load(){
       mount.innerHTML='';

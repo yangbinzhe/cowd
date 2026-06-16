@@ -114,6 +114,20 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .workspace-file-info b,.workspace-file-info small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .workspace-file-info b{font-size:13px}
 .workspace-file-info small{font-size:11px;color:var(--text3);font-family:var(--font-mono)}
+.workbench-page-runtime .runtime-console-grid,
+.workbench-page-context .context-workbench-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:1220px}
+.workbench-page-runtime .context-header,
+.workbench-page-context .context-header{max-width:1220px}
+.workbench-page-runtime .panel-section,
+.workbench-page-context .panel-section{border:1px solid var(--border);border-radius:10px;background:var(--surface-subtle);padding:12px;min-width:0;margin-bottom:0}
+.workbench-page-runtime .panel-section h3,
+.workbench-page-context .panel-section h3{border-bottom:1px solid var(--border);padding-bottom:7px;margin-bottom:9px}
+.workbench-page-runtime .runtime-console-summary,
+.workbench-page-context .context-overview{grid-column:1/-1}
+.workbench-page-runtime .memory-metrics,
+.workbench-page-context .memory-metrics{grid-template-columns:repeat(auto-fit,minmax(120px,1fr))}
+.workbench-page-runtime .context-controls,
+.workbench-page-context .context-controls{display:grid;grid-template-columns:minmax(0,1fr) 130px repeat(3,auto);gap:8px}
 #chat-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);min-height:44px}
 #chat-header-left{display:flex;align-items:center;gap:12px;min-width:0}
 #chat-header-right{display:flex;gap:4px}
@@ -477,6 +491,10 @@ pre,code{font-family:var(--font-mono);font-size:13px}
   .workspace-hero{flex-direction:column;gap:8px}
   .workspace-path{max-width:100%}
   .workspace-file-row{grid-template-columns:52px minmax(0,1fr);padding:10px 2px}
+  .workbench-page-runtime .runtime-console-grid,
+  .workbench-page-context .context-workbench-grid{grid-template-columns:1fr}
+  .workbench-page-runtime .context-controls,
+  .workbench-page-context .context-controls{grid-template-columns:1fr 1fr;gap:6px}
   #chat-header{padding:8px 10px;gap:8px}
   .chat-title-block{min-width:0}
   .chat-title-block span{display:none}

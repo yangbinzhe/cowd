@@ -27,6 +27,34 @@ async function routeShellApis(page) {
       { name: 'README.md', path: 'README.md', is_dir: false },
       { name: 'src', path: 'src', is_dir: true },
     ] });
+    if (path === '/api/context/current') return json({
+      source: 'mock',
+      envelope: {
+        id: 'ctx-webui',
+        profile: 'MainTurn',
+        selected: [{ role: 'orientation', title: 'Runtime policy', content: 'Cowd kernel owns durable sessions', source: 'memory' }],
+        omitted: [{ source: 'history', reason: 'budget', token_estimate: 128 }],
+        diagnostics: { pressure_bp: 125, stable_head_hash: 'stablehash', runtime_header_hash: 'runtimehash', dynamic_tail_hash: 'dynamichash' },
+        budget: { used_tokens: 512, total_tokens: 8000 },
+        assembled: { stable_head: ['system'], runtime_header: ['lease'], dynamic_tail: ['turn'] },
+      },
+      lean_probe: { status: 'ok' },
+      policy_decision: { decision: 'full' },
+    });
+    if (path === '/api/runtime/config/effective') return json({ control_policy: { agent: { max_parallel_agents: 4 } } });
+    if (path === '/api/runtime/control-plane') return json({ components: { permissions: { approval_gate: true, auth_required: true } } });
+    if (path === '/api/cowd/capabilities') return json({ capabilities: [{ id: 'runtime' }] });
+    if (path === '/api/cowd/projection') return json({ surface: 'webui', capabilities: ['runtime', 'context'] });
+    if (path === '/api/cowd/surfaces') return json({ surfaces: ['cli', 'tui', 'webui'] });
+    if (path === '/api/cowd/release-gate') return json({ status: 'pass' });
+    if (path === '/api/tasks') return json({ current: { id: 'task-1', objective: 'Inspect runtime', status: 'running' }, tasks: [] });
+    if (path === '/api/approval/pending') return json({ approvals: [] });
+    if (/^\/api\/sessions\/[^/]+\/runs$/.test(path)) return json({ runs: [{ run: { run_id: 'run-1', status: 'completed' } }], tree: { summary: { span_count: 1, root_count: 1, failed_count: 0, running_count: 0 } } });
+    if (path === '/api/runtime/timeline') return json({ total: 1, next_seq: 2, degraded: false, events: [{ kind: 'ToolComplete', seq: 1 }], value_loop: { status: 'complete' } });
+    if (/^\/api\/sessions\/[^/]+\/context$/.test(path)) return json({ summaries: [{ envelope_id: 'ctx-webui', profile: 'MainTurn', intent: 'ship', pressure_bp: 125 }], has_more: false });
+    if (path === '/api/context/ctx-webui') return json({ context: { envelope_id: 'ctx-webui', selected: [] } });
+    if (path === '/api/sessions/webui-runtime-console/context/recommendations') return json({ recommendations: [] });
+    if (path === '/api/memory/maintenance') return json({ candidates: [] });
     return json({});
   });
 }
@@ -138,6 +166,43 @@ test('v0.9.204 workspace uses the full-page file workbench layout', async ({ pag
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.204-workspace-desktop.png' });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.204-workspace-mobile.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.205 runtime and context render as full-page kernel workbenches', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await page.click('#nav-rail [data-view="runtime"]');
+  await expect(page.locator('#workbench-content.workbench-page-runtime')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Runtime');
+  await expect(page.locator('#workbench-content')).toContainText('Runtime Console');
+  await expect(page.locator('#workbench-content')).toContainText('Runtime State');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.205-runtime-desktop.png' });
+
+  await page.click('#nav-rail [data-view="context"]');
+  await expect(page.locator('#workbench-content.workbench-page-context')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Context');
+  await expect(page.locator('#workbench-content')).toContainText('Context Runtime');
+  await expect(page.locator('#workbench-content')).toContainText('Selected Context');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.205-context-desktop.png' });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.click('#nav-rail [data-view="runtime"]');
+  await expect(page.locator('#workbench-content')).toContainText('MainTurn');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.205-runtime-mobile.png' });
 
   expect(errors).toEqual([]);
 });
