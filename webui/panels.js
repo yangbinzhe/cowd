@@ -2222,8 +2222,8 @@ window.Panels = (()=>{
   }
 
   async function renderSettings(){
-    const c=cont();c.innerHTML='<h3>Settings</h3>';
-    const themeSec=UI.el('div','panel-section');
+    const c=cont();c.innerHTML='';
+    const themeSec=UI.el('div','panel-section settings-theme');
     themeSec.innerHTML='<h3>Theme</h3>';
     const themeSel=UI.el('select');
     themeSel.innerHTML='<option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option>';
@@ -2239,15 +2239,49 @@ window.Panels = (()=>{
     themeSec.appendChild(themeSel);
     c.appendChild(themeSec);
 
-    const modelSec=UI.el('div','panel-section');
+    const modelSec=UI.el('div','panel-section settings-model');
     modelSec.innerHTML='<h3>Default Model</h3>';
     try{
       const cfg=await Api.getConfig();
-      modelSec.innerHTML+='<p style="font-size:12px;color:var(--text2)">Current: '+(cfg.model||'unknown')+'</p>';
+      const metrics=UI.el('div','memory-metrics');
+      metrics.appendChild(renderMemoryMetric('current',cfg.model||'unknown','model'));
+      metrics.appendChild(renderMemoryMetric('version',cfg.version||'unknown','cowd'));
+      modelSec.appendChild(metrics);
     }catch(e){}
     c.appendChild(modelSec);
 
-    const profileSec=UI.el('div','panel-section');
+    const providerSec=UI.el('div','panel-section settings-providers');
+    providerSec.innerHTML='<h3>Providers</h3>';
+    c.appendChild(providerSec);
+    try{
+      const providers=await Api.getProviders();
+      const list=Array.isArray(providers.providers)?providers.providers:(Array.isArray(providers)?providers:[]);
+      const metrics=UI.el('div','memory-metrics');
+      metrics.appendChild(renderMemoryMetric('providers',list.length,'configured'));
+      metrics.appendChild(renderMemoryMetric('models',providers.model_count??providers.provider_model_count??0,'available'));
+      metrics.appendChild(renderMemoryMetric('resolved',providers.configured_model_resolved?'yes':'n/a','route'));
+      providerSec.appendChild(metrics);
+      if(list.length){
+        list.slice(0,6).forEach(function(provider){
+          const item=UI.el('div','panel-item provider-item');
+          const name=UI.el('span','pi-name');
+          name.textContent=[provider.name||provider.id||provider.provider||'provider',provider.kind||provider.type].filter(Boolean).join(' · ');
+          const actions=UI.el('span','pi-actions');
+          const badge=UI.el('span','profile-active');
+          badge.textContent=provider.status||provider.health||'configured';
+          actions.appendChild(badge);
+          item.appendChild(name);
+          item.appendChild(actions);
+          providerSec.appendChild(item);
+        });
+      }else{
+        providerSec.appendChild(UI.el('div','panel-empty','No providers reported'));
+      }
+    }catch(e){
+      providerSec.appendChild(UI.el('div','panel-empty','Providers unavailable'));
+    }
+
+    const profileSec=UI.el('div','panel-section settings-profiles');
     profileSec.innerHTML='<h3>Profiles</h3>';
     const createRow=UI.el('div','profile-create-row');
     const input=UI.el('input');
@@ -2314,6 +2348,16 @@ window.Panels = (()=>{
     }catch(e){
       profileSec.appendChild(UI.el('div','panel-empty','Profiles unavailable'));
     }
+
+    const securitySec=UI.el('div','panel-section settings-security');
+    securitySec.innerHTML='<h3>Security</h3>';
+    const authToken=localStorage.getItem('cowd-auth-token');
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('auth',authToken?'stored':'not stored','browser'));
+    metrics.appendChild(renderMemoryMetric('origin',location.origin||'local','webui'));
+    metrics.appendChild(renderMemoryMetric('theme',localStorage.getItem('cowd-theme')||'dark','local'));
+    securitySec.appendChild(metrics);
+    c.appendChild(securitySec);
   }
 
   async function renderCCConfig(){

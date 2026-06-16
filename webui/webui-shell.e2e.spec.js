@@ -22,6 +22,16 @@ async function routeShellApis(page) {
 
     if (path === '/api/auth/verify') return json({ ok: true });
     if (path === '/api/config') return json({ model: 'claude-sonnet-4-6', version: '0.9.202' });
+    if (path === '/api/config/providers') return json({
+      providers: [{ name: 'anthropic', kind: 'llm', status: 'ready' }, { name: 'local-tools', kind: 'tooling', status: 'ready' }],
+      model_count: 2,
+      configured_model_resolved: true,
+    });
+    if (path === '/api/profiles') return json({
+      profiles: [{ id: 'default', name: 'default', is_active: true }, { id: 'enterprise_ops', name: 'enterprise_ops', is_active: false }],
+      active_profile: 'default',
+      runtime_profile: 'default',
+    });
     if (path === '/api/sessions') return json({ sessions: [], total: 0, offset: 0, limit: 20 });
     if (path === '/api/workspace/files') return json({ files: [
       { name: 'README.md', path: 'README.md', is_dir: false },
@@ -391,6 +401,40 @@ test('v0.9.209 iacc renders as manufacturing application workbench on cowd data 
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.209-iacc-mobile.png' });
+
+  expect(errors).toEqual([]);
+});
+
+test('v0.9.210 settings renders operational controls with polished responsive layout', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+
+  await page.click('#nav-rail [data-view="settings"]');
+  await expect(page.locator('#workbench-content.workbench-page-settings')).toBeVisible();
+  await expect(page.locator('#workbench-title')).toHaveText('Settings');
+  await expect(page.locator('#workbench-content')).toContainText('Theme');
+  await expect(page.locator('#workbench-content')).toContainText('Default Model');
+  await expect(page.locator('#workbench-content')).toContainText('Providers');
+  await expect(page.locator('#workbench-content')).toContainText('Profiles');
+  await expect(page.locator('#workbench-content')).toContainText('Security');
+  await expect(page.locator('#workbench-content')).toContainText('claude-sonnet-4-6');
+  await expect(page.locator('#workbench-content')).toContainText('anthropic');
+  await expect(page.locator('#workbench-content')).toContainText('enterprise_ops');
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.210-settings-desktop.png' });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.210-settings-mobile.png' });
 
   expect(errors).toEqual([]);
 });

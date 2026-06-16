@@ -99,7 +99,7 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .workbench-content input:focus,.workbench-content select:focus,.workbench-content textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--focus-ring)}
 .workbench-content .panel-section{max-width:1120px}
 .workbench-content .panel-section h3{font-size:14px}
-.workbench-content .panel-empty{text-align:left}
+.workbench-content .panel-empty{text-align:left;padding:10px 0;min-height:0}
 .workspace-page{display:flex;flex-direction:column;gap:16px}
 .workspace-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;max-width:1120px;padding-bottom:14px;border-bottom:1px solid var(--border)}
 .workspace-hero h3{font-size:18px;font-weight:700;margin-bottom:4px}
@@ -164,6 +164,16 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .workbench-page-audit>.audit-summary{grid-column:1/-1}
 .workbench-page-gateway .panel-item,
 .workbench-page-audit .panel-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+.workbench-page-settings{display:grid;grid-template-columns:minmax(260px,.72fr) minmax(0,1.28fr);gap:14px;max-width:1160px;align-items:start}
+.workbench-page-settings>.panel-section{border:1px solid var(--border);border-radius:10px;background:var(--surface-subtle);padding:12px;margin-bottom:0;min-width:0}
+.workbench-page-settings>.settings-profiles{grid-column:1/-1}
+.workbench-page-settings select,
+.workbench-page-settings input{width:100%;min-width:0;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:13px}
+.workbench-page-settings .profile-create-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
+.workbench-page-settings .panel-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;min-height:42px}
+.workbench-page-settings .panel-item .pi-name{white-space:normal;line-height:1.35}
+.workbench-page-settings .panel-item .pi-actions{flex:0 0 auto;align-items:center}
+.workbench-page-settings .panel-item .pi-actions button{background:var(--surface);border-radius:7px;padding:4px 8px}
 #chat-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);min-height:44px}
 #chat-header-left{display:flex;align-items:center;gap:12px;min-width:0}
 #chat-header-right{display:flex;gap:4px}
@@ -555,6 +565,8 @@ pre,code{font-family:var(--font-mono);font-size:13px}
   .workbench-page-skills .skill-summary{grid-template-columns:1fr}
   .workbench-page-gateway,
   .workbench-page-audit{grid-template-columns:1fr}
+  .workbench-page-settings{grid-template-columns:1fr}
+  .workbench-page-settings .profile-create-row{grid-template-columns:1fr}
   .workbench-page-iacc{grid-template-columns:1fr}
   .workbench-page-iacc>.iacc-console{display:block}
   .workbench-page-iacc .iacc-report-controls{grid-template-columns:1fr;max-width:none;margin-left:0;margin-top:10px}
