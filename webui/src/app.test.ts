@@ -98,14 +98,43 @@ describe('Cowd Vue WebUI shell', () => {
     const wrapper = await mountApp('/tools');
     await settle();
     expect(wrapper.text()).toContain('Tools Registry');
-    expect(wrapper.findAll('.metric-card').length).toBe(3);
+    expect(wrapper.findAll('.metric-card').length).toBe(4);
     expect(wrapper.find('.capability-sidebar').exists()).toBe(true);
     expect(wrapper.find('.session-sidebar').exists()).toBe(false);
-    expect(wrapper.text()).toContain('Command execution');
+    expect(wrapper.findAll('.section-row').length).toBe(7);
+    expect(wrapper.text()).toContain('Execution planner');
+    expect(wrapper.text()).toContain('Mutation transactions');
+    expect(wrapper.text()).toContain('Checkpoints');
+    expect(wrapper.text()).toContain('Tool cache');
+    expect(wrapper.text()).toContain('Tool ledger');
     expect(wrapper.text()).toContain('Risk preflight');
-    expect(wrapper.text()).toContain('Command and risk history');
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Memory');
     expect(wrapper.find('.capability-sidebar').text()).not.toContain('Settings');
+  });
+
+  it('calls real tool operation endpoints through the backend', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ok: true, checkpoints: [] }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.toolExecute('tool_cache_stats');
+    await api.toolBatchReadonly([{ name: 'tool_cache_stats', input: {} }], 2);
+    await api.toolMutationPreview([{ path: 'README.md', old_string: 'A', new_string: 'B' }]);
+    await api.toolMutationApply([{ path: 'README.md', old_string: 'A', new_string: 'B' }], { 'README.md': 'hash' });
+    await api.toolCheckpoints();
+    await api.toolCheckpointCreate('before edit');
+    await api.toolCheckpointDiff('cp-1');
+    await api.toolCheckpointRestore('cp-1');
+    await api.toolIntentPlan('inspect workspace', ['tool_cache_stats']);
+    await api.toolContextFanoutPlan('inspect workspace');
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/execute', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/batch-readonly', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/mutations/preview', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/mutations/apply', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/checkpoints', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/checkpoints', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/checkpoints/cp-1/diff', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/checkpoints/cp-1/restore', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/intent-plan', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/tools/context-fanout/plan', expect.objectContaining({ method: 'POST' }));
   });
 
   it('marks HTML API fallback as offline instead of successful data', async () => {

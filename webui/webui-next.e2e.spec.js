@@ -30,15 +30,19 @@ test('tools page exposes current-page management without duplicated primary navi
   await page.goto('/index.html#/tools');
   await expect(page.locator('.session-sidebar')).toHaveCount(0);
   await expect(page.locator('.capability-sidebar')).toBeVisible();
-  await expect(page.locator('.section-row')).toHaveCount(4);
+  await expect(page.locator('.section-row')).toHaveCount(7);
   await expect(page.locator('.capability-sidebar')).not.toContainText('Memory Graph');
   await expect(page.locator('.capability-sidebar')).not.toContainText('Settings');
-  await expect(page.locator('.metric-card')).toHaveCount(3);
+  await expect(page.locator('.metric-card')).toHaveCount(4);
   await expect(page.getByRole('heading', { name: 'Tool registry' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Command execution' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Execution planner' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Mutation transactions' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Checkpoints' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Tool cache' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Tool ledger' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Risk preflight' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Command and risk history' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Execute command' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run readonly batch' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Preview mutation' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
   await expect(page.locator('.raw-payload').first()).toBeVisible();
   await page.locator('.section-row').filter({ hasText: 'Risk' }).click();
@@ -101,7 +105,7 @@ test('skills agents and tools pages expose lifecycle workbenches', async ({ page
 
   await page.goto('/index.html#/tools');
   await expect(page.getByRole('heading', { name: 'Tool registry' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Command and risk history' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Tool ledger' })).toBeVisible();
 });
 
 test('gateway page exposes connector and cross-plane controls', async ({ page }) => {

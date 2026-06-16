@@ -470,6 +470,38 @@ export const api = {
     body: JSON.stringify(body),
   }),
   toolRegistry: () => read('/api/tools', {}),
+  toolExecute: (name: string, input: Record<string, unknown> = {}, mode = 'read_only') => write('/api/tools/execute', {
+    method: 'POST',
+    body: JSON.stringify({ name, input, mode }),
+  }),
+  toolCacheStats: () => read('/api/tools/cache', {}),
+  toolBatchReadonly: (calls: Array<Record<string, unknown>>, max_concurrency = 4) => write('/api/tools/batch-readonly', {
+    method: 'POST',
+    body: JSON.stringify({ calls, max_concurrency }),
+  }),
+  toolMutationPreview: (edits: Array<Record<string, unknown>>) => write('/api/tools/mutations/preview', {
+    method: 'POST',
+    body: JSON.stringify({ edits }),
+  }),
+  toolMutationApply: (edits: Array<Record<string, unknown>>, expected_hashes: Record<string, string> = {}) => write('/api/tools/mutations/apply', {
+    method: 'POST',
+    body: JSON.stringify({ edits, expected_hashes }),
+  }),
+  toolCheckpoints: () => read('/api/tools/checkpoints', { checkpoints: [] }),
+  toolCheckpointCreate: (label = '') => write('/api/tools/checkpoints', {
+    method: 'POST',
+    body: JSON.stringify({ label: label || undefined }),
+  }),
+  toolCheckpointDiff: (id: string) => read(`/api/tools/checkpoints/${encodeURIComponent(id)}/diff`, {}),
+  toolCheckpointRestore: (id: string) => write(`/api/tools/checkpoints/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
+  toolIntentPlan: (prompt: string, selected_tools: string[] = []) => write('/api/tools/intent-plan', {
+    method: 'POST',
+    body: JSON.stringify({ prompt, selected_tools }),
+  }),
+  toolContextFanoutPlan: (prompt: string) => write('/api/tools/context-fanout/plan', {
+    method: 'POST',
+    body: JSON.stringify({ prompt }),
+  }),
   platforms: () => read('/api/platforms', {}),
   connectorsSummary: () => read('/api/connectors/summary', {}),
   connectorAccounts: () => read('/api/connectors/accounts', {}),

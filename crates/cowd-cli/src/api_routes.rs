@@ -2394,6 +2394,307 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_cache_api_reports_stats() {
+        let workspace = test_temp_dir("tool-cache-api");
+        let config_home = test_temp_dir("tool-cache-api-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools/cache")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tool_name"], "tool_cache_stats");
+        assert_eq!(json["status"], "ok");
+        assert!(json["data"]["entries"].is_number());
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn tool_execute_rejects_write_tools_and_path_escape() {
+        let workspace = test_temp_dir("tool-execute-safety");
+        let config_home = test_temp_dir("tool-execute-safety-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let rejected_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "write_file",
+                            "input": { "path": "owned.txt", "content": "no" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_write.status(), StatusCode::FORBIDDEN);
+
+        let rejected_escape = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "read_file",
+                            "input": { "path": "../outside.txt" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_escape.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn tool_mutation_api_previews_and_applies_transaction() {
+        let workspace = test_temp_dir("tool-mutation-api");
+        let config_home = test_temp_dir("tool-mutation-api-config");
+        std::fs::write(workspace.join("a.txt"), "alpha\n").unwrap();
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/mutations/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "edits": [{
+                                "path": "a.txt",
+                                "old_string": "alpha",
+                                "new_string": "beta"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let body = to_bytes(preview.into_body(), usize::MAX).await.unwrap();
+        let preview_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview_json["data"]["type"], "mutation_preview");
+        let expected_hash = preview_json["data"]["files"][0]["expectedHash"]
+            .as_str()
+            .unwrap();
+
+        let apply = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/mutations/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "edits": [{
+                                "path": "a.txt",
+                                "old_string": "alpha",
+                                "new_string": "beta"
+                            }],
+                            "expected_hashes": {
+                                "a.txt": expected_hash
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "beta\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn tool_checkpoint_api_returns_receipts() {
+        let workspace = test_temp_dir("tool-checkpoint-api");
+        let config_home = test_temp_dir("tool-checkpoint-api-config");
+        std::fs::write(workspace.join("a.txt"), "before\n").unwrap();
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/checkpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "label": "before edit" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let checkpoint_id = created["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created["tool_name"], "checkpoint_create");
+        assert_eq!(
+            created["changed_refs"][0],
+            format!("checkpoint:{checkpoint_id}")
+        );
+
+        std::fs::write(workspace.join("a.txt"), "after\n").unwrap();
+        let diff = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/tools/checkpoints/{checkpoint_id}/diff"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diff.status(), StatusCode::OK);
+        let body = to_bytes(diff.into_body(), usize::MAX).await.unwrap();
+        let diff_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(diff_json["data"]["changedFiles"][0], "a.txt");
+
+        let restore = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tools/checkpoints/{checkpoint_id}/restore"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restore.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "before\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn tool_batch_readonly_api_rejects_write_tools() {
+        let workspace = test_temp_dir("tool-batch-api");
+        let config_home = test_temp_dir("tool-batch-api-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/batch-readonly")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "calls": [{
+                                "name": "write_file",
+                                "input": { "path": "a.txt", "content": "no" }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn tool_intent_and_fanout_plan_are_readonly() {
+        let app = api_router(test_state());
+
+        let intent = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/intent-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "prompt": "review this WebUI change" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(intent.status(), StatusCode::OK);
+        let body = to_bytes(intent.into_body(), usize::MAX).await.unwrap();
+        let intent_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(intent_json["kind"], "tool.intent_plan");
+        assert!(intent_json["recommended_tools"].as_array().unwrap().len() > 1);
+
+        let fanout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tools/context-fanout/plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "prompt": "发布前验收" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fanout.status(), StatusCode::OK);
+        let body = to_bytes(fanout.into_body(), usize::MAX).await.unwrap();
+        let fanout_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fanout_json["kind"], "tool.context_fanout_plan");
+        assert_eq!(fanout_json["batch_ready"], true);
+    }
+
+    #[tokio::test]
     async fn workspace_api_reports_profile_and_lists_files() {
         let workspace = test_temp_dir("workspace-list");
         let config_home = test_temp_dir("workspace-config");

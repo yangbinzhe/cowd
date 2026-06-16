@@ -164,6 +164,7 @@ pub use connector::{
     ServiceConnector, ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
     SqliteResourceDirectory,
 };
+pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, ConversationRuntime, MemoryCallback, PromptCacheEvent,
@@ -226,6 +227,7 @@ pub use iacc::{
     IaccSourceKind, IaccSourcePack, IaccSourcePackValidation, IaccSourceSnapshot,
     IaccSqliteDataPlane, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
+pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,
     ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
@@ -332,6 +334,9 @@ pub use tool_invocation::{
     ToolOutputRef, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 pub use tool_memory::{memory_candidate_from_tool_invocation, ToolMemoryCandidatePolicy};
+pub use tool_orchestrator::{
+    tool_execution_profile, ToolCachePolicy, ToolExecutionProfile, ToolSafetyCategory,
+};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

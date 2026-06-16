@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+
+const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
+const webuiRoot = path.join(repoRoot, 'webui');
+const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0616-前端彻底重构/10-模块化管理重构方案');
+const reportDir = path.join(planRoot, 'reports');
+const version = process.env.COWD_VERSION || 'v0.9.246';
+const gate = process.argv.includes('--gate');
+
+function read(file) {
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+}
+
+function hasAll(text, items) {
+  return items.filter((item) => !text.includes(item));
+}
+
+const files = {
+  backend: path.join(repoRoot, 'crates/cowd-cli/src/api_routes/system_routes.rs'),
+  client: path.join(webuiRoot, 'src/api/client.ts'),
+  page: path.join(webuiRoot, 'src/pages/ToolsPage.vue'),
+  capabilities: path.join(webuiRoot, 'src/data/capabilities.ts'),
+  styles: path.join(webuiRoot, 'src/styles/base.css'),
+};
+
+const requiredBackendRoutes = [
+  '/api/tools/execute',
+  '/api/tools/cache',
+  '/api/tools/batch-readonly',
+  '/api/tools/mutations/preview',
+  '/api/tools/mutations/apply',
+  '/api/tools/checkpoints',
+  '/api/tools/checkpoints/:id/diff',
+  '/api/tools/checkpoints/:id/restore',
+  '/api/tools/intent-plan',
+  '/api/tools/context-fanout/plan',
+];
+
+const requiredClientMethods = [
+  'toolExecute:',
+  'toolCacheStats:',
+  'toolBatchReadonly:',
+  'toolMutationPreview:',
+  'toolMutationApply:',
+  'toolCheckpoints:',
+  'toolCheckpointCreate:',
+  'toolCheckpointDiff:',
+  'toolCheckpointRestore:',
+  'toolIntentPlan:',
+  'toolContextFanoutPlan:',
+];
+
+const requiredSections = [
+  'registry',
+  'operations',
+  'mutations',
+  'checkpoints',
+  'cache',
+  'ledger',
+  'risk',
+];
+
+const requiredHeadings = [
+  'Tool registry',
+  'Execution planner',
+  'Mutation transactions',
+  'Checkpoints',
+  'Tool cache',
+  'Tool ledger',
+  'Risk preflight',
+];
+
+const backendText = read(files.backend);
+const clientText = read(files.client);
+const pageText = read(files.page);
+const capabilitiesText = read(files.capabilities);
+const stylesText = read(files.styles);
+const failures = [];
+
+for (const route of hasAll(backendText, requiredBackendRoutes)) failures.push(`backend missing route ${route}`);
+for (const route of hasAll(clientText, requiredBackendRoutes.map((route) => route.replace('/:id', '/${encodeURIComponent(id)}')))) {
+  const literal = route.includes('${') ? route.replace('/${encodeURIComponent(id)}', '') : route;
+  if (!clientText.includes(literal)) failures.push(`client missing endpoint ${route}`);
+}
+for (const method of hasAll(clientText, requiredClientMethods)) failures.push(`client missing method ${method}`);
+for (const section of requiredSections) {
+  if (!capabilitiesText.includes(`id: '${section}'`)) failures.push(`capabilities missing section ${section}`);
+  if (!pageText.includes(`data-section="${section}"`)) failures.push(`ToolsPage missing data-section ${section}`);
+  if (!stylesText.includes(`data-active-section="${section}"`)) failures.push(`section filter missing ${section}`);
+}
+for (const heading of hasAll(pageText, requiredHeadings)) failures.push(`ToolsPage missing heading ${heading}`);
+
+const pageMustUse = [
+  'api.toolRegistry()',
+  'api.toolCacheStats()',
+  'api.toolCheckpoints()',
+  'api.runtimeTimeline(',
+  '<DataTable',
+  '<RequestReceipt',
+  '<RawPayload',
+  'Preview mutation',
+  'Apply transaction',
+  'Run readonly batch',
+];
+for (const item of hasAll(pageText, pageMustUse)) failures.push(`ToolsPage missing implementation evidence ${item}`);
+
+const rawOnlyPattern = /data-section="(?:operations|mutations|checkpoints|cache|ledger)"[\s\S]{0,1200}<RawPayload[\s\S]{0,300}<\/section>/g;
+const rawOnlyMatches = Array.from(pageText.matchAll(rawOnlyPattern)).filter((match) => !/DataTable|RequestReceipt|EmptyState/.test(match[0]));
+if (rawOnlyMatches.length) failures.push('ToolsPage has a tool-ops section that appears to expose only RawPayload');
+
+if (!backendText.includes('is_webui_generic_tool_allowed')) failures.push('backend execute whitelist guard missing');
+if (!backendText.includes('validate_workspace_relative_path')) failures.push('backend workspace path guard missing');
+if (!backendText.includes('TOOL_CWD_LOCK')) failures.push('backend workspace cwd lock missing');
+
+const report = {
+  version,
+  generated_at: new Date().toISOString(),
+  status: failures.length ? 'fail' : 'pass',
+  scope: 'tool operation management closure: backend routes, WebUI client, page sections, navigation filters, and structured rendering',
+  required_sections: requiredSections,
+  required_backend_routes: requiredBackendRoutes,
+  required_client_methods: requiredClientMethods,
+  failures,
+};
+
+fs.mkdirSync(reportDir, { recursive: true });
+const reportPath = path.join(reportDir, `${version}-tool-operations-gate.json`);
+fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+
+if (failures.length) {
+  console.error(`Tool operations gate failed:\n${failures.map((item) => `- ${item}`).join('\n')}`);
+  if (gate) process.exit(1);
+}
+
+console.log(`Tool operations gate written to ${reportPath}`);
