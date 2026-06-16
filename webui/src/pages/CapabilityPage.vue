@@ -34,7 +34,7 @@ const memoryContent = ref('Manufacturing line A reported repeated torque deviati
 const memoryResult = ref<any>(null);
 const memoryPacket = ref<any>(null);
 const maintenanceResult = ref<any>(null);
-const structuredSourceRef = ref('service://iacc/manufacturing/demo-line-a');
+const structuredSourceRef = ref('service://iacc/manufacturing/webui-line-a');
 const structuredFactType = ref('manufacturing_quality_event');
 const structuredPlan = ref<any>(null);
 const structuredCollections = ref<any>(null);
@@ -48,6 +48,15 @@ const toolState = ref<any>(null);
 const gatewayState = ref<any>(null);
 const crossPlaneResult = ref<any>(null);
 const resourceRef = ref('');
+const iaccState = ref<any>(null);
+const iaccResult = ref<any>(null);
+const iaccIncidentTitle = ref('Line A torque deviation threatens QA-2026-0616 shipment');
+const selectedIncidentId = ref('');
+const selectedIaccSkillId = ref('');
+const selectedActionId = ref('');
+const cockpitProfileId = ref('webui-manufacturing');
+const cockpitOwnerRef = ref('user:webui-operator');
+const cockpitReportId = ref('');
 
 async function refresh() {
   await store.loadCapability(props.page);
@@ -58,6 +67,7 @@ async function refresh() {
   if (props.page === 'agents') await loadAgentsWorkbench();
   if (props.page === 'tools') await loadToolsWorkbench();
   if (props.page === 'gateway') await loadGatewayWorkbench();
+  if (props.page === 'iacc') await loadIaccWorkbench();
 }
 
 function preview(data: any) {
@@ -157,7 +167,7 @@ async function planStructuredIngest() {
     source_ref: structuredSourceRef.value,
     fact_type: structuredFactType.value,
     estimated_rows: 128,
-    raw_checksum: 'sha256:manufacturing-demo-v0.9.220',
+    raw_checksum: 'sha256:manufacturing-webui-v0.9.220',
     metric_ids: ['torque_deviation_rate', 'station_quality_escape'],
   });
 }
@@ -244,6 +254,177 @@ async function runCrossPlanePreflight() {
     risk: 'medium',
     data_classification: 'internal',
     identity_trust: 'unknown',
+  });
+}
+
+function iaccItems(collection: any, key: string) {
+  return Array.isArray(collection?.[key]) ? collection[key] : Array.isArray(collection?.items) ? collection.items : [];
+}
+
+const iaccMetricChart = computed(() => {
+  const health = iaccState.value?.health || {};
+  return [
+    { name: 'facts', value: Number(health.fact_count || 0) },
+    { name: 'metrics', value: Number(health.metric_definition_count || 0) },
+    { name: 'attention', value: Number(health.attention_count || 0) },
+    { name: 'incidents', value: Number(health.incident_count || 0) },
+    { name: 'executions', value: Number(health.execution_count || 0) },
+  ].map((item) => ({ ...item, value: Math.max(1, item.value) }));
+});
+
+const iaccIncidents = computed(() => iaccItems(iaccState.value?.incidents, 'items'));
+const iaccMetrics = computed(() => iaccItems(iaccState.value?.metrics, 'metrics'));
+const iaccEntities = computed(() => iaccItems(iaccState.value?.entities, 'entities'));
+const iaccAttention = computed(() => iaccItems(iaccState.value?.attention, 'items'));
+const iaccSkills = computed(() => iaccItems(iaccState.value?.skills, 'items'));
+const iaccRoom = computed(() => iaccState.value?.room || {});
+const iaccAnalysis = computed(() => iaccRoom.value?.analysis || iaccResult.value?.analysis || iaccResult.value?.operational_analysis);
+const iaccRecommendedActions = computed(() => iaccAnalysis.value?.recommended_actions || []);
+
+async function loadIaccWorkbench() {
+  workbenchError.value = '';
+  try {
+    const [app, health, commandCenter, live, metrics, entities, changes, attention, incidents, skills] = await Promise.all([
+      api.iaccApp(),
+      api.iaccHealth(),
+      api.iaccCommandCenter(),
+      api.iaccCommandCenterLive(),
+      api.iaccMetrics(),
+      api.iaccEntities(),
+      api.iaccChanges(),
+      api.iaccAttentionHot(),
+      api.iaccIncidents(),
+      api.iaccSkills(),
+    ]);
+    iaccState.value = { app, health, commandCenter, live, metrics, entities, changes, attention, incidents, skills, room: iaccState.value?.room };
+    const firstIncident = iaccItems(incidents, 'items')[0]?.incident_id;
+    if (!selectedIncidentId.value && firstIncident) {
+      selectedIncidentId.value = firstIncident;
+      await loadIaccIncidentRoom();
+    }
+    const firstSkill = iaccItems(skills, 'items')[0]?.skill_id;
+    if (!selectedIaccSkillId.value && firstSkill) selectedIaccSkillId.value = firstSkill;
+  } catch (error) {
+    workbenchError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function seedIaccManufacturing() {
+  iaccResult.value = {
+    domain: await api.iaccSeedDomain(),
+    ontology: await api.iaccSeedOntology(),
+    fact: await api.iaccIngestFact([{
+      fact_type: 'manufacturing_quality_event',
+      entity_refs: ['line:A', 'station:torque-03'],
+      metric_key: 'torque_deviation_rate',
+      dimensions: { line: 'A', station: 'torque-03', batch: 'QA-2026-0616' },
+      measures: { deviation_rate: 0.18, affected_units: 42 },
+      source_ref: 'webui://iacc/simulated-manufacturing-quality',
+      confidence: 0.93,
+    }]),
+  };
+  await loadIaccWorkbench();
+}
+
+async function createIaccIncident() {
+  iaccResult.value = await api.iaccCreateIncident({
+    title: iaccIncidentTitle.value,
+    session_id: store.activeSessionId || 'webui-iacc',
+  });
+  selectedIncidentId.value = iaccResult.value?.incident?.incident_id || selectedIncidentId.value;
+  await loadIaccIncidentRoom();
+  await loadIaccWorkbench();
+}
+
+async function loadIaccIncidentRoom() {
+  if (!selectedIncidentId.value) return;
+  const room = await api.iaccIncidentRoom(selectedIncidentId.value);
+  iaccState.value = { ...(iaccState.value || {}), room };
+  selectedActionId.value = (room as any).analysis?.recommended_actions?.[0]?.action_id || selectedActionId.value;
+}
+
+async function analyzeIaccIncident() {
+  if (!selectedIncidentId.value) return;
+  iaccResult.value = await api.iaccAnalyzeIncident(selectedIncidentId.value);
+  await loadIaccIncidentRoom();
+}
+
+async function recommendIaccPlaybooks() {
+  if (!selectedIncidentId.value) return;
+  iaccResult.value = await api.iaccRecommendPlaybooks(selectedIncidentId.value, 5);
+  await loadIaccIncidentRoom();
+}
+
+async function promoteIaccCase() {
+  if (!selectedIncidentId.value) return;
+  iaccResult.value = await api.iaccPromoteIncidentCase(selectedIncidentId.value);
+  await loadIaccIncidentRoom();
+}
+
+async function planIaccSkills() {
+  if (!selectedIncidentId.value) return;
+  iaccResult.value = await api.iaccPlanSkills(selectedIncidentId.value, 3);
+  selectedIaccSkillId.value = iaccResult.value?.plan?.selected_skills?.[0]?.skill_id || selectedIaccSkillId.value;
+  await loadIaccIncidentRoom();
+}
+
+async function runIaccSkill() {
+  if (!selectedIncidentId.value || !selectedIaccSkillId.value) return;
+  iaccResult.value = await api.iaccRunSkill(selectedIncidentId.value, selectedIaccSkillId.value);
+  await loadIaccIncidentRoom();
+}
+
+async function executeIaccAction() {
+  const analysisId = iaccAnalysis.value?.analysis_id;
+  if (!analysisId || !selectedActionId.value) return;
+  iaccResult.value = await api.iaccExecuteAction(analysisId, selectedActionId.value, {
+    mode: 'dry_run',
+    operator_id: 'webui-operator',
+    note: 'executed from WebUI IACC workbench',
+  });
+  await loadIaccIncidentRoom();
+}
+
+async function bridgeIaccExecution() {
+  const executionId = iaccResult.value?.execution?.execution_id || iaccRoom.value?.executions?.[0]?.execution_id;
+  if (!executionId) return;
+  iaccResult.value = await api.iaccExecutionBridge(executionId, {
+    mode: 'dry_run',
+    actor_principal: 'webui-operator',
+    source_channel: 'channel://webui/iacc',
+    requested_capability: 'channel.feishu.send_text',
+  });
+  await loadIaccIncidentRoom();
+}
+
+async function generateIaccReport() {
+  const profile = await api.iaccUpsertProfile({
+    profile_id: cockpitProfileId.value,
+    owner_ref: cockpitOwnerRef.value,
+    display_name: 'WebUI Manufacturing Cockpit',
+    focus_refs: ['line:A', 'station:torque-03'],
+    focus_metric_ids: ['torque_deviation_rate', 'station_quality_escape'],
+    thresholds: { torque_deviation_rate: 0.08, station_quality_escape: 0 },
+    cadence: 'daily',
+  });
+  const report = await api.iaccGenerateReport(cockpitProfileId.value, {
+    report_id: cockpitReportId.value || undefined,
+    cadence: 'daily',
+    delivery_ref: 'channel://feishu/user/webui-operator',
+    note: 'generated from WebUI IACC workbench',
+  });
+  cockpitReportId.value = report?.report?.report_id || cockpitReportId.value;
+  iaccResult.value = { profile, report };
+  await loadIaccWorkbench();
+}
+
+async function retryIaccReportDelivery() {
+  if (!cockpitReportId.value) return;
+  iaccResult.value = await api.iaccRetryReportDelivery(cockpitReportId.value, {
+    mode: 'dry_run',
+    force: true,
+    actor_principal: 'webui-operator',
+    source_channel: 'iacc.report.retry',
   });
 }
 
@@ -587,6 +768,133 @@ watch(() => props.page, refresh);
         </header>
         <button class="primary-action" type="button" @click="runCrossPlanePreflight">Run preflight</button>
         <pre class="action-result">{{ preview(crossPlaneResult || { summary: gatewayState?.crossPlane, audit: gatewayState?.audit, adapters: gatewayState?.adapters, executions: gatewayState?.executions }) }}</pre>
+      </article>
+    </section>
+
+    <section v-if="props.page === 'iacc'" class="management-grid iacc-workbench">
+      <ChartPanel title="IACC operating load" kind="bar" :data="iaccMetricChart" />
+
+      <article class="management-panel iacc-command-panel">
+        <header>
+          <h2>Manufacturing command center</h2>
+          <span>{{ iaccState?.health?.status || 'unknown' }}</span>
+        </header>
+        <dl class="detail-list">
+          <dt>Schema</dt>
+          <dd>{{ iaccState?.health?.schema_version || 'unknown' }}</dd>
+          <dt>Capabilities</dt>
+          <dd>{{ iaccState?.health?.capabilities?.length || 0 }}</dd>
+          <dt>Risk queue</dt>
+          <dd>{{ iaccState?.commandCenter?.risk_queue?.length || 0 }}</dd>
+          <dt>Live actions</dt>
+          <dd>{{ iaccState?.live?.action_queue?.length || 0 }}</dd>
+        </dl>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Manufacturing data seed</h2>
+          <span>{{ iaccMetrics.length }} metrics</span>
+        </header>
+        <p>IACC is an upper application. This action seeds manufacturing ontology/domain data and writes a real manufacturing fact through IACC APIs.</p>
+        <button class="primary-action" type="button" @click="seedIaccManufacturing">Seed manufacturing fact</button>
+        <pre class="action-result">{{ preview({ metrics: iaccState?.metrics, attention: iaccState?.attention, changes: iaccState?.changes }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Incident room</h2>
+          <span>{{ iaccIncidents.length }} incidents</span>
+        </header>
+        <label class="field-line">
+          New incident
+          <textarea v-model="iaccIncidentTitle" rows="3" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="createIaccIncident">Create incident</button>
+          <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="loadIaccIncidentRoom">Open room</button>
+        </div>
+        <label class="field-line">
+          Current incident
+          <select v-model="selectedIncidentId" @change="loadIaccIncidentRoom">
+            <option value="">Select incident</option>
+            <option v-for="incident in iaccIncidents" :key="incident.incident_id" :value="incident.incident_id">
+              {{ incident.title || incident.incident_id }}
+            </option>
+          </select>
+        </label>
+        <pre class="action-result">{{ preview({ room: iaccRoom, entities: iaccEntities.slice(0, 8), attention: iaccAttention.slice(0, 8) }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Analysis, playbook, actions</h2>
+          <span>{{ iaccRecommendedActions.length }} actions</span>
+        </header>
+        <div class="button-row">
+          <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="analyzeIaccIncident">Analyze</button>
+          <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="recommendIaccPlaybooks">Recommend playbooks</button>
+          <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="promoteIaccCase">Promote case</button>
+        </div>
+        <label class="field-line">
+          Recommended action
+          <select v-model="selectedActionId">
+            <option value="">Select action</option>
+            <option v-for="action in iaccRecommendedActions" :key="action.action_id" :value="action.action_id">
+              {{ action.title || action.action_id }}
+            </option>
+          </select>
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" :disabled="!selectedActionId" @click="executeIaccAction">Execute dry run</button>
+          <button class="ghost-action" type="button" @click="bridgeIaccExecution">Bridge cross-plane</button>
+        </div>
+        <pre class="action-result">{{ preview({ analysis: iaccAnalysis, executions: iaccRoom?.executions, playbooks: iaccRoom?.playbooks }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Manufacturing skills</h2>
+          <span>{{ iaccSkills.length }} skills</span>
+        </header>
+        <label class="field-line">
+          Skill
+          <select v-model="selectedIaccSkillId">
+            <option value="">Select skill</option>
+            <option v-for="skill in iaccSkills" :key="skill.skill_id" :value="skill.skill_id">
+              {{ skill.name || skill.skill_id }}
+            </option>
+          </select>
+        </label>
+        <div class="button-row">
+          <button class="ghost-action" type="button" :disabled="!selectedIncidentId" @click="planIaccSkills">Plan skills</button>
+          <button class="primary-action" type="button" :disabled="!selectedIncidentId || !selectedIaccSkillId" @click="runIaccSkill">Run skill</button>
+        </div>
+        <pre class="action-result">{{ preview({ skills: iaccState?.skills, skill_runs: iaccRoom?.skill_runs || iaccResult?.skill_run }) }}</pre>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>Cockpit reports</h2>
+          <span>delivery/retry</span>
+        </header>
+        <label class="field-line">
+          Profile id
+          <input v-model="cockpitProfileId" type="text" />
+        </label>
+        <label class="field-line">
+          Owner ref
+          <input v-model="cockpitOwnerRef" type="text" />
+        </label>
+        <label class="field-line">
+          Report id
+          <input v-model="cockpitReportId" type="text" placeholder="optional" />
+        </label>
+        <div class="button-row">
+          <button class="primary-action" type="button" @click="generateIaccReport">Generate report</button>
+          <button class="ghost-action" type="button" :disabled="!cockpitReportId" @click="retryIaccReportDelivery">Retry delivery</button>
+        </div>
+        <pre class="action-result">{{ preview(iaccResult || {}) }}</pre>
       </article>
     </section>
 

@@ -81,6 +81,19 @@ test('gateway page exposes connector and cross-plane controls', async ({ page })
   await expect(page.getByRole('button', { name: 'Run preflight' })).toBeVisible();
 });
 
+test('iacc page exposes manufacturing application workbench controls', async ({ page }) => {
+  await page.goto('/index.html#/iacc');
+  await expect(page.getByRole('heading', { name: 'Manufacturing command center' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Manufacturing data seed' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Incident room' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Analysis, playbook, actions' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Manufacturing skills' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Cockpit reports' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Seed manufacturing fact' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create incident' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Generate report' })).toBeVisible();
+});
+
 test('settings page is reachable and theme control is usable', async ({ page }) => {
   await page.goto('/index.html#/settings');
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();

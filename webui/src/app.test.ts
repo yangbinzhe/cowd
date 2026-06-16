@@ -92,4 +92,21 @@ describe('Cowd Vue WebUI shell', () => {
       body: JSON.stringify({ path: 'docs/a.md', label: 'A doc', kind: 'workspace_file' }),
     }));
   });
+
+  it('calls real IACC incident and cockpit report endpoints', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'test.receipt' }), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.iaccCreateIncident({ title: 'Line A deviation' });
+    await api.iaccAnalyzeIncident('incident-1');
+    await api.iaccGenerateReport('profile-1', { cadence: 'daily' });
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ title: 'Line A deviation' }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents/incident-1/analyze', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/cockpit/profiles/profile-1/reports/generate', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ report: { cadence: 'daily' } }),
+    }));
+  });
 });

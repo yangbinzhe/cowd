@@ -332,6 +332,76 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body),
   }),
+  iaccApp: () => read('/api/iacc/app', {}),
+  iaccHealth: () => read('/api/iacc/health', {}),
+  iaccCommandCenter: () => read('/api/iacc/command-center', {}),
+  iaccCommandCenterLive: () => read('/api/iacc/command-center/live', {}),
+  iaccMetrics: () => read('/api/iacc/metrics', {}),
+  iaccMetricDetail: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}`, {}),
+  iaccMetricLineage: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}/lineage`, {}),
+  iaccAttentionPlan: (body: Record<string, unknown>) => write('/api/iacc/metrics/attention-plan', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccEntities: () => read('/api/iacc/entities', {}),
+  iaccChanges: () => read('/api/iacc/changes', {}),
+  iaccAttentionHot: () => read('/api/iacc/attention/hot', {}),
+  iaccIncidents: () => read('/api/iacc/incidents', {}),
+  iaccCreateIncident: (body: Record<string, unknown>) => write('/api/iacc/incidents', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccIncidentRoom: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}/room`, {}),
+  iaccAnalyzeIncident: (id: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/analyze`, { method: 'POST' }),
+  iaccPromoteIncidentCase: (id: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/cases/promote`, { method: 'POST' }),
+  iaccRecommendPlaybooks: (id: string, limit = 5) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/playbooks/recommend`, {
+    method: 'POST',
+    body: JSON.stringify({ limit }),
+  }),
+  iaccPlanSkills: (id: string, limit = 3) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/skills/plan`, {
+    method: 'POST',
+    body: JSON.stringify({ limit }),
+  }),
+  iaccRunSkill: (id: string, skillId: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/skills/${encodeURIComponent(skillId)}/run`, {
+    method: 'POST',
+    body: JSON.stringify({ session_id: id }),
+  }),
+  iaccSkillRuns: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}/skills`, {}),
+  iaccExecuteAction: (analysisId: string, actionId: string, body: Record<string, unknown>) => write(`/api/iacc/analyses/${encodeURIComponent(analysisId)}/actions/${encodeURIComponent(actionId)}/execute`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccExecutionBridge: (executionId: string, body: Record<string, unknown>) => write(`/api/iacc/executions/${encodeURIComponent(executionId)}/cross-plane/execute`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccExecutionFeedback: (executionId: string, body: Record<string, unknown>) => write(`/api/iacc/executions/${encodeURIComponent(executionId)}/feedback`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccUpsertProfile: (profile: Record<string, unknown>) => write('/api/iacc/cockpit/profiles/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  }),
+  iaccGenerateReport: (profileId: string, report: Record<string, unknown>) => write(`/api/iacc/cockpit/profiles/${encodeURIComponent(profileId)}/reports/generate`, {
+    method: 'POST',
+    body: JSON.stringify({ report }),
+  }),
+  iaccReportDeliveryState: (reportId: string) => read(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery-state`, {}),
+  iaccRetryReportDelivery: (reportId: string, body: Record<string, unknown>) => write(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery/retry`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccRunReportSchedule: (body: Record<string, unknown>) => write('/api/iacc/cockpit/reports/schedules/run', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  iaccIngestFact: (facts: Record<string, unknown>[]) => write('/api/iacc/facts/ingest', {
+    method: 'POST',
+    body: JSON.stringify({ facts, session_id: 'webui-iacc' }),
+  }),
+  iaccSeedDomain: () => write('/api/iacc/domain/server-manufacturing/seed', { method: 'POST' }),
+  iaccSeedOntology: () => write('/api/iacc/ontology/server-manufacturing/seed', { method: 'POST' }),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',
