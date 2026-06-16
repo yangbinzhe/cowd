@@ -194,6 +194,27 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .endpoint-health-list p { margin: 4px 0 0; color: var(--warn); font-size: 12px; }
 .request-receipt[data-ok="false"] { border-color: color-mix(in srgb, var(--warn) 44%, var(--border)); }
 .request-receipt .detail-list { grid-template-columns: 96px minmax(0, 1fr); }
+.governed-action-panel { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--border-2); border-radius: 8px; background: color-mix(in srgb, var(--surface-2) 72%, var(--surface)); margin-top: 12px; }
+.governed-action-panel > header { align-items: flex-start; margin: 0; }
+.governed-action-panel > header span { color: var(--text-faint); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.governed-action-panel > header h3 { margin: 3px 0 0; font-size: 15px; }
+.governed-action-panel > header code { max-width: 52%; padding: 5px 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
+.governed-action-panel > p, .impact-preview p, .schema-form .panel-note { margin: 0; color: var(--text-muted); line-height: 1.5; }
+.execution-mode-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.execution-mode-switch button { display: grid; gap: 4px; min-height: 72px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-muted); text-align: left; }
+.execution-mode-switch button.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, var(--bg)); color: var(--text); }
+.execution-mode-switch button span { color: var(--text-faint); font-size: 11px; line-height: 1.35; }
+.payload-editor, .schema-form { display: grid; gap: 10px; }
+.payload-editor label { display: grid; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.payload-editor textarea { width: 100%; min-height: 160px; resize: vertical; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 10px; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
+.field-error { color: var(--danger); font-size: 12px; }
+.field-ok { color: var(--success); font-size: 12px; }
+.impact-preview { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.impact-preview header { align-items: center; margin: 0; }
+.impact-preview h3 { margin: 0; font-size: 13px; }
+.impact-preview header span { color: var(--text-faint); font-size: 11px; }
+.impact-preview ul { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.impact-preview li { padding: 4px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text-muted); font-size: 11px; }
 .main-surface[data-active-section="overview"] [data-section]:not([data-section="overview"]),
 .main-surface[data-active-section="runs"] [data-section]:not([data-section="runs"]),
 .main-surface[data-active-section="policy"] [data-section]:not([data-section="policy"]),
@@ -221,7 +242,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .main-surface[data-active-section="identities"] [data-section]:not([data-section="identities"]),
 .main-surface[data-active-section="executions"] [data-section]:not([data-section="executions"]),
 .main-surface[data-active-section="data-plane"] [data-section]:not([data-section="data-plane"]),
+.main-surface[data-active-section="source-pack"] [data-section]:not([data-section="source-pack"]),
 .main-surface[data-active-section="metrics"] [data-section]:not([data-section="metrics"]),
+.main-surface[data-active-section="incident-room"] [data-section]:not([data-section="incident-room"]),
+.main-surface[data-active-section="actions"] [data-section]:not([data-section="actions"]),
+.main-surface[data-active-section="skills"] [data-section]:not([data-section="skills"]),
+.main-surface[data-active-section="reports"] [data-section]:not([data-section="reports"]),
 .main-surface[data-active-section="incidents"] [data-section]:not([data-section="incidents"]),
 .main-surface[data-active-section="export"] [data-section]:not([data-section="export"]),
 .main-surface[data-active-section="usage"] [data-section]:not([data-section="usage"]),

@@ -17,6 +17,7 @@ import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 import ToolsPage from './pages/ToolsPage.vue';
 import { useAppStore } from './stores/app';
+import iaccWriteContracts from './data/iaccWriteContracts.json';
 
 vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
 vi.mock('vue-echarts', () => ({ default: { template: '<div class="chart"></div>' } }));
@@ -237,6 +238,41 @@ describe('Cowd Vue WebUI shell', () => {
       method: 'POST',
       body: JSON.stringify({ report: { cadence: 'daily' } }),
     }));
+  });
+
+  it('renders IACC governed action chains from the write contract source', async () => {
+    const fetchMock = vi.fn((path: RequestInfo | URL) => {
+      const url = String(path);
+      if (url === '/api/webui/manifest') return Promise.resolve(new Response(JSON.stringify({ status: 'test' })));
+      if (url.startsWith('/api/sessions?')) return Promise.resolve(new Response(JSON.stringify({ sessions: [] })));
+      if (url === '/api/config') return Promise.resolve(new Response(JSON.stringify({ version: 'test' })));
+      if (url === '/api/runtime/control-plane') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/commands') return Promise.resolve(new Response(JSON.stringify({ commands: [] })));
+      if (url === '/api/config/providers') return Promise.resolve(new Response(JSON.stringify({ providers: [], models: [] })));
+      if (url === '/api/profiles') return Promise.resolve(new Response(JSON.stringify({ profiles: [], active_profile: 'default' })));
+      if (url === '/api/workspace') return Promise.resolve(new Response(JSON.stringify({ workspace_root: '', workspace_canonical: '' })));
+      if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
+      if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
+      if (url === '/api/iacc/health') return Promise.resolve(new Response(JSON.stringify({ status: 'ready', fact_count: 2, schema_version: 'test' })));
+      if (url === '/api/iacc/metrics') return Promise.resolve(new Response(JSON.stringify({ metrics: [{ metric_id: 'torque_deviation_rate', name: 'Torque deviation', unit: '%' }] })));
+      if (url === '/api/iacc/entities') return Promise.resolve(new Response(JSON.stringify({ entities: [{ entity_id: 'line-a', entity_type: 'manufacturing_line', canonical_key: 'line:A', display_name: 'Line A' }] })));
+      if (url === '/api/iacc/incidents') return Promise.resolve(new Response(JSON.stringify({ items: [{ incident_id: 'incident-1', title: 'Line A deviation' }] })));
+      if (url === '/api/iacc/skills') return Promise.resolve(new Response(JSON.stringify({ items: [{ skill_id: 'skill-1', name: 'Root cause analysis' }] })));
+      if (url === '/api/iacc/incidents/incident-1/room') return Promise.resolve(new Response(JSON.stringify({ analysis: { recommended_actions: [{ action_id: 'action-1', title: 'Notify QA' }] }, executions: [] })));
+      return Promise.resolve(new Response(JSON.stringify({})));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = await mountApp('/iacc');
+    await settleAsync();
+    await settleAsync();
+    const domains = new Set((iaccWriteContracts as any[]).map((contract) => contract.domain));
+    expect(domains).toEqual(new Set(['Cockpit', 'Data Plane', 'Entities', 'Evidence', 'Facts', 'Incidents', 'Metrics']));
+    expect(wrapper.findAll('.governed-action-panel').length).toBeGreaterThanOrEqual(7);
+    expect(wrapper.text()).toContain('Governed write contracts');
+    expect(wrapper.text()).toContain('cowd owns structured data');
+    expect(wrapper.text()).toContain('Source pack upsert');
+    expect(wrapper.text()).toContain('Manufacturing fact ingest');
+    expect(wrapper.text()).toContain('Metric compute run');
   });
 
   it('loads audit, usage, and release gate from real governance endpoints', async () => {

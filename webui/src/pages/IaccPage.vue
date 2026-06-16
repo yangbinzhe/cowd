@@ -8,6 +8,8 @@ import DataTable from '../components/workbench/DataTable.vue';
 import RawPayload from '../components/workbench/RawPayload.vue';
 import ApiStateBanner from '../components/workbench/ApiStateBanner.vue';
 import RequestReceipt from '../components/workbench/RequestReceipt.vue';
+import GovernedActionPanel from '../components/workbench/GovernedActionPanel.vue';
+import iaccWriteContracts from '../data/iaccWriteContracts.json';
 
 const store = useAppStore();
 const loading = ref(false);
@@ -36,6 +38,7 @@ const entityResult = ref<any>(null);
 const metricResult = ref<any>(null);
 const evidenceResult = ref<any>(null);
 const iaccLiveQuarantine = true;
+const contractsById = computed(() => Object.fromEntries((iaccWriteContracts as any[]).map((contract) => [contract.id, contract])));
 
 function items(collection: any, key: string) {
   return Array.isArray(collection?.[key]) ? collection[key] : Array.isArray(collection?.items) ? collection.items : [];
@@ -60,6 +63,11 @@ const skills = computed(() => items(state.value?.skills, 'items'));
 const room = computed(() => state.value?.room || {});
 const analysis = computed(() => room.value?.analysis || result.value?.analysis || result.value?.operational_analysis);
 const recommendedActions = computed(() => analysis.value?.recommended_actions || []);
+const contractSummary = computed(() => ({
+  count: (iaccWriteContracts as any[]).length,
+  domains: Array.from(new Set((iaccWriteContracts as any[]).map((contract) => contract.domain))).join(', '),
+  quarantined: (iaccWriteContracts as any[]).filter((contract) => String(contract.live_policy || '').includes('quarantined')).length,
+}));
 
 function quarantineReceipt(action: string, endpoint: string, payload: Record<string, unknown> = {}) {
   return {
@@ -71,6 +79,153 @@ function quarantineReceipt(action: string, endpoint: string, payload: Record<str
     payload_summary: JSON.stringify(payload).slice(0, 280),
     retryable: false,
   };
+}
+
+function contract(id: string) {
+  return contractsById.value[id] || (iaccWriteContracts as any[])[0];
+}
+
+function defaultFact() {
+  return {
+    source_ref: `source-pack://${sourcePackId.value}`,
+    fact_type: 'manufacturing_quality_event',
+    entity_ref: selectedEntityId.value || 'line:A',
+    metric_id: selectedMetricId.value || 'torque_deviation_rate',
+    observed_at: new Date().toISOString(),
+    measures: {
+      deviation_rate: 0.12,
+      affected_units: 8,
+    },
+  };
+}
+
+function parseFactPayloadOrDefault() {
+  if (!factPayload.value.trim()) return [defaultFact()];
+  try {
+    const parsed = JSON.parse(factPayload.value);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [defaultFact()];
+  }
+}
+
+function sourcePackGovernedPayload() {
+  return defaultSourcePack();
+}
+
+function factGovernedPayload() {
+  return { facts: parseFactPayloadOrDefault() };
+}
+
+function entityGovernedPayload() {
+  return {
+    entity_id: selectedEntityId.value || undefined,
+    entity_type: 'manufacturing_line',
+    canonical_key: 'line:A',
+    display_name: 'Line A',
+    source_keys: [{ source_system: sourcePackId.value, source_key: 'line:A', source_ref: `source-pack://${sourcePackId.value}` }],
+  };
+}
+
+function metricGovernedPayload() {
+  return {
+    job_id: computeJobId.value || undefined,
+    metric_ids: [selectedMetricId.value || 'torque_deviation_rate'],
+    entity_scope: selectedEntityId.value || undefined,
+    trigger_fact_type: 'manufacturing_quality_event',
+  };
+}
+
+function evidenceGovernedPayload() {
+  return {
+    evidence_id: evidenceId.value || undefined,
+    attention_id: attention.value[0]?.attention_id,
+    problem_statement: incidentTitle.value,
+  };
+}
+
+function incidentGovernedPayload() {
+  return {
+    incident_id: selectedIncidentId.value || undefined,
+    title: incidentTitle.value,
+    selected_action_id: selectedActionId.value || undefined,
+    mode: 'dry_run',
+  };
+}
+
+function reportGovernedPayload() {
+  return {
+    profile_id: cockpitProfileId.value,
+    owner_ref: cockpitOwnerRef.value,
+    report_id: cockpitReportId.value || undefined,
+    cadence: 'daily',
+  };
+}
+
+async function planFactIngest() {
+  try {
+    dataPlaneResult.value = await api.structuredIngestPlan({
+      source: 'iacc.governed_action',
+      session_id: 'webui-iacc',
+      ...factGovernedPayload(),
+    });
+  } catch (err) {
+    result.value = quarantineReceipt('Fact ingest plan', '/api/cowd/structured/ingest-plan', factGovernedPayload());
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function dryRunFactIngest() {
+  dataPlaneResult.value = await api.structuredIngestPlan({
+    source: 'iacc.governed_action.dry_run',
+    session_id: 'webui-iacc',
+    ...factGovernedPayload(),
+  });
+}
+
+async function planEntityGovernance() {
+  await resolveEntitySourceKey();
+}
+
+async function dryRunEntityGovernance() {
+  entityResult.value = await api.iaccEntityMatchCandidate(selectedEntityId.value || 'line:A', relationTargetId.value || selectedEntityId.value || 'line:A');
+}
+
+async function planEvidenceGovernance() {
+  if (evidenceId.value) await inspectEvidence();
+  else await buildEvidencePacket();
+}
+
+async function dryRunEvidenceGovernance() {
+  if (evidenceId.value) await inspectEvidence();
+  else await planMetricAttention();
+}
+
+async function planIncidentGovernance() {
+  if (selectedIncidentId.value) await planSkills();
+  else result.value = quarantineReceipt('Incident plan', '/api/iacc/incidents/:id/skills/plan', incidentGovernedPayload());
+}
+
+async function dryRunIncidentGovernance() {
+  if (selectedIncidentId.value) await recommendPlaybooks();
+  else result.value = quarantineReceipt('Incident dry run', '/api/iacc/incidents/:id/playbooks/recommend', incidentGovernedPayload());
+}
+
+async function planActionGovernance() {
+  if (selectedIncidentId.value) await analyzeIncident();
+  else result.value = quarantineReceipt('Action plan', '/api/iacc/analyses/:analysis_id/actions/:action_id/execute', incidentGovernedPayload());
+}
+
+async function dryRunActionGovernance() {
+  await executeAction();
+}
+
+async function planReportGovernance() {
+  result.value = await api.iaccReportDeliveryState(cockpitReportId.value || 'pending-report');
+}
+
+async function dryRunReportGovernance() {
+  result.value = quarantineReceipt('Cockpit report dry run', '/api/iacc/cockpit/profiles/:id/projection', reportGovernedPayload());
 }
 
 async function refresh() {
@@ -569,6 +724,21 @@ onMounted(refresh);
         </dl>
       </article>
 
+      <article class="management-panel" data-section="overview">
+        <header>
+          <h2>Governed write contracts</h2>
+          <span>{{ contractSummary.count }} contracts</span>
+        </header>
+        <dl class="detail-list">
+          <dt>Domains</dt>
+          <dd>{{ contractSummary.domains }}</dd>
+          <dt>Quarantined live writes</dt>
+          <dd>{{ contractSummary.quarantined }}</dd>
+          <dt>Core boundary</dt>
+          <dd>cowd owns structured data, memory, context, cross-plane policy, and audit; IACC owns manufacturing schema, workflows, metrics, incidents, and cockpit intent.</dd>
+        </dl>
+      </article>
+
       <article class="management-panel" data-section="data-plane">
         <header>
           <h2>Data plane and source packs</h2>
@@ -603,6 +773,22 @@ onMounted(refresh);
           <input v-model="connectorRunId" type="text" @keydown.enter.prevent="getConnectorRun" />
         </label>
         <RequestReceipt :receipt="sourcePackResult" title="Source pack receipt" />
+        <GovernedActionPanel
+          :contract="contract('source-pack-upsert')"
+          :payload="sourcePackGovernedPayload()"
+          :receipt="sourcePackResult"
+          @plan="sourcePackDeltaPlan"
+          @dry-run="validateSourcePack"
+          @live="upsertSourcePack"
+        />
+        <GovernedActionPanel
+          :contract="contract('connector-run')"
+          :payload="{ source_pack_id: sourcePackId, mode: 'dry_run', requested_capability: 'service.read' }"
+          :receipt="sourcePackResult"
+          @plan="planConnectorRun"
+          @dry-run="planConnectorRun"
+          @live="executeConnectorRun"
+        />
         <RawPayload :data="{ data_plane: dataPlaneResult, source_pack: sourcePackResult }" />
       </article>
 
@@ -618,6 +804,14 @@ onMounted(refresh);
           <span class="sr-only iacc-live-quarantined" data-iacc-risk="iaccSeedOntology">Ontology seed quarantined</span>
           <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccIngestFact" type="button" @click="ingestManufacturingFacts">Ingest facts</button>
         </div>
+        <GovernedActionPanel
+          :contract="contract('fact-ingest')"
+          :payload="factGovernedPayload()"
+          :receipt="dataPlaneResult || result"
+          @plan="planFactIngest"
+          @dry-run="dryRunFactIngest"
+          @live="ingestManufacturingFacts"
+        />
         <DataTable v-if="metrics.length" :rows="metrics.slice(0, 8)" :columns="['metric_id', 'name', 'unit', 'status']" />
         <RawPayload :data="{ metrics: state?.metrics, attention: state?.attention, changes: state?.changes }" />
       </article>
@@ -643,6 +837,22 @@ onMounted(refresh);
         <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccRelationUpsert" type="button" :disabled="!selectedEntityId || !relationTargetId" @click="upsertRelation">Upsert relation</button>
         <DataTable v-if="entities.length" :rows="entities.slice(0, 8)" :columns="['entity_id', 'entity_type', 'canonical_key', 'display_name']" />
         <RequestReceipt :receipt="entityResult" title="Entity receipt" />
+        <GovernedActionPanel
+          :contract="contract('entity-upsert')"
+          :payload="entityGovernedPayload()"
+          :receipt="entityResult"
+          @plan="planEntityGovernance"
+          @dry-run="dryRunEntityGovernance"
+          @live="upsertEntity"
+        />
+        <GovernedActionPanel
+          :contract="contract('relation-upsert')"
+          :payload="{ from_entity_id: selectedEntityId, to_entity_id: relationTargetId, relation_type: 'feeds' }"
+          :receipt="entityResult"
+          @plan="inspectEntity"
+          @dry-run="inspectEntity"
+          @live="upsertRelation"
+        />
         <RawPayload :data="entityResult || {}" />
       </article>
 
@@ -670,6 +880,14 @@ onMounted(refresh);
           <button class="ghost-action" type="button" @click="recomputeMetrics">Recompute all</button>
         </div>
         <RequestReceipt :receipt="metricResult" title="Metric receipt" />
+        <GovernedActionPanel
+          :contract="contract('metric-compute-run')"
+          :payload="metricGovernedPayload()"
+          :receipt="metricResult"
+          @plan="planComputeJob"
+          @dry-run="planMetricAttention"
+          @live="runComputeJob"
+        />
         <RawPayload :data="metricResult || {}" />
       </article>
 
@@ -692,6 +910,14 @@ onMounted(refresh);
           <button class="ghost-action" type="button" :disabled="!evidenceId" @click="evaluateEvidenceQuality">Quality gate</button>
         </div>
         <button class="ghost-action" type="button" :disabled="!qualityGateId" @click="inspectQualityGate">Open quality gate</button>
+        <GovernedActionPanel
+          :contract="contract('evidence-build')"
+          :payload="evidenceGovernedPayload()"
+          :receipt="evidenceResult"
+          @plan="planEvidenceGovernance"
+          @dry-run="dryRunEvidenceGovernance"
+          @live="buildEvidencePacket"
+        />
         <RawPayload :data="evidenceResult || {}" />
       </article>
 
@@ -718,6 +944,14 @@ onMounted(refresh);
           </select>
         </label>
         <DataTable v-if="incidents.length" :rows="incidents.slice(0, 8)" :columns="['incident_id', 'title', 'severity', 'status']" />
+        <GovernedActionPanel
+          :contract="contract('incident-create-analyze')"
+          :payload="incidentGovernedPayload()"
+          :receipt="result"
+          @plan="planIncidentGovernance"
+          @dry-run="dryRunIncidentGovernance"
+          @live="createIncident"
+        />
         <RawPayload :data="{ room, entities: entities.slice(0, 8), attention: attention.slice(0, 8) }" />
       </article>
 
@@ -744,6 +978,14 @@ onMounted(refresh);
           <button class="primary-action iacc-live-quarantined" data-iacc-risk="iaccExecuteAction" type="button" :disabled="!selectedActionId" @click="executeAction">Execute dry run</button>
           <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccExecutionBridge" type="button" @click="bridgeExecution">Bridge cross-plane</button>
         </div>
+        <GovernedActionPanel
+          :contract="contract('action-execute-bridge')"
+          :payload="incidentGovernedPayload()"
+          :receipt="result"
+          @plan="planActionGovernance"
+          @dry-run="dryRunActionGovernance"
+          @live="bridgeExecution"
+        />
         <RequestReceipt :receipt="result" title="Action receipt" />
         <RawPayload :data="{ analysis, executions: room?.executions, playbooks: room?.playbooks }" />
       </article>
@@ -791,6 +1033,22 @@ onMounted(refresh);
           <button class="primary-action" type="button" @click="generateReport">Generate report</button>
           <button class="ghost-action iacc-live-quarantined" data-iacc-risk="iaccRetryReportDelivery" type="button" :disabled="!cockpitReportId" @click="retryReportDelivery">Retry delivery</button>
         </div>
+        <GovernedActionPanel
+          :contract="contract('cockpit-report-generate')"
+          :payload="reportGovernedPayload()"
+          :receipt="result"
+          @plan="planReportGovernance"
+          @dry-run="dryRunReportGovernance"
+          @live="generateReport"
+        />
+        <GovernedActionPanel
+          :contract="contract('cockpit-report-retry')"
+          :payload="reportGovernedPayload()"
+          :receipt="result"
+          @plan="planReportGovernance"
+          @dry-run="dryRunReportGovernance"
+          @live="retryReportDelivery"
+        />
         <RequestReceipt :receipt="result" title="Report receipt" />
         <RawPayload :data="result || {}" />
       </article>
