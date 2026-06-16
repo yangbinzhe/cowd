@@ -6,34 +6,36 @@ window.Workspace = (()=>{
     if(dir!==undefined)currentDir=dir||'';
     const cont=UI.$('panel-content');
     cont.innerHTML='';
+    cont.classList.add('workspace-page');
     const panel=UI.$('right-panel');
     if(panel)panel.classList.remove('hidden');
     document.querySelectorAll('#panel-tabs button[data-panel]').forEach(function(btn){
       btn.classList.toggle('tab-active',btn.dataset.panel==='workspace');
     });
 
-    const bread=UI.el('div','panel-section');
-    bread.innerHTML='<h3>Workspace</h3>';
-    const bc=UI.el('div');bc.style.cssText='font-size:11px;color:var(--text3);padding:4px 0';
-    bc.textContent=currentDir||'/ (root)';
-    bread.appendChild(bc);
-    cont.appendChild(bread);
+    const hero=UI.el('div','workspace-hero');
+    const heroText=UI.el('div','workspace-hero-text');
+    heroText.innerHTML='<h3>Workspace</h3><p>Browse, preview, and create files in the active Cowd workspace.</p>';
+    const pathBadge=UI.el('div','workspace-path');
+    pathBadge.textContent=currentDir||'/ (root)';
+    hero.appendChild(heroText);
+    hero.appendChild(pathBadge);
+    cont.appendChild(hero);
 
-    const actions=UI.el('div','panel-section');
+    const actions=UI.el('div','workspace-actions');
     const newFileBtn=UI.el('button','btn-secondary');
     newFileBtn.textContent='+ New File';
     newFileBtn.onclick=createFilePrompt;
     const refreshBtn=UI.el('button','btn-secondary');
     refreshBtn.textContent='Refresh';
     refreshBtn.onclick=()=>render();
-    refreshBtn.style.marginLeft='8px';
     actions.appendChild(newFileBtn);
     actions.appendChild(refreshBtn);
     cont.appendChild(actions);
 
-    const treeSec=UI.el('div','panel-section');
-    treeSec.innerHTML='<h3>Files</h3>';
-    const tree=UI.el('div');
+    const treeSec=UI.el('div','workspace-list-section');
+    treeSec.innerHTML='<div class="workspace-list-head"><h3>Files</h3><span>Type</span></div>';
+    const tree=UI.el('div','workspace-file-list');
     tree.id='file-tree';
     cont.appendChild(treeSec);
     treeSec.appendChild(tree);
@@ -48,17 +50,27 @@ window.Workspace = (()=>{
   }
 
   function renderTree(parent,items){
+    if(!items.length){
+      parent.appendChild(UI.el('div','panel-empty','No files in this directory'));
+      return;
+    }
     items.forEach(f=>{
-      const item=UI.el('div','panel-item');
-      const icon=UI.el('span','pi-icon');
-      icon.textContent=f.is_dir?'[D]':'[F]';
-      const name=UI.el('span','pi-name');
+      const isDir=!!(f.is_dir||f.type==='dir');
+      const item=UI.el('div','workspace-file-row');
+      const icon=UI.el('span','workspace-file-kind');
+      icon.textContent=isDir?'DIR':'FILE';
+      const info=UI.el('span','workspace-file-info');
+      const name=UI.el('b');
       name.textContent=f.name||f.path||'';
-      item.appendChild(icon);item.appendChild(name);
-      if(f.is_dir||f.type==='dir'){
+      const path=UI.el('small');
+      path.textContent=(currentDir?currentDir+'/':'')+(f.name||f.path||'');
+      info.appendChild(name);
+      info.appendChild(path);
+      item.appendChild(icon);
+      item.appendChild(info);
+      if(isDir){
         item.onclick=()=>render((currentDir?currentDir+'/':'')+(f.name||f.path));
         item.style.cursor='pointer';
-        item.style.fontWeight='600';
       }else{
         item.onclick=()=>previewFile(f);
       }

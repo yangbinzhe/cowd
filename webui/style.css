@@ -96,6 +96,24 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .workbench-content .panel-section{max-width:1120px}
 .workbench-content .panel-section h3{font-size:14px}
 .workbench-content .panel-empty{text-align:left}
+.workspace-page{display:flex;flex-direction:column;gap:16px}
+.workspace-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;max-width:1120px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.workspace-hero h3{font-size:18px;font-weight:700;margin-bottom:4px}
+.workspace-hero p{font-size:13px;color:var(--text2);line-height:1.4}
+.workspace-path{flex:0 0 auto;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--text2);background:var(--surface-subtle);font-size:12px;font-family:var(--font-mono)}
+.workspace-actions{display:flex;gap:8px;align-items:center;max-width:1120px}
+.workspace-list-section{max-width:1120px}
+.workspace-list-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
+.workspace-list-head h3{font-size:14px}
+.workspace-list-head span{font-size:11px;text-transform:uppercase;color:var(--text3)}
+.workspace-file-list{display:flex;flex-direction:column}
+.workspace-file-row{display:grid;grid-template-columns:58px minmax(0,1fr);align-items:center;gap:12px;border-bottom:1px solid var(--border);padding:11px 8px;border-radius:8px;color:var(--text)}
+.workspace-file-row:hover{background:var(--surface-hover)}
+.workspace-file-kind{display:inline-flex;align-items:center;justify-content:center;width:46px;height:24px;border:1px solid var(--border);border-radius:999px;color:var(--text2);font-size:10px;font-weight:700;background:var(--surface-subtle)}
+.workspace-file-info{min-width:0;display:flex;flex-direction:column;gap:2px}
+.workspace-file-info b,.workspace-file-info small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.workspace-file-info b{font-size:13px}
+.workspace-file-info small{font-size:11px;color:var(--text3);font-family:var(--font-mono)}
 #chat-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);min-height:44px}
 #chat-header-left{display:flex;align-items:center;gap:12px;min-width:0}
 #chat-header-right{display:flex;gap:4px}
@@ -456,6 +474,9 @@ pre,code{font-family:var(--font-mono);font-size:13px}
   #workbench-header h1{font-size:16px}
   #workbench-header p{font-size:11px}
   .workbench-content{padding:14px}
+  .workspace-hero{flex-direction:column;gap:8px}
+  .workspace-path{max-width:100%}
+  .workspace-file-row{grid-template-columns:52px minmax(0,1fr);padding:10px 2px}
   #chat-header{padding:8px 10px;gap:8px}
   .chat-title-block{min-width:0}
   .chat-title-block span{display:none}

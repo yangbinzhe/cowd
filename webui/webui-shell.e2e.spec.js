@@ -112,3 +112,32 @@ test('v0.9.203 chat chrome and activity metadata stay readable', async ({ page }
 
   expect(errors).toEqual([]);
 });
+
+test('v0.9.204 workspace uses the full-page file workbench layout', async ({ page }) => {
+  const errors = [];
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (text.includes('Failed to load resource')) return;
+    if (text.includes('Failed to find a valid digest')) return;
+    errors.push('console: ' + text);
+  });
+
+  await routeShellApis(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('http://127.0.0.1:9241/index.html', { waitUntil: 'domcontentloaded' });
+  await page.click('#nav-rail [data-view="workspace"]');
+
+  await expect(page.locator('#workbench-content.workspace-page')).toBeVisible();
+  await expect(page.locator('.workspace-hero')).toContainText('Browse, preview, and create files');
+  await expect(page.locator('.workspace-file-list')).toContainText('README.md');
+  await expect(page.locator('.workspace-file-kind').first()).toHaveText('FILE');
+  await expect(page.locator('.workspace-file-kind').nth(1)).toHaveText('DIR');
+
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.204-workspace-desktop.png' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '../plan/0616-前端重构/screenshots/v0.9.204-workspace-mobile.png' });
+
+  expect(errors).toEqual([]);
+});
