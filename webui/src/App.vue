@@ -8,6 +8,7 @@ import {
 import { useAppStore } from './stores/app';
 import type { NavItem } from './types';
 import CompanionPanel from './components/CompanionPanel.vue';
+import CapabilitySidebar from './components/CapabilitySidebar.vue';
 import SessionSidebar from './components/SessionSidebar.vue';
 
 const store = useAppStore();
@@ -54,7 +55,8 @@ onMounted(() => {
       </button>
     </nav>
 
-    <SessionSidebar />
+    <SessionSidebar v-if="route.path === '/chat' || route.path === '/'" />
+    <CapabilitySidebar v-else />
 
     <main class="main-surface">
       <RouterView />

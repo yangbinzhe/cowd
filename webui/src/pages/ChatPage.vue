@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue';
-import { Paperclip, Send, Square, Zap } from 'lucide-vue-next';
+import { Bot, Boxes, Folder, Paperclip, Send, Square, Zap } from 'lucide-vue-next';
 import { useAppStore } from '../stores/app';
 import MarkdownBlock from '../components/MarkdownBlock.vue';
 
@@ -8,6 +8,15 @@ const store = useAppStore();
 const draft = ref('');
 const sending = ref(false);
 const contextUsage = computed(() => Math.min(88, 42 + store.turns.length * 6));
+const models = ['claude-sonnet-4-6', 'claude-opus-4-6', 'qwen3-coder-next', 'deepseek-v4-pro', 'grok-3-mini'];
+const profiles = ['default', 'review', 'builder', 'research', 'iacc'];
+const commands = [
+  { name: '/status', detail: 'Show runtime, session, memory, and gateway status.' },
+  { name: '/model', detail: 'Switch the model for the current conversation.' },
+  { name: '/memory', detail: 'Open memory recall and fact tools.' },
+  { name: '/agents', detail: 'Open agent lanes and work graph.' },
+  { name: '/gateway', detail: 'Open channel and connector controls.' },
+];
 
 async function submit() {
   const text = draft.value.trim();
@@ -29,13 +38,12 @@ async function submit() {
       </div>
       <div class="status-strip">
         <span>{{ store.health?.status || 'local' }}</span>
-        <strong>{{ store.activeSession?.model || store.settings?.model || 'default model' }}</strong>
+        <button type="button" @click="store.openModal('model')">{{ store.selectedModel }}</button>
       </div>
     </header>
 
     <div class="transcript" aria-label="Chat transcript">
       <article v-for="turn in store.turns" :key="turn.id" class="turn" :data-role="turn.role">
-        <div class="turn-role">{{ turn.role }}</div>
         <MarkdownBlock :content="turn.content" />
       </article>
     </div>
@@ -44,18 +52,64 @@ async function submit() {
       <textarea v-model="draft" placeholder="Ask Cowd, reference files, or type / for commands" @keydown.enter.exact.prevent="submit" />
       <div class="composer-bar">
         <div class="composer-context">
-          <span>Workspace: {{ store.workspaceDir || 'root' }}</span>
-          <span>Profile: {{ store.settings?.profile || 'default' }}</span>
+          <button type="button" class="composer-chip" @click="store.openModal('workspace')"><Folder :size="14" /> {{ store.workspaceDir || 'root' }}</button>
+          <button type="button" class="composer-chip" @click="store.openModal('model')"><Bot :size="14" /> {{ store.selectedProfile }}</button>
           <span>Context {{ contextUsage }}%</span>
           <div class="context-meter"><i :style="{ width: `${contextUsage}%` }" /></div>
         </div>
         <div class="composer-actions">
           <button class="icon-action" type="button" @click="store.openCompanion('workspace')"><Paperclip :size="16" /></button>
-          <button class="ghost-action" type="button"><Zap :size="15" /> Commands</button>
+          <button class="ghost-action" type="button" @click="store.openModal('commands')"><Zap :size="15" /> Commands</button>
           <button v-if="sending" class="primary-action" type="button"><Square :size="15" /> Stop</button>
           <button v-else class="primary-action" type="button" :disabled="!draft.trim()" @click="submit"><Send :size="15" /> Send</button>
         </div>
       </div>
     </footer>
+
+    <div v-if="store.activeModal" class="modal-scrim" @click.self="store.closeModal">
+      <section v-if="store.activeModal === 'model'" class="command-modal">
+        <header>
+          <h2>Model and profile</h2>
+          <button type="button" @click="store.closeModal">Close</button>
+        </header>
+        <div class="modal-columns">
+          <div>
+            <h3>Model</h3>
+            <button v-for="model in models" :key="model" class="choice-row" :class="{ active: store.selectedModel === model }" type="button" @click="store.chooseModel(model)">
+              {{ model }}
+            </button>
+          </div>
+          <div>
+            <h3>Profile</h3>
+            <button v-for="profile in profiles" :key="profile" class="choice-row" :class="{ active: store.selectedProfile === profile }" type="button" @click="store.chooseProfile(profile)">
+              {{ profile }}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section v-else-if="store.activeModal === 'workspace'" class="command-modal">
+        <header>
+          <h2>Workspace picker</h2>
+          <button type="button" @click="store.closeModal">Close</button>
+        </header>
+        <button class="choice-row active" type="button" @click="store.openCompanion('workspace'); store.closeModal()">
+          <Folder :size="15" />
+          {{ store.workspaceRoot || 'Current workspace' }}
+        </button>
+        <p class="modal-note">Workspace details, file preview, and editing are available in the right Workspace tab.</p>
+      </section>
+
+      <section v-else class="command-modal">
+        <header>
+          <h2>Commands</h2>
+          <button type="button" @click="store.closeModal">Close</button>
+        </header>
+        <button v-for="command in commands" :key="command.name" class="command-row" type="button" @click="draft = command.name + ' '; store.closeModal()">
+          <Boxes :size="15" />
+          <span><strong>{{ command.name }}</strong><small>{{ command.detail }}</small></span>
+        </button>
+      </section>
+    </div>
   </section>
 </template>

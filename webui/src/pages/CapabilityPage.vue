@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { RefreshCw } from 'lucide-vue-next';
+import { Play, RefreshCw } from 'lucide-vue-next';
 import { capabilitySpecs } from '../data/capabilities';
+import { useAppStore } from '../stores/app';
 import ChartPanel from '../components/ChartPanel.vue';
 
 const props = defineProps<{ page: keyof typeof capabilitySpecs }>();
+const store = useAppStore();
 const spec = computed(() => capabilitySpecs[props.page]);
+const activeSection = computed(() => store.activeSectionByPage[props.page] || spec.value.sections[0].id);
+const activeSectionDetail = computed(() => spec.value.sections.find((section) => section.id === activeSection.value) || spec.value.sections[0]);
 </script>
 
 <template>
@@ -47,5 +51,41 @@ const spec = computed(() => capabilitySpecs[props.page]);
         </table>
       </section>
     </div>
+
+    <section class="management-grid">
+      <article class="management-panel">
+        <header>
+          <h2>{{ activeSectionDetail.label }}</h2>
+          <span>{{ activeSection }}</span>
+        </header>
+        <p>{{ activeSectionDetail.description }}</p>
+        <div class="action-grid">
+          <button
+            v-for="action in spec.actions"
+            :key="action.label"
+            class="action-button"
+            :data-kind="action.kind"
+            type="button"
+          >
+            <Play :size="14" />
+            <span>{{ action.label }}</span>
+            <small>{{ action.endpoint }}</small>
+          </button>
+        </div>
+      </article>
+
+      <article class="management-panel">
+        <header>
+          <h2>API and capability contract</h2>
+          <span>enabled</span>
+        </header>
+        <dl class="contract-list">
+          <template v-for="item in spec.inspector" :key="item.label">
+            <dt>{{ item.label }}</dt>
+            <dd>{{ item.value }}</dd>
+          </template>
+        </dl>
+      </article>
+    </section>
   </section>
 </template>

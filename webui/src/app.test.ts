@@ -18,6 +18,14 @@ function mountApp(path = '/chat') {
       { path: '/', redirect: '/chat' },
       { path: '/chat', component: ChatPage },
       { path: '/runtime', component: CapabilityPage, props: { page: 'runtime' } },
+      { path: '/context', component: CapabilityPage, props: { page: 'context' } },
+      { path: '/memory', component: CapabilityPage, props: { page: 'memory' } },
+      { path: '/skills', component: CapabilityPage, props: { page: 'skills' } },
+      { path: '/agents', component: CapabilityPage, props: { page: 'agents' } },
+      { path: '/tools', component: CapabilityPage, props: { page: 'tools' } },
+      { path: '/gateway', component: CapabilityPage, props: { page: 'gateway' } },
+      { path: '/iacc', component: CapabilityPage, props: { page: 'iacc' } },
+      { path: '/audit', component: CapabilityPage, props: { page: 'audit' } },
       { path: '/settings', component: SettingsPage },
     ],
   });
@@ -56,5 +64,9 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.findAll('.metric-card').length).toBe(3);
     expect(wrapper.find('.chart-panel').exists()).toBe(true);
     expect(wrapper.find('.work-table table').exists()).toBe(true);
+    expect(wrapper.find('.capability-sidebar').exists()).toBe(true);
+    expect(wrapper.find('.session-sidebar').exists()).toBe(false);
+    expect(wrapper.findAll('.section-row').length).toBeGreaterThan(1);
+    expect(wrapper.findAll('.action-button').length).toBeGreaterThan(1);
   });
 });

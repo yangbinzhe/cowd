@@ -53,6 +53,18 @@ export interface Metric {
   tone?: Tone;
 }
 
+export interface CapabilityAction {
+  label: string;
+  kind: 'primary' | 'secondary' | 'danger';
+  endpoint?: string;
+}
+
+export interface CapabilitySection {
+  id: string;
+  label: string;
+  description: string;
+}
+
 export interface ChartPoint {
   name: string;
   value: number;
@@ -69,4 +81,7 @@ export interface CapabilitySpec {
   chartData: ChartPoint[];
   tableTitle: string;
   rows: Array<Record<string, string | number>>;
+  sections: CapabilitySection[];
+  actions: CapabilityAction[];
+  inspector: Array<{ label: string; value: string }>;
 }

@@ -20,6 +20,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { kind: 'ContextPacket', status: 'ready', surface: 'webui,tui' },
       { kind: 'Approval', status: 'none', surface: 'kernel' },
     ],
+    sections: [
+      { id: 'overview', label: 'Overview', description: 'Health, readiness, blocked checks, and current control-plane state.' },
+      { id: 'runs', label: 'Runs', description: 'Session runs, value-loop stages, leases, and active execution history.' },
+      { id: 'policy', label: 'Policy', description: 'Runtime policy, observability switches, provider reload, and production gates.' },
+      { id: 'timeline', label: 'Timeline', description: 'Chronological runtime events with tool/context/approval boundaries.' },
+    ],
+    actions: [
+      { label: 'Refresh runtime', kind: 'primary', endpoint: '/api/runtime/timeline' },
+      { label: 'Reload providers', kind: 'secondary', endpoint: '/api/runtime/providers/reload' },
+      { label: 'Acquire lease', kind: 'secondary', endpoint: '/api/runtime/session-leases/acquire' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/runtime/control-plane' },
+      { label: 'Parity', value: 'WebUI and TUI full control surface' },
+      { label: 'CLI', value: 'core-only status and import commands' },
+    ],
   },
   context: {
     id: 'context',
@@ -39,6 +55,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { source: 'memory', confidence: '0.91', action: 'inject' },
       { source: 'workspace', confidence: '0.86', action: 'preview' },
       { source: 'session', confidence: '0.79', action: 'summarize' },
+    ],
+    sections: [
+      { id: 'packet', label: 'Packet builder', description: 'Build and preview current context packets before a turn.' },
+      { id: 'budget', label: 'Budget', description: 'Token pressure, source mix, compression barriers, and reuse strategy.' },
+      { id: 'evidence', label: 'Evidence', description: 'Resolve evidence refs, source confidence, and injection decisions.' },
+      { id: 'history', label: 'History', description: 'Persisted envelopes and recommendations for the active session.' },
+    ],
+    actions: [
+      { label: 'Build packet', kind: 'primary', endpoint: '/api/context/current' },
+      { label: 'Resolve evidence', kind: 'secondary', endpoint: '/api/evidence/resolve' },
+      { label: 'Record recommendation', kind: 'secondary', endpoint: '/api/sessions/:id/context/recommendations' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/context/current' },
+      { label: 'Kernel role', value: 'Context orchestration and evidence routing' },
+      { label: 'Memory link', value: 'Recall packets and facts feed context packets' },
     ],
   },
   memory: {
@@ -60,6 +92,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { fact: 'iacc is upper application', result: 'supported', confidence: '0.91' },
       { fact: 'workspace is left rail page', result: 'rejected', confidence: '0.98' },
     ],
+    sections: [
+      { id: 'recall', label: 'Recall', description: 'Search, explain, and assemble memory packets for current work.' },
+      { id: 'entities', label: 'Entities', description: 'Detected entities, symbols, triples, and links.' },
+      { id: 'facts', label: 'Facts', description: 'Fact registration, checking, conflict detection, and audit.' },
+      { id: 'maintenance', label: 'Maintenance', description: 'Stale candidates, lifecycle review, and repair actions.' },
+    ],
+    actions: [
+      { label: 'Scan memory', kind: 'primary', endpoint: '/api/memory/maintenance' },
+      { label: 'Check facts', kind: 'secondary', endpoint: '/api/memory/facts/check' },
+      { label: 'Build memory packet', kind: 'secondary', endpoint: '/api/memory/packet' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/memory/status' },
+      { label: 'Long memory', value: 'Facts, entities, triples, clusters, links' },
+      { label: 'Structured data', value: 'Facts can be grounded by structured evidence' },
+    ],
   },
   skills: {
     id: 'skills',
@@ -79,6 +127,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { skill: 'frontend-app-builder', surface: 'webui', status: 'ready' },
       { skill: 'gitnexus-debugging', surface: 'kernel', status: 'ready' },
       { skill: 'manufacturing-cockpit', surface: 'iacc', status: 'planned' },
+    ],
+    sections: [
+      { id: 'catalog', label: 'Catalog', description: 'Installed and discovered skills with manifest health.' },
+      { id: 'projection', label: 'Projection', description: 'WebUI/TUI/CLI/IACC surface mapping and capability parity.' },
+      { id: 'runs', label: 'Runs', description: 'Skill run history, validation, planning, and execution results.' },
+      { id: 'governance', label: 'Governance', description: 'Permissions, evidence model, approval needs, and risk.' },
+    ],
+    actions: [
+      { label: 'Validate skill', kind: 'primary', endpoint: '/api/skills/:id/actions/validate' },
+      { label: 'Plan run', kind: 'secondary', endpoint: '/api/skills/:id/actions/plan' },
+      { label: 'Run skill', kind: 'secondary', endpoint: '/api/skills/:id/actions/run' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/skills/projection' },
+      { label: 'Parity', value: 'WebUI and TUI capability全集' },
+      { label: 'CLI', value: 'Install, list, invoke core only' },
     ],
   },
   agents: {
@@ -100,6 +164,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { lane: 'workspace', owner: 'frontend', status: 'active' },
       { lane: 'audit', owner: 'qa', status: 'queued' },
     ],
+    sections: [
+      { id: 'lanes', label: 'Lanes', description: 'Parallel execution lanes, owners, blocker status, and outputs.' },
+      { id: 'graph', label: 'Work graph', description: 'Dependencies, review handoff, and current execution topology.' },
+      { id: 'review', label: 'Review', description: 'Agent result review, merge readiness, and evidence quality.' },
+      { id: 'terminal', label: 'Terminal state', description: 'Spawn manifests, running status, and persisted outputs.' },
+    ],
+    actions: [
+      { label: 'Spawn lane', kind: 'primary', endpoint: '/api/tasks/:id/agent-graph' },
+      { label: 'Review phase', kind: 'secondary', endpoint: '/api/tasks/:id/phases/:phase/review' },
+      { label: 'Cancel task', kind: 'danger', endpoint: '/api/tasks/:id/cancel' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/agents/runs' },
+      { label: 'Execution', value: 'Parallel lanes with review gate' },
+      { label: 'Output', value: 'Manifests and artifacts are persisted' },
+    ],
   },
   tools: {
     id: 'tools',
@@ -119,6 +199,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { tool: 'read_file', risk: 'low', status: 'ready' },
       { tool: 'apply_patch', risk: 'medium', status: 'guarded' },
       { tool: 'exec_command', risk: 'medium', status: 'ready' },
+    ],
+    sections: [
+      { id: 'registry', label: 'Registry', description: 'Tool catalog, schemas, permissions, and availability.' },
+      { id: 'history', label: 'History', description: 'Recent calls, outputs, errors, and path references.' },
+      { id: 'risk', label: 'Risk', description: 'Approval policy, destructive actions, and preflight checks.' },
+      { id: 'links', label: 'Path links', description: 'Tool outputs that can jump into Workspace preview/edit.' },
+    ],
+    actions: [
+      { label: 'Run preflight', kind: 'primary', endpoint: '/api/cross-plane/action/preflight' },
+      { label: 'Simulate policy', kind: 'secondary', endpoint: '/api/cross-plane/policy/simulate' },
+      { label: 'Open history', kind: 'secondary', endpoint: '/api/commands/history' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/cowd/capabilities' },
+      { label: 'Safety', value: 'Approval-aware actions' },
+      { label: 'Workspace', value: 'Path outputs open right Workspace tab' },
     ],
   },
   gateway: {
@@ -140,6 +236,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { channel: 'feishu', status: 'ready', capability: 'docs' },
       { channel: 'mcp', status: 'ready', capability: 'tools' },
     ],
+    sections: [
+      { id: 'accounts', label: 'Accounts', description: 'Wechat, Feishu, MCP, and connector account readiness.' },
+      { id: 'capabilities', label: 'Capabilities', description: 'Available operations by platform and service connector.' },
+      { id: 'composer', label: 'Composer', description: 'Message or document delivery test surface.' },
+      { id: 'audit', label: 'Audit', description: 'External action evidence, resource promotion, and policy trace.' },
+    ],
+    actions: [
+      { label: 'Recheck channels', kind: 'primary', endpoint: '/api/connectors/summary' },
+      { label: 'Start WeChat QR', kind: 'secondary', endpoint: '/api/channels/wechat-ilink/qr' },
+      { label: 'Promote resource', kind: 'secondary', endpoint: '/api/connectors/resources/promote-memory' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/connectors/summary' },
+      { label: 'Wechat', value: 'QR login and message receive loop' },
+      { label: 'Feishu', value: 'Read-only docs and reaction runtime' },
+    ],
   },
   iacc: {
     id: 'iacc',
@@ -160,6 +272,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { report: 'risk-daily', cadence: 'daily', status: 'scheduled' },
       { report: 'supplier-monthly', cadence: 'monthly', status: 'draft' },
     ],
+    sections: [
+      { id: 'cockpit', label: 'Cockpit', description: 'Manufacturing cockpit profiles, readiness, and scheduled reports.' },
+      { id: 'sources', label: 'Source packs', description: 'Manufacturing source packs, ingestion, and structured evidence.' },
+      { id: 'reports', label: 'Reports', description: 'Report generation, delivery state, retry, and review.' },
+      { id: 'governance', label: 'Governance', description: 'Thresholds, ownership, risk, and audit for manufacturing workflows.' },
+    ],
+    actions: [
+      { label: 'Generate report', kind: 'primary', endpoint: '/api/iacc/cockpit/reports/:id' },
+      { label: 'Run schedule', kind: 'secondary', endpoint: '/api/iacc/cockpit/reports/schedules/run' },
+      { label: 'Retry delivery', kind: 'secondary', endpoint: '/api/iacc/cockpit/reports/:id/delivery/retry' },
+    ],
+    inspector: [
+      { label: 'Boundary', value: 'IACC is upper application, cowd is kernel' },
+      { label: 'API', value: '/api/iacc/health' },
+      { label: 'Data', value: 'Structured evidence stays in kernel' },
+    ],
   },
   audit: {
     id: 'audit',
@@ -179,6 +307,22 @@ export const capabilitySpecs: Record<Exclude<NavId, 'chat' | 'settings'>, Capabi
       { event: 'workspace.file.preview', actor: 'webui', result: 'allowed' },
       { event: 'gateway.wechat.qr', actor: 'operator', result: 'pending' },
       { event: 'skill.run', actor: 'agent', result: 'allowed' },
+    ],
+    sections: [
+      { id: 'events', label: 'Events', description: 'All policy, tool, connector, and configuration events.' },
+      { id: 'export', label: 'Export', description: 'Filter, export, and attach audit evidence to review.' },
+      { id: 'policy', label: 'Policy', description: 'Allowed, blocked, pending, and escalated decisions.' },
+      { id: 'cross-plane', label: 'Cross-plane', description: 'Identity grants, action adapters, and external execution trace.' },
+    ],
+    actions: [
+      { label: 'Export audit', kind: 'primary', endpoint: '/api/audit/export' },
+      { label: 'Resolve identity', kind: 'secondary', endpoint: '/api/cross-plane/identity/resolve' },
+      { label: 'Revoke grant', kind: 'danger', endpoint: '/api/cross-plane/grants/:id' },
+    ],
+    inspector: [
+      { label: 'API', value: '/api/audit/export' },
+      { label: 'Governance', value: 'Every external action should be explainable' },
+      { label: 'Evidence', value: 'Exportable for review and reports' },
     ],
   },
 };

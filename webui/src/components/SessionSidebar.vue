@@ -8,19 +8,19 @@ const store = useAppStore();
 <template>
   <aside class="session-sidebar">
     <header class="sidebar-head">
-      <button class="primary-action" type="button">
+      <button class="primary-action" type="button" @click="store.createSession">
         <Plus :size="16" />
         New session
       </button>
       <label class="search-field">
         <Search :size="15" />
-        <input type="search" placeholder="Search sessions" />
+        <input v-model="store.sessionQuery" type="search" placeholder="Search sessions" />
       </label>
     </header>
 
     <div class="session-list" aria-label="Sessions">
       <button
-        v-for="session in store.sessions"
+        v-for="session in store.filteredSessions"
         :key="session.id"
         class="session-row"
         :class="{ active: session.id === store.activeSessionId }"

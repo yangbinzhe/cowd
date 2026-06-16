@@ -27,6 +27,11 @@ export const useAppStore = defineStore('app', () => {
   const workspaceFilter = ref('');
   const fileError = ref('');
   const settingsSavedAt = ref('');
+  const activeSectionByPage = ref<Record<string, string>>({});
+  const activeModal = ref<'model' | 'workspace' | 'commands' | null>(null);
+  const selectedModel = ref('claude-sonnet-4-6');
+  const selectedProfile = ref('default');
+  const sessionQuery = ref('');
   const editorDirty = computed(() => selectedFileContent.value !== editorContent.value);
   const filteredWorkspaceFiles = computed(() => {
     const query = workspaceFilter.value.trim().toLowerCase();
@@ -36,6 +41,11 @@ export const useAppStore = defineStore('app', () => {
   const busy = ref(false);
 
   const activeSession = computed(() => sessions.value.find((item) => item.id === activeSessionId.value) || sessions.value[0]);
+  const filteredSessions = computed(() => {
+    const query = sessionQuery.value.trim().toLowerCase();
+    if (!query) return sessions.value;
+    return sessions.value.filter((session) => `${session.title} ${session.model} ${session.status}`.toLowerCase().includes(query));
+  });
 
   async function boot() {
     if (booted.value) return;
@@ -48,6 +58,8 @@ export const useAppStore = defineStore('app', () => {
     ]);
     health.value = manifest;
     settings.value = config;
+    selectedModel.value = config.model || selectedModel.value;
+    selectedProfile.value = config.profile || selectedProfile.value;
     sessions.value = sessionData.sessions;
     if (!activeSessionId.value && sessions.value[0]) activeSessionId.value = sessions.value[0].id;
     workspaceRoot.value = workspace.workspace_canonical || workspace.workspace_root || '';
@@ -70,6 +82,16 @@ export const useAppStore = defineStore('app', () => {
     if (!turns.value.length) {
       turns.value = [{ id: 'empty', role: 'system', content: '当前 session 暂无消息。', status: 'complete' }];
     }
+  }
+
+  async function createSession() {
+    const id = `local-${Date.now()}`;
+    sessions.value = [
+      { id, title: 'New conversation', model: selectedModel.value, status: 'active' },
+      ...sessions.value,
+    ];
+    activeSessionId.value = id;
+    turns.value = [{ id: `system-${Date.now()}`, role: 'system', content: '新会话已创建。', status: 'complete' }];
   }
 
   async function send(content: string) {
@@ -132,6 +154,30 @@ export const useAppStore = defineStore('app', () => {
     companionTab.value = tab;
   }
 
+  function selectSection(page: string, sectionId: string) {
+    activeSectionByPage.value = { ...activeSectionByPage.value, [page]: sectionId };
+  }
+
+  function openModal(modal: 'model' | 'workspace' | 'commands') {
+    activeModal.value = modal;
+  }
+
+  function closeModal() {
+    activeModal.value = null;
+  }
+
+  function chooseModel(model: string) {
+    selectedModel.value = model;
+    settings.value = { ...settings.value, model };
+    closeModal();
+  }
+
+  function chooseProfile(profile: string) {
+    selectedProfile.value = profile;
+    settings.value = { ...settings.value, profile };
+    closeModal();
+  }
+
   async function saveSettings(nextSettings: Record<string, unknown>) {
     settings.value = { ...settings.value, ...nextSettings };
     await api.saveSettings(settings.value);
@@ -157,11 +203,18 @@ export const useAppStore = defineStore('app', () => {
     editorContent,
     fileError,
     settingsSavedAt,
+    activeSectionByPage,
+    activeModal,
+    selectedModel,
+    selectedProfile,
+    sessionQuery,
+    filteredSessions,
     editorDirty,
     busy,
     activeSession,
     boot,
     loadMessages,
+    createSession,
     send,
     loadActivity,
     loadWorkspace,
@@ -169,6 +222,11 @@ export const useAppStore = defineStore('app', () => {
     saveFile,
     resetFile,
     openCompanion,
+    selectSection,
+    openModal,
+    closeModal,
+    chooseModel,
+    chooseProfile,
     saveSettings,
   };
 });
