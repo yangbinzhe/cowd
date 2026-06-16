@@ -1243,10 +1243,14 @@ mod tests {
             "Expected thinking label in collapsed output"
         );
         assert!(
-            joined.contains("line1"),
-            "Expected thinking text to be visible"
+            joined.contains("3 lines"),
+            "Expected thinking summary to include line count"
         );
         assert!(joined.contains("saved"), "Expected saved status");
+        assert!(
+            joined.contains("details in Process"),
+            "Expected process handoff"
+        );
     }
 
     #[test]
@@ -1260,18 +1264,17 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        // Thinking always renders collapsed in main view — shows preview only
         assert!(
-            joined.contains("line A"),
-            "Expected preview to contain 'line A'"
+            joined.contains("2 lines"),
+            "Expected thinking summary"
         );
         assert!(
-            joined.contains("thought"),
+            joined.contains("saved"),
             "Expected thinking status indicator"
         );
         assert!(
-            joined.contains("line B"),
-            "Expected thinking text in output"
+            !joined.contains("line B"),
+            "Detailed thinking should stay out of main chat"
         );
     }
 

@@ -4757,7 +4757,7 @@ providers:
     }
 
     #[test]
-    fn render_status_bar_shows_current_focus() {
+    fn focus_change_shows_toast_instead_of_footer_focus() {
         let mut state = TuiState::new("m", "s");
         state.dispatch_action(Action::Execute("/activity".into()));
 
@@ -4765,11 +4765,18 @@ providers:
         terminal.draw(|frame| state.render(frame));
         let joined = terminal.buffer_lines().join("\n");
 
-        assert!(joined.contains("focus:activity"), "missing focus: {joined}");
+        assert!(
+            joined.contains("activity: j/k scroll"),
+            "missing focus toast: {joined}"
+        );
+        assert!(
+            !joined.contains("focus:activity"),
+            "focus should not be pinned in footer: {joined}"
+        );
     }
 
     #[test]
-    fn render_status_bar_keeps_identity_and_focus_on_narrow_width() {
+    fn render_status_bar_keeps_top_identity_and_footer_model_on_narrow_width() {
         let mut state = TuiState::new("deepseek-v4-pro", "session-status-narrow");
 
         let mut terminal = MockTerminal::new(88, 28);
@@ -4778,15 +4785,19 @@ providers:
 
         assert!(
             joined.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
-            "missing version on narrow status line: {joined}"
+            "missing top version: {joined}"
         );
         assert!(
-            joined.contains("model:deepseek"),
-            "missing model on narrow status line: {joined}"
+            joined.contains("session session-status-narrow"),
+            "missing top session id: {joined}"
         );
         assert!(
-            joined.contains("focus:chat"),
-            "missing focus on narrow status line: {joined}"
+            joined.contains("deepseek-v4-pro STD"),
+            "missing footer model without prefix: {joined}"
+        );
+        assert!(
+            !joined.contains("model:") && !joined.contains("focus:"),
+            "footer should not show model prefix or focus: {joined}"
         );
     }
 
@@ -4799,8 +4810,11 @@ providers:
         terminal.draw(|frame| state.render(frame));
         let joined = terminal.buffer_lines().join("\n");
 
-        assert!(joined.contains("focus:memory"), "missing focus: {joined}");
         assert!(joined.contains("Enter detail"), "missing hint: {joined}");
+        assert!(
+            !joined.contains("focus:memory"),
+            "focus should not be pinned in footer: {joined}"
+        );
     }
 
     #[test]
@@ -4820,8 +4834,8 @@ providers:
             "missing inline think label: {joined}"
         );
         assert!(
-            joined.contains("Reviewing the request"),
-            "missing inline thinking text: {joined}"
+            joined.contains("details in Process"),
+            "missing process handoff: {joined}"
         );
         assert!(
             !joined.contains("┌💭 Thinking") && !joined.contains("┌ 💭 Thinking"),

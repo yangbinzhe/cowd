@@ -647,25 +647,22 @@ mod tests {
 
         bar.sync_from_app(&app);
 
-        let version = bar.section_mut("version").unwrap();
-        assert_eq!(
-            version.content.as_deref(),
-            Some(concat!("v", env!("CARGO_PKG_VERSION")))
-        );
         let model = bar.section_mut("model").unwrap();
-        assert_eq!(model.content.as_deref(), Some("model:test-model STD"));
+        assert_eq!(model.content.as_deref(), Some("test-model STD"));
     }
 
     #[test]
     fn sync_from_app_populates_context_section() {
-        let app = App::new("claude-sonnet-4", "test-session");
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.context_window = 200_000;
+        app.token_count = 50_000;
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
         let section = bar.section_mut("context").unwrap();
         let content = section.content.as_deref().unwrap();
-        assert!(content.contains("ctx:"));
+        assert!(content.contains("ctx "));
     }
 
     #[test]
@@ -695,15 +692,13 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_app_shows_session_id() {
+    fn default_footer_does_not_include_session_id() {
         let app = App::new("claude-sonnet-4", "test-session-abcdef");
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
 
-        let section = bar.section_mut("session").unwrap();
-        let content = section.content.as_ref().unwrap();
-        assert!(content.contains("test-sessi"));
+        assert!(bar.section_mut("session").is_none());
     }
 
     // ── Render tests ─────────────────────────────────────────────
@@ -736,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn render_default_status_keeps_version_and_model_on_narrow_width() {
+    fn render_default_status_keeps_model_on_narrow_width() {
         let app = App::new("deepseek-v4-pro", "session-status-narrow");
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
@@ -750,13 +745,10 @@ mod tests {
 
         let joined = terminal.buffer_lines().join("\n");
         assert!(
-            joined.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
-            "version should stay visible on narrow status bars: {joined}"
-        );
-        assert!(
-            joined.contains("model:deepseek"),
+            joined.contains("deepseek-v4-pro"),
             "model should stay visible on narrow status bars: {joined}"
         );
+        assert!(!joined.contains("model:"), "model prefix removed: {joined}");
     }
 
     #[test]
@@ -764,9 +756,6 @@ mod tests {
         let app = App::new("deepseek-v4-pro", "session-status-medium");
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
-        if let Some(section) = bar.section_mut("focus") {
-            section.content = Some("focus:chat".into());
-        }
 
         let mut terminal = MockTerminal::new(110, 3);
         let theme = SkinConfig::default();
@@ -776,8 +765,8 @@ mod tests {
         });
 
         let joined = terminal.buffer_lines().join("\n");
-        assert!(joined.contains("focus:chat"));
-        assert!(joined.contains("ctx:"));
+        assert!(!joined.contains("focus:"));
+        assert!(joined.contains("ctx "));
         assert!(!joined.contains("approvals:"));
         assert!(!joined.contains("perm:"));
         assert!(!joined.contains("Enter send"));

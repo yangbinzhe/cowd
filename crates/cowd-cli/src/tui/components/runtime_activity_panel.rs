@@ -831,17 +831,15 @@ mod tests {
         // Verify runtime status summary
         assert!(rendered.contains("YoloGoal"));
         assert!(rendered.contains("Parallel"));
-        assert!(rendered.contains("Runtime Status"));
-        assert!(rendered.contains("Status"));
-        assert!(rendered.contains("Provider:"));
-        assert!(rendered.contains("Context:"));
-        assert!(rendered.contains("Policy:"));
+        assert!(rendered.contains("Runtime"));
+        assert!(rendered.contains("Model:"));
+        assert!(rendered.contains("Agent:"));
         assert!(rendered.contains("Workgraph:"));
         assert!(rendered.contains("Activity:"));
         assert!(rendered.contains("2 events"));
         assert!(rendered.contains("1 messages"));
         assert!(rendered.contains("1 tools"));
-        assert!(rendered.contains("Tool Process"));
+        assert!(rendered.contains("Process"));
         assert!(rendered.contains("bash done exit:0 - ok"));
 
         // The runtime panel owns tool process details; the separate Activity
