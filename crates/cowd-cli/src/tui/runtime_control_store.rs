@@ -1,11 +1,8 @@
 use crate::tui::app::App;
-use crate::tui::control_client::{
-    DaemonControlClient, DaemonRuntimeSnapshot, DaemonSessionLease, DaemonStatus,
-};
-use crate::tui::projection_client::DaemonProjectionClient;
+use crate::tui::gateway_client::GatewayApiClient;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DaemonTaskSummary {
+pub struct TaskSummary {
     pub id: String,
     pub objective: String,
     pub status: String,
@@ -18,7 +15,7 @@ pub struct DaemonTaskSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DaemonApprovalSummary {
+pub struct ApprovalSummary {
     pub id: String,
     pub tool_name: String,
     pub risk: Option<String>,
@@ -88,16 +85,16 @@ pub struct StructuredDataSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
-    pub daemon_running: bool,
+    pub gateway_running: bool,
     pub active_sessions: usize,
     pub uptime_secs: Option<u64>,
     pub session_ids: Vec<String>,
     pub runtime_readiness: Option<String>,
     pub runtime_components: Option<u64>,
     pub task_count: Option<u64>,
-    pub tasks: Vec<DaemonTaskSummary>,
+    pub tasks: Vec<TaskSummary>,
     pub pending_approvals: Option<u64>,
-    pub approval_items: Vec<DaemonApprovalSummary>,
+    pub approval_items: Vec<ApprovalSummary>,
     pub lease_owner: Option<String>,
     pub lease_mode: Option<String>,
     pub memory_status: Option<String>,
@@ -117,96 +114,134 @@ pub struct RuntimeControlSnapshot {
 }
 
 impl RuntimeControlSnapshot {
-    pub fn from_status(status: &DaemonStatus) -> Self {
-        Self {
-            daemon_running: true,
-            active_sessions: status.active_sessions,
-            uptime_secs: Some(status.uptime_secs),
-            ..Self::default()
-        }
-    }
-
-    pub fn from_daemon_snapshot(snapshot: &DaemonRuntimeSnapshot) -> Self {
+    pub fn from_gateway_snapshot(value: &serde_json::Value) -> Self {
+        let session_ids = value
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut state = Self {
-            daemon_running: true,
-            active_sessions: snapshot.active_sessions,
-            uptime_secs: Some(snapshot.uptime_secs),
-            session_ids: snapshot.sessions.clone(),
+            gateway_running: value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            active_sessions: value
+                .get("active_sessions")
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| count as usize)
+                .unwrap_or(session_ids.len()),
+            uptime_secs: value.get("uptime_secs").and_then(serde_json::Value::as_u64),
+            session_ids,
             ..Self::default()
         };
-        if let Some(lease) = snapshot.leases.items.first() {
-            state.apply_lease(lease);
+        if let Some(lease) = value
+            .pointer("/leases/items")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+        {
+            state.apply_lease_value(lease);
         }
         state
     }
 
     pub fn from_app(app: &App) -> Self {
         Self {
-            daemon_running: app.server_running,
+            gateway_running: app.server_running,
             active_sessions: app.active_api_sessions,
             uptime_secs: app.server_uptime_secs,
-            runtime_readiness: app.daemon_runtime_readiness.clone(),
-            runtime_components: app.daemon_runtime_components,
-            task_count: app.daemon_task_count,
-            tasks: app.daemon_tasks.clone(),
-            pending_approvals: app.daemon_pending_approvals,
-            approval_items: app.daemon_approval_items.clone(),
-            lease_owner: app.daemon_lease_owner.clone(),
-            lease_mode: app.daemon_lease_mode.clone(),
+            runtime_readiness: app.gateway_runtime_readiness.clone(),
+            runtime_components: app.gateway_runtime_components,
+            task_count: app.gateway_task_count,
+            tasks: app.gateway_tasks.clone(),
+            pending_approvals: app.gateway_pending_approvals,
+            approval_items: app.gateway_approval_items.clone(),
+            lease_owner: app.gateway_lease_owner.clone(),
+            lease_mode: app.gateway_lease_mode.clone(),
             memory_status: app.memory_status.clone(),
             memory_total_entries: app.memory_total_entries,
             memory_vector_count: app.memory_vector_count,
             memory_layer_counts: app.memory_layer_counts,
-            cross_plane_grants_active: app.daemon_cross_plane_grants_active,
-            cross_plane_actions_24h: app.daemon_cross_plane_actions_24h,
-            connector_accounts: app.daemon_connector_accounts.clone(),
-            connector_capabilities: app.daemon_connector_capabilities.clone(),
-            connector_resources: app.daemon_connector_resources.clone(),
-            action_receipts: app.daemon_action_receipts.clone(),
-            cowd_kernel: app.daemon_cowd_kernel.clone(),
-            structured_data: app.daemon_structured_data.clone(),
-            connector_degraded_reasons: app.daemon_connector_degraded_reasons.clone(),
-            degraded_reasons: app.daemon_degraded_reasons.clone(),
+            cross_plane_grants_active: app.gateway_cross_plane_grants_active,
+            cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
+            connector_accounts: app.gateway_connector_accounts.clone(),
+            connector_capabilities: app.gateway_connector_capabilities.clone(),
+            connector_resources: app.gateway_connector_resources.clone(),
+            action_receipts: app.gateway_action_receipts.clone(),
+            cowd_kernel: app.gateway_cowd_kernel.clone(),
+            structured_data: app.gateway_structured_data.clone(),
+            connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
+            degraded_reasons: app.gateway_degraded_reasons.clone(),
             ..Self::default()
         }
     }
 
-    pub fn apply_lease(&mut self, lease: &DaemonSessionLease) {
-        self.lease_owner = Some(lease.owner.clone());
-        self.lease_mode = Some(lease.mode.clone());
+    pub fn apply_lease_value(&mut self, lease: &serde_json::Value) {
+        self.lease_owner = lease
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        self.lease_mode = lease
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
     }
 
     pub fn apply_to_app(&self, app: &mut App) {
-        app.server_running = self.daemon_running;
+        app.server_running = self.gateway_running;
         app.server_uptime_secs = self.uptime_secs;
         app.active_api_sessions = self.active_sessions;
-        app.daemon_runtime_readiness = self.runtime_readiness.clone();
-        app.daemon_runtime_components = self.runtime_components;
-        app.daemon_task_count = self.task_count;
-        app.daemon_tasks = self.tasks.clone();
-        app.daemon_pending_approvals = self.pending_approvals;
-        app.daemon_approval_items = self.approval_items.clone();
+        app.gateway_runtime_readiness = self.runtime_readiness.clone();
+        app.gateway_runtime_components = self.runtime_components;
+        app.gateway_task_count = self.task_count;
+        app.gateway_tasks = self.tasks.clone();
+        app.gateway_pending_approvals = self.pending_approvals;
+        app.gateway_approval_items = self.approval_items.clone();
         app.memory_status = self.memory_status.clone();
         app.memory_total_entries = self.memory_total_entries;
         app.memory_vector_count = self.memory_vector_count;
         app.memory_layer_counts = self.memory_layer_counts;
-        app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
-        app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
-        app.daemon_connector_accounts = self.connector_accounts.clone();
-        app.daemon_connector_capabilities = self.connector_capabilities.clone();
-        app.daemon_connector_resources = self.connector_resources.clone();
-        app.daemon_action_receipts = self.action_receipts.clone();
-        app.daemon_cowd_kernel = self.cowd_kernel.clone();
-        app.daemon_structured_data = self.structured_data.clone();
-        app.daemon_connector_degraded_reasons = self.connector_degraded_reasons.clone();
-        app.daemon_degraded_reasons = self.degraded_reasons.clone();
-        app.daemon_lease_owner = self.lease_owner.clone();
-        app.daemon_lease_mode = self.lease_mode.clone();
+        app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
+        app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
+        app.gateway_connector_accounts = self.connector_accounts.clone();
+        app.gateway_connector_capabilities = self.connector_capabilities.clone();
+        app.gateway_connector_resources = self.connector_resources.clone();
+        app.gateway_action_receipts = self.action_receipts.clone();
+        app.gateway_cowd_kernel = self.cowd_kernel.clone();
+        app.gateway_structured_data = self.structured_data.clone();
+        app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
+        app.gateway_degraded_reasons = self.degraded_reasons.clone();
+        app.gateway_lease_owner = self.lease_owner.clone();
+        app.gateway_lease_mode = self.lease_mode.clone();
     }
 
     pub fn ingest_session_ids(&mut self, session_ids: Vec<String>) {
         self.active_sessions = session_ids.len();
         self.session_ids = session_ids;
+    }
+
+    pub fn ingest_session_list(&mut self, value: &serde_json::Value) {
+        let sessions = value
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("id")
+                            .or_else(|| item.get("session_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.ingest_session_ids(sessions);
     }
 
     pub fn ingest_runtime_control_plane(&mut self, value: &serde_json::Value) {
@@ -541,7 +576,7 @@ fn memory_layer_index_from_str(value: &str) -> Option<usize> {
     None
 }
 
-fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary> {
+fn task_summary_from_json(value: &serde_json::Value) -> Option<TaskSummary> {
     let id = value.get("id").and_then(serde_json::Value::as_str)?;
     let objective = value
         .get("objective")
@@ -593,7 +628,7 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary
         .or_else(|| value.get("blocker"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
-    Some(DaemonTaskSummary {
+    Some(TaskSummary {
         id: id.to_string(),
         objective,
         status,
@@ -606,7 +641,7 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary
     })
 }
 
-fn approval_summary_from_json(value: &serde_json::Value) -> Option<DaemonApprovalSummary> {
+fn approval_summary_from_json(value: &serde_json::Value) -> Option<ApprovalSummary> {
     let id = value
         .get("id")
         .or_else(|| value.get("approval_id"))
@@ -641,7 +676,7 @@ fn approval_summary_from_json(value: &serde_json::Value) -> Option<DaemonApprova
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    Some(DaemonApprovalSummary {
+    Some(ApprovalSummary {
         id: id.to_string(),
         tool_name,
         risk,
@@ -782,73 +817,46 @@ fn connector_resource_from_json(value: &serde_json::Value) -> Option<ConnectorRe
 }
 
 pub async fn refresh_runtime_control_snapshot(
-    control_client: &DaemonControlClient,
-    projection_client: Option<&DaemonProjectionClient>,
+    gateway_client: Option<&GatewayApiClient>,
     session_id: Option<&str>,
 ) -> RuntimeControlSnapshot {
-    let mut snapshot = match control_client.runtime_snapshot().await {
-        Ok(value) => RuntimeControlSnapshot::from_daemon_snapshot(&value),
-        Err(err) => match control_client.status().await {
-            Ok(status) => {
-                let mut snapshot = RuntimeControlSnapshot::from_status(&status);
-                snapshot.degrade(format!("runtime host snapshot unavailable: {err}"));
-                snapshot
-            }
-            Err(status_err) => {
-                let mut snapshot = RuntimeControlSnapshot::default();
-                snapshot.degrade(format!("runtime host control unavailable: {status_err}"));
-                return snapshot;
-            }
-        },
+    let Some(projection) = gateway_client else {
+        let mut snapshot = RuntimeControlSnapshot::default();
+        snapshot.degrade("Gateway API unavailable");
+        return snapshot;
+    };
+
+    let mut snapshot = match projection.runtime_snapshot().await {
+        Ok(value) => RuntimeControlSnapshot::from_gateway_snapshot(&value),
+        Err(err) => {
+            let mut snapshot = RuntimeControlSnapshot::default();
+            snapshot.degrade(format!("runtime host snapshot unavailable: {err}"));
+            snapshot
+        }
     };
 
     if snapshot.session_ids.is_empty() {
-        match control_client.list_sessions().await {
-            Ok(list) => snapshot.ingest_session_ids(list.sessions),
+        match projection.list_sessions().await {
+            Ok(value) => snapshot.ingest_session_list(&value),
             Err(err) => snapshot.degrade(format!("session list unavailable: {err}")),
         }
     }
 
-    let Some(projection) = projection_client else {
-        snapshot.degrade("runtime projection unavailable");
-        return snapshot;
-    };
-
     match projection.runtime_control_plane().await {
         Ok(value) => snapshot.ingest_runtime_control_plane(&value),
-        Err(err) => snapshot.degrade(format!("runtime projection unavailable: {err}")),
+        Err(err) => snapshot.degrade(format!("Gateway API unavailable: {err}")),
     }
-    match control_client.task_status().await {
+    match projection.task_status().await {
         Ok(value) => snapshot.ingest_task_status(&value),
-        Err(socket_err) => match projection.task_status().await {
-            Ok(value) => {
-                snapshot.degrade(format!("task socket unavailable: {socket_err}"));
-                snapshot.ingest_task_status(&value);
-            }
-            Err(err) => snapshot.degrade(format!("task projection unavailable: {err}")),
-        },
+        Err(err) => snapshot.degrade(format!("task Gateway API unavailable: {err}")),
     }
-    match control_client.pending_approvals().await {
+    match projection.pending_approvals().await {
         Ok(value) => snapshot.ingest_pending_approvals(&value),
-        Err(socket_err) => match projection.pending_approvals().await {
-            Ok(value) => {
-                snapshot.degrade(format!("approval socket unavailable: {socket_err}"));
-                snapshot.ingest_pending_approvals(&value);
-            }
-            Err(err) => snapshot.degrade(format!("approval projection unavailable: {err}")),
-        },
+        Err(err) => snapshot.degrade(format!("approval Gateway API unavailable: {err}")),
     }
-    match control_client.memory_status().await {
+    match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
-        Err(socket_err) => match projection.memory_status().await {
-            Ok(value) => {
-                snapshot.degrade(format!("memory socket unavailable: {socket_err}"));
-                snapshot.ingest_memory_status(&value);
-            }
-            Err(err) => snapshot.degrade(format!(
-                "memory projection unavailable: {err}; socket unavailable: {socket_err}"
-            )),
-        },
+        Err(err) => snapshot.degrade(format!("memory Gateway API unavailable: {err}")),
     }
     let (capabilities, projection_state, surfaces, release_gate) = tokio::join!(
         projection.cowd_capabilities(),
@@ -932,7 +940,7 @@ pub async fn refresh_runtime_control_snapshot(
     }
 
     if let Some(session_id) = session_id {
-        match control_client.context_snapshot(Some(session_id)).await {
+        match projection.current_context(Some(session_id)).await {
             Ok(value) => {
                 if value
                     .get("degraded")
@@ -942,17 +950,11 @@ pub async fn refresh_runtime_control_snapshot(
                     let reason = value
                         .get("degraded_reason")
                         .and_then(|value| value.as_str())
-                        .unwrap_or("context socket degraded");
-                    snapshot.degrade(format!("context socket degraded: {reason}"));
+                        .unwrap_or("context degraded");
+                    snapshot.degrade(format!("context degraded: {reason}"));
                 }
             }
-            Err(socket_err) => {
-                if let Err(err) = projection.current_context(Some(session_id)).await {
-                    snapshot.degrade(format!(
-                        "context projection unavailable: {err}; socket unavailable: {socket_err}"
-                    ));
-                }
-            }
+            Err(err) => snapshot.degrade(format!("context Gateway API unavailable: {err}")),
         }
     }
 
@@ -963,19 +965,22 @@ pub async fn refresh_runtime_control_snapshot(
 mod tests {
     use super::*;
 
-    fn status() -> DaemonStatus {
-        DaemonStatus {
-            ok: true,
-            protocol_version: 1,
-            daemon: "cowd".to_string(),
-            active_sessions: 2,
-            uptime_secs: 9,
-        }
+    fn gateway_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "kind": "gateway_runtime_snapshot",
+            "protocol_version": 1,
+            "runtime_host": "gateway-runtime-host",
+            "active_sessions": 2,
+            "uptime_secs": 9,
+            "sessions": ["s1", "s2"],
+            "leases": {"total": 0, "items": []},
+        })
     }
 
     #[test]
     fn snapshot_extracts_projection_summaries() {
-        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.ingest_session_ids(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
         snapshot.ingest_runtime_control_plane(&serde_json::json!({
             "diagnostics": {
@@ -1034,7 +1039,7 @@ mod tests {
             }]
         }));
 
-        assert!(snapshot.daemon_running);
+        assert!(snapshot.gateway_running);
         assert_eq!(snapshot.active_sessions, 3);
         assert_eq!(snapshot.runtime_readiness.as_deref(), Some("87%"));
         assert_eq!(snapshot.runtime_components, Some(12));
@@ -1068,7 +1073,7 @@ mod tests {
 
     #[test]
     fn snapshot_extracts_cowd_and_structured_summaries() {
-        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.ingest_cowd_projection_state(
             &serde_json::json!({
                 "capability_count": 9,
@@ -1151,18 +1156,18 @@ mod tests {
                 sample_evidence: vec!["evidence-a".to_string()],
                 sample_watermarks: vec!["pack-a".to_string()],
             }),
-            ..RuntimeControlSnapshot::from_status(&status())
+            ..RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot())
         };
 
         snapshot.apply_to_app(&mut app);
         assert_eq!(
-            app.daemon_cowd_kernel
+            app.gateway_cowd_kernel
                 .as_ref()
                 .map(|kernel| kernel.release_gate_status.as_str()),
             Some("pass")
         );
         assert_eq!(
-            app.daemon_structured_data
+            app.gateway_structured_data
                 .as_ref()
                 .map(|data| data.fact_count),
             Some(3)
@@ -1174,28 +1179,26 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_prefers_daemon_socket_runtime_snapshot() {
-        let snapshot = RuntimeControlSnapshot::from_daemon_snapshot(&DaemonRuntimeSnapshot {
-            ok: true,
-            kind: "daemon_runtime_snapshot".to_string(),
-            protocol_version: 1,
-            daemon: "cowd".to_string(),
-            active_sessions: 2,
-            uptime_secs: 42,
-            sessions: vec!["s1".to_string(), "s2".to_string()],
-            leases: crate::tui::control_client::DaemonLeaseSnapshot {
-                total: 1,
-                items: vec![DaemonSessionLease {
-                    ok: true,
-                    session_id: "s1".to_string(),
-                    owner: "tui:fast".to_string(),
-                    mode: "collaborative".to_string(),
-                }],
-            },
-            lifecycle: Vec::new(),
-        });
+    fn snapshot_reads_gateway_runtime_snapshot() {
+        let snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&serde_json::json!({
+            "ok": true,
+            "kind": "gateway_runtime_snapshot",
+            "protocol_version": 1,
+            "runtime_host": "gateway-runtime-host",
+            "active_sessions": 2,
+            "uptime_secs": 42,
+            "sessions": ["s1", "s2"],
+            "leases": {
+                "total": 1,
+                "items": [{
+                    "session_id": "s1",
+                    "owner": "tui:fast",
+                    "mode": "collaborative"
+                }]
+            }
+        }));
 
-        assert!(snapshot.daemon_running);
+        assert!(snapshot.gateway_running);
         assert_eq!(snapshot.active_sessions, 2);
         assert_eq!(snapshot.uptime_secs, Some(42));
         assert_eq!(snapshot.session_ids, vec!["s1", "s2"]);
@@ -1205,11 +1208,11 @@ mod tests {
 
     #[test]
     fn snapshot_tracks_partial_degradation() {
-        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.degrade("task projection unavailable");
         snapshot.degrade("memory projection unavailable");
 
-        assert!(snapshot.daemon_running);
+        assert!(snapshot.gateway_running);
         assert_eq!(snapshot.degraded_reasons.len(), 2);
         assert!(snapshot
             .degraded_reasons
@@ -1220,7 +1223,7 @@ mod tests {
     #[test]
     fn snapshot_round_trips_memory_status_through_app() {
         let mut app = App::new("claude-sonnet-4-6", "session-memory-status");
-        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.ingest_memory_status(&serde_json::json!({
             "status": "available",
             "total_entries": 42,
@@ -1258,11 +1261,11 @@ mod tests {
                 capability: "daemon.task.complete".to_string(),
                 idempotency_key: Some("task-1".to_string()),
             }],
-            ..RuntimeControlSnapshot::from_status(&status())
+            ..RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot())
         };
 
         snapshot.apply_to_app(&mut app);
-        assert_eq!(app.daemon_action_receipts.len(), 1);
+        assert_eq!(app.gateway_action_receipts.len(), 1);
 
         let restored = RuntimeControlSnapshot::from_app(&app);
         assert_eq!(restored.action_receipts.len(), 1);
@@ -1275,15 +1278,15 @@ mod tests {
     #[test]
     fn local_store_applies_runtime_mutations_and_receipt_limits() {
         let mut app = App::new("claude-sonnet-4-6", "session-local-store");
-        app.daemon_approval_items = vec![DaemonApprovalSummary {
+        app.gateway_approval_items = vec![ApprovalSummary {
             id: "approval-1".to_string(),
             tool_name: "bash".to_string(),
             risk: Some("high".to_string()),
             requester: Some("session".to_string()),
             input_preview: "run command".to_string(),
         }];
-        app.daemon_pending_approvals = Some(1);
-        app.daemon_tasks = vec![DaemonTaskSummary {
+        app.gateway_pending_approvals = Some(1);
+        app.gateway_tasks = vec![TaskSummary {
             id: "task-1".to_string(),
             objective: "finish task".to_string(),
             status: "blocked".to_string(),
@@ -1294,8 +1297,8 @@ mod tests {
             artifact_count: 0,
             blocker_reason: Some("waiting".to_string()),
         }];
-        app.daemon_task_count = Some(1);
-        app.daemon_connector_resources = vec![ConnectorResourceSummary {
+        app.gateway_task_count = Some(1);
+        app.gateway_connector_resources = vec![ConnectorResourceSummary {
             reference: "service://mock.docs/document/1".to_string(),
             provider: "mock.docs".to_string(),
             resource_type: "document".to_string(),
@@ -1316,20 +1319,20 @@ mod tests {
         );
         store.apply_to_app(&mut app);
 
-        assert_eq!(app.daemon_pending_approvals, Some(0));
-        assert!(app.daemon_approval_items.is_empty());
-        assert_eq!(app.daemon_tasks[0].status, "completed");
-        assert_eq!(app.daemon_tasks[0].blocker_reason, None);
-        assert_eq!(app.daemon_connector_resources[0].indexed_state, "stale");
-        assert_eq!(app.daemon_action_receipts.len(), 1);
+        assert_eq!(app.gateway_pending_approvals, Some(0));
+        assert!(app.gateway_approval_items.is_empty());
+        assert_eq!(app.gateway_tasks[0].status, "completed");
+        assert_eq!(app.gateway_tasks[0].blocker_reason, None);
+        assert_eq!(app.gateway_connector_resources[0].indexed_state, "stale");
+        assert_eq!(app.gateway_action_receipts.len(), 1);
         assert_eq!(
-            app.daemon_action_receipts[0]
+            app.gateway_action_receipts[0]
                 .dispatch_status
                 .chars()
                 .count(),
             83
         );
-        assert!(app.daemon_action_receipts[0]
+        assert!(app.gateway_action_receipts[0]
             .dispatch_status
             .ends_with("..."));
     }

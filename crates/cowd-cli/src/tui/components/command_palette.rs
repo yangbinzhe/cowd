@@ -341,10 +341,10 @@ impl CommandPalette {
     pub fn sync_runtime_actions(&mut self, snapshot: &RuntimeControlSnapshot) {
         self.all_commands.retain(|entry| !entry.dynamic);
 
-        if !snapshot.daemon_running {
+        if !snapshot.gateway_running {
             self.all_commands.push(CommandEntry::dynamic(
                 "Start Gateway",
-                "Daemon is offline; inspect gateway status or start it from CLI",
+                "Gateway is offline; inspect gateway status or start it from CLI",
                 Action::Execute("/status".into()),
             ));
             self.run_search();
@@ -354,7 +354,7 @@ impl CommandPalette {
         self.all_commands.push(CommandEntry::dynamic(
             "Inspect Runtime",
             format!(
-                "Daemon readiness {} across {} components",
+                "Gateway readiness {} across {} components",
                 snapshot.runtime_readiness.as_deref().unwrap_or("unknown"),
                 snapshot.runtime_components.unwrap_or_default()
             ),
@@ -383,7 +383,7 @@ impl CommandPalette {
                 self.all_commands.push(CommandEntry::dynamic(
                     "Cancel Problem Task",
                     format!("Cancel {} directly: {}", task.id, task.objective),
-                    Action::CancelDaemonTask(task.id.clone()),
+                    Action::CancelGatewayTask(task.id.clone()),
                 ));
             }
             if let Some(task) = snapshot.tasks.iter().find(|task| {
@@ -397,7 +397,7 @@ impl CommandPalette {
                         "Complete {} directly with {} artifacts",
                         task.id, task.artifact_count
                     ),
-                    Action::CompleteDaemonTask(task.id.clone()),
+                    Action::CompleteGatewayTask(task.id.clone()),
                 ));
             }
         } else {
@@ -426,7 +426,7 @@ impl CommandPalette {
                         approval.risk.as_deref().unwrap_or("unknown"),
                         approval.input_preview
                     ),
-                    Action::RespondDaemonApproval {
+                    Action::RespondGatewayApproval {
                         id: approval.id.clone(),
                         approved: true,
                     },
@@ -434,7 +434,7 @@ impl CommandPalette {
                 self.all_commands.push(CommandEntry::dynamic(
                     "Reject First Pending Request",
                     format!("Reject {}", approval.id),
-                    Action::RespondDaemonApproval {
+                    Action::RespondGatewayApproval {
                         id: approval.id.clone(),
                         approved: false,
                     },
@@ -549,7 +549,7 @@ impl CommandPalette {
 
         if !snapshot.degraded_reasons.is_empty() {
             self.all_commands.push(CommandEntry::dynamic(
-                "Inspect Daemon Degradation",
+                "Inspect Gateway Degradation",
                 snapshot.degraded_reasons.join("; "),
                 Action::Execute("/context runtime".into()),
             ));
@@ -1200,16 +1200,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_runtime_actions_adds_contextual_daemon_entries() {
+    fn sync_runtime_actions_adds_contextual_gateway_entries() {
         let mut p = setup_palette();
         let before = p.command_count();
         let snapshot = RuntimeControlSnapshot {
-            daemon_running: true,
+            gateway_running: true,
             runtime_readiness: Some("92%".to_string()),
             runtime_components: Some(9),
             task_count: Some(2),
             tasks: vec![
-                crate::tui::runtime_control_store::DaemonTaskSummary {
+                crate::tui::runtime_control_store::TaskSummary {
                     id: "task-blocked".to_string(),
                     objective: "blocked task".to_string(),
                     status: "blocked".to_string(),
@@ -1220,7 +1220,7 @@ mod tests {
                     artifact_count: 0,
                     blocker_reason: Some("approval".to_string()),
                 },
-                crate::tui::runtime_control_store::DaemonTaskSummary {
+                crate::tui::runtime_control_store::TaskSummary {
                     id: "task-reviewed".to_string(),
                     objective: "reviewed task".to_string(),
                     status: "reviewed".to_string(),
@@ -1233,7 +1233,7 @@ mod tests {
                 },
             ],
             pending_approvals: Some(1),
-            approval_items: vec![crate::tui::runtime_control_store::DaemonApprovalSummary {
+            approval_items: vec![crate::tui::runtime_control_store::ApprovalSummary {
                 id: "approval-1".to_string(),
                 tool_name: "bash".to_string(),
                 risk: Some("high".to_string()),
@@ -1262,7 +1262,7 @@ mod tests {
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic
                 && entry.action
-                    == Action::RespondDaemonApproval {
+                    == Action::RespondGatewayApproval {
                         id: "approval-1".to_string(),
                         approved: true,
                     }
@@ -1270,16 +1270,16 @@ mod tests {
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic
                 && entry.action
-                    == Action::RespondDaemonApproval {
+                    == Action::RespondGatewayApproval {
                         id: "approval-1".to_string(),
                         approved: false,
                     }
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::CancelDaemonTask("task-blocked".into())
+            entry.dynamic && entry.action == Action::CancelGatewayTask("task-blocked".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::CompleteDaemonTask("task-reviewed".into())
+            entry.dynamic && entry.action == Action::CompleteGatewayTask("task-reviewed".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
@@ -1290,7 +1290,7 @@ mod tests {
     fn sync_runtime_actions_adds_connector_entries() {
         let mut p = setup_palette();
         let snapshot = RuntimeControlSnapshot {
-            daemon_running: true,
+            gateway_running: true,
             task_count: Some(0),
             connector_accounts: vec![crate::tui::runtime_control_store::ConnectorAccountSummary {
                 provider: "feishu".to_string(),
@@ -1381,7 +1381,7 @@ mod tests {
         let first_dynamic = p.all_commands.iter().filter(|entry| entry.dynamic).count();
 
         let online = RuntimeControlSnapshot {
-            daemon_running: true,
+            gateway_running: true,
             task_count: Some(0),
             ..RuntimeControlSnapshot::default()
         };

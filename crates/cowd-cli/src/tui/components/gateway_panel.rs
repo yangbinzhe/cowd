@@ -40,7 +40,7 @@ pub struct GatewayPanel {
     pub uptime_secs: Option<u64>,
     /// Number of active sessions.
     pub active_sessions: usize,
-    /// Runtime readiness score or status from runtime projection API.
+    /// Runtime readiness score or status from Gateway API API.
     pub runtime_readiness: Option<String>,
     /// Number of runtime control-plane components.
     pub runtime_components: Option<u64>,
@@ -165,21 +165,21 @@ impl GatewayPanel {
         self.server_running = app.server_running;
         self.uptime_secs = app.server_uptime_secs;
         self.active_sessions = app.active_api_sessions;
-        self.runtime_readiness = app.daemon_runtime_readiness.clone();
-        self.runtime_components = app.daemon_runtime_components;
-        self.task_count = app.daemon_task_count;
-        self.pending_approvals = app.daemon_pending_approvals;
-        self.lease_owner = app.daemon_lease_owner.clone();
-        self.lease_mode = app.daemon_lease_mode.clone();
+        self.runtime_readiness = app.gateway_runtime_readiness.clone();
+        self.runtime_components = app.gateway_runtime_components;
+        self.task_count = app.gateway_task_count;
+        self.pending_approvals = app.gateway_pending_approvals;
+        self.lease_owner = app.gateway_lease_owner.clone();
+        self.lease_mode = app.gateway_lease_mode.clone();
         self.memory_status = app.memory_status.clone();
-        self.connector_accounts = app.daemon_connector_accounts.clone();
-        self.connector_capabilities = app.daemon_connector_capabilities.clone();
-        self.connector_resources = app.daemon_connector_resources.clone();
-        self.execution_receipts = app.daemon_action_receipts.clone();
-        self.cowd_kernel = app.daemon_cowd_kernel.clone();
-        self.structured_data = app.daemon_structured_data.clone();
-        self.connector_degraded_reasons = app.daemon_connector_degraded_reasons.clone();
-        self.degraded_reasons = app.daemon_degraded_reasons.clone();
+        self.connector_accounts = app.gateway_connector_accounts.clone();
+        self.connector_capabilities = app.gateway_connector_capabilities.clone();
+        self.connector_resources = app.gateway_connector_resources.clone();
+        self.execution_receipts = app.gateway_action_receipts.clone();
+        self.cowd_kernel = app.gateway_cowd_kernel.clone();
+        self.structured_data = app.gateway_structured_data.clone();
+        self.connector_degraded_reasons = app.gateway_connector_degraded_reasons.clone();
+        self.degraded_reasons = app.gateway_degraded_reasons.clone();
         if app.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
@@ -346,10 +346,7 @@ impl Component for GatewayPanel {
 
             lines.push(Line::from(vec![
                 Span::styled("Transport: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "control socket · projection http",
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled("gateway http/sse", Style::default().fg(Color::Cyan)),
             ]));
 
             if let Some(readiness) = self.runtime_readiness.as_ref() {
@@ -1078,12 +1075,12 @@ mod tests {
             "Should show sessions, got: {joined}"
         );
         assert!(
-            joined.contains("Transport") && joined.contains("control socket"),
-            "Should show socket/http transport split, got: {joined}"
+            joined.contains("Transport") && joined.contains("gateway http/sse"),
+            "Should show Gateway transport, got: {joined}"
         );
         assert!(
             joined.contains("Runtime") && joined.contains("87%"),
-            "Should show runtime projection summary, got: {joined}"
+            "Should show Gateway API summary, got: {joined}"
         );
         assert!(
             joined.contains("Control") && joined.contains("approvals 1"),

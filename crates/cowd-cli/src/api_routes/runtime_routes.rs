@@ -4,7 +4,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Query, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -29,7 +29,25 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/providers/reload",
             post(reload_runtime_providers),
         )
+        .route("/api/runtime/status", get(get_runtime_status))
+        .route("/api/runtime/snapshot", get(get_runtime_snapshot))
         .route("/api/runtime/control-plane", get(get_runtime_control_plane))
+        .route(
+            "/api/runtime/sessions/:id/attach",
+            post(attach_runtime_session),
+        )
+        .route(
+            "/api/runtime/sessions/:id/detach",
+            post(detach_runtime_session),
+        )
+        .route(
+            "/api/runtime/sessions/:id/lifecycle",
+            get(get_runtime_session_lifecycle),
+        )
+        .route(
+            "/api/runtime/sessions/:id/replay",
+            get(replay_runtime_session),
+        )
         .route(
             "/api/runtime/session-leases",
             get(get_runtime_session_leases),
@@ -65,6 +83,116 @@ struct RuntimeSessionLeaseAcquireRequest {
 struct RuntimeSessionLeaseReleaseRequest {
     session_id: String,
     owner: String,
+}
+
+#[derive(Deserialize)]
+struct RuntimeSessionAttachRequest {
+    actor_id: String,
+    surface: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeSessionDetachRequest {
+    actor_id: String,
+}
+
+#[derive(Deserialize)]
+struct RuntimeSessionReplayParams {
+    #[serde(default)]
+    from_sequence: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub(super) async fn get_runtime_status(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.status_value()),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+pub(super) async fn get_runtime_snapshot(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.snapshot_value().await),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn attach_runtime_session(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RuntimeSessionAttachRequest>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(
+            runtime
+                .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
+                .await,
+        ),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn detach_runtime_session(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RuntimeSessionDetachRequest>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.detach_session_value(&id, &body.actor_id).await),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn get_runtime_session_lifecycle(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.lifecycle_snapshot_value(Some(&id)).await),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn replay_runtime_session(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<RuntimeSessionReplayParams>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(
+            runtime
+                .replay_session_value(
+                    &id,
+                    params.from_sequence.unwrap_or(0),
+                    params.limit.unwrap_or(100),
+                )
+                .await,
+        ),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
 }
 
 pub(super) async fn get_runtime_timeline(

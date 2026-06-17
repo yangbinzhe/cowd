@@ -7,12 +7,12 @@ use ratatui::{
 
 use crate::tui::app::{App, ApprovalRequest};
 use crate::tui::components::{Component, EventResult, RenderContext};
-use crate::tui::runtime_control_store::DaemonApprovalSummary;
+use crate::tui::runtime_control_store::ApprovalSummary;
 
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalCockpitPanel {
     local_approval: Option<ApprovalRequest>,
-    approval_items: Vec<DaemonApprovalSummary>,
+    approval_items: Vec<ApprovalSummary>,
     permission_count: usize,
     pending_approvals: Option<u64>,
     cross_plane_grants_active: Option<u64>,
@@ -20,7 +20,7 @@ pub struct ApprovalCockpitPanel {
     lease_owner: Option<String>,
     lease_mode: Option<String>,
     degraded_reasons: Vec<String>,
-    daemon_running: bool,
+    gateway_running: bool,
 }
 
 impl ApprovalCockpitPanel {
@@ -31,15 +31,15 @@ impl ApprovalCockpitPanel {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.local_approval = app.approval.clone();
-        self.approval_items = app.daemon_approval_items.clone();
+        self.approval_items = app.gateway_approval_items.clone();
         self.permission_count = app.permission_count;
-        self.pending_approvals = app.daemon_pending_approvals;
-        self.cross_plane_grants_active = app.daemon_cross_plane_grants_active;
-        self.cross_plane_actions_24h = app.daemon_cross_plane_actions_24h;
-        self.lease_owner = app.daemon_lease_owner.clone();
-        self.lease_mode = app.daemon_lease_mode.clone();
-        self.degraded_reasons = app.daemon_degraded_reasons.clone();
-        self.daemon_running = app.server_running;
+        self.pending_approvals = app.gateway_pending_approvals;
+        self.cross_plane_grants_active = app.gateway_cross_plane_grants_active;
+        self.cross_plane_actions_24h = app.gateway_cross_plane_actions_24h;
+        self.lease_owner = app.gateway_lease_owner.clone();
+        self.lease_mode = app.gateway_lease_mode.clone();
+        self.degraded_reasons = app.gateway_degraded_reasons.clone();
+        self.gateway_running = app.server_running;
     }
 
     fn render_lines(&self) -> Text<'_> {
@@ -48,14 +48,14 @@ impl ApprovalCockpitPanel {
         let actions = self.cross_plane_actions_24h.unwrap_or_default();
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("Daemon: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Gateway: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    if self.daemon_running {
+                    if self.gateway_running {
                         "connected"
                     } else {
                         "offline"
                     },
-                    Style::default().fg(if self.daemon_running {
+                    Style::default().fg(if self.gateway_running {
                         Color::Green
                     } else {
                         Color::Red
@@ -93,7 +93,7 @@ impl ApprovalCockpitPanel {
         }
         if !self.approval_items.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Daemon queue",
+                "Gateway queue",
                 Style::default().fg(Color::Cyan),
             )));
             for item in self.approval_items.iter().take(3) {
@@ -228,18 +228,18 @@ mod tests {
         let mut app = App::new("model", "session");
         app.server_running = true;
         app.permission_count = 2;
-        app.daemon_pending_approvals = Some(1);
-        app.daemon_approval_items = vec![DaemonApprovalSummary {
+        app.gateway_pending_approvals = Some(1);
+        app.gateway_approval_items = vec![ApprovalSummary {
             id: "approval-123456789".to_string(),
             tool_name: "bash".to_string(),
             risk: Some("high".to_string()),
             requester: Some("session".to_string()),
             input_preview: "rm -rf /tmp/example".to_string(),
         }];
-        app.daemon_cross_plane_grants_active = Some(3);
-        app.daemon_cross_plane_actions_24h = Some(9);
-        app.daemon_lease_owner = Some("tui:session".to_string());
-        app.daemon_lease_mode = Some("attached".to_string());
+        app.gateway_cross_plane_grants_active = Some(3);
+        app.gateway_cross_plane_actions_24h = Some(9);
+        app.gateway_lease_owner = Some("tui:session".to_string());
+        app.gateway_lease_mode = Some("attached".to_string());
         app.approval = Some(ApprovalRequest {
             tool_name: "bash".to_string(),
             input_preview: "rm -rf /tmp/example".to_string(),
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn renders_degraded_projection_reasons() {
         let mut app = App::new("model", "session");
-        app.daemon_degraded_reasons = vec!["approval projection unavailable".to_string()];
+        app.gateway_degraded_reasons = vec!["approval projection unavailable".to_string()];
 
         let mut panel = ApprovalCockpitPanel::new();
         panel.sync_from_app(&app);

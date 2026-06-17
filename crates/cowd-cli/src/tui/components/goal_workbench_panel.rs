@@ -9,13 +9,13 @@ use ratatui::{
 use crate::tui::app::{App, CurrentTaskSummary};
 use crate::tui::components::panel_scroll::{offset_to_u16, PanelScrollState};
 use crate::tui::components::{Component, EventResult, RenderContext};
-use crate::tui::runtime_control_store::DaemonTaskSummary;
+use crate::tui::runtime_control_store::TaskSummary;
 
 #[derive(Debug, Clone, Default)]
 pub struct GoalWorkbenchPanel {
     current_task: Option<CurrentTaskSummary>,
-    daemon_tasks: Vec<DaemonTaskSummary>,
-    daemon_task_count: Option<u64>,
+    gateway_tasks: Vec<TaskSummary>,
+    gateway_task_count: Option<u64>,
     pending_approvals: Option<u64>,
     scroll: PanelScrollState,
 }
@@ -28,9 +28,9 @@ impl GoalWorkbenchPanel {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.current_task = app.current_task.clone();
-        self.daemon_tasks = app.daemon_tasks.clone();
-        self.daemon_task_count = app.daemon_task_count;
-        self.pending_approvals = app.daemon_pending_approvals;
+        self.gateway_tasks = app.gateway_tasks.clone();
+        self.gateway_task_count = app.gateway_task_count;
+        self.pending_approvals = app.gateway_pending_approvals;
     }
 
     fn render_empty(&self) -> Text<'static> {
@@ -59,8 +59,8 @@ impl Component for GoalWorkbenchPanel {
 
         let title = format!(
             " Goals ({}) ",
-            self.daemon_task_count
-                .unwrap_or(self.daemon_tasks.len() as u64)
+            self.gateway_task_count
+                .unwrap_or(self.gateway_tasks.len() as u64)
         );
         let block = Block::default()
             .borders(Borders::ALL)
@@ -85,7 +85,7 @@ impl Component for GoalWorkbenchPanel {
             lines.push(Line::raw(""));
         }
 
-        if self.daemon_tasks.is_empty() {
+        if self.gateway_tasks.is_empty() {
             ctx.frame_mut().render_widget(
                 Paragraph::new(self.render_empty()).wrap(Wrap { trim: false }),
                 inner,
@@ -94,13 +94,13 @@ impl Component for GoalWorkbenchPanel {
         }
 
         lines.push(Line::from(Span::styled(
-            "Daemon Tasks",
+            "Gateway Tasks",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )));
         for task in self
-            .daemon_tasks
+            .gateway_tasks
             .iter()
             .take(area.height.saturating_sub(5) as usize)
         {
@@ -243,11 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_daemon_task_summary() {
+    fn renders_gateway_task_summary() {
         let mut panel = GoalWorkbenchPanel::new();
         let mut app = App::new("model", "session");
-        app.daemon_task_count = Some(1);
-        app.daemon_tasks = vec![DaemonTaskSummary {
+        app.gateway_task_count = Some(1);
+        app.gateway_tasks = vec![TaskSummary {
             id: "task-1234567890".to_string(),
             objective: "ship next generation TUI workbench".to_string(),
             status: "running".to_string(),
@@ -273,10 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_daemon_task_blocker_reason() {
+    fn renders_gateway_task_blocker_reason() {
         let mut panel = GoalWorkbenchPanel::new();
         let mut app = App::new("model", "session");
-        app.daemon_tasks = vec![DaemonTaskSummary {
+        app.gateway_tasks = vec![TaskSummary {
             id: "task-blocked".to_string(),
             objective: "finish migration".to_string(),
             status: "blocked".to_string(),

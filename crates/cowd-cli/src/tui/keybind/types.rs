@@ -46,11 +46,11 @@ pub enum Action {
     /// Execute a command string (e.g., `":help"`, `":session list"`).
     Execute(String),
     /// Respond to a pending daemon approval through the projection API.
-    RespondDaemonApproval { id: String, approved: bool },
+    RespondGatewayApproval { id: String, approved: bool },
     /// Cancel a daemon task through the projection API.
-    CancelDaemonTask(String),
+    CancelGatewayTask(String),
     /// Complete a daemon task through the projection API.
-    CompleteDaemonTask(String),
+    CompleteGatewayTask(String),
     /// Update a connector resource lifecycle state through the daemon API.
     RevalidateConnectorResource { reference: String, state: String },
     /// Promote connector resource metadata into memory through the daemon API.

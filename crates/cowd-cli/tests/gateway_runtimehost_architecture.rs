@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
@@ -29,9 +28,9 @@ fn runtime_host_owns_gateway_runtime_implementation() {
     assert!(root
         .join("crates/cowd-cli/src/runtime_host/mod.rs")
         .is_file());
-    assert!(root
+    assert!(!root
         .join("crates/cowd-cli/src/runtime_host/commands.rs")
-        .is_file());
+        .exists());
     let source = production_part(&read_repo("crates/cowd-cli/src/runtime_host/mod.rs")).to_string();
     assert!(source.contains("pub struct RuntimeHostConfig"));
     assert!(source.contains("pub async fn run_gateway_runtime"));
@@ -46,7 +45,6 @@ fn production_code_does_not_depend_on_daemon_module_except_transition_shim() {
         "crates/cowd-cli/src/api_routes.rs",
         "crates/cowd-cli/src/runtime_service.rs",
         "crates/cowd-cli/src/runtime_host/mod.rs",
-        "crates/cowd-cli/src/runtime_host/commands.rs",
     ];
     for file in files {
         let full_source = read_repo(file);
@@ -67,55 +65,19 @@ fn production_code_does_not_depend_on_daemon_module_except_transition_shim() {
 }
 
 #[test]
-fn socket_transition_command_set_is_frozen_until_tui_http_migration() {
-    let mut source = String::new();
-    source.push_str(production_part(&read_repo(
-        "crates/cowd-cli/src/runtime_host/mod.rs",
-    )));
-    source.push('\n');
-    source.push_str(production_part(&read_repo(
-        "crates/cowd-cli/src/runtime_host/commands.rs",
-    )));
-
-    let mut actual = BTreeSet::new();
-    for needle in source.match_indices("Some(\"") {
-        let start = needle.0 + "Some(\"".len();
-        if let Some(end) = source[start..].find('"') {
-            actual.insert(source[start..start + end].to_string());
-        }
-    }
-
-    let expected = [
+fn socket_business_commands_are_removed_after_tui_gateway_migration() {
+    let source = production_part(&read_repo("crates/cowd-cli/src/runtime_host/mod.rs")).to_string();
+    for forbidden in [
         "acquire_session_lease",
         "approval_pending",
         "approval_respond",
-        "attach_session",
-        "chat",
         "chat_stream",
         "connector_resource_list",
         "connector_resource_promote_memory",
         "connector_resource_revalidate",
         "context_snapshot",
-        "create_session",
-        "detach_session",
-        "ensure_session",
-        "list_sessions",
         "memory_status",
-        "poll_events",
-        "release_session_lease",
-        "replay_session",
-        "runtime.snapshot",
-        "runtime.status",
         "runtime_snapshot",
-        "session.attach",
-        "session.detach",
-        "session.lease.acquire",
-        "session.lease.release",
-        "session.lifecycle",
-        "session.lifecycle.snapshot",
-        "session.list",
-        "session.replay",
-        "status",
         "subscribe_session",
         "task_cancel",
         "task_complete",
@@ -123,14 +85,12 @@ fn socket_transition_command_set_is_frozen_until_tui_http_migration() {
         "task_start",
         "tool_approve",
         "tool_deny",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<BTreeSet<_>>();
-
-    assert_eq!(actual, expected);
-    let transition_header = read_repo("crates/cowd-cli/src/runtime_host/commands.rs");
-    assert!(transition_header.contains("delete_by: 0.9.293"));
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "runtime_host must not retain socket business command {forbidden}"
+        );
+    }
 }
 
 #[test]

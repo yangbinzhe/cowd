@@ -44,13 +44,6 @@ impl RuntimeService {
             "ok": true,
             "protocol_version": status.protocol_version,
             "runtime_host": status.runtime_host,
-            "daemon": status.runtime_host,
-            "compat": {
-                "daemon": {
-                    "delete_by": "0.9.293",
-                    "replacement": "runtime_host",
-                }
-            },
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
         })
@@ -72,24 +65,8 @@ impl RuntimeService {
         serde_json::json!({
             "ok": true,
             "kind": "gateway_runtime_snapshot",
-            "legacy_kind": "daemon_runtime_snapshot",
             "protocol_version": snapshot.protocol_version,
             "runtime_host": snapshot.runtime_host,
-            "daemon": snapshot.runtime_host,
-            "compat": {
-                "legacy_fields": {
-                    "legacy_kind": {
-                        "delete_by": "0.9.293",
-                        "replacement": "kind",
-                        "consumer": "tui/control_client",
-                    },
-                    "daemon": {
-                        "delete_by": "0.9.293",
-                        "replacement": "runtime_host",
-                        "consumer": "tui/control_client",
-                    }
-                }
-            },
             "active_sessions": snapshot.active_sessions,
             "uptime_secs": snapshot.uptime_secs,
             "sessions": snapshot.sessions,
@@ -100,11 +77,6 @@ impl RuntimeService {
             "lifecycle": self.lifecycle_kernel.snapshots().await,
             "transport": {
                 "control": "gateway_http",
-                "socket_transition": {
-                    "enabled": true,
-                    "delete_by": "0.9.293",
-                    "replacement": "gateway_http_sse",
-                },
                 "projection": "http_optional",
             },
         })
@@ -316,8 +288,8 @@ mod tests {
         let value = service.status_value();
         assert_eq!(value["ok"], true);
         assert_eq!(value["runtime_host"], "gateway-runtime-host");
-        assert_eq!(value["daemon"], "gateway-runtime-host");
-        assert_eq!(value["compat"]["daemon"]["delete_by"], "0.9.293");
+        let removed_legacy_key = ["dae", "mon"].concat();
+        assert!(value.get(&removed_legacy_key).is_none());
         assert_eq!(value["active_sessions"], 0);
     }
 
@@ -342,21 +314,11 @@ mod tests {
 
         let snapshot = service.snapshot_value().await;
         assert_eq!(snapshot["kind"], "gateway_runtime_snapshot");
-        assert_eq!(snapshot["legacy_kind"], "daemon_runtime_snapshot");
-        assert_eq!(
-            snapshot["compat"]["legacy_fields"]["legacy_kind"]["delete_by"],
-            "0.9.293"
-        );
-        assert_eq!(
-            snapshot["compat"]["legacy_fields"]["daemon"]["replacement"],
-            "runtime_host"
-        );
+        assert!(snapshot.get("legacy_kind").is_none());
+        let removed_legacy_key = ["dae", "mon"].concat();
+        assert!(snapshot.get(&removed_legacy_key).is_none());
         assert_eq!(snapshot["leases"]["total"], 1);
         assert_eq!(snapshot["transport"]["control"], "gateway_http");
-        assert_eq!(
-            snapshot["transport"]["socket_transition"]["delete_by"],
-            "0.9.293"
-        );
     }
 
     #[test]

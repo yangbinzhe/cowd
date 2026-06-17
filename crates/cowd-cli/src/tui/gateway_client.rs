@@ -1,32 +1,35 @@
 use std::fmt;
+use std::sync::mpsc;
 use std::time::Duration;
+
+use futures::StreamExt;
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
-pub struct DaemonProjectionClient {
+pub struct GatewayApiClient {
     base_url: String,
     auth_token: Option<String>,
     client: reqwest::Client,
 }
 
 #[derive(Debug)]
-pub enum ProjectionError {
+pub enum GatewayApiError {
     Http(reqwest::Error),
     Status(reqwest::StatusCode, String),
     Url(String),
 }
 
-impl DaemonProjectionClient {
+impl GatewayApiClient {
     pub fn new(
         base_url: impl Into<String>,
         auth_token: Option<String>,
-    ) -> Result<Self, ProjectionError> {
+    ) -> Result<Self, GatewayApiError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
-            .map_err(ProjectionError::Http)?;
+            .map_err(GatewayApiError::Http)?;
         Ok(Self {
             base_url: normalize_base_url(base_url.into())?,
             auth_token,
@@ -36,9 +39,9 @@ impl DaemonProjectionClient {
 
     pub fn from_running_gateway(
         auth_token: Option<String>,
-    ) -> Result<Option<Self>, ProjectionError> {
+    ) -> Result<Option<Self>, GatewayApiError> {
         let Some(info) =
-            crate::server::get_server_status().map_err(|e| ProjectionError::Url(e.to_string()))?
+            crate::server::get_server_status().map_err(|e| GatewayApiError::Url(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -47,7 +50,7 @@ impl DaemonProjectionClient {
 
     pub fn from_running_gateway_with_retry(
         auth_token: Option<String>,
-    ) -> Result<Option<Self>, ProjectionError> {
+    ) -> Result<Option<Self>, GatewayApiError> {
         let auth_token = auth_token.or_else(default_auth_token);
         for attempt in 0..GATEWAY_READY_RETRY_ATTEMPTS {
             if let Some(client) = Self::from_running_gateway(auth_token.clone())? {
@@ -60,18 +63,177 @@ impl DaemonProjectionClient {
         Ok(None)
     }
 
-    pub async fn runtime_control_plane(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub fn ensure_running_with_retry(
+        auth_token: Option<String>,
+    ) -> Result<Option<Self>, GatewayApiError> {
+        if let Some(client) = Self::from_running_gateway_with_retry(auth_token.clone())? {
+            return Ok(Some(client));
+        }
+
+        if std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_err() {
+            let exe =
+                std::env::current_exe().map_err(|error| GatewayApiError::Url(error.to_string()))?;
+            std::process::Command::new(exe)
+                .arg("gateway")
+                .arg("run")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        }
+
+        Self::from_running_gateway_with_retry(auth_token)
+    }
+
+    pub async fn runtime_control_plane(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/control-plane").await
     }
 
-    pub async fn cowd_capabilities(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn status(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/status").await
+    }
+
+    pub async fn runtime_snapshot(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/snapshot").await
+    }
+
+    pub async fn list_sessions(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/sessions").await
+    }
+
+    pub async fn ensure_session(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/sessions/{}/ensure", url_encode(session_id)),
+            serde_json::json!({ "model": model }),
+        )
+        .await
+    }
+
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/sessions/{}/messages", url_encode(session_id)),
+            serde_json::json!({ "content": content }),
+        )
+        .await
+    }
+
+    pub async fn subscribe_session_events(
+        &self,
+        session_id: &str,
+        tx: mpsc::SyncSender<runtime::CowdEvent>,
+    ) -> Result<(), GatewayApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/stream",
+            self.base_url,
+            url_encode(session_id)
+        );
+        let mut request = self.client.get(url);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(GatewayApiError::Http)?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(index) = buffer.find("\n\n") {
+                let frame = buffer[..index].to_string();
+                buffer.drain(..index + 2);
+                if let Some(event) = gateway_sse_frame_to_cowd_event(&frame) {
+                    let _ = tx.send(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn attach_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        surface: &str,
+        role: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/runtime/sessions/{}/attach", url_encode(session_id)),
+            serde_json::json!({
+                "actor_id": actor_id,
+                "surface": surface,
+                "role": role,
+            }),
+        )
+        .await
+    }
+
+    pub async fn detach_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/runtime/sessions/{}/detach", url_encode(session_id)),
+            serde_json::json!({ "actor_id": actor_id }),
+        )
+        .await
+    }
+
+    pub async fn lifecycle_snapshot(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        match session_id {
+            Some(session_id) => {
+                self.get_json(&format!(
+                    "/api/runtime/sessions/{}/lifecycle",
+                    url_encode(session_id)
+                ))
+                .await
+            }
+            None => self.get_json("/api/runtime/snapshot").await,
+        }
+    }
+
+    pub async fn replay_session(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/runtime/sessions/{}/replay?from_sequence={from_sequence}&limit={limit}",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn cowd_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/capabilities").await
     }
 
     pub async fn cowd_projection(
         &self,
         surface: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!(
             "/api/cowd/projection?surface={}",
             url_encode(surface)
@@ -79,39 +241,39 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn cowd_surfaces(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn cowd_surfaces(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/surfaces").await
     }
 
-    pub async fn cowd_release_gate(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn cowd_release_gate(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/release-gate").await
     }
 
-    pub async fn structured_sources(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn structured_sources(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/sources").await
     }
 
-    pub async fn structured_facts(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn structured_facts(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/facts").await
     }
 
-    pub async fn structured_evidence(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn structured_evidence(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/evidence").await
     }
 
-    pub async fn structured_watermarks(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn structured_watermarks(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/watermarks").await
     }
 
     pub async fn structured_ingest_plan(
         &self,
         input: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/cowd/structured/ingest-plan", input)
             .await
     }
 
-    pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/session-leases").await
     }
 
@@ -120,7 +282,7 @@ impl DaemonProjectionClient {
         session_id: &str,
         owner: &str,
         mode: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/acquire",
             serde_json::json!({
@@ -136,7 +298,7 @@ impl DaemonProjectionClient {
         &self,
         session_id: &str,
         owner: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/release",
             serde_json::json!({
@@ -147,7 +309,7 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn runtime_effective_config(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn runtime_effective_config(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/config/effective").await
     }
 
@@ -155,7 +317,7 @@ impl DaemonProjectionClient {
         &self,
         session_id: &str,
         limit: usize,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!(
             "/api/runtime/timeline?session_id={}&limit={}",
             url_encode(session_id),
@@ -167,7 +329,7 @@ impl DaemonProjectionClient {
     pub async fn current_context(
         &self,
         session_id: Option<&str>,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         let path = match session_id {
             Some(id) if !id.trim().is_empty() => {
                 format!("/api/context/current?session_id={}", url_encode(id))
@@ -177,15 +339,15 @@ impl DaemonProjectionClient {
         self.get_json(&path).await
     }
 
-    pub async fn memory_status(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn memory_status(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/memory/status").await
     }
 
-    pub async fn task_status(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn task_status(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/tasks").await
     }
 
-    pub async fn pending_approvals(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn pending_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/approval/pending").await
     }
 
@@ -195,7 +357,7 @@ impl DaemonProjectionClient {
         approved: bool,
         persistence: Option<&str>,
         reason: Option<&str>,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/approval/respond",
             serde_json::json!({
@@ -212,7 +374,7 @@ impl DaemonProjectionClient {
         &self,
         objective: &str,
         yolo_mode: bool,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tasks/start",
             serde_json::json!({
@@ -223,7 +385,7 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tasks/{}/cancel", url_encode(id)),
             serde_json::json!({}),
@@ -231,7 +393,7 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn complete_task(&self, id: &str) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn complete_task(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tasks/{}/complete", url_encode(id)),
             serde_json::json!({}),
@@ -239,15 +401,15 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn cross_plane_summary(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn cross_plane_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cross-plane/summary").await
     }
 
-    pub async fn connector_accounts(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn connector_accounts(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/connectors/accounts").await
     }
 
-    pub async fn connector_capabilities(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn connector_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/connectors/capabilities").await
     }
 
@@ -256,7 +418,7 @@ impl DaemonProjectionClient {
         query: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         let mut path = format!("/api/connectors/resources?limit={limit}&offset={offset}");
         if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
             path.push_str("&q=");
@@ -268,7 +430,7 @@ impl DaemonProjectionClient {
     pub async fn connector_service_tools(
         &self,
         service: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!(
             "/api/connectors/services/{}/tools",
             url_encode(service)
@@ -280,7 +442,7 @@ impl DaemonProjectionClient {
         &self,
         service: &str,
         request: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/connectors/services/{}/execute", url_encode(service)),
             request,
@@ -292,7 +454,7 @@ impl DaemonProjectionClient {
         &self,
         reference: &str,
         state: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/connectors/resources/revalidate",
             serde_json::json!({
@@ -307,7 +469,7 @@ impl DaemonProjectionClient {
         &self,
         reference: &str,
         session_id: Option<&str>,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/connectors/resources/promote-memory",
             serde_json::json!({
@@ -321,7 +483,7 @@ impl DaemonProjectionClient {
     pub async fn preflight_cross_plane_action(
         &self,
         action: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/cross-plane/action/preflight", action)
             .await
     }
@@ -329,7 +491,7 @@ impl DaemonProjectionClient {
     pub async fn execute_cross_plane_action(
         &self,
         request: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/cross-plane/action/execute", request)
             .await
     }
@@ -337,12 +499,12 @@ impl DaemonProjectionClient {
     pub async fn cross_plane_policy_simulate(
         &self,
         action: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/cross-plane/policy/simulate", action)
             .await
     }
 
-    pub async fn tool_registry(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn tool_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/tools").await
     }
 
@@ -351,7 +513,7 @@ impl DaemonProjectionClient {
         name: &str,
         input: serde_json::Value,
         mode: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/execute",
             serde_json::json!({
@@ -363,7 +525,7 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn tool_cache_stats(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn tool_cache_stats(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/tools/cache").await
     }
 
@@ -371,7 +533,7 @@ impl DaemonProjectionClient {
         &self,
         calls: Vec<serde_json::Value>,
         max_concurrency: usize,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/batch-readonly",
             serde_json::json!({
@@ -385,7 +547,7 @@ impl DaemonProjectionClient {
     pub async fn tool_mutation_preview(
         &self,
         edits: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/mutations/preview",
             serde_json::json!({ "edits": edits }),
@@ -397,7 +559,7 @@ impl DaemonProjectionClient {
         &self,
         edits: Vec<serde_json::Value>,
         expected_hashes: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/mutations/apply",
             serde_json::json!({
@@ -408,14 +570,14 @@ impl DaemonProjectionClient {
         .await
     }
 
-    pub async fn tool_checkpoints(&self) -> Result<serde_json::Value, ProjectionError> {
+    pub async fn tool_checkpoints(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/tools/checkpoints").await
     }
 
     pub async fn tool_checkpoint_create(
         &self,
         label: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/checkpoints",
             serde_json::json!({ "label": label }),
@@ -426,7 +588,7 @@ impl DaemonProjectionClient {
     pub async fn tool_checkpoint_diff(
         &self,
         id: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/tools/checkpoints/{}/diff", url_encode(id)))
             .await
     }
@@ -434,7 +596,7 @@ impl DaemonProjectionClient {
     pub async fn tool_checkpoint_restore(
         &self,
         id: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tools/checkpoints/{}/restore", url_encode(id)),
             serde_json::json!({}),
@@ -446,7 +608,7 @@ impl DaemonProjectionClient {
         &self,
         prompt: &str,
         selected_tools: Vec<String>,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/intent-plan",
             serde_json::json!({
@@ -460,7 +622,7 @@ impl DaemonProjectionClient {
     pub async fn tool_context_fanout_plan(
         &self,
         prompt: &str,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/tools/context-fanout/plan",
             serde_json::json!({ "prompt": prompt }),
@@ -468,7 +630,7 @@ impl DaemonProjectionClient {
         .await
     }
 
-    async fn get_json(&self, path: &str) -> Result<serde_json::Value, ProjectionError> {
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.client.get(url);
         if let Some(token) = self
@@ -478,20 +640,20 @@ impl DaemonProjectionClient {
         {
             request = request.bearer_auth(token.trim());
         }
-        let response = request.send().await.map_err(ProjectionError::Http)?;
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(ProjectionError::Status(status, body));
+            return Err(GatewayApiError::Status(status, body));
         }
-        response.json().await.map_err(ProjectionError::Http)
+        response.json().await.map_err(GatewayApiError::Http)
     }
 
     async fn post_json(
         &self,
         path: &str,
         body: serde_json::Value,
-    ) -> Result<serde_json::Value, ProjectionError> {
+    ) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.client.post(url).json(&body);
         if let Some(token) = self
@@ -501,13 +663,13 @@ impl DaemonProjectionClient {
         {
             request = request.bearer_auth(token.trim());
         }
-        let response = request.send().await.map_err(ProjectionError::Http)?;
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(ProjectionError::Status(status, body));
+            return Err(GatewayApiError::Status(status, body));
         }
-        response.json().await.map_err(ProjectionError::Http)
+        response.json().await.map_err(GatewayApiError::Http)
     }
 }
 
@@ -544,16 +706,16 @@ fn auth_token_from_runtime_config() -> Option<String> {
         .map(String::from)
 }
 
-fn normalize_base_url(mut base_url: String) -> Result<String, ProjectionError> {
+fn normalize_base_url(mut base_url: String) -> Result<String, GatewayApiError> {
     if base_url.trim().is_empty() {
-        return Err(ProjectionError::Url(
-            "empty daemon API base URL".to_string(),
+        return Err(GatewayApiError::Url(
+            "empty Gateway API base URL".to_string(),
         ));
     }
     base_url = base_url.trim().trim_end_matches('/').to_string();
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        return Err(ProjectionError::Url(format!(
-            "daemon API base URL must start with http:// or https://: {base_url}"
+        return Err(GatewayApiError::Url(format!(
+            "Gateway API base URL must start with http:// or https://: {base_url}"
         )));
     }
     Ok(base_url)
@@ -571,19 +733,139 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
-impl fmt::Display for ProjectionError {
+impl fmt::Display for GatewayApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(err) => write!(f, "runtime projection HTTP failed: {err}"),
+            Self::Http(err) => write!(f, "Gateway API HTTP failed: {err}"),
             Self::Status(status, body) => {
-                write!(f, "runtime projection returned {status}: {body}")
+                write!(f, "Gateway API returned {status}: {body}")
             }
-            Self::Url(err) => write!(f, "runtime projection URL error: {err}"),
+            Self::Url(err) => write!(f, "Gateway API URL error: {err}"),
         }
     }
 }
 
-impl std::error::Error for ProjectionError {}
+impl std::error::Error for GatewayApiError {}
+
+pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<runtime::CowdEvent> {
+    let event_type = value
+        .get("type")
+        .or_else(|| value.get("event"))
+        .or_else(|| value.get("event_type"))
+        .and_then(serde_json::Value::as_str)?;
+    match event_type {
+        "TextDelta" | "text_delta" | "assistant_delta" => value
+            .get("text")
+            .or_else(|| value.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .map(|text| runtime::CowdEvent::TextDelta {
+                text: text.to_string(),
+            }),
+        "ThinkingDelta" | "thinking_delta" => value
+            .get("thinking")
+            .or_else(|| value.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .map(|thinking| runtime::CowdEvent::ThinkingDelta {
+                thinking: thinking.to_string(),
+            }),
+        "ToolStart" | "tool_start" => Some(runtime::CowdEvent::ToolStart {
+            id: value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            name: value
+                .get("name")
+                .or_else(|| value.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            preview: value
+                .get("preview")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "ToolProgress" | "tool_progress" => Some(runtime::CowdEvent::ToolProgress {
+            id: value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            name: value
+                .get("name")
+                .or_else(|| value.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            progress: value
+                .get("progress")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "ToolComplete" | "tool_complete" => Some(runtime::CowdEvent::ToolComplete {
+            id: value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            name: value
+                .get("name")
+                .or_else(|| value.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            summary: value
+                .get("result_summary")
+                .or_else(|| value.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            exit_code: value
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map(|code| code as i32),
+        }),
+        "TurnComplete" | "turn_complete" => Some(runtime::CowdEvent::TurnComplete {
+            assistant_text: value
+                .get("assistant_text")
+                .or_else(|| value.get("response"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            iterations: value
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32)
+                .unwrap_or_default(),
+        }),
+        "TurnError" | "turn_error" => Some(runtime::CowdEvent::TurnError {
+            error: value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Gateway turn error")
+                .to_string(),
+        }),
+        _ => None,
+    }
+}
+
+pub fn gateway_sse_frame_to_cowd_event(frame: &str) -> Option<runtime::CowdEvent> {
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&data)
+        .ok()
+        .and_then(|value| gateway_sse_json_to_cowd_event(&value))
+}
 
 #[cfg(test)]
 mod tests {
@@ -603,6 +885,119 @@ mod tests {
     #[test]
     fn url_encode_encodes_session_ids() {
         assert_eq!(url_encode("session a/b"), "session%20a%2Fb");
+    }
+
+    #[test]
+    fn gateway_sse_json_maps_core_cowd_events() {
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "TextDelta",
+                "text": "hello"
+            })),
+            Some(runtime::CowdEvent::TextDelta { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "ThinkingDelta",
+                "thinking": "checking"
+            })),
+            Some(runtime::CowdEvent::ThinkingDelta { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "ToolStart",
+                "id": "tool-1",
+                "name": "read"
+            })),
+            Some(runtime::CowdEvent::ToolStart { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "TurnComplete"
+            })),
+            Some(runtime::CowdEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn gateway_sse_frame_maps_data_json() {
+        assert!(matches!(
+            gateway_sse_frame_to_cowd_event(
+                "event: message\ndata: {\"type\":\"TextDelta\",\"text\":\"hi\"}\n\n"
+            ),
+            Some(runtime::CowdEvent::TextDelta { .. })
+        ));
+        assert!(gateway_sse_frame_to_cowd_event("data: [DONE]\n\n").is_none());
+    }
+
+    #[test]
+    fn gateway_api_inventory_migrates_legacy_control_and_projection_methods() {
+        let migrated = [
+            "status",
+            "runtime_snapshot",
+            "list_sessions",
+            "ensure_session",
+            "acquire_session_lease",
+            "release_session_lease",
+            "attach_session",
+            "detach_session",
+            "lifecycle_snapshot",
+            "replay_session",
+            "task_status",
+            "start_task",
+            "cancel_task",
+            "complete_task",
+            "pending_approvals",
+            "memory_status",
+            "context_snapshot",
+            "respond_approval",
+            "connector_resources",
+            "revalidate_connector_resource",
+            "promote_connector_resource_to_memory",
+            "chat_session",
+            "subscribe_session_events",
+            "runtime_control_plane",
+            "cowd_capabilities",
+            "cowd_projection",
+            "cowd_surfaces",
+            "cowd_release_gate",
+            "structured_sources",
+            "structured_facts",
+            "structured_evidence",
+            "structured_watermarks",
+            "structured_ingest_plan",
+            "runtime_session_leases",
+            "acquire_runtime_session_lease",
+            "release_runtime_session_lease",
+            "runtime_effective_config",
+            "runtime_timeline",
+            "current_context",
+            "cross_plane_summary",
+            "connector_accounts",
+            "connector_capabilities",
+            "connector_service_tools",
+            "execute_connector_service",
+            "preflight_cross_plane_action",
+            "execute_cross_plane_action",
+            "cross_plane_policy_simulate",
+            "tool_registry",
+            "tool_execute",
+            "tool_cache_stats",
+            "tool_batch_readonly",
+            "tool_mutation_preview",
+            "tool_mutation_apply",
+            "tool_checkpoints",
+            "tool_checkpoint_create",
+            "tool_checkpoint_diff",
+            "tool_checkpoint_restore",
+            "tool_intent_plan",
+            "tool_context_fanout_plan",
+        ];
+        let deleted = ["socket_path", "with_timeout"];
+        assert_eq!(migrated.len(), 59);
+        assert_eq!(deleted.len(), 2);
+        assert!(!migrated.iter().any(|item| item.trim().is_empty()));
+        assert!(!deleted.iter().any(|item| item.trim().is_empty()));
     }
 
     #[tokio::test]
@@ -625,7 +1020,7 @@ mod tests {
         });
 
         let client =
-            DaemonProjectionClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
                 .expect("client");
         let json = client.runtime_control_plane().await.expect("json");
         assert_eq!(json["ok"], true);
@@ -650,7 +1045,7 @@ mod tests {
                 .expect("write projection");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let json = client.cowd_projection("tui").await.expect("json");
         assert_eq!(json["surface"], "tui");
         assert_eq!(json["capability_count"], 1);
@@ -699,7 +1094,7 @@ mod tests {
             }
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         assert_eq!(
             client.structured_facts().await.expect("facts")["kind"],
             "cowd.structured.facts"
@@ -750,7 +1145,7 @@ mod tests {
                 .expect("write release");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let acquired = client
             .acquire_runtime_session_lease("session-1", "tui:1", "collaborative")
             .await
@@ -785,7 +1180,7 @@ mod tests {
         });
 
         let client =
-            DaemonProjectionClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
                 .expect("client");
         let json = client
             .preflight_cross_plane_action(serde_json::json!({
@@ -819,7 +1214,7 @@ mod tests {
                 .expect("write");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let json = client
             .respond_approval("approval-1", true, Some("session"), None)
             .await
@@ -848,7 +1243,7 @@ mod tests {
                 .expect("write");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let json = client.start_task("ship tui", true).await.expect("json");
         assert_eq!(json["id"], "task-1");
         server.await.expect("server task");
@@ -874,7 +1269,7 @@ mod tests {
                 .expect("write");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let json = client
             .connector_resources(Some("Ready Doc"), 20, 40)
             .await
@@ -915,7 +1310,7 @@ mod tests {
                 .expect("write execute");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let tools = client
             .connector_service_tools("mock.docs")
             .await
@@ -1017,7 +1412,7 @@ mod tests {
             }
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         assert_eq!(client.tool_registry().await.expect("registry")["ok"], true);
         assert_eq!(
             client
@@ -1148,7 +1543,7 @@ mod tests {
                 .expect("write promote");
         });
 
-        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let revalidated = client
             .revalidate_connector_resource("service://mock.docs/document/tui-doc", "stale")
             .await

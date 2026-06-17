@@ -66,7 +66,7 @@ impl SystemStatusBar {
         self.reply_count = stats.message_count as u32;
         self.event_count = stats.event_count as u32;
         self.approval_count = app
-            .daemon_pending_approvals
+            .gateway_pending_approvals
             .unwrap_or_default()
             .max(app.permission_count as u64)
             + u64::from(app.approval.is_some());
@@ -98,7 +98,7 @@ impl SystemStatusBar {
             }
         }
         self.daemon = app
-            .daemon_runtime_readiness
+            .gateway_runtime_readiness
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         self.gateway = if app.server_running {
@@ -115,9 +115,9 @@ impl SystemStatusBar {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         self.issue = app
-            .daemon_degraded_reasons
+            .gateway_degraded_reasons
             .first()
-            .or_else(|| app.daemon_connector_degraded_reasons.first())
+            .or_else(|| app.gateway_connector_degraded_reasons.first())
             .map(|reason| preview(reason, 34));
     }
 }
@@ -196,12 +196,13 @@ impl Component for SystemStatusBar {
 }
 
 fn runtime_health(app: &App) -> &'static str {
-    if !app.daemon_degraded_reasons.is_empty() || !app.daemon_connector_degraded_reasons.is_empty()
+    if !app.gateway_degraded_reasons.is_empty()
+        || !app.gateway_connector_degraded_reasons.is_empty()
     {
         "degraded"
-    } else if app.daemon_pending_approvals.unwrap_or(0) > 0 || app.approval.is_some() {
+    } else if app.gateway_pending_approvals.unwrap_or(0) > 0 || app.approval.is_some() {
         "blocked"
-    } else if app.daemon_runtime_readiness.is_some() || app.server_running {
+    } else if app.gateway_runtime_readiness.is_some() || app.server_running {
         "ready"
     } else {
         "unknown"
@@ -209,11 +210,11 @@ fn runtime_health(app: &App) -> &'static str {
 }
 
 fn connector_health(app: &App) -> String {
-    if !app.daemon_connector_degraded_reasons.is_empty() {
-        return format!("degraded:{}", app.daemon_connector_degraded_reasons.len());
+    if !app.gateway_connector_degraded_reasons.is_empty() {
+        return format!("degraded:{}", app.gateway_connector_degraded_reasons.len());
     }
-    let accounts = app.daemon_connector_accounts.len();
-    let capabilities = app.daemon_connector_capabilities.len();
+    let accounts = app.gateway_connector_accounts.len();
+    let capabilities = app.gateway_connector_capabilities.len();
     if accounts == 0 && capabilities == 0 {
         "none".to_string()
     } else {
@@ -275,7 +276,7 @@ mod tests {
     #[test]
     fn runtime_health_blocks_on_pending_approvals() {
         let mut app = App::new("m", "s");
-        app.daemon_pending_approvals = Some(2);
+        app.gateway_pending_approvals = Some(2);
 
         assert_eq!(runtime_health(&app), "blocked");
     }
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn connector_health_summarizes_accounts_and_capabilities() {
         let mut app = App::new("m", "s");
-        app.daemon_connector_accounts.push(
+        app.gateway_connector_accounts.push(
             crate::tui::runtime_control_store::ConnectorAccountSummary {
                 provider: "mock".into(),
                 account_id: "a1".into(),
@@ -293,7 +294,7 @@ mod tests {
                 binding_count: 1,
             },
         );
-        app.daemon_connector_capabilities.push(
+        app.gateway_connector_capabilities.push(
             crate::tui::runtime_control_store::ConnectorCapabilitySummary {
                 provider: "mock".into(),
                 capability_id: "read".into(),

@@ -472,10 +472,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             yolo_mode,
         } => {
             // Auto-start Gateway RuntimeHost if not already ready
-            let sock_path = daemon_socket_path();
-            let sock = sock_path.as_path();
-            let daemon_autostart_disabled = std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
-            if !sock.exists() && !daemon_autostart_disabled {
+            let gateway_autostart_disabled = std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
+            let gateway_running = server::get_server_status().ok().flatten().is_some();
+            if !gateway_running && !gateway_autostart_disabled {
                 tracing::info!("runtime host not ready, auto-starting...");
                 setup_sigchld_handler();
                 if let Ok(exe) = std::env::current_exe() {
@@ -495,15 +494,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::warn!(error = %e, "failed to auto-start runtime host");
                         }
                     }
-                    // Wait for socket to appear (max 5 seconds)
+                    // Wait for Gateway status to appear (max 5 seconds).
                     for _ in 0..50 {
-                        if sock.exists() {
+                        if server::get_server_status().ok().flatten().is_some() {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
-            } else if daemon_autostart_disabled {
+            } else if gateway_autostart_disabled {
                 tracing::debug!(
                     "runtime host auto-start disabled by COWD_DISABLE_DAEMON_AUTOSTART"
                 );
@@ -644,7 +643,6 @@ fn run_gateway_action(
 
             let runtime_host_config = runtime_host::RuntimeHostConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
-                unix_sock_path: daemon_socket_path().display().to_string(),
                 memory_config,
                 platform_configs,
                 runtime_config: runtime_config_json,
@@ -1403,12 +1401,6 @@ fn config_aliases_for_current_dir() -> std::collections::HashMap<String, String>
         Ok(config) => config.aliases().clone().into_iter().collect(),
         Err(_) => std::collections::HashMap::new(),
     }
-}
-
-fn daemon_socket_path() -> PathBuf {
-    std::env::var_os("COWD_DAEMON_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/cowd.sock"))
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -3217,173 +3209,223 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     state.app.current_task = cli.yolo_task.as_ref().map(current_task_summary_from_record);
     state.add_message("system", &strip_ansi_for_tui(&cli.startup_banner()));
     state.add_message("system", &format_connected_line(&cli.model));
-    let daemon_client = tui::control_client::DaemonControlClient::default_local();
-    let mut daemon_session_ids: Vec<String> = Vec::new();
-    let mut daemon_session_attached = false;
-    let daemon_actor_id = format!("tui:{}", std::process::id());
-    let mut daemon_lease_owner: Option<String> = None;
-    let mut daemon_session_lease: Option<tui::control_client::DaemonSessionLease> = None;
-    match SHARED_RT.block_on(daemon_client.status()) {
-        Ok(status) => {
-            state.app.server_running = true;
-            state.app.active_api_sessions = status.active_sessions;
-            state.app.server_uptime_secs = Some(status.uptime_secs);
-            state.add_message(
-                "system",
-                &format!(
-                    "Daemon control connected: {} active sessions, uptime {}s",
-                    status.active_sessions, status.uptime_secs
-                ),
-            );
-            match SHARED_RT.block_on(daemon_client.ensure_session(&session_id, &cli.model)) {
-                Ok(ensured) => {
-                    state.app.active_api_sessions = ensured.active_sessions;
-                    daemon_session_attached = true;
-                    let action = if ensured.created {
-                        "created"
-                    } else {
-                        "attached"
-                    };
-                    state.add_message(
-                        "system",
-                        &format!("Daemon session {action}: {}", ensured.session_id),
-                    );
-                    match SHARED_RT.block_on(daemon_client.attach_session(
-                        &ensured.session_id,
-                        &daemon_actor_id,
-                        "tui",
-                        Some("writer"),
-                    )) {
-                        Ok(attached) => {
-                            state.add_message(
-                                "system",
-                                &format!(
-                                    "Daemon lifecycle attached: state={}, seq={}",
-                                    attached.event.state, attached.event.sequence
-                                ),
-                            );
-                            match SHARED_RT.block_on(daemon_client.replay_session(
-                                &ensured.session_id,
-                                0,
-                                100,
-                            )) {
-                                Ok(replay) => state.add_message(
-                                    "system",
-                                    &format!(
-                                        "Daemon replay ready: total={}, next_seq={}",
-                                        replay.total, replay.next_sequence
-                                    ),
-                                ),
-                                Err(err) => state.add_message(
-                                    "system",
-                                    &format!("Daemon replay unavailable: {err}"),
-                                ),
-                            }
-                        }
-                        Err(err) => state.add_message(
-                            "system",
-                            &format!("Daemon lifecycle attach unavailable: {err}"),
-                        ),
-                    }
-                    let lease_owner = daemon_actor_id.clone();
-                    match SHARED_RT.block_on(daemon_client.acquire_session_lease(
-                        &ensured.session_id,
-                        &lease_owner,
-                        "collaborative",
-                    )) {
-                        Ok(lease) => {
-                            daemon_lease_owner = Some(lease.owner.clone());
-                            daemon_session_lease = Some(lease.clone());
-                            state.app.daemon_lease_owner = Some(lease.owner.clone());
-                            state.app.daemon_lease_mode = Some(lease.mode.clone());
-                            state.add_message(
-                                "system",
-                                &format!(
-                                    "Daemon session lease acquired: owner={}, mode={}",
-                                    lease.owner, lease.mode
-                                ),
-                            );
-                        }
-                        Err(err) => state.add_message(
-                            "system",
-                            &format!("Daemon session lease unavailable: {err}"),
-                        ),
-                    }
-                }
-                Err(err) => {
-                    state.add_message(
-                        "system",
-                        &format!(
-                            "Daemon session attach failed; local runtime remains active: {err}"
-                        ),
-                    );
-                }
-            }
-            let projection =
-                match tui::projection_client::DaemonProjectionClient::from_running_gateway_with_retry(
-                    daemon_projection_auth_token(),
-                ) {
-                    Ok(client) => client,
-                    Err(err) => {
-                        state.add_message(
-                            "system",
-                            &format!("Daemon projection client unavailable: {err}"),
-                        );
-                        None
-                    }
-                };
-            let mut snapshot = SHARED_RT.block_on(
-                tui::runtime_control_store::refresh_runtime_control_snapshot(
-                    &daemon_client,
-                    projection.as_ref(),
-                    Some(&session_id),
-                ),
-            );
-            if let Some(lease) = daemon_session_lease.as_ref() {
-                snapshot.apply_lease(lease);
-            }
-            daemon_session_ids = snapshot.session_ids.clone();
-            let readiness = snapshot.runtime_readiness.clone();
-            let components = snapshot.runtime_components.unwrap_or_default();
-            let degraded_reasons = snapshot.degraded_reasons.clone();
-            snapshot.apply_to_app(&mut state.app);
-            if let Some(readiness) = readiness {
+    let mut gateway_session_ids: Vec<String> = Vec::new();
+    let mut gateway_session_attached = false;
+    let gateway_actor_id = format!("tui:{}", std::process::id());
+    let mut gateway_lease_owner: Option<String> = None;
+    let gateway_client = match tui::gateway_client::GatewayApiClient::ensure_running_with_retry(
+        tui::gateway_client::default_auth_token(),
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            state.add_message("system", &format!("Gateway API client unavailable: {err}"));
+            None
+        }
+    };
+    if let Some(gateway_client) = gateway_client.as_ref() {
+        match SHARED_RT.block_on(gateway_client.status()) {
+            Ok(status) => {
+                state.app.server_running = true;
+                state.app.active_api_sessions = status
+                    .get("active_sessions")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or_default();
+                state.app.server_uptime_secs = status
+                    .get("uptime_secs")
+                    .and_then(serde_json::Value::as_u64);
+                let active_api_sessions = state.app.active_api_sessions;
+                let server_uptime_secs = state.app.server_uptime_secs.unwrap_or_default();
                 state.add_message(
                     "system",
                     &format!(
-                        "Daemon runtime projection connected: readiness={readiness}, components={components}"
+                        "Gateway API connected: {} active sessions, uptime {}s",
+                        active_api_sessions, server_uptime_secs
                     ),
                 );
-            }
-            for reason in degraded_reasons.into_iter().take(3) {
-                state.add_message("system", &format!("Daemon projection degraded: {reason}"));
-            }
-            if daemon_session_attached {
-                let event_client = daemon_client.clone();
-                let event_session_id = session_id.clone();
-                let event_tx = tui_tx.clone();
-                let _event_bridge = SHARED_RT.spawn(async move {
-                    if let Err(err) = event_client
-                        .subscribe_session_events(&event_session_id, event_tx.clone())
-                        .await
-                    {
-                        let _ = event_tx.send(runtime::CowdEvent::TurnError {
-                            error: format!("Daemon event bridge stopped: {err}"),
-                        });
+                match SHARED_RT.block_on(gateway_client.ensure_session(&session_id, &cli.model)) {
+                    Ok(ensured) => {
+                        state.app.active_api_sessions = ensured
+                            .get("active_sessions")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|value| value as usize)
+                            .unwrap_or(state.app.active_api_sessions);
+                        gateway_session_attached = true;
+                        let ensured_session_id = ensured
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&session_id)
+                            .to_string();
+                        let action = if ensured
+                            .get("created")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            "created"
+                        } else {
+                            "attached"
+                        };
+                        state.add_message(
+                            "system",
+                            &format!("Gateway session {action}: {ensured_session_id}"),
+                        );
+                        match SHARED_RT.block_on(gateway_client.attach_session(
+                            &ensured_session_id,
+                            &gateway_actor_id,
+                            "tui",
+                            Some("writer"),
+                        )) {
+                            Ok(attached) => {
+                                state.add_message(
+                                    "system",
+                                    &format!(
+                                        "Gateway lifecycle attached: state={}, seq={}",
+                                        attached
+                                            .pointer("/event/state")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("attached"),
+                                        attached
+                                            .pointer("/event/sequence")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or_default()
+                                    ),
+                                );
+                                match SHARED_RT.block_on(gateway_client.replay_session(
+                                    &ensured_session_id,
+                                    0,
+                                    100,
+                                )) {
+                                    Ok(replay) => state.add_message(
+                                        "system",
+                                        &format!(
+                                            "Gateway replay ready: total={}, next_seq={}",
+                                            replay
+                                                .get("total")
+                                                .and_then(serde_json::Value::as_u64)
+                                                .unwrap_or_default(),
+                                            replay
+                                                .get("next_sequence")
+                                                .and_then(serde_json::Value::as_u64)
+                                                .unwrap_or_default()
+                                        ),
+                                    ),
+                                    Err(err) => state.add_message(
+                                        "system",
+                                        &format!("Gateway replay unavailable: {err}"),
+                                    ),
+                                }
+                            }
+                            Err(err) => state.add_message(
+                                "system",
+                                &format!("Gateway lifecycle attach unavailable: {err}"),
+                            ),
+                        }
+                        let lease_owner = gateway_actor_id.clone();
+                        match SHARED_RT.block_on(gateway_client.acquire_runtime_session_lease(
+                            &ensured_session_id,
+                            &lease_owner,
+                            "collaborative",
+                        )) {
+                            Ok(lease) => {
+                                gateway_lease_owner = lease
+                                    .get("owner")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                state.app.gateway_lease_owner = gateway_lease_owner.clone();
+                                state.app.gateway_lease_mode = lease
+                                    .get("mode")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                state.add_message(
+                                    "system",
+                                    &format!(
+                                        "Gateway session lease acquired: owner={}, mode={}",
+                                        lease
+                                            .get("owner")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("unknown"),
+                                        lease
+                                            .get("mode")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("unknown")
+                                    ),
+                                );
+                            }
+                            Err(err) => state.add_message(
+                                "system",
+                                &format!("Gateway session lease unavailable: {err}"),
+                            ),
+                        }
                     }
-                });
-                state.add_message("system", "Daemon event bridge subscribed for this session");
+                    Err(err) => {
+                        state.add_message(
+                            "system",
+                            &format!(
+                            "Gateway session attach failed; local runtime remains active: {err}"
+                        ),
+                        );
+                    }
+                }
+                let snapshot = SHARED_RT.block_on(
+                    tui::runtime_control_store::refresh_runtime_control_snapshot(
+                        Some(gateway_client),
+                        Some(&session_id),
+                    ),
+                );
+                gateway_session_ids = snapshot.session_ids.clone();
+                let readiness = snapshot.runtime_readiness.clone();
+                let components = snapshot.runtime_components.unwrap_or_default();
+                let degraded_reasons = snapshot.degraded_reasons.clone();
+                snapshot.apply_to_app(&mut state.app);
+                if let Some(readiness) = readiness {
+                    state.add_message(
+                    "system",
+                    &format!(
+                        "Gateway runtime projection connected: readiness={readiness}, components={components}"
+                    ),
+                );
+                }
+                for reason in degraded_reasons.into_iter().take(3) {
+                    state.add_message("system", &format!("Gateway projection degraded: {reason}"));
+                }
+                if gateway_session_attached {
+                    let event_client = gateway_client.clone();
+                    let event_session_id = session_id.clone();
+                    let event_tx = tui_tx.clone();
+                    let _event_bridge = SHARED_RT.spawn(async move {
+                        if let Err(err) = event_client
+                            .subscribe_session_events(&event_session_id, event_tx.clone())
+                            .await
+                        {
+                            let _ = event_tx.send(runtime::CowdEvent::TurnError {
+                                error: format!("Gateway event stream stopped: {err}"),
+                            });
+                        }
+                    });
+                    state.add_message("system", "Gateway event stream subscribed for this session");
+                }
             }
-        }
-        Err(err) => {
-            state.app.server_running = false;
-            state.app.active_api_sessions = 0;
-            state.app.server_uptime_secs = None;
-            tracing::debug!(
+            Err(err) => {
+                state.app.server_running = false;
+                state.app.active_api_sessions = 0;
+                state.app.server_uptime_secs = None;
+                tracing::debug!(
                 "runtime host control transition unavailable; local TUI runtime fallback: {err}"
             );
-            state.add_message("system", "Daemon unavailable; local TUI runtime active.");
+                state.add_message(
+                    "system",
+                    "Gateway API unavailable; local TUI runtime active.",
+                );
+            }
         }
+    } else {
+        state.app.server_running = false;
+        state.app.active_api_sessions = 0;
+        state.app.server_uptime_secs = None;
+        state.add_message(
+            "system",
+            "Gateway API unavailable; local TUI runtime active.",
+        );
     }
     terminal.draw(|f| state.render(f))?;
 
@@ -3456,7 +3498,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 (r.session_id.clone(), name, r.created_at.clone())
             })
             .collect();
-        for id in daemon_session_ids {
+        for id in gateway_session_ids {
             if session_list.iter().any(|(existing, _, _)| existing == &id) {
                 continue;
             }
@@ -3554,18 +3596,56 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     }
                                     state.add_message("user", &text);
                                     state.is_loading = true;
-                                    if daemon_session_attached {
-                                        let event_client = daemon_client.clone();
+                                    if gateway_session_attached {
+                                        let Some(event_client) = gateway_client.clone() else {
+                                            state.add_message(
+                                                "system",
+                                                "Gateway API unavailable for this message",
+                                            );
+                                            continue;
+                                        };
                                         let event_session_id = session_id.clone();
                                         let event_tx = tui_tx.clone();
                                         SHARED_RT.spawn(async move {
-                                            if let Err(err) = event_client
-                                                .chat_session(&event_session_id, &text)
+                                            match event_client
+                                                .send_message(&event_session_id, &text)
                                                 .await
                                             {
-                                                let _ = event_tx.send(runtime::CowdEvent::TurnError {
-                                                    error: format!("Daemon chat failed: {err}"),
-                                                });
+                                                Ok(value) => {
+                                                    if let Some(response) = value
+                                                        .get("response")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .filter(|value| !value.is_empty())
+                                                    {
+                                                        let _ = event_tx.send(
+                                                            runtime::CowdEvent::TextDelta {
+                                                                text: response.to_string(),
+                                                            },
+                                                        );
+                                                    }
+                                                    let _ = event_tx
+                                                        .send(runtime::CowdEvent::TurnComplete {
+                                                            assistant_text: value
+                                                                .get("response")
+                                                                .and_then(serde_json::Value::as_str)
+                                                                .unwrap_or_default()
+                                                                .to_string(),
+                                                            iterations: value
+                                                                .get("iterations")
+                                                                .and_then(serde_json::Value::as_u64)
+                                                                .map(|value| value as u32)
+                                                                .unwrap_or_default(),
+                                                        });
+                                                }
+                                                Err(err) => {
+                                                    let _ = event_tx.send(
+                                                        runtime::CowdEvent::TurnError {
+                                                            error: format!(
+                                                                "Gateway chat failed: {err}"
+                                                            ),
+                                                        },
+                                                    );
+                                                }
                                             }
                                         });
                                         continue;
@@ -3658,18 +3738,20 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         Ok::<(), Box<dyn std::error::Error>>(())
     });
 
-    if let Some(owner) = daemon_lease_owner.as_deref() {
+    if let (Some(client), Some(owner)) = (gateway_client.as_ref(), gateway_lease_owner.as_deref()) {
         if let Err(err) =
-            SHARED_RT.block_on(daemon_client.release_session_lease(&session_id, owner))
+            SHARED_RT.block_on(client.release_runtime_session_lease(&session_id, owner))
         {
-            tracing::debug!(error = %err, session_id = %session_id, owner, "best-effort daemon session lease release failed");
+            tracing::debug!(error = %err, session_id = %session_id, owner, "best-effort Gateway session lease release failed");
         }
     }
-    if daemon_session_attached {
-        if let Err(err) =
-            SHARED_RT.block_on(daemon_client.detach_session(&session_id, &daemon_actor_id))
-        {
-            tracing::debug!(error = %err, session_id = %session_id, actor = %daemon_actor_id, "best-effort daemon session lifecycle detach failed");
+    if gateway_session_attached {
+        if let Some(client) = gateway_client.as_ref() {
+            if let Err(err) =
+                SHARED_RT.block_on(client.detach_session(&session_id, &gateway_actor_id))
+            {
+                tracing::debug!(error = %err, session_id = %session_id, actor = %gateway_actor_id, "best-effort Gateway session lifecycle detach failed");
+            }
         }
     }
     cli.persist_session()?;
@@ -4505,7 +4587,7 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonTaskSlashCommand {
+enum GatewayTaskSlashCommand {
     List,
     Start { objective: String, yolo_mode: bool },
     Cancel { id: String },
@@ -4514,7 +4596,7 @@ enum DaemonTaskSlashCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonApprovalSlashCommand {
+enum GatewayApprovalSlashCommand {
     List,
     Respond {
         id: String,
@@ -4526,7 +4608,7 @@ enum DaemonApprovalSlashCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonContextSlashCommand {
+enum GatewayContextSlashCommand {
     Current,
     Runtime,
     Config,
@@ -4536,25 +4618,25 @@ enum DaemonContextSlashCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonCrossPlaneSlashCommand {
+enum GatewayCrossPlaneSlashCommand {
     Summary,
     Preflight(String),
     Execute(String),
     Help,
 }
 
-fn parse_daemon_task_slash_command(args: Option<&str>) -> Result<DaemonTaskSlashCommand, String> {
+fn parse_gateway_task_slash_command(args: Option<&str>) -> Result<GatewayTaskSlashCommand, String> {
     let raw = args.unwrap_or_default().trim();
     if raw.is_empty() || matches!(raw, "list" | "status") {
-        return Ok(DaemonTaskSlashCommand::List);
+        return Ok(GatewayTaskSlashCommand::List);
     }
     if matches!(raw, "-h" | "--help" | "help") {
-        return Ok(DaemonTaskSlashCommand::Help);
+        return Ok(GatewayTaskSlashCommand::Help);
     }
 
     let mut parts = raw.split_whitespace();
     let Some(action) = parts.next() else {
-        return Ok(DaemonTaskSlashCommand::List);
+        return Ok(GatewayTaskSlashCommand::List);
     };
 
     match action {
@@ -4572,7 +4654,7 @@ fn parse_daemon_task_slash_command(args: Option<&str>) -> Result<DaemonTaskSlash
             if objective.is_empty() {
                 return Err("usage: /tasks start [--yolo] <objective>".to_string());
             }
-            Ok(DaemonTaskSlashCommand::Start {
+            Ok(GatewayTaskSlashCommand::Start {
                 objective,
                 yolo_mode,
             })
@@ -4582,14 +4664,14 @@ fn parse_daemon_task_slash_command(args: Option<&str>) -> Result<DaemonTaskSlash
             if id.is_empty() {
                 return Err("usage: /tasks cancel <task-id>".to_string());
             }
-            Ok(DaemonTaskSlashCommand::Cancel { id })
+            Ok(GatewayTaskSlashCommand::Cancel { id })
         }
         "complete" => {
             let id = parts.next().unwrap_or_default().trim().to_string();
             if id.is_empty() {
                 return Err("usage: /tasks complete <task-id>".to_string());
             }
-            Ok(DaemonTaskSlashCommand::Complete { id })
+            Ok(GatewayTaskSlashCommand::Complete { id })
         }
         other => Err(format!(
             "unknown /tasks action `{other}`; use /tasks --help"
@@ -4597,15 +4679,15 @@ fn parse_daemon_task_slash_command(args: Option<&str>) -> Result<DaemonTaskSlash
     }
 }
 
-fn parse_daemon_approval_slash_command(
+fn parse_gateway_approval_slash_command(
     args: Option<&str>,
-) -> Result<DaemonApprovalSlashCommand, String> {
+) -> Result<GatewayApprovalSlashCommand, String> {
     let raw = args.unwrap_or_default().trim();
     if raw.is_empty() || matches!(raw, "list" | "pending" | "status") {
-        return Ok(DaemonApprovalSlashCommand::List);
+        return Ok(GatewayApprovalSlashCommand::List);
     }
     if matches!(raw, "-h" | "--help" | "help") {
-        return Ok(DaemonApprovalSlashCommand::Help);
+        return Ok(GatewayApprovalSlashCommand::Help);
     }
 
     let mut parts = raw.split_whitespace();
@@ -4650,7 +4732,7 @@ fn parse_daemon_approval_slash_command(
         }
     }
 
-    Ok(DaemonApprovalSlashCommand::Respond {
+    Ok(GatewayApprovalSlashCommand::Respond {
         id,
         approved,
         persistence,
@@ -4658,36 +4740,36 @@ fn parse_daemon_approval_slash_command(
     })
 }
 
-fn parse_daemon_context_slash_command(
+fn parse_gateway_context_slash_command(
     args: Option<&str>,
-) -> Result<DaemonContextSlashCommand, String> {
+) -> Result<GatewayContextSlashCommand, String> {
     let raw = args.unwrap_or_default().trim();
     if raw.is_empty() || matches!(raw, "current" | "status") {
-        return Ok(DaemonContextSlashCommand::Current);
+        return Ok(GatewayContextSlashCommand::Current);
     }
     if matches!(raw, "-h" | "--help" | "help") {
-        return Ok(DaemonContextSlashCommand::Help);
+        return Ok(GatewayContextSlashCommand::Help);
     }
     match raw {
-        "runtime" | "control-plane" => Ok(DaemonContextSlashCommand::Runtime),
-        "config" | "effective-config" => Ok(DaemonContextSlashCommand::Config),
-        "memory" => Ok(DaemonContextSlashCommand::Memory),
-        "cross-plane" | "channels" => Ok(DaemonContextSlashCommand::CrossPlane),
+        "runtime" | "control-plane" => Ok(GatewayContextSlashCommand::Runtime),
+        "config" | "effective-config" => Ok(GatewayContextSlashCommand::Config),
+        "memory" => Ok(GatewayContextSlashCommand::Memory),
+        "cross-plane" | "channels" => Ok(GatewayContextSlashCommand::CrossPlane),
         other => Err(format!(
             "unknown /context action `{other}`; use /context --help"
         )),
     }
 }
 
-fn parse_daemon_cross_plane_slash_command(
+fn parse_gateway_cross_plane_slash_command(
     args: Option<&str>,
-) -> Result<DaemonCrossPlaneSlashCommand, String> {
+) -> Result<GatewayCrossPlaneSlashCommand, String> {
     let raw = args.unwrap_or_default().trim();
     if raw.is_empty() || matches!(raw, "summary" | "status") {
-        return Ok(DaemonCrossPlaneSlashCommand::Summary);
+        return Ok(GatewayCrossPlaneSlashCommand::Summary);
     }
     if matches!(raw, "-h" | "--help" | "help") {
-        return Ok(DaemonCrossPlaneSlashCommand::Help);
+        return Ok(GatewayCrossPlaneSlashCommand::Help);
     }
 
     let Some(split_at) = raw.find(char::is_whitespace) else {
@@ -4699,33 +4781,35 @@ fn parse_daemon_cross_plane_slash_command(
         return Err("usage: /cross-plane preflight|execute <json>".to_string());
     }
     match action {
-        "preflight" => Ok(DaemonCrossPlaneSlashCommand::Preflight(payload.to_string())),
-        "execute" => Ok(DaemonCrossPlaneSlashCommand::Execute(payload.to_string())),
+        "preflight" => Ok(GatewayCrossPlaneSlashCommand::Preflight(
+            payload.to_string(),
+        )),
+        "execute" => Ok(GatewayCrossPlaneSlashCommand::Execute(payload.to_string())),
         other => Err(format!(
             "unknown /cross-plane action `{other}`; use /cross-plane --help"
         )),
     }
 }
 
-fn daemon_projection_auth_token() -> Option<String> {
+fn gateway_projection_auth_token() -> Option<String> {
     std::env::var("COWD_API_TOKEN")
         .ok()
         .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
 }
 
-fn running_daemon_projection_client(
-) -> Result<tui::projection_client::DaemonProjectionClient, Box<dyn std::error::Error>> {
-    let Some(client) = tui::projection_client::DaemonProjectionClient::from_running_gateway(
-        daemon_projection_auth_token(),
+fn running_gateway_client(
+) -> Result<tui::gateway_client::GatewayApiClient, Box<dyn std::error::Error>> {
+    let Some(client) = tui::gateway_client::GatewayApiClient::from_running_gateway(
+        gateway_projection_auth_token(),
     )?
     else {
-        return Err("daemon gateway is not running; start cowd daemon first".into());
+        return Err("Gateway API is not running; start gateway first".into());
     };
     Ok(client)
 }
 
-fn print_daemon_task_status(value: &serde_json::Value) {
-    println!("## Daemon Tasks");
+fn print_gateway_task_status(value: &serde_json::Value) {
+    println!("## Gateway Tasks");
     let Some(tasks) = value.get("tasks").and_then(serde_json::Value::as_array) else {
         println!(
             "{}",
@@ -4760,7 +4844,7 @@ fn print_daemon_task_status(value: &serde_json::Value) {
     }
 }
 
-fn print_daemon_approval_status(value: &serde_json::Value) {
+fn print_gateway_approval_status(value: &serde_json::Value) {
     println!("## Pending Approvals");
     let approvals = value
         .as_array()
@@ -4801,7 +4885,7 @@ fn print_daemon_approval_status(value: &serde_json::Value) {
     }
 }
 
-fn print_daemon_projection_response(title: &str, value: &serde_json::Value) {
+fn print_gateway_projection_response(title: &str, value: &serde_json::Value) {
     println!("## {title}");
     println!(
         "{}",
@@ -5135,13 +5219,13 @@ impl LiveCli {
         }
     }
 
-    fn handle_daemon_tasks_command(
+    fn handle_gateway_tasks_command(
         &mut self,
         args: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let command = parse_daemon_task_slash_command(args)?;
-        if command == DaemonTaskSlashCommand::Help {
-            println!("## Daemon Tasks");
+        let command = parse_gateway_task_slash_command(args)?;
+        if command == GatewayTaskSlashCommand::Help {
+            println!("## Gateway Tasks");
             println!("/tasks");
             println!("/tasks start [--yolo] <objective>");
             println!("/tasks cancel <task-id>");
@@ -5149,39 +5233,39 @@ impl LiveCli {
             return Ok(());
         }
 
-        let client = running_daemon_projection_client()?;
+        let client = running_gateway_client()?;
         match command {
-            DaemonTaskSlashCommand::List => {
+            GatewayTaskSlashCommand::List => {
                 let value = SHARED_RT.block_on(client.task_status())?;
-                print_daemon_task_status(&value);
+                print_gateway_task_status(&value);
             }
-            DaemonTaskSlashCommand::Start {
+            GatewayTaskSlashCommand::Start {
                 objective,
                 yolo_mode,
             } => {
                 let value = SHARED_RT.block_on(client.start_task(&objective, yolo_mode))?;
-                print_daemon_projection_response("Task Started", &value);
+                print_gateway_projection_response("Task Started", &value);
             }
-            DaemonTaskSlashCommand::Cancel { id } => {
+            GatewayTaskSlashCommand::Cancel { id } => {
                 let value = SHARED_RT.block_on(client.cancel_task(&id))?;
-                print_daemon_projection_response("Task Cancelled", &value);
+                print_gateway_projection_response("Task Cancelled", &value);
             }
-            DaemonTaskSlashCommand::Complete { id } => {
+            GatewayTaskSlashCommand::Complete { id } => {
                 let value = SHARED_RT.block_on(client.complete_task(&id))?;
-                print_daemon_projection_response("Task Completed", &value);
+                print_gateway_projection_response("Task Completed", &value);
             }
-            DaemonTaskSlashCommand::Help => {}
+            GatewayTaskSlashCommand::Help => {}
         }
         Ok(())
     }
 
-    fn handle_daemon_approvals_command(
+    fn handle_gateway_approvals_command(
         &mut self,
         args: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let command = parse_daemon_approval_slash_command(args)?;
-        if command == DaemonApprovalSlashCommand::Help {
-            println!("## Daemon Approvals");
+        let command = parse_gateway_approval_slash_command(args)?;
+        if command == GatewayApprovalSlashCommand::Help {
+            println!("## Gateway Approvals");
             println!("/approvals");
             println!(
                 "/approvals approve <request-id> [--persist once|session|forever] [--reason text]"
@@ -5190,13 +5274,13 @@ impl LiveCli {
             return Ok(());
         }
 
-        let client = running_daemon_projection_client()?;
+        let client = running_gateway_client()?;
         match command {
-            DaemonApprovalSlashCommand::List => {
+            GatewayApprovalSlashCommand::List => {
                 let value = SHARED_RT.block_on(client.pending_approvals())?;
-                print_daemon_approval_status(&value);
+                print_gateway_approval_status(&value);
             }
-            DaemonApprovalSlashCommand::Respond {
+            GatewayApprovalSlashCommand::Respond {
                 id,
                 approved,
                 persistence,
@@ -5208,20 +5292,20 @@ impl LiveCli {
                     persistence.as_deref(),
                     reason.as_deref(),
                 ))?;
-                print_daemon_projection_response("Approval Responded", &value);
+                print_gateway_projection_response("Approval Responded", &value);
             }
-            DaemonApprovalSlashCommand::Help => {}
+            GatewayApprovalSlashCommand::Help => {}
         }
         Ok(())
     }
 
-    fn handle_daemon_context_command(
+    fn handle_gateway_context_command(
         &mut self,
         args: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let command = parse_daemon_context_slash_command(args)?;
-        if command == DaemonContextSlashCommand::Help {
-            println!("## Daemon Context");
+        let command = parse_gateway_context_slash_command(args)?;
+        if command == GatewayContextSlashCommand::Help {
+            println!("## Gateway Context");
             println!("/context");
             println!("/context runtime");
             println!("/context config");
@@ -5230,39 +5314,39 @@ impl LiveCli {
             return Ok(());
         }
 
-        let client = running_daemon_projection_client()?;
+        let client = running_gateway_client()?;
         let (title, value) = match command {
-            DaemonContextSlashCommand::Current => (
+            GatewayContextSlashCommand::Current => (
                 "Current Context",
                 SHARED_RT.block_on(client.current_context(Some(&self.session.id)))?,
             ),
-            DaemonContextSlashCommand::Runtime => (
+            GatewayContextSlashCommand::Runtime => (
                 "Runtime Control Plane",
                 SHARED_RT.block_on(client.runtime_control_plane())?,
             ),
-            DaemonContextSlashCommand::Config => (
+            GatewayContextSlashCommand::Config => (
                 "Runtime Effective Config",
                 SHARED_RT.block_on(client.runtime_effective_config())?,
             ),
-            DaemonContextSlashCommand::Memory => {
+            GatewayContextSlashCommand::Memory => {
                 ("Memory Status", SHARED_RT.block_on(client.memory_status())?)
             }
-            DaemonContextSlashCommand::CrossPlane => (
+            GatewayContextSlashCommand::CrossPlane => (
                 "Cross-Plane Summary",
                 SHARED_RT.block_on(client.cross_plane_summary())?,
             ),
-            DaemonContextSlashCommand::Help => unreachable!("help returned above"),
+            GatewayContextSlashCommand::Help => unreachable!("help returned above"),
         };
-        print_daemon_projection_response(title, &value);
+        print_gateway_projection_response(title, &value);
         Ok(())
     }
 
-    fn handle_daemon_cross_plane_command(
+    fn handle_gateway_cross_plane_command(
         &mut self,
         args: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let command = parse_daemon_cross_plane_slash_command(args)?;
-        if command == DaemonCrossPlaneSlashCommand::Help {
+        let command = parse_gateway_cross_plane_slash_command(args)?;
+        if command == GatewayCrossPlaneSlashCommand::Help {
             println!("## Cross-Plane");
             println!("/cross-plane");
             println!("/cross-plane preflight <json>");
@@ -5270,23 +5354,23 @@ impl LiveCli {
             return Ok(());
         }
 
-        let client = running_daemon_projection_client()?;
+        let client = running_gateway_client()?;
         match command {
-            DaemonCrossPlaneSlashCommand::Summary => {
+            GatewayCrossPlaneSlashCommand::Summary => {
                 let value = SHARED_RT.block_on(client.cross_plane_summary())?;
-                print_daemon_projection_response("Cross-Plane Summary", &value);
+                print_gateway_projection_response("Cross-Plane Summary", &value);
             }
-            DaemonCrossPlaneSlashCommand::Preflight(payload) => {
+            GatewayCrossPlaneSlashCommand::Preflight(payload) => {
                 let request: serde_json::Value = serde_json::from_str(&payload)?;
                 let value = SHARED_RT.block_on(client.preflight_cross_plane_action(request))?;
-                print_daemon_projection_response("Cross-Plane Preflight", &value);
+                print_gateway_projection_response("Cross-Plane Preflight", &value);
             }
-            DaemonCrossPlaneSlashCommand::Execute(payload) => {
+            GatewayCrossPlaneSlashCommand::Execute(payload) => {
                 let request: serde_json::Value = serde_json::from_str(&payload)?;
                 let value = SHARED_RT.block_on(client.execute_cross_plane_action(request))?;
-                print_daemon_projection_response("Cross-Plane Execute", &value);
+                print_gateway_projection_response("Cross-Plane Execute", &value);
             }
-            DaemonCrossPlaneSlashCommand::Help => {}
+            GatewayCrossPlaneSlashCommand::Help => {}
         }
         Ok(())
     }
@@ -5304,7 +5388,7 @@ impl LiveCli {
                 );
                 println!("**Memory**: /memory /closet /sandbox");
                 println!("**Agent**: /subagent /pipeline /agents");
-                println!("**Daemon**: /tasks /approvals /context /cross-plane");
+                println!("**Gateway**: /tasks /approvals /context /cross-plane");
                 println!("**Project**: /state /diff /commit /init /config /title");
                 println!("**Model**: use --model or config aliases (main/fast/coder/reasoning)");
                 println!("Type /<command> --help for details.");
@@ -5424,19 +5508,19 @@ impl LiveCli {
                 false
             }
             SlashCommand::Tasks { args } => {
-                self.handle_daemon_tasks_command(args.as_deref())?;
+                self.handle_gateway_tasks_command(args.as_deref())?;
                 false
             }
             SlashCommand::Approvals { args } => {
-                self.handle_daemon_approvals_command(args.as_deref())?;
+                self.handle_gateway_approvals_command(args.as_deref())?;
                 false
             }
             SlashCommand::Context { action } => {
-                self.handle_daemon_context_command(action.as_deref())?;
+                self.handle_gateway_context_command(action.as_deref())?;
                 false
             }
             SlashCommand::CrossPlane { args } => {
-                self.handle_daemon_cross_plane_command(args.as_deref())?;
+                self.handle_gateway_cross_plane_command(args.as_deref())?;
                 false
             }
             SlashCommand::Stats => {
@@ -7051,9 +7135,9 @@ fn render_repl_help() -> String {
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
-        "  Daemon tasks         /tasks [start|cancel|complete]".to_string(),
-        "  Daemon approvals     /approvals [approve|reject]".to_string(),
-        "  Daemon context       /context [runtime|config|memory|cross-plane]".to_string(),
+        "  Gateway tasks         /tasks [start|cancel|complete]".to_string(),
+        "  Gateway approvals     /approvals [approve|reject]".to_string(),
+        "  Gateway context       /context [runtime|config|memory|cross-plane]".to_string(),
         "  Cross-plane action   /cross-plane [preflight|execute] <json>".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
@@ -11530,10 +11614,10 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error,
         gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
         hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args,
-        parse_daemon_approval_slash_command, parse_daemon_context_slash_command,
-        parse_daemon_cross_plane_slash_command, parse_daemon_task_slash_command, parse_export_args,
-        parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_gateway_approval_slash_command, parse_gateway_args,
+        parse_gateway_context_slash_command, parse_gateway_cross_plane_slash_command,
+        parse_gateway_task_slash_command, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
@@ -11545,9 +11629,9 @@ mod tests {
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
         workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        CliToolExecutor, DaemonApprovalSlashCommand, DaemonContextSlashCommand,
-        DaemonCrossPlaneSlashCommand, DaemonTaskSlashCommand, GatewayAction, GitWorkspaceSummary,
-        LiveCli, LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
+        CliToolExecutor, GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
+        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GitWorkspaceSummary, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
         DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
     };
     use crate::task_kernel::{
@@ -11607,44 +11691,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_daemon_task_slash_command_maps_core_actions() {
+    fn parse_gateway_task_slash_command_maps_core_actions() {
         assert_eq!(
-            parse_daemon_task_slash_command(None).unwrap(),
-            DaemonTaskSlashCommand::List
+            parse_gateway_task_slash_command(None).unwrap(),
+            GatewayTaskSlashCommand::List
         );
         assert_eq!(
-            parse_daemon_task_slash_command(Some("status")).unwrap(),
-            DaemonTaskSlashCommand::List
+            parse_gateway_task_slash_command(Some("status")).unwrap(),
+            GatewayTaskSlashCommand::List
         );
         assert_eq!(
-            parse_daemon_task_slash_command(Some("start --yolo finish daemon parity")).unwrap(),
-            DaemonTaskSlashCommand::Start {
-                objective: "finish daemon parity".to_string(),
+            parse_gateway_task_slash_command(Some("start --yolo finish gateway parity")).unwrap(),
+            GatewayTaskSlashCommand::Start {
+                objective: "finish gateway parity".to_string(),
                 yolo_mode: true,
             }
         );
         assert_eq!(
-            parse_daemon_task_slash_command(Some("cancel task-1")).unwrap(),
-            DaemonTaskSlashCommand::Cancel {
+            parse_gateway_task_slash_command(Some("cancel task-1")).unwrap(),
+            GatewayTaskSlashCommand::Cancel {
                 id: "task-1".to_string(),
             }
         );
-        assert!(parse_daemon_task_slash_command(Some("start --yolo")).is_err());
-        assert!(parse_daemon_task_slash_command(Some("unknown")).is_err());
+        assert!(parse_gateway_task_slash_command(Some("start --yolo")).is_err());
+        assert!(parse_gateway_task_slash_command(Some("unknown")).is_err());
     }
 
     #[test]
-    fn parse_daemon_approval_slash_command_maps_core_actions() {
+    fn parse_gateway_approval_slash_command_maps_core_actions() {
         assert_eq!(
-            parse_daemon_approval_slash_command(None).unwrap(),
-            DaemonApprovalSlashCommand::List
+            parse_gateway_approval_slash_command(None).unwrap(),
+            GatewayApprovalSlashCommand::List
         );
         assert_eq!(
-            parse_daemon_approval_slash_command(Some(
+            parse_gateway_approval_slash_command(Some(
                 "approve req-1 --persist session --reason trusted channel"
             ))
             .unwrap(),
-            DaemonApprovalSlashCommand::Respond {
+            GatewayApprovalSlashCommand::Respond {
                 id: "req-1".to_string(),
                 approved: true,
                 persistence: Some("session".to_string()),
@@ -11652,60 +11736,62 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_daemon_approval_slash_command(Some("reject req-2")).unwrap(),
-            DaemonApprovalSlashCommand::Respond {
+            parse_gateway_approval_slash_command(Some("reject req-2")).unwrap(),
+            GatewayApprovalSlashCommand::Respond {
                 id: "req-2".to_string(),
                 approved: false,
                 persistence: None,
                 reason: None,
             }
         );
-        assert!(parse_daemon_approval_slash_command(Some("approve")).is_err());
-        assert!(parse_daemon_approval_slash_command(Some("maybe req-1")).is_err());
+        assert!(parse_gateway_approval_slash_command(Some("approve")).is_err());
+        assert!(parse_gateway_approval_slash_command(Some("maybe req-1")).is_err());
     }
 
     #[test]
-    fn parse_daemon_context_slash_command_maps_core_actions() {
+    fn parse_gateway_context_slash_command_maps_core_actions() {
         assert_eq!(
-            parse_daemon_context_slash_command(None).unwrap(),
-            DaemonContextSlashCommand::Current
+            parse_gateway_context_slash_command(None).unwrap(),
+            GatewayContextSlashCommand::Current
         );
         assert_eq!(
-            parse_daemon_context_slash_command(Some("runtime")).unwrap(),
-            DaemonContextSlashCommand::Runtime
+            parse_gateway_context_slash_command(Some("runtime")).unwrap(),
+            GatewayContextSlashCommand::Runtime
         );
         assert_eq!(
-            parse_daemon_context_slash_command(Some("effective-config")).unwrap(),
-            DaemonContextSlashCommand::Config
+            parse_gateway_context_slash_command(Some("effective-config")).unwrap(),
+            GatewayContextSlashCommand::Config
         );
         assert_eq!(
-            parse_daemon_context_slash_command(Some("memory")).unwrap(),
-            DaemonContextSlashCommand::Memory
+            parse_gateway_context_slash_command(Some("memory")).unwrap(),
+            GatewayContextSlashCommand::Memory
         );
         assert_eq!(
-            parse_daemon_context_slash_command(Some("channels")).unwrap(),
-            DaemonContextSlashCommand::CrossPlane
+            parse_gateway_context_slash_command(Some("channels")).unwrap(),
+            GatewayContextSlashCommand::CrossPlane
         );
-        assert!(parse_daemon_context_slash_command(Some("unknown")).is_err());
+        assert!(parse_gateway_context_slash_command(Some("unknown")).is_err());
     }
 
     #[test]
-    fn parse_daemon_cross_plane_slash_command_maps_core_actions() {
+    fn parse_gateway_cross_plane_slash_command_maps_core_actions() {
         assert_eq!(
-            parse_daemon_cross_plane_slash_command(None).unwrap(),
-            DaemonCrossPlaneSlashCommand::Summary
+            parse_gateway_cross_plane_slash_command(None).unwrap(),
+            GatewayCrossPlaneSlashCommand::Summary
         );
         assert_eq!(
-            parse_daemon_cross_plane_slash_command(Some("preflight {\"operation\":\"send_text\"}"))
-                .unwrap(),
-            DaemonCrossPlaneSlashCommand::Preflight("{\"operation\":\"send_text\"}".to_string())
+            parse_gateway_cross_plane_slash_command(Some(
+                "preflight {\"operation\":\"send_text\"}"
+            ))
+            .unwrap(),
+            GatewayCrossPlaneSlashCommand::Preflight("{\"operation\":\"send_text\"}".to_string())
         );
         assert_eq!(
-            parse_daemon_cross_plane_slash_command(Some("execute {\"id\":\"req-1\"}")).unwrap(),
-            DaemonCrossPlaneSlashCommand::Execute("{\"id\":\"req-1\"}".to_string())
+            parse_gateway_cross_plane_slash_command(Some("execute {\"id\":\"req-1\"}")).unwrap(),
+            GatewayCrossPlaneSlashCommand::Execute("{\"id\":\"req-1\"}".to_string())
         );
-        assert!(parse_daemon_cross_plane_slash_command(Some("execute")).is_err());
-        assert!(parse_daemon_cross_plane_slash_command(Some("unknown {}")).is_err());
+        assert!(parse_gateway_cross_plane_slash_command(Some("execute")).is_err());
+        assert!(parse_gateway_cross_plane_slash_command(Some("unknown {}")).is_err());
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

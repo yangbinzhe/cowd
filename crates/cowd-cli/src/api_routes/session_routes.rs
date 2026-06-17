@@ -16,6 +16,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/search", get(search_messages_handler))
+        .route("/api/sessions/:id/ensure", post(ensure_session_handler))
         .route(
             "/api/sessions/:id",
             get(get_session)
@@ -337,6 +338,106 @@ async fn create_session(
     }
 
     Ok((StatusCode::CREATED, Json(info)))
+}
+
+async fn ensure_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateSessionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session id is required".to_string(),
+            }),
+        ));
+    }
+
+    let mut created = false;
+    if state.active_runtime(&id).is_none() {
+        let session = runtime::Session::new();
+        let model = body
+            .model
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| default_session_model(&state));
+        let runtime = if let Some(store) = state.unified_store() {
+            crate::build_runtime_with_session_store(
+                store.clone(),
+                session,
+                &id,
+                model.clone(),
+                vec![],
+                true,
+                true,
+                None,
+                runtime::PermissionMode::WorkspaceWrite,
+                None,
+                None,
+            )
+        } else {
+            crate::build_runtime(
+                session,
+                &id,
+                model.clone(),
+                vec![],
+                true,
+                true,
+                None,
+                runtime::PermissionMode::WorkspaceWrite,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to build runtime: {error}"),
+                }),
+            )
+        })?;
+
+        if let Err(error) = state.register_runtime(id.clone(), runtime) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("failed to register session: {error}"),
+                }),
+            ));
+        }
+        if state.has_unified_store()
+            && state
+                .session_kernel
+                .stored_session(&id)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            let record = new_api_session_record(&id, Some(model));
+            state
+                .session_kernel
+                .upsert_stored_session(&record)
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("failed to persist session: {error}"),
+                        }),
+                    )
+                })?;
+        }
+        created = true;
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": id,
+        "created": created,
+        "active_sessions": state.list_active_session_ids().len(),
+    })))
 }
 
 async fn get_session(

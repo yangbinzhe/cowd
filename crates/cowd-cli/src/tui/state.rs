@@ -2275,7 +2275,7 @@ impl TuiState {
                         .set_status("No selected tool to execute");
                     return true;
                 };
-                self.record_tool_ops_result(run_runtime_projection_blocking(move |client| {
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| {
                     let name = tool_name;
                     async move {
                         client
@@ -2287,16 +2287,16 @@ impl TuiState {
             }
             (ToolOpsMode::Operations, KeyCode::Char('i')) => {
                 let prompt = self.tool_ops_panel.intent_prompt.clone();
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_intent_plan(&prompt, Vec::new()).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_intent_plan(&prompt, Vec::new()).await
+                }));
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('f')) => {
                 let prompt = self.tool_ops_panel.fanout_prompt.clone();
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_context_fanout_plan(&prompt).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_context_fanout_plan(&prompt).await
+                }));
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('b')) => {
@@ -2310,9 +2310,9 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_batch_readonly(calls, 4).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_batch_readonly(calls, 4).await
+                }));
                 true
             }
             (ToolOpsMode::Mutations, KeyCode::Char('v')) => {
@@ -2326,9 +2326,9 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_mutation_preview(edits).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_mutation_preview(edits).await
+                }));
                 true
             }
             (ToolOpsMode::Mutations, KeyCode::Char('A')) => {
@@ -2353,15 +2353,13 @@ impl TuiState {
                 };
                 let expected_hashes = serde_json::to_value(&self.tool_ops_panel.expected_hashes)
                     .unwrap_or_else(|_| serde_json::json!({}));
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move {
-                        client.tool_mutation_apply(edits, expected_hashes).await
-                    },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_mutation_apply(edits, expected_hashes).await
+                }));
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('n')) => {
-                self.record_tool_ops_result(run_runtime_projection_blocking(|client| async move {
+                self.record_tool_ops_result(run_gateway_api_blocking(|client| async move {
                     client.tool_checkpoint_create("tui checkpoint").await
                 }));
                 self.refresh_tool_ops_panel_overview();
@@ -2377,9 +2375,9 @@ impl TuiState {
                         .set_status("No selected checkpoint to diff");
                     return true;
                 };
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_checkpoint_diff(&id).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_checkpoint_diff(&id).await
+                }));
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('R')) => {
@@ -2395,9 +2393,9 @@ impl TuiState {
                 if !self.tool_ops_panel.arm_restore_checkpoint(id.clone()) {
                     return true;
                 }
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.tool_checkpoint_restore(&id).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.tool_checkpoint_restore(&id).await
+                }));
                 self.refresh_tool_ops_panel_overview();
                 true
             }
@@ -2408,9 +2406,9 @@ impl TuiState {
                     "actor": "tui-operator",
                     "inputs": { "mode": "risk" }
                 });
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.cross_plane_policy_simulate(action).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.cross_plane_policy_simulate(action).await
+                }));
                 true
             }
             (ToolOpsMode::Risk, KeyCode::Char('p')) => {
@@ -2427,9 +2425,9 @@ impl TuiState {
                     "data_classification": "internal",
                     "identity_trust": "verified"
                 });
-                self.record_tool_ops_result(run_runtime_projection_blocking(
-                    move |client| async move { client.preflight_cross_plane_action(action).await },
-                ));
+                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                    client.preflight_cross_plane_action(action).await
+                }));
                 true
             }
             _ => false,
@@ -2437,25 +2435,24 @@ impl TuiState {
     }
 
     fn refresh_tool_ops_panel_overview(&mut self) {
-        match run_runtime_projection_blocking(|client| async move { client.tool_registry().await })
-        {
+        match run_gateway_api_blocking(|client| async move { client.tool_registry().await }) {
             Ok(payload) => self.tool_ops_panel.sync_registry(&payload),
             Err(error) => self
                 .tool_ops_panel
                 .set_status(format!("Registry refresh failed: {error}")),
         }
         if let Ok(payload) =
-            run_runtime_projection_blocking(|client| async move { client.tool_cache_stats().await })
+            run_gateway_api_blocking(|client| async move { client.tool_cache_stats().await })
         {
             self.tool_ops_panel.sync_cache(&payload);
         }
         if let Ok(payload) =
-            run_runtime_projection_blocking(|client| async move { client.tool_checkpoints().await })
+            run_gateway_api_blocking(|client| async move { client.tool_checkpoints().await })
         {
             self.tool_ops_panel.sync_checkpoints(&payload);
         }
         let session_id = self.app.session_id.clone();
-        if let Ok(payload) = run_runtime_projection_blocking(move |client| async move {
+        if let Ok(payload) = run_gateway_api_blocking(move |client| async move {
             client.runtime_timeline(&session_id, 50).await
         }) {
             self.tool_ops_panel.sync_ledger(&payload);
@@ -3057,16 +3054,16 @@ impl TuiState {
                 self.app
                     .show_notification("Command prepared. Press Enter to run.");
             }
-            Action::RespondDaemonApproval { id, approved } => {
+            Action::RespondGatewayApproval { id, approved } => {
                 let approval_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_runtime_control_blocking(move |client| async move {
+                let result = run_gateway_api_blocking(move |client| async move {
                     client
                         .respond_approval(&id, approved, Some("once"), None)
                         .await
                 })
                 .or_else(move |_| {
-                    run_runtime_projection_blocking(move |client| async move {
+                    run_gateway_api_blocking(move |client| async move {
                         client
                             .respond_approval(&projection_id, approved, Some("once"), None)
                             .await
@@ -3074,7 +3071,7 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_daemon_approval_response(&approval_id);
+                        self.apply_local_gateway_approval_response(&approval_id);
                         let verdict = if approved { "approved" } else { "rejected" };
                         self.push_runtime_action_receipt(
                             "ok",
@@ -3086,7 +3083,7 @@ impl TuiState {
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Approval".into()),
-                            format!("Daemon approval {verdict}"),
+                            format!("Gateway approval {verdict}"),
                             2000,
                         );
                     }
@@ -3107,20 +3104,21 @@ impl TuiState {
                     }
                 }
             }
-            Action::CancelDaemonTask(id) => {
+            Action::CancelGatewayTask(id) => {
                 let task_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_runtime_control_blocking(move |client| async move {
-                    client.cancel_task(&id).await
-                })
-                .or_else(move |_| {
-                    run_runtime_projection_blocking(move |client| async move {
-                        client.cancel_task(&projection_id).await
-                    })
-                });
+                let result =
+                    run_gateway_api_blocking(
+                        move |client| async move { client.cancel_task(&id).await },
+                    )
+                    .or_else(move |_| {
+                        run_gateway_api_blocking(move |client| async move {
+                            client.cancel_task(&projection_id).await
+                        })
+                    });
                 match result {
                     Ok(_) => {
-                        self.apply_local_daemon_task_status(&task_id, "cancelled");
+                        self.apply_local_gateway_task_status(&task_id, "cancelled");
                         self.push_runtime_action_receipt(
                             "ok",
                             "cancelled",
@@ -3131,7 +3129,7 @@ impl TuiState {
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Task".into()),
-                            "Daemon task canceled".into(),
+                            "Gateway task canceled".into(),
                             2000,
                         );
                     }
@@ -3152,20 +3150,20 @@ impl TuiState {
                     }
                 }
             }
-            Action::CompleteDaemonTask(id) => {
+            Action::CompleteGatewayTask(id) => {
                 let task_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_runtime_control_blocking(move |client| async move {
+                let result = run_gateway_api_blocking(move |client| async move {
                     client.complete_task(&id).await
                 })
                 .or_else(move |_| {
-                    run_runtime_projection_blocking(move |client| async move {
+                    run_gateway_api_blocking(move |client| async move {
                         client.complete_task(&projection_id).await
                     })
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_daemon_task_status(&task_id, "completed");
+                        self.apply_local_gateway_task_status(&task_id, "completed");
                         self.push_runtime_action_receipt(
                             "ok",
                             "completed",
@@ -3176,7 +3174,7 @@ impl TuiState {
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Task".into()),
-                            "Daemon task completed".into(),
+                            "Gateway task completed".into(),
                             2000,
                         );
                     }
@@ -3202,13 +3200,13 @@ impl TuiState {
                 let desired_state = state.clone();
                 let projection_ref = reference.clone();
                 let projection_state = state.clone();
-                let result = run_runtime_control_blocking(move |client| async move {
+                let result = run_gateway_api_blocking(move |client| async move {
                     client
                         .revalidate_connector_resource(&reference, &state)
                         .await
                 })
                 .or_else(move |_| {
-                    run_runtime_projection_blocking(move |client| async move {
+                    run_gateway_api_blocking(move |client| async move {
                         client
                             .revalidate_connector_resource(&projection_ref, &projection_state)
                             .await
@@ -3280,13 +3278,13 @@ impl TuiState {
                 let projection_ref = reference.clone();
                 let receipt_ref = reference.clone();
                 let projection_session_id = session_id.clone();
-                let result = run_runtime_control_blocking(move |client| async move {
+                let result = run_gateway_api_blocking(move |client| async move {
                     client
                         .promote_connector_resource_to_memory(&reference, session_id.as_deref())
                         .await
                 })
                 .or_else(move |_| {
-                    run_runtime_projection_blocking(move |client| async move {
+                    run_gateway_api_blocking(move |client| async move {
                         client
                             .promote_connector_resource_to_memory(
                                 &projection_ref,
@@ -3394,11 +3392,11 @@ impl TuiState {
         }
     }
 
-    fn apply_local_daemon_approval_response(&mut self, approval_id: &str) {
+    fn apply_local_gateway_approval_response(&mut self, approval_id: &str) {
         self.mutate_runtime_control_store(|store| store.apply_approval_response(approval_id));
     }
 
-    fn apply_local_daemon_task_status(&mut self, task_id: &str, status: &str) {
+    fn apply_local_gateway_task_status(&mut self, task_id: &str, status: &str) {
         self.mutate_runtime_control_store(|store| store.apply_task_status(task_id, status));
     }
 
@@ -3854,56 +3852,25 @@ impl L4KnowledgeView {
     }
 }
 
-fn run_runtime_control_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+fn gateway_api_auth_token() -> Option<String> {
+    crate::tui::gateway_client::default_auth_token()
+}
+
+fn run_gateway_api_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
 where
-    F: FnOnce(crate::tui::control_client::DaemonControlClient) -> Fut + Send + 'static,
+    F: FnOnce(crate::tui::gateway_client::GatewayApiClient) -> Fut + Send + 'static,
     Fut: std::future::Future<
-            Output = Result<serde_json::Value, crate::tui::control_client::DaemonControlError>,
+            Output = Result<serde_json::Value, crate::tui::gateway_client::GatewayApiError>,
         > + Send
         + 'static,
 {
     let run = move || {
-        let client = crate::tui::control_client::DaemonControlClient::default_local();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| err.to_string())?;
-        runtime
-            .block_on(operation(client))
-            .map_err(|err| err.to_string())
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(run)
-            .join()
-            .map_err(|_| "runtime control worker panicked".to_string())?
-    } else {
-        run()
-    }
-}
-
-fn daemon_projection_auth_token() -> Option<String> {
-    std::env::var("COWD_API_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
-}
-
-fn run_runtime_projection_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
-where
-    F: FnOnce(crate::tui::projection_client::DaemonProjectionClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<
-            Output = Result<serde_json::Value, crate::tui::projection_client::ProjectionError>,
-        > + Send
-        + 'static,
-{
-    let run = move || {
-        let Some(client) =
-            crate::tui::projection_client::DaemonProjectionClient::from_running_gateway_with_retry(
-                daemon_projection_auth_token(),
-            )
-            .map_err(|err| err.to_string())?
+        let Some(client) = crate::tui::gateway_client::GatewayApiClient::ensure_running_with_retry(
+            gateway_api_auth_token(),
+        )
+        .map_err(|err| err.to_string())?
         else {
-            return Err("daemon gateway is not running".to_string());
+            return Err("Gateway API is not running".to_string());
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3917,7 +3884,7 @@ where
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::spawn(run)
             .join()
-            .map_err(|_| "runtime projection worker panicked".to_string())?
+            .map_err(|_| "Gateway API worker panicked".to_string())?
     } else {
         run()
     }
@@ -4004,17 +3971,17 @@ mod tests {
     }
 
     #[test]
-    fn local_daemon_approval_response_updates_projection_state() {
+    fn local_gateway_approval_response_updates_projection_state() {
         let mut state = TuiState::new("test-model", "test-session");
-        state.app.daemon_approval_items = vec![
-            crate::tui::runtime_control_store::DaemonApprovalSummary {
+        state.app.gateway_approval_items = vec![
+            crate::tui::runtime_control_store::ApprovalSummary {
                 id: "approval-1".to_string(),
                 tool_name: "bash".to_string(),
                 risk: Some("high".to_string()),
                 requester: Some("session".to_string()),
                 input_preview: "rm -rf /tmp/example".to_string(),
             },
-            crate::tui::runtime_control_store::DaemonApprovalSummary {
+            crate::tui::runtime_control_store::ApprovalSummary {
                 id: "approval-2".to_string(),
                 tool_name: "edit".to_string(),
                 risk: Some("medium".to_string()),
@@ -4022,20 +3989,20 @@ mod tests {
                 input_preview: "write file".to_string(),
             },
         ];
-        state.app.daemon_pending_approvals = Some(2);
+        state.app.gateway_pending_approvals = Some(2);
 
-        state.apply_local_daemon_approval_response("approval-1");
+        state.apply_local_gateway_approval_response("approval-1");
 
-        assert_eq!(state.app.daemon_pending_approvals, Some(1));
-        assert_eq!(state.app.daemon_approval_items.len(), 1);
-        assert_eq!(state.app.daemon_approval_items[0].id, "approval-2");
+        assert_eq!(state.app.gateway_pending_approvals, Some(1));
+        assert_eq!(state.app.gateway_approval_items.len(), 1);
+        assert_eq!(state.app.gateway_approval_items[0].id, "approval-2");
     }
 
     #[test]
-    fn local_daemon_task_status_updates_projection_state() {
+    fn local_gateway_task_status_updates_projection_state() {
         let mut state = TuiState::new("test-model", "test-session");
-        state.app.daemon_tasks = vec![
-            crate::tui::runtime_control_store::DaemonTaskSummary {
+        state.app.gateway_tasks = vec![
+            crate::tui::runtime_control_store::TaskSummary {
                 id: "task-1".to_string(),
                 objective: "blocked task".to_string(),
                 status: "blocked".to_string(),
@@ -4046,7 +4013,7 @@ mod tests {
                 artifact_count: 0,
                 blocker_reason: Some("waiting for approval".to_string()),
             },
-            crate::tui::runtime_control_store::DaemonTaskSummary {
+            crate::tui::runtime_control_store::TaskSummary {
                 id: "task-2".to_string(),
                 objective: "running task".to_string(),
                 status: "running".to_string(),
@@ -4058,20 +4025,20 @@ mod tests {
                 blocker_reason: None,
             },
         ];
-        state.app.daemon_task_count = Some(2);
+        state.app.gateway_task_count = Some(2);
 
-        state.apply_local_daemon_task_status("task-1", "completed");
+        state.apply_local_gateway_task_status("task-1", "completed");
 
-        assert_eq!(state.app.daemon_task_count, Some(2));
-        assert_eq!(state.app.daemon_tasks[0].status, "completed");
-        assert_eq!(state.app.daemon_tasks[0].blocker_reason, None);
-        assert_eq!(state.app.daemon_tasks[1].status, "running");
+        assert_eq!(state.app.gateway_task_count, Some(2));
+        assert_eq!(state.app.gateway_tasks[0].status, "completed");
+        assert_eq!(state.app.gateway_tasks[0].blocker_reason, None);
+        assert_eq!(state.app.gateway_tasks[1].status, "running");
     }
 
     #[test]
     fn local_connector_resource_state_updates_projection_state() {
         let mut state = TuiState::new("test-model", "test-session");
-        state.app.daemon_connector_resources = vec![
+        state.app.gateway_connector_resources = vec![
             crate::tui::runtime_control_store::ConnectorResourceSummary {
                 reference: "service://mock.docs/document/tui-doc".to_string(),
                 provider: "mock.docs".to_string(),
@@ -4084,105 +4051,9 @@ mod tests {
         state.apply_local_connector_resource_state("service://mock.docs/document/tui-doc", "stale");
 
         assert_eq!(
-            state.app.daemon_connector_resources[0].indexed_state,
+            state.app.gateway_connector_resources[0].indexed_state,
             "stale"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn connector_resource_actions_prefer_socket_control() {
-        use std::io::{BufRead, Write};
-
-        let dir = unique_temp_dir("cowd-tui-connector-socket");
-        let socket = dir.join("control.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
-        let server = std::thread::spawn(move || {
-            for expected in [
-                "connector_resource_revalidate",
-                "connector_resource_promote_memory",
-            ] {
-                let (stream, _) = listener.accept().expect("accept socket");
-                let mut reader = std::io::BufReader::new(stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("read command");
-                let command: serde_json::Value =
-                    serde_json::from_str(line.trim()).expect("command json");
-                assert_eq!(
-                    command.get("cmd").and_then(|value| value.as_str()),
-                    Some(expected)
-                );
-                assert_eq!(
-                    command.get("reference").and_then(|value| value.as_str()),
-                    Some("service://mock.docs/document/tui-doc")
-                );
-                let stream = reader.get_mut();
-                match expected {
-                    "connector_resource_revalidate" => {
-                        assert_eq!(
-                            command.get("state").and_then(|value| value.as_str()),
-                            Some("stale")
-                        );
-                        stream
-                            .write_all(br#"{"ok":true,"changed":true,"state":"stale"}"#)
-                            .expect("write response");
-                    }
-                    _ => {
-                        assert_eq!(
-                            command.get("session_id").and_then(|value| value.as_str()),
-                            Some("test-session")
-                        );
-                        stream
-                            .write_all(br#"{"ok":true,"memory_id":"mem-1","layer":"L3"}"#)
-                            .expect("write response");
-                    }
-                }
-                stream.write_all(b"\n").expect("write newline");
-            }
-        });
-
-        unsafe {
-            std::env::set_var("COWD_DAEMON_SOCKET", &socket);
-        }
-        let mut state = TuiState::new("test-model", "test-session");
-        state.app.daemon_connector_resources = vec![
-            crate::tui::runtime_control_store::ConnectorResourceSummary {
-                reference: "service://mock.docs/document/tui-doc".to_string(),
-                provider: "mock.docs".to_string(),
-                resource_type: "document".to_string(),
-                title: "TUI Doc".to_string(),
-                indexed_state: "indexed".to_string(),
-            },
-        ];
-
-        state.dispatch_action(Action::RevalidateConnectorResource {
-            reference: "service://mock.docs/document/tui-doc".to_string(),
-            state: "stale".to_string(),
-        });
-        state.dispatch_action(Action::PromoteConnectorResourceToMemory {
-            reference: "service://mock.docs/document/tui-doc".to_string(),
-            session_id: None,
-        });
-
-        unsafe {
-            std::env::remove_var("COWD_DAEMON_SOCKET");
-        }
-        server.join().expect("server thread");
-        assert_eq!(
-            state.app.daemon_connector_resources[0].indexed_state,
-            "stale"
-        );
-        assert_eq!(state.app.daemon_action_receipts.len(), 2);
-        assert_eq!(
-            state.app.daemon_action_receipts[0].capability,
-            "connector.resource.promote_memory"
-        );
-        assert_eq!(
-            state.app.daemon_action_receipts[1].capability,
-            "connector.resource.revalidate"
-        );
-        assert_eq!(state.gateway_panel.execution_receipts.len(), 2);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -5258,10 +5129,10 @@ providers:
                 state.layout_state.toggle_sidebar(&mut state.layout_tree);
                 state.app.server_running = true;
                 state.app.active_api_sessions = 1;
-                state.app.daemon_runtime_readiness = Some("92%".to_string());
-                state.app.daemon_task_count = Some(1);
-                state.app.daemon_pending_approvals = Some(1);
-                state.app.daemon_cross_plane_grants_active = Some(1);
+                state.app.gateway_runtime_readiness = Some("92%".to_string());
+                state.app.gateway_task_count = Some(1);
+                state.app.gateway_pending_approvals = Some(1);
+                state.app.gateway_cross_plane_grants_active = Some(1);
                 state.app.memory_status = Some("available".to_string());
                 state.sidebar_active_tab = tab;
 
@@ -5285,12 +5156,12 @@ providers:
         state.app.server_running = true;
         state.app.server_uptime_secs = Some(61);
         state.app.active_api_sessions = 2;
-        state.app.daemon_runtime_readiness = Some("94%".to_string());
-        state.app.daemon_runtime_components = Some(12);
-        state.app.daemon_task_count = Some(3);
-        state.app.daemon_pending_approvals = Some(1);
+        state.app.gateway_runtime_readiness = Some("94%".to_string());
+        state.app.gateway_runtime_components = Some(12);
+        state.app.gateway_task_count = Some(3);
+        state.app.gateway_pending_approvals = Some(1);
         state.app.memory_status = Some("available".to_string());
-        state.app.daemon_action_receipts = vec![
+        state.app.gateway_action_receipts = vec![
             crate::tui::runtime_control_store::RuntimeActionReceiptSummary {
                 status: "ok".to_string(),
                 dispatch_status: "completed".to_string(),
@@ -5299,7 +5170,7 @@ providers:
                 idempotency_key: Some("task-1".to_string()),
             },
         ];
-        state.app.daemon_connector_resources = vec![
+        state.app.gateway_connector_resources = vec![
             crate::tui::runtime_control_store::ConnectorResourceSummary {
                 reference: "service://mock.docs/document/1".to_string(),
                 provider: "mock.docs".to_string(),

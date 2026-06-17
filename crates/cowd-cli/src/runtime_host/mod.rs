@@ -1,7 +1,6 @@
 // ── Gateway RuntimeHost ────────────────────────────────────
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
-//   - Unix socket (/tmp/cowd.sock) for TUI connection
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
@@ -13,16 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::http::HeaderValue;
 use axum::{http::StatusCode, response::IntoResponse};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
-use crate::runtime_protocol::RuntimeRequest;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
@@ -30,7 +26,6 @@ use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
 use runtime::mirror::MessageMirror;
-use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::platform::{InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime};
 use runtime::{ContentBlock, ConversationMessage};
@@ -215,7 +210,6 @@ fn spawn_session_cleanup_task(
 
 pub struct RuntimeHostConfig {
     pub http_addr: String,
-    pub unix_sock_path: String,
     pub memory_config: Option<MemoryConfig>,
     pub platform_configs: Vec<PlatformConfig>,
     pub runtime_config: Option<serde_json::Value>,
@@ -235,7 +229,6 @@ struct PlatformStartupDiagnostic {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StartupDiagnostics {
     http_addr: String,
-    unix_sock_path: String,
     workspace_root: String,
     config_home: String,
     webui_dir: Option<String>,
@@ -278,7 +271,6 @@ fn build_startup_diagnostics(
 
     StartupDiagnostics {
         http_addr: config.http_addr.clone(),
-        unix_sock_path: config.unix_sock_path.clone(),
         workspace_root: workspace_root.display().to_string(),
         config_home: config_home.display().to_string(),
         webui_dir: static_webui
@@ -303,7 +295,6 @@ fn build_startup_diagnostics(
 fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
     tracing::info!(
         http_addr = %diagnostics.http_addr,
-        unix_sock_path = %diagnostics.unix_sock_path,
         workspace_root = %diagnostics.workspace_root,
         config_home = %diagnostics.config_home,
         webui_dir = ?diagnostics.webui_dir,
@@ -628,7 +619,7 @@ impl Drop for PidFileGuard {
     }
 }
 
-// ── Daemon entry point ─────────────────────────────────────────
+// ── Gateway entry point ─────────────────────────────────────────
 
 pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String> {
     let started_at = Instant::now();
@@ -811,17 +802,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         tracing::warn!("failed to write addr file: {e}");
     }
 
-    // 4. Unix socket
-    let _ = std::fs::remove_file(&config.unix_sock_path);
-    let unix_listener = UnixListener::bind(&config.unix_sock_path).map_err(|e| {
-        format!(
-            "failed to bind unix socket {}: {}",
-            config.unix_sock_path, e
-        )
-    })?;
-    tracing::info!("Unix socket on {}", config.unix_sock_path);
-
-    // 5. Platform adapters via PlatformRuntime
+    // 4. Platform adapters via PlatformRuntime
 
     // Initialise the message mirror with default rules from daemon config
     if let Some(mirror) = config.message_mirror {
@@ -917,60 +898,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     spawn_platform_inbound_loop(platform_runtime.clone(), app_state.clone());
 
-    // 6. Unix socket accept loop (background)
-    // Use spawn_blocking — handle_unix_client internally calls run_turn_async
-    // which holds std::sync::MutexGuard across .await, making its future !Send.
-    {
-        let sessions = sessions.clone();
-        let event_bus = event_bus.clone();
-        let unified_store = unified_store.clone();
-        let lease_registry = lease_registry.clone();
-        let lifecycle_kernel = lifecycle_kernel.clone();
-        let session_kernel_for_socket = session_kernel.clone();
-        let task_kernel = app_state.task_kernel.clone();
-        let approval_gate = app_state.approval_gate.clone();
-        let app_state_for_socket = app_state.clone();
-        let started_at = started_at;
-        tokio::task::spawn_blocking(move || {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async move {
-                loop {
-                    match unix_listener.accept().await {
-                        Ok((stream, _addr)) => {
-                            let sessions = sessions.clone();
-                            let event_bus = event_bus.clone();
-                            let unified_store = unified_store.clone();
-                            let lease_registry = lease_registry.clone();
-                            let lifecycle_kernel = lifecycle_kernel.clone();
-                            let session_kernel = session_kernel_for_socket.clone();
-                            let task_kernel = task_kernel.clone();
-                            let approval_gate = approval_gate.clone();
-                            let app_state = app_state_for_socket.clone();
-                            handle_unix_client(
-                                stream,
-                                sessions,
-                                event_bus,
-                                unified_store,
-                                lease_registry,
-                                session_kernel,
-                                lifecycle_kernel,
-                                task_kernel,
-                                approval_gate,
-                                app_state,
-                                started_at,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::warn!("unix socket accept error: {e}");
-                        }
-                    }
-                }
-            })
-        });
-    }
-
-    // 7. HTTP server with graceful shutdown on SIGINT/SIGTERM
+    // 5. HTTP server with graceful shutdown on SIGINT/SIGTERM
     let shutdown_signal = async {
         #[cfg(unix)]
         {
@@ -1002,10 +930,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up daemon resources...");
 
-    // Remove unix socket
-    let _ = std::fs::remove_file(&config.unix_sock_path);
-    tracing::info!("unix socket removed");
-
     // Shutdown platform adapters
     let _ = platform_runtime.shutdown().await;
     tracing::info!("platform runtime shut down");
@@ -1013,818 +937,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("daemon shutdown complete");
     Ok(())
-}
-
-// ── Unix client handler ─────────────────────────────────────────
-
-/// Handle a single Unix socket client connection.
-/// Reads newline-delimited JSON commands and writes JSON responses.
-/// Supported commands:
-///   {"cmd":"status"}
-///   {"cmd":"runtime_snapshot"}
-///   {"cmd":"memory_status"}
-///   {"cmd":"context_snapshot","session_id":"..."}
-///   {"cmd":"task_list"}
-///   {"cmd":"task_start","objective":"...","yolo_mode":true}
-///   {"cmd":"task_cancel","id":"..."}
-///   {"cmd":"task_complete","id":"..."}
-///   {"cmd":"approval_pending"}
-///   {"cmd":"approval_respond","id":"...","approved":true,"persistence":"once|session|always","reason":"..."}
-///   {"cmd":"connector_resource_list","limit":20,"offset":0,"q":"..."}
-///   {"cmd":"connector_resource_revalidate","reference":"...","state":"indexed|stale"}
-///   {"cmd":"connector_resource_promote_memory","reference":"...","session_id":"..."}
-///   {"cmd":"ensure_session","session_id":"...","model":"..."}
-///   {"cmd":"subscribe_session","session_id":"..."}
-///   {"cmd":"acquire_session_lease","session_id":"...","owner":"...","mode":"collaborative|exclusive|takeover"}
-///   {"cmd":"release_session_lease","session_id":"...","owner":"..."}
-///   {"cmd":"create_session","model":"..."}
-///   {"cmd":"chat","session_id":"...","content":"..."}
-///   {"cmd":"list_sessions"}
-async fn handle_unix_client(
-    stream: UnixStream,
-    sessions: Arc<ActiveSessions>,
-    event_bus: Arc<SessionEventBus>,
-    unified_store: Option<Arc<UnifiedSessionStore>>,
-    lease_registry: Arc<SessionLeaseRegistry>,
-    session_kernel: Arc<SessionKernel>,
-    lifecycle_kernel: Arc<SessionLifecycleKernel>,
-    task_kernel: Arc<crate::task_kernel::TaskKernel>,
-    approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
-    app_state: Arc<api_routes::AppState>,
-    started_at: Instant,
-) {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    let runtime_service = RuntimeService::new(
-        sessions.clone(),
-        lease_registry.clone(),
-        session_kernel,
-        lifecycle_kernel,
-        started_at,
-    );
-
-    loop {
-        line.clear();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF
-                break;
-            }
-            Ok(_n) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let response = match serde_json::from_str::<serde_json::Value>(trimmed) {
-                    Ok(cmd) => {
-                        if cmd.get("cmd").and_then(|c| c.as_str()) == Some("subscribe_session") {
-                            let session_id = cmd
-                                .get("session_id")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or_default();
-                            handle_unix_event_subscription(
-                                &mut writer,
-                                event_bus.clone(),
-                                session_id,
-                            )
-                            .await;
-                            break;
-                        }
-
-                        let protocol_request =
-                            serde_json::from_value::<RuntimeRequest>(cmd.clone()).ok();
-                        if let Some(request) = protocol_request
-                            .as_ref()
-                            .filter(|request| !request.is_supported_version())
-                        {
-                            RuntimeService::unsupported_protocol_value(request)
-                        } else {
-                            match cmd.get("cmd").and_then(|c| c.as_str()) {
-                                Some("status") | Some("runtime.status") => {
-                                    runtime_service.status_value()
-                                }
-                                Some("runtime_snapshot") | Some("runtime.snapshot") => {
-                                    runtime_service.snapshot_value().await
-                                }
-                                Some("memory_status") => {
-                                    let mut value =
-                                        api_routes::memory_routes::memory_status_value(&app_state)
-                                            .await;
-                                    if let Some(object) = value.as_object_mut() {
-                                        object.insert("ok".to_string(), serde_json::json!(true));
-                                        object.insert(
-                                            "kind".to_string(),
-                                            serde_json::json!("daemon_memory_status"),
-                                        );
-                                    }
-                                    value
-                                }
-                                Some("context_snapshot") => {
-                                    let session_id =
-                                        cmd.get("session_id").and_then(|value| value.as_str());
-                                    daemon_context_snapshot(&app_state, session_id).await
-                                }
-                                Some("task_list") => serde_json::json!({
-                                    "ok": true,
-                                    "tasks": task_kernel.list(),
-                                    "current": task_kernel.current(),
-                                }),
-                                Some("task_start") => {
-                                    let objective = cmd
-                                        .get("objective")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default();
-                                    let yolo_mode = cmd
-                                        .get("yolo_mode")
-                                        .and_then(|value| value.as_bool())
-                                        .unwrap_or(false);
-                                    match task_kernel.start_goal(objective, yolo_mode) {
-                                        Ok(task) => serde_json::json!({
-                                            "ok": true,
-                                            "task": task,
-                                        }),
-                                        Err(error) => serde_json::json!({
-                                            "ok": false,
-                                            "error": error,
-                                        }),
-                                    }
-                                }
-                                Some("task_cancel") => {
-                                    let id = cmd
-                                        .get("id")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default();
-                                    match task_kernel.transition(
-                                        id,
-                                        crate::task_kernel::TaskStatus::Cancelled,
-                                        None,
-                                        "cancelled by TUI socket",
-                                    ) {
-                                        Ok(task) => serde_json::json!({
-                                            "ok": true,
-                                            "task": task,
-                                        }),
-                                        Err(error) => serde_json::json!({
-                                            "ok": false,
-                                            "error": error,
-                                        }),
-                                    }
-                                }
-                                Some("task_complete") => {
-                                    let id = cmd
-                                        .get("id")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default();
-                                    match task_kernel.transition(
-                                        id,
-                                        crate::task_kernel::TaskStatus::Completed,
-                                        None,
-                                        "accepted by TUI socket",
-                                    ) {
-                                        Ok(task) => serde_json::json!({
-                                            "ok": true,
-                                            "task": task,
-                                        }),
-                                        Err(error) => serde_json::json!({
-                                            "ok": false,
-                                            "error": error,
-                                        }),
-                                    }
-                                }
-                                Some("approval_pending") => {
-                                    let pending = match approval_gate.as_ref() {
-                                        Some(gate) => gate.get_pending_requests().await,
-                                        None => Vec::new(),
-                                    };
-                                    serde_json::json!({
-                                        "ok": true,
-                                        "approvals": pending,
-                                    })
-                                }
-                                Some("approval_respond") => match approval_gate.as_ref() {
-                                    Some(gate) => {
-                                        let id = cmd
-                                            .get("id")
-                                            .and_then(|value| value.as_str())
-                                            .unwrap_or_default();
-                                        let approved = cmd
-                                            .get("approved")
-                                            .and_then(|value| value.as_bool())
-                                            .unwrap_or(false);
-                                        let persistence = parse_socket_approval_persistence(
-                                            cmd.get("persistence")
-                                                .and_then(|value| value.as_str())
-                                                .unwrap_or("once"),
-                                        );
-                                        let verdict = if approved {
-                                            ApprovalVerdict::Approved
-                                        } else {
-                                            ApprovalVerdict::Denied {
-                                                reason: cmd
-                                                    .get("reason")
-                                                    .and_then(|value| value.as_str())
-                                                    .unwrap_or("denied by TUI socket")
-                                                    .to_string(),
-                                            }
-                                        };
-                                        match gate.resolve_approval(id, verdict, persistence).await
-                                        {
-                                            Some(request) => serde_json::json!({
-                                                "ok": true,
-                                                "id": id,
-                                                "resolved": true,
-                                                "approved": approved,
-                                                "tool": "bash",
-                                                "action": request.command,
-                                            }),
-                                            None => serde_json::json!({
-                                                "ok": false,
-                                                "error": "approval request not found",
-                                            }),
-                                        }
-                                    }
-                                    None => return_json_error("approval gate not configured"),
-                                },
-                                Some("connector_resource_list") => {
-                                    let limit = cmd
-                                        .get("limit")
-                                        .and_then(|value| value.as_u64())
-                                        .map(|value| value as usize);
-                                    let offset = cmd
-                                        .get("offset")
-                                        .and_then(|value| value.as_u64())
-                                        .map(|value| value as usize);
-                                    let query = cmd.get("q").and_then(|value| value.as_str());
-                                    api_routes::connector_routes::connector_resources_snapshot(
-                                        &app_state, limit, offset, query,
-                                    )
-                                }
-                                Some("connector_resource_revalidate") => {
-                                    let reference = cmd
-                                        .get("reference")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default();
-                                    let state = cmd.get("state").and_then(|value| value.as_str());
-                                    api_routes::connector_routes::connector_resource_revalidate_snapshot(
-                                    &app_state, reference, state,
-                                )
-                                }
-                                Some("connector_resource_promote_memory") => {
-                                    let reference = cmd
-                                        .get("reference")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default();
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|value| value.as_str())
-                                        .map(ToOwned::to_owned);
-                                    api_routes::connector_routes::connector_resource_promote_memory_snapshot(
-                                    &app_state,
-                                    reference,
-                                    session_id,
-                                )
-                                .await
-                                }
-                                Some("acquire_session_lease") | Some("session.lease.acquire") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let owner = cmd
-                                        .get("owner")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let mode = cmd
-                                        .get("mode")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("collaborative");
-                                    runtime_service
-                                        .acquire_session_lease_value(session_id, owner, mode)
-                                        .await
-                                }
-                                Some("release_session_lease") | Some("session.lease.release") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let owner = cmd
-                                        .get("owner")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    runtime_service
-                                        .release_session_lease_value(session_id, owner)
-                                        .await
-                                }
-                                Some("session.attach") | Some("attach_session") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let actor_id = cmd
-                                        .get("actor_id")
-                                        .or_else(|| cmd.get("owner"))
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("anonymous");
-                                    let surface = cmd
-                                        .get("surface")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("socket");
-                                    let role = cmd.get("role").and_then(|s| s.as_str());
-                                    runtime_service
-                                        .attach_session_value(session_id, actor_id, surface, role)
-                                        .await
-                                }
-                                Some("session.detach") | Some("detach_session") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let actor_id = cmd
-                                        .get("actor_id")
-                                        .or_else(|| cmd.get("owner"))
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    runtime_service
-                                        .detach_session_value(session_id, actor_id)
-                                        .await
-                                }
-                                Some("session.lifecycle") | Some("session.lifecycle.snapshot") => {
-                                    let session_id = cmd.get("session_id").and_then(|s| s.as_str());
-                                    runtime_service.lifecycle_snapshot_value(session_id).await
-                                }
-                                Some("session.replay") | Some("replay_session") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let from_sequence = cmd
-                                        .get("from_sequence")
-                                        .or_else(|| cmd.get("from_seq"))
-                                        .and_then(|value| value.as_u64())
-                                        .unwrap_or(0)
-                                        as usize;
-                                    let limit = cmd
-                                        .get("limit")
-                                        .and_then(|value| value.as_u64())
-                                        .unwrap_or(100)
-                                        as usize;
-                                    runtime_service
-                                        .replay_session_value(session_id, from_sequence, limit)
-                                        .await
-                                }
-                                Some("ensure_session") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let model = cmd
-                                        .get("model")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("claude-sonnet-4-6");
-                                    ensure_daemon_session(
-                                        &sessions,
-                                        unified_store.as_ref(),
-                                        session_id,
-                                        model,
-                                    )
-                                    .await
-                                }
-                                Some("create_session") => {
-                                    let model = cmd
-                                        .get("model")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("claude-sonnet-4-6");
-                                    let session_id = uuid::Uuid::new_v4().to_string();
-                                    ensure_daemon_session(
-                                        &sessions,
-                                        unified_store.as_ref(),
-                                        &session_id,
-                                        model,
-                                    )
-                                    .await
-                                }
-                                Some("chat") => {
-                                    let session_id = cmd
-                                        .get("session_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or_default();
-                                    let content = cmd
-                                        .get("content")
-                                        .and_then(|c| c.as_str())
-                                        .unwrap_or_default();
-
-                                    if session_id.is_empty() || content.is_empty() {
-                                        serde_json::json!({
-                                            "ok": false,
-                                            "error": "session_id and content are required",
-                                        })
-                                    } else {
-                                        match sessions.get(session_id) {
-                                            Some(entry) => {
-                                                let started_data = serde_json::json!({
-                                                    "type": "TurnStarted",
-                                                    "session_id": session_id,
-                                                });
-                                                event_bus
-                                                    .broadcast(
-                                                        session_id,
-                                                        &started_data.to_string(),
-                                                    )
-                                                    .await;
-                                                let mut guard = entry.lock().await;
-                                                match guard
-                                                    .run_turn_async(
-                                                        content,
-                                                        &runtime::permissions::SharedPrompter::none(
-                                                        ),
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(summary) => {
-                                                        if let Some(ref store) = unified_store {
-                                                            let session_snapshot =
-                                                                guard.session().clone();
-                                                            if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
-                                                            store,
-                                                            session_id,
-                                                            &session_snapshot,
-                                                        ).await {
-                                                            tracing::warn!(session_id = %session_id, error = %e, "failed to sync daemon session metadata");
-                                                        }
-                                                        }
-                                                        let final_text = summary
-                                                            .assistant_messages
-                                                            .last()
-                                                            .map(|msg| {
-                                                                msg.blocks
-                                                                    .iter()
-                                                                    .filter_map(|block| {
-                                                                        match block {
-                                                                runtime::ContentBlock::Text {
-                                                                    text,
-                                                                } => Some(text.as_str()),
-                                                                _ => None,
-                                                            }
-                                                                    })
-                                                                    .collect::<Vec<_>>()
-                                                                    .join("")
-                                                            })
-                                                            .unwrap_or_default();
-
-                                                        let sse_data = serde_json::json!({
-                                                            "type": "TurnComplete",
-                                                            "session_id": session_id,
-                                                            "response": final_text,
-                                                            "iterations": summary.iterations,
-                                                        });
-                                                        let thinking_done = serde_json::json!({
-                                                            "type": "ThinkingComplete",
-                                                            "session_id": session_id,
-                                                        });
-                                                        event_bus
-                                                            .broadcast(
-                                                                session_id,
-                                                                &thinking_done.to_string(),
-                                                            )
-                                                            .await;
-                                                        event_bus
-                                                            .broadcast(
-                                                                session_id,
-                                                                &sse_data.to_string(),
-                                                            )
-                                                            .await;
-
-                                                        serde_json::json!({
-                                                            "ok": true,
-                                                            "response": final_text,
-                                                            "iterations": summary.iterations,
-                                                        })
-                                                    }
-                                                    Err(e) => {
-                                                        let err_msg = e.to_string();
-                                                        let sse_data = serde_json::json!({
-                                                            "type": "TurnError",
-                                                            "session_id": session_id,
-                                                            "error": err_msg,
-                                                        });
-                                                        event_bus
-                                                            .broadcast(
-                                                                session_id,
-                                                                &sse_data.to_string(),
-                                                            )
-                                                            .await;
-                                                        serde_json::json!({
-                                                            "ok": false,
-                                                            "error": err_msg,
-                                                        })
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                serde_json::json!({
-                                                    "ok": false,
-                                                    "error": format!("session {session_id} not found"),
-                                                })
-                                            }
-                                        }
-                                    }
-                                }
-                                Some("list_sessions") | Some("session.list") => {
-                                    runtime_service.list_sessions_value()
-                                }
-                                Some(other) => {
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error": format!("unknown command: {other}"),
-                                    })
-                                }
-                                None => {
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error": "missing 'cmd' field",
-                                    })
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        serde_json::json!({
-                            "ok": false,
-                            "error": format!("invalid JSON: {e}"),
-                        })
-                    }
-                };
-
-                let mut resp_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                resp_bytes.push(b'\n');
-                if let Err(e) = writer.write_all(&resp_bytes).await {
-                    tracing::warn!("unix socket write error: {e}");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("unix socket read error: {e}");
-                break;
-            }
-        }
-    }
-}
-
-fn return_json_error(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "ok": false,
-        "error": message,
-    })
-}
-
-fn parse_socket_approval_persistence(value: &str) -> ApprovalPersistence {
-    match value {
-        "session" => ApprovalPersistence::Session,
-        "always" | "forever" => ApprovalPersistence::Always,
-        _ => ApprovalPersistence::Once,
-    }
-}
-
-async fn handle_unix_event_subscription(
-    writer: &mut OwnedWriteHalf,
-    event_bus: Arc<SessionEventBus>,
-    session_id: &str,
-) {
-    if session_id.trim().is_empty() {
-        let response = serde_json::json!({
-            "ok": false,
-            "error": "session_id is required",
-        });
-        let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
-        bytes.push(b'\n');
-        let _ = writer.write_all(&bytes).await;
-        return;
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-    event_bus.subscribe(session_id, tx.clone()).await;
-
-    let connected = serde_json::json!({
-        "ok": true,
-        "type": "Subscribed",
-        "session_id": session_id,
-    });
-    let mut bytes = serde_json::to_vec(&connected).unwrap_or_default();
-    bytes.push(b'\n');
-    if writer.write_all(&bytes).await.is_err() {
-        event_bus.unsubscribe(session_id, &tx).await;
-        return;
-    }
-
-    while let Some(event) = rx.recv().await {
-        let mut bytes = event.into_bytes();
-        bytes.push(b'\n');
-        if writer.write_all(&bytes).await.is_err() {
-            break;
-        }
-    }
-
-    event_bus.unsubscribe(session_id, &tx).await;
-}
-
-async fn ensure_daemon_session(
-    sessions: &ActiveSessions,
-    unified_store: Option<&Arc<UnifiedSessionStore>>,
-    session_id: &str,
-    model: &str,
-) -> serde_json::Value {
-    if session_id.trim().is_empty() {
-        return serde_json::json!({
-            "ok": false,
-            "error": "session_id is required",
-        });
-    }
-
-    if sessions.get(session_id).is_some() {
-        return serde_json::json!({
-            "ok": true,
-            "session_id": session_id,
-            "created": false,
-            "active_sessions": sessions.list().len(),
-        });
-    }
-
-    let session = runtime::Session::new();
-    let runtime_result = if let Some(store) = unified_store {
-        crate::build_runtime_with_session_store(
-            (*store).clone(),
-            session,
-            session_id,
-            model.to_string(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::build_runtime(
-            session,
-            session_id,
-            model.to_string(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    };
-
-    match runtime_result {
-        Ok(runtime) => {
-            if let Some(store) = unified_store {
-                let record =
-                    crate::api_routes::new_api_session_record(session_id, Some(model.to_string()));
-                if let Err(e) = store.upsert_session(&record).await {
-                    tracing::warn!(session_id = %session_id, error = %e, "failed to persist daemon session");
-                }
-            }
-            match sessions.register(session_id.to_string(), runtime) {
-                Ok(_) => serde_json::json!({
-                    "ok": true,
-                    "session_id": session_id,
-                    "created": true,
-                    "active_sessions": sessions.list().len(),
-                }),
-                Err(e) => serde_json::json!({
-                    "ok": false,
-                    "error": format!("failed to register daemon session: {e}"),
-                }),
-            }
-        }
-        Err(e) => serde_json::json!({
-            "ok": false,
-            "error": format!("failed to build runtime: {e}"),
-        }),
-    }
-}
-
-fn daemon_control_status(sessions: &ActiveSessions, started_at: Instant) -> serde_json::Value {
-    serde_json::json!({
-        "ok": true,
-        "protocol_version": 1,
-        "runtime_host": "gateway-runtime-host",
-        "daemon": "gateway-runtime-host",
-        "compat": {
-            "daemon": {
-                "delete_by": "0.9.293",
-                "replacement": "runtime_host",
-            }
-        },
-        "active_sessions": sessions.list().len(),
-        "uptime_secs": started_at.elapsed().as_secs(),
-    })
-}
-
-async fn daemon_runtime_snapshot(
-    sessions: &ActiveSessions,
-    lease_registry: &SessionLeaseRegistry,
-    started_at: Instant,
-) -> serde_json::Value {
-    let mut session_ids = sessions.list();
-    session_ids.sort();
-    let leases = lease_registry.list().await;
-    serde_json::json!({
-        "ok": true,
-        "kind": "gateway_runtime_snapshot",
-        "legacy_kind": "daemon_runtime_snapshot",
-        "protocol_version": 1,
-        "runtime_host": "gateway-runtime-host",
-        "daemon": "gateway-runtime-host",
-        "compat": {
-            "legacy_fields": {
-                "legacy_kind": {
-                    "delete_by": "0.9.293",
-                    "replacement": "kind",
-                    "consumer": "tui/control_client",
-                },
-                "daemon": {
-                    "delete_by": "0.9.293",
-                    "replacement": "runtime_host",
-                    "consumer": "tui/control_client",
-                }
-            }
-        },
-        "active_sessions": session_ids.len(),
-        "uptime_secs": started_at.elapsed().as_secs(),
-        "sessions": session_ids,
-        "leases": {
-            "total": leases.len(),
-            "items": leases,
-        },
-        "transport": {
-            "control": "gateway_http",
-            "socket_transition": {
-                "enabled": true,
-                "delete_by": "0.9.293",
-                "replacement": "gateway_http_sse",
-            },
-            "projection": "http_optional",
-        },
-    })
-}
-
-async fn daemon_context_snapshot(
-    app_state: &api_routes::AppState,
-    requested_session_id: Option<&str>,
-) -> serde_json::Value {
-    let session_id = requested_session_id
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            app_state
-                .session_kernel
-                .list_active_session_ids()
-                .into_iter()
-                .next()
-        })
-        .unwrap_or_else(|| "runtime-context".to_string());
-
-    let Some(runtime_entry) = app_state.session_kernel.active_runtime(&session_id) else {
-        return serde_json::json!({
-            "ok": true,
-            "kind": "context_snapshot",
-            "legacy_kind": "daemon_context_snapshot",
-            "enabled": false,
-            "source": "session_kernel",
-            "session_id": session_id,
-            "has_envelope": false,
-            "degraded": true,
-            "degraded_reason": "runtime not active",
-        });
-    };
-
-    let runtime = runtime_entry.lock().await;
-    let envelope = runtime.last_context_envelope();
-    serde_json::json!({
-        "ok": true,
-        "kind": "context_snapshot",
-        "legacy_kind": "daemon_context_snapshot",
-        "enabled": true,
-        "source": "runtime",
-        "session_id": session_id,
-        "has_envelope": envelope.is_some(),
-        "envelope_id": envelope.as_ref().map(|value| value.id.as_str()),
-        "intent": envelope.as_ref().map(|value| value.intent.as_str()),
-        "selected_items": envelope.as_ref().map(|value| value.selected.len()).unwrap_or(0),
-        "omitted_items": envelope.as_ref().map(|value| value.omitted.len()).unwrap_or(0),
-        "stable_head_items": envelope
-            .as_ref()
-            .map(|value| value.assembled.stable_head.len())
-            .unwrap_or(0),
-        "degraded": false,
-    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1850,10 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_defaults() {
+    fn gateway_config_defaults() {
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: "/tmp/cowd.sock".into(),
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
@@ -1863,59 +974,9 @@ mod tests {
             message_mirror: None,
         };
         assert_eq!(config.http_addr, "0.0.0.0:8642");
-        assert_eq!(config.unix_sock_path, "/tmp/cowd.sock");
         assert!(config.memory_config.is_none());
         assert!(config.platform_configs.is_empty());
         assert!(config.auth_token.is_none());
-    }
-
-    #[test]
-    fn daemon_control_status_reports_protocol_and_sessions() {
-        let sessions = ActiveSessions::new();
-        let status = daemon_control_status(&sessions, Instant::now());
-        assert_eq!(status.get("ok").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            status.get("protocol_version").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(status.get("daemon").and_then(|v| v.as_str()), Some("cowd"));
-        assert_eq!(
-            status.get("active_sessions").and_then(|v| v.as_u64()),
-            Some(0)
-        );
-        assert!(status.get("uptime_secs").and_then(|v| v.as_u64()).is_some());
-    }
-
-    #[tokio::test]
-    async fn daemon_runtime_snapshot_reports_sessions_leases_and_transport() {
-        let sessions = ActiveSessions::new();
-        let registry = SessionLeaseRegistry::default();
-        let lease = registry
-            .acquire("session-a", "tui:test", "collaborative")
-            .await;
-        assert_eq!(lease.get("ok").and_then(|v| v.as_bool()), Some(true));
-
-        let snapshot = daemon_runtime_snapshot(&sessions, &registry, Instant::now()).await;
-        assert_eq!(
-            snapshot.get("kind").and_then(|v| v.as_str()),
-            Some("daemon_runtime_snapshot")
-        );
-        assert_eq!(
-            snapshot
-                .pointer("/transport/control")
-                .and_then(|v| v.as_str()),
-            Some("unix_socket")
-        );
-        assert_eq!(
-            snapshot.pointer("/leases/total").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            snapshot
-                .pointer("/leases/items/0/owner")
-                .and_then(|v| v.as_str()),
-            Some("tui:test")
-        );
     }
 
     #[tokio::test]
@@ -1941,10 +1002,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_with_auth() {
+    fn gateway_config_with_auth() {
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9000".into(),
-            unix_sock_path: "/tmp/test.sock".into(),
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
@@ -1959,11 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_with_memory() {
+    fn gateway_config_with_memory() {
         let mem_cfg = MemoryConfig::default();
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: "/tmp/cowd.sock".into(),
             memory_config: Some(mem_cfg),
             platform_configs: vec![],
             runtime_config: None,
@@ -2062,7 +1121,6 @@ mod tests {
             .with_setting("app_secret", "do-not-log-this-secret");
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9864".into(),
-            unix_sock_path: "/tmp/cowd-diagnostics.sock".into(),
             memory_config: Some(MemoryConfig::default()),
             platform_configs: vec![platform],
             runtime_config: Some(serde_json::json!({"model": "test-model"})),

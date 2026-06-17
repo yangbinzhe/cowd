@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::tui::runtime_control_store::{
-    ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, DaemonApprovalSummary, DaemonTaskSummary, RuntimeActionReceiptSummary,
-    StructuredDataSummary,
+    ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
+    CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary, TaskSummary,
 };
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
@@ -205,41 +204,41 @@ pub struct App {
     /// Number of active API sessions.
     pub active_api_sessions: usize,
     /// Runtime host readiness summary from the HTTP projection API.
-    pub daemon_runtime_readiness: Option<String>,
+    pub gateway_runtime_readiness: Option<String>,
     /// Runtime host component count from the HTTP projection API.
-    pub daemon_runtime_components: Option<u64>,
-    /// Number of tasks observed through the runtime projection API.
-    pub daemon_task_count: Option<u64>,
+    pub gateway_runtime_components: Option<u64>,
+    /// Number of tasks observed through the Gateway API API.
+    pub gateway_task_count: Option<u64>,
     /// Runtime host task summaries observed through the runtime control snapshot.
-    pub daemon_tasks: Vec<DaemonTaskSummary>,
-    /// Number of pending approvals observed through the runtime projection API.
-    pub daemon_pending_approvals: Option<u64>,
-    /// Pending approval summaries observed through the runtime projection API.
-    pub daemon_approval_items: Vec<DaemonApprovalSummary>,
-    /// Number of active cross-plane grants observed through the runtime projection API.
-    pub daemon_cross_plane_grants_active: Option<u64>,
+    pub gateway_tasks: Vec<TaskSummary>,
+    /// Number of pending approvals observed through the Gateway API API.
+    pub gateway_pending_approvals: Option<u64>,
+    /// Pending approval summaries observed through the Gateway API API.
+    pub gateway_approval_items: Vec<ApprovalSummary>,
+    /// Number of active cross-plane grants observed through the Gateway API API.
+    pub gateway_cross_plane_grants_active: Option<u64>,
     /// Number of cross-plane interop actions observed over the last 24h.
-    pub daemon_cross_plane_actions_24h: Option<u64>,
-    /// Connector provider accounts observed through the runtime projection API.
-    pub daemon_connector_accounts: Vec<ConnectorAccountSummary>,
-    /// Connector capabilities observed through the runtime projection API.
-    pub daemon_connector_capabilities: Vec<ConnectorCapabilitySummary>,
-    /// Connector resources observed through the runtime projection API.
-    pub daemon_connector_resources: Vec<ConnectorResourceSummary>,
+    pub gateway_cross_plane_actions_24h: Option<u64>,
+    /// Connector provider accounts observed through the Gateway API API.
+    pub gateway_connector_accounts: Vec<ConnectorAccountSummary>,
+    /// Connector capabilities observed through the Gateway API API.
+    pub gateway_connector_capabilities: Vec<ConnectorCapabilitySummary>,
+    /// Connector resources observed through the Gateway API API.
+    pub gateway_connector_resources: Vec<ConnectorResourceSummary>,
     /// Recent runtime action receipts produced by TUI controls.
-    pub daemon_action_receipts: Vec<RuntimeActionReceiptSummary>,
+    pub gateway_action_receipts: Vec<RuntimeActionReceiptSummary>,
     /// Cowd kernel capability and release-gate summary observed through projection API.
-    pub daemon_cowd_kernel: Option<CowdKernelSummary>,
+    pub gateway_cowd_kernel: Option<CowdKernelSummary>,
     /// Structured data-plane summary observed through projection API.
-    pub daemon_structured_data: Option<StructuredDataSummary>,
-    /// Connector-specific degraded reasons observed through the runtime projection API.
-    pub daemon_connector_degraded_reasons: Vec<String>,
-    /// Degraded runtime projection/control reasons collected during snapshot refresh.
-    pub daemon_degraded_reasons: Vec<String>,
+    pub gateway_structured_data: Option<StructuredDataSummary>,
+    /// Connector-specific degraded reasons observed through the Gateway API API.
+    pub gateway_connector_degraded_reasons: Vec<String>,
+    /// Degraded Gateway API/control reasons collected during snapshot refresh.
+    pub gateway_degraded_reasons: Vec<String>,
     /// Current runtime session lease owner for the attached TUI session.
-    pub daemon_lease_owner: Option<String>,
+    pub gateway_lease_owner: Option<String>,
     /// Current runtime session lease mode for the attached TUI session.
-    pub daemon_lease_mode: Option<String>,
+    pub gateway_lease_mode: Option<String>,
 
     pub scroll_offset: u16,
     pub auto_scroll: bool,
@@ -492,24 +491,24 @@ impl App {
             server_running: false,
             server_uptime_secs: None,
             active_api_sessions: 0,
-            daemon_runtime_readiness: None,
-            daemon_runtime_components: None,
-            daemon_task_count: None,
-            daemon_tasks: Vec::new(),
-            daemon_pending_approvals: None,
-            daemon_approval_items: Vec::new(),
-            daemon_cross_plane_grants_active: None,
-            daemon_cross_plane_actions_24h: None,
-            daemon_connector_accounts: Vec::new(),
-            daemon_connector_capabilities: Vec::new(),
-            daemon_connector_resources: Vec::new(),
-            daemon_action_receipts: Vec::new(),
-            daemon_cowd_kernel: None,
-            daemon_structured_data: None,
-            daemon_connector_degraded_reasons: Vec::new(),
-            daemon_degraded_reasons: Vec::new(),
-            daemon_lease_owner: None,
-            daemon_lease_mode: None,
+            gateway_runtime_readiness: None,
+            gateway_runtime_components: None,
+            gateway_task_count: None,
+            gateway_tasks: Vec::new(),
+            gateway_pending_approvals: None,
+            gateway_approval_items: Vec::new(),
+            gateway_cross_plane_grants_active: None,
+            gateway_cross_plane_actions_24h: None,
+            gateway_connector_accounts: Vec::new(),
+            gateway_connector_capabilities: Vec::new(),
+            gateway_connector_resources: Vec::new(),
+            gateway_action_receipts: Vec::new(),
+            gateway_cowd_kernel: None,
+            gateway_structured_data: None,
+            gateway_connector_degraded_reasons: Vec::new(),
+            gateway_degraded_reasons: Vec::new(),
+            gateway_lease_owner: None,
+            gateway_lease_mode: None,
 
             scroll_offset: 0,
             auto_scroll: true,

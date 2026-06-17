@@ -2,7 +2,7 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、Matrix 事实引擎、MFG 应用层和生产 Release Gate。
 
-当前内核版本：`0.9.292`
+当前内核版本：`0.9.293`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 
@@ -726,7 +726,7 @@ MFG skill 执行流程：
 
 Structured Data Core 属于 cowd 内核，不属于 MFG。MFG 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
-Memory 默认存储位置从 0.9.292 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
+Memory 默认存储位置从 0.9.293 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
 
 ### 8.3 Agents 面板
 
@@ -786,7 +786,7 @@ MFG 是 manufacturing application layer on top of the cowd kernel。当前页面
 
 ## 9. Capability 系统
 
-Capability 系统是 v0.9.292 的顶层治理机制，用于声明、投影和验证各表面能力。
+Capability 系统是 v0.9.293 的顶层治理机制，用于声明、投影和验证各表面能力。
 
 ### 9.1 Capability Registry
 
@@ -833,7 +833,7 @@ Capability 系统是 v0.9.292 的顶层治理机制，用于声明、投影和�
 
 ## 10. Structured Data Core
 
-Structured Data Core 是 v0.9.292 的通用结构化数据契约层，用于统一管理和运营结构化数据。
+Structured Data Core 是 v0.9.293 的通用结构化数据契约层，用于统一管理和运营结构化数据。
 
 核心概念：
 
