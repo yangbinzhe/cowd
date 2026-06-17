@@ -116,8 +116,8 @@ curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/healthz" >/dev/null
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"config_key":"gateway.webui_dir"'
-curl -fsS "$BASE_URL/api/cowd/release-gate" | rg -q '"structured_indexes_ready"\s*:\s*true'
-curl -fsS "$BASE_URL/api/cowd/release-gate" | rg -q '"structured_watermark_persistent"\s*:\s*true'
+release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
+printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; required=["structured_data.indexes.ready","structured_data.watermark.persistent"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate structured checks not passing: {missing}"'
 
 python3 - "$SOCKET" "$SMOKE_ID" <<'PY'
 import json
