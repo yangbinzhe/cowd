@@ -116,6 +116,8 @@ curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/healthz" >/dev/null
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"config_key":"gateway.webui_dir"'
+curl -fsS "$BASE_URL/api/cowd/release-gate" | rg -q '"structured_indexes_ready"\s*:\s*true'
+curl -fsS "$BASE_URL/api/cowd/release-gate" | rg -q '"structured_watermark_persistent"\s*:\s*true'
 
 python3 - "$SOCKET" "$SMOKE_ID" <<'PY'
 import json
