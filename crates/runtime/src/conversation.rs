@@ -3512,11 +3512,21 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
     };
 
     let mem = feature_config.memory();
-    let default_store_path = crate::cowd_dirs::config_home_dir().join("memory");
-    let store_path = mem.store_path.as_ref().unwrap_or(&default_store_path);
-
-    let sqlite_path = store_path.join("memory.db");
-    let blob_dir = store_path.join("blobs");
+    let storage_layout =
+        cowd_storage::StorageLayout::default_for_config_home(crate::cowd_dirs::config_home_dir());
+    let (sqlite_path, blob_dir) = if let Some(store_path) = mem.store_path.as_ref() {
+        (store_path.join("memory.db"), store_path.join("blobs"))
+    } else {
+        (
+            storage_layout
+                .sqlite_path("memory")
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    crate::cowd_dirs::config_home_dir().join("storage/memory.sqlite")
+                }),
+            storage_layout.blobs.join("memory"),
+        )
+    };
 
     CcMemoryConfig {
         store: StoreConfig {

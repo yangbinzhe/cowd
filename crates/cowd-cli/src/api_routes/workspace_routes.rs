@@ -254,7 +254,11 @@ async fn workspace_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl I
         "workspace_canonical": workspace_canonical.map(|path| path.display().to_string()),
         "profile_id": state.profile_id,
         "config_home": state.config_home.display().to_string(),
-        "sessions_db": state.config_home.join("sessions.db").display().to_string(),
+        "sessions_db": storage::StorageLayout::default_for_config_home(&state.config_home)
+            .sqlite_path("session")
+            .map(std::path::Path::display)
+            .map(|display| display.to_string())
+            .unwrap_or_else(|| state.config_home.join("sessions.db").display().to_string()),
         "memory_dir": state.config_home.join("memory").display().to_string(),
     }))
 }

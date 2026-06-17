@@ -662,12 +662,27 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
+    storage_config
+        .layout
+        .ensure_directories()
+        .map_err(|e| format!("failed to initialize storage layout: {e}"))?;
+    let approval_history_path = storage_config
+        .layout
+        .file_path("approval_history")
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| approval_dir.join("approval_history.json"));
+    let task_db_path = storage_config
+        .layout
+        .sqlite_path("tasks")
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| approval_dir.join("tasks.db"));
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
             runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
         ),
         runtime::ApprovalConfig::default(),
-        Some(approval_dir.join("approval_history.json")),
+        Some(approval_history_path),
     ));
     let profile_manager = Arc::new(runtime::ProfileManager::from_config_home(&approval_dir));
     if let Err(e) = profile_manager.initialize() {
@@ -685,7 +700,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     let profile_id = profile_manager.active_id();
     let task_kernel = Arc::new(
-        crate::task_kernel::TaskKernel::open(approval_dir.join("tasks.db"))
+        crate::task_kernel::TaskKernel::open(task_db_path)
             .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
     );
 

@@ -1,4 +1,7 @@
 use serde::Serialize;
+use storage::{
+    MigrationRunner, SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry,
+};
 
 use crate::api_routes::AppState;
 use crate::gateway_static::StaticWebUiSource;
@@ -29,6 +32,14 @@ pub(crate) struct GatewayHealthSnapshot {
     pub(crate) process: GatewayProcessSnapshot,
     pub(crate) static_webui: StaticWebUiSource,
     pub(crate) runtime: GatewayRuntimeSnapshot,
+    pub(crate) storage: StorageGatewaySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StorageGatewaySnapshot {
+    pub(crate) registry: StorageHealth,
+    pub(crate) migrations: Vec<storage::StorageMigration>,
+    pub(crate) locks: Vec<StorageLockDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +64,18 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         event_bus: true,
         session_kernel: true,
     };
+    let storage_registry = StorageRegistry::default_for_config_home(&state.config_home);
+    let pragma = SqlitePragmaConfig::default();
+    let storage = StorageGatewaySnapshot {
+        registry: storage_registry.health(),
+        migrations: MigrationRunner::from_registry(&storage_registry).status(),
+        locks: storage_registry
+            .handles
+            .iter()
+            .filter(|handle| matches!(handle.backend, storage::StorageBackendKind::Sqlite))
+            .map(|handle| StorageLockDiagnostics::for_handle(handle, pragma.busy_timeout_ms))
+            .collect(),
+    };
     let status = if runtime.session_kernel && runtime.event_bus {
         "healthy"
     } else {
@@ -71,6 +94,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         },
         static_webui,
         runtime,
+        storage,
     }
 }
 
@@ -82,6 +106,15 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
     }
     if !health.runtime.event_bus {
         degraded.push("runtime.event_bus_unavailable".to_string());
+    }
+    if !health
+        .storage
+        .registry
+        .handles
+        .iter()
+        .all(|handle| handle.writable_parent)
+    {
+        degraded.push("storage.parent_not_writable".to_string());
     }
 
     let ready = degraded.is_empty();
@@ -101,6 +134,7 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
             "gateway-api-router".to_string(),
             "session-kernel".to_string(),
             "event-bus".to_string(),
+            "storage-registry".to_string(),
         ],
         optional: vec!["static-webui".to_string()],
         optional_missing,

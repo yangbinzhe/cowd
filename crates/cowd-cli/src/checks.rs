@@ -484,7 +484,10 @@ pub(crate) fn check_enterprise_readiness(
             );
 
             let config_home = runtime::cowd_dirs::config_home_dir();
-            let session_db = config_home.join("sessions.db");
+            let session_db = storage::StorageLayout::default_for_config_home(&config_home)
+                .sqlite_path("session")
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| config_home.join("sessions.db"));
             let session_parent = session_db
                 .parent()
                 .map(|path| path.exists())

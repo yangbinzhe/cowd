@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 provider = { path = "../provider" }
+storage = { path = "../storage" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }

@@ -108,6 +108,34 @@ approval:
   auto_pass_read_only: true     # 只读命令自动通过
   auto_pass_low_risk: true      # 低风险命令自动通过
 
+# =============================================================================
+# Storage 统一治理
+# =============================================================================
+# 0.9.295 起，cowd 内核统一声明存储布局。Gateway/TUI 会通过健康检查展示
+# registry、migration 和锁诊断；历史 .cowd/*.db 或 .cowd/*.sqlite 不会被静默移动。
+storage:
+  backend: "sqlite"
+  root: "~/.cowd/storage"
+  sqlite:
+    session: "session.sqlite"
+    memory: "memory.sqlite"
+    matrix: "matrix.sqlite"
+    resource_directory: "resource-directory.sqlite"
+    tasks: "tasks.sqlite"
+    audit: "audit.sqlite"
+    approval: "approval.sqlite"
+  files:
+    approval_history: "files/approval_history.json"
+    always_approved: "files/always_approved.json"
+    audit_log: "files/audit.jsonl"
+  blobs: "blobs"
+  sqlite_pragmas:
+    busy_timeout_ms: 5000
+    journal_mode: "WAL"
+    foreign_keys: true
+    synchronous: "NORMAL"
+    temp_store: "MEMORY"
+
 # 受信根路径 (超出此范围的文件操作需要额外确认)
 trusted_roots: []
 
@@ -202,8 +230,8 @@ memory:
 
   # ── 存储配置 ──
   store:
-    sqlite_path: "~/.cowd/memory/memory.db" # SQLite 数据库路径
-    blob_dir: "~/.cowd/memory/blobs"        # Blob 存储目录
+    sqlite_path: "~/.cowd/storage/memory.sqlite" # SQLite 数据库路径
+    blob_dir: "~/.cowd/storage/blobs/memory"     # Blob 存储目录
     enable_vector_index: true    # 启用向量索引
 
   # ── 向量索引 (可选, 需配置远程 API) ──

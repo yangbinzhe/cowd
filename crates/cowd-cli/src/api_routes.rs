@@ -994,6 +994,80 @@ mod tests {
         assert_eq!(json["static_webui"]["status"], "missing_config");
         assert_eq!(json["runtime"]["session_kernel"], true);
         assert_eq!(json["runtime"]["event_bus"], true);
+        assert_eq!(json["storage"]["registry"]["handle_count"], 11);
+        assert!(json["storage"]["registry"]["root"]
+            .as_str()
+            .unwrap()
+            .contains("storage"));
+        assert!(json["storage"]["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "storage.matrix.layout"));
+        assert!(json["storage"]["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["domain"] == "tasks"));
+    }
+
+    #[tokio::test]
+    async fn gateway_storage_health_reports_registry_and_locks() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let handles = json["storage"]["registry"]["handles"].as_array().unwrap();
+        assert!(handles.iter().any(|item| item["domain"] == "session"));
+        assert!(handles.iter().any(|item| item["domain"] == "memory"));
+        assert!(handles.iter().any(|item| item["domain"] == "matrix"));
+        assert!(handles
+            .iter()
+            .any(|item| item["domain"] == "resource_directory"));
+        assert!(handles.iter().any(|item| item["domain"] == "tasks"));
+        assert_eq!(json["storage"]["locks"].as_array().unwrap().len(), 7);
+        assert!(json["storage"]["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "storage.tasks.layout"));
+    }
+
+    #[tokio::test]
+    async fn gateway_status_includes_storage_registry_summary() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["storage"]["registry"]["status"], "registered");
+        assert_eq!(json["storage"]["registry"]["handle_count"], 11);
+        assert!(
+            json["storage"]["registry"]["missing_count"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
     }
 
     #[tokio::test]
@@ -1009,10 +1083,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
@@ -1020,6 +1091,7 @@ mod tests {
         assert!(required.iter().any(|item| item == "gateway-runtime-host"));
         assert!(required.iter().any(|item| item == "gateway-api-router"));
         assert!(required.iter().any(|item| item == "session-kernel"));
+        assert!(required.iter().any(|item| item == "storage-registry"));
         let old_required_webui = ["static", "webui", "index"].join("-");
         assert!(!required.iter().any(|item| item == &old_required_webui));
         assert!(json["optional"]

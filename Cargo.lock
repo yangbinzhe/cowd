@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "command-runtime"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "chrono",
  "commands",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "serde",
 ]
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "commands",
  "runtime",
@@ -637,14 +637,14 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-mfg"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "runtime",
 ]
 
 [[package]]
 name = "cowd-cli"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "async-trait",
  "axum",
@@ -671,6 +671,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "sha2",
+ "storage",
  "syntect",
  "thiserror 2.0.18",
  "tokio",
@@ -689,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-memory"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2501,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "serde",
  "serde_json",
@@ -2608,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "reqwest",
  "runtime",
@@ -2988,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "aes",
  "async-trait",
@@ -3020,6 +3021,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
+ "storage",
  "telemetry",
  "tempfile",
  "thiserror 2.0.18",
@@ -3480,6 +3482,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "storage"
+version = "0.9.295"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3623,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "serde",
  "serde_json",
@@ -3896,7 +3909,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.294"
+version = "0.9.295"
 dependencies = [
  "base64 0.22.1",
  "command-runtime",

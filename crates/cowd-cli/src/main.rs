@@ -247,20 +247,33 @@ fn build_memory_config(
     if !src.enabled {
         return None;
     }
-    let store_path = src
-        .store_path
-        .as_ref()
-        .map(|p| expand_home(p))
-        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("memory"));
-
-    // Ensure the store directory exists before SQLite tries to open the database.
-    if let Err(e) = std::fs::create_dir_all(&store_path) {
-        tracing::warn!("failed to create memory store dir {:?}: {e}", store_path);
-    }
-
+    let storage_layout =
+        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
     let mut mc = memory::MemoryConfig::default();
-    mc.store.sqlite_path = store_path.join("memory.db");
-    mc.store.blob_dir = store_path.join("blobs");
+    if let Some(store_path) = src.store_path.as_ref().map(|p| expand_home(p)) {
+        if let Err(e) = std::fs::create_dir_all(&store_path) {
+            tracing::warn!("failed to create memory store dir {:?}: {e}", store_path);
+        }
+        mc.store.sqlite_path = store_path.join("memory.db");
+        mc.store.blob_dir = store_path.join("blobs");
+    } else {
+        mc.store.sqlite_path = storage_layout
+            .sqlite_path("memory")
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("storage/memory.sqlite"));
+        mc.store.blob_dir = storage_layout.blobs.join("memory");
+        if let Some(parent) = mc.store.sqlite_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("failed to create memory sqlite dir {:?}: {e}", parent);
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&mc.store.blob_dir) {
+            tracing::warn!(
+                "failed to create memory blob dir {:?}: {e}",
+                mc.store.blob_dir
+            );
+        }
+    }
     mc.store.enable_vector_index = src.vector.enabled;
     mc.store.vector.enabled = src.vector.enabled;
     mc.store.vector.model = src.vector.model.clone();
@@ -6361,7 +6374,12 @@ fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn s
         return Ok(store);
     }
 
-    let db_path = runtime::cowd_dirs::config_home_dir().join("sessions.db");
+    let storage_layout =
+        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
+    let db_path = storage_layout
+        .sqlite_path("session")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("sessions.db"));
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -6381,7 +6399,10 @@ fn jsonl_sessions_dir() -> PathBuf {
 }
 
 fn session_db_path() -> PathBuf {
-    runtime::cowd_dirs::config_home_dir().join("sessions.db")
+    storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir())
+        .sqlite_path("session")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("sessions.db"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7790,7 +7811,10 @@ fn setup_memory_item(config: &runtime::RuntimeConfig) -> SetupItem {
 }
 
 fn setup_session_item(config_home: &Path) -> SetupItem {
-    let db_path = config_home.join("sessions.db");
+    let db_path = storage::StorageLayout::default_for_config_home(config_home)
+        .sqlite_path("session")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| config_home.join("sessions.db"));
     SetupItem {
         id: "session",
         label: "Session",
@@ -9105,8 +9129,13 @@ pub(crate) fn ensure_yolo_task(
     if !yolo_mode {
         return Ok(None);
     }
-    let kernel =
-        task_kernel::TaskKernel::open(runtime::cowd_dirs::config_home_dir().join("tasks.db"))?;
+    let storage_layout =
+        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
+    let task_path = storage_layout
+        .sqlite_path("tasks")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("tasks.db"));
+    let kernel = task_kernel::TaskKernel::open(task_path)?;
     if let Some(current) = kernel.current() {
         return Ok(Some(current));
     }
@@ -12537,7 +12566,7 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(second.objective, "ship v0.8.10");
-        assert!(config_home.join("tasks.db").is_file());
+        assert!(config_home.join("storage").join("tasks.sqlite").is_file());
 
         match original {
             Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),

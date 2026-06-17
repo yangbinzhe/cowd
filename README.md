@@ -2,7 +2,7 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、Matrix 事实引擎、MFG 应用层和生产 Release Gate。
 
-当前内核版本：`0.9.294`
+当前内核版本：`0.9.295`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 
@@ -726,7 +726,9 @@ MFG skill 执行流程：
 
 Structured Data Core 属于 cowd 内核，不属于 MFG。MFG 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
-Memory 默认存储位置从 0.9.293 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
+0.9.295 起，cowd 内核新增统一 Storage Registry：默认根目录为 `~/.cowd/storage/`，设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/storage/`。Registry 统一声明 `session.sqlite`、`memory.sqlite`、`matrix.sqlite`、`resource-directory.sqlite`、`tasks.sqlite`、`audit.sqlite`、`approval.sqlite`、`files/approval_history.json`、`files/always_approved.json`、`files/audit.jsonl` 和 `blobs/`。Gateway `/healthz` 与 `/readyz` 会展示 storage registry、migration 和 SQLite 锁诊断。
+
+Memory 旧版默认存储曾使用 `~/.cowd/memory/memory.db`、`~/.cowd/memory/blobs`，更早版本也可能在项目工作目录生成 `memory.db` 或 `memory_blobs`。0.9.295 不会静默移动历史数据；需要保留历史数据时，应先备份旧文件，再迁移到统一 storage 目录，或在配置中显式设置历史路径。
 
 ### 8.3 Agents 面板
 

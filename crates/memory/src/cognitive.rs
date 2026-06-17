@@ -3516,6 +3516,7 @@ mod tests {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         let layers = mgr.list_layers().await;
@@ -3527,6 +3528,7 @@ mod tests {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert!(!mgr.embedding_capability().supports_semantic());
@@ -3537,6 +3539,7 @@ mod tests {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert_eq!(mgr.vector_index_stats().count, 0);
