@@ -1,181 +1,16 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::matrix::{
-    MatrixDataPlaneIngestPlan, MatrixDataPlaneWatermark, MatrixEvidencePacket, MatrixFact,
-    MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourcePack,
+    MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
+    MatrixEvidencePacket, MatrixFact, MatrixSourceDeltaPlan, MatrixSourceEntityMapping,
+    MatrixSourceFactMapping, MatrixSourcePack,
 };
-use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CowdStructuredTargetKind {
-    Entity,
-    Fact,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredSource {
-    pub source_id: String,
-    pub source_name: String,
-    pub domain: Option<String>,
-    pub owner: String,
-    pub access_mode: String,
-    pub refresh_mode: String,
-    #[serde(default)]
-    pub mappings: Vec<CowdStructuredMapping>,
-    #[serde(default)]
-    pub reconciliation_rules: Vec<String>,
-    #[serde(default)]
-    pub quality_rules: Vec<String>,
-    #[serde(default)]
-    pub freshness_sla: Option<String>,
-    #[serde(default)]
-    pub security_policy: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredMapping {
-    pub mapping_id: String,
-    pub source_ref: String,
-    pub source_collection: String,
-    pub target_kind: CowdStructuredTargetKind,
-    pub target_type: String,
-    #[serde(default)]
-    pub metric_key: Option<String>,
-    #[serde(default)]
-    pub key_fields: Vec<String>,
-    #[serde(default)]
-    pub measure_fields: Vec<String>,
-    #[serde(default)]
-    pub dedup_key: Option<String>,
-    #[serde(default)]
-    pub delta_signature: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredFact {
-    pub fact_id: String,
-    pub snapshot_id: String,
-    pub fact_type: String,
-    #[serde(default)]
-    pub entity_refs: Vec<String>,
-    #[serde(default)]
-    pub metric_key: Option<String>,
-    #[serde(default)]
-    pub dimensions: Value,
-    #[serde(default)]
-    pub measures: Value,
-    pub event_time: DateTime<Utc>,
-    #[serde(default)]
-    pub valid_from: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub valid_to: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub source_ref: Option<String>,
-    pub confidence: f32,
-    pub raw_hash: String,
-    #[serde(default)]
-    pub domain: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredEvidenceSourceRef {
-    pub kind: String,
-    pub reference: String,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredEvidence {
-    pub evidence_id: String,
-    #[serde(default)]
-    pub attention_id: Option<String>,
-    pub problem_statement: String,
-    #[serde(default)]
-    pub domain: Option<String>,
-    #[serde(default)]
-    pub business_context: Value,
-    #[serde(default)]
-    pub metric_evidence: Vec<Value>,
-    #[serde(default)]
-    pub change_evidence: Vec<Value>,
-    #[serde(default)]
-    pub anomaly_evidence: Vec<Value>,
-    #[serde(default)]
-    pub attribution_candidates: Vec<Value>,
-    #[serde(default)]
-    pub impact_paths: Vec<Value>,
-    #[serde(default)]
-    pub source_refs: Vec<CowdStructuredEvidenceSourceRef>,
-    #[serde(default)]
-    pub missing_evidence: Vec<String>,
-    pub confidence: f32,
-    pub token_budget: u64,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CowdWatermark {
-    pub source_ref: String,
-    pub fact_type: String,
-    pub partition_ref: String,
-    pub high_watermark: String,
-    pub last_batch_id: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredComputeRequest {
-    #[serde(default)]
-    pub job_id: Option<String>,
-    pub trigger_fact_type: String,
-    #[serde(default)]
-    pub trigger_fact_refs: Vec<String>,
-    #[serde(default)]
-    pub entity_scope: Option<String>,
-    #[serde(default)]
-    pub period: Option<String>,
-    #[serde(default)]
-    pub metric_ids: Vec<String>,
-    #[serde(default)]
-    pub priority: Option<f32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdIngestPlan {
-    pub batch_id: String,
-    pub source_ref: String,
-    pub fact_type: String,
-    pub partition_ref: String,
-    pub idempotency_key: String,
-    pub replay_policy: String,
-    pub estimated_rows: u64,
-    #[serde(default)]
-    pub affected_metric_ids: Vec<String>,
-    #[serde(default)]
-    pub compute_requests: Vec<CowdStructuredComputeRequest>,
-    pub watermark: CowdWatermark,
-    pub planned_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CowdDeltaPlan {
-    pub source_ref: String,
-    #[serde(default)]
-    pub fact_types: Vec<String>,
-    #[serde(default)]
-    pub affected_metric_ids: Vec<String>,
-    pub compute_scope: String,
-    pub planned_at: DateTime<Utc>,
-}
+use super::{
+    CowdDeltaPlan, CowdIngestPlan, CowdStructuredComputeRequest, CowdStructuredEvidence,
+    CowdStructuredEvidenceSourceRef, CowdStructuredFact, CowdStructuredIngestPlanInput,
+    CowdStructuredMapping, CowdStructuredSource, CowdStructuredTargetKind, CowdWatermark,
+};
 
 impl From<&MatrixSourcePack> for CowdStructuredSource {
     fn from(pack: &MatrixSourcePack) -> Self {
@@ -278,31 +113,6 @@ impl From<&MatrixFact> for CowdStructuredFact {
     }
 }
 
-impl CowdStructuredFact {
-    #[must_use]
-    pub fn stable_ref(&self) -> String {
-        format!("structured-fact:{}", self.fact_id)
-    }
-
-    #[must_use]
-    pub fn memory_summary(&self) -> CowdStructuredMemorySummary {
-        CowdStructuredMemorySummary {
-            reference: self.stable_ref(),
-            title: format!("{} fact {}", self.fact_type, self.fact_id),
-            summary: format!(
-                "Structured fact {} of type {} references {} entities and metric {}.",
-                self.fact_id,
-                self.fact_type,
-                self.entity_refs.len(),
-                self.metric_key.as_deref().unwrap_or("none")
-            ),
-            source_ref: self.source_ref.clone(),
-            confidence: self.confidence,
-            raw_hash: self.raw_hash.clone(),
-        }
-    }
-}
-
 impl From<&MatrixEvidencePacket> for CowdStructuredEvidence {
     fn from(packet: &MatrixEvidencePacket) -> Self {
         Self {
@@ -331,63 +141,6 @@ impl From<&MatrixEvidencePacket> for CowdStructuredEvidence {
             created_at: packet.created_at,
         }
     }
-}
-
-impl CowdStructuredEvidence {
-    #[must_use]
-    pub fn stable_ref(&self) -> String {
-        format!("structured-evidence:{}", self.evidence_id)
-    }
-
-    #[must_use]
-    pub fn memory_summary(&self) -> CowdStructuredMemorySummary {
-        CowdStructuredMemorySummary {
-            reference: self.stable_ref(),
-            title: format!("Evidence {}", self.evidence_id),
-            summary: format!(
-                "{}. metric_evidence={}, change_evidence={}, source_refs={}, confidence={:.2}",
-                self.problem_statement,
-                self.metric_evidence.len(),
-                self.change_evidence.len(),
-                self.source_refs.len(),
-                self.confidence
-            ),
-            source_ref: None,
-            confidence: self.confidence,
-            raw_hash: self.evidence_id.clone(),
-        }
-    }
-
-    #[must_use]
-    pub fn to_context_item(&self) -> ContextItem {
-        let summary = self.memory_summary();
-        let mut item = ContextItem::new(
-            summary.reference,
-            ContextSourceKind::Task,
-            ContextRole::Evidence,
-            summary.summary,
-        );
-        item.authority = ContextAuthority::Derived;
-        item.visibility = ContextVisibility::Shared;
-        item.score = self.confidence;
-        item.evidence = self
-            .source_refs
-            .iter()
-            .map(|source| source.reference.clone())
-            .collect();
-        item
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CowdStructuredMemorySummary {
-    pub reference: String,
-    pub title: String,
-    pub summary: String,
-    #[serde(default)]
-    pub source_ref: Option<String>,
-    pub confidence: f32,
-    pub raw_hash: String,
 }
 
 impl From<&MatrixDataPlaneWatermark> for CowdWatermark {
@@ -445,12 +198,29 @@ impl From<&MatrixSourceDeltaPlan> for CowdDeltaPlan {
     }
 }
 
+impl From<CowdStructuredIngestPlanInput> for MatrixDataPlaneIngestPlanInput {
+    fn from(input: CowdStructuredIngestPlanInput) -> Self {
+        Self {
+            source_ref: input.source_ref,
+            fact_type: input.fact_type,
+            partition_ref: input.partition_ref,
+            high_watermark: input.high_watermark,
+            estimated_rows: input.estimated_rows,
+            raw_checksum: input.raw_checksum,
+            metric_ids: input.metric_ids,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
+
     use super::*;
     use crate::matrix::{
         MatrixComputeJobInput, MatrixDataPlaneIngestPlan, MatrixDataPlaneWatermark,
-        MatrixEvidenceSourceRef, MatrixFactInput,
+        MatrixEvidenceSourceRef, MatrixFactInput, MatrixSourceEntityMapping,
+        MatrixSourceFactMapping, MatrixSourcePack,
     };
 
     #[test]
@@ -594,58 +364,5 @@ mod tests {
         assert_eq!(evidence.source_refs[0].reference, "fact-1");
         assert_eq!(evidence.metric_evidence.len(), 1);
         assert_eq!(evidence.confidence, 0.7);
-    }
-
-    #[test]
-    fn structured_fact_memory_summary_keeps_reference_without_raw_payload_copy() {
-        let fact = MatrixFact::from_input(MatrixFactInput {
-            fact_id: Some("fact-1".to_string()),
-            snapshot_id: Some("snapshot-1".to_string()),
-            fact_type: "inventory_balance".to_string(),
-            entity_refs: vec!["material:123".to_string(), "site:cn-1".to_string()],
-            metric_key: Some("stock_on_hand".to_string()),
-            dimensions: serde_json::json!({"large_dimension": "x".repeat(512)}),
-            measures: serde_json::json!({"quantity": 12}),
-            event_time: Some(DateTime::<Utc>::UNIX_EPOCH),
-            valid_from: None,
-            valid_to: None,
-            source_ref: Some("pack-1".to_string()),
-            confidence: Some(0.9),
-            raw_hash: Some("sha256:fact".to_string()),
-        });
-
-        let summary = CowdStructuredFact::from(&fact).memory_summary();
-
-        assert_eq!(summary.reference, "structured-fact:fact-1");
-        assert_eq!(summary.source_ref.as_deref(), Some("pack-1"));
-        assert_eq!(summary.raw_hash, "sha256:fact");
-        assert!(!summary.summary.contains("large_dimension"));
-        assert!(summary.summary.contains("references 2 entities"));
-    }
-
-    #[test]
-    fn structured_evidence_context_item_uses_summary_and_source_refs() {
-        let mut packet = MatrixEvidencePacket::new("supplier delivery risk changed");
-        packet.packet_id = "packet-1".to_string();
-        packet.source_refs.push(MatrixEvidenceSourceRef {
-            kind: "fact".to_string(),
-            reference: "fact-1".to_string(),
-            summary: "inventory fact".to_string(),
-        });
-        packet
-            .metric_evidence
-            .push(serde_json::json!({"metric": "order_delivery_risk"}));
-        packet.confidence = 0.75;
-
-        let evidence = CowdStructuredEvidence::from(&packet);
-        let item = evidence.to_context_item();
-
-        assert_eq!(item.id, "structured-evidence:packet-1");
-        assert_eq!(item.role, ContextRole::Evidence);
-        assert_eq!(item.authority, ContextAuthority::Derived);
-        assert_eq!(item.visibility, ContextVisibility::Shared);
-        assert_eq!(item.score, 0.75);
-        assert_eq!(item.evidence, vec!["fact-1"]);
-        assert!(item.content.contains("metric_evidence=1"));
     }
 }

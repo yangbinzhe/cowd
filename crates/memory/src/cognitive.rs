@@ -3489,6 +3489,7 @@ mod tests {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert_eq!(mgr.search_mode_label(), "keyword");
@@ -3500,6 +3501,7 @@ mod tests {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
 
         let mgr = CognitiveContextManager::new(cfg)
             .await

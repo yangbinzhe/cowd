@@ -154,7 +154,7 @@ impl CowdCapabilityRegistry {
                     "mfg.manufacturing.application",
                     "MFG Manufacturing Application",
                     CowdCapabilityKind::Manufacturing,
-                    "runtime::mfg",
+                    "cowd-app-mfg",
                     "Manufacturing upper application over Matrix structured facts, memory, context and skill capabilities.",
                     &[
                         "cowd.matrix.runtime",
@@ -329,7 +329,7 @@ mod tests {
             .expect("mfg app capability should exist");
 
         assert_eq!(mfg.layer, CowdCapabilityLayer::Application);
-        assert_eq!(mfg.owner_module, "runtime::mfg");
+        assert_eq!(mfg.owner_module, "cowd-app-mfg");
         assert!(mfg.depends_on.contains(&"cowd.matrix.runtime".to_string()));
         assert_eq!(mfg.required_permissions, vec!["read:mfg", "write:mfg"]);
     }

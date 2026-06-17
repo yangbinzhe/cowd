@@ -7,12 +7,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use cowd_app_mfg::server_manufacturing_skill_pack;
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
 use runtime::matrix::{
-    MatrixDataPlaneIngestPlanInput, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixStore,
-    MatrixStoreError,
+    MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixStore, MatrixStoreError,
 };
-use runtime::mfg::server_manufacturing_skill_pack;
 use runtime::projection::CowdProjection;
 use runtime::quality_gate::CowdStructuredQualityGate;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
@@ -20,7 +19,8 @@ use runtime::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
 use runtime::skill_dependency::CowdSkillStructuredDependency;
 use runtime::skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 use runtime::structured_data::{
-    CowdIngestPlan, CowdStructuredEvidence, CowdStructuredFact, CowdStructuredSource, CowdWatermark,
+    CowdIngestPlan, CowdStructuredEvidence, CowdStructuredFact, CowdStructuredIngestPlanInput,
+    CowdStructuredSource, CowdWatermark,
 };
 use runtime::surface_contract::CowdSurfaceParityContract;
 use serde::{Deserialize, Serialize};
@@ -118,10 +118,12 @@ async fn structured_source_get_handler(
 
 async fn structured_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(input): Json<MatrixDataPlaneIngestPlanInput>,
+    Json(input): Json<CowdStructuredIngestPlanInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let store = open_matrix_store(&state)?;
-    let plan = store.plan_data_plane_ingest(input).map_err(store_error)?;
+    let plan = store
+        .plan_data_plane_ingest(input.into())
+        .map_err(store_error)?;
     Ok(Json(CowdIngestPlan::from(&plan)))
 }
 

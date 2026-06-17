@@ -3510,20 +3510,13 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
     use memory::config::{
         BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig,
     };
-    use std::path::PathBuf;
 
     let mem = feature_config.memory();
+    let default_store_path = crate::cowd_dirs::config_home_dir().join("memory");
+    let store_path = mem.store_path.as_ref().unwrap_or(&default_store_path);
 
-    let sqlite_path = mem
-        .store_path
-        .as_ref()
-        .map(|p| p.join("memory.db"))
-        .unwrap_or_else(|| PathBuf::from("memory.db"));
-    let blob_dir = mem
-        .store_path
-        .as_ref()
-        .map(|p| p.join("memory_blobs"))
-        .unwrap_or_else(|| PathBuf::from("memory_blobs"));
+    let sqlite_path = store_path.join("memory.db");
+    let blob_dir = store_path.join("blobs");
 
     CcMemoryConfig {
         store: StoreConfig {

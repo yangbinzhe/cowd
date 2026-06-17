@@ -3194,7 +3194,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
     // P1: Skills data pipeline, aligned with the WebUI unified skill catalog.
     app.skill_list.clear();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for skill in runtime::server_manufacturing_skill_pack() {
+    for skill in cowd_app_mfg::server_manufacturing_skill_pack() {
         let risk = if skill
             .output_actions
             .iter()
@@ -9828,13 +9828,11 @@ impl AnthropicRuntimeClient {
         // For Anthropic we build the client directly instead of going
         // through `ApiProviderClient::from_model_with_anthropic_auth`
         // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/cowd-cli/tests/compact_output.rs`) to point
-        // cowd at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
+        // reads `ANTHROPIC_BASE_URL` and lets configured test or
+        // staging endpoints exercise the same provider path as
+        // production. We also attach a session-scoped prompt cache on
+        // the Anthropic path; the prompt cache is Anthropic-only so
+        // non-Anthropic variants skip it.
         let resolved_model = model.trim().to_string();
 
         let provider = runtime::resolve_global_provider(&resolved_model).ok_or_else(|| {
@@ -15136,7 +15134,7 @@ providers:
     }
 
     #[test]
-    fn tool_rendering_helpers_compact_output() {
+    fn tool_rendering_helpers_compact_display() {
         let start = format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#);
         assert!(start.contains("read_file"));
         assert!(start.contains("src/main.rs"));

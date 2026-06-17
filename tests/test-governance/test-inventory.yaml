@@ -1,5 +1,5 @@
 version: 1
-release_version: 0.9.201
+release_version: 0.9.290
 governance_goal: >
   Keep cowd validation focused on critical control points. Default gates should
   protect kernel contracts and a small set of cross-module golden paths. Manual,

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability::CowdCapabilityRegistry;
-use crate::mfg::manufacturing_app_descriptor as mfg_manufacturing_app_descriptor;
 use crate::surface_contract::CowdSurfaceParityContract;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +56,7 @@ impl CowdReleaseGateReport {
     pub fn evaluate_with(evidence: CowdReleaseGateRuntimeEvidence) -> Self {
         let registry = CowdCapabilityRegistry::core();
         let surface = CowdSurfaceParityContract::from_registry(&registry);
-        let mfg = mfg_manufacturing_app_descriptor();
+        let mfg = registry.capability("mfg.manufacturing.application");
         let checks = vec![
             check(
                 "capability.registry.unique_ids",
@@ -76,13 +75,10 @@ impl CowdReleaseGateReport {
             ),
             check(
                 "mfg.application.boundary",
-                registry
-                    .capability("mfg.manufacturing.application")
-                    .is_some()
-                    && mfg.layer == "application"
-                    && mfg
-                        .cowd_capabilities
-                        .contains(&"cowd.matrix.runtime".to_string()),
+                mfg.is_some_and(|mfg| {
+                    mfg.layer == crate::capability::CowdCapabilityLayer::Application
+                        && mfg.depends_on.contains(&"cowd.matrix.runtime".to_string())
+                }),
                 "MFG is an application descriptor over Matrix, Memory and runtime capabilities.",
             ),
             check(

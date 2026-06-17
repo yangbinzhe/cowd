@@ -1,8 +1,8 @@
 # Cowd
 
-Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、MFG 结构化运营智能和生产 Release Gate。
+Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、Matrix 事实引擎、MFG 应用层和生产 Release Gate。
 
-当前内核版本：`0.9.201`
+当前内核版本：`0.9.290`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 
@@ -163,7 +163,6 @@ crates/commands
 crates/compat-harness
 crates/cowd-cli
 crates/memory
-crates/mock-anthropic-service
 crates/plugins
 crates/runtime
 crates/telemetry
@@ -240,8 +239,9 @@ crates/tools
 | `src/release_gate.rs` | 证据驱动发布门 |
 | `src/gates.rs` | PreFlight/Revision/Escalation/Abort Gate 机制 |
 | `src/green_contract.rs` | Green 合约分级 |
-| `src/matrix/* + src/mfg/*` | MFG 结构化运营智能 |
-| `src/mfg/app.rs` | MFG 应用描述器 |
+| `src/matrix/*` | Matrix 结构化事实引擎 |
+| `crates/app-mfg` | MFG 制造应用边界 |
+| `src/mfg/*` | MFG 兼容桥，迁移期保留，后续从 runtime 内核移除 |
 | `src/platform/*` | 平台和 channel 类型 |
 | `src/mcp_stdio.rs` | MCP stdio 管理 |
 | `src/connector.rs` | Connector 基础 |
@@ -318,7 +318,6 @@ install <path>
 - Anthropic / OpenAI / DeepSeek / Qwen 等 API 适配
 - streaming / non-streaming
 - 请求签名和响应结构
-- mock parity 支持
 
 ### 3.8 `crates/plugins`
 
@@ -338,10 +337,6 @@ install <path>
 ### 3.10 `crates/compat-harness`
 
 兼容性测试和命令/tool 对齐验证。
-
-### 3.11 `crates/mock-anthropic-service`
-
-本地 mock 服务，用于 API 和兼容测试。
 
 ---
 
@@ -490,7 +485,7 @@ Cowd 自身的能力、投影和结构化数据 API：
 
 ### 5.6 Matrix/MFG API
 
-Matrix/MFG API 是结构化运营智能的领域实现层。
+Matrix API 是结构化事实引擎管理层；MFG API 是 `cowd-app-mfg` 制造应用层。MFG 不属于 cowd 内核，迁移期通过 runtime 兼容桥复用既有实现。
 
 常用入口：
 
@@ -726,6 +721,8 @@ MFG skill 执行流程：
 
 Structured Data Core 属于 cowd 内核，不属于 MFG。MFG 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
+Memory 默认存储位置从 0.9.290 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
+
 ### 8.3 Agents 面板
 
 入口：左侧 `Agents` icon。
@@ -784,7 +781,7 @@ MFG 是 manufacturing application layer on top of the cowd kernel。当前页面
 
 ## 9. Capability 系统
 
-Capability 系统是 v0.9.201 的顶层治理机制，用于声明、投影和验证各表面能力。
+Capability 系统是 v0.9.290 的顶层治理机制，用于声明、投影和验证各表面能力。
 
 ### 9.1 Capability Registry
 
@@ -831,7 +828,7 @@ Capability 系统是 v0.9.201 的顶层治理机制，用于声明、投影和�
 
 ## 10. Structured Data Core
 
-Structured Data Core 是 v0.9.201 的通用结构化数据契约层，用于统一管理和运营结构化数据。
+Structured Data Core 是 v0.9.290 的通用结构化数据契约层，用于统一管理和运营结构化数据。
 
 核心概念：
 
@@ -936,8 +933,8 @@ SourceSnapshot
 | execution | dry_run / commit / feedback |
 | cockpit | profile / projection / report / delivery |
 | skill | MFG skill manifest、plan、run |
-| app | MFG 应用描述器（domain, surface, skill pack） |
-| store | MFG SQLite store |
+| app | MFG 应用描述器（domain, surface, skill pack），对外边界在 `crates/app-mfg` |
+| store | MFG 应用 Store 外观，底层暂与 Matrix SQLite 共用 |
 
 Matrix store 默认位置：
 

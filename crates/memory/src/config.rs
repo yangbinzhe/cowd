@@ -493,14 +493,28 @@ pub struct StoreConfig {
 
 impl Default for StoreConfig {
     fn default() -> Self {
+        let store_dir = default_memory_store_dir();
         Self {
-            sqlite_path: PathBuf::from("memory.db"),
-            blob_dir: PathBuf::from("memory_blobs"),
+            sqlite_path: store_dir.join("memory.db"),
+            blob_dir: store_dir.join("blobs"),
             enable_vector_index: false,
             cache_capacity: 512,
             vector: VectorConfig::default(),
         }
     }
+}
+
+fn default_memory_store_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
+        return PathBuf::from(path).join("memory");
+    }
+
+    let dot_dir = std::env::var("COWD_DIR_NAME").unwrap_or_else(|_| ".cowd".to_string());
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(dot_dir)
+        .join("memory")
 }
 
 /// Remote embedding model configuration.

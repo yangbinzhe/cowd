@@ -10,11 +10,11 @@ use axum::{
     Json, Router,
 };
 use commands::{SkillInfo, SkillRegistry, SkillRouter};
-use runtime::{
+use cowd_app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack, MatrixEvidencePacket, MatrixStore, MatrixStoreError,
-    MfgIncident, MfgOperationalAnalysis, MfgSkillManifest,
+    server_manufacturing_skill_pack, MfgIncident, MfgOperationalAnalysis, MfgSkillManifest,
 };
+use runtime::{MatrixEvidencePacket, MatrixStore, MatrixStoreError};
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};

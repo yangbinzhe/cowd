@@ -186,7 +186,7 @@ run_unit_fast() {
 
 run_contract() {
   run_step cargo_fmt cargo fmt --check
-  for pkg in api commands compat-harness cowd-memory mock-anthropic-service plugins runtime telemetry tools; do
+  for pkg in api commands compat-harness cowd-memory plugins runtime telemetry tools; do
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
   done
   run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture

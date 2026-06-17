@@ -52,11 +52,13 @@ fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
 
 #[test]
 fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
-    let mfg_root = repo_root().join("crates/runtime/src/mfg");
+    let mfg_root = repo_root().join("crates/app-mfg/src");
     let files = read_rs_files(&mfg_root);
     assert!(
-        files.iter().any(|(_, content)| content.contains("Matrix")),
-        "MFG application boundary should document Matrix as its structured fact dependency"
+        files
+            .iter()
+            .any(|(_, content)| content.contains("runtime::mfg")),
+        "MFG application crate should own the public application boundary during migration"
     );
 
     for (path, content) in files {
@@ -64,6 +66,55 @@ fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
             !content.contains("webui"),
             "MFG runtime source {} must not depend on WebUI",
             path.display()
+        );
+    }
+}
+
+#[test]
+fn structured_data_contract_has_no_matrix_or_context_dependency() {
+    let contract = repo_root().join("crates/runtime/src/structured_data/contract.rs");
+    let content = fs::read_to_string(&contract)
+        .unwrap_or_else(|_| panic!("read source {}", contract.display()));
+    for term in [
+        "crate::matrix",
+        "Matrix",
+        "ContextItem",
+        "ContextRole",
+        "ContextSourceKind",
+    ] {
+        assert!(
+            !content.contains(term),
+            "structured data contract must not contain forbidden dependency term {term}"
+        );
+    }
+}
+
+#[test]
+fn cowd_cli_depends_on_mfg_application_crate() {
+    let manifest = repo_root().join("crates/cowd-cli/Cargo.toml");
+    let content = fs::read_to_string(&manifest)
+        .unwrap_or_else(|_| panic!("read manifest {}", manifest.display()));
+    assert!(
+        content.contains("cowd-app-mfg"),
+        "cowd-cli must consume MFG through the application crate"
+    );
+}
+
+#[test]
+fn mfg_store_facade_does_not_expose_matrix_store() {
+    let store = repo_root().join("crates/app-mfg/src/store.rs");
+    let content =
+        fs::read_to_string(&store).unwrap_or_else(|_| panic!("read source {}", store.display()));
+
+    for term in [
+        "impl Deref for MfgStore",
+        "pub fn matrix(",
+        "pub(crate) fn matrix(",
+        "pub use runtime::MatrixStore",
+    ] {
+        assert!(
+            !content.contains(term),
+            "MFG store facade must not leak MatrixStore through {term}"
         );
     }
 }
