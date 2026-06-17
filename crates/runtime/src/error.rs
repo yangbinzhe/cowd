@@ -1,11 +1,11 @@
-//! Unified error types for the cowd runtime.
+//! Unified error types for the runtime.
 //!
 //! Provides `CowdError`, `RecoveryStrategy`, and the `ErrorChain` concept
 //! so that every layer of the stack can surface structured, recoverable errors.
 
 use std::fmt;
 
-/// Top-level error type for all cowd runtime operations.
+/// Top-level error type for all runtime operations.
 #[derive(Debug)]
 pub enum CowdError {
     /// Storage-layer failures (I/O, serialisation, corruption).

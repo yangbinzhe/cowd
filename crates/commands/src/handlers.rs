@@ -677,7 +677,9 @@ mod tests {
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
-        assert!(help.contains("[resume]          also works with --resume <session-id|latest>"));
+        assert!(
+            help.contains("[resumed TUI]     available after `cowd --resume <session-id|latest>`")
+        );
         assert!(help.contains("Session"));
         assert!(help.contains("Tools"));
         assert!(help.contains("Config"));
@@ -788,7 +790,9 @@ mod tests {
         assert!(help.contains("/mcp"));
         assert!(help.contains("Summary          Inspect configured MCP servers"));
         assert!(help.contains("Category         Tools"));
-        assert!(help.contains("Resume           Supported with --resume <session-id|latest>"));
+        assert!(
+            help.contains("Resumed TUI      Available after `cowd --resume <session-id|latest>`")
+        );
     }
 
     #[test]

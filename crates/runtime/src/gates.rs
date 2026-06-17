@@ -748,7 +748,7 @@ impl EscalationGate {
                 "src/auth".to_string(),
                 "src/security".to_string(),
                 "src/payment".to_string(),
-                "crates/api/src/auth".to_string(),
+                "crates/provider/src/auth".to_string(),
             ],
             high_risk_patterns: vec![
                 r"password.*=.*".to_string(),

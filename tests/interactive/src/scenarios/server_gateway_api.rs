@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::provider::ApiClient;
 use crate::server::ServerProcess;
 use crate::reporter::TestRunner;
 

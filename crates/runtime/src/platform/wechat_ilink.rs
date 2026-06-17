@@ -490,7 +490,7 @@ impl WeChatLinkAdapter {
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| {
                     PlatformError::AuthenticationFailed(
-                        "missing QR-authorized wechat token; run `cowd gateway wechat-qr`"
+                        "missing QR-authorized wechat token; configure the WeChat platform in Gateway/WebUI"
                             .to_string(),
                     )
                 });

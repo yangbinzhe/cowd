@@ -1,3 +1,5 @@
+const PROMPT_PERMISSION_MODE: &str = "prompt";
+
 pub fn is_help_flag(value: &str) -> bool {
     value == "--help" || value == "-h"
 }
@@ -9,7 +11,7 @@ pub fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
         "danger-full-access" | "dangerfull" | "dangerFullAccess" | "danger_full_access" => {
             Some("danger-full-access")
         }
-        "prompt" => Some("prompt"),
+        value if value == PROMPT_PERMISSION_MODE => Some(PROMPT_PERMISSION_MODE),
         _ => None,
     }
 }

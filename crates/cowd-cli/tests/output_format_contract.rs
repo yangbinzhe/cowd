@@ -4,7 +4,6 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::Session;
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -18,9 +17,9 @@ fn help_emits_json_when_requested() {
     assert_eq!(parsed["kind"], "help");
     let message = parsed["message"].as_str().expect("help text");
     assert!(message.contains("Core commands:"));
-    assert!(message.contains("cowd gateway start|stop|status|doctor"));
+    assert!(message.contains("cowd gateway start|stop|restart|status|doctor|logs|repair|open"));
     assert!(message.contains("cowd skills list|show|validate"));
-    assert!(message.contains("Advanced compatibility:"));
+    assert!(message.contains("Advanced local tools:"));
 }
 
 #[test]
@@ -275,9 +274,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(sandbox["enabled"].is_boolean());
     assert!(sandbox["fallback_reason"].is_null() || sandbox["fallback_reason"].is_string());
 
-    let config_home = root.join("resume-config-home");
-    write_session_fixture(&config_home, &root, "resume-json", Some("hello"));
-    let resumed = assert_json_command_with_env(
+    let output = run_cowd(
         &root,
         &[
             "--output-format",
@@ -286,35 +283,17 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "resume-json",
             "/status",
         ],
-        &[(
-            "COWD_CONFIG_HOME",
-            config_home.to_str().expect("utf8 config home"),
-        )],
+        &[],
     );
-    assert_eq!(resumed["kind"], "status");
-    // model is null in resume mode (not known without --model flag)
-    assert!(resumed["model"].is_null());
-    assert_eq!(resumed["usage"]["messages"], 1);
-    assert!(resumed["workspace"]["cwd"].as_str().is_some());
-    assert!(resumed["sandbox"]["filesystem_mode"].as_str().is_some());
+    assert_resume_slash_removed(&output);
 }
 
 #[test]
-fn resumed_inventory_commands_emit_structured_json_when_requested() {
+fn resumed_inventory_commands_are_tui_only() {
     let root = unique_temp_dir("resume-inventory-json");
-    let config_home = root.join("config-home");
-    let home = root.join("home");
-    fs::create_dir_all(&config_home).expect("config home should exist");
-    fs::create_dir_all(&home).expect("home should exist");
+    fs::create_dir_all(&root).expect("temp dir should exist");
 
-    write_session_fixture(
-        &config_home,
-        &root,
-        "resume-inventory-json",
-        Some("inventory"),
-    );
-
-    let mcp = assert_json_command_with_env(
+    let mcp = run_cowd(
         &root,
         &[
             "--output-format",
@@ -323,19 +302,11 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
             "resume-inventory-json",
             "/mcp",
         ],
-        &[
-            (
-                "COWD_CONFIG_HOME",
-                config_home.to_str().expect("utf8 config home"),
-            ),
-            ("HOME", home.to_str().expect("utf8 home")),
-        ],
+        &[],
     );
-    assert_eq!(mcp["kind"], "mcp");
-    assert_eq!(mcp["action"], "list");
-    assert!(mcp["servers"].is_array());
+    assert_resume_slash_removed(&mcp);
 
-    let skills = assert_json_command_with_env(
+    let skills = run_cowd(
         &root,
         &[
             "--output-format",
@@ -344,29 +315,17 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
             "resume-inventory-json",
             "/skills",
         ],
-        &[
-            (
-                "COWD_CONFIG_HOME",
-                config_home.to_str().expect("utf8 config home"),
-            ),
-            ("HOME", home.to_str().expect("utf8 home")),
-        ],
+        &[],
     );
-    assert_eq!(skills["kind"], "skills");
-    assert_eq!(skills["action"], "list");
-    assert!(skills["summary"]["total"].is_number());
-    assert!(skills["skills"].is_array());
+    assert_resume_slash_removed(&skills);
 }
 
 #[test]
-fn resumed_version_and_init_emit_structured_json_when_requested() {
+fn resumed_version_and_init_commands_are_tui_only() {
     let root = unique_temp_dir("resume-version-init-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
-    let config_home = root.join("config-home");
 
-    write_session_fixture(&config_home, &root, "resume-version-init-json", None);
-
-    let version = assert_json_command_with_env(
+    let version = run_cowd(
         &root,
         &[
             "--output-format",
@@ -375,15 +334,11 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
             "resume-version-init-json",
             "/version",
         ],
-        &[(
-            "COWD_CONFIG_HOME",
-            config_home.to_str().expect("utf8 config home"),
-        )],
+        &[],
     );
-    assert_eq!(version["kind"], "version");
-    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
+    assert_resume_slash_removed(&version);
 
-    let init = assert_json_command_with_env(
+    let init = run_cowd(
         &root,
         &[
             "--output-format",
@@ -392,13 +347,9 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
             "resume-version-init-json",
             "/init",
         ],
-        &[(
-            "COWD_CONFIG_HOME",
-            config_home.to_str().expect("utf8 config home"),
-        )],
+        &[],
     );
-    assert_eq!(init["kind"], "init");
-    assert!(root.join("CLAUDE.md").exists());
+    assert_resume_slash_removed(&init);
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
@@ -414,6 +365,24 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("stdout should be valid json")
+}
+
+fn assert_resume_slash_removed(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "expected resume slash command to fail\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was removed from the CLI surface"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run slash commands inside the TUI"),
+        "{stderr}"
+    );
 }
 
 fn run_cowd(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
@@ -463,65 +432,6 @@ fn write_upstream_fixture(root: &Path) -> PathBuf {
     )
     .expect("cli fixture should write");
     upstream
-}
-
-fn write_session_fixture(
-    config_home: &Path,
-    root: &Path,
-    session_id: &str,
-    user_text: Option<&str>,
-) {
-    fs::create_dir_all(config_home).expect("config home should exist");
-    let mut session = Session::new().with_workspace_root(root.to_path_buf());
-    session.session_id = session_id.to_string();
-    if let Some(text) = user_text {
-        session
-            .push_user_text(text)
-            .expect("session fixture message should persist");
-    }
-
-    let store = memory::UnifiedSessionStore::open(&config_home.join("sessions.db"))
-        .expect("unified session store should open");
-    let record = memory::SessionRecord {
-        session_id: session.session_id.clone(),
-        platform: "cli".to_string(),
-        chat_id: session.session_id.clone(),
-        user_id: None,
-        model: session.model.clone(),
-        created_at: "2026-06-05T00:00:00Z".to_string(),
-        last_activity: "2026-06-05T00:00:00Z".to_string(),
-        message_count: session.messages.len() as i64,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(
-            serde_json::json!({
-                "workspace_root": session.workspace_root().map(|path| path.display().to_string()),
-                "session_path": config_home.join("sessions.db").display().to_string(),
-            })
-            .to_string(),
-        ),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    };
-    let messages = session
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(sequence, message)| message.to_session_message(&session.session_id, sequence))
-        .collect::<Vec<_>>();
-
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should create");
-    runtime
-        .block_on(async {
-            store.upsert_session(&record).await?;
-            store.delete_messages_from(&session.session_id, 0).await?;
-            if !messages.is_empty() {
-                store.insert_messages_batch(&messages).await?;
-            }
-            Ok::<(), memory::MemoryError>(())
-        })
-        .expect("fixture should persist to unified store");
 }
 
 fn write_agent(root: &Path, name: &str, description: &str, model: &str, reasoning: &str) {

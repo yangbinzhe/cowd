@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::provider::ApiClient;
 use crate::reporter::TestRunner;
 use crate::tui::TuiSession;
 

@@ -10,7 +10,7 @@
 //! This module replaces:
 //! * the CLI built-in alias table (`crates/cowd-cli/src/cli/mod.rs`)
 //! * the API `MODEL_REGISTRY` and `resolve_model_alias` in
-//!   `crates/api/src/providers/mod.rs`
+//!   `crates/provider/src/providers/mod.rs`
 //!
 //! The built-in fallback table only retains the two entries from
 //! `config-default.yaml`: `main → claude-sonnet-4-6`, `fast → claude-haiku-...`.

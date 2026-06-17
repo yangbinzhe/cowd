@@ -61,7 +61,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `cowd login` is removed"
+            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; legacy login is removed"
                 .to_string(),
         ])
         .with_data(Map::from_iter([

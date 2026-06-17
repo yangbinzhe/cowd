@@ -349,11 +349,11 @@ mcp:
 # =============================================================================
 # 网关 (多平台接入)
 # =============================================================================
-# cowd serve 启动时自动读取本配置：
-#   - host/port 从 api_server 配置读取（CLI --host/--port 可覆盖）
-#   - auth.enabled/token 控制 API 认证（CLI --no-auth 可关闭）
-#   - 直接启动: cowd serve （使用以下配置）
-#   - 指定端口: cowd serve --port 9090 （覆盖以下 port）
+# cowd gateway start 启动时自动读取本配置：
+#   - host/port 从 api_server 配置读取
+#   - webui_dir 可指定外部 WebUI 静态资源目录
+#   - API 凭证、模型和渠道密钥统一由 config/secrets 管理
+#   - 直接启动: cowd gateway start
 
 gateway:
   enabled: true
@@ -365,7 +365,7 @@ gateway:
   # 空闲会话超时（分钟），用于 idle/both 策略，默认 30
   # idle_timeout_minutes: 30
   platforms:
-    # Web API Server — cowd serve 命令使用此配置
+    # Web API Server — cowd gateway start 使用此配置
     - platform_type: api_server
       enabled: true
       host: "127.0.0.1"

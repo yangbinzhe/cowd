@@ -2,7 +2,7 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、Matrix 事实引擎、MFG 应用层和生产 Release Gate。
 
-当前内核版本：`0.9.290`
+当前内核版本：`0.9.291`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 
@@ -38,20 +38,21 @@ Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统�
 ~/AI/cowd --permission-mode workspace-write
 ```
 
-一次性 prompt：
+交互式输入：
 
 ```bash
-~/AI/cowd prompt "总结当前仓库结构"
-~/AI/cowd --output-format json prompt "列出可用 skills"
-~/AI/cowd --compact "总结 Cargo.toml"
+~/AI/cowd
 ```
+
+一次性 `prompt/run/chat` CLI 入口已经移除；请在 TUI 或 WebUI 中发起对话。
 
 恢复会话：
 
 ```bash
 ~/AI/cowd --resume latest
-~/AI/cowd --resume latest /status /diff
 ```
+
+进入后在 TUI 内使用 `/status`、`/diff`、`/session` 等交互命令。
 
 ### 1.3 启动 WebUI / Gateway
 
@@ -59,7 +60,7 @@ Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统�
 
 ```bash
 cd /path/to/workspace
-~/AI/cowd gateway run
+~/AI/cowd gateway start
 ```
 
 默认 HTTP Gateway 由配置文件决定。常见本地配置如下：
@@ -112,7 +113,7 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
 
 ```text
 用户入口
-  ├─ CLI: cowd prompt / cowd skills / cowd doctor / cowd gateway
+  ├─ CLI: cowd / cowd skills / cowd doctor / cowd gateway
   ├─ TUI: cowd 交互界面
   ├─ WebUI: Gateway 提供浏览器控制台
   └─ Channel: Feishu / WeCom / Email / MCP / future connectors
@@ -158,7 +159,7 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
 根目录 `Cargo.toml` 使用 workspace：
 
 ```text
-crates/api
+crates/provider
 crates/commands
 crates/compat-harness
 crates/cowd-cli
@@ -309,7 +310,7 @@ install <path>
 - tool schema
 - runtime tool registry
 
-### 3.7 `crates/api`
+### 3.7 `crates/provider`
 
 模型 Provider 适配层。
 
@@ -529,23 +530,24 @@ CLI 的定位是极简控制和一次性任务，不承担复杂状态管理。
 ~/AI/cowd init
 ```
 
-### 6.2 Prompt
+### 6.2 TUI 对话
 
 ```bash
-~/AI/cowd prompt "解释当前项目"
-~/AI/cowd "解释当前项目"
-~/AI/cowd --output-format json prompt "列出模块"
-~/AI/cowd --compact "只输出最终结论"
+~/AI/cowd
+~/AI/cowd --model claude-sonnet-4-6
 ```
+
+CLI 不再提供一次性 `prompt/run/chat`。请在 TUI 或 WebUI 中输入消息。
 
 ### 6.3 Session
 
 ```bash
 ~/AI/cowd --resume latest
-~/AI/cowd --resume latest /status
 ~/AI/cowd export conversation.md
 ~/AI/cowd import-session old-session.jsonl
 ```
+
+`--resume` 只负责启动并附着 TUI；会话状态、压缩、切换等操作在 TUI 或 WebUI 中完成。
 
 ### 6.4 Skills
 
@@ -571,10 +573,13 @@ legacy /commands
 ### 6.5 Gateway
 
 ```bash
-~/AI/cowd gateway run
+~/AI/cowd gateway start
 ~/AI/cowd gateway status
 ~/AI/cowd gateway stop
 ~/AI/cowd gateway restart
+~/AI/cowd gateway logs
+~/AI/cowd gateway repair
+~/AI/cowd gateway open
 ```
 
 ---
@@ -721,7 +726,7 @@ MFG skill 执行流程：
 
 Structured Data Core 属于 cowd 内核，不属于 MFG。MFG 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
-Memory 默认存储位置从 0.9.290 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
+Memory 默认存储位置从 0.9.291 起统一为 `~/.cowd/memory/memory.db` 和 `~/.cowd/memory/blobs`；设置 `COWD_CONFIG_HOME` 时使用 `$COWD_CONFIG_HOME/memory/`。旧版本曾在项目工作目录生成 `memory.db` 或 `memory_blobs`，新版本不会继续把这些相对路径作为默认写入位置。需要保留历史数据时，应先备份旧文件，再迁移到统一 memory 目录，或在配置中显式设置 `memory.store_path` 指向旧目录。
 
 ### 8.3 Agents 面板
 
@@ -781,7 +786,7 @@ MFG 是 manufacturing application layer on top of the cowd kernel。当前页面
 
 ## 9. Capability 系统
 
-Capability 系统是 v0.9.290 的顶层治理机制，用于声明、投影和验证各表面能力。
+Capability 系统是 v0.9.291 的顶层治理机制，用于声明、投影和验证各表面能力。
 
 ### 9.1 Capability Registry
 
@@ -828,7 +833,7 @@ Capability 系统是 v0.9.290 的顶层治理机制，用于声明、投影和�
 
 ## 10. Structured Data Core
 
-Structured Data Core 是 v0.9.290 的通用结构化数据契约层，用于统一管理和运营结构化数据。
+Structured Data Core 是 v0.9.291 的通用结构化数据契约层，用于统一管理和运营结构化数据。
 
 核心概念：
 
@@ -1181,7 +1186,7 @@ install -m 0755 target/release/cowd ~/AI/cowd
 检查：
 
 ```bash
-~/AI/cowd gateway run
+~/AI/cowd gateway start
 curl http://127.0.0.1:8642/readyz
 curl http://127.0.0.1:8642/api/webui/manifest
 ```

@@ -38,7 +38,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
 }
 
 #[test]
-fn resume_flag_loads_a_saved_session_and_dispatches_status() {
+fn resume_flag_rejects_status_slash_dispatch() {
     // given
     let temp_dir = unique_temp_dir("resume-status");
     let config_home = temp_dir.join("home").join(".cowd");
@@ -54,20 +54,22 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
         .expect("cowd should launch");
 
     // then
-    assert_success(&output);
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Messages         1"));
-    assert!(stdout.contains("Session          "));
-    assert!(stdout.contains("sessions.db"));
-    assert!(stdout.contains("Session id       resume-status"));
-    assert!(stdout.contains("Session store    SQLite session store"));
+    assert_failure(&output);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(
+        stderr.contains("was removed from the CLI surface"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run slash commands inside the TUI"),
+        "{stderr}"
+    );
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
 
 #[test]
-fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
+fn direct_slash_commands_are_tui_only() {
     // given
     let temp_dir = unique_temp_dir("slash-dispatch");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
@@ -85,21 +87,15 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
         .expect("cowd should launch");
 
     // then
-    assert_success(&help_output);
-    let help_stdout = String::from_utf8(help_output.stdout).expect("stdout should be utf8");
-    assert!(help_stdout.contains("Interactive slash commands:"));
-    assert!(help_stdout.contains("/status"));
+    assert_failure(&help_output);
+    let help_stderr = String::from_utf8(help_output.stderr).expect("stderr should be utf8");
+    assert!(help_stderr.contains("top-level slash commands were removed"));
+    assert!(help_stderr.contains("Start the TUI"));
 
-    assert!(
-        !unknown_output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
-        String::from_utf8_lossy(&unknown_output.stdout),
-        String::from_utf8_lossy(&unknown_output.stderr)
-    );
+    assert_failure(&unknown_output);
     let stderr = String::from_utf8(unknown_output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("unknown slash command outside the REPL: /zstats"));
-    assert!(stderr.contains("Did you mean"));
-    assert!(stderr.contains("/status"));
+    assert!(stderr.contains("top-level slash commands were removed"));
+    assert!(stderr.contains("Start the TUI"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
@@ -122,15 +118,14 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
-    assert!(stderr.contains("Claude Code/OMC plugin command"));
-    assert!(stderr.contains("does not yet load plugin slash commands"));
+    assert!(stderr.contains("top-level slash commands were removed"));
+    assert!(stderr.contains("Start the TUI"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
 
 #[test]
-fn config_command_loads_defaults_from_standard_config_locations() {
+fn resume_flag_rejects_config_slash_dispatch() {
     // given
     let temp_dir = unique_temp_dir("config-defaults");
     let config_home = temp_dir.join("home").join(".cowd");
@@ -159,27 +154,16 @@ fn config_command_loads_defaults_from_standard_config_locations() {
         .expect("cowd should launch");
 
     // then
-    assert_success(&output);
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Config"));
-    assert!(stdout.contains("Loaded files      3"));
-    assert!(stdout.contains("Merged section: model"));
-    assert!(stdout.contains("opus"));
-    assert!(stdout.contains(config_home.join("config.yaml").to_str().expect("utf8 path")));
-    assert!(stdout.contains(
-        temp_dir
-            .join(".cowd")
-            .join("config.yaml")
-            .to_str()
-            .expect("utf8 path")
-    ));
-    assert!(stdout.contains(
-        temp_dir
-            .join(".cowd")
-            .join("config.local.yaml")
-            .to_str()
-            .expect("utf8 path")
-    ));
+    assert_failure(&output);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(
+        stderr.contains("was removed from the CLI surface"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run slash commands inside the TUI"),
+        "{stderr}"
+    );
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
@@ -317,6 +301,15 @@ fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
         "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failure(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "expected command to fail\nstdout:\n{}\n\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

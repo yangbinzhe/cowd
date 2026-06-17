@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use api::{
+use provider::{
     AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
     OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, ToolChoice,
@@ -904,7 +904,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 },
                 InputContentBlock::ToolResult {
                     tool_use_id: "toolu_prev".to_string(),
-                    content: vec![api::ToolResultContentBlock::Json {
+                    content: vec![provider::ToolResultContentBlock::Json {
                         value: json!({"forecast": "sunny"}),
                     }],
                     is_error: false,

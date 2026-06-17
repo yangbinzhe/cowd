@@ -6,12 +6,12 @@ use std::pin::Pin;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use api::{
+use base64::Engine;
+use provider::{
     max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
-use base64::Engine;
 use reqwest::blocking::Client;
 use runtime::tool_orchestrator::tool_execution_profile;
 use runtime::{
@@ -4368,7 +4368,7 @@ fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantE
 }
 
 fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
+    record: provider::PromptCacheRecord,
 ) -> Option<PromptCacheEvent> {
     let cache_break = record.cache_break?;
     Some(PromptCacheEvent {
@@ -5684,7 +5684,7 @@ mod tests {
         AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
-    use api::OutputContentBlock;
+    use provider::OutputContentBlock;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session,

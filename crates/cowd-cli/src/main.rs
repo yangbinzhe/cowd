@@ -46,19 +46,21 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 
-use api::{
+use provider::{
     detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
+#[cfg(test)]
+use commands::resume_supported_slash_commands;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, SkillRegistry, SkillSlashDispatch, SlashCommand,
+    render_slash_command_help_filtered, resolve_skill_invocation, slash_command_specs,
+    SkillRegistry, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -95,7 +97,7 @@ impl tui::app::ToolRegistry for GlobalToolRegistry {
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    api::max_tokens_for_model(model)
+    provider::max_tokens_for_model(model)
 }
 /// Global list of daemon child processes that must be reaped.
 /// Children are adopted (stored here) instead of dropping the handle,
@@ -215,6 +217,7 @@ const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/cowd";
 const OFFICIAL_REPO_SLUG: &str = "ultraworkers/cowd";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install cowd";
 const LATEST_SESSION_REFERENCE: &str = "latest";
+const REMOVED_PROMPT_SUBCOMMAND: &str = "prompt";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 
 type AllowedToolSet = BTreeSet<String>;
@@ -518,29 +521,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => run_gateway_action(&action, output_format)?,
         CliAction::Install { systemd, path } => run_install(systemd, path.as_deref())?,
-        CliAction::Prompt {
-            text,
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            yolo_mode,
-            compact,
-            output_format,
-        } => run_prompt(
-            &text,
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            yolo_mode,
-            compact,
-            output_format,
-        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -603,7 +583,7 @@ fn run_gateway_action(
         GatewayAction::Doctor => doctor::run_doctor(output_format),
         GatewayAction::Run => {
             if let Ok(Some(status)) = server::get_server_status() {
-                tracing::info!(pid = status.pid, address = %status.address, "gateway run: existing gateway is already running");
+                tracing::info!(pid = status.pid, address = %status.address, "gateway foreground: existing gateway is already running");
                 println!(
                     "Gateway is already running (pid: {}, address: {})",
                     status.pid, status.address
@@ -690,6 +670,41 @@ fn run_gateway_action(
             tracing::info!(pid, "gateway restarted");
             Ok(())
         }
+        GatewayAction::Logs => {
+            let path = runtime::cowd_dirs::config_home_dir()
+                .join("logs")
+                .join("gateway-daemon.log");
+            match std::fs::read_to_string(&path) {
+                Ok(content) if !content.trim().is_empty() => {
+                    let lines: Vec<&str> = content.lines().rev().take(80).collect();
+                    for line in lines.into_iter().rev() {
+                        println!("{line}");
+                    }
+                }
+                Ok(_) => println!("Gateway log is empty: {}", path.display()),
+                Err(error) => println!("Gateway log unavailable at {}: {error}", path.display()),
+            }
+            Ok(())
+        }
+        GatewayAction::Repair => {
+            server::stop_server().ok();
+            let path = runtime::cowd_dirs::config_home_dir()
+                .join("logs")
+                .join("gateway-daemon.log");
+            println!("Gateway repair prepared a clean start state.");
+            println!("Next: cowd gateway start");
+            println!("Logs: {}", path.display());
+            Ok(())
+        }
+        GatewayAction::Open => {
+            let status = server::get_server_status().map_err(|e| e.to_string())?;
+            let address = status
+                .as_ref()
+                .map(|s| s.address.clone())
+                .unwrap_or_else(|| "127.0.0.1:8642".to_string());
+            println!("Gateway WebUI: http://{address}/");
+            Ok(())
+        }
         GatewayAction::WechatQr => run_wechat_qr_login(),
     }
 }
@@ -772,7 +787,7 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "expired" => {
-                return Err("WeChat QR code expired; rerun `cowd gateway wechat-qr`".into());
+                return Err("WeChat QR code expired; rerun the WeChat platform setup flow".into());
             }
             other => {
                 println!("\nStatus           {other}");
@@ -796,6 +811,9 @@ pub(crate) enum GatewayAction {
     Doctor,
     Run,
     Restart,
+    Logs,
+    Repair,
+    Open,
     WechatQr,
 }
 
@@ -808,6 +826,9 @@ impl GatewayAction {
             "doctor" => Some(Self::Doctor),
             "run" => Some(Self::Run),
             "restart" => Some(Self::Restart),
+            "logs" => Some(Self::Logs),
+            "repair" => Some(Self::Repair),
+            "open" => Some(Self::Open),
             "wechat-qr" => Some(Self::WechatQr),
             _ => None,
         }
@@ -901,18 +922,6 @@ pub(crate) enum CliAction {
         systemd: bool,
         path: Option<String>,
     },
-    Prompt {
-        text: String,
-        model: String,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
-        base_commit: Option<String>,
-        reasoning_effort: Option<String>,
-        allow_broad_cwd: bool,
-        yolo_mode: bool,
-        compact: bool,
-        output_format: CliOutputFormat,
-    },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
@@ -959,7 +968,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
     let mut yolo_mode = false;
-    let mut compact = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -983,8 +991,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                             | "issue"
                     ) =>
             {
-                // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `cowd prompt --help`) should show
+                // `--help` following a removed or local subcommand should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor) must NOT be intercepted
@@ -1087,8 +1094,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "--compact" => {
-                compact = true;
-                index += 1;
+                return Err(
+                    "--compact was only supported by removed one-shot prompt mode; start the TUI with `cowd`."
+                        .to_string(),
+                );
             }
             "--tui" => {
                 index += 1;
@@ -1202,10 +1211,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
-        "mcp" => Ok(CliAction::Mcp {
-            args: join_optional_args(&rest[1..]),
-            output_format,
-        }),
+        "mcp" => parse_mcp_args(&rest[1..], output_format),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -1252,35 +1258,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "install" => parse_install_args(&rest[1..], output_format),
         "gateway" => parse_gateway_args(&rest[1..], output_format),
-        "prompt" => {
-            let text = rest[1..].join(" ");
-            if text.trim().is_empty() {
-                return Err("missing prompt text. Usage: cowd prompt \"your text\"".to_string());
-            }
-            Ok(CliAction::Prompt {
-                text,
-                model,
-                allowed_tools,
-                permission_mode,
-                base_commit,
-                reasoning_effort: reasoning_effort.clone(),
-                allow_broad_cwd,
-                yolo_mode,
-                compact,
-                output_format,
-            })
-        }
+        removed if removed == REMOVED_PROMPT_SUBCOMMAND => Err(
+            "one-shot text mode was removed. Start the TUI with `cowd` or use Gateway/WebUI for chat."
+                .to_string(),
+        ),
 
-        other if other.starts_with('/') => parse_direct_slash_cli_action(
-            &rest,
-            model,
-            output_format,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            yolo_mode,
+        other if other.starts_with('/') => Err(
+            "top-level slash commands were removed. Start the TUI with `cowd` and use slash commands there."
+                .to_string(),
         ),
         _other => Ok(CliAction::Repl {
             model,
@@ -1358,15 +1343,14 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     let slash_command = slash_command_specs()
         .iter()
         .find(|spec| spec.name == command_name)?;
-    let guidance = if slash_command.resume_supported {
-        format!(
-            "`cowd {command_name}` is a slash command. Use `cowd --resume <session-id|latest> /{command_name}` or start `cowd` and run `/{command_name}`."
-        )
+    let session_hint = if slash_command.resume_supported {
+        " Use `cowd --resume <session-id|latest>` first when you need a saved session."
     } else {
-        format!(
-            "`cowd {command_name}` is a slash command. Start `cowd` and run `/{command_name}` inside the REPL."
-        )
+        ""
     };
+    let guidance = format!(
+        "`cowd {command_name}` is a slash command. Start `cowd` and run `/{command_name}` inside the TUI.{session_hint}"
+    );
     Some(guidance)
 }
 
@@ -1396,69 +1380,6 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-fn parse_direct_slash_cli_action(
-    rest: &[String],
-    model: String,
-    output_format: CliOutputFormat,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    base_commit: Option<String>,
-    reasoning_effort: Option<String>,
-    allow_broad_cwd: bool,
-    yolo_mode: bool,
-) -> Result<CliAction, String> {
-    let raw = rest.join(" ");
-    match SlashCommand::parse(&raw) {
-        Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
-        Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents {
-            args,
-            output_format,
-        }),
-        Ok(Some(SlashCommand::Mcp { action, target })) => Ok(CliAction::Mcp {
-            args: match (action, target) {
-                (None, None) => None,
-                (Some(action), None) => Some(action),
-                (Some(action), Some(target)) => Some(format!("{action} {target}")),
-                (None, Some(target)) => Some(target),
-            },
-            output_format,
-        }),
-        Ok(Some(SlashCommand::Skills { args })) => {
-            match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(_prompt) => Ok(CliAction::Repl {
-                    model,
-                    session_id: None,
-                    allowed_tools,
-                    permission_mode,
-                    base_commit,
-                    reasoning_effort: reasoning_effort.clone(),
-                    allow_broad_cwd,
-                    yolo_mode,
-                }),
-                SkillSlashDispatch::Local => Ok(CliAction::Skills {
-                    args,
-                    output_format,
-                }),
-            }
-        }
-        Ok(Some(SlashCommand::Setup)) => Ok(CliAction::Setup { output_format }),
-        Ok(Some(SlashCommand::Unknown(name))) => {
-            Err(suggestions::format_unknown_direct_slash_command(&name))
-        }
-        Ok(Some(command)) => Err({
-            let _ = command;
-            format!(
-                "slash command {command_name} is interactive-only. Start `cowd` and run it there, or use `cowd --resume <session-id|latest> {command_name}` / `cowd --resume {latest} {command_name}` when the command is marked [resume] in /help.",
-                command_name = rest[0],
-                latest = LATEST_SESSION_REFERENCE,
-            )
-        }),
-        Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 fn resolve_model_alias_with_config(model: &str) -> String {
@@ -1706,15 +1627,28 @@ fn parse_gateway_args(
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let action_str = args.first().ok_or_else(|| {
-        "gateway requires a subcommand: start, stop, status, or doctor. Advanced: run, restart, wechat-qr".to_string()
+        "gateway requires a subcommand: start, stop, restart, status, doctor, logs, repair, or open".to_string()
     })?;
     let action = GatewayAction::from_str(action_str).ok_or_else(|| {
         format!(
-            "unknown gateway subcommand: {action_str}. Expected core start, stop, status, doctor. Advanced compatibility: run, restart, wechat-qr"
+            "unknown gateway subcommand: {action_str}. Expected start, stop, restart, status, doctor, logs, repair, or open"
         )
     })?;
     Ok(CliAction::Gateway {
         action,
+        output_format,
+    })
+}
+
+fn parse_mcp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    if matches!(args.first().map(String::as_str), Some("serve")) {
+        return Err(
+            "`cowd mcp serve` was removed from the CLI surface. Start `cowd gateway start` and manage MCP through Gateway/WebUI or the TUI."
+                .to_string(),
+        );
+    }
+    Ok(CliAction::Mcp {
+        args: join_optional_args(args),
         output_format,
     })
 }
@@ -1764,67 +1698,37 @@ fn parse_resume_args(
     allow_broad_cwd: bool,
     yolo_mode: bool,
 ) -> Result<CliAction, String> {
-    let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
-        None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
+    let removed_resume_commands = "`cowd --resume ... /command` was removed from the CLI surface. Start `cowd --resume <session-id|latest>` and run slash commands inside the TUI.";
+    let session_path = match args.first() {
+        None => PathBuf::from(LATEST_SESSION_REFERENCE),
         Some(first) if looks_like_slash_command_token(first) => {
-            (PathBuf::from(LATEST_SESSION_REFERENCE), args)
+            return Err(removed_resume_commands.to_string());
         }
-        Some(first) => (PathBuf::from(first), &args[1..]),
+        Some(first) => {
+            if args.len() > 1 {
+                return Err(removed_resume_commands.to_string());
+            }
+            PathBuf::from(first)
+        }
     };
-    let mut commands = Vec::new();
-    let mut current_command = String::new();
 
-    for token in command_tokens {
-        if token.trim_start().starts_with('/') {
-            if resume_command_can_absorb_token(&current_command, token) {
-                current_command.push(' ');
-                current_command.push_str(token);
-                continue;
-            }
-            if !current_command.is_empty() {
-                commands.push(current_command);
-            }
-            current_command = String::from(token.as_str());
-            continue;
-        }
-
-        if current_command.is_empty() {
-            return Err("--resume trailing arguments must be slash commands".to_string());
-        }
-
-        current_command.push(' ');
-        current_command.push_str(token);
+    if output_format != CliOutputFormat::Text {
+        return Err(
+            "`--output-format` is not supported with `--resume`; start the TUI with `cowd --resume <session-id|latest>`."
+                .to_string(),
+        );
     }
 
-    if !current_command.is_empty() {
-        commands.push(current_command);
-    }
-
-    if commands.is_empty() && output_format == CliOutputFormat::Text {
-        return Ok(CliAction::Repl {
-            model,
-            session_id: Some(session_path.display().to_string()),
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            yolo_mode,
-        });
-    }
-
-    Ok(CliAction::ResumeSession {
-        session_path,
-        commands,
-        output_format,
+    Ok(CliAction::Repl {
+        model,
+        session_id: Some(session_path.display().to_string()),
+        allowed_tools,
+        permission_mode,
+        base_commit,
+        reasoning_effort,
+        allow_broad_cwd,
+        yolo_mode,
     })
-}
-
-fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {
-    matches!(
-        SlashCommand::parse(current_command),
-        Ok(Some(SlashCommand::Export { path: None }))
-    ) && !looks_like_slash_command_token(token)
 }
 
 fn looks_like_slash_command_token(token: &str) -> bool {
@@ -5983,12 +5887,6 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `cowd mcp serve` starts a stdio MCP server exposing cowd's built-in
-        // tools. All other `mcp` subcommands fall through to the existing
-        // configured-server reporter (`list`, `status`, ...).
-        if matches!(args.map(str::trim), Some("serve")) {
-            return mcp_serve::run_mcp_serve();
-        }
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
@@ -7557,8 +7455,8 @@ fn render_setup_report() -> Result<String, Box<dyn std::error::Error>> {
     lines.push(String::new());
     lines.push("Safe commands".to_string());
     lines.push("  /setup                         Re-run this setup check in TUI".to_string());
-    lines.push("  cowd gateway wechat-qr          Authorize personal WeChat by QR".to_string());
-    lines.push("  cowd gateway run                Start gateway/WebUI in foreground".to_string());
+    lines.push("  cowd gateway open               Show Gateway/WebUI URL".to_string());
+    lines.push("  cowd gateway start              Start gateway/WebUI".to_string());
     lines.push("  cowd gateway restart            Reload gateway after channel auth".to_string());
     Ok(lines.join("\n"))
 }
@@ -7709,7 +7607,7 @@ fn setup_gateway_item(config: &runtime::RuntimeConfig, gateway_running: bool) ->
         } else {
             format!("Configured at http://{host}:{port}, not currently running")
         },
-        next: (!gateway_running).then(|| "cowd gateway run".to_string()),
+        next: (!gateway_running).then(|| "cowd gateway start".to_string()),
     }
 }
 
@@ -7773,14 +7671,14 @@ fn setup_wechat_item() -> SetupItem {
             label: "WeChat",
             status: "action",
             summary: "No personal WeChat QR account authorized".to_string(),
-            next: Some("cowd gateway wechat-qr".to_string()),
+            next: Some("Configure the WeChat platform in Gateway/WebUI".to_string()),
         },
         Err(error) => SetupItem {
             id: "wechat",
             label: "WeChat",
             status: "warn",
             summary: format!("Could not read WeChat accounts: {error}"),
-            next: Some("cowd gateway wechat-qr".to_string()),
+            next: Some("Configure the WeChat platform in Gateway/WebUI".to_string()),
         },
     }
 }
@@ -7844,9 +7742,9 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
   Usage            cowd status
-  Purpose          show the local workspace snapshot without entering the REPL
+  Purpose          show the local workspace snapshot without entering the TUI
   Output           model, permissions, git state, config files, and sandbox status
-  Related          /status · cowd --resume latest /status"
+  Related          /status inside TUI · cowd --resume latest"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
   Usage            cowd sandbox
@@ -7858,13 +7756,13 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Usage            cowd doctor
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
-  Related          /doctor · cowd --resume latest /doctor"
+  Related          /doctor inside TUI · cowd --resume latest"
             .to_string(),
         LocalHelpTopic::Setup => "Setup
   Usage            cowd setup
   Purpose          check local setup, channels, gateway, memory, sessions, and permissions
   Output           safe readiness report with no secrets
-  Related          /setup · cowd gateway wechat-qr · cowd gateway run"
+  Related          /setup · cowd gateway status · cowd gateway open"
             .to_string(),
     }
 }
@@ -8878,7 +8776,7 @@ Description=COWD Gateway Daemon
 After=network.target
 
 [Service]
-ExecStart={} gateway run
+ExecStart={} gateway start
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=warn
@@ -9621,7 +9519,7 @@ fn build_runtime_with_plugin_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let overrides = feature_config.model_context_windows();
-    let model_ctx = api::model_context_window_with_overrides(&model, Some(&overrides));
+    let model_ctx = provider::model_context_window_with_overrides(&model, Some(&overrides));
     let workspace_item = workspace_context_item(&session, model_ctx);
     // Clone model for sub-agent usage before it's consumed by the main runtime.
     let subagent_model = model.clone();
@@ -9827,7 +9725,7 @@ impl AnthropicRuntimeClient {
         //
         // For Anthropic we build the client directly instead of going
         // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
+        // so we can explicitly apply `provider::read_base_url()` — that
         // reads `ANTHROPIC_BASE_URL` and lets configured test or
         // staging endpoints exercise the same provider path as
         // production. We also attach a session-scoped prompt cache on
@@ -9836,7 +9734,7 @@ impl AnthropicRuntimeClient {
         let resolved_model = model.trim().to_string();
 
         let provider = runtime::resolve_global_provider(&resolved_model).ok_or_else(|| {
-            api::ApiError::NoProviderConfigured {
+            provider::ApiError::NoProviderConfigured {
                 model: resolved_model.clone(),
             }
         })?;
@@ -9869,7 +9767,7 @@ impl AnthropicRuntimeClient {
     /// 运行时切换模型（不改配置文件）。重建内部 ProviderClient 和 CachedProviderClient
     pub fn switch_model(&mut self, new_model: &str) -> Result<(), Box<dyn std::error::Error>> {
         let provider = runtime::resolve_global_provider(new_model).ok_or_else(|| {
-            api::ApiError::NoProviderConfigured {
+            provider::ApiError::NoProviderConfigured {
                 model: new_model.to_string(),
             }
         })?;
@@ -9888,7 +9786,7 @@ impl AnthropicRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
+fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, provider::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
@@ -10360,7 +10258,7 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
-fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
+fn format_user_visible_api_error(session_id: &str, error: &provider::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
@@ -10379,11 +10277,11 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
     }
 }
 
-fn format_context_window_error(session_id: &str, error: &api::ApiError) -> String {
+fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> String {
     let mut lines: Vec<String> = vec!["context_window_blocked".to_string(), String::new()];
 
     match error {
-        api::ApiError::ContextWindowExceeded {
+        provider::ApiError::ContextWindowExceeded {
             model,
             estimated_input_tokens,
             requested_output_tokens: _,
@@ -10404,10 +10302,7 @@ fn format_context_window_error(session_id: &str, error: &api::ApiError) -> Strin
             ));
             lines.push(String::new());
             lines.push(format!("{:<17}/compact", "Compact"));
-            lines.push(format!(
-                "{:<17}cowd --resume {session_id} /compact",
-                "Resume compact"
-            ));
+            lines.push(format!("{:<17}cowd --resume {session_id}", "Resume TUI"));
             lines.push(format!("{:<17}/clear --confirm", "Fresh session"));
             lines.push(format!(
                 "{:<17}reduce output tokens or break into smaller requests",
@@ -10415,7 +10310,7 @@ fn format_context_window_error(session_id: &str, error: &api::ApiError) -> Strin
             ));
             lines.push(format!("{:<17}rerun", "Retry"));
         }
-        api::ApiError::Api {
+        provider::ApiError::Api {
             message,
             request_id,
             ..
@@ -10430,7 +10325,7 @@ fn format_context_window_error(session_id: &str, error: &api::ApiError) -> Strin
             lines.push(format!("{:<17}/compact", "Compact"));
             lines.push(format!("{:<17}/clear --confirm", "Fresh session"));
         }
-        api::ApiError::RetriesExhausted {
+        provider::ApiError::RetriesExhausted {
             attempts,
             last_error,
         } => {
@@ -10440,7 +10335,7 @@ fn format_context_window_error(session_id: &str, error: &api::ApiError) -> Strin
             if let Some(rid) = last_error.request_id() {
                 lines.push(format!("{:<17}{rid}", "Trace"));
             }
-            if let api::ApiError::Api {
+            if let provider::ApiError::Api {
                 message: Some(ref msg),
                 ..
             } = **last_error
@@ -10449,10 +10344,7 @@ fn format_context_window_error(session_id: &str, error: &api::ApiError) -> Strin
             }
             lines.push(String::new());
             lines.push(format!("{:<17}/compact", "Compact"));
-            lines.push(format!(
-                "{:<17}cowd --resume {session_id} /compact",
-                "Resume compact"
-            ));
+            lines.push(format!("{:<17}cowd --resume {session_id}", "Resume TUI"));
         }
         _ => {
             lines.push(error.to_string());
@@ -11241,7 +11133,7 @@ fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<Assista
 }
 
 fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
+    record: provider::PromptCacheRecord,
 ) -> Option<PromptCacheEvent> {
     let cache_break = record.cache_break?;
     Some(PromptCacheEvent {
@@ -11455,17 +11347,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Explicitly start the interactive TUI")?;
     writeln!(
         out,
-        "  cowd [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  cowd gateway start|stop|restart|status|doctor|logs|repair|open"
     )?;
-    writeln!(out, "      Send one prompt and exit")?;
-    writeln!(out, "  cowd gateway start|stop|status|doctor")?;
-    writeln!(out, "      Control the daemon and browser WebUI gateway")?;
+    writeln!(out, "      Control and diagnose the browser WebUI gateway")?;
     writeln!(out, "  cowd status")?;
     writeln!(out, "      Show the current local workspace snapshot")?;
     writeln!(out, "  cowd doctor")?;
     writeln!(
         out,
-        "      Diagnose local auth, config, workspace, and sandbox health"
+        "      Diagnose local provider credentials, config, workspace, and sandbox health"
     )?;
     writeln!(out, "  cowd setup")?;
     writeln!(
@@ -11497,20 +11387,9 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "      Print the local WebUI/API address when the gateway is running"
     )?;
     writeln!(out)?;
-    writeln!(out, "Advanced compatibility:")?;
-    writeln!(
-        out,
-        "  cowd [--model MODEL] [--output-format text|json] TEXT"
-    )?;
-    writeln!(out, "      Shorthand non-interactive prompt mode")?;
-    writeln!(
-        out,
-        "  cowd --resume [session-id|latest] [/status] [/compact] [...]"
-    )?;
-    writeln!(
-        out,
-        "      Inspect or maintain a saved session without entering the TUI"
-    )?;
+    writeln!(out, "Advanced local tools:")?;
+    writeln!(out, "  cowd --resume [session-id|latest]")?;
+    writeln!(out, "      Start the TUI attached to a saved session")?;
     writeln!(out, "  cowd sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
     writeln!(out, "  cowd help | cowd version")?;
@@ -11523,8 +11402,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  cowd dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  cowd bootstrap-plan")?;
     writeln!(out, "  cowd system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  cowd gateway run|restart")?;
-    writeln!(out, "  cowd gateway wechat-qr")?;
+    writeln!(out, "  cowd gateway logs|repair|open")?;
     writeln!(
         out,
         "      Compatibility and channel helpers; prefer WebUI/TUI for broad state management"
@@ -11547,11 +11425,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
-    )?;
-    writeln!(
-        out,
-        "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
+        "  --output-format FORMAT     Machine-readable output for local diagnostics and export: text or json"
     )?;
     writeln!(
         out,
@@ -11581,16 +11455,6 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Interactive slash commands:")?;
     writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
     writeln!(out)?;
-    let resume_commands = resume_supported_slash_commands()
-        .into_iter()
-        .map(|spec| match spec.argument_hint {
-            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
-            None => format!("/{}", spec.name),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(out, "Resume-safe commands: {resume_commands}")?;
-    writeln!(out)?;
     writeln!(out, "Session shortcuts:")?;
     writeln!(out, "  REPL turns auto-save to the SQLite session store")?;
     writeln!(
@@ -11606,24 +11470,13 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Local .jsonl/.json files are never imported automatically; use cowd import-session PATH"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  cowd --model claude-opus \"summarize this repo\"")?;
-    writeln!(
-        out,
-        "  cowd --output-format json prompt \"explain src/main.rs\""
-    )?;
-    writeln!(out, "  cowd --compact \"summarize Cargo.toml\" | wc -l")?;
-    writeln!(
-        out,
-        "  cowd --allowedTools read,glob \"summarize Cargo.toml\""
-    )?;
+    writeln!(out, "  cowd --model claude-opus")?;
+    writeln!(out, "  cowd gateway start")?;
+    writeln!(out, "  cowd gateway status --output-format json")?;
+    writeln!(out, "  cowd skills list")?;
     writeln!(out, "  cowd --resume {LATEST_SESSION_REFERENCE}")?;
-    writeln!(
-        out,
-        "  cowd --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
-    )?;
     writeln!(out, "  cowd agents")?;
     writeln!(out, "  cowd mcp show my-server")?;
-    writeln!(out, "  cowd /skills")?;
     writeln!(out, "  cowd doctor")?;
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
@@ -11694,10 +11547,10 @@ mod tests {
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
+    use provider::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
         ContextProfile, ConversationMessage, GatewayPlatformConfig, JsonValue, MessageRole,
@@ -11939,6 +11792,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_gateway_local_diagnostics_subcommands() {
+        for (name, expected) in [
+            ("logs", GatewayAction::Logs),
+            ("repair", GatewayAction::Repair),
+            ("open", GatewayAction::Open),
+        ] {
+            let parsed = parse_gateway_args(&[name.to_string()], CliOutputFormat::Text)
+                .expect("gateway diagnostic subcommand should parse");
+            match parsed {
+                CliAction::Gateway { action, .. } => assert_eq!(action, expected),
+                other => panic!("unexpected action: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_mcp_serve_is_removed_from_cli_surface() {
+        let error =
+            parse_args(&["mcp".to_string(), "serve".to_string()]).expect_err("serve is removed");
+        assert!(error.contains("`cowd mcp serve` was removed"));
+        assert!(error.contains("cowd gateway start"));
+    }
+
+    #[test]
     fn context_window_preflight_errors_render_recovery_steps() {
         let error = ApiError::ContextWindowExceeded {
             model: "claude-sonnet-4-6".to_string(),
@@ -11969,7 +11846,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   cowd --resume session-issue-32 /compact"),
+            rendered.contains("Resume TUI       cowd --resume session-issue-32"),
             "{rendered}"
         );
         assert!(
@@ -12042,7 +11919,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   cowd --resume session-issue-32 /compact"),
+            rendered.contains("Resume TUI       cowd --resume session-issue-32"),
             "{rendered}"
         );
     }
@@ -12657,17 +12534,17 @@ mod tests {
 
         assert!(help.contains("Core commands:"));
         assert!(help.contains("cowd --tui"));
-        assert!(help.contains("cowd gateway start|stop|status|doctor"));
+        assert!(help.contains("cowd gateway start|stop|restart|status|doctor|logs|repair|open"));
         assert!(help.contains("cowd status"));
         assert!(help.contains("cowd doctor"));
         assert!(help.contains("cowd export"));
         assert!(help.contains("cowd import-session PATH"));
         assert!(help.contains("cowd skills list|show|validate"));
-        assert!(help.contains("Advanced compatibility:"));
+        assert!(help.contains("Advanced local tools:"));
 
         let core_start = help.find("Core commands:").expect("core section");
         let advanced_start = help
-            .find("Advanced compatibility:")
+            .find("Advanced local tools:")
             .expect("advanced section");
         let core = &help[core_start..advanced_start];
         let advanced = &help[advanced_start..];
@@ -12698,14 +12575,14 @@ mod tests {
         let help = String::from_utf8(out).expect("help should be utf8");
         let core_start = help.find("Core commands:").expect("core section");
         let advanced_start = help
-            .find("Advanced compatibility:")
+            .find("Advanced local tools:")
             .expect("advanced section");
         let core = &help[core_start..advanced_start];
         let advanced = &help[advanced_start..];
 
-        assert!(core.contains("gateway start|stop|status|doctor"));
+        assert!(core.contains("gateway start|stop|restart|status|doctor|logs|repair|open"));
         assert!(!core.contains("wechat-qr"));
-        assert!(advanced.contains("gateway wechat-qr"));
+        assert!(!advanced.contains("wechat-qr"));
     }
 
     #[test]
@@ -13173,10 +13050,10 @@ mod tests {
         assert_eq!(
             parse_args(&[
                 "--output-format=json".to_string(),
-                "/skills".to_string(),
+                "skills".to_string(),
                 "help".to_string(),
             ])
-            .expect("json /skills help should parse"),
+            .expect("json skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
                 output_format: CliOutputFormat::Json,
@@ -13192,115 +13069,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_agents_mcp_and_skills_slash_commands() {
+    fn direct_slash_commands_return_tui_guidance() {
         let _cfg_guard = ConfigHomeGuard::new();
-        assert_eq!(
-            parse_args(&["/agents".to_string()]).expect("/agents should parse"),
-            CliAction::Agents {
-                args: None,
-                output_format: CliOutputFormat::Text
-            }
-        );
-        assert_eq!(
-            parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
-                .expect("/mcp show demo should parse"),
-            CliAction::Mcp {
-                args: Some("show demo".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string()]).expect("/skills should parse"),
-            CliAction::Skills {
-                args: None,
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skill".to_string()]).expect("/skill should parse"),
-            CliAction::Skills {
-                args: None,
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string(), "help".to_string()])
-                .expect("/skills help should parse"),
-            CliAction::Skills {
-                args: Some("help".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skill".to_string(), "list".to_string()])
-                .expect("/skill list should parse"),
-            CliAction::Skills {
-                args: Some("list".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/setup".to_string()]).expect("/setup should parse"),
-            CliAction::Setup {
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&[
-                "/skills".to_string(),
-                "help".to_string(),
-                "overview".to_string()
-            ])
-            .expect("/skills help overview should invoke"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                session_id: None,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-                yolo_mode: false,
-            }
-        );
-        assert_eq!(
-            parse_args(&[
+        for args in [
+            vec!["/agents".to_string()],
+            vec!["/mcp".to_string(), "show".to_string(), "demo".to_string()],
+            vec!["/skills".to_string()],
+            vec!["/skill".to_string()],
+            vec!["/skills".to_string(), "help".to_string()],
+            vec!["/skill".to_string(), "list".to_string()],
+            vec!["/setup".to_string()],
+            vec![
                 "/skills".to_string(),
                 "install".to_string(),
                 "./fixtures/help-skill".to_string(),
-            ])
-            .expect("/skills install should parse"),
-            CliAction::Skills {
-                args: Some("install ./fixtures/help-skill".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string(), "/test".to_string()])
-                .expect("/skills /test should normalize to a single skill prompt prefix"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                session_id: None,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-                yolo_mode: false,
-            }
-        );
-        let error = parse_args(&["/status".to_string()])
-            .expect_err("/status should remain REPL-only when invoked directly");
-        assert!(error.contains("interactive-only"));
-        assert!(error.contains("cowd --resume <session-id|latest> /status"));
+            ],
+            vec!["/status".to_string()],
+        ] {
+            let error = parse_args(&args).expect_err("direct slash command should be TUI-only");
+            assert!(error.contains("top-level slash commands were removed"));
+            assert!(error.contains("Start the TUI"));
+        }
     }
 
     #[test]
     fn direct_slash_commands_surface_shared_validation_errors() {
         let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
             .expect_err("invalid /compact shape should be rejected");
-        assert!(compact_error.contains("Unexpected arguments for /compact."));
-        assert!(compact_error.contains("Usage            /compact"));
+        assert!(compact_error.contains("top-level slash commands were removed"));
 
         let plugins_error = parse_args(&[
             "/plugins".to_string(),
@@ -13308,13 +13104,11 @@ mod tests {
             "extra".to_string(),
         ])
         .expect_err("invalid /plugins list shape should be rejected");
-        assert!(plugins_error.contains("Usage: /plugin list"));
-        assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
+        assert!(plugins_error.contains("top-level slash commands were removed"));
 
         let setup_error = parse_args(&["/setup".to_string(), "now".to_string()])
             .expect_err("invalid /setup shape should be rejected");
-        assert!(setup_error.contains("Unexpected arguments for /setup."));
-        assert!(setup_error.contains("Usage            /setup"));
+        assert!(setup_error.contains("top-level slash commands were removed"));
     }
 
     #[test]
@@ -13325,7 +13119,7 @@ mod tests {
         let report = render_setup_report().expect("setup report should render");
         assert!(report.contains("Setup Center"));
         assert!(report.contains("Checks"));
-        assert!(report.contains("cowd gateway wechat-qr"));
+        assert!(report.contains("cowd gateway open"));
         assert!(!report.contains("app_secret"));
         assert!(!report.contains("auth_token"));
 
@@ -13354,20 +13148,23 @@ mod tests {
                     label: "Gateway",
                     status: "warn",
                     summary: "configured but not running".to_string(),
-                    next: Some("cowd gateway run".to_string()),
+                    next: Some("cowd gateway start".to_string()),
                 },
                 super::SetupItem {
                     id: "wechat",
                     label: "WeChat",
                     status: "action",
                     summary: "not authorized".to_string(),
-                    next: Some("cowd gateway wechat-qr".to_string()),
+                    next: Some("Configure the WeChat platform in Gateway/WebUI".to_string()),
                 },
             ],
         };
 
         assert_eq!(snapshot.overall_status(), "action");
-        assert_eq!(snapshot.next_action(), "cowd gateway wechat-qr");
+        assert_eq!(
+            snapshot.next_action(),
+            "Configure the WeChat platform in Gateway/WebUI"
+        );
     }
 
     #[test]
@@ -13409,20 +13206,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_resume_flag_with_slash_command() {
+    fn rejects_resume_flag_with_single_slash_command() {
         let args = vec![
             "--resume".to_string(),
             "session-123".to_string(),
             "/compact".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("session-123"),
-                commands: vec!["/compact".to_string()],
-                output_format: CliOutputFormat::Text,
-            }
-        );
+        let error = parse_args(&args).expect_err("resume slash commands should be removed");
+        assert!(error.contains("was removed from the CLI surface"));
+        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
@@ -13440,19 +13232,14 @@ mod tests {
                 yolo_mode: false,
             }
         );
-        assert_eq!(
-            parse_args(&["--resume".to_string(), "/status".to_string()])
-                .expect("resume shortcut should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("latest"),
-                commands: vec!["/status".to_string()],
-                output_format: CliOutputFormat::Text,
-            }
-        );
+        let error = parse_args(&["--resume".to_string(), "/status".to_string()])
+            .expect_err("resume slash shortcut should be removed");
+        assert!(error.contains("was removed from the CLI surface"));
+        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
-    fn parses_resume_flag_with_multiple_slash_commands() {
+    fn rejects_resume_flag_with_slash_commands() {
         let args = vec![
             "--resume".to_string(),
             "session-123".to_string(),
@@ -13460,18 +13247,9 @@ mod tests {
             "/compact".to_string(),
             "/cost".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("session-123"),
-                commands: vec![
-                    "/status".to_string(),
-                    "/compact".to_string(),
-                    "/cost".to_string(),
-                ],
-                output_format: CliOutputFormat::Text,
-            }
-        );
+        let error = parse_args(&args).expect_err("resume slash commands should be removed");
+        assert!(error.contains("was removed from the CLI surface"));
+        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
@@ -13483,7 +13261,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_resume_flag_with_slash_command_arguments() {
+    fn rejects_resume_flag_with_slash_command_arguments() {
         let args = vec![
             "--resume".to_string(),
             "session-123".to_string(),
@@ -13492,21 +13270,13 @@ mod tests {
             "/clear".to_string(),
             "--confirm".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("session-123"),
-                commands: vec![
-                    "/export notes.txt".to_string(),
-                    "/clear --confirm".to_string(),
-                ],
-                output_format: CliOutputFormat::Text,
-            }
-        );
+        let error = parse_args(&args).expect_err("resume slash commands should be removed");
+        assert!(error.contains("was removed from the CLI surface"));
+        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
-    fn parses_resume_flag_with_absolute_export_path() {
+    fn rejects_resume_flag_with_absolute_export_path() {
         let args = vec![
             "--resume".to_string(),
             "session-123".to_string(),
@@ -13514,14 +13284,9 @@ mod tests {
             "/tmp/notes.txt".to_string(),
             "/status".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("session-123"),
-                commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
-                output_format: CliOutputFormat::Text,
-            }
-        );
+        let error = parse_args(&args).expect_err("resume slash commands should be removed");
+        assert!(error.contains("was removed from the CLI surface"));
+        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
@@ -13566,7 +13331,9 @@ mod tests {
     fn shared_help_uses_resume_annotation_copy() {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
-        assert!(help.contains("works with --resume <session-id|latest>"));
+        assert!(
+            help.contains("[resumed TUI]     available after `cowd --resume <session-id|latest>`")
+        );
     }
 
     #[test]
@@ -14076,7 +13843,7 @@ mod tests {
     }
 
     #[test]
-    fn init_help_mentions_direct_subcommand() {
+    fn help_mentions_minimal_local_commands() {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
@@ -14088,11 +13855,13 @@ mod tests {
         assert!(help.contains("cowd agents"));
         assert!(help.contains("cowd mcp"));
         assert!(help.contains("cowd skills"));
-        assert!(help.contains("cowd /skills"));
+        assert!(help.contains("cowd skills list"));
+        assert!(help.contains("/skills"));
+        assert!(!help.contains("cowd /skills"));
         assert!(help.contains("ultraworkers/cowd"));
         assert!(help.contains("cargo install cowd"));
-        assert!(!help.contains("cowd login"));
-        assert!(!help.contains("cowd logout"));
+        assert!(!help.contains("login command"));
+        assert!(!help.contains("logout command"));
     }
 
     #[test]
@@ -14673,7 +14442,7 @@ UU conflicted.rs",
         assert!(help.contains("cowd import-session PATH"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("cowd --resume latest"));
-        assert!(help.contains("cowd --resume latest /status /diff /export notes.txt"));
+        assert!(!help.contains("cowd --resume latest /status"));
     }
 
     #[test]
@@ -15693,12 +15462,7 @@ providers:
     #[test]
     fn accepts_valid_reasoning_effort_values() {
         for value in ["low", "medium", "high"] {
-            let result = parse_args(&[
-                "--reasoning-effort".to_string(),
-                value.to_string(),
-                "prompt".to_string(),
-                "hello".to_string(),
-            ]);
+            let result = parse_args(&["--reasoning-effort".to_string(), value.to_string()]);
             assert!(
                 result.is_ok(),
                 "--reasoning-effort {value} should be accepted, got: {result:?}"

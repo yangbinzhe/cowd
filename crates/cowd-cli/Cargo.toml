@@ -10,7 +10,7 @@ name = "cowd"
 path = "src/main.rs"
 
 [dependencies]
-api = { path = "../api" }
+provider = { path = "../provider" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }

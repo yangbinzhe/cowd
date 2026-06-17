@@ -745,7 +745,9 @@ fn slash_command_detail_lines(spec: &SlashCommandSpec) -> Vec<String> {
         ));
     }
     if spec.resume_supported {
-        lines.push("  Resume           Supported with --resume <session-id|latest>".to_string());
+        lines.push(
+            "  Resumed TUI      Available after `cowd --resume <session-id|latest>`".to_string(),
+        );
     }
     lines
 }
@@ -803,7 +805,7 @@ fn format_slash_command_help_line(spec: &SlashCommandSpec) -> String {
         )
     };
     let resume = if spec.resume_supported {
-        " [resume]"
+        " [resumed TUI]"
     } else {
         ""
     };
@@ -892,7 +894,7 @@ pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume <session-id|latest>".to_string(),
+        "  [resumed TUI]     available after `cowd --resume <session-id|latest>`".to_string(),
         String::new(),
     ];
 
@@ -925,7 +927,7 @@ pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume <session-id|latest>".to_string(),
+        "  [resumed TUI]     available after `cowd --resume <session-id|latest>`".to_string(),
         String::new(),
     ];
 

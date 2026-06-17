@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use api::ToolDefinition;
 use plugins::PluginTool;
+use provider::ToolDefinition;
 use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,

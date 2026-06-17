@@ -1,5 +1,5 @@
 // ── Unified Gateway Daemon ────────────────────────────────────
-// `cowd gateway run` = single daemon process providing:
+// Gateway foreground mode is a single daemon process providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
 //   - Unix socket (/tmp/cowd.sock) for TUI connection
 //   - Platform adapters (feishu, wechat_ilink, email)
