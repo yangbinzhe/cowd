@@ -112,6 +112,12 @@ done
 
 [[ -S "$SOCKET" ]]
 curl -fsS "$BASE_URL/health" >/dev/null
+curl -fsS "$BASE_URL/api/cowd/projection?surface=tui" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("surface") == "tui", data; assert data.get("contract_version") == "cowd.projection.v1", data; assert data.get("capabilities"), data'
+curl -fsS "$BASE_URL/api/cowd/surfaces" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("webui_tui_full_parity") is True, data; assert data.get("cli_is_minimal_control") is True, data; assert (data.get("tui") or {}).get("role") == "console_full_capability", data'
+curl -fsS "$BASE_URL/api/cowd/release-gate" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); checks=data.get("checks") or []; assert any(item.get("check_id") == "surface.webui_tui.parity" and item.get("status") == "pass" for item in checks), data'
 
 curl -fsS -X POST "$BASE_URL/api/connectors/services/mock.docs/execute" \
   -H 'Content-Type: application/json' \
