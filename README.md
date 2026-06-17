@@ -2,7 +2,7 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、MFG 结构化运营智能和生产 Release Gate。
 
-当前内核版本：`0.9.200`
+当前内核版本：`0.9.201`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 
@@ -784,7 +784,7 @@ MFG 是 manufacturing application layer on top of the cowd kernel。当前页面
 
 ## 9. Capability 系统
 
-Capability 系统是 v0.9.200 的顶层治理机制，用于声明、投影和验证各表面能力。
+Capability 系统是 v0.9.201 的顶层治理机制，用于声明、投影和验证各表面能力。
 
 ### 9.1 Capability Registry
 
@@ -831,7 +831,7 @@ Capability 系统是 v0.9.200 的顶层治理机制，用于声明、投影和�
 
 ## 10. Structured Data Core
 
-Structured Data Core 是 v0.9.200 的通用结构化数据契约层，用于统一管理和运营结构化数据。
+Structured Data Core 是 v0.9.201 的通用结构化数据契约层，用于统一管理和运营结构化数据。
 
 核心概念：
 

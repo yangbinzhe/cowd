@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for v0.9.71 agent scenario" >&2
+  echo "tmux is required for agent graph scenario" >&2
   exit 1
 fi
 
@@ -67,7 +67,7 @@ done
 
 task_json="$(curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  --data '{"objective":"v0.9.71 multi-agent graph scenario","yolo_mode":true}')"
+  --data '{"objective":"multi-agent graph scenario","yolo_mode":true}')"
 task_id="$(printf '%s' "$task_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
 phase_json="$(curl -fsS "$BASE_URL/api/tasks/$task_id/phases" \

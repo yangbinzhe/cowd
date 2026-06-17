@@ -2,6 +2,18 @@
 
 TUI + Server 交叉交互测试框架，使用 tmux 控制终端 UI、curl 调用 HTTP API、大模型辅助生成用例和实时判断。
 
+## Governance Status
+
+This framework is a manual/nightly diagnostic suite. It is not part of the
+default release gate because several scenarios still depend on tmux timing,
+optional LLM judging, fixed ports, and exploratory cross-surface checks.
+
+Default release confidence comes from `scripts/validate.sh contract`,
+`scripts/validate.sh scenario`, and `scripts/validate.sh release`. Interactive
+scenarios may be promoted only after they use deterministic assertions, avoid
+swallowing failures, and are listed as default checks in
+`tests/test-governance/test-inventory.yaml`.
+
 ## 设计目标
 
 - 覆盖 TUI 交互、Server API、交叉场景的全部核心功能

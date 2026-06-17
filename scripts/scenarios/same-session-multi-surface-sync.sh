@@ -33,7 +33,7 @@ print_logs() {
 
 on_error() {
   local status=$?
-  echo "v0.9.56 same-session multi-surface sync failed with status $status" >&2
+  echo "same-session multi-surface sync failed with status $status" >&2
   print_logs
   exit "$status"
 }
@@ -43,7 +43,7 @@ trap on_error ERR
 
 for cmd in tmux curl python3 rg ss; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "$cmd is required for v0.9.56 same-session sync scenario" >&2
+    echo "$cmd is required for same-session sync scenario" >&2
     exit 1
   fi
 done
@@ -167,4 +167,4 @@ if not any(task.get("objective") == objective and task.get("status") == "running
 PY
 
 tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
-echo "v0.9.56 same-session multi-surface sync scenario passed"
+echo "same-session multi-surface sync scenario passed"

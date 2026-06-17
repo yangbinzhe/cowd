@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for v0.9.73 memory scenario" >&2
+  echo "tmux is required for memory runtime scenario" >&2
   exit 1
 fi
 

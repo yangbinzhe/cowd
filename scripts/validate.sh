@@ -21,10 +21,15 @@ Usage: scripts/validate.sh [unit-fast|contract|scenario|release|all|manual <name
 Lanes:
   unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
   contract   package/API/CLI contracts without browser or tmux scenarios
-  scenario   one debug build plus daemon/TUI/API scenario contracts
-  release    clean build, install to ~/AI/cowd-debug-current, and release smoke
+  scenario   current integration gate; V2 will converge it to 5 golden paths
+  release    install artifact smoke; deep scenario checks stay in scenario/manual
   all        contract + scenario
   manual     run one manual script from scripts/manual
+
+Governance:
+  tests/test-governance/test-inventory.yaml classifies default, manual,
+  nightly, and delete-candidate checks. Interactive/live/LLM/visual tests
+  are not release gates unless explicitly promoted by that inventory.
 
 Compatibility aliases:
   fast -> unit-fast, core -> contract, live -> scenario, full -> all

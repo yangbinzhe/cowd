@@ -19,7 +19,7 @@ SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-session-lifecycle-scen
 
 cleanup() {
   if [[ "$FAILED" == "1" && "${COWD_SESSION_LIFECYCLE_KEEP_TMP:-}" == "1" ]]; then
-    echo "preserving v0.9.68 scenario temp dir: $TMP_DIR" >&2
+    echo "preserving session lifecycle scenario temp dir: $TMP_DIR" >&2
     return
   fi
   if command -v tmux >/dev/null 2>&1; then
@@ -39,7 +39,7 @@ print_logs() {
 on_error() {
   local status=$?
   FAILED=1
-  echo "v0.9.68 session lifecycle scenario failed with status $status" >&2
+  echo "session lifecycle scenario failed with status $status" >&2
   print_logs
   exit "$status"
 }
@@ -49,7 +49,7 @@ trap on_error ERR
 
 for cmd in tmux curl python3 rg ss; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "$cmd is required for v0.9.68 session lifecycle scenario" >&2
+    echo "$cmd is required for session lifecycle scenario" >&2
     exit 1
   fi
 done
@@ -150,4 +150,4 @@ assert any(item["session_id"] == session_id for item in runtime.get("lifecycle",
 PY
 
 tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
-echo "v0.9.68 session lifecycle scenario passed"
+echo "session lifecycle scenario passed"

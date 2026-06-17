@@ -1,0 +1,230 @@
+version: 1
+release_version: 0.9.201
+governance_goal: >
+  Keep cowd validation focused on critical control points. Default gates should
+  protect kernel contracts and a small set of cross-module golden paths. Manual,
+  nightly, live, LLM, visual, and exploratory checks must not become release
+  gates without replacing overlapping default coverage.
+
+lanes:
+  unit-fast:
+    default: true
+    purpose: edit feedback for stable low-cost checks
+  contract:
+    default: true
+    purpose: kernel/API/CLI contracts without browser or live platform dependencies
+  scenario:
+    default: true
+    purpose: integration gate; V2 will converge it to five golden paths
+  release:
+    default: false
+    purpose: install artifact smoke before publishing or local handoff
+  manual:
+    default: false
+    purpose: diagnostics, live platforms, visual checks, LLM-assisted analysis
+
+promotion_rules:
+  - A default check must protect a kernel contract, a cross-module golden path, or a high-cost regression.
+  - A new default scenario must replace overlapping coverage instead of adding a duplicate gateway run.
+  - Live platform, LLM-judged, visual, and exploratory checks remain manual or nightly.
+  - A check that swallows critical failures or ignores HTTP status cannot be a default gate.
+  - Stable capabilities should use key control points rather than step-by-step end-to-end repetition.
+
+structured_data_control_points:
+  contract:
+    status: planned-v2
+    target: cargo test -p runtime structured_data --no-default-features
+  scenario:
+    status: planned-v2
+    target: skill_mfg verifies structured evidence/ref propagation
+  release:
+    status: planned-v3
+    target: release smoke checks structured data contract exposure only
+
+scenario_scripts:
+  - path: scripts/scenarios/gateway-webui-contract.sh
+    classification: scenario
+    default_gate: planned-v2
+    capability: gateway.baseline
+    keep_reason: health, ready, webui manifest, and fallback contract are release-critical.
+  - path: scripts/scenarios/runtime-surface.sh
+    classification: scenario
+    default_gate: current
+    capability: session.runtime
+    keep_reason: validates runtime/session/task surface wiring.
+    planned_change: merge with session-lifecycle into session_runtime golden path.
+  - path: scripts/scenarios/session-lifecycle.sh
+    classification: scenario
+    default_gate: current
+    capability: session.lifecycle
+    keep_reason: protects session/task persistence control point.
+    planned_change: merge into session_runtime golden path.
+  - path: scripts/scenarios/memory-runtime.sh
+    classification: scenario
+    default_gate: current
+    capability: memory.context
+    keep_reason: protects write/search/context/lifecycle cross-module behavior.
+    planned_change: trim to key memory_context controls.
+  - path: scripts/scenarios/channel-permission.sh
+    classification: scenario
+    default_gate: current
+    capability: tools.permission
+    keep_reason: protects preflight, dry-run, commit, audit, and connector permission chain.
+    planned_change: remain scenario golden path; remove full duplicate from release in V3.
+  - path: scripts/scenarios/skill-surface-unification.sh
+    classification: scenario
+    default_gate: current
+    capability: skills.mfg
+    keep_reason: protects skills catalog/detail/projection/action and mfg application wiring.
+    planned_change: add structured evidence/ref assertion in V2.
+  - path: scripts/scenarios/agent-graph.sh
+    classification: manual
+    default_gate: current
+    capability: agents.graph
+    keep_reason: useful but overlaps session/runtime and skill/mfg graph assertions.
+    planned_change: move out of default scenario or fold assertions into skill_mfg/session_runtime.
+  - path: scripts/scenarios/context-runtime.sh
+    classification: manual
+    default_gate: current
+    capability: context.runtime
+    keep_reason: useful but overlaps memory_context and session_runtime.
+    planned_change: move out of default scenario or fold assertions into memory_context.
+  - path: scripts/scenarios/same-session-multi-surface-sync.sh
+    classification: manual
+    default_gate: false
+    capability: session.multi_surface_sync
+    keep_reason: important diagnostic, but not a default gate until merged into session_runtime.
+  - path: scripts/scenarios/tui-smoke.sh
+    classification: surface
+    default_gate: current
+    capability: tui.startup
+    keep_reason: protects basic terminal startup.
+    planned_change: move from scenario to surface or release TUI attach coverage.
+  - path: scripts/scenarios/tui-daemon-attach.sh
+    classification: release
+    default_gate: release
+    capability: tui.daemon_attach
+    keep_reason: validates installed artifact can attach to daemon from TUI.
+  - path: scripts/scenarios/tui-interaction-quality.sh
+    classification: manual
+    default_gate: false
+    capability: tui.interaction_quality
+    keep_reason: targeted UI diagnostics; not a default gate until reduced to projection smoke.
+  - path: scripts/scenarios/full-product-smoke.sh
+    classification: release
+    default_gate: release
+    capability: release.install_smoke
+    keep_reason: install artifact smoke.
+    planned_change: trim duplicated deep scenario assertions in V3.
+
+manual_scripts:
+  - path: scripts/manual/context-runtime-lean-spike.sh
+    classification: manual
+    capability: context.runtime
+  - path: scripts/manual/memory-degraded.sh
+    classification: manual
+    capability: memory.degraded
+  - path: scripts/manual/task-phase.sh
+    classification: manual
+    capability: task.phase
+  - path: scripts/manual/report-build-size.sh
+    classification: manual
+    capability: release.size_report
+  - path: scripts/manual/webui-live-workbench.sh
+    classification: manual
+    capability: webui.cross_repo_live
+
+interactive_modules:
+  - path: tests/interactive/src/scenarios/tui_basic.rs
+    classification: manual
+    capability: tui.basic
+    rationale: overlaps TUI smoke and uses exploratory timing/LLM checks.
+  - path: tests/interactive/src/scenarios/tui_interact.rs
+    classification: manual
+    capability: tui.interaction
+    rationale: valuable diagnostics, not a deterministic release gate.
+  - path: tests/interactive/src/scenarios/tui_gateway.rs
+    classification: manual
+    capability: tui.gateway_panel
+    rationale: overlaps gateway panel/live checks; merge in V4.
+  - path: tests/interactive/src/scenarios/tui_gateway_live.rs
+    classification: manual
+    capability: tui.gateway_panel
+    rationale: overlaps tui_gateway; merge in V4.
+  - path: tests/interactive/src/scenarios/tui_memory.rs
+    classification: manual
+    capability: tui.memory_panel
+    rationale: panel smoke only; promote later only if it reads real projection deterministically.
+  - path: tests/interactive/src/scenarios/tui_skills.rs
+    classification: manual
+    capability: tui.skills_panel
+    rationale: overlaps skills registry; merge in V4.
+  - path: tests/interactive/src/scenarios/tui_skills_registry.rs
+    classification: manual
+    capability: tui.skills_panel
+    rationale: keep as basis for deterministic projection smoke, but not default yet.
+  - path: tests/interactive/src/scenarios/tui_session_sidebar.rs
+    classification: manual
+    capability: tui.session_sidebar
+    rationale: overlaps session runtime golden path.
+  - path: tests/interactive/src/scenarios/tui_all_panels.rs
+    classification: manual
+    capability: tui.panels
+    rationale: broad panel traversal is too expensive for default gates.
+  - path: tests/interactive/src/scenarios/server_core.rs
+    classification: manual
+    capability: server.core
+    rationale: overlaps gateway/API scenario and currently contains weak assertions.
+  - path: tests/interactive/src/scenarios/server_gateway_api.rs
+    classification: manual
+    capability: gateway.api
+    rationale: overlaps gateway baseline; keep for diagnostics.
+  - path: tests/interactive/src/scenarios/server_gateway_cmd.rs
+    classification: manual
+    capability: gateway.cli
+    rationale: useful diagnostics, not a default gate.
+  - path: tests/interactive/src/scenarios/server_mgmt.rs
+    classification: delete-candidate
+    capability: server.management
+    rationale: weak .ok() API checks; rewrite before promotion.
+  - path: tests/interactive/src/scenarios/server_send_message.rs
+    classification: manual
+    capability: server.messages
+    rationale: useful smoke but overlaps session/API contracts.
+  - path: tests/interactive/src/scenarios/server_feishu.rs
+    classification: delete-candidate
+    capability: platform.feishu
+    rationale: file-existence checks do not validate behavior.
+  - path: tests/interactive/src/scenarios/cross_cut.rs
+    classification: manual
+    capability: cross_surface
+    rationale: overlaps multi-surface/session scenario; keep one golden path later.
+  - path: tests/interactive/src/scenarios/cross_active.rs
+    classification: manual
+    capability: cross_surface
+    rationale: overlaps cross_cut; merge in V4.
+  - path: tests/interactive/src/scenarios/core.rs
+    classification: manual
+    capability: interactive.legacy_core
+    rationale: legacy aggregate scenario; keep out of default gates.
+  - path: tests/interactive/src/scenarios/mod.rs
+    classification: registry
+    capability: interactive.registry
+    rationale: scenario registry, not an executable gate by itself.
+
+default_gate_summary:
+  current:
+    - scripts/validate.sh unit-fast
+    - scripts/validate.sh contract
+    - scripts/validate.sh scenario
+    - scripts/validate.sh release
+  planned_v2_scenario_steps:
+    - gateway_baseline
+    - session_runtime
+    - memory_context
+    - tool_permission
+    - skill_mfg
+  planned_v5_surface_steps:
+    - cli_minimal_contract
+    - tui_projection_smoke
+    - webui_gateway_contract
