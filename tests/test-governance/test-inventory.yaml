@@ -40,6 +40,10 @@ structured_data_control_points:
   release:
     status: planned-v3
     target: release smoke checks structured data contract exposure only
+  domain_fixture:
+    status: current
+    target: tests/fixtures/mfg/server_gpu_shortage.json
+    boundary: fixture supports one golden path and must not add a sixth default scenario
 
 scenario_scripts:
   - path: scripts/scenarios/gateway-webui-contract.sh
