@@ -14,15 +14,33 @@ impl ApiClient {
 
     pub fn get(&self, path: &str) -> Result<String> {
         let out = Command::new("curl")
-            .args(["-s", &format!("{}{}", self.base, path)])
+            .args(["-fsS", &format!("{}{}", self.base, path)])
             .output()?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "GET {}{} failed with status {}: {}",
+                self.base,
+                path,
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
     pub fn post(&self, path: &str) -> Result<String> {
         let out = Command::new("curl")
-            .args(["-s", "-X", "POST", &format!("{}{}", self.base, path)])
+            .args(["-fsS", "-X", "POST", &format!("{}{}", self.base, path)])
             .output()?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "POST {}{} failed with status {}: {}",
+                self.base,
+                path,
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 

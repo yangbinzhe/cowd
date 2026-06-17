@@ -12,7 +12,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let mut srv = ServerProcess::start()?;
     let api = ApiClient::new("http://127.0.0.1:8642");
     let tui = TuiSession::new("cross-cut")?;
-    tui.wait_for("COWD", 15).ok();
+    tui.wait_for("COWD", 15)?;
     println!("\n── Cross-Cut ──");
 
     runner.run("TUI→API: send /status, verify API sees session", || {

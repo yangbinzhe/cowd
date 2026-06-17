@@ -17,7 +17,6 @@ mod cross_active;
 mod tui_all_panels;
 
 use crate::reporter::TestRunner;
-use anyhow::Result;
 
 pub fn list() {
     for (name, desc) in [

@@ -8,7 +8,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-basic")?;
-    tui.wait_for("COWD", 15).ok();
+    tui.wait_for("COWD", 15)?;
     println!("\n── TUI Basic ──");
 
     runner.run("Startup: COWD logo + status bar", || {
@@ -41,9 +41,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Scroll: PgUp/PgDn changes viewport", || {
         tui.send("Write a haiku about programming")?; tui.enter()?;
-        tui.wait_for("haiku", 15).ok();
+        tui.wait_for("haiku", 15)?;
         tui.send("Write another about debugging")?; tui.enter()?;
-        tui.wait_for("debugging", 15).ok();
+        tui.wait_for("debugging", 15)?;
         let before = tui.capture()?;
         tui.send_key("PageUp")?;
         std::thread::sleep(std::time::Duration::from_millis(500));

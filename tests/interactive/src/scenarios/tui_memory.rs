@@ -7,7 +7,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-memory")?;
-    tui.wait_for("COWD", 15).ok();
+    tui.wait_for("COWD", 15)?;
     println!("\n── TUI Memory ──");
 
     runner.run("MemoryPanel: navigate and verify entries display", || {

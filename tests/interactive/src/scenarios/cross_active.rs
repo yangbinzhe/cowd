@@ -8,7 +8,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-cross-active")?;
-    tui.wait_for("COWD", 15).ok();
+    tui.wait_for("COWD", 15)?;
     println!("\n── Cross Active ──");
 
     runner.run("Cross: TUI session visible in API sessions list", || {

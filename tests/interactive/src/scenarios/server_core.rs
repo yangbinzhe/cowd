@@ -26,12 +26,12 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     });
 
     runner.run("Memory search", || {
-        api.get("/api/memory/search?q=test").ok();
+        let _ = api.get("/api/memory/search?q=test")?;
         Ok(())
     });
 
     runner.run("Config", || {
-        api.get("/api/config").ok();
+        let _ = api.get("/api/config")?;
         Ok(())
     });
 

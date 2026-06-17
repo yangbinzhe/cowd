@@ -11,10 +11,10 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let api = ApiClient::new("http://127.0.0.1:8642");
     println!("\n── Server Mgmt ──");
 
-    runner.run("Workspace files", || { api.get("/api/workspace/files").ok(); Ok(()) });
-    runner.run("Platform list", || { api.get("/api/platforms").ok(); Ok(()) });
-    runner.run("Approval config", || { api.get("/api/approval/config").ok(); Ok(()) });
-    runner.run("Commands list", || { api.get("/api/commands").ok(); Ok(()) });
+    runner.run("Workspace files", || { let _ = api.get("/api/workspace/files")?; Ok(()) });
+    runner.run("Platform list", || { let _ = api.get("/api/platforms")?; Ok(()) });
+    runner.run("Approval config", || { let _ = api.get("/api/approval/config")?; Ok(()) });
+    runner.run("Commands list", || { let _ = api.get("/api/commands")?; Ok(()) });
 
     srv.close()?;
     Ok(())

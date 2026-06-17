@@ -72,9 +72,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     runner.run("Memory + Config", || {
         let mut srv = ServerProcess::start()?;
         let api = ApiClient::new("http://127.0.0.1:8642");
-        api.get("/api/memory/search?q=test").ok();
-        api.get("/api/config").ok();
-        api.get("/api/approval/config").ok();
+        let _ = api.get("/api/memory/search?q=test")?;
+        let _ = api.get("/api/config")?;
+        let _ = api.get("/api/approval/config")?;
         Ok(())
     });
 
@@ -82,9 +82,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     println!("\n── Cross Test ──");
     runner.run("TUI→API session verify", || {
         let t = TuiSession::new("cross")?;
-        t.wait_for("COWD", 10).ok();
+        t.wait_for("COWD", 10)?;
         t.send("/status")?; t.enter()?;
-        t.wait_for("Model", 8).ok();
+        t.wait_for("Model", 8)?;
         t.close();
 
         let mut srv = ServerProcess::start()?;

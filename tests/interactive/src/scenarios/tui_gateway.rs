@@ -7,7 +7,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-gateway")?;
-    tui.wait_for("COWD", 15).ok();
+    tui.wait_for("COWD", 15)?;
     println!("\n── TUI Gateway ──");
 
     runner.run("GatewayPanel: server status and API endpoints", || {

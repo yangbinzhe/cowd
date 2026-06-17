@@ -17,10 +17,9 @@ impl ServerProcess {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(15) {
             let out = Command::new("curl")
-                .args(["-s", "http://127.0.0.1:8642/health"])
+                .args(["-fsS", "http://127.0.0.1:8642/health"])
                 .output();
             if let Ok(o) = out {
-                let body = String::from_utf8_lossy(&o.stdout);
                 if o.status.success() {
                     return Ok(srv);
                 }
@@ -46,9 +45,5 @@ impl Drop for ServerProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // Also kill gateway if running
-        let _ = Command::new("pkill")
-            .args(["-f", "cowd.*gateway"])
-            .status();
     }
 }
