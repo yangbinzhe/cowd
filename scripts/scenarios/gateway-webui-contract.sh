@@ -69,7 +69,7 @@ curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"kind":"cowd.webui.manifest"'
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
-curl -fsS "$BASE_URL/manifest.json" | rg -q '"name"'
+curl -sS "$BASE_URL/manifest.json" | rg -q '"error":"webui_not_configured"'
 
 if [[ ! -f "$LOG" ]]; then
   echo "gateway log file was not created" >&2
