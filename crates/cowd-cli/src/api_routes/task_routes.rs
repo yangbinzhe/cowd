@@ -215,7 +215,8 @@ async fn append_task_runtime_event(
         "latest_audit": latest_audit,
     });
     state
-        .session_kernel
+        .services
+        .session
         .append_runtime_event(&task.id, memory::RuntimeEventScope::Task, kind, payload)
         .await
         .map(|_| ())

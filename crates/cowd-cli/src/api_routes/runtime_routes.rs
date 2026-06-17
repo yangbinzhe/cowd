@@ -203,7 +203,8 @@ pub(super) async fn get_runtime_timeline(
     let limit = params.limit.unwrap_or(100).min(500);
     let agent_policy = load_agent_control_policy(&state);
     let page = state
-        .session_kernel
+        .services
+        .session
         .stored_timeline_runtime_page(&params.session_id, from_seq, limit)
         .await
         .map_err(|e| {
@@ -466,11 +467,12 @@ pub(super) async fn get_runtime_control_plane(
     } else {
         "degraded"
     };
-    let active_session_ids = state.session_kernel.list_active_session_ids();
+    let active_session_ids = state.services.session.list_active_session_ids();
     let active_session_count = active_session_ids.len();
-    let durable_session_store = state.session_kernel.has_unified_store();
+    let durable_session_store = state.services.session.has_unified_store();
     let stored_session_count = match state
-        .session_kernel
+        .services
+        .session
         .list_stored_sessions_page(&SessionListOptions {
             sort: "last_activity",
             order: "desc",
@@ -826,7 +828,7 @@ pub(super) async fn get_runtime_control_plane(
             "permissions": {
                 "status": "available",
                 "auth_required": state.auth_token.is_some(),
-                "approval_gate": state.approval_gate.is_some(),
+                "approval_gate": state.services.approval.is_configured(),
                 "cross_plane_api": true,
                 "review_critical_actions": control.policy.permission.review_critical_actions,
             },

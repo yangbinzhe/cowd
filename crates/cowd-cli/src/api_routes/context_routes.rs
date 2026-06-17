@@ -366,7 +366,8 @@ async fn get_session_context_history(
     let limit = params.limit.unwrap_or(50).min(200);
     let include_envelopes = params.include_envelopes.unwrap_or(true);
     let Some((total, stored_events)) = state
-        .session_kernel
+        .services
+        .session
         .stored_events_by_type_page(&id, "ContextEnvelope", from_seq, limit)
         .await
         .map_err(|error| {
@@ -463,7 +464,8 @@ async fn get_context_envelope_handler(
     }
 
     let Some(event) = state
-        .session_kernel
+        .services
+        .session
         .context_event_by_envelope_id(&envelope_id)
         .await
         .map_err(|error| {
@@ -514,7 +516,8 @@ async fn get_context_recommendation_stats(
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(200).min(500);
     let Some((total, stored_events)) = state
-        .session_kernel
+        .services
+        .session
         .stored_events_by_type_page(&id, "ContextRecommendationAction", from_seq, limit)
         .await
         .map_err(|error| {
@@ -849,7 +852,7 @@ async fn resolve_session_evidence(
             "reason": "missing session id",
         });
     }
-    match state.session_kernel.stored_session(session_id).await {
+    match state.services.session.stored_session(session_id).await {
         Ok(Some(session)) => serde_json::json!({
             "ref": reference,
             "kind": "session",
@@ -897,7 +900,8 @@ async fn resolve_tool_evidence(
         .and_then(|tail| tail.split('/').next())
         .unwrap_or_default();
     let Some((_, events)) = state
-        .session_kernel
+        .services
+        .session
         .stored_events_page(session_id, 0, 500)
         .await
         .ok()
@@ -969,7 +973,8 @@ async fn record_context_recommendation_action(
         "note": body.note,
     });
     state
-        .session_kernel
+        .services
+        .session
         .append_timeline_event(&id, "ContextRecommendationAction", payload.clone())
         .await
         .map_err(|error| {

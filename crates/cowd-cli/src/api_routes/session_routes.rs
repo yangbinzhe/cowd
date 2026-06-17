@@ -181,7 +181,8 @@ async fn list_sessions(
     let offset = params.offset.unwrap_or(0);
 
     if let Ok(Some(page)) = state
-        .session_kernel
+        .services
+        .session
         .list_stored_sessions_page(&SessionListOptions {
             query: params.q.as_deref(),
             model: params.model.as_deref(),
@@ -210,6 +211,8 @@ async fn list_sessions(
     }
 
     let mut sessions: Vec<SessionInfo> = state
+        .services
+        .session
         .list_active_session_ids()
         .into_iter()
         .map(active_session_info)
@@ -273,7 +276,7 @@ async fn create_session(
         .model
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
-    let runtime = if let Some(store) = state.unified_store() {
+    let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::build_runtime_with_session_store(
             store.clone(),
             session,
@@ -310,7 +313,11 @@ async fn create_session(
         )
     })?;
 
-    if let Err(error) = state.register_runtime(session_id.clone(), runtime) {
+    if let Err(error) = state
+        .services
+        .session
+        .register_runtime(session_id.clone(), runtime)
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -320,10 +327,11 @@ async fn create_session(
     }
 
     let mut info = active_session_info(session_id.clone());
-    if state.has_unified_store() {
+    if state.services.session.has_unified_store() {
         let record = new_api_session_record(&session_id, Some(model));
         state
-            .session_kernel
+            .services
+            .session
             .upsert_stored_session(&record)
             .await
             .map_err(|error| {
@@ -355,13 +363,13 @@ async fn ensure_session_handler(
     }
 
     let mut created = false;
-    if state.active_runtime(&id).is_none() {
+    if state.services.session.active_runtime(&id).is_none() {
         let session = runtime::Session::new();
         let model = body
             .model
             .filter(|model| !model.trim().is_empty())
             .unwrap_or_else(|| default_session_model(&state));
-        let runtime = if let Some(store) = state.unified_store() {
+        let runtime = if let Some(store) = state.services.session.unified_store() {
             crate::build_runtime_with_session_store(
                 store.clone(),
                 session,
@@ -398,7 +406,7 @@ async fn ensure_session_handler(
             )
         })?;
 
-        if let Err(error) = state.register_runtime(id.clone(), runtime) {
+        if let Err(error) = state.services.session.register_runtime(id.clone(), runtime) {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
@@ -406,9 +414,10 @@ async fn ensure_session_handler(
                 }),
             ));
         }
-        if state.has_unified_store()
+        if state.services.session.has_unified_store()
             && state
-                .session_kernel
+                .services
+                .session
                 .stored_session(&id)
                 .await
                 .ok()
@@ -417,7 +426,8 @@ async fn ensure_session_handler(
         {
             let record = new_api_session_record(&id, Some(model));
             state
-                .session_kernel
+                .services
+                .session
                 .upsert_stored_session(&record)
                 .await
                 .map_err(|error| {
@@ -436,7 +446,7 @@ async fn ensure_session_handler(
         "ok": true,
         "session_id": id,
         "created": created,
-        "active_sessions": state.list_active_session_ids().len(),
+        "active_sessions": state.services.session.list_active_session_ids().len(),
     })))
 }
 
@@ -444,8 +454,8 @@ async fn get_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if state.has_unified_store() {
-        match state.session_kernel.stored_session(&id).await {
+    if state.services.session.has_unified_store() {
+        match state.services.session.stored_session(&id).await {
             Ok(Some(record)) => return Ok(Json(session_info_from_record(record))),
             Ok(None) => {}
             Err(error) => {
@@ -459,7 +469,7 @@ async fn get_session(
         }
     }
 
-    if state.active_runtime(&id).is_some() {
+    if state.services.session.active_runtime(&id).is_some() {
         Ok(Json(active_session_info(id)))
     } else {
         Err((
@@ -475,9 +485,10 @@ async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state.remove_active_runtime(&id).is_some();
+    let removed_active = state.services.session.remove_active_runtime(&id).is_some();
     let removed_stored = state
-        .session_kernel
+        .services
+        .session
         .delete_stored_session(&id)
         .await
         .map_err(|error| {
@@ -509,7 +520,8 @@ async fn get_session_events(
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(500);
     let Some((total, stored_events)) = state
-        .session_kernel
+        .services
+        .session
         .stored_events_page(&id, from_seq, limit)
         .await
         .map_err(|error| {
@@ -645,7 +657,8 @@ async fn get_session_runs(
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).min(200);
     let Some((total, stored_events)) = state
-        .session_kernel
+        .services
+        .session
         .stored_events_by_type_page(&id, "RuntimeRun", from_seq, limit)
         .await
         .map_err(|error| {
@@ -693,7 +706,8 @@ async fn search_messages_handler(
     Query(params): Query<SearchMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let Some(db_messages) = state
-        .session_kernel
+        .services
+        .session
         .search_stored_messages(&params.q, params.limit)
         .await
         .map_err(|error| {
@@ -753,7 +767,7 @@ async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
+    let runtime_entry = state.services.session.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -770,8 +784,7 @@ async fn compact_session_handler(
     let session_snapshot = runtime_guard.session().clone();
     drop(runtime_guard);
 
-    state
-        .session_kernel
+    state.services.session
         .sync_runtime_session_snapshot(&id, &session_snapshot)
         .await
         .map_err(|error| {
@@ -798,7 +811,7 @@ async fn get_session_stats_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
+    let runtime_entry = state.services.session.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -873,7 +886,7 @@ async fn update_session_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let mut found = false;
 
-    if let Some(runtime_entry) = state.active_runtime(&id) {
+    if let Some(runtime_entry) = state.services.session.active_runtime(&id) {
         found = true;
         let mut runtime_guard = runtime_entry.lock().await;
         let mut session = runtime_guard.session_mut_async().await;
@@ -882,8 +895,8 @@ async fn update_session_handler(
         }
     }
 
-    if state.has_unified_store() {
-        match state.session_kernel.stored_session(&id).await {
+    if state.services.session.has_unified_store() {
+        match state.services.session.stored_session(&id).await {
             Ok(Some(mut record)) => {
                 found = true;
                 if let Some(ref model) = body.model {
@@ -914,7 +927,8 @@ async fn update_session_handler(
                     record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
                 }
                 state
-                    .session_kernel
+                    .services
+                    .session
                     .update_stored_session(&record)
                     .await
                     .map_err(|error| {

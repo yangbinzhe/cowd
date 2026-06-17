@@ -7,6 +7,7 @@
 //! active `PermissionPolicy`.
 
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use approval::{ApprovalRepository, FileApprovalRepository};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -732,18 +733,26 @@ pub struct DestructivePatternDetector {
     patterns: Vec<DangerPattern>,
     /// Session-level approval cache (command_hash → persistence)
     session_approved: Arc<RwLock<HashMap<String, ApprovalPersistence>>>,
-    /// Permanent approval config path
-    always_approved_path: PathBuf,
+    /// Permanent approval repository.
+    approval_repository: FileApprovalRepository,
 }
 
 impl DestructivePatternDetector {
     /// Create a new detector with all built-in patterns
     pub fn new(config_dir: PathBuf) -> Self {
+        let storage_layout = cowd_storage::StorageLayout::default_for_config_home(&config_dir);
+        let approval_repository = FileApprovalRepository::from_storage_layout(&storage_layout)
+            .unwrap_or_else(|_| {
+                FileApprovalRepository::new(
+                    config_dir.join("storage").join("approval_history.json"),
+                    config_dir.join("storage").join("always_approved.json"),
+                )
+            });
         let patterns = Self::build_patterns();
         Self {
             patterns,
             session_approved: Arc::new(RwLock::new(HashMap::new())),
-            always_approved_path: config_dir.join("always_approved.json"),
+            approval_repository,
         }
     }
 
@@ -1111,13 +1120,10 @@ impl DestructivePatternDetector {
 
     /// Check if command is permanently approved
     fn is_always_approved(&self, _normalized: &str) -> bool {
-        // Check the always_approved config file
-        if let Ok(data) = std::fs::read_to_string(&self.always_approved_path) {
-            if let Ok(patterns) = serde_json::from_str::<Vec<String>>(&data) {
-                return patterns.iter().any(|p| _normalized.contains(p));
-            }
-        }
-        false
+        self.approval_repository
+            .list_always_allowed()
+            .map(|patterns| patterns.iter().any(|p| _normalized.contains(p)))
+            .unwrap_or(false)
     }
 
     /// Detect if a command is dangerous and requires approval
@@ -1182,15 +1188,7 @@ impl DestructivePatternDetector {
                 cache.insert(cache_key, persistence);
             }
             ApprovalPersistence::Always => {
-                // Write to permanent config file
-                let mut patterns: Vec<String> = std::fs::read_to_string(&self.always_approved_path)
-                    .ok()
-                    .and_then(|d| serde_json::from_str(&d).ok())
-                    .unwrap_or_default();
-                patterns.push(normalized);
-                if let Ok(data) = serde_json::to_string_pretty(&patterns) {
-                    let _ = std::fs::write(&self.always_approved_path, data);
-                }
+                let _ = self.approval_repository.add_always_allowed(&normalized);
             }
         }
     }

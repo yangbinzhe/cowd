@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 provider = { path = "../provider" }
 storage = { path = "../storage" }
+approval = { path = "../approval" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,6 +35,8 @@ plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+session = { path = "../session" }
+mcp = { path = "../mcp" }
 sha2 = "0.10"
 toml = "0.8"
 syntect = "5"

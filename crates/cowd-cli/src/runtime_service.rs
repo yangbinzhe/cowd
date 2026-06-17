@@ -5,10 +5,10 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
 };
-use crate::runtime_host::SessionLeaseRegistry;
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
+use session::SessionLeaseRegistry;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
@@ -47,6 +47,11 @@ impl RuntimeService {
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn session_kernel(&self) -> Arc<SessionKernel> {
+        self.session_kernel.clone()
     }
 
     #[must_use]

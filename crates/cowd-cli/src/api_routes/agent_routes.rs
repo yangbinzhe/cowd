@@ -337,7 +337,8 @@ async fn append_agent_runtime_event(
     graph: &AgentRunGraph,
 ) -> Result<(), String> {
     state
-        .session_kernel
+        .services
+        .session
         .append_runtime_event(
             session_id,
             memory::RuntimeEventScope::Workgraph,

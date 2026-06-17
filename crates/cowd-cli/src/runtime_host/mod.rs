@@ -4,14 +4,15 @@
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::http::HeaderValue;
 use axum::{http::StatusCode, response::IntoResponse};
 use serde::Serialize;
+use session::SessionLeaseRegistry;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -25,125 +26,206 @@ use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
+use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::mirror::MessageMirror;
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::platform::{InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime};
-use runtime::{ContentBlock, ConversationMessage};
+use runtime::{ContentBlock, ConversationMessage, McpServerManager, RuntimeConfig};
 use tools::GlobalToolRegistry;
 
 use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct SessionLease {
-    pub(crate) session_id: String,
-    pub(crate) owner: String,
-    pub(crate) mode: String,
-    pub(crate) acquired_at_ms: u64,
+#[derive(Clone, Default)]
+struct RuntimeMcpServiceAdapter {
+    registry: McpToolRegistry,
 }
 
-#[derive(Default)]
-pub(crate) struct SessionLeaseRegistry {
-    leases: tokio::sync::RwLock<HashMap<String, SessionLease>>,
-}
+impl RuntimeMcpServiceAdapter {
+    async fn from_runtime_config(config: &RuntimeConfig) -> Self {
+        let registry = McpToolRegistry::new();
+        for (server_name, server_config) in config.mcp().servers() {
+            let single_server = BTreeMap::from([(server_name.clone(), server_config.clone())]);
+            let mut manager = McpServerManager::from_servers(&single_server);
+            if manager.server_names().is_empty() {
+                registry.register_server(
+                    server_name,
+                    McpConnectionStatus::Error,
+                    vec![],
+                    vec![],
+                    manager
+                        .unsupported_servers()
+                        .first()
+                        .map(|server| server.reason.clone()),
+                );
+                continue;
+            }
 
-impl SessionLeaseRegistry {
-    pub(crate) async fn acquire(
-        &self,
-        session_id: &str,
-        owner: &str,
-        mode: &str,
-    ) -> serde_json::Value {
-        if session_id.trim().is_empty() || owner.trim().is_empty() {
-            return serde_json::json!({
-                "ok": false,
-                "error": "session_id and owner are required",
-            });
-        }
-
-        let normalized_mode = match mode {
-            "exclusive" | "collaborative" | "takeover" => mode,
-            _ => "collaborative",
-        };
-
-        let mut leases = self.leases.write().await;
-        if let Some(existing) = leases.get(session_id) {
-            let same_owner = existing.owner == owner;
-            let compatible = existing.mode == "collaborative" && normalized_mode == "collaborative";
-            let takeover = normalized_mode == "takeover";
-            if !same_owner && !compatible && !takeover {
-                return serde_json::json!({
-                    "ok": false,
-                    "error": "session lease is held by another owner",
-                    "session_id": session_id,
-                    "owner": existing.owner,
-                    "mode": existing.mode,
-                });
+            let discovery = manager.discover_tools_best_effort().await;
+            let failed = discovery
+                .failed_servers
+                .iter()
+                .find(|failure| failure.server_name == *server_name);
+            let status = if failed.is_some() {
+                McpConnectionStatus::Error
+            } else {
+                McpConnectionStatus::Connected
+            };
+            let tools = discovery
+                .tools
+                .iter()
+                .filter(|tool| tool.server_name == *server_name)
+                .map(|tool| McpToolInfo {
+                    name: tool.raw_name.clone(),
+                    description: tool.tool.description.clone(),
+                    input_schema: tool.tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            registry.register_server(
+                server_name,
+                status,
+                tools,
+                vec![],
+                failed.map(|failure| failure.error.clone()),
+            );
+            if status == McpConnectionStatus::Connected {
+                registry.set_server_manager(server_name, manager);
             }
         }
+        Self { registry }
+    }
 
-        let effective_mode = if normalized_mode == "takeover" {
-            "exclusive"
-        } else {
-            normalized_mode
-        };
-        let lease = SessionLease {
-            session_id: session_id.to_string(),
-            owner: owner.to_string(),
-            mode: effective_mode.to_string(),
-            acquired_at_ms: current_epoch_ms(),
-        };
-        leases.insert(session_id.to_string(), lease.clone());
+    fn server_projection(
+        state: runtime::mcp_tool_bridge::McpServerState,
+    ) -> mcp::McpServerProjection {
+        mcp::McpServerProjection {
+            name: state.server_name,
+            transport: mcp::McpTransportKind::ManagedProxy,
+            enabled: state.status != McpConnectionStatus::Disconnected,
+            status: state.status.to_string(),
+            auth_state: (state.status == McpConnectionStatus::AuthRequired)
+                .then(|| "auth_required".to_string()),
+        }
+    }
+}
 
-        serde_json::json!({
+impl mcp::McpService for RuntimeMcpServiceAdapter {
+    fn list_servers(&self) -> Result<Vec<mcp::McpServerProjection>, mcp::McpServiceError> {
+        Ok(self
+            .registry
+            .list_servers()
+            .into_iter()
+            .map(Self::server_projection)
+            .collect())
+    }
+
+    fn server(&self, name: &str) -> Result<mcp::McpServerProjection, mcp::McpServiceError> {
+        self.registry
+            .get_server(name)
+            .map(Self::server_projection)
+            .ok_or_else(|| mcp::McpServiceError::NotFound(name.to_string()))
+    }
+
+    fn health(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+        let servers = self.registry.list_servers();
+        Ok(serde_json::json!({
             "ok": true,
-            "session_id": lease.session_id,
-            "owner": lease.owner,
-            "mode": lease.mode,
-            "acquired_at_ms": lease.acquired_at_ms,
+            "servers": servers.len(),
+            "connected": servers.iter().filter(|server| server.status == McpConnectionStatus::Connected).count(),
+        }))
+    }
+
+    fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+        Ok(serde_json::json!({
+            "ok": true,
+            "status": "reload_not_required",
+            "source": "runtime_mcp_service_adapter"
+        }))
+    }
+
+    fn list_tools(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<mcp::McpToolProjection>, mcp::McpServiceError> {
+        let mut tools = Vec::new();
+        for state in self.registry.list_servers() {
+            if server.is_some_and(|requested| requested != state.server_name) {
+                continue;
+            }
+            let server_tools = self
+                .registry
+                .list_tools(&state.server_name)
+                .map_err(mcp::McpServiceError::Request)?;
+            tools.extend(server_tools.into_iter().map(|tool| mcp::McpToolProjection {
+                server: state.server_name.clone(),
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema.unwrap_or_else(|| serde_json::json!({})),
+            }));
+        }
+        Ok(tools)
+    }
+
+    fn list_resources(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<mcp::McpResourceProjection>, mcp::McpServiceError> {
+        let mut resources = Vec::new();
+        for state in self.registry.list_servers() {
+            if server.is_some_and(|requested| requested != state.server_name) {
+                continue;
+            }
+            let server_resources = self
+                .registry
+                .list_resources(&state.server_name)
+                .map_err(mcp::McpServiceError::Request)?;
+            resources.extend(server_resources.into_iter().map(|resource| {
+                mcp::McpResourceProjection {
+                    server: state.server_name.clone(),
+                    uri: resource.uri,
+                    name: Some(resource.name),
+                    mime_type: resource.mime_type,
+                    content: None,
+                }
+            }));
+        }
+        Ok(resources)
+    }
+
+    fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<mcp::McpResourceProjection, mcp::McpServiceError> {
+        let resource = self
+            .registry
+            .read_resource(server, uri)
+            .map_err(mcp::McpServiceError::Request)?;
+        Ok(mcp::McpResourceProjection {
+            server: server.to_string(),
+            uri: resource.uri,
+            name: Some(resource.name),
+            mime_type: resource.mime_type,
+            content: None,
         })
     }
 
-    pub(crate) async fn release(&self, session_id: &str, owner: &str) -> serde_json::Value {
-        let mut leases = self.leases.write().await;
-        match leases.get(session_id) {
-            Some(existing) if existing.owner == owner => {
-                leases.remove(session_id);
-                serde_json::json!({
-                    "ok": true,
-                    "session_id": session_id,
-                    "released": true,
-                })
-            }
-            Some(existing) => serde_json::json!({
-                "ok": false,
-                "error": "session lease is held by another owner",
-                "session_id": session_id,
-                "owner": existing.owner,
-                "mode": existing.mode,
-            }),
-            None => serde_json::json!({
-                "ok": true,
-                "session_id": session_id,
-                "released": false,
-            }),
-        }
+    fn call_tool(
+        &self,
+        request: mcp::McpToolCallRequest,
+    ) -> Result<mcp::McpToolCallReceipt, mcp::McpServiceError> {
+        let output = self
+            .registry
+            .call_tool(&request.server, &request.tool, &request.input)
+            .map_err(mcp::McpServiceError::Request)?;
+        Ok(mcp::McpToolCallReceipt {
+            server: request.server,
+            tool: request.tool,
+            ok: true,
+            output,
+        })
     }
-
-    pub(crate) async fn list(&self) -> Vec<SessionLease> {
-        let leases = self.leases.read().await;
-        let mut items = leases.values().cloned().collect::<Vec<_>>();
-        items.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        items
-    }
-}
-
-fn current_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ── Background session cleanup task ────────────────────────────
@@ -662,6 +744,16 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let runtime_config = runtime::ConfigLoader::new(&workspace_root, &approval_dir)
+        .load()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load runtime config for MCP service");
+            RuntimeConfig::empty()
+        });
+    let mcp_service =
+        Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
+    let _ = tools::set_mcp_service(mcp_service);
     let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
     storage_config
         .layout
@@ -672,6 +764,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .file_path("approval_history")
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| approval_dir.join("approval_history.json"));
+    let approval_repository =
+        approval::FileApprovalRepository::from_storage_layout(&storage_config.layout)
+            .map_err(|e| format!("failed to initialize approval repository: {e}"))?;
     let task_db_path = storage_config
         .layout
         .sqlite_path("tasks")
@@ -720,7 +815,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Duration::from_secs(300),
     );
 
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let static_webui =
         crate::gateway_static::resolve_static_webui_source(config.webui_dir.as_deref());
     let startup_diagnostics = build_startup_diagnostics(
@@ -734,15 +828,17 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     emit_startup_diagnostics(&startup_diagnostics);
 
     let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
-    let gateway_services = Arc::new(crate::gateway_services::GatewayServices::new(Arc::new(
-        RuntimeService::new(
+    let gateway_services = Arc::new(crate::gateway_services::GatewayServices::new(
+        Arc::new(RuntimeService::new(
             sessions.clone(),
             lease_registry.clone(),
             session_kernel.clone(),
             lifecycle_kernel.clone(),
             started_at,
-        ),
-    )));
+        )),
+        approval_gate.clone(),
+        approval_repository,
+    ));
 
     let app_state = Arc::new(api_routes::AppState {
         session_kernel: session_kernel.clone(),
@@ -959,6 +1055,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp::McpService;
     use memory::MemoryConfig;
     use std::fs;
 
@@ -992,6 +1089,37 @@ mod tests {
         assert!(config.memory_config.is_none());
         assert!(config.platform_configs.is_empty());
         assert!(config.auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_mcp_service_projects_configured_servers() {
+        let root = temp_webui_dir("mcp-config");
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "mcpServers": {
+                "remote-server": {
+                  "type": "http",
+                  "url": "https://example.test/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write config");
+
+        let config = runtime::ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("load runtime config");
+        let service = RuntimeMcpServiceAdapter::from_runtime_config(&config).await;
+        let servers = service.list_servers().expect("list servers");
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "remote-server");
+        assert_eq!(servers[0].status, "error");
     }
 
     #[tokio::test]

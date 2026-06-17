@@ -45,7 +45,7 @@ use crate::prepared::{
 };
 use crate::tool_specs::{mvp_tool_specs, ToolSpec};
 use crate::{
-    global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry,
+    configured_mcp_service, global_cron_registry, global_lsp_registry, global_task_registry,
     global_team_registry, global_worker_registry, GlobalToolRegistry,
 };
 
@@ -733,9 +733,11 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
     let server = input.server.as_deref().unwrap_or("default");
-    match registry.list_resources(server) {
+    let Some(service) = configured_mcp_service() else {
+        return mcp_service_unavailable("list_resources", server);
+    };
+    match service.list_resources(Some(server)) {
         Ok(resources) => {
             let items: Vec<_> = resources
                 .iter()
@@ -743,7 +745,6 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
                     json!({
                         "uri": r.uri,
                         "name": r.name,
-                        "description": r.description,
                         "mime_type": r.mime_type,
                     })
                 })
@@ -757,35 +758,36 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
         Err(e) => to_pretty_json(json!({
             "server": server,
             "resources": [],
-            "error": e
+            "error": e.to_string()
         })),
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
     let uri = input.uri.as_deref().unwrap_or("");
     let server = input.server.as_deref().unwrap_or("default");
-    match registry.read_resource(server, uri) {
+    let Some(service) = configured_mcp_service() else {
+        return mcp_service_unavailable("read_resource", server);
+    };
+    match service.read_resource(server, uri) {
         Ok(resource) => to_pretty_json(json!({
             "server": server,
             "uri": resource.uri,
             "name": resource.name,
-            "description": resource.description,
-            "mime_type": resource.mime_type
+            "mime_type": resource.mime_type,
+            "content": resource.content
         })),
         Err(e) => to_pretty_json(json!({
             "server": server,
             "uri": uri,
-            "error": e
+            "error": e.to_string()
         })),
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
     let auth_url_env = format!(
         "COWD_MCP_AUTH_URL_{}",
         input
@@ -799,21 +801,29 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
             .collect::<String>()
     );
     let auth_url = std::env::var(auth_url_env).ok();
-    match registry.get_server(&input.server) {
-        Some(state) => {
-            let status = state.status.to_string();
+    let Some(service) = configured_mcp_service() else {
+        return to_pretty_json(json!({
+            "server": input.server,
+            "status": "disconnected",
+            "auth_required": false,
+            "auth_url": auth_url,
+            "next_action": "connect_server",
+            "message": "MCP service is not configured for this tool runtime."
+        }));
+    };
+    match service.server(&input.server) {
+        Ok(state) => {
+            let status = state.status;
             to_pretty_json(json!({
             "server": input.server,
             "status": status,
             "auth_required": status == "auth_required",
             "auth_url": auth_url,
             "next_action": if status == "auth_required" { "open_auth_url_or_complete_external_auth" } else { "none" },
-            "server_info": state.server_info,
-            "tool_count": state.tools.len(),
-            "resource_count": state.resources.len()
+            "auth_state": state.auth_state,
             }))
         }
-        None => to_pretty_json(json!({
+        Err(_) => to_pretty_json(json!({
             "server": input.server,
             "status": "disconnected",
             "auth_required": false,
@@ -822,6 +832,16 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
             "message": "Server not registered. Use MCP tool to connect first."
         })),
     }
+}
+
+fn mcp_service_unavailable(operation: &str, server: &str) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": server,
+        "operation": operation,
+        "status": "service_unavailable",
+        "error": "MCP service is not configured for this tool runtime.",
+        "next_action": "start_gateway_runtime"
+    }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -893,19 +913,25 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
     let args = input.arguments.unwrap_or(serde_json::json!({}));
-    match registry.call_tool(&input.server, &input.tool, &args) {
-        Ok(result) => to_pretty_json(json!({
+    let Some(service) = configured_mcp_service() else {
+        return mcp_service_unavailable("call_tool", &input.server);
+    };
+    match service.call_tool(mcp::McpToolCallRequest {
+        server: input.server.clone(),
+        tool: input.tool.clone(),
+        input: args,
+    }) {
+        Ok(receipt) => to_pretty_json(json!({
             "server": input.server,
             "tool": input.tool,
-            "result": result,
-            "status": "success"
+            "result": receipt.output,
+            "status": if receipt.ok { "success" } else { "error" }
         })),
         Err(e) => to_pretty_json(json!({
             "server": input.server,
             "tool": input.tool,
-            "error": e,
+            "error": e.to_string(),
             "status": "error"
         })),
     }

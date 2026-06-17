@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use mcp::McpService;
 use plugins::PluginTool;
 use provider::ToolDefinition;
 use runtime::{
     lsp_client::LspRegistry,
-    mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::PermissionEnforcer,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -26,10 +26,20 @@ fn global_lsp_registry() -> &'static LspRegistry {
     REGISTRY.get_or_init(LspRegistry::new)
 }
 
-fn global_mcp_registry() -> &'static McpToolRegistry {
+fn global_mcp_service() -> &'static std::sync::OnceLock<std::sync::Arc<dyn McpService>> {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<McpToolRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(McpToolRegistry::new)
+    static SERVICE: OnceLock<std::sync::Arc<dyn McpService>> = OnceLock::new();
+    &SERVICE
+}
+
+pub fn set_mcp_service(service: std::sync::Arc<dyn McpService>) -> Result<(), &'static str> {
+    global_mcp_service()
+        .set(service)
+        .map_err(|_| "mcp service already configured")
+}
+
+fn configured_mcp_service() -> Option<std::sync::Arc<dyn McpService>> {
+    global_mcp_service().get().cloned()
 }
 
 fn global_team_registry() -> &'static TeamRegistry {

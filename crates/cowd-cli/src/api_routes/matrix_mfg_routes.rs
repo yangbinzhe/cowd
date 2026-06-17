@@ -786,8 +786,8 @@ async fn matrix_production_governance_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let bundle = MfgProductionGovernanceBundle {
         auth_token_configured: state.auth_token.is_some(),
-        approval_gate_configured: state.approval_gate.is_some(),
-        session_store_ready: state.has_unified_store(),
+        approval_gate_configured: state.services.approval.is_configured(),
+        session_store_ready: state.services.session.has_unified_store(),
         platform_runtime_ready: state.platform_runtime.is_some(),
         audit_export_surface: true,
         cross_plane_audit_surface: true,
@@ -3394,7 +3394,8 @@ async fn append_matrix_agent_runtime_event(
         .await
         .map_err(|error| format!("failed to prepare MFG task runtime session: {error}"))?;
     state
-        .session_kernel
+        .services
+        .session
         .append_runtime_event(
             &task.id,
             memory::RuntimeEventScope::Workgraph,

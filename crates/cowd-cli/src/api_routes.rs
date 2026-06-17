@@ -87,7 +87,7 @@ pub struct AppState {
     pub profile_manager: Arc<ProfileManager>,
     pub task_kernel: Arc<TaskKernel>,
     pub services: Arc<GatewayServices>,
-    pub session_lease_registry: Option<Arc<crate::runtime_host::SessionLeaseRegistry>>,
+    pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
@@ -645,7 +645,7 @@ mod tests {
     }
 
     fn test_state_with_lease_registry(
-        registry: Arc<crate::runtime_host::SessionLeaseRegistry>,
+        registry: Arc<session::SessionLeaseRegistry>,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -877,14 +877,16 @@ mod tests {
             platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: Some(gate),
+            approval_gate: Some(gate.clone()),
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: Arc::new(
+                crate::gateway_services::GatewayServices::transition_with_approval_for_tests(gate),
+            ),
             session_lease_registry: None,
         })
     }
@@ -4293,7 +4295,7 @@ runtime:
 
     #[tokio::test]
     async fn runtime_session_lease_routes_share_daemon_registry_projection() {
-        let registry = Arc::new(crate::runtime_host::SessionLeaseRegistry::default());
+        let registry = Arc::new(session::SessionLeaseRegistry::default());
         let app = api_router(test_state_with_lease_registry(registry));
 
         let acquire = app

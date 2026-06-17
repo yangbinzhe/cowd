@@ -7,10 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use runtime::{
-    permission_enforcer::{ApprovalPersistence, ApprovalVerdict},
-    ApprovalConfig,
-};
+use runtime::{permission_enforcer::ApprovalPersistence, ApprovalConfig};
 use serde::Deserialize;
 
 use super::{api_error, AppState, ErrorResponse};
@@ -38,41 +35,26 @@ struct ApprovalRespondRequest {
 }
 
 async fn approval_pending_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let pending = match &state.approval_gate {
-        Some(gate) => gate.get_pending_requests().await,
-        None => Vec::new(),
-    };
-    Json(serde_json::json!(pending))
+    Json(state.services.approval.pending().await)
 }
 
 async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = match &state.approval_gate {
-        Some(gate) => gate.config().read().await.clone(),
-        None => ApprovalConfig::default(),
-    };
-    Json(serde_json::json!(cfg))
+    Json(serde_json::json!(state.services.approval.config().await))
 }
 
 async fn update_approval_config_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(config): Json<ApprovalConfig>,
 ) -> impl IntoResponse {
-    if let Some(gate) = &state.approval_gate {
-        gate.update_config(config.clone()).await;
-    }
-    Json(serde_json::json!(config))
+    Json(serde_json::json!(
+        state.services.approval.update_config(config).await
+    ))
 }
 
 async fn toggle_solo_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let mut cfg = match &state.approval_gate {
-        Some(gate) => gate.config().read().await.clone(),
-        None => ApprovalConfig::default(),
-    };
-    cfg.solo_mode = !cfg.solo_mode;
-    if let Some(gate) = &state.approval_gate {
-        gate.update_config(cfg.clone()).await;
-    }
-    Json(serde_json::json!(cfg))
+    Json(serde_json::json!(
+        state.services.approval.toggle_solo().await
+    ))
 }
 
 async fn approval_history_handler(
@@ -88,46 +70,23 @@ async fn approval_history_handler(
         .get("offset")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    let history = match &state.approval_gate {
-        Some(gate) => gate.history().list_history(limit, offset).await.0,
-        None => Vec::new(),
-    };
-    Json(serde_json::json!(history))
+    Json(state.services.approval.history(limit, offset).await)
 }
 
 async fn approval_respond_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ApprovalRespondRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(gate) = &state.approval_gate else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "approval gate not configured",
-        ));
-    };
     let persistence = match body.persistence.as_deref().unwrap_or("once") {
         "session" => ApprovalPersistence::Session,
         "always" => ApprovalPersistence::Always,
         _ => ApprovalPersistence::Once,
     };
-    let verdict = if body.approved {
-        ApprovalVerdict::Approved
-    } else {
-        ApprovalVerdict::Denied {
-            reason: body.reason.unwrap_or_else(|| "denied by user".to_string()),
-        }
-    };
-    let Some(request) = gate.resolve_approval(&body.id, verdict, persistence).await else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "approval request not found",
-        ));
-    };
-    Ok(Json(serde_json::json!({
-        "id": body.id,
-        "resolved": true,
-        "approved": body.approved,
-        "tool": "bash",
-        "action": request.command,
-    })))
+    state
+        .services
+        .approval
+        .respond(&body.id, body.approved, persistence, body.reason)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }

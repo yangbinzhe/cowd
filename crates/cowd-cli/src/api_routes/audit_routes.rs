@@ -31,10 +31,10 @@ async fn audit_export_handler(
     let include_memory = matches!(source, "all" | "memory");
 
     let (approval, approval_total) = if include_approval {
-        match &state.approval_gate {
-            Some(gate) => gate.history().list_history(limit + offset, 0).await,
-            None => (Vec::new(), 0),
-        }
+        let approval = state.services.approval.history(limit + offset, 0).await;
+        let items = approval.as_array().cloned().unwrap_or_default();
+        let total = items.len();
+        (items, total)
     } else {
         (Vec::new(), 0)
     };
@@ -52,9 +52,9 @@ async fn audit_export_handler(
     for entry in &approval {
         records.push(serde_json::json!({
             "source": "approval",
-            "timestamp": entry.resolved_at,
-            "id": entry.id,
-            "summary": entry.command,
+            "timestamp": entry.get("resolved_at").and_then(|value| value.as_str()).unwrap_or_default(),
+            "id": entry.get("id").and_then(|value| value.as_str()).unwrap_or_default(),
+            "summary": entry.get("command").and_then(|value| value.as_str()).unwrap_or_default(),
             "record": entry,
         }));
     }

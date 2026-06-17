@@ -1,11 +1,24 @@
 use std::sync::Arc;
 
+use approval::{ApprovalRepository, FileApprovalRepository};
 use commands::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
+use memory::store::session::{
+    SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
+};
+use memory::{
+    CognitiveContextManager, MemoryError, RuntimeEventPage, RuntimeEventScope, UnifiedSessionStore,
+};
+use runtime::{
+    approval_gate::SmartApprovalGate,
+    permission_enforcer::{ApprovalPersistence, ApprovalVerdict},
+    AgentWorkGraph, ApprovalConfig, CollaborationReviewPacket,
+};
 
 use crate::runtime_service::RuntimeService;
+use crate::session_kernel::SessionKernel;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServiceEnvelope {
@@ -45,9 +58,7 @@ macro_rules! define_gateway_service {
     };
 }
 
-define_gateway_service!(SessionService, "session");
 define_gateway_service!(TaskService, "task");
-define_gateway_service!(ApprovalService, "approval");
 define_gateway_service!(MemoryService, "memory");
 define_gateway_service!(ContextService, "context");
 define_gateway_service!(ConnectorService, "connector");
@@ -58,6 +69,456 @@ define_gateway_service!(SkillService, "skill");
 define_gateway_service!(AgentService, "agent");
 define_gateway_service!(MatrixService, "matrix");
 define_gateway_service!(MfgService, "mfg");
+
+#[derive(Clone)]
+pub(crate) struct SessionService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+    kernel: Option<Arc<SessionKernel>>,
+}
+
+impl SessionService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "session",
+            owner: "0.9.296 Session service boundary",
+            kernel: None,
+        }
+    }
+
+    pub(crate) fn with_kernel(kernel: Arc<SessionKernel>) -> Self {
+        Self {
+            kernel: Some(kernel),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        ServiceEnvelope {
+            service: self.label,
+            operation,
+            status: if self.kernel.is_some() {
+                "service_ready"
+            } else {
+                "service_boundary_ready"
+            },
+            owner: self.owner,
+            route_transition_delete_by: "0.9.297",
+        }
+    }
+
+    fn kernel(&self) -> Option<&Arc<SessionKernel>> {
+        self.kernel.as_ref()
+    }
+
+    pub(crate) fn unified_store(&self) -> Option<Arc<UnifiedSessionStore>> {
+        self.kernel().and_then(|kernel| kernel.unified_store())
+    }
+
+    pub(crate) fn has_unified_store(&self) -> bool {
+        self.kernel()
+            .is_some_and(|kernel| kernel.has_unified_store())
+    }
+
+    pub(crate) fn list_active_session_ids(&self) -> Vec<String> {
+        self.kernel()
+            .map_or_else(Vec::new, |kernel| kernel.list_active_session_ids())
+    }
+
+    pub(crate) fn active_runtime(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>> {
+        self.kernel()
+            .and_then(|kernel| kernel.active_runtime(session_id))
+    }
+
+    pub(crate) fn register_runtime(
+        &self,
+        session_id: String,
+        runtime: crate::BuiltRuntime,
+    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>>, String> {
+        self.kernel()
+            .ok_or_else(|| "session service not configured".to_string())?
+            .register_runtime(session_id, runtime)
+    }
+
+    pub(crate) fn remove_active_runtime(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>> {
+        self.kernel()
+            .and_then(|kernel| kernel.remove_active_runtime(session_id))
+    }
+
+    pub(crate) async fn list_stored_sessions_page(
+        &self,
+        options: &SessionListOptions<'_>,
+    ) -> Result<Option<SessionListPage>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.list_stored_sessions_page(options).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRecord>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.stored_session(session_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn upsert_stored_session(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.upsert_stored_session(record).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn update_stored_session(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.update_stored_session(record).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_stored_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.delete_stored_session(session_id).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn stored_events_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<(usize, Vec<SessionEvent>)>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .stored_events_page(session_id, from_sequence, limit)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_events_by_type_page(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<(usize, Vec<SessionEvent>)>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .stored_events_by_type_page(session_id, event_type, from_sequence, limit)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn search_stored_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionMessage>>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.search_stored_messages(query, limit).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_message_count(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<usize>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.stored_message_count(session_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_messages(
+        &self,
+        session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionMessage>>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.stored_messages(session_id, offset, limit).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_messages_from_sequence(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionMessage>>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .stored_messages_from_sequence(session_id, from_sequence, limit)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn append_timeline_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .append_timeline_event(session_id, event_type, payload)
+                    .await
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn append_runtime_event(
+        &self,
+        session_id: &str,
+        scope: RuntimeEventScope,
+        kind: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<Option<usize>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .append_runtime_event(session_id, scope, kind, payload)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn persist_workgraph_review(
+        &self,
+        graph: &AgentWorkGraph,
+        packet: &CollaborationReviewPacket,
+        memory_manager: Option<&Arc<CognitiveContextManager>>,
+    ) -> Result<crate::session_kernel::RuntimeClosedLoopResult, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .persist_workgraph_review(graph, packet, memory_manager)
+                    .await
+            }
+            None => Ok(crate::session_kernel::RuntimeClosedLoopResult {
+                session_id: graph.session_id.clone(),
+                persisted: false,
+                runtime_event_sequence: None,
+                memory_pulse: None,
+                degraded_reason: Some("session service not configured".to_string()),
+            }),
+        }
+    }
+
+    pub(crate) async fn context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.context_event_by_envelope_id(envelope_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_runtime_events_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .stored_runtime_events_page(session_id, from_sequence, limit)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn stored_timeline_runtime_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .stored_timeline_runtime_page(session_id, from_sequence, limit)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn sync_runtime_session_snapshot(
+        &self,
+        session_id: &str,
+        session: &runtime::Session,
+    ) -> Result<(), MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel
+                .sync_runtime_session_snapshot(session_id, session)
+                .await
+                .map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ApprovalService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+    gate: Option<Arc<SmartApprovalGate>>,
+    repository: Option<FileApprovalRepository>,
+}
+
+impl ApprovalService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "approval",
+            owner: "0.9.296 Approval service boundary",
+            gate: None,
+            repository: None,
+        }
+    }
+
+    pub(crate) fn with_gate_and_repository(
+        gate: Arc<SmartApprovalGate>,
+        repository: FileApprovalRepository,
+    ) -> Self {
+        Self {
+            gate: Some(gate),
+            repository: Some(repository),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        ServiceEnvelope {
+            service: self.label,
+            operation,
+            status: if self.gate.is_some() {
+                "service_ready"
+            } else {
+                "service_boundary_ready"
+            },
+            owner: self.owner,
+            route_transition_delete_by: "0.9.297",
+        }
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.gate.is_some()
+    }
+
+    pub(crate) async fn pending(&self) -> serde_json::Value {
+        let pending = match &self.gate {
+            Some(gate) => gate.get_pending_requests().await,
+            None => Vec::new(),
+        };
+        serde_json::json!(pending)
+    }
+
+    pub(crate) async fn config(&self) -> ApprovalConfig {
+        match &self.gate {
+            Some(gate) => gate.config().read().await.clone(),
+            None => ApprovalConfig::default(),
+        }
+    }
+
+    pub(crate) async fn update_config(&self, config: ApprovalConfig) -> ApprovalConfig {
+        if let Some(gate) = &self.gate {
+            gate.update_config(config.clone()).await;
+        }
+        config
+    }
+
+    pub(crate) async fn toggle_solo(&self) -> ApprovalConfig {
+        let mut cfg = self.config().await;
+        cfg.solo_mode = !cfg.solo_mode;
+        self.update_config(cfg).await
+    }
+
+    pub(crate) async fn history(&self, limit: usize, offset: usize) -> serde_json::Value {
+        if let Some(repository) = &self.repository {
+            if let Ok((history, _total)) = repository.list_history(limit, offset) {
+                if !history.is_empty() {
+                    return serde_json::json!(history);
+                }
+            }
+        }
+        let history = match &self.gate {
+            Some(gate) => gate.history().list_history(limit, offset).await.0,
+            None => Vec::new(),
+        };
+        serde_json::json!(history)
+    }
+
+    pub(crate) async fn respond(
+        &self,
+        id: &str,
+        approved: bool,
+        persistence: ApprovalPersistence,
+        reason: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or_else(|| "approval gate not configured".to_string())?;
+        let deny_reason = reason
+            .clone()
+            .unwrap_or_else(|| "denied by user".to_string());
+        let verdict = if approved {
+            ApprovalVerdict::Approved
+        } else {
+            ApprovalVerdict::Denied {
+                reason: deny_reason.clone(),
+            }
+        };
+        let request = gate
+            .resolve_approval(id, verdict, persistence)
+            .await
+            .ok_or_else(|| "approval request not found".to_string())?;
+        Ok(serde_json::json!({
+            "id": id,
+            "resolved": true,
+            "approved": approved,
+            "tool": "bash",
+            "action": request.command,
+        }))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CommandService {
@@ -257,11 +718,18 @@ pub(crate) struct GatewayServices {
 }
 
 impl GatewayServices {
-    pub(crate) fn new(runtime: Arc<RuntimeService>) -> Self {
+    pub(crate) fn new(
+        runtime: Arc<RuntimeService>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_repository: FileApprovalRepository,
+    ) -> Self {
         let command_runtime = Arc::clone(&runtime);
+        let session_kernel = runtime.session_kernel();
         Self {
             runtime: Some(runtime),
             command: CommandService::new(Some(command_runtime)),
+            session: SessionService::with_kernel(session_kernel),
+            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
             ..Self::transition_only()
         }
     }
@@ -285,6 +753,24 @@ impl GatewayServices {
             mfg: MfgService::new(),
             owner: "0.9.292 Gateway RuntimeHost",
             route_transition_delete_by: "0.9.293-0.9.298",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_with_approval_for_tests(
+        approval_gate: Arc<SmartApprovalGate>,
+    ) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "cowd-approval-service-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = FileApprovalRepository::new(
+            dir.join("approval_history.json"),
+            dir.join("always_approved.json"),
+        );
+        Self {
+            approval: ApprovalService::with_gate_and_repository(approval_gate, repository),
+            ..Self::transition_only()
         }
     }
 
@@ -429,16 +915,16 @@ impl TaskService {
 }
 
 impl ApprovalService {
-    pub(crate) fn pending(&self) -> ServiceEnvelope {
+    pub(crate) fn pending_contract(&self) -> ServiceEnvelope {
         self.envelope("pending")
     }
 
-    pub(crate) fn respond(&self) -> ServiceEnvelope {
+    pub(crate) fn respond_contract(&self) -> ServiceEnvelope {
         self.envelope("respond")
     }
 
     fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.pending(), self.respond()]
+        vec![self.pending_contract(), self.respond_contract()]
     }
 }
 
@@ -636,7 +1122,7 @@ mod tests {
         assert_eq!(services.session.create_session().operation, "create");
         assert_eq!(services.session.chat().status, "service_boundary_ready");
         assert_eq!(services.task.complete().service, "task");
-        assert_eq!(services.approval.respond().operation, "respond");
+        assert_eq!(services.approval.respond_contract().operation, "respond");
         assert_eq!(services.memory.status().operation, "status");
         assert_eq!(services.context.snapshot().operation, "snapshot");
         assert_eq!(

@@ -22,7 +22,7 @@ use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
-use crate::session_kernel::SessionKernel;
+use crate::gateway_services::SessionService;
 use crate::task_kernel::TaskRecord;
 
 use super::{AppState, ErrorResponse};
@@ -58,13 +58,13 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn append_session_timeline_event_to_kernel(
-    kernel: &SessionKernel,
+async fn append_session_timeline_event(
+    session_service: &SessionService,
     session_id: &str,
     event_type: &str,
     payload: serde_json::Value,
 ) {
-    if let Err(error) = kernel
+    if let Err(error) = session_service
         .append_timeline_event(session_id, event_type, payload)
         .await
     {
@@ -217,8 +217,8 @@ async fn send_message(
     } else {
         ContextProfile::MainTurn
     };
-    append_session_timeline_event_to_kernel(
-        &state.session_kernel,
+    append_session_timeline_event(
+        &state.services.session,
         &session_id,
         "RuntimeRun",
         runtime_run_started_payload(
@@ -237,15 +237,15 @@ async fn send_message(
             let mut rx = cowd_bus.subscribe();
             let eb = event_bus.clone();
             let sid = session_id.clone();
-            let kernel = state.session_kernel.clone();
+            let session_service = state.services.session.clone();
             let active_run_id = run_id.clone();
             tokio::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     match event {
                         runtime::CowdEvent::TextDelta { text } => {
                             eb.text_delta(&sid, &text).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "TextDelta",
                                 serde_json::json!({"type":"TextDelta","content":text}),
@@ -254,8 +254,8 @@ async fn send_message(
                         }
                         runtime::CowdEvent::ThinkingDelta { thinking } => {
                             eb.thinking_delta(&sid, &thinking).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "ThinkingDelta",
                                 serde_json::json!({"type":"ThinkingDelta","content":thinking}),
@@ -264,8 +264,8 @@ async fn send_message(
                         }
                         runtime::CowdEvent::ToolStart { id, name, preview } => {
                             eb.tool_start(&sid, &id, &name).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "ToolStart",
                                 serde_json::json!({"type":"ToolStart","id":id,"name":name,"preview":preview}),
@@ -274,8 +274,8 @@ async fn send_message(
                         }
                         runtime::CowdEvent::ToolProgress { id, name, progress } => {
                             eb.tool_progress(&sid, &id, &name, &progress).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "ToolProgress",
                                 serde_json::json!({"type":"ToolProgress","id":id,"name":name,"progress":progress}),
@@ -290,8 +290,8 @@ async fn send_message(
                         } => {
                             eb.tool_complete(&sid, &id, &name, &summary, exit_code)
                                 .await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "ToolComplete",
                                 serde_json::json!({"type":"ToolComplete","id":id,"name":name,"summary":summary,"exit_code":exit_code}),
@@ -304,8 +304,8 @@ async fn send_message(
                         } => {
                             let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "TurnComplete",
                                 json,
@@ -315,8 +315,8 @@ async fn send_message(
                         runtime::CowdEvent::TurnStarted => {
                             let json = serde_json::json!({"type":"TurnStarted"});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "TurnStarted",
                                 json,
@@ -326,8 +326,8 @@ async fn send_message(
                         runtime::CowdEvent::TurnError { error } => {
                             let json = serde_json::json!({"type":"TurnError","error":error});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
+                            append_session_timeline_event(
+                                &session_service,
                                 &sid,
                                 "TurnError",
                                 json,
@@ -427,7 +427,8 @@ async fn send_message(
                 runtime_guard.take_collaboration_result()
             };
             if let Err(e) = state
-                .session_kernel
+                .services
+                .session
                 .sync_runtime_session_snapshot(&session_id, &session_snapshot)
                 .await
             {
@@ -435,7 +436,8 @@ async fn send_message(
             }
             if let Some(collaboration_result) = collaboration_result {
                 if let Err(e) = state
-                    .session_kernel
+                    .services
+                    .session
                     .persist_workgraph_review(
                         &collaboration_result.work_graph,
                         &collaboration_result.review_packet,
@@ -467,8 +469,8 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
+            append_session_timeline_event(
+                &state.services.session,
                 &session_id,
                 "RuntimeRun",
                 runtime_run_completed_payload(
@@ -504,8 +506,8 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
+            append_session_timeline_event(
+                &state.services.session,
                 &session_id,
                 "RuntimeRun",
                 runtime_run_completed_payload(
@@ -544,8 +546,8 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
+            append_session_timeline_event(
+                &state.services.session,
                 &session_id,
                 "RuntimeRun",
                 runtime_run_completed_payload(
@@ -569,8 +571,8 @@ async fn send_message(
         }
         Err(join_err) => {
             let error_msg = format!("task join error: {join_err}");
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
+            append_session_timeline_event(
+                &state.services.session,
                 &session_id,
                 "RuntimeRun",
                 runtime_run_completed_payload(
@@ -605,21 +607,24 @@ async fn get_session_messages(
 
     if state.has_unified_store() {
         let total = state
-            .session_kernel
+            .services
+            .session
             .stored_message_count(&id)
             .await
             .unwrap_or(Some(0))
             .unwrap_or(0);
         let db_messages = if let Some(seq) = from_seq {
             state
-                .session_kernel
+                .services
+                .session
                 .stored_messages_from_sequence(&id, seq, limit)
                 .await
                 .unwrap_or(Some(Vec::new()))
                 .unwrap_or_default()
         } else {
             state
-                .session_kernel
+                .services
+                .session
                 .stored_messages(&id, offset, limit)
                 .await
                 .unwrap_or(Some(Vec::new()))
