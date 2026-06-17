@@ -35,7 +35,7 @@ tests/interactive/
 │   ├── reporter.rs         ← 测试报告 + 统计
 │   ├── llm.rs              ← 大模型集成 (生成/判断/分析)
 │   └── scenarios/
-│       ├── mod.rs          ← 场景注册 (19 场景)
+│       ├── mod.rs          ← 场景注册
 │       ├── tui_basic.rs    ← TUI 基础 (启动/对话/滚动/搜索)
 │       ├── tui_interact.rs ← TUI 交互 (WhichKey/面板/历史/Toast)
 │       ├── server_core.rs  ← Server 核心 (Health/会话/记忆)

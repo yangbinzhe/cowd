@@ -1,4 +1,30 @@
-# 交互式测试场景全集
+# 交互式测试场景目录
+
+本目录是 manual/nightly 诊断清单，不属于默认 release gate。默认门禁只来自：
+
+- `scripts/validate.sh contract`
+- `scripts/validate.sh scenario`
+- `scripts/validate.sh surface`
+- `scripts/validate.sh release`
+
+interactive 场景用于人工复核、回归定位和后续重写候选。新增或恢复为默认门禁前，必须满足：
+
+1. 断言确定性，不依赖真实 LLM 语义判断。
+2. HTTP 调用必须检查状态码，不能吞掉 404/500。
+3. TUI 等待失败必须失败退出，不能用 `.ok()` 降级。
+4. 进程清理只能清理自身启动的子进程，不能 `pkill` 用户环境。
+5. 与 scenario/surface/release 已覆盖的能力不能重复进入默认门禁。
+
+## 默认门禁映射
+
+| 能力 | 默认门禁 | interactive 定位 |
+| --- | --- | --- |
+| Gateway health/ready/WebUI manifest | `scenario.gateway_baseline`、`surface.webui_gateway_contract` | 只用于手工诊断面板或 API 细节 |
+| Session/runtime | `scenario.session_runtime` | 只用于复现 TUI/API 跨面状态 |
+| Memory/context | `scenario.memory_context` | 只用于复杂交互定位 |
+| Tool/permission/audit | `scenario.tool_permission`、`release.full_product_smoke` | 只用于人工排查 |
+| Skill/MFG/structured data | `scenario.skill_mfg`、`release.full_product_smoke` | 只用于扩展质量评测 |
+| CLI/TUI/WebUI surface | `surface` lane 三个控制点 | 只用于视觉或交互细节回归 |
 
 ## TUI 测试 (18 项)
 
