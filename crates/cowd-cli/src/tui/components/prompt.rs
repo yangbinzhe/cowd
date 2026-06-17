@@ -17,7 +17,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
-use commands::slash_command_specs;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -173,6 +172,8 @@ pub struct AutocompleteEngine {
     cwd: std::path::PathBuf,
     /// Command history for free-text matching.
     history: Vec<String>,
+    /// Slash command names supplied by the Gateway command projection.
+    commands: BTreeSet<String>,
     /// Frecency tracker for ranking suggestions.
     frecency: FrecencyTracker,
     /// Max number of suggestions to return.
@@ -185,9 +186,20 @@ impl AutocompleteEngine {
         Self {
             cwd: cwd.into(),
             history: Vec::new(),
+            commands: BTreeSet::new(),
             frecency: FrecencyTracker::new(),
             max_suggestions: 5,
         }
+    }
+
+    pub fn set_commands<I>(&mut self, commands: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.commands = commands
+            .into_iter()
+            .map(|command| command.trim_start_matches('/').to_string())
+            .collect();
     }
 
     /// Add a command to the history (for future free-text matching).
@@ -366,12 +378,9 @@ impl AutocompleteEngine {
         if prefix.is_empty() {
             return Vec::new();
         }
-        slash_command_specs()
+        self.commands
             .iter()
-            .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|cmd| cmd.starts_with(prefix))
+            .filter(|cmd| cmd.starts_with(prefix.trim_start_matches('/')))
             .map(|cmd| Suggestion::new(format!("/{cmd}"), SuggestionKind::Command))
             .collect()
     }
@@ -720,6 +729,31 @@ impl Prompt {
             shell_mode: false,
             shell_command: String::new(),
         }
+    }
+
+    pub fn sync_command_suggestions_from_projection(&mut self, payload: &serde_json::Value) {
+        let commands = payload
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|command| {
+                let mut names = Vec::new();
+                if let Some(name) = command.get("name").and_then(serde_json::Value::as_str) {
+                    names.push(name.to_string());
+                }
+                if let Some(aliases) = command.get("aliases").and_then(serde_json::Value::as_array)
+                {
+                    names.extend(
+                        aliases
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                    );
+                }
+                names
+            });
+        self.engine.set_commands(commands);
     }
 
     /// Create a prompt with a custom block title.
@@ -1547,9 +1581,39 @@ mod tests {
 
     // ── AutocompleteEngine tests ───────────────────────────────────
 
+    fn engine_with_test_commands() -> AutocompleteEngine {
+        let mut engine = AutocompleteEngine::new("/tmp");
+        engine.set_commands(
+            [
+                "/status",
+                "/stats",
+                "/skills",
+                "/skill",
+                "/plugin",
+                "/plugins",
+                "/marketplace",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned),
+        );
+        engine
+    }
+
+    fn prompt_with_test_commands() -> Prompt {
+        let mut prompt = Prompt::new("/tmp");
+        prompt.engine.set_commands(
+            [
+                "/status", "/stats", "/skills", "/skill", "/setup", "/session",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned),
+        );
+        prompt
+    }
+
     #[test]
     fn autocomplete_command_prefix() {
-        let mut engine = AutocompleteEngine::new("/tmp");
+        let mut engine = engine_with_test_commands();
 
         let suggestions = engine.suggest("/sta");
         assert!(
@@ -1578,14 +1642,14 @@ mod tests {
 
     #[test]
     fn autocomplete_command_no_match() {
-        let mut engine = AutocompleteEngine::new("/tmp");
+        let mut engine = engine_with_test_commands();
         let suggestions = engine.suggest("/zzz");
         assert!(suggestions.is_empty());
     }
 
     #[test]
     fn autocomplete_commands_include_registered_aliases() {
-        let mut engine = AutocompleteEngine::new("/tmp");
+        let mut engine = engine_with_test_commands();
         let suggestions = engine.suggest("/market");
         assert!(
             suggestions.iter().any(|s| s.text == "/marketplace"),
@@ -1842,7 +1906,7 @@ mod tests {
 
     #[test]
     fn tab_accepts_suggestion() {
-        let mut prompt = Prompt::new("/tmp");
+        let mut prompt = prompt_with_test_commands();
 
         // Type "@sr" with file suggestions — but since in test there are
         // no files, test command completion instead.
@@ -1882,7 +1946,7 @@ mod tests {
 
     #[test]
     fn shift_tab_cycles_suggestions() {
-        let mut prompt = Prompt::new("/tmp");
+        let mut prompt = prompt_with_test_commands();
 
         // Type "/s" via handle_event to get suggestions
         for c in "/s".chars() {
@@ -1915,7 +1979,7 @@ mod tests {
 
     #[test]
     fn up_down_navigate_visible_suggestions() {
-        let mut prompt = Prompt::new("/tmp");
+        let mut prompt = prompt_with_test_commands();
 
         for c in "/s".chars() {
             let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
@@ -1936,7 +2000,7 @@ mod tests {
 
     #[test]
     fn enter_accepts_currently_highlighted_suggestion() {
-        let mut prompt = Prompt::new("/tmp");
+        let mut prompt = prompt_with_test_commands();
 
         for c in "/s".chars() {
             let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
@@ -1956,7 +2020,7 @@ mod tests {
 
     #[test]
     fn dropdown_renders_above_bottom_anchored_input() {
-        let mut prompt = Prompt::new("/tmp");
+        let mut prompt = prompt_with_test_commands();
         for c in "/s".chars() {
             let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char(c)));
         }

@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use commands::{
+    command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
+    CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
+};
+
 use crate::runtime_service::RuntimeService;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,8 +60,185 @@ define_gateway_service!(MatrixService, "matrix");
 define_gateway_service!(MfgService, "mfg");
 
 #[derive(Clone)]
+pub(crate) struct CommandService {
+    runtime: Option<Arc<RuntimeService>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct CommandResolution {
+    pub(crate) input: String,
+    pub(crate) surface: CommandSurface,
+    pub(crate) command: CommandDefinition,
+    pub(crate) action_request: serde_json::Value,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct CommandExecutionReceipt {
+    pub(crate) ok: bool,
+    pub(crate) command: String,
+    pub(crate) id: String,
+    pub(crate) action: CommandActionTarget,
+    pub(crate) status: String,
+    pub(crate) data: serde_json::Value,
+    pub(crate) executed_at_ms: i64,
+}
+
+impl CommandService {
+    pub(crate) fn new(runtime: Option<Arc<RuntimeService>>) -> Self {
+        Self { runtime }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        "command"
+    }
+
+    pub(crate) fn contracts(&self) -> Vec<ServiceEnvelope> {
+        ["registry", "projection", "detail", "resolve", "execute"]
+            .into_iter()
+            .map(|operation| ServiceEnvelope {
+                service: self.label(),
+                operation,
+                status: "service_boundary_ready",
+                owner: "0.9.294 Commands unified registry",
+                route_transition_delete_by: "0.9.295-0.9.298",
+            })
+            .collect()
+    }
+
+    pub(crate) fn registry(&self) -> CommandRegistry {
+        unified_command_registry()
+    }
+
+    pub(crate) fn projection(&self, surface: CommandSurface) -> CommandProjection {
+        command_projection(surface)
+    }
+
+    pub(crate) fn detail(&self, id: &str) -> Option<CommandDefinition> {
+        let normalized = normalize_command_name(id);
+        self.registry()
+            .definitions()
+            .iter()
+            .find(|definition| {
+                definition.id == id
+                    || definition.name == normalized
+                    || definition.name.trim_start_matches('/') == id
+            })
+            .cloned()
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        input: &str,
+        surface: CommandSurface,
+        context: serde_json::Value,
+    ) -> Result<CommandResolution, String> {
+        let normalized = normalize_command_name(input);
+        let registry = self.registry();
+        let definition = registry
+            .find(&normalized)
+            .cloned()
+            .ok_or_else(|| format!("unknown command `{input}`"))?;
+        if !definition.surfaces.contains(&surface) {
+            return Err(format!(
+                "command `{}` is not available on {surface:?}",
+                definition.name
+            ));
+        }
+        let action_request = serde_json::json!({
+            "command_id": definition.id,
+            "command": definition.name,
+            "surface": surface,
+            "action": definition.action,
+            "context": context,
+        });
+        Ok(CommandResolution {
+            input: input.to_string(),
+            surface,
+            command: definition,
+            action_request,
+        })
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+    ) -> Result<CommandExecutionReceipt, String> {
+        let definition = self
+            .registry()
+            .find(command)
+            .cloned()
+            .ok_or_else(|| format!("unknown command `{command}`"))?;
+        let (ok, status, data) = self.execute_target(&definition.action, args).await;
+        Ok(CommandExecutionReceipt {
+            ok,
+            command: definition.name,
+            id: definition.id,
+            action: definition.action,
+            status: status.to_string(),
+            data,
+            executed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    async fn execute_target(
+        &self,
+        action: &CommandActionTarget,
+        args: serde_json::Value,
+    ) -> (bool, &'static str, serde_json::Value) {
+        match action {
+            CommandActionTarget::Runtime { operation } if operation == "runtime.status" => {
+                match &self.runtime {
+                    Some(runtime) => (true, "complete", runtime.status_value()),
+                    None => (
+                        true,
+                        "degraded",
+                        serde_json::json!({
+                            "ok": true,
+                            "runtime_host": "transition-only",
+                            "active_sessions": 0,
+                            "warning": "runtime service is unavailable in this gateway state",
+                        }),
+                    ),
+                }
+            }
+            CommandActionTarget::Client { action } => (
+                false,
+                "client-action",
+                serde_json::json!({
+                    "error": "client action must be handled by the requesting surface",
+                    "action": action,
+                    "args": args,
+                }),
+            ),
+            CommandActionTarget::Route { path } => (
+                false,
+                "unsupported",
+                serde_json::json!({
+                    "error": "route-backed command execution is not enabled; call resolve and dispatch through the owning service",
+                    "path": path,
+                    "args": args,
+                }),
+            ),
+            CommandActionTarget::Runtime { operation }
+            | CommandActionTarget::Config { operation }
+            | CommandActionTarget::Registry { operation } => (
+                false,
+                "unsupported",
+                serde_json::json!({
+                    "error": "command target is declared but not yet executable through CommandService",
+                    "operation": operation,
+                    "args": args,
+                }),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
+    pub(crate) command: CommandService,
     pub(crate) session: SessionService,
     pub(crate) task: TaskService,
     pub(crate) approval: ApprovalService,
@@ -76,8 +258,10 @@ pub(crate) struct GatewayServices {
 
 impl GatewayServices {
     pub(crate) fn new(runtime: Arc<RuntimeService>) -> Self {
+        let command_runtime = Arc::clone(&runtime);
         Self {
             runtime: Some(runtime),
+            command: CommandService::new(Some(command_runtime)),
             ..Self::transition_only()
         }
     }
@@ -85,6 +269,7 @@ impl GatewayServices {
     pub(crate) fn transition_only() -> Self {
         Self {
             runtime: None,
+            command: CommandService::new(None),
             session: SessionService::new(),
             task: TaskService::new(),
             approval: ApprovalService::new(),
@@ -106,6 +291,7 @@ impl GatewayServices {
     pub(crate) fn service_labels(&self) -> Vec<&'static str> {
         vec![
             "runtime",
+            self.command.label(),
             self.session.label,
             self.task.label,
             self.approval.label,
@@ -124,6 +310,7 @@ impl GatewayServices {
 
     pub(crate) fn service_contracts(&self) -> Vec<ServiceEnvelope> {
         let mut contracts = Vec::new();
+        contracts.extend(self.command.contracts());
         contracts.extend(self.session.contracts());
         contracts.extend(self.task.contracts());
         contracts.extend(self.approval.contracts());
@@ -150,6 +337,10 @@ impl GatewayServices {
 
         [
             ("session", "chat"),
+            ("command", "registry"),
+            ("command", "projection"),
+            ("command", "resolve"),
+            ("command", "execute"),
             ("session", "create"),
             ("session", "list"),
             ("session", "replay"),

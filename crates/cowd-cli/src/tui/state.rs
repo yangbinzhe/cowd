@@ -2727,6 +2727,7 @@ impl TuiState {
     }
 
     fn open_command_palette(&mut self) {
+        self.refresh_command_projection_from_gateway();
         let snapshot =
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
@@ -2735,11 +2736,22 @@ impl TuiState {
     }
 
     fn open_command_palette_with_query(&mut self, query: &str) {
+        self.refresh_command_projection_from_gateway();
         let snapshot =
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
         self.command_palette.open_with_query(query);
         self.set_focus_target(FocusTarget::CommandPalette);
+    }
+
+    fn refresh_command_projection_from_gateway(&mut self) {
+        if let Ok(payload) =
+            run_gateway_api_blocking(|client| async move { client.command_projection("tui").await })
+        {
+            self.command_palette.sync_command_projection(&payload);
+            self.prompt
+                .sync_command_suggestions_from_projection(&payload);
+        }
     }
 
     /// Handle a key press while search is active.
@@ -4851,6 +4863,12 @@ providers:
     #[test]
     fn exact_slash_command_enter_submits_instead_of_accepting_completion() {
         let mut state = TuiState::new("m", "s");
+        let projection =
+            serde_json::to_value(commands::command_projection(commands::CommandSurface::Tui))
+                .expect("projection");
+        state
+            .prompt
+            .sync_command_suggestions_from_projection(&projection);
         state.replace_input_text("/status");
         state.prompt.refresh_suggestions_from_text_at_cursor(
             &state.input_text(),

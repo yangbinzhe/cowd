@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
     pub name: String,
@@ -16,27 +18,200 @@ pub enum CommandSource {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandRegistry {
     entries: Vec<CommandManifestEntry>,
+    definitions: Vec<CommandDefinition>,
 }
 
 impl CommandRegistry {
     #[must_use]
     pub fn new(entries: Vec<CommandManifestEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            definitions: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_definitions(definitions: Vec<CommandDefinition>) -> Self {
+        Self {
+            entries: Vec::new(),
+            definitions,
+        }
     }
 
     #[must_use]
     pub fn entries(&self) -> &[CommandManifestEntry] {
         &self.entries
     }
+
+    #[must_use]
+    pub fn definitions(&self) -> &[CommandDefinition] {
+        &self.definitions
+    }
+
+    #[must_use]
+    pub fn projection(&self, surface: CommandSurface) -> CommandProjection {
+        CommandProjection::from_definitions(surface, &self.definitions)
+    }
+
+    #[must_use]
+    pub fn find(&self, command: &str) -> Option<&CommandDefinition> {
+        let normalized = normalize_command_name(command);
+        self.definitions.iter().find(|definition| {
+            definition.name == normalized
+                || definition.aliases.iter().any(|alias| {
+                    alias == &normalized || alias.trim_start_matches('/') == normalized
+                })
+        })
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SlashCommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub summary: &'static str,
     pub argument_hint: Option<&'static str>,
     pub resume_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandKind {
+    Slash,
+    Palette,
+    Keybind,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandCategory {
+    Session,
+    Runtime,
+    Config,
+    Skills,
+    Agents,
+    Memory,
+    Tools,
+    Gateway,
+    Workspace,
+    Debug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandSurface {
+    Tui,
+    Webui,
+    Cli,
+    Gateway,
+}
+
+impl CommandSurface {
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or("webui")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tui" => Self::Tui,
+            "cli" => Self::Cli,
+            "gateway" => Self::Gateway,
+            _ => Self::Webui,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandArgumentSchema {
+    pub usage: String,
+    pub hint: Option<String>,
+    pub accepts_freeform: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCapabilityRequirement {
+    pub capability: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CommandActionTarget {
+    Client { action: String },
+    Route { path: String },
+    Runtime { operation: String },
+    Config { operation: String },
+    Registry { operation: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDisplayHints {
+    pub label: String,
+    pub detail: String,
+    pub group: String,
+    pub priority: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDefinition {
+    pub id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub summary: String,
+    pub kind: CommandKind,
+    pub category: CommandCategory,
+    pub surfaces: Vec<CommandSurface>,
+    pub arguments: CommandArgumentSchema,
+    pub capabilities: Vec<CommandCapabilityRequirement>,
+    pub action: CommandActionTarget,
+    pub display: CommandDisplayHints,
+    pub resume_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandProjectionEntry {
+    pub id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
+    pub usage: String,
+    pub action: CommandActionTarget,
+    pub category: CommandCategory,
+    pub surface: CommandSurface,
+    pub display: CommandDisplayHints,
+    pub resume_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandProjection {
+    pub surface: CommandSurface,
+    pub commands: Vec<CommandProjectionEntry>,
+}
+
+impl CommandProjection {
+    #[must_use]
+    pub fn from_definitions(surface: CommandSurface, definitions: &[CommandDefinition]) -> Self {
+        let commands = definitions
+            .iter()
+            .filter(|definition| definition.surfaces.contains(&surface))
+            .map(|definition| CommandProjectionEntry {
+                id: definition.id.clone(),
+                name: definition.name.clone(),
+                aliases: definition.aliases.clone(),
+                description: definition.summary.clone(),
+                usage: definition.arguments.usage.clone(),
+                action: definition.action.clone(),
+                category: definition.category,
+                surface,
+                display: definition.display.clone(),
+                resume_supported: definition.resume_supported,
+            })
+            .collect();
+        Self { surface, commands }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1060,6 +1235,367 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
 ];
 
+#[must_use]
+pub fn unified_command_registry() -> CommandRegistry {
+    let mut definitions = SLASH_COMMAND_SPECS
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| command_definition_from_slash(index as u16, spec))
+        .collect::<Vec<_>>();
+    definitions.extend(palette_command_definitions());
+    CommandRegistry::from_definitions(definitions)
+}
+
+#[must_use]
+pub fn command_projection(surface: CommandSurface) -> CommandProjection {
+    unified_command_registry().projection(surface)
+}
+
+#[must_use]
+pub fn normalize_command_name(command: &str) -> String {
+    let trimmed = command.trim();
+    let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    if first.starts_with('/') {
+        first.to_string()
+    } else {
+        format!("/{first}")
+    }
+}
+
+fn command_definition_from_slash(priority: u16, spec: &SlashCommandSpec) -> CommandDefinition {
+    let category = slash_category(spec.name);
+    let name = format!("/{}", spec.name);
+    let usage = match spec.argument_hint {
+        Some(hint) => format!("{name} {hint}"),
+        None => name.clone(),
+    };
+    CommandDefinition {
+        id: format!("slash.{}", spec.name),
+        name: name.clone(),
+        aliases: spec
+            .aliases
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect(),
+        summary: spec.summary.to_string(),
+        kind: CommandKind::Slash,
+        category,
+        surfaces: vec![
+            CommandSurface::Tui,
+            CommandSurface::Webui,
+            CommandSurface::Gateway,
+        ],
+        arguments: CommandArgumentSchema {
+            usage,
+            hint: spec.argument_hint.map(ToOwned::to_owned),
+            accepts_freeform: spec.argument_hint.is_some(),
+        },
+        capabilities: capability_requirements_for(category),
+        action: action_target_for_slash(spec.name),
+        display: CommandDisplayHints {
+            label: name,
+            detail: spec.summary.to_string(),
+            group: format!("{category:?}"),
+            priority,
+        },
+        resume_supported: spec.resume_supported,
+    }
+}
+
+fn palette_command_definitions() -> Vec<CommandDefinition> {
+    [
+        (
+            "palette.toggle-help",
+            "Toggle Help",
+            "Show or hide the help overlay",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "toggle-help".into(),
+            },
+        ),
+        (
+            "palette.toggle-theme",
+            "Toggle Theme",
+            "Switch between light and dark themes",
+            CommandCategory::Config,
+            CommandActionTarget::Client {
+                action: "toggle-theme".into(),
+            },
+        ),
+        (
+            "palette.search",
+            "Search",
+            "Activate incremental find / search mode",
+            CommandCategory::Workspace,
+            CommandActionTarget::Client {
+                action: "search".into(),
+            },
+        ),
+        (
+            "palette.copy",
+            "Copy",
+            "Copy the focused selection to clipboard",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "copy".into(),
+            },
+        ),
+        (
+            "palette.next-panel",
+            "Next Panel",
+            "Focus the next panel in the layout",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "next-panel".into(),
+            },
+        ),
+        (
+            "palette.previous-panel",
+            "Previous Panel",
+            "Focus the previous panel in the layout",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "previous-panel".into(),
+            },
+        ),
+        (
+            "palette.submit-input",
+            "Submit Input",
+            "Send the current input buffer as a message",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "submit-input".into(),
+            },
+        ),
+        (
+            "palette.reload-providers",
+            "Reload Providers",
+            "Reload provider and model routing from runtime config",
+            CommandCategory::Config,
+            CommandActionTarget::Client {
+                action: "reload-providers".into(),
+            },
+        ),
+        (
+            "palette.open-runtime",
+            "/runtime",
+            "Open runtime status, tasks, approvals, network, and connector health",
+            CommandCategory::Runtime,
+            CommandActionTarget::Client {
+                action: "slash:runtime".into(),
+            },
+        ),
+        (
+            "palette.open-activity",
+            "/activity",
+            "Open the recent execution stream beside the main conversation",
+            CommandCategory::Runtime,
+            CommandActionTarget::Client {
+                action: "slash:activity".into(),
+            },
+        ),
+        (
+            "palette.open-tools",
+            "/tools",
+            "Operate tool registry, cache, checkpoints, ledger, and risk checks",
+            CommandCategory::Tools,
+            CommandActionTarget::Client {
+                action: "slash:tools".into(),
+            },
+        ),
+        (
+            "palette.open-files",
+            "/files",
+            "Browse workspace files in the sidebar",
+            CommandCategory::Workspace,
+            CommandActionTarget::Client {
+                action: "slash:files".into(),
+            },
+        ),
+        (
+            "palette.open-sessions",
+            "/sessions",
+            "Browse and switch recent sessions",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "slash:sessions".into(),
+            },
+        ),
+        (
+            "palette.open-gateway",
+            "/gateway",
+            "Inspect external connector and gateway state",
+            CommandCategory::Gateway,
+            CommandActionTarget::Client {
+                action: "slash:gateway".into(),
+            },
+        ),
+        (
+            "palette.open-diff",
+            "/diff",
+            "Review current code changes in the on-demand topic panel",
+            CommandCategory::Workspace,
+            CommandActionTarget::Client {
+                action: "slash:diff".into(),
+            },
+        ),
+        (
+            "palette.focus-input",
+            "/focus input",
+            "Return keyboard focus to the prompt input",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "slash:focus input".into(),
+            },
+        ),
+        (
+            "palette.focus-chat",
+            "/focus chat",
+            "Return keyboard focus to the main conversation",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "slash:focus chat".into(),
+            },
+        ),
+        (
+            "palette.cancel",
+            "Cancel",
+            "Cancel the current operation",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "cancel".into(),
+            },
+        ),
+        (
+            "palette.quit",
+            "Quit",
+            "Exit the application",
+            CommandCategory::Session,
+            CommandActionTarget::Client {
+                action: "quit".into(),
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(
+        |(index, (id, name, summary, category, action))| CommandDefinition {
+            id: id.to_string(),
+            name: name.to_string(),
+            aliases: Vec::new(),
+            summary: summary.to_string(),
+            kind: CommandKind::Palette,
+            category,
+            surfaces: vec![CommandSurface::Tui],
+            arguments: CommandArgumentSchema {
+                usage: name.to_string(),
+                hint: None,
+                accepts_freeform: false,
+            },
+            capabilities: capability_requirements_for(category),
+            action,
+            display: CommandDisplayHints {
+                label: name.to_string(),
+                detail: summary.to_string(),
+                group: format!("{category:?}"),
+                priority: 10_000 + index as u16,
+            },
+            resume_supported: true,
+        },
+    )
+    .collect()
+}
+
+fn slash_category(name: &str) -> CommandCategory {
+    match name {
+        "help" | "status" | "cost" | "resume" | "session" | "version" | "usage" | "stats"
+        | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
+        | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
+        | "bookmarks" | "retry" | "stop" | "undo" | "plan" => CommandCategory::Session,
+        "model" | "permissions" | "config" | "theme" | "vim" | "voice" | "color" | "effort"
+        | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings" | "language"
+        | "profile" | "max-tokens" | "temperature" | "system-prompt" | "api-key"
+        | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env" | "project"
+        | "reasoning" | "budget" | "rate-limit" | "reset" | "ide" | "desktop" | "upgrade" => {
+            CommandCategory::Config
+        }
+        "memory" => CommandCategory::Memory,
+        "agents" | "agent-profile" | "solve" | "discuss" | "branch" | "review" | "advisor" => {
+            CommandCategory::Agents
+        }
+        "skills" | "skill" | "plugin" | "plugins" | "marketplace" => CommandCategory::Skills,
+        "workspace" | "cwd" | "files" | "focus" | "unfocus" | "add-dir" | "search" | "diff"
+        | "teleport" => CommandCategory::Workspace,
+        "tasks" | "approvals" | "approval" | "approve" | "deny" | "runtime" => {
+            CommandCategory::Runtime
+        }
+        "gateway" | "cross-plane" | "xplane" | "mcp" => CommandCategory::Gateway,
+        "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
+        | "metrics" => CommandCategory::Debug,
+        _ => CommandCategory::Tools,
+    }
+}
+
+fn capability_requirements_for(category: CommandCategory) -> Vec<CommandCapabilityRequirement> {
+    let capability = match category {
+        CommandCategory::Session => "session",
+        CommandCategory::Runtime => "runtime",
+        CommandCategory::Config => "config",
+        CommandCategory::Skills => "skills",
+        CommandCategory::Agents => "agents",
+        CommandCategory::Memory => "memory",
+        CommandCategory::Tools => "tools",
+        CommandCategory::Gateway => "gateway",
+        CommandCategory::Workspace => "workspace",
+        CommandCategory::Debug => "diagnostics",
+    };
+    vec![CommandCapabilityRequirement {
+        capability: capability.to_string(),
+        required: true,
+    }]
+}
+
+fn action_target_for_slash(name: &str) -> CommandActionTarget {
+    match name {
+        "status" => CommandActionTarget::Runtime {
+            operation: "runtime.status".into(),
+        },
+        "compact" => CommandActionTarget::Runtime {
+            operation: "session.compact".into(),
+        },
+        "model" => CommandActionTarget::Config {
+            operation: "config.model".into(),
+        },
+        "providers" => CommandActionTarget::Config {
+            operation: "config.providers".into(),
+        },
+        "skills" => CommandActionTarget::Registry {
+            operation: "skills.registry".into(),
+        },
+        "agents" => CommandActionTarget::Registry {
+            operation: "agents.registry".into(),
+        },
+        "memory" => CommandActionTarget::Route {
+            path: "/api/memory".into(),
+        },
+        "workspace" | "files" => CommandActionTarget::Route {
+            path: "/api/workspace".into(),
+        },
+        "tasks" => CommandActionTarget::Runtime {
+            operation: "task.manage".into(),
+        },
+        "approvals" | "approve" | "deny" => CommandActionTarget::Runtime {
+            operation: "approval.respond".into(),
+        },
+        "gateway" => CommandActionTarget::Route {
+            path: "/api/runtime/status".into(),
+        },
+        other => CommandActionTarget::Client {
+            action: format!("slash:{other}"),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
@@ -1250,7 +1786,7 @@ pub struct SlashCommandParseError {
 }
 
 impl SlashCommandParseError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

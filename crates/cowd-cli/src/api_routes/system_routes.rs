@@ -6,12 +6,13 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, State as AxumState},
+    extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use commands::CommandSurface;
 use runtime::{
     classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
     ToolSafetyCategory,
@@ -64,7 +65,9 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/usage", get(usage_handler))
         .route("/api/commands", get(commands_handler))
         .route("/api/commands/history", get(commands_history_handler))
+        .route("/api/commands/resolve", post(commands_resolve_handler))
         .route("/api/commands/execute", post(commands_execute_handler))
+        .route("/api/commands/:id", get(command_detail_handler))
 }
 
 #[derive(Deserialize)]
@@ -78,6 +81,21 @@ struct ExecuteCommandRequest {
     command: String,
     #[serde(default)]
     args: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CommandsQuery {
+    #[serde(default)]
+    surface: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResolveCommandRequest {
+    input: String,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    context: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -870,10 +888,28 @@ async fn config_providers_handler(
     })))
 }
 
-async fn commands_handler() -> Json<serde_json::Value> {
+async fn commands_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<CommandsQuery>,
+) -> Json<serde_json::Value> {
+    let surface = CommandSurface::parse(query.surface.as_deref());
+    let projection = state.services.command.projection(surface);
     Json(serde_json::json!({
-        "commands": command_registry(),
+        "surface": projection.surface,
+        "commands": projection.commands,
     }))
+}
+
+async fn command_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let command = state
+        .services
+        .command
+        .detail(&id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown command `{id}`")))?;
+    Ok(Json(serde_json::json!({ "command": command })))
 }
 
 async fn commands_history_handler(
@@ -895,117 +931,41 @@ async fn commands_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ExecuteCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let command = normalize_command(&body.command);
-    let Some(definition) = command_registry()
-        .into_iter()
-        .find(|item| item["name"].as_str() == Some(command.as_str()))
-    else {
+    let receipt = state
+        .services
+        .command
+        .execute(
+            &body.command,
+            body.args.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    if !receipt.ok {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            format!("unknown command `{}`", body.command),
+            serde_json::to_string(&receipt).unwrap_or_else(|_| receipt.status.clone()),
         ));
-    };
-    let receipt = serde_json::json!({
-        "ok": true,
-        "command": command,
-        "args": body.args.unwrap_or_else(|| serde_json::json!({})),
-        "action": definition["action"].clone(),
-        "target": definition["target"].clone(),
-        "executed_at_ms": chrono::Utc::now().timestamp_millis(),
-    });
+    }
+    let receipt = serde_json::to_value(receipt)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     append_command_history(&state, &receipt);
     Ok(Json(receipt))
 }
 
-fn command_registry() -> Vec<serde_json::Value> {
-    vec![
-        command(
-            "/status",
-            "Show runtime, session, memory, and gateway status.",
-            "open",
-            "/runtime",
-        ),
-        command(
-            "/model",
-            "Open model selector or switch the current session model.",
-            "open",
-            "model-modal",
-        ),
-        command(
-            "/workspace",
-            "Open workspace browser and file controls.",
-            "open",
-            "workspace-panel",
-        ),
-        command(
-            "/memory",
-            "Open memory search, facts, and packet tools.",
-            "open",
-            "/memory",
-        ),
-        command(
-            "/context",
-            "Open context packet and evidence tools.",
-            "open",
-            "/context",
-        ),
-        command(
-            "/skills",
-            "Open skills catalog and run console.",
-            "open",
-            "/skills",
-        ),
-        command(
-            "/agents",
-            "Open tasks and agent work graph.",
-            "open",
-            "/agents",
-        ),
-        command(
-            "/gateway",
-            "Open channel, connector, and cross-plane controls.",
-            "open",
-            "/gateway",
-        ),
-        command(
-            "/settings",
-            "Open settings and provider/profile controls.",
-            "open",
-            "/settings",
-        ),
-        command(
-            "/clear",
-            "Clear the local composer input.",
-            "client",
-            "composer",
-        ),
-        command(
-            "/compact",
-            "Compact the current session.",
-            "api",
-            "/api/sessions/:id/compact",
-        ),
-    ]
-}
-
-fn command(name: &str, description: &str, action: &str, target: &str) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "description": description,
-        "action": action,
-        "target": target,
-        "surface": ["webui", "tui"],
-    })
-}
-
-fn normalize_command(command: &str) -> String {
-    let trimmed = command.trim();
-    let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    if first.starts_with('/') {
-        first.to_string()
-    } else {
-        format!("/{first}")
-    }
+async fn commands_resolve_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<ResolveCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let surface = CommandSurface::parse(body.surface.as_deref());
+    let resolution = state
+        .services
+        .command
+        .resolve(&body.input, surface, body.context)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "resolution": resolution,
+    })))
 }
 
 fn append_command_history(state: &AppState, receipt: &serde_json::Value) {

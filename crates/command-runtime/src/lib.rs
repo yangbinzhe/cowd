@@ -1,0 +1,48 @@
+pub mod handlers;
+pub mod parser;
+pub mod skill_manifest;
+pub mod skill_registry;
+pub mod skill_router;
+pub mod skill_security;
+pub mod skill_tools;
+
+pub use commands::{
+    command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
+    CommandArgumentSchema, CommandCapabilityRequirement, CommandCategory, CommandDefinition,
+    CommandDisplayHints, CommandKind, CommandManifestEntry, CommandProjection,
+    CommandProjectionEntry, CommandRegistry, CommandSource, CommandSurface, SkillSlashDispatch,
+    SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
+};
+
+pub use handlers::handle_slash_command;
+pub use parser::{
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    render_slash_command_help_detail, render_slash_command_help_filtered, resolve_skill_invocation,
+    resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
+    suggest_slash_commands, validate_slash_command_input, SlashCommandResult,
+};
+pub use skill_manifest::{
+    check_prerequisites, get_config_vars, get_related_skills, get_skill_description,
+    get_skill_name, get_tags, matches_platform, parse_skill_content, parse_skill_file, Platform,
+    PrerequisitesCheck, SkillConditions, SkillConfigVar, SkillHermesMetadata, SkillManifest,
+    SkillPrerequisites,
+};
+pub use skill_registry::{
+    discover_skill_registry_roots, SkillInfo, SkillRegistry, SkillRegistryRoot,
+    SkillRegistryRootKind, SkillRegistryScope, SkillRegistrySource,
+};
+pub use skill_router::{
+    SkillActivationCandidate, SkillActivationResult, SkillRouter, SkillRouterConfig,
+};
+pub use skill_security::{
+    scan_skill_content, scan_skill_file, FindingCategory, SecurityFinding, SecurityScanResult,
+    SecurityStatus, Severity,
+};
+pub use skill_tools::{
+    SkillCreateInput, SkillCreateOutput, SkillDeleteInput, SkillDeleteOutput, SkillEditInput,
+    SkillEditOutput, SkillGenerateInput, SkillGenerateOutput, SkillLinkedFiles, SkillListInput,
+    SkillListOutput, SkillManager, SkillMeta, SkillPrerequisitesStatus, SkillViewInput,
+    SkillViewOutput,
+};

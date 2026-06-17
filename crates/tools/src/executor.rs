@@ -3113,7 +3113,7 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    match commands::resolve_skill_path(&cwd, skill) {
+    match command_runtime::resolve_skill_path(&cwd, skill) {
         Ok(path) => Ok(path),
         Err(_) => resolve_skill_path_from_compat_roots(skill),
     }

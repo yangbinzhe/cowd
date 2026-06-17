@@ -94,6 +94,30 @@ impl GatewayApiClient {
         self.get_json("/api/runtime/status").await
     }
 
+    pub async fn command_projection(
+        &self,
+        surface: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/commands?surface={}", url_encode(surface)))
+            .await
+    }
+
+    pub async fn command_resolve(
+        &self,
+        input: &str,
+        surface: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/commands/resolve",
+            serde_json::json!({
+                "input": input,
+                "surface": surface,
+                "context": {},
+            }),
+        )
+        .await
+    }
+
     pub async fn runtime_snapshot(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/snapshot").await
     }

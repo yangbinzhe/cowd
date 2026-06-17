@@ -15,6 +15,7 @@ axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 commands = { path = "../commands" }
+command-runtime = { path = "../command-runtime" }
 compat-harness = { path = "../compat-harness" }
 cowd-app-mfg = { path = "../app-mfg" }
 crossterm = { version = "0.28", features = ["event-stream"] }

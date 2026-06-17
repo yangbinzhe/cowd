@@ -12,7 +12,6 @@
 
 #![allow(dead_code)]
 
-use commands::slash_command_specs;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -42,7 +41,11 @@ pub struct CommandEntry {
 }
 
 impl CommandEntry {
-    pub fn new(name: impl Into<String>, description: impl Into<String>, action: Action) -> Self {
+    pub fn static_entry(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        action: Action,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -131,135 +134,78 @@ fn score_entry(query: &str, entry: &CommandEntry) -> usize {
 // Default command registry
 // ═══════════════════════════════════════════════════════════════════
 
-/// All known slash commands plus keybind actions.
-fn default_entries() -> Vec<CommandEntry> {
-    let mut entries: Vec<CommandEntry> = Vec::new();
-
-    // ── Slash commands ──────────────────────────────────────────
-    for spec in slash_command_specs() {
-        entries.push(CommandEntry::new(
-            format!("/{}", spec.name),
-            spec.summary,
-            Action::Execute(format!("/{}", spec.name)),
+/// All known commands projected from the shared command registry.
+fn registry_entries_from_payload(payload: &serde_json::Value) -> Vec<CommandEntry> {
+    let mut entries = Vec::new();
+    let commands = payload
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for command in commands {
+        let name = command
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let description = command
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        entries.push(CommandEntry::static_entry(
+            name.clone(),
+            description.clone(),
+            action_from_target(command.get("action"), &name),
         ));
-
-        for alias in spec.aliases {
-            entries.push(CommandEntry::new(
-                format!("/{alias}"),
-                format!("Alias for /{} · {}", spec.name, spec.summary),
-                Action::Execute(format!("/{alias}")),
+        for alias in command
+            .get("aliases")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            entries.push(CommandEntry::static_entry(
+                alias.to_string(),
+                format!("Alias for {name} · {description}"),
+                Action::Execute(alias.to_string()),
             ));
         }
     }
-
-    // ── Keybind actions ─────────────────────────────────────────
-    entries.push(CommandEntry::new(
-        "Toggle Help",
-        "Show or hide the help overlay",
-        Action::ToggleHelp,
-    ));
-    entries.push(CommandEntry::new(
-        "Toggle Theme",
-        "Switch between light and dark themes",
-        Action::ToggleTheme,
-    ));
-    entries.push(CommandEntry::new(
-        "Search",
-        "Activate incremental find / search mode",
-        Action::Search,
-    ));
-    entries.push(CommandEntry::new(
-        "Copy",
-        "Copy the focused selection to clipboard",
-        Action::Copy,
-    ));
-    entries.push(CommandEntry::new(
-        "Next Panel",
-        "Focus the next panel in the layout",
-        Action::NextPanel,
-    ));
-    entries.push(CommandEntry::new(
-        "Previous Panel",
-        "Focus the previous panel in the layout",
-        Action::PrevPanel,
-    ));
-    entries.push(CommandEntry::new(
-        "Submit Input",
-        "Send the current input buffer as a message",
-        Action::SubmitInput,
-    ));
-    entries.push(CommandEntry::new(
-        "Reload Providers",
-        "Reload provider and model routing from runtime config",
-        Action::ReloadProviders,
-    ));
-    entries.push(CommandEntry::new(
-        "Open Setup Center",
-        "Check local setup and show the next required action",
-        Action::Execute("/setup".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Runtime Panel",
-        "Show runtime status, tasks, approvals, network, and connector health",
-        Action::Execute("/runtime".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Activity Panel",
-        "Show the recent execution stream beside the main conversation",
-        Action::Execute("/activity".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Tools Ops",
-        "Operate tool registry, cache, checkpoints, ledger, and risk checks",
-        Action::Execute("/tools".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Files Panel",
-        "Browse workspace files in the sidebar",
-        Action::Execute("/files".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Sessions Panel",
-        "Browse and switch recent sessions",
-        Action::Execute("/sessions".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Gateway Panel",
-        "Inspect external connector and gateway state",
-        Action::Execute("/gateway".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Memory Panel",
-        "Inspect memory entries in the on-demand topic panel",
-        Action::Execute("/memory".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Open Diff Panel",
-        "Review current code changes in the on-demand topic panel",
-        Action::Execute("/diff".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Focus Input",
-        "Return keyboard focus to the prompt input",
-        Action::Execute("/focus input".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Focus Chat",
-        "Return keyboard focus to the main conversation",
-        Action::Execute("/focus chat".into()),
-    ));
-    entries.push(CommandEntry::new(
-        "Cancel",
-        "Cancel the current operation",
-        Action::Cancel,
-    ));
-    entries.push(CommandEntry::new(
-        "Quit",
-        "Exit the application",
-        Action::Quit,
-    ));
-
     entries
+}
+
+fn action_from_target(target: Option<&serde_json::Value>, fallback_command: &str) -> Action {
+    let kind = target
+        .and_then(|value| value.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match kind {
+        "client" => match target
+            .and_then(|value| value.get("action"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "toggle-help" => Action::ToggleHelp,
+            "toggle-theme" => Action::ToggleTheme,
+            "search" => Action::Search,
+            "copy" => Action::Copy,
+            "next-panel" => Action::NextPanel,
+            "previous-panel" => Action::PrevPanel,
+            "submit-input" => Action::SubmitInput,
+            "reload-providers" => Action::ReloadProviders,
+            "cancel" => Action::Cancel,
+            "quit" => Action::Quit,
+            slash if slash.starts_with("slash:") => {
+                Action::Execute(format!("/{}", slash.trim_start_matches("slash:")))
+            }
+            other => Action::Execute(other.to_string()),
+        },
+        _ => Action::Execute(fallback_command.to_string()),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -290,8 +236,21 @@ impl CommandPalette {
     /// Create a new command palette with all default commands pre-registered.
     #[must_use]
     pub fn new() -> Self {
-        let all_commands = default_entries();
-        let mut palette = Self {
+        Self {
+            all_commands: Vec::new(),
+            search_input: String::new(),
+            cursor: 0,
+            results: Vec::new(),
+            selected_index: 0,
+            visible: false,
+            pending_action: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_projection(payload: &serde_json::Value) -> Self {
+        let all_commands = registry_entries_from_payload(payload);
+        Self {
             all_commands,
             search_input: String::new(),
             cursor: 0,
@@ -299,29 +258,19 @@ impl CommandPalette {
             selected_index: 0,
             visible: false,
             pending_action: None,
-        };
-        // Register commands with refined descriptions
-        palette.register(
-            "/solve",
-            "Start joint problem-solving (7-phase)",
-            Action::Execute("/solve".into()),
-        );
-        palette.register(
-            "/discuss",
-            "Start agent discussion for consensus",
-            Action::Execute("/discuss".into()),
-        );
-        palette.register(
-            "/agents",
-            "Show agent team panel",
-            Action::Execute("/agents".into()),
-        );
-        palette.register(
-            "/perf",
-            "Toggle performance dashboard",
-            Action::Execute("/perf".into()),
-        );
-        palette
+        }
+    }
+
+    pub fn sync_command_projection(&mut self, payload: &serde_json::Value) {
+        let dynamic = self
+            .all_commands
+            .iter()
+            .filter(|entry| entry.dynamic)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.all_commands = registry_entries_from_payload(payload);
+        self.all_commands.extend(dynamic);
+        self.run_search();
     }
 
     // ── Registration ────────────────────────────────────────────
@@ -334,7 +283,7 @@ impl CommandPalette {
         action: Action,
     ) {
         self.all_commands
-            .push(CommandEntry::new(name, description, action));
+            .push(CommandEntry::static_entry(name, description, action));
     }
 
     /// Replace live runtime-derived actions while preserving static commands.
@@ -1087,6 +1036,7 @@ mod tests {
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
+    use commands::{command_projection, CommandSurface};
     use crossterm::event::KeyModifiers;
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1108,7 +1058,9 @@ mod tests {
     }
 
     fn setup_palette() -> CommandPalette {
-        CommandPalette::new()
+        CommandPalette::new_with_projection(
+            &serde_json::to_value(command_projection(CommandSurface::Tui)).expect("projection"),
+        )
     }
 
     // ── Registration and construction ─────────────────────────────
@@ -1116,55 +1068,50 @@ mod tests {
     #[test]
     fn new_has_default_commands() {
         let p = setup_palette();
-        // Should have all slash commands + keybind entries
+        let projection = command_projection(CommandSurface::Tui);
         assert!(
-            p.command_count() >= slash_command_specs().len(),
-            "expected at least all registered slash commands, got {}",
+            p.command_count() >= projection.commands.len(),
+            "expected at least all projected commands, got {}",
             p.command_count()
         );
     }
 
     #[test]
-    fn default_entries_include_every_registered_slash_command_and_alias() {
+    fn registry_entries_include_every_projected_command_and_alias() {
         let p = setup_palette();
 
-        for spec in slash_command_specs() {
-            let command = format!("/{}", spec.name);
+        for command in command_projection(CommandSurface::Tui).commands {
             assert!(
-                p.all_commands.iter().any(|entry| entry.name == command
-                    && entry.description == spec.summary
-                    && entry.action == Action::Execute(command.clone())),
-                "palette missing registered slash command {command}"
+                p.all_commands
+                    .iter()
+                    .any(|entry| entry.name == command.name
+                        && entry.description == command.description),
+                "palette missing projected command {}",
+                command.name
             );
 
-            for alias in spec.aliases {
-                let alias_command = format!("/{alias}");
+            for alias in command.aliases {
                 assert!(
-                    p.all_commands
-                        .iter()
-                        .any(|entry| entry.name == alias_command
-                            && entry.action == Action::Execute(alias_command.clone())),
-                    "palette missing alias {alias_command} for /{}",
-                    spec.name
+                    p.all_commands.iter().any(|entry| entry.name == alias
+                        && entry.action == Action::Execute(alias.clone())),
+                    "palette missing alias {alias} for {}",
+                    command.name
                 );
             }
         }
     }
 
     #[test]
-    fn default_entries_include_on_demand_panel_shortcuts() {
+    fn registry_entries_include_on_demand_panel_shortcuts() {
         let p = setup_palette();
         for (name, action) in [
-            ("Open Runtime Panel", Action::Execute("/runtime".into())),
-            ("Open Activity Panel", Action::Execute("/activity".into())),
-            ("Open Tools Ops", Action::Execute("/tools".into())),
-            ("Open Files Panel", Action::Execute("/files".into())),
-            ("Open Sessions Panel", Action::Execute("/sessions".into())),
-            ("Open Gateway Panel", Action::Execute("/gateway".into())),
-            ("Open Memory Panel", Action::Execute("/memory".into())),
-            ("Open Diff Panel", Action::Execute("/diff".into())),
-            ("Focus Input", Action::Execute("/focus input".into())),
-            ("Focus Chat", Action::Execute("/focus chat".into())),
+            ("/runtime", Action::Execute("/runtime".into())),
+            ("/activity", Action::Execute("/activity".into())),
+            ("/tools", Action::Execute("/tools".into())),
+            ("/files", Action::Execute("/files".into())),
+            ("/gateway", Action::Execute("/gateway".into())),
+            ("/memory", Action::Execute("/memory".into())),
+            ("/diff", Action::Execute("/diff".into())),
         ] {
             assert!(
                 p.all_commands
@@ -1184,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn default_entries_include_reload_providers_action() {
+    fn registry_entries_include_reload_providers_action() {
         let p = setup_palette();
         assert!(p.all_commands.iter().any(|entry| {
             entry.name == "Reload Providers" && entry.action == Action::ReloadProviders
@@ -1192,10 +1139,10 @@ mod tests {
     }
 
     #[test]
-    fn default_entries_include_setup_center_action() {
+    fn registry_entries_include_setup_center_action() {
         let p = setup_palette();
         assert!(p.all_commands.iter().any(|entry| {
-            entry.name == "Open Setup Center" && entry.action == Action::Execute("/setup".into())
+            entry.name == "/setup" && entry.action == Action::Execute("/setup".into())
         }));
     }
 

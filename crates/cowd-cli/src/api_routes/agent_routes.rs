@@ -97,7 +97,7 @@ struct UpsertAgentTeamProfileRequest {
 async fn agent_catalog_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+    command_runtime::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
@@ -106,7 +106,7 @@ async fn agent_directory_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let catalog =
-        commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+        command_runtime::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let agents = catalog
         .get("agents")
@@ -129,7 +129,7 @@ async fn agent_discover_handler(
     if task.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "task query is required"));
     }
-    commands::handle_agents_slash_command_json(
+    command_runtime::handle_agents_slash_command_json(
         Some(&format!("discover {task}")),
         &state.workspace_root,
     )
@@ -145,7 +145,7 @@ async fn agent_assemble_handler(
     if task.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "task is required"));
     }
-    let discovery = commands::handle_agents_slash_command_json(
+    let discovery = command_runtime::handle_agents_slash_command_json(
         Some(&format!("discover {task}")),
         &state.workspace_root,
     )
@@ -163,7 +163,7 @@ async fn agent_reputation_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let catalog =
-        commands::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
+        command_runtime::handle_agents_slash_command_json(Some("list"), &state.workspace_root)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let agents = catalog
         .get("agents")

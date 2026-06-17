@@ -4653,7 +4653,7 @@ providers:
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/commands")
+                    .uri("/api/commands?surface=webui")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4667,6 +4667,38 @@ providers:
             .unwrap()
             .iter()
             .any(|command| command["name"] == "/status"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/commands/slash.status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["command"]["id"], "slash.status");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands/resolve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"input":"/status","surface":"webui"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["resolution"]["command"]["name"], "/status");
 
         let response = app
             .clone()
@@ -4687,6 +4719,24 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["command"], "/status");
+        assert!(matches!(
+            json["status"].as_str(),
+            Some("complete" | "degraded")
+        ));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"command":"/compact","args":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .oneshot(
