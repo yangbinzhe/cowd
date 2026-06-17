@@ -56,10 +56,6 @@ mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/docs" "$AI_ROOT"
 cp "$BIN" "$INSTALL_DIR/bin/cowd"
 chmod +x "$INSTALL_DIR/bin/cowd"
 
-if [[ -d "$ROOT/docs/plans" ]]; then
-  cp -a "$ROOT/docs/plans" "$INSTALL_DIR/docs/"
-fi
-
 cat >"$INSTALL_DIR/install.json" <<EOF
 {
   "version": "$VERSION",

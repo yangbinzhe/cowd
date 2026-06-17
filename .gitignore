@@ -34,6 +34,9 @@ memory_blobs/
 
 # Stale plan artifacts
 plan/
+.omo/
+.cargo/.package-cache
+.cargo/.package-cache-mutate
 
 # Legacy directories (no longer used, pre-cowd rename)
 .omx/

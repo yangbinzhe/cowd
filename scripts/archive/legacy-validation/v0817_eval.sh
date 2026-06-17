@@ -23,7 +23,7 @@ check_version_contract() {
   printf '\n==> checking v0.8.17 version contract\n'
   cargo metadata --no-deps --format-version 1 | rg '"version":"0\.8\.17"' >/dev/null
   if rg -n 'v0\.8\.4|version = "0\.8\.10"|当前版本 v0\.8\.4' \
-    Cargo.toml README.md docs/plans/v0.8.17-runtime-event-kernel.md; then
+    Cargo.toml README.md docs/README.md; then
     echo "v0.8.17 eval found stale version text" >&2
     return 1
   fi
