@@ -6,7 +6,6 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_V0964_PORT:-18684}"
 BASE_URL="http://127.0.0.1:$PORT"
-CHROMIUM="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium}"
 GATEWAY_SESSION="cowd-v0964-gateway-$$"
 TUI_SESSION="cowd-v0964-tui-$$"
 TMP_DIR="$(mktemp -d /tmp/cowd-v0964-unified.XXXXXX)"
@@ -63,17 +62,12 @@ on_error() {
 trap cleanup EXIT
 trap on_error ERR
 
-for cmd in tmux curl python3 rg ss sqlite3 npm; do
+for cmd in tmux curl python3 rg ss sqlite3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "$cmd is required for v0.9.64 unified scenario" >&2
     exit 1
   fi
 done
-
-if [[ ! -x "$CHROMIUM" ]]; then
-  echo "chromium executable not found at $CHROMIUM" >&2
-  exit 1
-fi
 
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
@@ -90,7 +84,6 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
@@ -206,15 +199,6 @@ fi
 if rg -q "__COWD_TUI_EXIT__[1-9][0-9]*|panic|backtrace|thread .* panicked|failed to initialize terminal|Run cowd --help" "$TUI_CAPTURE"; then
   exit 1
 fi
-
-(cd "$ROOT/webui" && \
-  env COWD_WEBUI_BASE_URL="$BASE_URL" \
-    COWD_V0964_SESSION_ID="$SESSION_ID" \
-    COWD_V0964_TASK_OBJECTIVE="$TASK_OBJECTIVE" \
-    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
-    npx playwright test unified-runtime.live.e2e.spec.js \
-      --config=playwright.live.config.js \
-      --browser=chromium)
 
 curl -fsS "$BASE_URL/api/runtime/control-plane" >"$TMP_DIR/control-plane.json"
 curl -fsS "$BASE_URL/api/runtime/session-leases" >"$TMP_DIR/leases.json"

@@ -32,8 +32,6 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
 fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
-
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 permissions:
@@ -103,4 +101,4 @@ if [[ -z "$memory_id" ]]; then
 fi
 curl -fsS "$BASE_URL/api/memory/lifecycle/$memory_id" | rg -q '"events"'
 
-curl -fsS "$BASE_URL/runtime/context/inspect" | rg -q '<title>Cowd Web UI</title>'
+curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'

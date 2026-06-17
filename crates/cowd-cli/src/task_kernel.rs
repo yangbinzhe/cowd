@@ -731,7 +731,7 @@ mod tests {
                 "Cover task workbench browser scenario",
                 vec!["Add Playwright fixture".to_string()],
                 vec!["E2E passes".to_string()],
-                vec!["cd webui && npm run test:e2e".to_string()],
+                vec!["cargo test -p cowd-cli task_kernel -- --nocapture".to_string()],
             )
             .unwrap();
         let phase = with_phase

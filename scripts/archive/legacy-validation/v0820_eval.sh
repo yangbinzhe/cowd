@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WEBUI="$ROOT/webui"
+WEBUI="${COWD_WEBUI_REPO:-}"
 PORT_PATTERN=':(18642|18643|18652|18662|18663|18664|18665|18666|18667|18668|18669|9237|9238|9239|9240|9241|8642)\b'
 TMUX_PATTERN='cowd-|webui-|phase5|message100k|prepare|audit|workspace|profile|v0815|v0816|v0817|v0820'
 

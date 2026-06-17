@@ -5,11 +5,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${1:-${COWD_INSTALL_DIR:-}}"
 if [[ -n "$INSTALL_DIR" ]]; then
   BIN="${COWD_BIN:-$INSTALL_DIR/bin/cowd}"
-  WEBUI_SRC="$INSTALL_DIR/webui"
 else
   TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
   BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-  WEBUI_SRC="$ROOT/webui"
 fi
 
 PORT="${COWD_RELEASE_SMOKE_PORT:-18695}"
@@ -61,17 +59,12 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
   exit 1
 fi
-if [[ ! -d "$WEBUI_SRC" ]]; then
-  echo "missing webui directory at $WEBUI_SRC" >&2
-  exit 1
-fi
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
   exit 1
 fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$WEBUI_SRC" "$WORKDIR/webui"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
@@ -121,7 +114,8 @@ done
 [[ -S "$SOCKET" ]]
 curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/healthz" >/dev/null
-curl -fsS "$BASE_URL/runtime/context/inspect" | rg -q '<title>Cowd Web UI</title>'
+curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
+curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"config_key":"gateway.webui_dir"'
 
 python3 - "$SOCKET" "$SMOKE_ID" <<'PY'
 import json

@@ -161,7 +161,6 @@ run_unit_fast() {
   run_step cargo_test_commands cargo test -p commands --no-default-features -- --nocapture
   run_step cargo_test_memory_tuner cargo test -p cowd-memory performance_monitor::tests::test_tuner --no-default-features -- --nocapture
   run_step cargo_test_runtime_worker_state cargo test -p runtime worker_boot::tests::emit_state_file_writes_worker_status_on_transition --no-default-features -- --nocapture
-  run_step webui_npm_test bash -lc 'cd webui && npm test'
 }
 
 run_contract() {
@@ -177,7 +176,6 @@ run_contract() {
     cargo test -p cowd-cli runtime_control --no-default-features -- --nocapture --test-threads=1
   run_step cargo_test_cowd_cli_connector timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
     cargo test -p cowd-cli connector --no-default-features -- --nocapture --test-threads=1
-  run_step webui_npm_test bash -lc 'cd webui && npm test'
 }
 
 run_scenario() {

@@ -32,8 +32,6 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
 fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
-
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 permissions:
@@ -70,7 +68,7 @@ done
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"kind":"cowd.webui.manifest"'
-curl -fsS "$BASE_URL/runtime/deep/link/refresh" | rg -q '<title>Cowd Web UI</title>'
+curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/manifest.json" | rg -q '"name"'
 
 if [[ ! -f "$LOG" ]]; then

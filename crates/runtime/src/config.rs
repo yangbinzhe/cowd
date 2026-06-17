@@ -841,6 +841,7 @@ impl Default for ExtractionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
     pub enabled: bool,
+    pub webui_dir: Option<PathBuf>,
     pub platforms: Vec<PlatformConfig>,
     pub session_reset: SessionResetPolicy,
 }
@@ -859,6 +860,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            webui_dir: None,
             platforms: Vec::new(),
             session_reset: SessionResetPolicy::default(),
         }
@@ -2156,6 +2158,8 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         .map(|s| parse_session_reset_policy(s, "merged settings.gateway.sessionReset"))
         .transpose()?
         .unwrap_or_default();
+    let webui_dir =
+        optional_string_dual(gw, "webui_dir", "merged settings.gateway")?.map(PathBuf::from);
     let platforms = if let Some(plat_val) = gw.get("platforms") {
         let arr = expect_array(plat_val, "merged settings.gateway.platforms")?;
         arr.iter()
@@ -2181,6 +2185,7 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
     };
     Ok(GatewayConfig {
         enabled,
+        webui_dir,
         platforms,
         session_reset,
     })
@@ -3951,6 +3956,41 @@ memory:
         assert_eq!(loaded.memory().vector.api_key, "test-key");
         assert_eq!(loaded.memory().vector.dimension, 0);
         assert_eq!(loaded.memory().vector.batch_size, 32);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn gateway_webui_dir_reads_configured_static_asset_dir() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+gateway:
+  enabled: true
+  webui_dir: "/tmp/cowd-webui-dist"
+  platforms:
+    - platformType: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+"#,
+        )
+        .expect("write gateway config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.gateway().enabled);
+        assert_eq!(
+            loaded.gateway().webui_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/cowd-webui-dist"))
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

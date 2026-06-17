@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage: scripts/install_debug_to_ai.sh [--current] [--print-path-only]
 
-Installs the already-built debug cowd binary and static WebUI into ~/AI.
+Installs the already-built debug cowd binary into ~/AI.
 
 Environment:
   CARGO_TARGET_DIR  target directory containing debug/cowd
@@ -52,32 +52,10 @@ if [[ -e "$INSTALL_DIR" ]]; then
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/webui" "$INSTALL_DIR/docs" "$AI_ROOT"
+mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/docs" "$AI_ROOT"
 cp "$BIN" "$INSTALL_DIR/bin/cowd"
 chmod +x "$INSTALL_DIR/bin/cowd"
 
-if [[ -d "$ROOT/webui" ]]; then
-  for item in \
-    index.html \
-    api.js \
-    boot.js \
-    commands.js \
-    manifest.json \
-    messages.js \
-    panels.js \
-    sessions.js \
-    state.js \
-    style.css \
-    sw.js \
-    ui.js \
-    workspace.js \
-    assets
-  do
-    if [[ -e "$ROOT/webui/$item" ]]; then
-      cp -a "$ROOT/webui/$item" "$INSTALL_DIR/webui/"
-    fi
-  done
-fi
 if [[ -d "$ROOT/docs/plans" ]]; then
   cp -a "$ROOT/docs/plans" "$INSTALL_DIR/docs/"
 fi
@@ -99,6 +77,7 @@ if [[ "$PRINT_ONLY" == "1" ]]; then
   printf '%s\n' "$INSTALL_DIR"
 else
   echo "installed cowd debug build: $INSTALL_DIR"
+  echo "WebUI assets are external; configure gateway.webui_dir to enable browser UI."
   if [[ "$UPDATE_CURRENT" == "1" ]]; then
     echo "current symlink: $AI_ROOT/cowd-debug-current"
   fi

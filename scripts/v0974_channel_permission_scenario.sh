@@ -36,8 +36,6 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
 fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
-
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 permissions:
@@ -104,4 +102,4 @@ audit_json="$(curl -fsS "$BASE_URL/api/cross-plane/audit")"
 printf '%s' "$audit_json" | rg -q "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
 printf '%s' "$audit_json" | rg -q '"remaining_uses_after"\s*:\s*0'
 
-curl -fsS "$BASE_URL/runtime/context/inspect" | rg -q '<title>Cowd Web UI</title>'
+curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'

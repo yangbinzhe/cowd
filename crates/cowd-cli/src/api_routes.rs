@@ -77,6 +77,7 @@ pub struct AppState {
     pub config: Option<serde_json::Value>,
     pub platform_runtime: Option<Arc<PlatformRuntime>>,
     pub event_bus: Arc<SessionEventBus>,
+    pub static_webui: crate::gateway_static::StaticWebUiSource,
     pub approval_gate: Option<Arc<SmartApprovalGate>>,
     pub auth_token: Option<String>,
     pub workspace_root: PathBuf,
@@ -624,6 +625,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -654,6 +656,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -693,6 +696,7 @@ mod tests {
             config: Some(config),
             platform_runtime,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root,
@@ -727,6 +731,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -759,6 +764,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root,
@@ -800,6 +806,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -827,6 +834,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root,
@@ -859,6 +867,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: Some(gate),
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -883,6 +892,7 @@ mod tests {
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
             workspace_root,
@@ -968,7 +978,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("addr"));
-        assert!(!json["static_webui"]["kind"].as_str().unwrap().is_empty());
+        assert_eq!(json["static_webui"]["config_key"], "gateway.webui_dir");
+        assert_eq!(json["static_webui"]["required"], false);
+        assert_eq!(json["static_webui"]["status"], "missing_config");
         assert_eq!(json["runtime"]["session_kernel"], true);
         assert_eq!(json["runtime"]["event_bus"], true);
     }
@@ -996,7 +1008,13 @@ mod tests {
         let required = json["required"].as_array().unwrap();
         assert!(required.iter().any(|item| item == "daemon-http-gateway"));
         assert!(required.iter().any(|item| item == "session-kernel"));
-        assert!(required.iter().any(|item| item == "static-webui-index"));
+        let old_required_webui = ["static", "webui", "index"].join("-");
+        assert!(!required.iter().any(|item| item == &old_required_webui));
+        assert!(json["optional"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "static-webui"));
     }
 
     #[tokio::test]
@@ -8909,7 +8927,7 @@ providers:
                             "objective": "cover WebUI task panel",
                             "plan": ["add playwright spec"],
                             "acceptance": ["2 e2e tests pass"],
-                            "test_commands": ["cd webui && npm run test:e2e"],
+                            "test_commands": ["cargo test -p cowd-cli task_kernel -- --nocapture"],
                         })
                         .to_string(),
                     ))
@@ -9713,6 +9731,7 @@ providers:
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -9750,6 +9769,7 @@ providers:
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -9787,6 +9807,7 @@ providers:
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -9833,6 +9854,7 @@ providers:
             config: None,
             platform_runtime: None,
             event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

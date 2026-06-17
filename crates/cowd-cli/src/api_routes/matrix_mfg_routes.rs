@@ -1101,7 +1101,9 @@ async fn matrix_decision_trace_handler(
     } else {
         None
     };
-    let delivery_state = report.as_ref().map(MfgCockpitReportDeliveryState::from_report);
+    let delivery_state = report
+        .as_ref()
+        .map(MfgCockpitReportDeliveryState::from_report);
 
     let source_pack_ref = source_pack
         .as_ref()
@@ -1132,7 +1134,11 @@ async fn matrix_decision_trace_handler(
     let evidence_ref = evidence
         .as_ref()
         .map(|packet| packet.packet_id.clone())
-        .or_else(|| incident.as_ref().and_then(|item| item.evidence_packet_id.clone()))
+        .or_else(|| {
+            incident
+                .as_ref()
+                .and_then(|item| item.evidence_packet_id.clone())
+        })
         .unwrap_or_else(|| "evidence pending".to_string());
     let incident_ref = incident
         .as_ref()

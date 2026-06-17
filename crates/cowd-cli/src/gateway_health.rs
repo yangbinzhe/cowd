@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::api_routes::AppState;
-use crate::gateway_static::{resolve_static_webui_source, StaticWebUiSource};
+use crate::gateway_static::StaticWebUiSource;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayProcessSnapshot {
@@ -35,13 +35,15 @@ pub(crate) struct GatewayReadinessSnapshot {
     pub(crate) ready: bool,
     pub(crate) status: String,
     pub(crate) required: Vec<String>,
+    pub(crate) optional: Vec<String>,
+    pub(crate) optional_missing: Vec<String>,
     pub(crate) degraded: Vec<String>,
     pub(crate) health: GatewayHealthSnapshot,
 }
 
 pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot {
     let server_status = crate::server::get_server_status().ok().flatten();
-    let static_webui = resolve_static_webui_source();
+    let static_webui = state.static_webui.clone();
     let runtime = GatewayRuntimeSnapshot {
         unified_store: state.has_unified_store(),
         memory_manager: state.memory_manager.is_some(),
@@ -49,7 +51,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         event_bus: true,
         session_kernel: true,
     };
-    let status = if static_webui.available && runtime.session_kernel && runtime.event_bus {
+    let status = if runtime.session_kernel && runtime.event_bus {
         "healthy"
     } else {
         "degraded"
@@ -73,9 +75,6 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
 pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSnapshot {
     let health = gateway_health_snapshot(state);
     let mut degraded = Vec::new();
-    if !health.static_webui.available {
-        degraded.push("static_webui.index_missing".to_string());
-    }
     if !health.runtime.session_kernel {
         degraded.push("runtime.session_kernel_unavailable".to_string());
     }
@@ -84,16 +83,25 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
     }
 
     let ready = degraded.is_empty();
+    let optional_missing = if health.static_webui.available {
+        Vec::new()
+    } else {
+        vec![format!(
+            "static_webui.{}",
+            health.static_webui.status.as_str()
+        )]
+    };
     GatewayReadinessSnapshot {
         ready,
         status: if ready { "ready" } else { "degraded" }.to_string(),
         required: vec![
             "daemon-http-gateway".to_string(),
             "api-router".to_string(),
-            "static-webui-index".to_string(),
             "session-kernel".to_string(),
             "event-bus".to_string(),
         ],
+        optional: vec!["static-webui".to_string()],
+        optional_missing,
         degraded,
         health,
     }

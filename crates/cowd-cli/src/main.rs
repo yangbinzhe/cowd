@@ -664,6 +664,7 @@ fn run_gateway_action(
                 memory_config,
                 platform_configs,
                 runtime_config: runtime_config_json,
+                webui_dir: runtime_config.gateway().webui_dir.clone(),
                 cors_origins,
                 auth_token,
                 message_mirror: None,
@@ -8856,9 +8857,7 @@ fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::err
         raw_install_dir
     };
     let bin_dir = install_dir.join("bin");
-    let webui_dir = install_dir.join("webui");
     std::fs::create_dir_all(&bin_dir)?;
-    std::fs::create_dir_all(&webui_dir)?;
 
     let current_exe = std::env::current_exe()?;
     let target = bin_dir.join("cowd");
@@ -8869,12 +8868,8 @@ fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::err
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    let webui_source = resolve_install_webui_source(&current_exe)
-        .ok_or("cannot install WebUI assets: webui/index.html was not found")?;
-    copy_dir_recursive(&webui_source, &webui_dir)?;
-
     println!("Installed cowd to {}", target.display());
-    println!("Installed WebUI to {}", webui_dir.display());
+    println!("WebUI assets are optional; configure gateway.webui_dir to enable browser UI.");
 
     if systemd {
         let unit = format!(
@@ -8887,13 +8882,11 @@ ExecStart={} gateway run
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=warn
-Environment=COWD_WEBUI_DIR={}
 
 [Install]
 WantedBy=default.target
 "#,
-            target.display(),
-            webui_dir.display()
+            target.display()
         );
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
         let unit_path = PathBuf::from(&home_dir)
@@ -8910,52 +8903,6 @@ WantedBy=default.target
             "To enable: systemctl --user enable --now {}",
             unit_path.display()
         );
-    }
-    Ok(())
-}
-
-fn resolve_install_webui_source(current_exe: &Path) -> Option<PathBuf> {
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_webui = cwd.join("webui");
-        if gateway_static::has_webui_index(&cwd_webui) {
-            return Some(cwd_webui);
-        }
-    }
-    if let Some(exe_dir) = current_exe.parent() {
-        let installed_sibling = exe_dir.parent().map(|dir| dir.join("webui"));
-        if let Some(path) = installed_sibling {
-            if gateway_static::has_webui_index(&path) {
-                return Some(path);
-            }
-        }
-        let exe_webui = exe_dir.join("webui");
-        if gateway_static::has_webui_index(&exe_webui) {
-            return Some(exe_webui);
-        }
-    }
-    let manifest_webui = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("webui"));
-    if let Some(path) = manifest_webui {
-        if gateway_static::has_webui_index(&path) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
     }
     Ok(())
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderValue;
+use axum::{http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -218,6 +219,7 @@ pub struct DaemonConfig {
     pub memory_config: Option<MemoryConfig>,
     pub platform_configs: Vec<PlatformConfig>,
     pub runtime_config: Option<serde_json::Value>,
+    pub webui_dir: Option<PathBuf>,
     pub cors_origins: Vec<String>,
     pub auth_token: Option<String>,
     pub message_mirror: Option<Arc<MessageMirror>>,
@@ -236,7 +238,8 @@ struct StartupDiagnostics {
     unix_sock_path: String,
     workspace_root: String,
     config_home: String,
-    webui_dir: String,
+    webui_dir: Option<String>,
+    webui_status: String,
     webui_available: bool,
     memory_enabled: bool,
     memory_available: bool,
@@ -254,7 +257,7 @@ fn build_startup_diagnostics(
     config: &DaemonConfig,
     workspace_root: &Path,
     config_home: &Path,
-    webui_dir: &Path,
+    static_webui: &crate::gateway_static::StaticWebUiSource,
     memory_available: bool,
     unified_store_available: bool,
 ) -> StartupDiagnostics {
@@ -278,8 +281,12 @@ fn build_startup_diagnostics(
         unix_sock_path: config.unix_sock_path.clone(),
         workspace_root: workspace_root.display().to_string(),
         config_home: config_home.display().to_string(),
-        webui_dir: webui_dir.display().to_string(),
-        webui_available: crate::gateway_static::has_webui_index(webui_dir),
+        webui_dir: static_webui
+            .configured_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        webui_status: static_webui.status.as_str().to_string(),
+        webui_available: static_webui.available,
         memory_enabled: config.memory_config.is_some(),
         memory_available,
         unified_store_available,
@@ -299,7 +306,8 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
         unix_sock_path = %diagnostics.unix_sock_path,
         workspace_root = %diagnostics.workspace_root,
         config_home = %diagnostics.config_home,
-        webui_dir = %diagnostics.webui_dir,
+        webui_dir = ?diagnostics.webui_dir,
+        webui_status = %diagnostics.webui_status,
         webui_available = diagnostics.webui_available,
         memory_enabled = diagnostics.memory_enabled,
         memory_available = diagnostics.memory_available,
@@ -329,8 +337,16 @@ impl PidFileGuard {
     }
 }
 
-fn resolve_webui_dir() -> PathBuf {
-    crate::gateway_static::resolve_static_webui_source().path
+async fn webui_not_configured_handler() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "ok": false,
+            "error": "webui_not_configured",
+            "config_key": "gateway.webui_dir",
+            "message": "WebUI static assets are optional; configure gateway.webui_dir with a directory containing index.html to enable browser UI.",
+        })),
+    )
 }
 
 fn spawn_platform_inbound_loop(
@@ -699,12 +715,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     );
 
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let webui_dir = resolve_webui_dir();
+    let static_webui =
+        crate::gateway_static::resolve_static_webui_source(config.webui_dir.as_deref());
     let startup_diagnostics = build_startup_diagnostics(
         &config,
         &workspace_root,
         &approval_dir,
-        &webui_dir,
+        &static_webui,
         cognitive.is_some(),
         unified_store.is_some(),
     );
@@ -721,6 +738,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         config: config.runtime_config.clone(),
         platform_runtime: Some(platform_runtime.clone()),
         event_bus: event_bus.clone(),
+        static_webui: static_webui.clone(),
         approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
         workspace_root,
@@ -750,13 +768,24 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         }
         let cors = build_cors_layer(cors_origin_values);
 
-        tracing::info!(path = %webui_dir.display(), "serving WebUI assets");
-        api_routes::api_router(app_state.clone())
-            .fallback_service(
-                ServeDir::new(webui_dir.clone())
-                    .fallback(ServeFile::new(webui_dir.join("index.html"))),
-            )
-            .layer(cors)
+        let router = api_routes::api_router(app_state.clone());
+        if let (true, Some(webui_dir), Some(index_path)) = (
+            static_webui.available,
+            static_webui.configured_path.clone(),
+            static_webui.index_path.clone(),
+        ) {
+            tracing::info!(path = %webui_dir.display(), "serving configured WebUI assets");
+            router
+                .fallback_service(ServeDir::new(webui_dir).fallback(ServeFile::new(index_path)))
+                .layer(cors)
+        } else {
+            tracing::info!(
+                status = %static_webui.status.as_str(),
+                config_key = static_webui.config_key,
+                "WebUI assets disabled; serving gateway API only"
+            );
+            router.fallback(webui_not_configured_handler).layer(cors)
+        }
     };
 
     // 3. HTTP listener
@@ -1765,9 +1794,6 @@ mod tests {
     use super::*;
     use memory::MemoryConfig;
     use std::fs;
-    use std::sync::Mutex;
-
-    static WEBUI_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_webui_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(
@@ -1791,6 +1817,7 @@ mod tests {
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
+            webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
             message_mirror: None,
@@ -1881,6 +1908,7 @@ mod tests {
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
+            webui_dir: None,
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("secret-token".into()),
             message_mirror: None,
@@ -1899,6 +1927,7 @@ mod tests {
             memory_config: Some(mem_cfg),
             platform_configs: vec![],
             runtime_config: None,
+            webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
             message_mirror: None,
@@ -1997,13 +2026,16 @@ mod tests {
             memory_config: Some(MemoryConfig::default()),
             platform_configs: vec![platform],
             runtime_config: Some(serde_json::json!({"model": "test-model"})),
+            webui_dir: Some(webui_dir.clone()),
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("do-not-log-this-token".into()),
             message_mirror: None,
         };
 
+        let static_webui =
+            crate::gateway_static::resolve_static_webui_source(config.webui_dir.as_deref());
         let diagnostics =
-            build_startup_diagnostics(&config, &workspace, &config_home, &webui_dir, true, true);
+            build_startup_diagnostics(&config, &workspace, &config_home, &static_webui, true, true);
         let serialized = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
 
         assert_eq!(diagnostics.http_addr, "127.0.0.1:9864");
@@ -2027,35 +2059,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_webui_dir_prefers_valid_env_path() {
-        let _guard = WEBUI_ENV_LOCK.lock().expect("webui env lock");
-        let previous = std::env::var_os("COWD_WEBUI_DIR");
-        let dir = temp_webui_dir("env");
+    fn configured_webui_dir_with_index_is_ready() {
+        let dir = temp_webui_dir("configured");
         fs::write(dir.join("index.html"), "<!doctype html>").expect("write index");
-        std::env::set_var("COWD_WEBUI_DIR", &dir);
 
-        assert_eq!(resolve_webui_dir(), dir);
+        let source = crate::gateway_static::resolve_static_webui_source(Some(&dir));
 
-        if let Some(value) = previous {
-            std::env::set_var("COWD_WEBUI_DIR", value);
-        } else {
-            std::env::remove_var("COWD_WEBUI_DIR");
-        }
+        assert!(source.available);
+        assert_eq!(source.configured_path.as_deref(), Some(dir.as_path()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_webui_dir_ignores_env_path_without_index() {
-        let _guard = WEBUI_ENV_LOCK.lock().expect("webui env lock");
-        let previous = std::env::var_os("COWD_WEBUI_DIR");
+    fn configured_webui_dir_without_index_is_optional() {
         let dir = temp_webui_dir("missing-index");
-        std::env::set_var("COWD_WEBUI_DIR", &dir);
 
-        assert_ne!(resolve_webui_dir(), dir);
+        let source = crate::gateway_static::resolve_static_webui_source(Some(&dir));
 
-        if let Some(value) = previous {
-            std::env::set_var("COWD_WEBUI_DIR", value);
-        } else {
-            std::env::remove_var("COWD_WEBUI_DIR");
-        }
+        assert!(!source.required);
+        assert!(!source.available);
+        assert_eq!(
+            source.status,
+            crate::gateway_static::StaticWebUiStatus::MissingIndex
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

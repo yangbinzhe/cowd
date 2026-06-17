@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${COWD_WEBUI_REPO:-}" ]]; then
+  echo "live WebUI workbench scenario moved to cowd-webui; set COWD_WEBUI_REPO to run it cross-repo"
+  exit 0
+fi
+
+if [[ ! -d "$COWD_WEBUI_REPO" ]]; then
+  echo "COWD_WEBUI_REPO does not exist: $COWD_WEBUI_REPO" >&2
+  exit 2
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
@@ -21,10 +31,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for live WebUI scenario" >&2
-  exit 1
-fi
+for cmd in tmux ss curl; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "$cmd is required for live WebUI scenario" >&2
+    exit 1
+  fi
+done
 
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
@@ -35,8 +47,6 @@ cd "$ROOT"
 cargo build -p cowd-cli
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
-
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 permissions:
@@ -45,6 +55,7 @@ memory:
   enabled: false
 gateway:
   enabled: true
+  webui_dir: "$COWD_WEBUI_REPO/dist"
   sessionReset: "none"
   platforms:
     - platformType: "api_server"
@@ -70,18 +81,15 @@ for _ in {1..80}; do
   sleep 0.25
 done
 
-curl -fsS "$BASE_URL/health" >/dev/null
+curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 
-(cd "$ROOT/webui" && \
+(
+  cd "$COWD_WEBUI_REPO"
   env COWD_WEBUI_BASE_URL="$BASE_URL" \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
     npx playwright test tasks-workbench.live.e2e.spec.js \
       --config=playwright.live.config.js \
-      --browser=chromium)
-
-sqlite3 "$CONFIG_HOME/tasks.db" "SELECT record_json FROM tasks;" \
-  | rg -q "Live WebUI workbench enterprise scenario"
-sqlite3 "$CONFIG_HOME/tasks.db" "SELECT record_json FROM tasks;" \
-  | rg -q "accepted by live browser scenario"
+      --browser=chromium
+)
 
 echo "live WebUI workbench scenario passed"

@@ -30,8 +30,8 @@ human_size() {
   echo "- generated at: \`$(date -Iseconds)\`"
   echo "- total size: \`$(human_size "$INSTALL_DIR")\` (\`$(size_bytes "$INSTALL_DIR")\` bytes)"
   echo "- binary size: \`$(human_size "$INSTALL_DIR/bin/cowd")\` (\`$(size_bytes "$INSTALL_DIR/bin/cowd")\` bytes)"
-  echo "- webui size: \`$(human_size "$INSTALL_DIR/webui")\` (\`$(size_bytes "$INSTALL_DIR/webui")\` bytes)"
   echo "- docs size: \`$(human_size "$INSTALL_DIR/docs")\` (\`$(size_bytes "$INSTALL_DIR/docs")\` bytes)"
+  echo "- webui: external; configure \`gateway.webui_dir\` to serve a built cowd-webui dist"
   echo
   echo "## Top Directories"
   echo

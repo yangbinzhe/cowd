@@ -59,7 +59,6 @@ cd "$ROOT"
 cargo build -p cowd-cli
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
-ln -s "$ROOT/webui" "$WORKDIR/webui"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
@@ -106,7 +105,7 @@ if ! curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-(cd "$ROOT/webui" && \
+(cd "${COWD_WEBUI_REPO:-}" && \
   env COWD_WEBUI_BASE_URL="$BASE_URL" \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
     npx playwright test connector-console.live.e2e.spec.js \
