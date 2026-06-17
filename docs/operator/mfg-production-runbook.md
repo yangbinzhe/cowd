@@ -103,7 +103,7 @@ curl -X POST http://127.0.0.1:8642/api/apps/mfg/cockpit/reports/schedules/run
 Release validation:
 
 ```bash
-scripts/v0998_mfg_production_release_gate.sh
+scripts/validate.sh release
 ```
 
 ## Governance

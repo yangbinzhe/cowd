@@ -98,7 +98,7 @@ mod tests {
             1,
             "toolu-1",
             "bash",
-            "npm test",
+            "scripts/validate.sh unit-fast",
             ToolSafetyCategory::WriteLocal,
             100,
         )

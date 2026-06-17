@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 LANE="${1:-${COWD_VALIDATION_LANE:-contract}}"
+MANUAL_TARGET="${2:-}"
 
 case "$LANE" in
   unit-fast|fast) LANE="unit-fast" ;;
@@ -12,19 +13,28 @@ case "$LANE" in
   scenario|live) LANE="scenario" ;;
   release) LANE="release" ;;
   all|full) LANE="all" ;;
+  manual) LANE="manual" ;;
   -h|--help|help)
     cat <<'EOF'
-Usage: scripts/validate.sh [unit-fast|contract|scenario|release|all]
+Usage: scripts/validate.sh [unit-fast|contract|scenario|release|all|manual <name>]
 
 Lanes:
-  unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes, WebUI unit
+  unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
   contract   package/API/CLI contracts without browser or tmux scenarios
-  scenario   one debug build plus daemon/TUI/WebUI scenario contracts
+  scenario   one debug build plus daemon/TUI/API scenario contracts
   release    clean build, install to ~/AI/cowd-debug-current, and release smoke
   all        contract + scenario
+  manual     run one manual script from scripts/manual
 
 Compatibility aliases:
   fast -> unit-fast, core -> contract, live -> scenario, full -> all
+
+Manual targets:
+  context-runtime-lean-spike
+  memory-degraded
+  task-phase
+  report-build-size
+  webui-live-workbench
 EOF
     exit 0
     ;;
@@ -181,33 +191,58 @@ run_contract() {
 run_scenario() {
   run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
-  run_step tui_smoke bash scripts/tui_smoke.sh
-  run_step skill_surface_unification bash scripts/v09136_skill_surface_unification_scenario.sh
-  run_step unified_runtime_surface bash scripts/v0964_unified_runtime_surface_scenario.sh
-  run_step session_lifecycle bash scripts/v0968_session_lifecycle_scenario.sh
-  run_step agent_graph_contract bash scripts/v0971_agent_graph_scenario.sh
-  run_step context_runtime_contract bash scripts/v0972_context_runtime_scenario.sh
-  run_step memory_runtime_contract bash scripts/v0973_memory_runtime_scenario.sh
-  run_step channel_permission_contract bash scripts/v0974_channel_permission_scenario.sh
+  run_step tui_smoke bash scripts/scenarios/tui-smoke.sh
+  run_step skill_surface_unification bash scripts/scenarios/skill-surface-unification.sh
+  run_step unified_runtime_surface bash scripts/scenarios/runtime-surface.sh
+  run_step session_lifecycle bash scripts/scenarios/session-lifecycle.sh
+  run_step agent_graph_contract bash scripts/scenarios/agent-graph.sh
+  run_step context_runtime_contract bash scripts/scenarios/context-runtime.sh
+  run_step memory_runtime_contract bash scripts/scenarios/memory-runtime.sh
+  run_step channel_permission_contract bash scripts/scenarios/channel-permission.sh
 }
 
 run_release() {
   if [[ "${COWD_RELEASE_SKIP_TMP_CLEAN:-0}" == "1" ]]; then
     run_step clean_tmp bash -lc 'echo "skipped tmp cleanup for target reuse"'
   else
-    run_step clean_tmp bash scripts/clean_build_artifacts.sh --tmp
+    run_step clean_tmp bash scripts/release/clean-build-artifacts.sh --tmp
   fi
   run_step cargo_fmt cargo fmt --check
   run_step cargo_build_debug cargo build -p cowd-cli --no-default-features
-  run_step install_debug bash -lc 'scripts/install_debug_to_ai.sh --current --print-path-only | tee "$0"' "$INSTALL_DIR_FILE"
+  run_step install_debug bash -lc 'scripts/release/install-debug-to-ai.sh --current --print-path-only | tee "$0"' "$INSTALL_DIR_FILE"
   local install_dir
   install_dir="$(cat "$INSTALL_DIR_FILE")"
   export COWD_BIN="$install_dir/bin/cowd"
-  run_step artifact_report bash scripts/report_release_artifacts.sh "$install_dir" "$REPORT_DIR/artifacts.md"
+  run_step artifact_report bash scripts/release/report-artifacts.sh "$install_dir" "$REPORT_DIR/artifacts.md"
   run_step setup_smoke bash -lc '"$COWD_BIN" --version && "$COWD_BIN" setup'
-  run_step full_product_smoke timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenario_full_product_smoke.sh "$install_dir"
-  run_step tui_daemon_attach timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/v0952_tui_daemon_attach_scenario.sh
-  run_step channel_permission_contract timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/v0974_channel_permission_scenario.sh
+  run_step full_product_smoke timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/full-product-smoke.sh "$install_dir"
+  run_step tui_daemon_attach timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/tui-daemon-attach.sh
+  run_step channel_permission_contract timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/channel-permission.sh
+}
+
+run_manual() {
+  case "$MANUAL_TARGET" in
+    context-runtime-lean-spike)
+      run_step manual_context_runtime_lean_spike bash scripts/manual/context-runtime-lean-spike.sh
+      ;;
+    memory-degraded)
+      run_step manual_memory_degraded bash scripts/manual/memory-degraded.sh
+      ;;
+    task-phase)
+      run_step manual_task_phase bash scripts/manual/task-phase.sh
+      ;;
+    report-build-size)
+      run_step manual_report_build_size bash scripts/manual/report-build-size.sh
+      ;;
+    webui-live-workbench)
+      run_step manual_webui_live_workbench bash scripts/manual/webui-live-workbench.sh
+      ;;
+    *)
+      echo "unknown manual validation target: ${MANUAL_TARGET:-<missing>}" >&2
+      echo "run scripts/validate.sh --help for available manual targets" >&2
+      exit 2
+      ;;
+  esac
 }
 
 case "$LANE" in
@@ -215,6 +250,7 @@ case "$LANE" in
   contract) run_contract ;;
   scenario) run_scenario ;;
   release) run_release ;;
+  manual) run_manual ;;
   all)
     run_contract
     run_scenario

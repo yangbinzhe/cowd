@@ -1,6 +1,6 @@
 //! Quick WeChat iLink live test — verifies saved QR credentials work.
 //!
-//! Run: cargo test --test wechat_quick_test -- --nocapture
+//! Run: COWD_WECHAT_ILINK_LIVE=1 cargo test --test wechat_quick_test -- --nocapture
 
 use runtime::platform::adapter::PlatformAdapter;
 use runtime::platform::wechat_ilink::{
@@ -9,6 +9,11 @@ use runtime::platform::wechat_ilink::{
 
 #[tokio::test]
 async fn test_wechat_ilink_qr_token_live() {
+    if std::env::var("COWD_WECHAT_ILINK_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping live WeChat iLink test; set COWD_WECHAT_ILINK_LIVE=1 to run");
+        return;
+    }
+
     println!("\n═══ WeChat iLink QR Token Live Test ═══");
 
     // 1. Load saved QR account

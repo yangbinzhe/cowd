@@ -783,8 +783,8 @@ fn maybe_write_report(reports: &[ScenarioReport]) {
 }
 
 fn load_scenario_manifest() -> Vec<ScenarioManifestEntry> {
-    let manifest_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/mock_parity_scenarios.json");
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/parity/mock-parity-scenarios.json");
     let manifest = fs::read_to_string(&manifest_path).expect("scenario manifest should exist");
     serde_json::from_str::<Vec<Value>>(&manifest)
         .expect("scenario manifest should parse")

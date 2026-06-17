@@ -390,7 +390,7 @@ fn verification_lines(cwd: &Path, detection: &RepoDetection) -> Vec<String> {
         }
     }
     if detection.package_json {
-        lines.push("- Run the JavaScript/TypeScript checks from `package.json` before shipping changes (`npm test`, `npm run lint`, `npm run build`, or the repo equivalent).".to_string());
+        lines.push("- Run the JavaScript/TypeScript checks declared by this repository before shipping changes.".to_string());
     }
     if detection.tests_dir && detection.src_dir {
         lines.push("- `src/` and `tests/` are both present; update both surfaces together when behavior changes.".to_string());

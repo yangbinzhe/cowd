@@ -146,9 +146,20 @@ fn canonical_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn cache_hits_then_invalidates() {
+        let _guard = test_lock();
         reset_tool_cache_for_tests();
         assert!(get_cached_tool_result("read_file", r#"{"path":"a"}"#).is_none());
         put_cached_tool_result("read_file", r#"{"path":"a"}"#, "ok");
@@ -165,6 +176,7 @@ mod tests {
 
     #[test]
     fn scoped_cache_invalidation_only_expires_matching_scope() {
+        let _guard = test_lock();
         reset_tool_cache_for_tests();
         put_cached_tool_result_scoped("read_file", r#"{"path":"a"}"#, "file:a", "a");
         put_cached_tool_result_scoped("read_file", r#"{"path":"b"}"#, "file:b", "b");

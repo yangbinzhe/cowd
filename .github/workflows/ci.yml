@@ -18,17 +18,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: webui/package-lock.json
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci
-        working-directory: webui
       - run: cargo check --workspace
       - run: cargo clippy --workspace --all-targets
-      - run: scripts/validate_fast.sh
+      - run: scripts/validate.sh unit-fast
 
   validate-core:
     runs-on: ubuntu-latest
@@ -36,15 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: webui/package-lock.json
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci
-        working-directory: webui
-      - run: scripts/validate_core.sh
+      - run: scripts/validate.sh contract
 
   release-gate:
     runs-on: ubuntu-latest
@@ -52,18 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: webui/package-lock.json
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci
-        working-directory: webui
       - run: cargo test -p runtime release_gate
       - run: cargo test -p cowd-cli cowd_release_gate
-      - run: npm test -- modules.test.js
-        working-directory: webui
 
   validate-scenario:
     runs-on: ubuntu-latest
@@ -72,8 +49,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: scripts/validate_live.sh
+      - run: sudo apt-get update && sudo apt-get install -y tmux curl ripgrep iproute2 sqlite3 python3
+      - run: scripts/validate.sh scenario
 
   build:
     runs-on: ubuntu-latest

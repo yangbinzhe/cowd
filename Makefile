@@ -51,12 +51,12 @@ build:
 	cargo build --workspace -j $(SAFE_BUILD_JOBS)
 
 tui-smoke:
-	@echo "=== scripts/tui_smoke.sh ==="
-	scripts/tui_smoke.sh
+	@echo "=== scripts/scenarios/tui-smoke.sh ==="
+	scripts/scenarios/tui-smoke.sh
 
 release-gate:
-	@echo "=== scripts/release_gate.sh ==="
-	scripts/release_gate.sh
+	@echo "=== scripts/validate.sh release ==="
+	scripts/validate.sh release
 
 clean:
 	@echo "⚠️  WARNING: cargo clean destroys native build caches (SQLite etc.)"

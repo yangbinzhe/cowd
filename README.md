@@ -9,7 +9,7 @@ Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统�
 当前安装约定：
 
 - 主程序：`~/AI/cowd`
-- WebUI 静态资源：`~/AI/webui`
+- WebUI 静态资源：由配置项 `gateway.webui_dir` 指向外部构建产物目录
 - 不再使用：`~/AI/bin`
 
 ---
@@ -95,15 +95,13 @@ curl http://127.0.0.1:8642/readyz
 
 Gateway 静态资源解析顺序：
 
-1. 当前工作区的 `webui/`
-2. 安装目录的 `~/AI/webui`
-3. fallback 路径
+1. 配置文件中的 `gateway.webui_dir`
+2. 未配置或目录下无 `index.html` 时返回 Gateway 健康/接口状态
 
-因此正式安装时只需要：
+因此正式安装时主仓只需要：
 
 ```text
 ~/AI/cowd
-~/AI/webui
 ```
 
 ---
@@ -347,24 +345,22 @@ install <path>
 
 ---
 
-## 4. WebUI 结构
+## 4. WebUI 边界
 
-WebUI 位于 `webui/`，由 Vue 3 + Vite 构建，并由 Gateway 静态服务直接提供。源码目录和构建产物分离：
+WebUI 源码已拆分到独立 `cowd-webui` 仓库。主仓不再包含前端源码、Node 依赖、前端构建脚本或视觉测试脚本。
 
-| 文件 | 说明 |
-|---|---|
-| `src/App.vue` | 应用 shell、左侧 icon 导航、右侧 Companion、全局布局 |
-| `src/api/client.ts` | 统一 HTTP API client、写操作回执、错误结构 |
-| `src/stores/app.ts` | session、workspace、settings、runtime activity 等前端状态 |
-| `src/pages/*.vue` | Chat、Runtime、Context、Memory、Skills、Agents、Tools、Gateway、MFG、Audit、Settings 页面 |
-| `src/components/workbench/*` | 表格、详情、RawPayload、回执、治理动作、Schema 表单等管理组件 |
-| `src/data/capabilities.ts` | 模块能力说明、二级分区、动作和 endpoint 投影 |
-| `src/data/mfgWriteContracts.json` | MFG 高风险写操作治理契约 |
-| `scripts/api-matrix.mjs` | WebUI API client、页面调用、后端 route 三方矩阵门禁 |
-| `scripts/capability-parity.mjs` | WebUI/TUI/CLI/backend 能力对齐审计 |
-| `scripts/raw-payload-audit.mjs` | 原始 JSON 展示位置审计 |
-| `scripts/visual-audit.mjs` | 响应式截图和视觉冒烟审计 |
-| `assets/app/` | 已构建并随 Gateway 服务的前端静态资源 |
+主仓负责：
+
+- 提供 Gateway 静态托管配置项 `gateway.webui_dir`。
+- 提供 `/api/webui/manifest` 说明当前静态资源状态。
+- 保证未配置 WebUI 静态资源时 Gateway 仍可健康启动并返回 API。
+- 提供 WebUI/TUI/CLI surface projection、capability parity、写操作契约和后端管理 API。
+
+WebUI 仓库负责：
+
+- Vue/Vite 应用源码、前端状态管理、页面组件和样式系统。
+- API client、RawPayload 渲染、写操作回执、视觉审计和浏览器端 E2E。
+- 构建产物 `dist/`，由主仓 Gateway 通过 `gateway.webui_dir` 托管。
 
 WebUI 的定位：
 
@@ -1070,28 +1066,17 @@ cargo build --release -p cowd-cli --no-default-features
 
 ### 17.2 WebUI
 
+WebUI 源码、npm 测试、Playwright/视觉审计在独立 `cowd-webui` 仓库内执行。主仓只验证 Gateway 托管契约：
+
 ```bash
-cd webui
-npm ci
-npm test
-npm run test:e2e
-npm run build
+scripts/scenarios/gateway-webui-contract.sh
 ```
 
-`npm test` 会执行：
+联动外部 WebUI 构建产物时，在配置中设置：
 
-- Vitest 单元测试
-- API matrix gate：WebUI client、UI 调用、后端 route、测试证据
-- MFG write contract gate
-- Capability parity gate：WebUI/TUI/CLI/backend 对齐
-- RawPayload audit gate
-
-视觉审计：
-
-```bash
-cd webui
-npm run dev -- --port 5195
-COWD_VERSION=v0.9.245 COWD_VISUAL_BASE_URL=http://127.0.0.1:5195 npm run test:visual-audit
+```yaml
+gateway:
+  webui_dir: "/path/to/cowd-webui/dist"
 ```
 
 ### 17.3 场景脚本
@@ -1099,19 +1084,19 @@ COWD_VERSION=v0.9.245 COWD_VISUAL_BASE_URL=http://127.0.0.1:5195 npm run test:vi
 Skills 统一面验收：
 
 ```bash
-COWD_BIN=/path/to/cowd scripts/v09136_skill_surface_unification_scenario.sh
+COWD_BIN=/path/to/cowd scripts/scenarios/skill-surface-unification.sh
 ```
 
 安装版验收：
 
 ```bash
-COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
+COWD_BIN=~/AI/cowd scripts/scenarios/skill-surface-unification.sh
 ```
 
 Release Gate：
 
 ```bash
-bash scripts/release_gate.sh
+scripts/validate.sh release
 ```
 
 ### 17.4 浏览器评测
@@ -1136,9 +1121,6 @@ chromium.launch({
 cargo build --release -p cowd-cli --no-default-features
 rm -f ~/AI/cowd
 install -m 0755 target/release/cowd ~/AI/cowd
-rm -rf ~/AI/webui
-mkdir -p ~/AI/webui
-cp -a webui/. ~/AI/webui/
 ~/AI/cowd --version
 ```
 
@@ -1162,7 +1144,7 @@ cp -a webui/. ~/AI/webui/
 
 - 三分支统一：`master`、`develop`、`dev-mfg`
 - `~/AI/cowd` 安装
-- `~/AI/webui` 安装
+- WebUI 静态资源外置并通过 `gateway.webui_dir` 托管
 - Skills catalog/projection/action API
 - WebUI Skills 闭环：validate/plan/run/watch/runs/detail/filter
 - TUI Skills action availability
@@ -1202,12 +1184,12 @@ cp -a webui/. ~/AI/webui/
 检查：
 
 ```bash
-ls ~/AI/webui/index.html
 ~/AI/cowd gateway run
 curl http://127.0.0.1:8642/readyz
+curl http://127.0.0.1:8642/api/webui/manifest
 ```
 
-`readyz` 中应看到 static WebUI source 指向 `installed:exe-dir/webui` 或当前工作区 `webui`。
+`readyz` 和 `/api/webui/manifest` 会显示 `gateway.webui_dir` 的配置状态。未配置或目录下没有 `index.html` 时，Gateway 仍应保持健康，只是不提供浏览器控制台静态页面。
 
 ### Skills Run 报 `incident_id is required`
 
@@ -1224,6 +1206,5 @@ curl http://127.0.0.1:8642/readyz
 ```bash
 cargo fmt --check
 cargo test -p cowd-cli skill --no-default-features -- --test-threads=1
-cd webui && npm test
-COWD_BIN=~/AI/cowd scripts/v09136_skill_surface_unification_scenario.sh
+COWD_BIN=~/AI/cowd scripts/scenarios/skill-surface-unification.sh
 ```

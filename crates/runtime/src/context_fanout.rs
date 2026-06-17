@@ -31,7 +31,7 @@ pub fn plan_context_fanout(prompt: &str) -> ContextFanoutPlan {
                 "grep_many",
                 json!({"searches": [
                     {"pattern": "TODO|FIXME|panic!|unwrap\\(", "path": ".", "glob": "*.rs"},
-                    {"pattern": "cargo test|npm test|validate.sh", "path": "."}
+                    {"pattern": "cargo test|validate.sh", "path": "."}
                 ]}),
             ),
         ],
