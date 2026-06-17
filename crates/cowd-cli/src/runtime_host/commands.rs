@@ -1,20 +1,24 @@
-// ── Unix client handler ─────────────────────────────────────────
+// ── RuntimeHost socket transition handler ───────────────────────
+// owner: 0.9.292 Gateway RuntimeHost
+// delete_by: 0.9.293
+// replacement: Gateway HTTP/SSE service API
+// new_old_path_policy: do not add new socket business commands
 
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::daemon::prompter::SocketPrompter;
-use crate::daemon::singletons;
+use crate::runtime_host::prompter::SocketPrompter;
+use crate::runtime_host::singletons;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 
 // ── Stub callbacks (Phase A2) — will be wired to socket in Phase A3 ──
 
-struct DaemonToolCallback;
+struct RuntimeHostToolCallback;
 
-impl runtime::ToolCallback for DaemonToolCallback {
+impl runtime::ToolCallback for RuntimeHostToolCallback {
     fn on_tool_start(&self, _id: &str, _name: &str, _preview: &str) {}
     fn on_tool_progress(&self, _id: &str, _name: &str, _progress: &str) {}
     fn on_tool_complete(
@@ -26,9 +30,9 @@ impl runtime::ToolCallback for DaemonToolCallback {
     ) {}
 }
 
-struct DaemonHookReporter;
+struct RuntimeHostHookReporter;
 
-impl runtime::HookProgressReporter for DaemonHookReporter {
+impl runtime::HookProgressReporter for RuntimeHostHookReporter {
     fn on_event(&mut self, _event: &runtime::HookProgressEvent) {}
 }
 
@@ -84,13 +88,13 @@ pub(crate) async fn handle_unix_client(
                                     None,
                                 ) {
                                     Ok(mut runtime) => {
-                                        // Phase A2: Inject all daemon capabilities
+                                        // Phase A2: inject runtime host capabilities.
                                         let cowd_bus = runtime::CowdEventBus::new();
                                         runtime = runtime
                                             .with_cowd_event_bus(cowd_bus)
-                                            .with_tool_callback(Arc::new(DaemonToolCallback))
+                                            .with_tool_callback(Arc::new(RuntimeHostToolCallback))
                                             .with_hook_progress_reporter(Box::new(
-                                                DaemonHookReporter,
+                                                RuntimeHostHookReporter,
                                             ))
                                             .with_memory_manager(
                                                 singletons::GLOBAL_MEMORY
@@ -336,12 +340,12 @@ mod tests {
     #[test]
     fn test_daemon_tool_callback_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DaemonToolCallback>();
+        assert_send_sync::<RuntimeHostToolCallback>();
     }
 
     #[test]
     fn test_daemon_hook_reporter_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DaemonHookReporter>();
+        assert_send_sync::<RuntimeHostHookReporter>();
     }
 }

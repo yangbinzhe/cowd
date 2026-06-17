@@ -32,6 +32,7 @@ use tools::GlobalToolRegistry;
 
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
+use crate::gateway_services::GatewayServices;
 use crate::session_kernel::SessionKernel;
 use crate::task_kernel::TaskKernel;
 use memory::cognitive::CognitiveContextManager;
@@ -85,7 +86,8 @@ pub struct AppState {
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
     pub task_kernel: Arc<TaskKernel>,
-    pub session_lease_registry: Option<Arc<crate::daemon::SessionLeaseRegistry>>,
+    pub services: Arc<GatewayServices>,
+    pub session_lease_registry: Option<Arc<crate::runtime_host::SessionLeaseRegistry>>,
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
@@ -633,6 +635,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -642,7 +645,7 @@ mod tests {
     }
 
     fn test_state_with_lease_registry(
-        registry: Arc<crate::daemon::SessionLeaseRegistry>,
+        registry: Arc<crate::runtime_host::SessionLeaseRegistry>,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -664,6 +667,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: Some(registry),
         })
     }
@@ -704,6 +708,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -739,6 +744,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -772,6 +778,7 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -814,6 +821,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -842,6 +850,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -875,6 +884,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -900,6 +910,7 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         })
     }
@@ -968,8 +979,8 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["gateway"], "daemon-http-gateway");
-        assert_eq!(json["api_router"], "embedded-router");
+        assert_eq!(json["gateway"], "gateway-runtime-host");
+        assert_eq!(json["api_router"], "gateway-api-router");
         assert!(json["process"]["pid_file"]
             .as_str()
             .unwrap()
@@ -1006,7 +1017,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         let required = json["required"].as_array().unwrap();
-        assert!(required.iter().any(|item| item == "daemon-http-gateway"));
+        assert!(required.iter().any(|item| item == "gateway-runtime-host"));
+        assert!(required.iter().any(|item| item == "gateway-api-router"));
         assert!(required.iter().any(|item| item == "session-kernel"));
         let old_required_webui = ["static", "webui", "index"].join("-");
         assert!(!required.iter().any(|item| item == &old_required_webui));
@@ -1039,7 +1051,7 @@ mod tests {
         assert_eq!(json["api_router"], "gateway internal route table");
         assert_eq!(
             json["socket_control"],
-            "local low-latency daemon control plane"
+            "local low-latency runtime host control plane"
         );
     }
 
@@ -4209,7 +4221,7 @@ runtime:
 
     #[tokio::test]
     async fn runtime_session_lease_routes_share_daemon_registry_projection() {
-        let registry = Arc::new(crate::daemon::SessionLeaseRegistry::default());
+        let registry = Arc::new(crate::runtime_host::SessionLeaseRegistry::default());
         let app = api_router(test_state_with_lease_registry(registry));
 
         let acquire = app
@@ -9739,6 +9751,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9777,6 +9790,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9815,6 +9829,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9862,6 +9877,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
             session_lease_registry: None,
         });
         let app = api_router(state);

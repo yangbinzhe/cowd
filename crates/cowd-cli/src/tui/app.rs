@@ -204,27 +204,27 @@ pub struct App {
     pub server_uptime_secs: Option<u64>,
     /// Number of active API sessions.
     pub active_api_sessions: usize,
-    /// Daemon runtime readiness summary from the HTTP projection API.
+    /// Runtime host readiness summary from the HTTP projection API.
     pub daemon_runtime_readiness: Option<String>,
-    /// Daemon runtime component count from the HTTP projection API.
+    /// Runtime host component count from the HTTP projection API.
     pub daemon_runtime_components: Option<u64>,
-    /// Number of tasks observed through the daemon projection API.
+    /// Number of tasks observed through the runtime projection API.
     pub daemon_task_count: Option<u64>,
-    /// Daemon task summaries observed through the runtime control snapshot.
+    /// Runtime host task summaries observed through the runtime control snapshot.
     pub daemon_tasks: Vec<DaemonTaskSummary>,
-    /// Number of pending approvals observed through the daemon projection API.
+    /// Number of pending approvals observed through the runtime projection API.
     pub daemon_pending_approvals: Option<u64>,
-    /// Pending daemon approval summaries observed through the daemon projection API.
+    /// Pending approval summaries observed through the runtime projection API.
     pub daemon_approval_items: Vec<DaemonApprovalSummary>,
-    /// Number of active cross-plane grants observed through the daemon projection API.
+    /// Number of active cross-plane grants observed through the runtime projection API.
     pub daemon_cross_plane_grants_active: Option<u64>,
     /// Number of cross-plane interop actions observed over the last 24h.
     pub daemon_cross_plane_actions_24h: Option<u64>,
-    /// Connector provider accounts observed through the daemon projection API.
+    /// Connector provider accounts observed through the runtime projection API.
     pub daemon_connector_accounts: Vec<ConnectorAccountSummary>,
-    /// Connector capabilities observed through the daemon projection API.
+    /// Connector capabilities observed through the runtime projection API.
     pub daemon_connector_capabilities: Vec<ConnectorCapabilitySummary>,
-    /// Connector resources observed through the daemon projection API.
+    /// Connector resources observed through the runtime projection API.
     pub daemon_connector_resources: Vec<ConnectorResourceSummary>,
     /// Recent runtime action receipts produced by TUI controls.
     pub daemon_action_receipts: Vec<RuntimeActionReceiptSummary>,
@@ -232,13 +232,13 @@ pub struct App {
     pub daemon_cowd_kernel: Option<CowdKernelSummary>,
     /// Structured data-plane summary observed through projection API.
     pub daemon_structured_data: Option<StructuredDataSummary>,
-    /// Connector-specific degraded reasons observed through the daemon projection API.
+    /// Connector-specific degraded reasons observed through the runtime projection API.
     pub daemon_connector_degraded_reasons: Vec<String>,
-    /// Degraded daemon projection/control reasons collected during snapshot refresh.
+    /// Degraded runtime projection/control reasons collected during snapshot refresh.
     pub daemon_degraded_reasons: Vec<String>,
-    /// Current daemon session lease owner for the attached TUI session.
+    /// Current runtime session lease owner for the attached TUI session.
     pub daemon_lease_owner: Option<String>,
-    /// Current daemon session lease mode for the attached TUI session.
+    /// Current runtime session lease mode for the attached TUI session.
     pub daemon_lease_mode: Option<String>,
 
     pub scroll_offset: u16,

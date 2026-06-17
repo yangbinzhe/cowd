@@ -13,6 +13,7 @@ pub(crate) struct GatewayProcessSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayRuntimeSnapshot {
+    pub(crate) service_layer: bool,
     pub(crate) unified_store: bool,
     pub(crate) memory_manager: bool,
     pub(crate) platform_runtime: bool,
@@ -45,6 +46,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
     let server_status = crate::server::get_server_status().ok().flatten();
     let static_webui = state.static_webui.clone();
     let runtime = GatewayRuntimeSnapshot {
+        service_layer: state.services.has_minimum_service_contract(),
         unified_store: state.has_unified_store(),
         memory_manager: state.memory_manager.is_some(),
         platform_runtime: state.platform_runtime.is_some(),
@@ -59,8 +61,8 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
 
     GatewayHealthSnapshot {
         status: status.to_string(),
-        gateway: "daemon-http-gateway",
-        api_router: "embedded-router",
+        gateway: "gateway-runtime-host",
+        api_router: "gateway-api-router",
         process: GatewayProcessSnapshot {
             pid: server_status.as_ref().map(|info| info.pid),
             address: server_status.map(|info| info.address),
@@ -95,8 +97,8 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
         ready,
         status: if ready { "ready" } else { "degraded" }.to_string(),
         required: vec![
-            "daemon-http-gateway".to_string(),
-            "api-router".to_string(),
+            "gateway-runtime-host".to_string(),
+            "gateway-api-router".to_string(),
             "session-kernel".to_string(),
             "event-bus".to_string(),
         ],

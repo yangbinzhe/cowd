@@ -27,7 +27,7 @@ use crate::tui::{
     },
 };
 
-/// Panel showing backend daemon/API gateway status.
+/// Panel showing backend runtime/API gateway status.
 ///
 /// Tracks server running state, health status, and
 /// displays available API endpoints with descriptions.
@@ -40,7 +40,7 @@ pub struct GatewayPanel {
     pub uptime_secs: Option<u64>,
     /// Number of active sessions.
     pub active_sessions: usize,
-    /// Runtime readiness score or status from daemon projection API.
+    /// Runtime readiness score or status from runtime projection API.
     pub runtime_readiness: Option<String>,
     /// Number of runtime control-plane components.
     pub runtime_components: Option<u64>,
@@ -1087,11 +1087,11 @@ mod tests {
         );
         assert!(
             joined.contains("Control") && joined.contains("approvals 1"),
-            "Should show daemon control summary, got: {joined}"
+            "Should show runtime control summary, got: {joined}"
         );
         assert!(
             joined.contains("Lease") && joined.contains("tui:42"),
-            "Should show daemon lease summary, got: {joined}"
+            "Should show runtime lease summary, got: {joined}"
         );
     }
 

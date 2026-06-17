@@ -432,7 +432,7 @@ pub struct TuiState {
     /// Skills panel showing categorized skill/plugin browsing.
     pub skills_panel: SkillsPanel,
 
-    /// Gateway panel showing backend daemon/API gateway status.
+    /// Gateway panel showing backend runtime/API gateway status.
     pub gateway_panel: GatewayPanel,
 
     /// Runtime activity panel summarizing run/context/tool state.
@@ -2275,7 +2275,7 @@ impl TuiState {
                         .set_status("No selected tool to execute");
                     return true;
                 };
-                self.record_tool_ops_result(run_daemon_projection_blocking(move |client| {
+                self.record_tool_ops_result(run_runtime_projection_blocking(move |client| {
                     let name = tool_name;
                     async move {
                         client
@@ -2287,14 +2287,14 @@ impl TuiState {
             }
             (ToolOpsMode::Operations, KeyCode::Char('i')) => {
                 let prompt = self.tool_ops_panel.intent_prompt.clone();
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_intent_plan(&prompt, Vec::new()).await },
                 ));
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('f')) => {
                 let prompt = self.tool_ops_panel.fanout_prompt.clone();
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_context_fanout_plan(&prompt).await },
                 ));
                 true
@@ -2310,7 +2310,7 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_batch_readonly(calls, 4).await },
                 ));
                 true
@@ -2326,7 +2326,7 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_mutation_preview(edits).await },
                 ));
                 true
@@ -2353,7 +2353,7 @@ impl TuiState {
                 };
                 let expected_hashes = serde_json::to_value(&self.tool_ops_panel.expected_hashes)
                     .unwrap_or_else(|_| serde_json::json!({}));
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move {
                         client.tool_mutation_apply(edits, expected_hashes).await
                     },
@@ -2361,7 +2361,7 @@ impl TuiState {
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('n')) => {
-                self.record_tool_ops_result(run_daemon_projection_blocking(|client| async move {
+                self.record_tool_ops_result(run_runtime_projection_blocking(|client| async move {
                     client.tool_checkpoint_create("tui checkpoint").await
                 }));
                 self.refresh_tool_ops_panel_overview();
@@ -2377,7 +2377,7 @@ impl TuiState {
                         .set_status("No selected checkpoint to diff");
                     return true;
                 };
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_checkpoint_diff(&id).await },
                 ));
                 true
@@ -2395,7 +2395,7 @@ impl TuiState {
                 if !self.tool_ops_panel.arm_restore_checkpoint(id.clone()) {
                     return true;
                 }
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.tool_checkpoint_restore(&id).await },
                 ));
                 self.refresh_tool_ops_panel_overview();
@@ -2408,7 +2408,7 @@ impl TuiState {
                     "actor": "tui-operator",
                     "inputs": { "mode": "risk" }
                 });
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.cross_plane_policy_simulate(action).await },
                 ));
                 true
@@ -2427,7 +2427,7 @@ impl TuiState {
                     "data_classification": "internal",
                     "identity_trust": "verified"
                 });
-                self.record_tool_ops_result(run_daemon_projection_blocking(
+                self.record_tool_ops_result(run_runtime_projection_blocking(
                     move |client| async move { client.preflight_cross_plane_action(action).await },
                 ));
                 true
@@ -2437,24 +2437,25 @@ impl TuiState {
     }
 
     fn refresh_tool_ops_panel_overview(&mut self) {
-        match run_daemon_projection_blocking(|client| async move { client.tool_registry().await }) {
+        match run_runtime_projection_blocking(|client| async move { client.tool_registry().await })
+        {
             Ok(payload) => self.tool_ops_panel.sync_registry(&payload),
             Err(error) => self
                 .tool_ops_panel
                 .set_status(format!("Registry refresh failed: {error}")),
         }
         if let Ok(payload) =
-            run_daemon_projection_blocking(|client| async move { client.tool_cache_stats().await })
+            run_runtime_projection_blocking(|client| async move { client.tool_cache_stats().await })
         {
             self.tool_ops_panel.sync_cache(&payload);
         }
         if let Ok(payload) =
-            run_daemon_projection_blocking(|client| async move { client.tool_checkpoints().await })
+            run_runtime_projection_blocking(|client| async move { client.tool_checkpoints().await })
         {
             self.tool_ops_panel.sync_checkpoints(&payload);
         }
         let session_id = self.app.session_id.clone();
-        if let Ok(payload) = run_daemon_projection_blocking(move |client| async move {
+        if let Ok(payload) = run_runtime_projection_blocking(move |client| async move {
             client.runtime_timeline(&session_id, 50).await
         }) {
             self.tool_ops_panel.sync_ledger(&payload);
@@ -3059,13 +3060,13 @@ impl TuiState {
             Action::RespondDaemonApproval { id, approved } => {
                 let approval_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_daemon_control_blocking(move |client| async move {
+                let result = run_runtime_control_blocking(move |client| async move {
                     client
                         .respond_approval(&id, approved, Some("once"), None)
                         .await
                 })
                 .or_else(move |_| {
-                    run_daemon_projection_blocking(move |client| async move {
+                    run_runtime_projection_blocking(move |client| async move {
                         client
                             .respond_approval(&projection_id, approved, Some("once"), None)
                             .await
@@ -3109,11 +3110,11 @@ impl TuiState {
             Action::CancelDaemonTask(id) => {
                 let task_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_daemon_control_blocking(move |client| async move {
+                let result = run_runtime_control_blocking(move |client| async move {
                     client.cancel_task(&id).await
                 })
                 .or_else(move |_| {
-                    run_daemon_projection_blocking(move |client| async move {
+                    run_runtime_projection_blocking(move |client| async move {
                         client.cancel_task(&projection_id).await
                     })
                 });
@@ -3154,11 +3155,11 @@ impl TuiState {
             Action::CompleteDaemonTask(id) => {
                 let task_id = id.clone();
                 let projection_id = id.clone();
-                let result = run_daemon_control_blocking(move |client| async move {
+                let result = run_runtime_control_blocking(move |client| async move {
                     client.complete_task(&id).await
                 })
                 .or_else(move |_| {
-                    run_daemon_projection_blocking(move |client| async move {
+                    run_runtime_projection_blocking(move |client| async move {
                         client.complete_task(&projection_id).await
                     })
                 });
@@ -3201,13 +3202,13 @@ impl TuiState {
                 let desired_state = state.clone();
                 let projection_ref = reference.clone();
                 let projection_state = state.clone();
-                let result = run_daemon_control_blocking(move |client| async move {
+                let result = run_runtime_control_blocking(move |client| async move {
                     client
                         .revalidate_connector_resource(&reference, &state)
                         .await
                 })
                 .or_else(move |_| {
-                    run_daemon_projection_blocking(move |client| async move {
+                    run_runtime_projection_blocking(move |client| async move {
                         client
                             .revalidate_connector_resource(&projection_ref, &projection_state)
                             .await
@@ -3279,13 +3280,13 @@ impl TuiState {
                 let projection_ref = reference.clone();
                 let receipt_ref = reference.clone();
                 let projection_session_id = session_id.clone();
-                let result = run_daemon_control_blocking(move |client| async move {
+                let result = run_runtime_control_blocking(move |client| async move {
                     client
                         .promote_connector_resource_to_memory(&reference, session_id.as_deref())
                         .await
                 })
                 .or_else(move |_| {
-                    run_daemon_projection_blocking(move |client| async move {
+                    run_runtime_projection_blocking(move |client| async move {
                         client
                             .promote_connector_resource_to_memory(
                                 &projection_ref,
@@ -3853,7 +3854,7 @@ impl L4KnowledgeView {
     }
 }
 
-fn run_daemon_control_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+fn run_runtime_control_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
 where
     F: FnOnce(crate::tui::control_client::DaemonControlClient) -> Fut + Send + 'static,
     Fut: std::future::Future<
@@ -3875,7 +3876,7 @@ where
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::spawn(run)
             .join()
-            .map_err(|_| "daemon control worker panicked".to_string())?
+            .map_err(|_| "runtime control worker panicked".to_string())?
     } else {
         run()
     }
@@ -3887,7 +3888,7 @@ fn daemon_projection_auth_token() -> Option<String> {
         .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
 }
 
-fn run_daemon_projection_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+fn run_runtime_projection_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
 where
     F: FnOnce(crate::tui::projection_client::DaemonProjectionClient) -> Fut + Send + 'static,
     Fut: std::future::Future<
@@ -3916,7 +3917,7 @@ where
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::spawn(run)
             .join()
-            .map_err(|_| "daemon projection worker panicked".to_string())?
+            .map_err(|_| "runtime projection worker panicked".to_string())?
     } else {
         run()
     }

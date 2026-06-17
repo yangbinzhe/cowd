@@ -791,12 +791,12 @@ pub async fn refresh_runtime_control_snapshot(
         Err(err) => match control_client.status().await {
             Ok(status) => {
                 let mut snapshot = RuntimeControlSnapshot::from_status(&status);
-                snapshot.degrade(format!("daemon runtime snapshot unavailable: {err}"));
+                snapshot.degrade(format!("runtime host snapshot unavailable: {err}"));
                 snapshot
             }
             Err(status_err) => {
                 let mut snapshot = RuntimeControlSnapshot::default();
-                snapshot.degrade(format!("daemon control unavailable: {status_err}"));
+                snapshot.degrade(format!("runtime host control unavailable: {status_err}"));
                 return snapshot;
             }
         },
@@ -810,7 +810,7 @@ pub async fn refresh_runtime_control_snapshot(
     }
 
     let Some(projection) = projection_client else {
-        snapshot.degrade("daemon projection unavailable");
+        snapshot.degrade("runtime projection unavailable");
         return snapshot;
     };
 

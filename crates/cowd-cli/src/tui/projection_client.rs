@@ -574,11 +574,11 @@ fn url_encode(value: &str) -> String {
 impl fmt::Display for ProjectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(err) => write!(f, "daemon projection HTTP failed: {err}"),
+            Self::Http(err) => write!(f, "runtime projection HTTP failed: {err}"),
             Self::Status(status, body) => {
-                write!(f, "daemon projection returned {status}: {body}")
+                write!(f, "runtime projection returned {status}: {body}")
             }
-            Self::Url(err) => write!(f, "daemon projection URL error: {err}"),
+            Self::Url(err) => write!(f, "runtime projection URL error: {err}"),
         }
     }
 }

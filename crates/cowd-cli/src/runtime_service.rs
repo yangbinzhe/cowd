@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::daemon::SessionLeaseRegistry;
 use crate::gateway::ActiveSessions;
 use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
 };
+use crate::runtime_host::SessionLeaseRegistry;
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
@@ -43,7 +43,14 @@ impl RuntimeService {
         serde_json::json!({
             "ok": true,
             "protocol_version": status.protocol_version,
-            "daemon": status.daemon,
+            "runtime_host": status.runtime_host,
+            "daemon": status.runtime_host,
+            "compat": {
+                "daemon": {
+                    "delete_by": "0.9.293",
+                    "replacement": "runtime_host",
+                }
+            },
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
         })
@@ -53,7 +60,7 @@ impl RuntimeService {
     pub(crate) fn status(&self) -> RuntimeBoundaryStatus {
         RuntimeBoundaryStatus {
             protocol_version: crate::runtime_protocol::RUNTIME_PROTOCOL_VERSION,
-            daemon: "cowd",
+            runtime_host: "gateway-runtime-host",
             active_sessions: self.sessions.list().len(),
             uptime_secs: self.clock().uptime_secs(),
         }
@@ -64,9 +71,25 @@ impl RuntimeService {
         let leases = self.lease_registry.list().await;
         serde_json::json!({
             "ok": true,
-            "kind": "daemon_runtime_snapshot",
+            "kind": "gateway_runtime_snapshot",
+            "legacy_kind": "daemon_runtime_snapshot",
             "protocol_version": snapshot.protocol_version,
-            "daemon": snapshot.daemon,
+            "runtime_host": snapshot.runtime_host,
+            "daemon": snapshot.runtime_host,
+            "compat": {
+                "legacy_fields": {
+                    "legacy_kind": {
+                        "delete_by": "0.9.293",
+                        "replacement": "kind",
+                        "consumer": "tui/control_client",
+                    },
+                    "daemon": {
+                        "delete_by": "0.9.293",
+                        "replacement": "runtime_host",
+                        "consumer": "tui/control_client",
+                    }
+                }
+            },
             "active_sessions": snapshot.active_sessions,
             "uptime_secs": snapshot.uptime_secs,
             "sessions": snapshot.sessions,
@@ -76,7 +99,12 @@ impl RuntimeService {
             },
             "lifecycle": self.lifecycle_kernel.snapshots().await,
             "transport": {
-                "control": "unix_socket",
+                "control": "gateway_http",
+                "socket_transition": {
+                    "enabled": true,
+                    "delete_by": "0.9.293",
+                    "replacement": "gateway_http_sse",
+                },
                 "projection": "http_optional",
             },
         })
@@ -87,7 +115,7 @@ impl RuntimeService {
         session_ids.sort();
         RuntimeBoundarySnapshot {
             protocol_version: crate::runtime_protocol::RUNTIME_PROTOCOL_VERSION,
-            daemon: "cowd",
+            runtime_host: "gateway-runtime-host",
             active_sessions: session_ids.len(),
             uptime_secs: self.clock().uptime_secs(),
             sessions: session_ids,
@@ -287,7 +315,9 @@ mod tests {
 
         let value = service.status_value();
         assert_eq!(value["ok"], true);
-        assert_eq!(value["daemon"], "cowd");
+        assert_eq!(value["runtime_host"], "gateway-runtime-host");
+        assert_eq!(value["daemon"], "gateway-runtime-host");
+        assert_eq!(value["compat"]["daemon"]["delete_by"], "0.9.293");
         assert_eq!(value["active_sessions"], 0);
     }
 
@@ -311,9 +341,22 @@ mod tests {
         assert_eq!(lease["ok"], true);
 
         let snapshot = service.snapshot_value().await;
-        assert_eq!(snapshot["kind"], "daemon_runtime_snapshot");
+        assert_eq!(snapshot["kind"], "gateway_runtime_snapshot");
+        assert_eq!(snapshot["legacy_kind"], "daemon_runtime_snapshot");
+        assert_eq!(
+            snapshot["compat"]["legacy_fields"]["legacy_kind"]["delete_by"],
+            "0.9.293"
+        );
+        assert_eq!(
+            snapshot["compat"]["legacy_fields"]["daemon"]["replacement"],
+            "runtime_host"
+        );
         assert_eq!(snapshot["leases"]["total"], 1);
-        assert_eq!(snapshot["transport"]["control"], "unix_socket");
+        assert_eq!(snapshot["transport"]["control"], "gateway_http");
+        assert_eq!(
+            snapshot["transport"]["socket_transition"]["delete_by"],
+            "0.9.293"
+        );
     }
 
     #[test]

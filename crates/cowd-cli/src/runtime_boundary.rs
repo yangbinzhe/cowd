@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeBoundaryStatus {
     pub(crate) protocol_version: u32,
-    pub(crate) daemon: &'static str,
+    pub(crate) runtime_host: &'static str,
     pub(crate) active_sessions: usize,
     pub(crate) uptime_secs: u64,
 }
@@ -13,7 +13,7 @@ pub(crate) struct RuntimeBoundaryStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeBoundarySnapshot {
     pub(crate) protocol_version: u32,
-    pub(crate) daemon: &'static str,
+    pub(crate) runtime_host: &'static str,
     pub(crate) active_sessions: usize,
     pub(crate) uptime_secs: u64,
     pub(crate) sessions: Vec<String>,

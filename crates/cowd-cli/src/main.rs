@@ -15,12 +15,14 @@ mod event_bus;
 mod gateway;
 mod gateway_health;
 mod gateway_service;
+mod gateway_services;
 mod gateway_static;
 mod init;
 mod logging;
 mod mcp_serve;
 mod render;
 mod runtime_boundary;
+mod runtime_host;
 mod runtime_protocol;
 mod runtime_service;
 mod server;
@@ -99,14 +101,14 @@ pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     provider::max_tokens_for_model(model)
 }
-/// Global list of daemon child processes that must be reaped.
+/// Global list of gateway child processes that must be reaped.
 /// Children are adopted (stored here) instead of dropping the handle,
-/// which prevents zombie processes when the daemon exits.
+/// which prevents zombie processes when the gateway process exits.
 static DAEMON_CHILDREN: LazyLock<Mutex<Vec<Child>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Adopt a daemon child process — store it so the handle is not dropped.
+/// Adopt a gateway child process — store it so the handle is not dropped.
 /// Returns the child's PID.
-fn adopt_daemon_child(child: Child) -> u32 {
+fn adopt_gateway_child(child: Child) -> u32 {
     let pid = child.id();
     if let Ok(mut children) = DAEMON_CHILDREN.lock() {
         children.push(child);
@@ -114,49 +116,49 @@ fn adopt_daemon_child(child: Child) -> u32 {
     pid
 }
 
-/// Keep daemon-child setup local to tracked child handles.
+/// Keep gateway-child setup local to tracked child handles.
 ///
 /// Do not install `SIGCHLD = SIG_IGN`: that makes unrelated tool subprocesses
 /// impossible to `wait` reliably and breaks bash/tool execution in one-shot
-/// runs. Zombie prevention is handled by retaining daemon handles and calling
-/// `reap_daemon_children`.
+/// runs. Zombie prevention is handled by retaining gateway process handles and calling
+/// `reap_gateway_children`.
 #[cfg(unix)]
 fn setup_sigchld_handler() {
-    tracing::debug!("daemon child reaping uses retained child handles");
+    tracing::debug!("gateway child reaping uses retained child handles");
 }
 
-/// Try to reap any exited daemon children. Called periodically.
-fn reap_daemon_children() {
+/// Try to reap any exited gateway children. Called periodically.
+fn reap_gateway_children() {
     if let Ok(mut children) = DAEMON_CHILDREN.lock() {
         children.retain_mut(|child| match child.try_wait() {
             Ok(Some(status)) => {
                 tracing::debug!(
                     pid = child.id(),
                     code = status.code(),
-                    "daemon child reaped"
+                    "gateway child reaped"
                 );
                 false
             }
             Ok(None) => true, // still running
             Err(e) => {
-                tracing::warn!(pid = child.id(), error = %e, "failed to wait on daemon child");
+                tracing::warn!(pid = child.id(), error = %e, "failed to wait on gateway child");
                 false
             }
         });
     }
 }
 
-fn gateway_daemon_log_file() -> Result<std::fs::File, Box<dyn std::error::Error>> {
+fn gateway_process_log_file() -> Result<std::fs::File, Box<dyn std::error::Error>> {
     let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
     std::fs::create_dir_all(&log_dir)?;
     Ok(std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("gateway-daemon.log"))?)
+        .open(log_dir.join("gateway.log"))?)
 }
 
-fn spawn_gateway_daemon(exe: &Path) -> Result<Child, Box<dyn std::error::Error>> {
-    let stdout = gateway_daemon_log_file()?;
+fn spawn_gateway_process(exe: &Path) -> Result<Child, Box<dyn std::error::Error>> {
+    let stdout = gateway_process_log_file()?;
     let stderr = stdout.try_clone()?;
     let mut command = std::process::Command::new(exe);
     command
@@ -171,7 +173,7 @@ fn spawn_gateway_daemon(exe: &Path) -> Result<Child, Box<dyn std::error::Error>>
     }
     command
         .spawn()
-        .map_err(|e| format!("failed to start gateway daemon: {e}").into())
+        .map_err(|e| format!("failed to start gateway process: {e}").into())
 }
 
 fn wait_for_gateway_start(
@@ -181,7 +183,7 @@ fn wait_for_gateway_start(
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
         if let Some(status) = child.try_wait()? {
-            return Err(format!("gateway daemon exited during startup: {status}").into());
+            return Err(format!("gateway process exited during startup: {status}").into());
         }
         if server::get_server_status()
             .map_err(|e| e.to_string())?
@@ -191,7 +193,7 @@ fn wait_for_gateway_start(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err("gateway daemon did not become ready before timeout".into())
+    Err("gateway process did not become ready before timeout".into())
 }
 
 static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -386,7 +388,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     logging::init_logging(VERSION);
 
-    // Set up SIGCHLD handler to auto-reap daemon child processes
+    // Set up SIGCHLD handler to auto-reap gateway child processes
     setup_sigchld_handler();
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -469,12 +471,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_broad_cwd,
             yolo_mode,
         } => {
-            // Auto-start daemon if not already running
+            // Auto-start Gateway RuntimeHost if not already ready
             let sock_path = daemon_socket_path();
             let sock = sock_path.as_path();
             let daemon_autostart_disabled = std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
             if !sock.exists() && !daemon_autostart_disabled {
-                tracing::info!("daemon not running, auto-starting...");
+                tracing::info!("runtime host not ready, auto-starting...");
                 setup_sigchld_handler();
                 if let Ok(exe) = std::env::current_exe() {
                     match std::process::Command::new(&exe)
@@ -486,11 +488,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .spawn()
                     {
                         Ok(child) => {
-                            let pid = adopt_daemon_child(child);
-                            tracing::info!(pid, "daemon auto-started for REPL");
+                            let pid = adopt_gateway_child(child);
+                            tracing::info!(pid, "runtime host auto-started for REPL");
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "failed to auto-start daemon");
+                            tracing::warn!(error = %e, "failed to auto-start runtime host");
                         }
                     }
                     // Wait for socket to appear (max 5 seconds)
@@ -502,7 +504,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else if daemon_autostart_disabled {
-                tracing::debug!("daemon auto-start disabled by COWD_DISABLE_DAEMON_AUTOSTART");
+                tracing::debug!(
+                    "runtime host auto-start disabled by COWD_DISABLE_DAEMON_AUTOSTART"
+                );
             }
             tracing::debug!("starting TUI REPL");
             run_repl(
@@ -542,12 +546,12 @@ fn run_gateway_action(
             setup_sigchld_handler();
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-            tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
-            let mut child = spawn_gateway_daemon(&exe)?;
+            tracing::info!(binary = %exe.display(), "gateway start: spawning gateway process");
+            let mut child = spawn_gateway_process(&exe)?;
             wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
-            let pid = adopt_daemon_child(child);
+            let pid = adopt_gateway_child(child);
             println!("Gateway started (pid: {pid})");
-            tracing::info!(pid, "gateway daemon spawned");
+            tracing::info!(pid, "gateway process spawned");
             Ok(())
         }
         GatewayAction::Stop => {
@@ -638,7 +642,7 @@ fn run_gateway_action(
             // daemon starts so that the OnceLock is populated.
             let _ = get_unified_store();
 
-            let daemon_config = daemon::DaemonConfig {
+            let runtime_host_config = runtime_host::RuntimeHostConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
                 unix_sock_path: daemon_socket_path().display().to_string(),
                 memory_config,
@@ -651,7 +655,7 @@ fn run_gateway_action(
             };
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {
-                daemon::run_daemon(daemon_config)
+                runtime_host::run_gateway_runtime(runtime_host_config)
                     .await
                     .map_err(|e| e.to_string())
             })?;
@@ -663,9 +667,9 @@ fn run_gateway_action(
             tracing::info!("gateway restart: stopped, re-spawning");
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-            let mut child = spawn_gateway_daemon(&exe)?;
+            let mut child = spawn_gateway_process(&exe)?;
             wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
-            let pid = adopt_daemon_child(child);
+            let pid = adopt_gateway_child(child);
             println!("Gateway restarted (pid: {pid})");
             tracing::info!(pid, "gateway restarted");
             Ok(())
@@ -673,7 +677,7 @@ fn run_gateway_action(
         GatewayAction::Logs => {
             let path = runtime::cowd_dirs::config_home_dir()
                 .join("logs")
-                .join("gateway-daemon.log");
+                .join("gateway.log");
             match std::fs::read_to_string(&path) {
                 Ok(content) if !content.trim().is_empty() => {
                     let lines: Vec<&str> = content.lines().rev().take(80).collect();
@@ -690,7 +694,7 @@ fn run_gateway_action(
             server::stop_server().ok();
             let path = runtime::cowd_dirs::config_home_dir()
                 .join("logs")
-                .join("gateway-daemon.log");
+                .join("gateway.log");
             println!("Gateway repair prepared a clean start state.");
             println!("Next: cowd gateway start");
             println!("Logs: {}", path.display());
@@ -3375,7 +3379,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             state.app.server_running = false;
             state.app.active_api_sessions = 0;
             state.app.server_uptime_secs = None;
-            tracing::debug!("daemon control unavailable; local TUI runtime fallback: {err}");
+            tracing::debug!(
+                "runtime host control transition unavailable; local TUI runtime fallback: {err}"
+            );
             state.add_message("system", "Daemon unavailable; local TUI runtime active.");
         }
     }
@@ -8772,7 +8778,7 @@ fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::err
     if systemd {
         let unit = format!(
             r#"[Unit]
-Description=COWD Gateway Daemon
+Description=COWD Gateway Process
 After=network.target
 
 [Service]
@@ -11379,7 +11385,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  cowd gateway start")?;
     writeln!(
         out,
-        "      Start the gateway daemon that serves the browser console"
+        "      Start the gateway process that serves the browser console"
     )?;
     writeln!(out, "  cowd gateway status")?;
     writeln!(

@@ -1,0 +1,110 @@
+# Gateway service-layer transition allowlist
+#
+# owner: 0.9.292 Gateway RuntimeHost
+# policy: existing route direct dependencies are frozen until their replacement service lands.
+# new_usage_policy: do not add new route direct store/kernel dependencies.
+
+file=api_routes/message_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SessionKernel
+reason=message send path still owns session runtime execution until SessionService migration
+replacement_service=SessionService
+delete_by=0.9.293
+
+file=api_routes/runtime_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SessionKernel/AppState
+reason=runtime status and projection still read shared runtime state directly until RuntimeService owns the full route boundary
+replacement_service=RuntimeService
+delete_by=0.9.293
+
+file=api_routes/session_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SessionKernel/AppState
+reason=session list and replay routes still use session kernel state until SessionService migration
+replacement_service=SessionService
+delete_by=0.9.293
+
+file=api_routes/agent_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=TaskKernel/AppState
+reason=agent execution and inspection routes still share task kernel state until AgentService and TaskService own orchestration
+replacement_service=AgentService+TaskService
+delete_by=0.9.296
+
+file=api_routes/approval_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SmartApprovalGate/AppState
+reason=approval queue and responses still use smart approval gate directly until ApprovalService owns policy IO
+replacement_service=ApprovalService
+delete_by=0.9.296
+
+file=api_routes/audit_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SmartApprovalGate/AppState
+reason=audit projection still reads approval and runtime app state directly until AuditService owns compliance views
+replacement_service=AuditService
+delete_by=0.9.296
+
+file=api_routes/connector_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=CognitiveContextManager
+reason=connector resource promotion still writes memory evidence until ConnectorService migration
+replacement_service=ConnectorService+MemoryService
+delete_by=0.9.296
+
+file=api_routes/context_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SessionKernel/AppState
+reason=context snapshot routes still compose session runtime state directly until ContextService owns context projections
+replacement_service=ContextService
+delete_by=0.9.296
+
+file=api_routes/memory_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=CognitiveContextManager/AppState
+reason=memory status and evidence routes still use context manager directly until MemoryService owns memory projections
+replacement_service=MemoryService
+delete_by=0.9.296
+
+file=api_routes/system_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=UnifiedSessionStore/AppState
+reason=system diagnostics still inspect store and app state directly until SystemService owns diagnostics
+replacement_service=SystemService
+delete_by=0.9.296
+
+file=api_routes/task_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=TaskKernel/AppState
+reason=task operations still use task kernel directly until TaskService owns task lifecycle API
+replacement_service=TaskService
+delete_by=0.9.296
+
+file=api_routes/cowd_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=MatrixStore::open
+reason=release gate and matrix evidence routes still read matrix facts directly
+replacement_service=MatrixService
+delete_by=0.9.297
+
+file=api_routes/matrix_mfg_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=MatrixStore::open
+reason=matrix cockpit routes are scheduled for MatrixService extraction
+replacement_service=MatrixService
+delete_by=0.9.297
+
+file=api_routes/matrix_mfg_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=MfgStore::open
+reason=MFG application routes remain upper-layer app routes until app extraction
+replacement_service=MfgService
+delete_by=0.9.298
+
+file=api_routes/skill_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=MatrixStore::open
+reason=skill evidence projection still reads matrix evidence directly
+replacement_service=SkillService+MatrixService
+delete_by=0.9.297
