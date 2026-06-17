@@ -11,17 +11,19 @@ case "$LANE" in
   unit-fast|fast) LANE="unit-fast" ;;
   contract|core) LANE="contract" ;;
   scenario|live) LANE="scenario" ;;
+  surface) LANE="surface" ;;
   release) LANE="release" ;;
   all|full) LANE="all" ;;
   manual) LANE="manual" ;;
   -h|--help|help)
     cat <<'EOF'
-Usage: scripts/validate.sh [unit-fast|contract|scenario|release|all|manual <name>]
+Usage: scripts/validate.sh [unit-fast|contract|scenario|surface|release|all|manual <name>]
 
 Lanes:
   unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
   contract   package/API/CLI contracts without browser or tmux scenarios
-  scenario   current integration gate; V2 will converge it to 5 golden paths
+  scenario   5 golden paths: gateway, session, memory, tool, skill+mfg
+  surface    3 surface control points: CLI minimal, TUI projection, WebUI gateway
   release    install artifact smoke; deep scenario checks stay in scenario/manual
   all        contract + scenario
   manual     run one manual script from scripts/manual
@@ -35,9 +37,13 @@ Compatibility aliases:
   fast -> unit-fast, core -> contract, live -> scenario, full -> all
 
 Manual targets:
+  agent-graph
+  context-runtime
   context-runtime-lean-spike
   memory-degraded
+  same-session-multi-surface-sync
   task-phase
+  tui-smoke
   report-build-size
   webui-live-workbench
 EOF
@@ -183,6 +189,7 @@ run_contract() {
   for pkg in api commands compat-harness cowd-memory mock-anthropic-service plugins runtime telemetry tools; do
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
   done
+  run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture
   run_step cargo_test_cowd_cli_setup timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
     cargo test -p cowd-cli setup --no-default-features -- --nocapture --test-threads=1
   run_step cargo_test_cowd_cli_gateway timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
@@ -196,14 +203,19 @@ run_contract() {
 run_scenario() {
   run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
-  run_step tui_smoke bash scripts/scenarios/tui-smoke.sh
-  run_step skill_surface_unification bash scripts/scenarios/skill-surface-unification.sh
-  run_step unified_runtime_surface bash scripts/scenarios/runtime-surface.sh
-  run_step session_lifecycle bash scripts/scenarios/session-lifecycle.sh
-  run_step agent_graph_contract bash scripts/scenarios/agent-graph.sh
-  run_step context_runtime_contract bash scripts/scenarios/context-runtime.sh
-  run_step memory_runtime_contract bash scripts/scenarios/memory-runtime.sh
-  run_step channel_permission_contract bash scripts/scenarios/channel-permission.sh
+  run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
+  run_step session_runtime bash scripts/scenarios/runtime-surface.sh
+  run_step memory_context bash scripts/scenarios/memory-runtime.sh
+  run_step tool_permission bash scripts/scenarios/channel-permission.sh
+  run_step skill_mfg bash scripts/scenarios/skill-surface-unification.sh
+}
+
+run_surface() {
+  run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
+  export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
+  run_step cli_minimal_contract cargo test -p cowd-cli output_format_contract --no-default-features -- --nocapture --test-threads=1
+  run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
+  run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
 }
 
 run_release() {
@@ -222,19 +234,30 @@ run_release() {
   run_step setup_smoke bash -lc '"$COWD_BIN" --version && "$COWD_BIN" setup'
   run_step full_product_smoke timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/full-product-smoke.sh "$install_dir"
   run_step tui_daemon_attach timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/tui-daemon-attach.sh
-  run_step channel_permission_contract timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/channel-permission.sh
 }
 
 run_manual() {
   case "$MANUAL_TARGET" in
+    agent-graph)
+      run_step manual_agent_graph bash scripts/scenarios/agent-graph.sh
+      ;;
+    context-runtime)
+      run_step manual_context_runtime bash scripts/scenarios/context-runtime.sh
+      ;;
     context-runtime-lean-spike)
       run_step manual_context_runtime_lean_spike bash scripts/manual/context-runtime-lean-spike.sh
       ;;
     memory-degraded)
       run_step manual_memory_degraded bash scripts/manual/memory-degraded.sh
       ;;
+    same-session-multi-surface-sync)
+      run_step manual_same_session_multi_surface_sync bash scripts/scenarios/same-session-multi-surface-sync.sh
+      ;;
     task-phase)
       run_step manual_task_phase bash scripts/manual/task-phase.sh
+      ;;
+    tui-smoke)
+      run_step manual_tui_smoke bash scripts/scenarios/tui-smoke.sh
       ;;
     report-build-size)
       run_step manual_report_build_size bash scripts/manual/report-build-size.sh
@@ -254,6 +277,7 @@ case "$LANE" in
   unit-fast) run_unit_fast ;;
   contract) run_contract ;;
   scenario) run_scenario ;;
+  surface) run_surface ;;
   release) run_release ;;
   manual) run_manual ;;
   all)

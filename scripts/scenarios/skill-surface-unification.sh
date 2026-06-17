@@ -132,6 +132,7 @@ packet_json="$(curl -fsS "$BASE_URL/api/matrix/evidence/build" \
   -H 'content-type: application/json' \
   -d '{"request_id":"skill-surface-packet","session_id":"session-skill-surface","problem_statement":"GPU shortage and delivery risk for server build plan"}')"
 printf '%s' "$packet_json" | rg -q '"kind":"mfg.evidence.packet"'
+printf '%s' "$packet_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); refs=(data.get("packet") or {}).get("source_refs") or []; assert refs, "expected structured evidence packet source_refs"; assert any((item.get("reference") or item.get("kind")) for item in refs), "expected structured evidence refs to carry reference or kind"'
 packet_id="$(printf '%s' "$packet_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packet"]["packet_id"])')"
 
 incident_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents" \
