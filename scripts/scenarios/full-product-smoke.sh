@@ -116,8 +116,6 @@ curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/healthz" >/dev/null
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"config_key":"gateway.webui_dir"'
-release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
-printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; required=["structured_data.indexes.ready","structured_data.watermark.persistent"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate structured checks not passing: {missing}"'
 
 python3 - "$SOCKET" "$SMOKE_ID" <<'PY'
 import json
@@ -148,6 +146,21 @@ assert task.get("task", {}).get("status") == "running", task
 snapshot = request({"cmd": "runtime_snapshot", "protocol_version": 1})
 assert session_id in snapshot.get("sessions", []), snapshot
 PY
+
+fact_json="$(curl -fsS "$BASE_URL/api/matrix/facts/ingest" \
+  -H 'content-type: application/json' \
+  -d "{\"request_id\":\"release-smoke-fact\",\"session_id\":\"$SMOKE_ID\",\"facts\":[{\"fact_id\":\"fact-$SMOKE_ID\",\"snapshot_id\":\"snapshot-$SMOKE_ID\",\"fact_type\":\"supply.material_shortage\",\"entity_refs\":[\"component:gpu-a\"],\"metric_key\":\"material_shortage_risk\",\"dimensions\":{\"week\":\"2026-W24\"},\"measures\":{\"short_qty\":42},\"source_ref\":\"connector:mock.docs:gpu-shortage\",\"confidence\":0.91}]}")"
+attention_id="$(printf '%s' "$fact_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["attention"][0]["attention_id"])')"
+
+curl -fsS "$BASE_URL/api/matrix/evidence/build" \
+  -H 'content-type: application/json' \
+  -d "{\"request_id\":\"release-smoke-evidence\",\"session_id\":\"$SMOKE_ID\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"Release smoke validates structured evidence and outcome timeline\"}" \
+  | rg -q '"kind":"mfg.evidence.packet"'
+curl -fsS "$BASE_URL/api/runtime/timeline?session_id=$SMOKE_ID&from_seq=0&limit=20" \
+  | rg -q '"kind":"execution.outcome"'
+
+release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
+printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; assert data.get("status")=="pass", data; required=["structured_data.indexes.ready","structured_data.watermark.persistent","execution_outcome.timeline.available"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate checks not passing: {missing}"'
 
 curl -fsS "$BASE_URL/api/context/current?q=release%20full%20product&session_id=$SMOKE_ID" \
   | rg -q '"session_id"\s*:\s*"'"$SMOKE_ID"'"|release full product'
