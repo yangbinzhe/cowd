@@ -35,16 +35,16 @@ const criticalMethods = {
   updateMemoryEntry: { criticality: 'p1', page: 'memory' },
   deleteMemoryEntry: { criticality: 'p1', page: 'memory' },
   crossPlaneExecute: { criticality: 'p0', page: 'gateway' },
-  iaccSourcePackUpsert: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccIngestFact: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccEntityUpsert: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccRelationUpsert: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccComputeJobRun: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccSeedDomain: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccSeedOntology: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccExecuteAction: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccExecutionBridge: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
-  iaccRetryReportDelivery: { criticality: 'p0', page: 'iacc', quarantineRequired: true },
+  mfgSourcePackUpsert: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgIngestFact: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgEntityUpsert: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgRelationUpsert: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgComputeJobRun: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgSeedDomain: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgSeedOntology: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgExecuteAction: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgExecutionBridge: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
+  mfgRetryReportDelivery: { criticality: 'p0', page: 'mfg', quarantineRequired: true },
 };
 
 function read(file) {
@@ -105,7 +105,7 @@ function extractClientMethods() {
 
 function inferPage(name, route) {
   const text = `${name} ${route}`.toLowerCase();
-  for (const page of ['runtime', 'context', 'memory', 'skills', 'agents', 'tools', 'gateway', 'iacc', 'audit', 'settings', 'workspace']) {
+  for (const page of ['runtime', 'context', 'memory', 'skills', 'agents', 'tools', 'gateway', 'mfg', 'audit', 'settings', 'workspace']) {
     if (text.includes(page)) return page;
   }
   if (text.includes('session') || text.includes('message')) return 'chat';
@@ -179,9 +179,9 @@ function routeMatches(entry, route) {
 
 function hasQuarantineEvidence(entry) {
   if (!entry.quarantine_required) return true;
-  const iaccPath = path.join(webuiRoot, 'src/pages/IaccPage.vue');
-  const text = read(iaccPath);
-  return text.includes(`data-iacc-risk="${entry.client_method}"`) && text.includes('iacc-live-quarantined');
+  const mfgPath = path.join(webuiRoot, 'src/pages/MfgPage.vue');
+  const text = read(mfgPath);
+  return text.includes(`data-mfg-risk="${entry.client_method}"`) && text.includes('mfg-live-quarantined');
 }
 
 const clientEntries = extractClientMethods();
@@ -211,7 +211,7 @@ for (const entry of entries.filter((item) => item.criticality === 'p0' || item.c
   if (!entry.has_ui_call) blocking.push(`${entry.client_method}: missing UI call`);
   if (!entry.has_backend_route) blocking.push(`${entry.client_method}: missing backend route for ${entry.method} ${entry.path}`);
   if (entry.operation === 'write' && !entry.has_frontend_test) blocking.push(`${entry.client_method}: missing frontend request test`);
-  if (entry.quarantine_required && !entry.quarantine_ok) blocking.push(`${entry.client_method}: missing IACC temporary quarantine evidence`);
+  if (entry.quarantine_required && !entry.quarantine_ok) blocking.push(`${entry.client_method}: missing MFG temporary quarantine evidence`);
 }
 
 fs.mkdirSync(reportDir, { recursive: true });

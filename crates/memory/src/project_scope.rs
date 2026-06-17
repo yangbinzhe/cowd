@@ -1416,9 +1416,9 @@ fn process_unknown(content: &str, source_file: &str, now: &DateTime<Utc>, kg: &m
     for line in content.lines() {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let name = &trimmed[..trimmed.len().min(100)];
+            let name: String = trimmed.chars().take(100).collect();
             add_entity(
-                name,
+                &name,
                 EntityType::Concept,
                 0.3,
                 source_file,

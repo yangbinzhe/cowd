@@ -1940,7 +1940,7 @@ impl CognitiveContextManager {
                 let title = format!(
                     "delegation:{}:{}",
                     d.agent_role,
-                    &d.task[..d.task.len().min(40)]
+                    truncate_summary(&d.task, 40)
                 );
                 let content = format!(
                     "Agent: {}\nTask: {}\nResult: {}",

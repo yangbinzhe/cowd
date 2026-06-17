@@ -34,6 +34,8 @@ fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
         "server_manufacturing",
         "runtime::mfg",
         "crate::mfg",
+        "Mfg",
+        "mfg_",
         "webui",
     ];
 

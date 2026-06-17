@@ -6,7 +6,7 @@ import PayloadEditor from './PayloadEditor.vue';
 import SchemaForm from './SchemaForm.vue';
 import RequestReceipt from './RequestReceipt.vue';
 
-type IaccWriteContract = {
+type MfgWriteContract = {
   id: string;
   domain: string;
   title: string;
@@ -29,7 +29,7 @@ type IaccWriteContract = {
 };
 
 const props = defineProps<{
-  contract: IaccWriteContract;
+  contract: MfgWriteContract;
   payload?: Record<string, unknown>;
   receipt?: unknown;
 }>();

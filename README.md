@@ -1,6 +1,6 @@
 # Cowd
 
-Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、IACC 结构化运营智能和生产 Release Gate。
+Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、MFG 结构化运营智能和生产 Release Gate。
 
 当前内核版本：`0.9.200`
 
@@ -132,12 +132,12 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
   ├─ Connector Runtime
   ├─ Cross-plane Governance
   ├─ Release Gate
-  └─ IACC Operating Intelligence
+  └─ MFG Operating Intelligence
 
 持久化
   ├─ SQLite Session Store
   ├─ Memory Stores
-  ├─ IACC SQLite Store
+  ├─ Matrix SQLite Store
   └─ Config / Skills / Plugins 文件系统目录
 ```
 
@@ -148,7 +148,7 @@ Cowd 的核心不是单一聊天 CLI，而是一个统一 runtime。CLI、TUI、
 - WebUI/TUI 不发明独立状态，只投影 daemon/API contract。
 - CLI 保持极简，不承担复杂状态管理。
 - Skills 的发现、投影、执行统一走 `/api/skills/*`。
-- IACC 的领域能力保留专用 API，同时通过 Skills Action API 对外统一。
+- MFG 的领域能力保留专用 API，同时通过 Skills Action API 对外统一。
 - 所有能力通过 Capability Registry 声明，三表面投影由 Surface Parity Contract 保障。
 
 ---
@@ -184,7 +184,7 @@ crates/tools
 - HTTP API 路由聚合
 - 静态 WebUI 服务
 - Session lifecycle 接入
-- IACC API 接入
+- Matrix/MFG API 接入
 - Capability / Projection / Release Gate API 接入
 - Structured Data API 接入
 - TUI panel 状态构建
@@ -223,7 +223,7 @@ crates/tools
 - Tool Execution Plans
 - Tool Memory（工具事实到记忆候选）
 - Release Gate（证据驱动发布门）
-- IACC 领域模型、store、skill pack
+- MFG 领域模型、store、skill pack
 - server manufacturing domain pack + app descriptor
 - skill plan/run/activation/dependency/memory 逻辑
 
@@ -242,8 +242,8 @@ crates/tools
 | `src/release_gate.rs` | 证据驱动发布门 |
 | `src/gates.rs` | PreFlight/Revision/Escalation/Abort Gate 机制 |
 | `src/green_contract.rs` | Green 合约分级 |
-| `src/iacc/*` | IACC 结构化运营智能 |
-| `src/iacc/app.rs` | IACC 应用描述器 |
+| `src/matrix/* + src/mfg/*` | MFG 结构化运营智能 |
+| `src/mfg/app.rs` | MFG 应用描述器 |
 | `src/platform/*` | 平台和 channel 类型 |
 | `src/mcp_stdio.rs` | MCP stdio 管理 |
 | `src/connector.rs` | Connector 基础 |
@@ -356,10 +356,10 @@ WebUI 位于 `webui/`，由 Vue 3 + Vite 构建，并由 Gateway 静态服务直
 | `src/App.vue` | 应用 shell、左侧 icon 导航、右侧 Companion、全局布局 |
 | `src/api/client.ts` | 统一 HTTP API client、写操作回执、错误结构 |
 | `src/stores/app.ts` | session、workspace、settings、runtime activity 等前端状态 |
-| `src/pages/*.vue` | Chat、Runtime、Context、Memory、Skills、Agents、Tools、Gateway、IACC、Audit、Settings 页面 |
+| `src/pages/*.vue` | Chat、Runtime、Context、Memory、Skills、Agents、Tools、Gateway、MFG、Audit、Settings 页面 |
 | `src/components/workbench/*` | 表格、详情、RawPayload、回执、治理动作、Schema 表单等管理组件 |
 | `src/data/capabilities.ts` | 模块能力说明、二级分区、动作和 endpoint 投影 |
-| `src/data/iaccWriteContracts.json` | IACC 高风险写操作治理契约 |
+| `src/data/mfgWriteContracts.json` | MFG 高风险写操作治理契约 |
 | `scripts/api-matrix.mjs` | WebUI API client、页面调用、后端 route 三方矩阵门禁 |
 | `scripts/capability-parity.mjs` | WebUI/TUI/CLI/backend 能力对齐审计 |
 | `scripts/raw-payload-audit.mjs` | 原始 JSON 展示位置审计 |
@@ -370,7 +370,7 @@ WebUI 的定位：
 
 - 浏览器端最强管理面，承担复杂状态、表格、过滤、详情、批量操作、证据 drill-down 和治理回执展示。
 - 左侧一级 icon 是全局模块入口；一级模块不重复展示假二级菜单。
-- 只有页面内部确实复杂时才使用模块内二级分区，例如 Skills 的 Catalog/Projection/Runs/Governance，IACC 的 Data Plane/Entities/Metrics/Incidents/Actions/Reports。
+- 只有页面内部确实复杂时才使用模块内二级分区，例如 Skills 的 Catalog/Projection/Runs/Governance，MFG 的 Data Plane/Entities/Metrics/Incidents/Actions/Reports。
 - 右侧 Companion 只承载与主区域互补的 Activity、Thinking、Workspace、Inspector；Workspace 支持目录浏览、预览、编辑、上传、重命名和删除。
 - Chat 只保留对话主流程，用户消息右侧、系统/助手消息左侧，正文使用 Markdown 渲染。
 - 所有写操作尽量返回 `RequestReceipt`，包含 request id、status、changed refs、audit ref、warnings 和 next actions。
@@ -433,7 +433,7 @@ Catalog：
 | API | 用途 |
 |---|---|
 | `GET /api/skills/catalog` | 技能全集 |
-| `GET /api/skills/catalog?scope=iacc` | 过滤 IACC skills |
+| `GET /api/skills/catalog?scope=mfg` | 过滤 MFG skills |
 | `GET /api/skills/:id` | 技能详情 |
 
 Projection：
@@ -454,26 +454,26 @@ Action：
 | `GET /api/skills/runs` | 最近 skill run |
 | `GET /api/skills/runs/:id` | 单个 skill run 详情 |
 
-IACC skill 示例：
+MFG skill 示例：
 
 ```bash
 curl http://127.0.0.1:8642/api/skills/catalog
-curl http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst
+curl http://127.0.0.1:8642/api/skills/mfg:supply-risk-analyst
 
-curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/validate \
+curl -X POST http://127.0.0.1:8642/api/skills/mfg:supply-risk-analyst/actions/validate \
   -H 'content-type: application/json' \
   -d '{"request_id":"demo-validate"}'
 
-curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/plan \
+curl -X POST http://127.0.0.1:8642/api/skills/mfg:supply-risk-analyst/actions/plan \
   -H 'content-type: application/json' \
   -d '{"request_id":"demo-plan","incident_id":"incident-id","limit":3}'
 
-curl -X POST http://127.0.0.1:8642/api/skills/iacc:supply-risk-analyst/actions/run \
+curl -X POST http://127.0.0.1:8642/api/skills/mfg:supply-risk-analyst/actions/run \
   -H 'content-type: application/json' \
   -d '{"request_id":"demo-run","incident_id":"incident-id"}'
 ```
 
-Local skill 的 action 当前返回 `unsupported_for_local_skill`。这是有意设计：local skill 在 CLI 侧保留 list/view/install/invoke，不承担 IACC 状态管理。
+Local skill 的 action 当前返回 `unsupported_for_local_skill`。这是有意设计：local skill 在 CLI 侧保留 list/view/install/invoke，不承担 MFG 状态管理。
 
 ### 5.5 Cowd Capability / Structured Data API
 
@@ -492,33 +492,33 @@ Cowd 自身的能力、投影和结构化数据 API：
 | `GET /api/cowd/structured/evidence` | 结构化证据列表 |
 | `GET /api/cowd/structured/watermarks` | 数据水位列表 |
 
-### 5.6 IACC API
+### 5.6 Matrix/MFG API
 
-IACC API 是结构化运营智能的领域实现层。
+Matrix/MFG API 是结构化运营智能的领域实现层。
 
 常用入口：
 
 | API | 用途 |
 |---|---|
-| `GET /api/iacc/health` | IACC store 健康 |
-| `POST /api/iacc/domain/server-manufacturing/seed` | 注入服务器制造领域种子 |
-| `GET /api/iacc/skills` | IACC skill pack |
-| `GET /api/iacc/command-center` | command center |
-| `GET /api/iacc/command-center/live` | live 队列 |
-| `GET /api/iacc/entities` | entity 列表 |
-| `POST /api/iacc/facts/ingest` | fact ingest |
-| `GET /api/iacc/metrics` | metric 列表 |
-| `GET /api/iacc/changes` | change event |
-| `GET /api/iacc/attention/hot` | attention hot |
-| `POST /api/iacc/evidence/build` | 构建 evidence packet |
-| `POST /api/iacc/incidents` | 创建 incident |
-| `GET /api/iacc/incidents` | incident 列表 |
-| `POST /api/iacc/incidents/:id/analyze` | operational analysis |
-| `POST /api/iacc/incidents/:id/skills/plan` | IACC 专用 skill plan |
-| `POST /api/iacc/incidents/:id/skills/:skill_id/run` | IACC 专用 skill run |
-| `GET /api/iacc/skill-runs/:id` | IACC skill run |
+| `GET /api/matrix/health` | Matrix store 健康 |
+| `POST /api/apps/mfg/domain/server-manufacturing/seed` | 注入服务器制造领域种子 |
+| `GET /api/apps/mfg/skills` | MFG skill pack |
+| `GET /api/apps/mfg/command-center` | command center |
+| `GET /api/apps/mfg/command-center/live` | live 队列 |
+| `GET /api/matrix/entities` | entity 列表 |
+| `POST /api/matrix/facts/ingest` | fact ingest |
+| `GET /api/matrix/metrics` | metric 列表 |
+| `GET /api/matrix/changes` | change event |
+| `GET /api/matrix/attention/hot` | attention hot |
+| `POST /api/matrix/evidence/build` | 构建 evidence packet |
+| `POST /api/apps/mfg/incidents` | 创建 incident |
+| `GET /api/apps/mfg/incidents` | incident 列表 |
+| `POST /api/apps/mfg/incidents/:id/analyze` | operational analysis |
+| `POST /api/apps/mfg/incidents/:id/skills/plan` | MFG 专用 skill plan |
+| `POST /api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 专用 skill run |
+| `GET /api/apps/mfg/skill-runs/:id` | MFG skill run |
 
-对外产品面推荐优先使用 `/api/skills/*` 的统一 action 协议。IACC 专用 API 保留为领域能力层和高级调试入口。
+对外产品面推荐优先使用 `/api/skills/*` 的统一 action 协议。MFG 专用 API 保留为领域能力层和高级调试入口。
 
 ---
 
@@ -651,7 +651,7 @@ Skills panel 控制台操作：
 
 - TUI 展示 WebUI 等同的核心能力全集。
 - TUI 当前以控制台方式显示 action availability。
-- 真正的 IACC skill action 通过统一 Skills API 和 incident id 执行。
+- 真正的 MFG skill action 通过统一 Skills API 和 incident id 执行。
 - local skills 保持 view/import/invoke 边界，不做状态 run。
 - TUI 支持 inline thinking 渲染和流式输出稳定性。
 - 启动时保持状态和记忆面板稳定性。
@@ -678,7 +678,7 @@ WebUI 是 cowd 的浏览器增强管理面：
 - Agents team profile、task、phase、review、graph、persistent run evidence
 - Tools registry、command history、risk preflight、tool action result
 - Gateway connector、resource、identity、grant、cross-plane execution
-- IACC manufacturing 应用全链路管理
+- MFG manufacturing 应用全链路管理
 - Audit、usage、release gate、governance evidence
 - Settings token verify/clear、manifest、endpoint 状态
 
@@ -706,11 +706,11 @@ WebUI 是 cowd 的浏览器增强管理面：
 - RequestReceipt 展示 validate/plan/run 的后端回执
 - RawPayload 仅作为 run/detail/action result 的折叠证据
 
-IACC skill 执行流程：
+MFG skill 执行流程：
 
-1. 在 IACC 面板或 API 中创建 incident。
+1. 在 MFG App 页面或 API 中创建 incident。
 2. 在 Skills 面板输入 incident id。
-3. 对目标 IACC skill 点 `Validate`。
+3. 对目标 MFG skill 点 `Validate`。
 4. 点 `Plan` 查看证据需求和 agent node plan。
 5. 点 `Run` 生成 skill run。
 6. 在 Runs 区域过滤、查看、展开详情。
@@ -728,7 +728,7 @@ IACC skill 执行流程：
 - Structured Core：`/api/cowd/structured/*` 的数据源、事实、证据、水位和 ingest plan
 - Maintenance：过期候选、维护任务、压缩和修复
 
-Structured Data Core 属于 cowd 内核，不属于 IACC。IACC 只消费和扩展制造领域 schema、workflow、metric、incident、report。
+Structured Data Core 属于 cowd 内核，不属于 MFG。MFG 只消费和扩展制造领域 schema、workflow、metric、incident、report。
 
 ### 8.3 Agents 面板
 
@@ -753,11 +753,11 @@ Structured Data Core 属于 cowd 内核，不属于 IACC。IACC 只消费和扩�
 - action preflight、dry-run/live execution
 - audit 记录和 RequestReceipt
 
-### 8.5 IACC 面板
+### 8.5 MFG App 页面
 
-入口：左侧 `IACC` icon。
+入口：左侧 `MFG` app icon。
 
-IACC 是 manufacturing application layer on top of the cowd kernel。当前页面按真实业务分区：
+MFG 是 manufacturing application layer on top of the cowd kernel。当前页面按真实业务分区：
 
 - Overview：health、operating load、contract summary
 - Data Plane：source pack、connector run、delta plan、ingest plan
@@ -770,7 +770,7 @@ IACC 是 manufacturing application layer on top of the cowd kernel。当前页�
 - Skills：manufacturing skill plan/run
 - Reports：cockpit report generate/retry
 
-高风险 live 写操作通过 `iaccWriteContracts.json` 治理，页面展示 execution mode、impact preview、payload editor、schema plan、receipt/audit 约束。当前审计要求所有写操作都必须有后端 route、UI 调用、测试证据或明确隔离策略。
+高风险 live 写操作通过 `mfgWriteContracts.json` 治理，页面展示 execution mode、impact preview、payload editor、schema plan、receipt/audit 约束。当前审计要求所有写操作都必须有后端 route、UI 调用、测试证据或明确隔离策略。
 
 ### 8.6 Settings 面板
 
@@ -803,7 +803,7 @@ Capability 系统是 v0.9.200 的顶层治理机制，用于声明、投影和�
 | Kernel | Runtime Event | Available |
 | Kernel | Skill Lifecycle | Available |
 | Kernel | Connector Runtime | Available |
-| Application | IACC Manufacturing Application | Preview |
+| Application | MFG Manufacturing Application | Preview |
 
 ### 9.2 Surface Projection
 
@@ -894,9 +894,9 @@ Execution Outcome Bridge 将工具调用、Agent 执行、Task 执行和 Manufac
 
 ---
 
-## 13. IACC 核心逻辑
+## 13. MFG 核心逻辑
 
-IACC 是 Cowd 的结构化运营智能层，用来把企业运营事实转为可追踪的 evidence、incident、analysis、action、report。
+MFG 是 Cowd 的结构化运营智能层，用来把企业运营事实转为可追踪的 evidence、incident、analysis、action、report。
 
 核心链路：
 
@@ -939,14 +939,14 @@ SourceSnapshot
 | analysis | 归因、影响和建议动作 |
 | execution | dry_run / commit / feedback |
 | cockpit | profile / projection / report / delivery |
-| skill | IACC skill manifest、plan、run |
-| app | IACC 应用描述器（domain, surface, skill pack） |
-| store | IACC SQLite store |
+| skill | MFG skill manifest、plan、run |
+| app | MFG 应用描述器（domain, surface, skill pack） |
+| store | MFG SQLite store |
 
-IACC store 默认位置：
+Matrix store 默认位置：
 
 ```text
-<workspace>/.cowd/iacc.sqlite
+<workspace>/.cowd/matrix.sqlite
 ```
 
 ---
@@ -958,7 +958,7 @@ Skills 是 Cowd 当前统一能力管理的核心面。
 ### 14.1 数据来源
 
 ```text
-IACC skill pack
+MFG skill pack
   + local SkillRegistry
     + .cowd/skills
     + .agents/skills
@@ -1082,7 +1082,7 @@ npm run build
 
 - Vitest 单元测试
 - API matrix gate：WebUI client、UI 调用、后端 route、测试证据
-- IACC write contract gate
+- MFG write contract gate
 - Capability parity gate：WebUI/TUI/CLI/backend 对齐
 - RawPayload audit gate
 
@@ -1160,14 +1160,14 @@ cp -a webui/. ~/AI/webui/
 
 已完成：
 
-- 三分支统一：`master`、`develop`、`dev-iacc`
+- 三分支统一：`master`、`develop`、`dev-mfg`
 - `~/AI/cowd` 安装
 - `~/AI/webui` 安装
 - Skills catalog/projection/action API
 - WebUI Skills 闭环：validate/plan/run/watch/runs/detail/filter
 - TUI Skills action availability
 - CLI skills 极简化
-- IACC skill pack 接入统一 Skills API
+- MFG skill pack 接入统一 Skills API
 - Capability Registry + Surface Projection
 - Surface Parity Contract（WebUI=TUI full parity, CLI=minimal）
 - Structured Data Core（Source/Mapping/Fact/Evidence/Ingest/Watermark）
@@ -1176,14 +1176,14 @@ cp -a webui/. ~/AI/webui/
 - Graph Quality Contracts
 - Tool Execution Plans（可解释批量执行计划）
 - Tool Memory（工具事实→记忆候选策略转换）
-- IACC Manufacturing Application Descriptor
-- WebUI Cowd IACC Workbench 面板
+- MFG Manufacturing Application Descriptor
+- WebUI Cowd MFG Workbench 面板
 - TUI 结构化摘要、inline thinking、流式输出稳定
 - TUI 启动状态和记忆面板稳定
 - WebUI Vue/Vite 重构：左侧模块 icon、右侧 Companion、Workspace、Inspector、模块化管理页面
-- WebUI 写操作回执体系：runtime、context、memory、skills、agents、tools、gateway、IACC
+- WebUI 写操作回执体系：runtime、context、memory、skills、agents、tools、gateway、MFG
 - Agents team profile 后端持久化 CRUD
-- IACC governed action workbench 和高风险写操作契约
+- MFG governed action workbench 和高风险写操作契约
 - API matrix / capability parity / RawPayload / visual audit 最终门禁
 
 后续增强不属于当前五版必须项，但可以继续提升：
@@ -1191,7 +1191,7 @@ cp -a webui/. ~/AI/webui/
 - TUI 的 Skills Action API 快捷交互可以进一步减少按键路径。
 - WebUI skill runs 可以增加批量对比、归档和跨 incident 分析。
 - local skills 可以增加更细的安全扫描和 manifest 修复建议。
-- IACC action 与 memory case/playbook 的闭环可以增加更丰富的趋势视图。
+- MFG action 与 memory case/playbook 的闭环可以增加更丰富的趋势视图。
 
 ---
 
@@ -1211,11 +1211,11 @@ curl http://127.0.0.1:8642/readyz
 
 ### Skills Run 报 `incident_id is required`
 
-`plan` 和 `run` 需要 IACC incident。先通过 IACC API 或 WebUI IACC 面板创建 incident，再在 Skills 面板输入 incident id。
+`plan` 和 `run` 需要 MFG incident。先通过 Matrix/MFG API 或 WebUI MFG App 页面创建 incident，再在 Skills 面板输入 incident id。
 
 ### local skill 不能 Run
 
-这是设计约束。local skill 由 CLI 管理导入、查看和 prompt dispatch，不承载 IACC 状态执行。
+这是设计约束。local skill 由 CLI 管理导入、查看和 prompt dispatch，不承载 MFG 状态执行。
 
 ### `cargo clippy -D warnings` 报 memory 历史 lint
 

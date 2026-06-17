@@ -1,6 +1,9 @@
 use std::fmt;
 use std::time::Duration;
 
+const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
+const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone)]
 pub struct DaemonProjectionClient {
     base_url: String,
@@ -39,7 +42,22 @@ impl DaemonProjectionClient {
         else {
             return Ok(None);
         };
-        Self::new(info.address, auth_token).map(Some)
+        Self::new(info.address, auth_token.or_else(default_auth_token)).map(Some)
+    }
+
+    pub fn from_running_gateway_with_retry(
+        auth_token: Option<String>,
+    ) -> Result<Option<Self>, ProjectionError> {
+        let auth_token = auth_token.or_else(default_auth_token);
+        for attempt in 0..GATEWAY_READY_RETRY_ATTEMPTS {
+            if let Some(client) = Self::from_running_gateway(auth_token.clone())? {
+                return Ok(Some(client));
+            }
+            if attempt + 1 < GATEWAY_READY_RETRY_ATTEMPTS {
+                std::thread::sleep(GATEWAY_READY_RETRY_DELAY);
+            }
+        }
+        Ok(None)
     }
 
     pub async fn runtime_control_plane(&self) -> Result<serde_json::Value, ProjectionError> {
@@ -491,6 +509,39 @@ impl DaemonProjectionClient {
         }
         response.json().await.map_err(ProjectionError::Http)
     }
+}
+
+pub fn default_auth_token() -> Option<String> {
+    std::env::var("COWD_API_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .or_else(auth_token_from_runtime_config)
+}
+
+fn auth_token_from_runtime_config() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;
+    let platform = config.gateway().platforms.iter().find(|platform| {
+        platform.enabled && matches!(platform.platform_type.as_str(), "api_server" | "api")
+    })?;
+
+    let flat = platform
+        .extra
+        .get("auth_token")
+        .and_then(|value| value.as_str());
+    let nested = platform
+        .extra
+        .get("auth")
+        .and_then(|value| value.as_object())
+        .and_then(|auth| auth.get("token"))
+        .and_then(|value| value.as_str());
+
+    flat.or(nested)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(String::from)
 }
 
 fn normalize_base_url(mut base_url: String) -> Result<String, ProjectionError> {

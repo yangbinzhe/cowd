@@ -243,15 +243,15 @@ const pageEndpoints = (page: Exclude<NavId, 'chat' | 'settings'>, sessionId: str
       ['Platforms', '/api/platforms'],
       ['WeChat accounts', '/api/channels/wechat-ilink/accounts'],
     ],
-    iacc: [
-      ['App descriptor', '/api/iacc/app'],
-      ['Health', '/api/iacc/health'],
-      ['Metrics', '/api/iacc/metrics'],
-      ['Entities', '/api/iacc/entities'],
-      ['Changes', '/api/iacc/changes'],
-      ['Incidents', '/api/iacc/incidents'],
-      ['Skills', '/api/iacc/skills'],
-      ['Command center', '/api/iacc/command-center'],
+    mfg: [
+      ['App descriptor', '/api/apps/mfg/app'],
+      ['Health', '/api/matrix/health'],
+      ['Metrics', '/api/matrix/metrics'],
+      ['Entities', '/api/matrix/entities'],
+      ['Changes', '/api/matrix/changes'],
+      ['Incidents', '/api/apps/mfg/incidents'],
+      ['Skills', '/api/apps/mfg/skills'],
+      ['Command center', '/api/apps/mfg/command-center'],
     ],
     audit: [
       ['Audit export', '/api/audit/export?limit=50'],
@@ -554,160 +554,160 @@ export const api = {
   cowdProjection: (surface = 'webui') => read(`/api/cowd/projection?surface=${encodeURIComponent(surface)}`, {}),
   cowdSurfaces: () => read('/api/cowd/surfaces', {}),
   cowdReleaseGate: () => read('/api/cowd/release-gate', {}),
-  iaccApp: () => read('/api/iacc/app', {}),
-  iaccHealth: () => read('/api/iacc/health', {}),
-  iaccProductionGovernance: () => read('/api/iacc/production/governance', {}),
-  iaccDataPlaneHealth: () => read('/api/iacc/data-plane/health', {}),
-  iaccDataPlaneIngestPlan: (ingest: Record<string, unknown>) => write('/api/iacc/data-plane/ingest-plan', {
+  mfgApp: () => read('/api/apps/mfg/app', {}),
+  mfgHealth: () => read('/api/matrix/health', {}),
+  mfgProductionGovernance: () => read('/api/apps/mfg/production/governance', {}),
+  mfgDataPlaneHealth: () => read('/api/matrix/data-plane/health', {}),
+  mfgDataPlaneIngestPlan: (ingest: Record<string, unknown>) => write('/api/matrix/data-plane/ingest-plan', {
     method: 'POST',
-    body: JSON.stringify({ ingest, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ ingest, session_id: 'webui-mfg' }),
   }),
-  iaccCommandCenter: () => read('/api/iacc/command-center', {}),
-  iaccCommandCenterLive: () => read('/api/iacc/command-center/live', {}),
-  iaccSourcePackUpsert: (source_pack: Record<string, unknown>) => write('/api/iacc/source-packs/upsert', {
+  mfgCommandCenter: () => read('/api/apps/mfg/command-center', {}),
+  mfgCommandCenterLive: () => read('/api/apps/mfg/command-center/live', {}),
+  mfgSourcePackUpsert: (source_pack: Record<string, unknown>) => write('/api/matrix/source-packs/upsert', {
     method: 'POST',
-    body: JSON.stringify({ source_pack, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ source_pack, session_id: 'webui-mfg' }),
   }),
-  iaccSourcePack: (id: string) => read(`/api/iacc/source-packs/${encodeURIComponent(id)}`, {}),
-  iaccSourcePackValidate: (id: string) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/validate`, { method: 'POST' }),
-  iaccSourcePackDeltaPlan: (id: string) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/delta-plan`, { method: 'POST' }),
-  iaccSourcePackIngestFile: (id: string, facts: Record<string, unknown>[]) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/ingest-file`, {
+  mfgSourcePack: (id: string) => read(`/api/matrix/source-packs/${encodeURIComponent(id)}`, {}),
+  mfgSourcePackValidate: (id: string) => write(`/api/matrix/source-packs/${encodeURIComponent(id)}/validate`, { method: 'POST' }),
+  mfgSourcePackDeltaPlan: (id: string) => write(`/api/matrix/source-packs/${encodeURIComponent(id)}/delta-plan`, { method: 'POST' }),
+  mfgSourcePackIngestFile: (id: string, facts: Record<string, unknown>[]) => write(`/api/matrix/source-packs/${encodeURIComponent(id)}/ingest-file`, {
     method: 'POST',
-    body: JSON.stringify({ facts, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ facts, session_id: 'webui-mfg' }),
   }),
-  iaccSourcePackConnectorPlan: (id: string, run?: Record<string, unknown>) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/connector-runs/plan`, {
+  mfgSourcePackConnectorPlan: (id: string, run?: Record<string, unknown>) => write(`/api/matrix/source-packs/${encodeURIComponent(id)}/connector-runs/plan`, {
     method: 'POST',
-    body: JSON.stringify({ run, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ run, session_id: 'webui-mfg' }),
   }),
-  iaccSourcePackConnectorRun: (id: string, run?: Record<string, unknown>) => write(`/api/iacc/source-packs/${encodeURIComponent(id)}/connector-runs/run`, {
+  mfgSourcePackConnectorRun: (id: string, run?: Record<string, unknown>) => write(`/api/matrix/source-packs/${encodeURIComponent(id)}/connector-runs/run`, {
     method: 'POST',
-    body: JSON.stringify({ run, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ run, session_id: 'webui-mfg' }),
   }),
-  iaccConnectorRun: (id: string) => read(`/api/iacc/connector-runs/${encodeURIComponent(id)}`, {}),
-  iaccMetrics: () => read('/api/iacc/metrics', {}),
-  iaccMetricDetail: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}`, {}),
-  iaccMetricLineage: (id: string) => read(`/api/iacc/metrics/${encodeURIComponent(id)}/lineage`, {}),
-  iaccAttentionPlan: (body: Record<string, unknown>) => write('/api/iacc/metrics/attention-plan', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  }),
-  iaccMetricSnapshotMaterialize: (metric_ids: string[], scope_ref?: string) => write('/api/iacc/metrics/snapshots/materialize', {
-    method: 'POST',
-    body: JSON.stringify({ metric_ids, scope_ref, session_id: 'webui-iacc' }),
-  }),
-  iaccMetricRecompute: () => write('/api/iacc/metrics/recompute', { method: 'POST' }),
-  iaccMetricDependencyUpsert: (dependency: Record<string, unknown>) => write('/api/iacc/metric-dependencies/upsert', {
-    method: 'POST',
-    body: JSON.stringify({ dependency, session_id: 'webui-iacc' }),
-  }),
-  iaccMetricAffectedByFactType: (fact_type: string) => write('/api/iacc/metric-dependencies/affected-by-fact-type', {
-    method: 'POST',
-    body: JSON.stringify({ fact_type, session_id: 'webui-iacc' }),
-  }),
-  iaccComputeJobPlan: (job: Record<string, unknown>) => write('/api/iacc/compute/jobs/plan', {
-    method: 'POST',
-    body: JSON.stringify({ job, session_id: 'webui-iacc' }),
-  }),
-  iaccComputeJob: (id: string) => read(`/api/iacc/compute/jobs/${encodeURIComponent(id)}`, {}),
-  iaccComputeJobRun: (id: string) => write(`/api/iacc/compute/jobs/${encodeURIComponent(id)}/run`, { method: 'POST' }),
-  iaccEntities: () => read('/api/iacc/entities', {}),
-  iaccEntity: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}`, {}),
-  iaccEntityUpsert: (entity: Record<string, unknown>) => write('/api/iacc/entities/upsert', {
-    method: 'POST',
-    body: JSON.stringify({ entity, session_id: 'webui-iacc' }),
-  }),
-  iaccEntityResolveSourceKey: (source_system: string, source_key: string) => write('/api/iacc/entities/resolve-source-key', {
-    method: 'POST',
-    body: JSON.stringify({ source_system, source_key, session_id: 'webui-iacc' }),
-  }),
-  iaccEntityMatchCandidate: (left_entity_id: string, right_entity_id: string) => write('/api/iacc/entities/match-candidate', {
-    method: 'POST',
-    body: JSON.stringify({ left_entity_id, right_entity_id, session_id: 'webui-iacc' }),
-  }),
-  iaccEntityConflictDecision: (body: Record<string, unknown>) => write('/api/iacc/entities/conflict-decision', {
-    method: 'POST',
-    body: JSON.stringify({ ...body, session_id: 'webui-iacc' }),
-  }),
-  iaccEntityRelations: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}/relations`, {}),
-  iaccEntityImpactPath: (id: string) => read(`/api/iacc/entities/${encodeURIComponent(id)}/impact-path`, {}),
-  iaccRelationUpsert: (relation: Record<string, unknown>) => write('/api/iacc/relations/upsert', {
-    method: 'POST',
-    body: JSON.stringify({ relation, session_id: 'webui-iacc' }),
-  }),
-  iaccChanges: () => read('/api/iacc/changes', {}),
-  iaccAttentionHot: () => read('/api/iacc/attention/hot', {}),
-  iaccEvidenceBuild: (body: Record<string, unknown>) => write('/api/iacc/evidence/build', {
-    method: 'POST',
-    body: JSON.stringify({ ...body, session_id: 'webui-iacc' }),
-  }),
-  iaccEvidence: (id: string) => read(`/api/iacc/evidence/${encodeURIComponent(id)}`, {}),
-  iaccEvidenceQualityGate: (id: string) => write(`/api/iacc/evidence/${encodeURIComponent(id)}/quality-gate`, { method: 'POST' }),
-  iaccEvidenceContext: (id: string) => read(`/api/iacc/evidence/${encodeURIComponent(id)}/context`, {}),
-  iaccQualityGate: (id: string) => read(`/api/iacc/quality-gates/${encodeURIComponent(id)}`, {}),
-  iaccIncidents: () => read('/api/iacc/incidents', {}),
-  iaccIncident: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}`, {}),
-  iaccSkills: () => read('/api/iacc/skills', {}),
-  iaccSkill: (id: string) => read(`/api/iacc/skills/${encodeURIComponent(id)}`, {}),
-  iaccCreateIncident: (body: Record<string, unknown>) => write('/api/iacc/incidents', {
+  mfgConnectorRun: (id: string) => read(`/api/matrix/connector-runs/${encodeURIComponent(id)}`, {}),
+  mfgMetrics: () => read('/api/matrix/metrics', {}),
+  mfgMetricDetail: (id: string) => read(`/api/matrix/metrics/${encodeURIComponent(id)}`, {}),
+  mfgMetricLineage: (id: string) => read(`/api/matrix/metrics/${encodeURIComponent(id)}/lineage`, {}),
+  mfgAttentionPlan: (body: Record<string, unknown>) => write('/api/matrix/metrics/attention-plan', {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccIncidentRoom: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}/room`, {}),
-  iaccAnalyzeIncident: (id: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/analyze`, { method: 'POST' }),
-  iaccPromoteIncidentCase: (id: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/cases/promote`, { method: 'POST' }),
-  iaccRecommendPlaybooks: (id: string, limit = 5) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/playbooks/recommend`, {
+  mfgMetricSnapshotMaterialize: (metric_ids: string[], scope_ref?: string) => write('/api/matrix/metrics/snapshots/materialize', {
+    method: 'POST',
+    body: JSON.stringify({ metric_ids, scope_ref, session_id: 'webui-mfg' }),
+  }),
+  mfgMetricRecompute: () => write('/api/matrix/metrics/recompute', { method: 'POST' }),
+  mfgMetricDependencyUpsert: (dependency: Record<string, unknown>) => write('/api/matrix/metric-dependencies/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ dependency, session_id: 'webui-mfg' }),
+  }),
+  mfgMetricAffectedByFactType: (fact_type: string) => write('/api/matrix/metric-dependencies/affected-by-fact-type', {
+    method: 'POST',
+    body: JSON.stringify({ fact_type, session_id: 'webui-mfg' }),
+  }),
+  mfgComputeJobPlan: (job: Record<string, unknown>) => write('/api/matrix/compute/jobs/plan', {
+    method: 'POST',
+    body: JSON.stringify({ job, session_id: 'webui-mfg' }),
+  }),
+  mfgComputeJob: (id: string) => read(`/api/matrix/compute/jobs/${encodeURIComponent(id)}`, {}),
+  mfgComputeJobRun: (id: string) => write(`/api/matrix/compute/jobs/${encodeURIComponent(id)}/run`, { method: 'POST' }),
+  mfgEntities: () => read('/api/matrix/entities', {}),
+  mfgEntity: (id: string) => read(`/api/matrix/entities/${encodeURIComponent(id)}`, {}),
+  mfgEntityUpsert: (entity: Record<string, unknown>) => write('/api/matrix/entities/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ entity, session_id: 'webui-mfg' }),
+  }),
+  mfgEntityResolveSourceKey: (source_system: string, source_key: string) => write('/api/matrix/entities/resolve-source-key', {
+    method: 'POST',
+    body: JSON.stringify({ source_system, source_key, session_id: 'webui-mfg' }),
+  }),
+  mfgEntityMatchCandidate: (left_entity_id: string, right_entity_id: string) => write('/api/matrix/entities/match-candidate', {
+    method: 'POST',
+    body: JSON.stringify({ left_entity_id, right_entity_id, session_id: 'webui-mfg' }),
+  }),
+  mfgEntityConflictDecision: (body: Record<string, unknown>) => write('/api/matrix/entities/conflict-decision', {
+    method: 'POST',
+    body: JSON.stringify({ ...body, session_id: 'webui-mfg' }),
+  }),
+  mfgEntityRelations: (id: string) => read(`/api/matrix/entities/${encodeURIComponent(id)}/relations`, {}),
+  mfgEntityImpactPath: (id: string) => read(`/api/matrix/entities/${encodeURIComponent(id)}/impact-path`, {}),
+  mfgRelationUpsert: (relation: Record<string, unknown>) => write('/api/matrix/relations/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ relation, session_id: 'webui-mfg' }),
+  }),
+  mfgChanges: () => read('/api/matrix/changes', {}),
+  mfgAttentionHot: () => read('/api/matrix/attention/hot', {}),
+  mfgEvidenceBuild: (body: Record<string, unknown>) => write('/api/matrix/evidence/build', {
+    method: 'POST',
+    body: JSON.stringify({ ...body, session_id: 'webui-mfg' }),
+  }),
+  mfgEvidence: (id: string) => read(`/api/matrix/evidence/${encodeURIComponent(id)}`, {}),
+  mfgEvidenceQualityGate: (id: string) => write(`/api/matrix/evidence/${encodeURIComponent(id)}/quality-gate`, { method: 'POST' }),
+  mfgEvidenceContext: (id: string) => read(`/api/matrix/evidence/${encodeURIComponent(id)}/context`, {}),
+  mfgQualityGate: (id: string) => read(`/api/matrix/quality-gates/${encodeURIComponent(id)}`, {}),
+  mfgIncidents: () => read('/api/apps/mfg/incidents', {}),
+  mfgIncident: (id: string) => read(`/api/apps/mfg/incidents/${encodeURIComponent(id)}`, {}),
+  mfgSkills: () => read('/api/apps/mfg/skills', {}),
+  mfgSkill: (id: string) => read(`/api/apps/mfg/skills/${encodeURIComponent(id)}`, {}),
+  mfgCreateIncident: (body: Record<string, unknown>) => write('/api/apps/mfg/incidents', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  mfgIncidentRoom: (id: string) => read(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/room`, {}),
+  mfgAnalyzeIncident: (id: string) => write(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/analyze`, { method: 'POST' }),
+  mfgPromoteIncidentCase: (id: string) => write(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/cases/promote`, { method: 'POST' }),
+  mfgRecommendPlaybooks: (id: string, limit = 5) => write(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/playbooks/recommend`, {
     method: 'POST',
     body: JSON.stringify({ limit }),
   }),
-  iaccPlanSkills: (id: string, limit = 3) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/skills/plan`, {
+  mfgPlanSkills: (id: string, limit = 3) => write(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/skills/plan`, {
     method: 'POST',
     body: JSON.stringify({ limit }),
   }),
-  iaccRunSkill: (id: string, skillId: string) => write(`/api/iacc/incidents/${encodeURIComponent(id)}/skills/${encodeURIComponent(skillId)}/run`, {
+  mfgRunSkill: (id: string, skillId: string) => write(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/skills/${encodeURIComponent(skillId)}/run`, {
     method: 'POST',
     body: JSON.stringify({ session_id: id }),
   }),
-  iaccSkillRuns: (id: string) => read(`/api/iacc/incidents/${encodeURIComponent(id)}/skills`, {}),
-  iaccExecuteAction: (analysisId: string, actionId: string, body: Record<string, unknown>) => write(`/api/iacc/analyses/${encodeURIComponent(analysisId)}/actions/${encodeURIComponent(actionId)}/execute`, {
+  mfgSkillRuns: (id: string) => read(`/api/apps/mfg/incidents/${encodeURIComponent(id)}/skills`, {}),
+  mfgExecuteAction: (analysisId: string, actionId: string, body: Record<string, unknown>) => write(`/api/apps/mfg/analyses/${encodeURIComponent(analysisId)}/actions/${encodeURIComponent(actionId)}/execute`, {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccExecutionBridge: (executionId: string, body: Record<string, unknown>) => write(`/api/iacc/executions/${encodeURIComponent(executionId)}/cross-plane/execute`, {
+  mfgExecutionBridge: (executionId: string, body: Record<string, unknown>) => write(`/api/apps/mfg/executions/${encodeURIComponent(executionId)}/cross-plane/execute`, {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccExecutionFeedback: (executionId: string, body: Record<string, unknown>) => write(`/api/iacc/executions/${encodeURIComponent(executionId)}/feedback`, {
+  mfgExecutionFeedback: (executionId: string, body: Record<string, unknown>) => write(`/api/apps/mfg/executions/${encodeURIComponent(executionId)}/feedback`, {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccUpsertProfile: (profile: Record<string, unknown>) => write('/api/iacc/cockpit/profiles/upsert', {
+  mfgUpsertProfile: (profile: Record<string, unknown>) => write('/api/apps/mfg/cockpit/profiles/upsert', {
     method: 'POST',
     body: JSON.stringify({ profile }),
   }),
-  iaccGenerateReport: (profileId: string, report: Record<string, unknown>) => write(`/api/iacc/cockpit/profiles/${encodeURIComponent(profileId)}/reports/generate`, {
+  mfgGenerateReport: (profileId: string, report: Record<string, unknown>) => write(`/api/apps/mfg/cockpit/profiles/${encodeURIComponent(profileId)}/reports/generate`, {
     method: 'POST',
     body: JSON.stringify({ report }),
   }),
-  iaccReportDeliveryState: (reportId: string) => read(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery-state`, {}),
-  iaccReport: (reportId: string) => read(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}`, {}),
-  iaccDeliverReport: (reportId: string, body: Record<string, unknown>) => write(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/deliver`, {
+  mfgReportDeliveryState: (reportId: string) => read(`/api/apps/mfg/cockpit/reports/${encodeURIComponent(reportId)}/delivery-state`, {}),
+  mfgReport: (reportId: string) => read(`/api/apps/mfg/cockpit/reports/${encodeURIComponent(reportId)}`, {}),
+  mfgDeliverReport: (reportId: string, body: Record<string, unknown>) => write(`/api/apps/mfg/cockpit/reports/${encodeURIComponent(reportId)}/deliver`, {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccRetryReportDelivery: (reportId: string, body: Record<string, unknown>) => write(`/api/iacc/cockpit/reports/${encodeURIComponent(reportId)}/delivery/retry`, {
+  mfgRetryReportDelivery: (reportId: string, body: Record<string, unknown>) => write(`/api/apps/mfg/cockpit/reports/${encodeURIComponent(reportId)}/delivery/retry`, {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccRunReportSchedule: (body: Record<string, unknown>) => write('/api/iacc/cockpit/reports/schedules/run', {
+  mfgRunReportSchedule: (body: Record<string, unknown>) => write('/api/apps/mfg/cockpit/reports/schedules/run', {
     method: 'POST',
     body: JSON.stringify(body),
   }),
-  iaccIngestFact: (facts: Record<string, unknown>[]) => write('/api/iacc/facts/ingest', {
+  mfgIngestFact: (facts: Record<string, unknown>[]) => write('/api/matrix/facts/ingest', {
     method: 'POST',
-    body: JSON.stringify({ facts, session_id: 'webui-iacc' }),
+    body: JSON.stringify({ facts, session_id: 'webui-mfg' }),
   }),
-  iaccSeedDomain: () => write('/api/iacc/domain/server-manufacturing/seed', { method: 'POST' }),
-  iaccSeedOntology: () => write('/api/iacc/ontology/server-manufacturing/seed', { method: 'POST' }),
+  mfgSeedDomain: () => write('/api/apps/mfg/domain/server-manufacturing/seed', { method: 'POST' }),
+  mfgSeedOntology: () => write('/api/apps/mfg/ontology/server-manufacturing/seed', { method: 'POST' }),
   settings: () => read('/api/config', { model: 'unknown', version: 'unknown' }),
   saveConfig: (config: Record<string, unknown>) => write('/api/config', {
     method: 'PUT',

@@ -1,9 +1,0 @@
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on artifact directory
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.03s
-     Running tests/client_integration.rs (/tmp/cowd-master-full-target/debug/deps/client_integration-bfe24f1516cc834e)
-
-running 1 test
-test send_message_blocks_oversized_requests_before_the_http_call ... 

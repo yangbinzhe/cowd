@@ -264,7 +264,8 @@ impl SmartApprovalGate {
     /// For other tools, it auto-passes (they have their own permission checks).
     pub async fn evaluate(&self, tool_name: &str, input: &str) -> ApprovalGateResult {
         // Step 0: Same-session auto-approve
-        let key = format!("{tool_name}:{}", &input[..input.len().min(80)]);
+        let input_preview: String = input.chars().take(80).collect();
+        let key = format!("{tool_name}:{input_preview}");
         if self.session_approved.lock().await.contains(&key) {
             return ApprovalGateResult::AutoPass {
                 reason: AutoPassReason::ReadOnlyCommand,

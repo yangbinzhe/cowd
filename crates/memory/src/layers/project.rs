@@ -158,8 +158,11 @@ impl ProjectLayer {
                 continue;
             }
             // Truncate very long files to avoid blowing the token budget.
-            let content = if content.len() > 8000 {
-                format!("{}\n… (truncated)", &content[..8000])
+            let content = if content.chars().count() > 8000 {
+                format!(
+                    "{}\n… (truncated)",
+                    content.chars().take(8000).collect::<String>()
+                )
             } else {
                 content
             };

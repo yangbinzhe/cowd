@@ -532,6 +532,15 @@ impl CompletionRequest {
     }
 
     pub fn apply_to_text(&self, text: &str, replacement: &str) -> String {
+        if self.replace_start > text.len()
+            || self.replace_end > text.len()
+            || self.replace_start > self.replace_end
+            || !text.is_char_boundary(self.replace_start)
+            || !text.is_char_boundary(self.replace_end)
+        {
+            return text.to_string();
+        }
+
         let replacement = match self.trigger {
             CompletionTrigger::SlashCommand
                 if self.token.starts_with('/') && !replacement.starts_with('/') =>
@@ -1805,6 +1814,28 @@ mod tests {
         let request = CompletionRequest::from_text_at_cursor(text, cursor).unwrap();
 
         assert_eq!(request.apply("status"), "please run /status now");
+    }
+
+    #[test]
+    fn completion_request_invalid_range_does_not_panic() {
+        let request = CompletionRequest {
+            trigger: CompletionTrigger::SlashCommand,
+            token: "/status".to_string(),
+            replace_start: 48,
+            replace_end: 48,
+            source_text: "/status".to_string(),
+        };
+
+        assert_eq!(request.apply("status"), "/status");
+    }
+
+    #[test]
+    fn completion_kernel_replaces_multibyte_token_boundary_safely() {
+        let text = "请运行 /statu 查看状态";
+        let cursor = text.find(" 查看").unwrap();
+        let request = CompletionRequest::from_text_at_cursor(text, cursor).unwrap();
+
+        assert_eq!(request.apply("status"), "请运行 /status 查看状态");
     }
 
     // ── Prompt tab_accepts test ────────────────────────────────────

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::iacc::IaccQualityGateDecision;
+use crate::matrix::MatrixQualityGateDecision;
 use crate::structured_data::CowdStructuredEvidence;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,8 +65,8 @@ impl CowdStructuredQualityGate {
     }
 }
 
-impl From<&IaccQualityGateDecision> for CowdStructuredQualityGate {
-    fn from(gate: &IaccQualityGateDecision) -> Self {
+impl From<&MatrixQualityGateDecision> for CowdStructuredQualityGate {
+    fn from(gate: &MatrixQualityGateDecision) -> Self {
         Self {
             gate_id: gate.gate_id.clone(),
             target_ref: gate.target_ref.clone(),
@@ -83,17 +83,17 @@ impl From<&IaccQualityGateDecision> for CowdStructuredQualityGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::{IaccEvidencePacket, IaccEvidenceSourceRef};
+    use crate::matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 
     #[test]
     fn structured_quality_gate_uses_structured_evidence_refs() {
-        let mut packet = IaccEvidencePacket::new("shortage risk changed");
+        let mut packet = MatrixEvidencePacket::new("shortage risk changed");
         packet.packet_id = "packet-1".to_string();
         packet.confidence = 0.8;
         packet
             .metric_evidence
             .push(serde_json::json!({"metric": "material_shortage_risk"}));
-        packet.source_refs.push(IaccEvidenceSourceRef {
+        packet.source_refs.push(MatrixEvidenceSourceRef {
             kind: "fact".to_string(),
             reference: "structured-fact:fact-1".to_string(),
             summary: "shortage fact".to_string(),

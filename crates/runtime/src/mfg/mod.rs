@@ -3,62 +3,51 @@
 //! MFG is the manufacturing application layer built on Matrix structured facts,
 //! Memory, runtime context, skills and governed action dispatch.
 
-pub use crate::iacc::{
+mod analysis;
+mod app;
+mod cockpit;
+mod domain;
+mod execution;
+mod incident;
+mod memory_case;
+mod ontology;
+mod skill;
+
+pub use analysis::{
+    MfgAttributionCandidate, MfgImpactPath, MfgOperationalAnalysis, MfgRecommendedAction,
+};
+pub use app::{
+    manufacturing_app_descriptor, MfgApplicationDescriptor, MfgApplicationDomain,
+    MfgApplicationSurface, MfgApplicationSurfaceKind,
+};
+pub use cockpit::{
+    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitProjection,
+    MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgCockpitWidget,
+};
+pub use domain::{
+    server_manufacturing_domain_pack, server_manufacturing_seed_plan, MfgDomainPack,
+    MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult,
+};
+pub use execution::{
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCrossPlaneBridgeReceipt,
+};
+pub use incident::MfgIncident;
+pub use memory_case::{MfgCasePromotion, MfgMemoryCase, MfgPlaybook, MfgPlaybookStep};
+pub use ontology::server_manufacturing_ontology_pack;
+pub use skill::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_domain_pack, server_manufacturing_ontology_pack,
-    server_manufacturing_seed_plan, server_manufacturing_skill_pack, IaccApplicationDescriptor,
-    IaccApplicationDomain, IaccApplicationSurface, IaccApplicationSurfaceKind,
+    server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillManifest, MfgSkillPlan,
+    MfgSkillRun,
 };
 
 #[must_use]
-pub fn manufacturing_app_descriptor() -> IaccApplicationDescriptor {
-    let mut descriptor = crate::iacc::manufacturing_app_descriptor();
-    descriptor.app_id = "mfg.manufacturing".to_string();
-    descriptor.name = "MFG Manufacturing Application".to_string();
-    descriptor.description =
-        "Manufacturing operations application over Matrix structured facts, Memory, context, skills and governance."
-            .to_string();
-    if !descriptor
-        .cowd_capabilities
-        .contains(&"cowd.matrix.runtime".to_string())
-    {
-        descriptor
-            .cowd_capabilities
-            .insert(0, "cowd.matrix.runtime".to_string());
-    }
-    for surface in &mut descriptor.surfaces {
-        for entrypoint in &mut surface.entrypoints {
-            if entrypoint == "/api/iacc/app" {
-                *entrypoint = "/api/apps/mfg/app".to_string();
-            }
-        }
-    }
-    descriptor
+pub fn mfg_seed_plan() -> MfgDomainSeedPlan {
+    server_manufacturing_seed_plan()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mfg_descriptor_projects_manufacturing_as_application_over_matrix() {
-        let descriptor = manufacturing_app_descriptor();
-
-        assert_eq!(descriptor.app_id, "mfg.manufacturing");
-        assert_eq!(descriptor.layer, "application");
-        assert!(descriptor
-            .cowd_capabilities
-            .contains(&"cowd.matrix.runtime".to_string()));
-        assert_eq!(descriptor.domains[0].domain_id, "server_manufacturing");
-    }
-
-    #[test]
-    fn mfg_descriptor_exposes_mfg_app_entrypoints() {
-        let descriptor = manufacturing_app_descriptor();
-
-        assert!(descriptor.surfaces.iter().all(|surface| surface
-            .entrypoints
-            .iter()
-            .any(|entrypoint| entrypoint == "/api/apps/mfg/app")));
-    }
+#[must_use]
+pub fn mfg_ontology_pack() -> crate::matrix::MatrixOntologyPack {
+    server_manufacturing_ontology_pack()
 }

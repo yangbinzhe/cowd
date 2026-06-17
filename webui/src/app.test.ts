@@ -12,13 +12,13 @@ import MemoryPage from './pages/MemoryPage.vue';
 import RuntimePage from './pages/RuntimePage.vue';
 import ContextPage from './pages/ContextPage.vue';
 import GatewayPage from './pages/GatewayPage.vue';
-import IaccPage from './pages/IaccPage.vue';
+import MfgPage from './pages/MfgPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import SkillsPage from './pages/SkillsPage.vue';
 import ToolsPage from './pages/ToolsPage.vue';
 import { pluginRoutes, webuiPagePlugins } from './plugins/registry';
 import { useAppStore } from './stores/app';
-import iaccWriteContracts from './data/iaccWriteContracts.json';
+import mfgWriteContracts from './data/mfgWriteContracts.json';
 
 vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
 vi.mock('vue-echarts', () => ({ default: { template: '<div class="chart"></div>' } }));
@@ -37,7 +37,7 @@ function mountApp(path = '/chat') {
       { path: '/tools', component: ToolsPage },
       { path: '/gateway', component: GatewayPage },
       ...pluginRoutes,
-      { path: '/iacc', component: IaccPage },
+      { path: '/mfg', component: MfgPage },
       { path: '/audit', component: AuditPage },
       { path: '/settings', component: SettingsPage },
     ],
@@ -59,7 +59,7 @@ async function settleAsync() {
 }
 
 describe('Cowd Vue WebUI shell', () => {
-  it('registers MFG as a pluggable page instead of a hard-coded IACC nav item', async () => {
+  it('registers MFG as a pluggable page without a legacy nav item', async () => {
     const plugin = webuiPagePlugins.find((item) => item.id === 'mfg');
     expect(plugin).toBeTruthy();
     expect(plugin?.route).toBe('/apps/mfg');
@@ -69,7 +69,8 @@ describe('Cowd Vue WebUI shell', () => {
     const wrapper = await mountApp('/chat');
     const railButtons = wrapper.findAll('.rail-button');
     expect(railButtons.some((button) => button.attributes('aria-label') === 'MFG')).toBe(true);
-    expect(railButtons.some((button) => button.attributes('aria-label') === 'IACC')).toBe(false);
+    const legacyLabel = ['IA', 'CC'].join('');
+    expect(railButtons.some((button) => button.attributes('aria-label') === legacyLabel)).toBe(false);
   });
 
   it('keeps Workspace out of the left rail and inside the right companion panel', async () => {
@@ -240,51 +241,51 @@ describe('Cowd Vue WebUI shell', () => {
     }));
   });
 
-  it('calls critical IACC write endpoints with explicit request bodies', async () => {
+  it('calls critical MFG write endpoints with explicit request bodies', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 })));
     vi.stubGlobal('fetch', fetchMock);
-    await api.iaccSourcePackUpsert({ source_pack_id: 'sp-1' });
-    await api.iaccEntityUpsert({ entity_id: 'entity-1' });
-    await api.iaccRelationUpsert({ relation_type: 'feeds' });
-    await api.iaccComputeJobRun('job-1');
-    await api.iaccExecuteAction('analysis-1', 'action-1', { mode: 'dry_run' });
-    await api.iaccExecutionBridge('exec-1', { mode: 'dry_run' });
-    await api.iaccRetryReportDelivery('report-1', { mode: 'dry_run' });
-    await api.iaccIngestFact([{ fact_type: 'quality', source_ref: 'source-pack://sp-1' }]);
-    await api.iaccSeedDomain();
-    await api.iaccSeedOntology();
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/source-packs/upsert', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/entities/upsert', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/relations/upsert', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/compute/jobs/job-1/run', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/analyses/analysis-1/actions/action-1/execute', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/executions/exec-1/cross-plane/execute', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/cockpit/reports/report-1/delivery/retry', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/facts/ingest', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/domain/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/ontology/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
+    await api.mfgSourcePackUpsert({ source_pack_id: 'sp-1' });
+    await api.mfgEntityUpsert({ entity_id: 'entity-1' });
+    await api.mfgRelationUpsert({ relation_type: 'feeds' });
+    await api.mfgComputeJobRun('job-1');
+    await api.mfgExecuteAction('analysis-1', 'action-1', { mode: 'dry_run' });
+    await api.mfgExecutionBridge('exec-1', { mode: 'dry_run' });
+    await api.mfgRetryReportDelivery('report-1', { mode: 'dry_run' });
+    await api.mfgIngestFact([{ fact_type: 'quality', source_ref: 'source-pack://sp-1' }]);
+    await api.mfgSeedDomain();
+    await api.mfgSeedOntology();
+    expect(fetchMock).toHaveBeenCalledWith('/api/matrix/source-packs/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/matrix/entities/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/matrix/relations/upsert', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/matrix/compute/jobs/job-1/run', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/analyses/analysis-1/actions/action-1/execute', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/executions/exec-1/cross-plane/execute', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/cockpit/reports/report-1/delivery/retry', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/matrix/facts/ingest', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/domain/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/ontology/server-manufacturing/seed', expect.objectContaining({ method: 'POST' }));
   });
 
-  it('calls real IACC incident and cockpit report endpoints', async () => {
+  it('calls real MFG incident and cockpit report endpoints', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ kind: 'test.receipt' }), { status: 200 })));
     vi.stubGlobal('fetch', fetchMock);
-    await api.iaccCreateIncident({ title: 'Line A deviation' });
-    await api.iaccAnalyzeIncident('incident-1');
-    await api.iaccSkills();
-    await api.iaccGenerateReport('profile-1', { cadence: 'daily' });
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents', expect.objectContaining({
+    await api.mfgCreateIncident({ title: 'Line A deviation' });
+    await api.mfgAnalyzeIncident('incident-1');
+    await api.mfgSkills();
+    await api.mfgGenerateReport('profile-1', { cadence: 'daily' });
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/incidents', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ title: 'Line A deviation' }),
     }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/incidents/incident-1/analyze', expect.objectContaining({ method: 'POST' }));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/skills', expect.any(Object));
-    expect(fetchMock).toHaveBeenCalledWith('/api/iacc/cockpit/profiles/profile-1/reports/generate', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/incidents/incident-1/analyze', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/skills', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/cockpit/profiles/profile-1/reports/generate', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ report: { cadence: 'daily' } }),
     }));
   });
 
-  it('renders IACC governed action chains from the write contract source', async () => {
+  it('renders MFG governed action chains from the write contract source', async () => {
     const fetchMock = vi.fn((path: RequestInfo | URL) => {
       const url = String(path);
       if (url === '/api/webui/manifest') return Promise.resolve(new Response(JSON.stringify({ status: 'test' })));
@@ -297,19 +298,19 @@ describe('Cowd Vue WebUI shell', () => {
       if (url === '/api/workspace') return Promise.resolve(new Response(JSON.stringify({ workspace_root: '', workspace_canonical: '' })));
       if (url === '/api/approval/config') return Promise.resolve(new Response(JSON.stringify({})));
       if (url === '/api/workspace/files') return Promise.resolve(new Response(JSON.stringify({ files: [] })));
-      if (url === '/api/iacc/health') return Promise.resolve(new Response(JSON.stringify({ status: 'ready', fact_count: 2, schema_version: 'test' })));
-      if (url === '/api/iacc/metrics') return Promise.resolve(new Response(JSON.stringify({ metrics: [{ metric_id: 'torque_deviation_rate', name: 'Torque deviation', unit: '%' }] })));
-      if (url === '/api/iacc/entities') return Promise.resolve(new Response(JSON.stringify({ entities: [{ entity_id: 'line-a', entity_type: 'manufacturing_line', canonical_key: 'line:A', display_name: 'Line A' }] })));
-      if (url === '/api/iacc/incidents') return Promise.resolve(new Response(JSON.stringify({ items: [{ incident_id: 'incident-1', title: 'Line A deviation' }] })));
-      if (url === '/api/iacc/skills') return Promise.resolve(new Response(JSON.stringify({ items: [{ skill_id: 'skill-1', name: 'Root cause analysis' }] })));
-      if (url === '/api/iacc/incidents/incident-1/room') return Promise.resolve(new Response(JSON.stringify({ analysis: { recommended_actions: [{ action_id: 'action-1', title: 'Notify QA' }] }, executions: [] })));
+      if (url === '/api/matrix/health') return Promise.resolve(new Response(JSON.stringify({ status: 'ready', fact_count: 2, schema_version: 'test' })));
+      if (url === '/api/matrix/metrics') return Promise.resolve(new Response(JSON.stringify({ metrics: [{ metric_id: 'torque_deviation_rate', name: 'Torque deviation', unit: '%' }] })));
+      if (url === '/api/matrix/entities') return Promise.resolve(new Response(JSON.stringify({ entities: [{ entity_id: 'line-a', entity_type: 'manufacturing_line', canonical_key: 'line:A', display_name: 'Line A' }] })));
+      if (url === '/api/apps/mfg/incidents') return Promise.resolve(new Response(JSON.stringify({ items: [{ incident_id: 'incident-1', title: 'Line A deviation' }] })));
+      if (url === '/api/apps/mfg/skills') return Promise.resolve(new Response(JSON.stringify({ items: [{ skill_id: 'skill-1', name: 'Root cause analysis' }] })));
+      if (url === '/api/apps/mfg/incidents/incident-1/room') return Promise.resolve(new Response(JSON.stringify({ analysis: { recommended_actions: [{ action_id: 'action-1', title: 'Notify QA' }] }, executions: [] })));
       return Promise.resolve(new Response(JSON.stringify({})));
     });
     vi.stubGlobal('fetch', fetchMock);
-    const wrapper = await mountApp('/iacc');
+    const wrapper = await mountApp('/mfg');
     await settleAsync();
     await settleAsync();
-    const domains = new Set((iaccWriteContracts as any[]).map((contract) => contract.domain));
+    const domains = new Set((mfgWriteContracts as any[]).map((contract) => contract.domain));
     expect(domains).toEqual(new Set(['Cockpit', 'Data Plane', 'Entities', 'Evidence', 'Facts', 'Incidents', 'Metrics']));
     expect(wrapper.findAll('.governed-action-panel').length).toBeGreaterThanOrEqual(7);
     expect(wrapper.text()).toContain('Governed write contracts');

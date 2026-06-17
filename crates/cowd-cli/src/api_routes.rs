@@ -52,7 +52,7 @@ pub(crate) mod connector_routes;
 mod context_routes;
 mod cowd_routes;
 mod cross_plane_routes;
-mod iacc_routes;
+mod matrix_mfg_routes;
 pub(crate) mod memory_routes;
 mod message_routes;
 mod profile_routes;
@@ -166,7 +166,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(context_routes::router())
         .merge(cowd_routes::router())
         .merge(cross_plane_routes::router())
-        .merge(iacc_routes::router())
+        .merge(matrix_mfg_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
@@ -1047,7 +1047,7 @@ mod tests {
             .iter()
             .any(|capability| capability["id"] == "cowd.structured_data.core"));
         assert!(capabilities.iter().any(|capability| capability["id"]
-            == "iacc.manufacturing.application"
+            == "mfg.manufacturing.application"
             && capability["layer"] == "application"));
     }
 
@@ -1096,12 +1096,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iacc_app_route_projects_manufacturing_as_application_descriptor() {
+    async fn mfg_app_route_projects_manufacturing_as_application_descriptor() {
         let app = api_router(test_state());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/app")
+                    .uri("/api/apps/mfg/app")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1112,7 +1112,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["app_id"], "iacc.manufacturing");
+        assert_eq!(json["app_id"], "mfg.manufacturing");
         assert_eq!(json["layer"], "application");
         assert!(json["cowd_capabilities"]
             .as_array()
@@ -1168,7 +1168,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/source-packs/upsert")
+                    .uri("/api/matrix/source-packs/upsert")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1182,7 +1182,7 @@ mod tests {
                                 "refresh_mode": "incremental",
                                 "entity_mappings": [{
                                     "source_entity": "plant",
-                                    "iacc_entity_type": "factory",
+                                    "matrix_entity_type": "factory",
                                     "source_key_field": "plant_id"
                                 }],
                                 "fact_mappings": [{
@@ -1211,7 +1211,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1248,7 +1248,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/evidence/build")
+                    .uri("/api/matrix/evidence/build")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1422,9 +1422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cowd_iacc_full_loop_passes_release_gate() {
-        let workspace = test_temp_dir("cowd-iacc-full-loop");
-        let config_home = test_temp_dir("cowd-iacc-full-loop-config");
+    async fn cowd_matrix_mfg_full_loop_passes_release_gate() {
+        let workspace = test_temp_dir("cowd-matrix-mfg-full-loop");
+        let config_home = test_temp_dir("cowd-matrix-mfg-full-loop-config");
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "session-full-loop";
         store
@@ -1456,7 +1456,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/source-packs/upsert")
+                    .uri("/api/matrix/source-packs/upsert")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1470,7 +1470,7 @@ mod tests {
                                 "refresh_mode": "incremental",
                                 "entity_mappings": [{
                                     "source_entity": "line",
-                                    "iacc_entity_type": "production_line",
+                                    "matrix_entity_type": "production_line",
                                     "source_key_field": "line_id"
                                 }],
                                 "fact_mappings": [{
@@ -1499,7 +1499,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1533,7 +1533,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/evidence/build")
+                    .uri("/api/matrix/evidence/build")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1611,16 +1611,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
-        let workspace = test_temp_dir("iacc-foundation");
-        let config_home = test_temp_dir("iacc-config");
+    async fn matrix_foundation_ingests_fact_and_builds_evidence_packet() {
+        let workspace = test_temp_dir("matrix-foundation");
+        let config_home = test_temp_dir("matrix-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
 
         let health = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/health")
+                    .uri("/api/matrix/health")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1633,12 +1633,12 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "request_id": "iacc-test-1",
-                            "session_id": "session-iacc",
+                            "request_id": "matrix-test-1",
+                            "session_id": "session-matrix",
                             "facts": [{
                                 "fact_id": "fact-gpu-shortage",
                                 "snapshot_id": "snapshot-week-24",
@@ -1670,7 +1670,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/attention/hot")
+                    .uri("/api/matrix/attention/hot")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1686,7 +1686,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/evidence/build")
+                    .uri("/api/matrix/evidence/build")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1710,19 +1710,19 @@ mod tests {
         let fetched = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/iacc/evidence/{packet_id}"))
+                    .uri(format!("/api/matrix/evidence/{packet_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert!(workspace.join(".cowd").join("iacc.sqlite").exists());
+        assert!(workspace.join(".cowd").join("matrix.sqlite").exists());
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn matrix_routes_alias_iacc_structured_fact_engine() {
+    async fn matrix_routes_expose_structured_fact_engine() {
         let workspace = test_temp_dir("matrix-foundation");
         let config_home = test_temp_dir("matrix-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
@@ -1737,27 +1737,29 @@ mod tests {
             )
             .await
             .unwrap();
-        let iacc_health = app
+        let matrix_health_again = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/health")
+                    .uri("/api/matrix/health")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(matrix_health.status(), StatusCode::OK);
-        assert_eq!(iacc_health.status(), StatusCode::OK);
+        assert_eq!(matrix_health_again.status(), StatusCode::OK);
         let matrix_health_body = to_bytes(matrix_health.into_body(), usize::MAX)
             .await
             .unwrap();
-        let iacc_health_body = to_bytes(iacc_health.into_body(), usize::MAX).await.unwrap();
+        let matrix_health_again_body = to_bytes(matrix_health_again.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let matrix_health_json: serde_json::Value =
             serde_json::from_slice(&matrix_health_body).unwrap();
-        let iacc_health_json: serde_json::Value =
-            serde_json::from_slice(&iacc_health_body).unwrap();
-        assert_eq!(matrix_health_json, iacc_health_json);
+        let matrix_health_again_json: serde_json::Value =
+            serde_json::from_slice(&matrix_health_again_body).unwrap();
+        assert_eq!(matrix_health_json, matrix_health_again_json);
 
         let ingest = app
             .clone()
@@ -1807,7 +1809,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "attention_id": attention_id,
-                            "problem_statement": "Matrix evidence should share IACC compatibility storage"
+                            "problem_statement": "Matrix evidence should share Matrix storage"
                         })
                         .to_string(),
                     ))
@@ -1830,32 +1832,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert!(workspace.join(".cowd").join("iacc.sqlite").exists());
+        assert!(workspace.join(".cowd").join("matrix.sqlite").exists());
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn iacc_fact_and_evidence_append_execution_outcomes_to_runtime_timeline() {
-        let workspace = test_temp_dir("iacc-outcome-timeline");
-        let config_home = test_temp_dir("iacc-outcome-config");
+    async fn matrix_fact_and_evidence_append_execution_outcomes_to_runtime_timeline() {
+        let workspace = test_temp_dir("matrix-outcome-timeline");
+        let config_home = test_temp_dir("matrix-outcome-config");
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let app = api_router(test_state_with_store_and_workspace(
             store,
             workspace.clone(),
             config_home,
         ));
-        let session_id = "iacc-outcome-session";
+        let session_id = "matrix-outcome-session";
 
         let ingest = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "request_id": "iacc-outcome-fact",
+                            "request_id": "matrix-outcome-fact",
                             "session_id": session_id,
                             "facts": [{
                                 "fact_id": "fact-outcome-stock",
@@ -1887,11 +1889,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/evidence/build")
+                    .uri("/api/matrix/evidence/build")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "request_id": "iacc-outcome-evidence",
+                            "request_id": "matrix-outcome-evidence",
                             "session_id": session_id,
                             "attention_id": attention_id,
                             "problem_statement": "Inventory balance outcome should reach timeline"
@@ -1943,9 +1945,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iacc_metric_recompute_projects_changes_and_attention() {
-        let workspace = test_temp_dir("iacc-metric");
-        let config_home = test_temp_dir("iacc-metric-config");
+    async fn matrix_metric_recompute_projects_changes_and_attention() {
+        let workspace = test_temp_dir("matrix-metric");
+        let config_home = test_temp_dir("matrix-metric-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
 
         let ingest = app
@@ -1953,7 +1955,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1993,7 +1995,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/metrics/recompute")
+                    .uri("/api/matrix/metrics/recompute")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2010,7 +2012,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/metrics/plan_bom_delta")
+                    .uri("/api/matrix/metrics/plan_bom_delta")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2022,7 +2024,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/changes")
+                    .uri("/api/matrix/changes")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2036,7 +2038,7 @@ mod tests {
         let hot = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/iacc/attention/hot")
+                    .uri("/api/matrix/attention/hot")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2058,9 +2060,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iacc_evidence_context_and_incident_create_agent_graph() {
-        let workspace = test_temp_dir("iacc-agent");
-        let config_home = test_temp_dir("iacc-agent-config");
+    async fn matrix_evidence_context_and_mfg_incident_create_agent_graph() {
+        let workspace = test_temp_dir("matrix-mfg-agent");
+        let config_home = test_temp_dir("matrix-mfg-agent-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
 
         let ingest = app
@@ -2068,7 +2070,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/facts/ingest")
+                    .uri("/api/matrix/facts/ingest")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -2096,7 +2098,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/metrics/recompute")
+                    .uri("/api/matrix/metrics/recompute")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2114,7 +2116,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/evidence/build")
+                    .uri("/api/matrix/evidence/build")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -2142,7 +2144,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/iacc/evidence/{packet_id}/context"))
+                    .uri(format!("/api/matrix/evidence/{packet_id}/context"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2153,7 +2155,7 @@ mod tests {
         let context_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             context_json["context_item"]["id"],
-            format!("iacc:evidence:{packet_id}")
+            format!("matrix:evidence:{packet_id}")
         );
 
         let incident = app
@@ -2161,7 +2163,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/iacc/incidents")
+                    .uri("/api/apps/mfg/incidents")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -2182,12 +2184,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|node| node["id"] == "iacc_researcher"));
+            .any(|node| node["id"] == "matrix_researcher"));
         assert!(incident_json["agent_graph"]["evidence"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|evidence| evidence["reference"] == format!("iacc:evidence:{packet_id}")));
+            .any(|evidence| evidence["reference"] == format!("mfg:evidence:{packet_id}")));
         let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
 
         let analysis = app
@@ -2195,7 +2197,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/iacc/incidents/{incident_id}/analyze"))
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2223,7 +2225,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/iacc/analyses/{analysis_id}"))
+                    .uri(format!("/api/apps/mfg/analyses/{analysis_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2237,7 +2239,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!(
-                        "/api/iacc/analyses/{analysis_id}/actions/{action_id}/execute"
+                        "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -2269,7 +2271,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/iacc/executions/{execution_id}/feedback"))
+                    .uri(format!("/api/apps/mfg/executions/{execution_id}/feedback"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -2292,7 +2294,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/iacc/executions/{execution_id}"))
+                    .uri(format!("/api/apps/mfg/executions/{execution_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2303,7 +2305,7 @@ mod tests {
         let fetched = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/iacc/incidents/{incident_id}"))
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )

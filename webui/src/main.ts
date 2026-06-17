@@ -18,7 +18,7 @@ const routes = [
   { path: '/tools', component: () => import('./pages/ToolsPage.vue') },
   { path: '/gateway', component: () => import('./pages/GatewayPage.vue') },
   ...pluginRoutes,
-  { path: '/iacc', redirect: '/apps/mfg' },
+  { path: '/mfg', redirect: '/apps/mfg' },
   { path: '/audit', component: () => import('./pages/AuditPage.vue') },
   { path: '/settings', component: () => import('./pages/SettingsPage.vue') },
 ];

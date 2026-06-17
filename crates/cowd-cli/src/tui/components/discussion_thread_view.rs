@@ -225,10 +225,10 @@ impl DiscussionThreadView {
         // Content (wrap to fit)
         let content_lines: Vec<&str> = contribution.content.lines().collect();
         for content_line in content_lines {
-            let truncated = if content_line.len() > 90 {
-                &content_line[..90]
+            let truncated = if content_line.chars().count() > 90 {
+                content_line.chars().take(90).collect::<String>()
             } else {
-                content_line
+                content_line.to_string()
             };
             lines.push(Line::from(Span::styled(
                 format!("    \"{truncated}\""),

@@ -122,8 +122,8 @@ test('gateway page exposes connector and cross-plane controls', async ({ page })
   await expect(page.getByRole('button', { name: 'Execute action' })).toBeVisible();
 });
 
-test('iacc page exposes manufacturing application workbench controls', async ({ page }) => {
-  await page.goto('/index.html#/iacc');
+test('mfg page exposes manufacturing application workbench controls', async ({ page }) => {
+  await page.goto('/index.html#/apps/mfg');
   await expect(page.getByRole('heading', { name: 'Manufacturing command center' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Data plane and source packs' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Manufacturing data ingestion' })).toBeVisible();
@@ -169,7 +169,7 @@ test('composer model workspace and command controls are clickable', async ({ pag
 
   await page.getByRole('button', { name: /root/ }).click();
   await expect(page.getByRole('heading', { name: 'Workspace picker' })).toBeVisible();
-  await page.getByRole('button', { name: /Current workspace|dev-iacc/ }).click();
+  await page.getByRole('button', { name: /Current workspace|dev-mfg/ }).click();
   await expect(page.locator('.companion-tabs button.active')).toContainText('Workspace');
 
   await page.getByRole('button', { name: /Commands/ }).click();

@@ -3,10 +3,10 @@ use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::iacc::{
-    IaccActionExecution, IaccComputeJob, IaccDataPlaneIngestPlan, IaccEvidencePacket, IaccFact,
-    IaccSkillRun,
+use crate::matrix::{
+    MatrixComputeJob, MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact,
 };
+use crate::mfg::{MfgActionExecution, MfgSkillRun};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,8 +92,8 @@ impl CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccDataPlaneIngestPlan> for CowdExecutionOutcome {
-    fn from(plan: &IaccDataPlaneIngestPlan) -> Self {
+impl From<&MatrixDataPlaneIngestPlan> for CowdExecutionOutcome {
+    fn from(plan: &MatrixDataPlaneIngestPlan) -> Self {
         Self {
             outcome_id: format!("structured-ingest:{}", plan.batch_id),
             kind: CowdExecutionOutcomeKind::StructuredIngest,
@@ -103,7 +103,7 @@ impl From<&IaccDataPlaneIngestPlan> for CowdExecutionOutcome {
                 "Plan {} ingests {} estimated rows from {} partition {}.",
                 plan.batch_id, plan.estimated_rows, plan.source_ref, plan.partition_ref
             ),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             refs: vec![
                 CowdExecutionRef {
                     ref_type: "structured_source".to_string(),
@@ -124,12 +124,12 @@ impl From<&IaccDataPlaneIngestPlan> for CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccComputeJob> for CowdExecutionOutcome {
-    fn from(job: &IaccComputeJob) -> Self {
+impl From<&MatrixComputeJob> for CowdExecutionOutcome {
+    fn from(job: &MatrixComputeJob) -> Self {
         Self {
             outcome_id: format!("manufacturing-compute:{}", job.job_id),
             kind: CowdExecutionOutcomeKind::ManufacturingCompute,
-            status: status_from_iacc(&job.status),
+            status: status_from_matrix(&job.status),
             title: format!("Manufacturing compute {}", job.trigger_fact_type),
             summary: format!(
                 "Compute job {} status {} affects {} metrics.",
@@ -137,9 +137,9 @@ impl From<&IaccComputeJob> for CowdExecutionOutcome {
                 job.status,
                 job.metric_ids.len()
             ),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             refs: vec![CowdExecutionRef {
-                ref_type: "iacc_compute_job".to_string(),
+                ref_type: "matrix_compute_job".to_string(),
                 id: job.job_id.clone(),
                 label: Some(job.trigger_fact_type.clone()),
             }],
@@ -151,8 +151,8 @@ impl From<&IaccComputeJob> for CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccFact> for CowdExecutionOutcome {
-    fn from(fact: &IaccFact) -> Self {
+impl From<&MatrixFact> for CowdExecutionOutcome {
+    fn from(fact: &MatrixFact) -> Self {
         let mut refs = vec![CowdExecutionRef {
             ref_type: "structured_fact".to_string(),
             id: fact.fact_id.clone(),
@@ -177,7 +177,7 @@ impl From<&IaccFact> for CowdExecutionOutcome {
                 fact.entity_refs.len(),
                 fact.confidence
             ),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             refs,
             evidence_refs: fact
                 .source_ref
@@ -191,8 +191,8 @@ impl From<&IaccFact> for CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccEvidencePacket> for CowdExecutionOutcome {
-    fn from(packet: &IaccEvidencePacket) -> Self {
+impl From<&MatrixEvidencePacket> for CowdExecutionOutcome {
+    fn from(packet: &MatrixEvidencePacket) -> Self {
         Self {
             outcome_id: format!("structured-evidence:{}", packet.packet_id),
             kind: CowdExecutionOutcomeKind::StructuredEvidence,
@@ -209,7 +209,7 @@ impl From<&IaccEvidencePacket> for CowdExecutionOutcome {
                 packet.change_evidence.len(),
                 packet.confidence
             ),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             refs: vec![CowdExecutionRef {
                 ref_type: "structured_evidence".to_string(),
                 id: packet.packet_id.clone(),
@@ -232,26 +232,26 @@ impl From<&IaccEvidencePacket> for CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccActionExecution> for CowdExecutionOutcome {
-    fn from(execution: &IaccActionExecution) -> Self {
+impl From<&MfgActionExecution> for CowdExecutionOutcome {
+    fn from(execution: &MfgActionExecution) -> Self {
         Self {
             outcome_id: format!("manufacturing-action:{}", execution.execution_id),
             kind: CowdExecutionOutcomeKind::ManufacturingAction,
-            status: status_from_iacc(&execution.status),
+            status: status_from_matrix(&execution.status),
             title: execution.title.clone(),
             summary: format!(
-                "IACC action {} for incident {} is {}.",
+                "MFG action {} for incident {} is {}.",
                 execution.action_id, execution.incident_id, execution.status
             ),
-            domain: Some("iacc".to_string()),
+            domain: Some("mfg".to_string()),
             refs: vec![
                 CowdExecutionRef {
-                    ref_type: "iacc_execution".to_string(),
+                    ref_type: "mfg_execution".to_string(),
                     id: execution.execution_id.clone(),
                     label: Some(execution.action_type.clone()),
                 },
                 CowdExecutionRef {
-                    ref_type: "iacc_incident".to_string(),
+                    ref_type: "mfg_incident".to_string(),
                     id: execution.incident_id.clone(),
                     label: None,
                 },
@@ -268,8 +268,8 @@ impl From<&IaccActionExecution> for CowdExecutionOutcome {
     }
 }
 
-impl From<&IaccSkillRun> for CowdExecutionOutcome {
-    fn from(run: &IaccSkillRun) -> Self {
+impl From<&MfgSkillRun> for CowdExecutionOutcome {
+    fn from(run: &MfgSkillRun) -> Self {
         Self {
             outcome_id: format!(
                 "skill-run:{}",
@@ -278,18 +278,18 @@ impl From<&IaccSkillRun> for CowdExecutionOutcome {
                     .unwrap_or_else(|| format!("{}:{}", run.incident_id, run.skill_id))
             ),
             kind: CowdExecutionOutcomeKind::SkillRun,
-            status: status_from_iacc(&run.status),
+            status: status_from_matrix(&run.status),
             title: format!("Skill run {}", run.skill_id),
             summary: run.summary.clone(),
-            domain: Some("iacc".to_string()),
+            domain: Some("mfg".to_string()),
             refs: vec![
                 CowdExecutionRef {
-                    ref_type: "iacc_skill".to_string(),
+                    ref_type: "mfg_skill".to_string(),
                     id: run.skill_id.clone(),
                     label: run.agent_node_id.clone(),
                 },
                 CowdExecutionRef {
-                    ref_type: "iacc_incident".to_string(),
+                    ref_type: "mfg_incident".to_string(),
                     id: run.incident_id.clone(),
                     label: None,
                 },
@@ -314,7 +314,7 @@ impl From<&IaccSkillRun> for CowdExecutionOutcome {
     }
 }
 
-fn status_from_iacc(status: &str) -> CowdExecutionOutcomeStatus {
+fn status_from_matrix(status: &str) -> CowdExecutionOutcomeStatus {
     match status {
         "planned" | "dry_run_ready" | "queued_for_human_review" => {
             CowdExecutionOutcomeStatus::Planned
@@ -345,14 +345,15 @@ fn created_at_ms(created_at: DateTime<Utc>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::{
-        IaccComputeJob, IaccComputeJobInput, IaccDataPlaneIngestPlan, IaccDataPlaneWatermark,
-        IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccFactInput,
+    use crate::matrix::{
+        MatrixComputeJob, MatrixComputeJobInput, MatrixDataPlaneIngestPlan,
+        MatrixDataPlaneWatermark, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
+        MatrixFactInput,
     };
 
     #[test]
     fn ingest_plan_outcome_preserves_structured_refs_and_metrics() {
-        let plan = IaccDataPlaneIngestPlan {
+        let plan = MatrixDataPlaneIngestPlan {
             batch_id: "batch-1".to_string(),
             source_ref: "pack-1".to_string(),
             fact_type: "inventory_balance".to_string(),
@@ -362,7 +363,7 @@ mod tests {
             estimated_rows: 12,
             affected_metric_ids: vec!["stock_on_hand".to_string()],
             compute_jobs: Vec::new(),
-            watermark: IaccDataPlaneWatermark {
+            watermark: MatrixDataPlaneWatermark {
                 source_ref: "pack-1".to_string(),
                 fact_type: "inventory_balance".to_string(),
                 partition_ref: "2026-W30".to_string(),
@@ -392,7 +393,7 @@ mod tests {
 
     #[test]
     fn compute_job_outcome_maps_status_and_evidence_refs() {
-        let mut job = IaccComputeJob::from_input(IaccComputeJobInput {
+        let mut job = MatrixComputeJob::from_input(MatrixComputeJobInput {
             job_id: Some("job-1".to_string()),
             trigger_fact_type: "inventory_balance".to_string(),
             trigger_fact_refs: vec!["fact-1".to_string()],
@@ -408,12 +409,12 @@ mod tests {
         assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Succeeded);
         assert_eq!(outcome.evidence_refs, vec!["fact-1"]);
         assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
-        assert_eq!(outcome.refs[0].ref_type, "iacc_compute_job");
+        assert_eq!(outcome.refs[0].ref_type, "matrix_compute_job");
     }
 
     #[test]
     fn structured_fact_outcome_keeps_fact_source_and_metric_refs() {
-        let fact = IaccFact::from_input(IaccFactInput {
+        let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-1".to_string()),
             snapshot_id: Some("snapshot-1".to_string()),
             fact_type: "inventory_balance".to_string(),
@@ -445,13 +446,13 @@ mod tests {
 
     #[test]
     fn structured_evidence_outcome_keeps_packet_refs_and_partial_status() {
-        let mut packet = IaccEvidencePacket::new("Inventory balance needs review");
+        let mut packet = MatrixEvidencePacket::new("Inventory balance needs review");
         packet.packet_id = "evidence-1".to_string();
         packet.attention_id = Some("attention-1".to_string());
         packet.metric_evidence = vec![serde_json::json!({"metric_id": "stock_on_hand"})];
-        packet.source_refs = vec![IaccEvidenceSourceRef {
+        packet.source_refs = vec![MatrixEvidenceSourceRef {
             kind: "fact".to_string(),
-            reference: "iacc:fact:fact-1".to_string(),
+            reference: "matrix:fact:fact-1".to_string(),
             summary: "Fact source".to_string(),
         }];
 
@@ -461,7 +462,7 @@ mod tests {
         assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredEvidence);
         assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Partial);
         assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
-        assert_eq!(outcome.evidence_refs, vec!["iacc:fact:fact-1"]);
+        assert_eq!(outcome.evidence_refs, vec!["matrix:fact:fact-1"]);
         assert!(event.refs.iter().any(|reference| {
             reference.ref_type == "structured_evidence" && reference.id == "evidence-1"
         }));

@@ -292,7 +292,7 @@ fn summarize_tool_output(tool_name: &str, content: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("?");
             let short_q = if query.len() > 60 {
-                format!("{}...", &query[..57])
+                format!("{}...", query.chars().take(57).collect::<String>())
             } else {
                 query.to_string()
             };
@@ -405,7 +405,7 @@ fn summarize_tool_output(tool_name: &str, content: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("?");
             let short_goal = if g.len() > 60 {
-                format!("{}...", &g[..57])
+                format!("{}...", g.chars().take(57).collect::<String>())
             } else {
                 g.to_string()
             };

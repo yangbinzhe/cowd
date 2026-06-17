@@ -18,7 +18,7 @@ const routes = [
   { id: 'skills', path: '/#/skills' },
   { id: 'agents', path: '/#/agents' },
   { id: 'gateway', path: '/#/gateway' },
-  { id: 'iacc', path: '/#/iacc' },
+  { id: 'mfg', path: '/#/apps/mfg' },
   { id: 'audit', path: '/#/audit' },
   { id: 'settings', path: '/#/settings' },
 ];

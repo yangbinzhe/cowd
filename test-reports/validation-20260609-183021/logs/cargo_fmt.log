@@ -1,2 +1,0 @@
-[2026-06-09T18:30:21+08:00] START cargo_fmt
-[2026-06-09T18:30:23+08:00] END cargo_fmt status=0 elapsed=2s target_before=10569475360 target_after=10569475360

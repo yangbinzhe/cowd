@@ -375,8 +375,8 @@ impl L4KnowledgeView {
 
                 // Source agent (truncated)
                 let agent = entry.source_agent.as_deref().unwrap_or("?");
-                let agent_short = if agent.len() > 12 {
-                    format!("{}..", &agent[..10])
+                let agent_short = if agent.chars().count() > 12 {
+                    format!("{}..", agent.chars().take(10).collect::<String>())
                 } else {
                     agent.to_string()
                 };

@@ -45,6 +45,10 @@ tracing-appender = "0.2"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+default = []
+embedded-webui = []
+
 [lints.rust]
 unsafe_code = "allow"
 

@@ -24,7 +24,7 @@ export const webuiPagePlugins: WebuiPagePlugin[] = [
     apiNamespace: '/api/apps/mfg',
     routeRecord: {
       path: '/apps/mfg',
-      component: () => import('../pages/IaccPage.vue'),
+      component: () => import('../pages/MfgPage.vue'),
       meta: {
         pluginId: 'mfg',
         label: 'MFG',

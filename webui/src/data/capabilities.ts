@@ -97,7 +97,7 @@ export const capabilitySpecs: Record<CapabilityId, CapabilitySpec> = {
     '技能全集、投影、运行记录和 WebUI/TUI 能力对齐集中管理。',
     [
       { id: 'catalog', label: 'Catalog', description: 'Installed and discovered skills with manifest health.' },
-      { id: 'projection', label: 'Projection', description: 'WebUI/TUI/CLI/IACC surface mapping and capability parity.' },
+      { id: 'projection', label: 'Projection', description: 'WebUI/TUI/CLI/MFG surface mapping and capability parity.' },
       { id: 'runs', label: 'Runs', description: 'Skill run history, validation, planning, and execution results.' },
       { id: 'governance', label: 'Governance', description: 'Permissions, evidence model, approval needs, and risk.' },
     ],
@@ -178,10 +178,10 @@ export const capabilitySpecs: Record<CapabilityId, CapabilitySpec> = {
       { label: 'Governance', value: 'Identities, grants, audit, executions' },
     ],
   ),
-  iacc: spec(
-    'iacc',
-    'IACC Manufacturing Application',
-    'IACC 是制造领域上层应用，运行在 cowd 内核的数据、记忆、上下文与跨平面能力之上。',
+  mfg: spec(
+    'mfg',
+    'MFG Manufacturing Application',
+    'MFG 是制造领域上层应用，运行在 cowd 内核的数据、记忆、上下文与跨平面能力之上。',
     [
       { id: 'data-plane', label: 'Data plane', description: 'Manufacturing data ingest planning, source packs, and connector runs.' },
       { id: 'entities', label: 'Entities', description: 'Manufacturing entities, source key resolution, relations, and impact paths.' },
@@ -189,12 +189,12 @@ export const capabilitySpecs: Record<CapabilityId, CapabilitySpec> = {
       { id: 'incidents', label: 'Incidents', description: 'Incident room, evidence quality, playbooks, skills, and actions.' },
     ],
     [
-      { label: 'Ingest manufacturing facts', kind: 'primary', endpoint: '/api/iacc/facts/ingest' },
-      { label: 'Plan compute job', kind: 'secondary', endpoint: '/api/iacc/compute/jobs/plan' },
-      { label: 'Generate report', kind: 'secondary', endpoint: '/api/iacc/cockpit/profiles/:id/reports/generate' },
+      { label: 'Ingest manufacturing facts', kind: 'primary', endpoint: '/api/matrix/facts/ingest' },
+      { label: 'Plan compute job', kind: 'secondary', endpoint: '/api/matrix/compute/jobs/plan' },
+      { label: 'Generate report', kind: 'secondary', endpoint: '/api/apps/mfg/cockpit/profiles/:id/reports/generate' },
     ],
     [
-      { label: 'API', value: '/api/iacc/app' },
+      { label: 'API', value: '/api/apps/mfg/app' },
       { label: 'Boundary', value: 'Application layer, not cowd kernel' },
       { label: 'Kernel dependency', value: 'Structured data, memory, context, cross-plane' },
     ],

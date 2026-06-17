@@ -3897,7 +3897,7 @@ where
 {
     let run = move || {
         let Some(client) =
-            crate::tui::projection_client::DaemonProjectionClient::from_running_gateway(
+            crate::tui::projection_client::DaemonProjectionClient::from_running_gateway_with_retry(
                 daemon_projection_auth_token(),
             )
             .map_err(|err| err.to_string())?

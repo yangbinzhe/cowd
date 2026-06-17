@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::iacc::{IaccImpactPath, IaccMetricDependency};
+use crate::matrix::MatrixMetricDependency;
+use crate::mfg::MfgImpactPath;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CowdGraphNode {
@@ -34,8 +35,8 @@ pub struct CowdGraphPath {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<&IaccMetricDependency> for CowdGraphPath {
-    fn from(dependency: &IaccMetricDependency) -> Self {
+impl From<&MatrixMetricDependency> for CowdGraphPath {
+    fn from(dependency: &MatrixMetricDependency) -> Self {
         let upstream = format!("metric:{}", dependency.upstream_metric_id);
         let downstream = format!("metric:{}", dependency.downstream_metric_id);
         Self {
@@ -75,8 +76,8 @@ impl From<&IaccMetricDependency> for CowdGraphPath {
     }
 }
 
-impl From<&IaccImpactPath> for CowdGraphPath {
-    fn from(path: &IaccImpactPath) -> Self {
+impl From<&MfgImpactPath> for CowdGraphPath {
+    fn from(path: &MfgImpactPath) -> Self {
         Self {
             path_id: format!("graph-path:{}", path.path_id),
             path_type: "impact_path".to_string(),
@@ -109,11 +110,11 @@ impl From<&IaccImpactPath> for CowdGraphPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::IaccMetricDependencyInput;
+    use crate::matrix::MatrixMetricDependencyInput;
 
     #[test]
     fn metric_dependency_maps_to_graph_path_with_structured_refs() {
-        let dependency = IaccMetricDependency::from_input(IaccMetricDependencyInput {
+        let dependency = MatrixMetricDependency::from_input(MatrixMetricDependencyInput {
             dependency_id: Some("dep-1".to_string()),
             upstream_metric_id: "material_shortage_risk".to_string(),
             downstream_metric_id: "order_delivery_risk".to_string(),

@@ -12,8 +12,8 @@ use axum::{
 use commands::{SkillInfo, SkillRegistry, SkillRouter};
 use runtime::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack, IaccEvidencePacket, IaccIncident, IaccOperationalAnalysis,
-    IaccSkillManifest, IaccStore, IaccStoreError,
+    server_manufacturing_skill_pack, MatrixEvidencePacket, MatrixStore, MatrixStoreError,
+    MfgIncident, MfgOperationalAnalysis, MfgSkillManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -177,12 +177,12 @@ async fn skills_projection_handler(
         actions: projection_actions(&surface),
         facets: projection_facets(&items),
         queue: SkillProjectionQueue {
-            source: "iacc.skill_runs",
-            run_list_endpoint: "/api/iacc/incidents/:incident_id/skills",
+            source: "mfg.skill_runs",
+            run_list_endpoint: "/api/apps/mfg/incidents/:incident_id/skills",
             supports_watch: surface != "cli",
         },
         governance: SkillProjectionGovernance {
-            evidence_model: "iacc.evidence.packet + agent_evidence + tool_invocation",
+            evidence_model: "matrix.evidence.packet + agent_evidence + tool_invocation",
             tool_fact_model: "tool.execution_plan + tool.invocation.runtime_event",
             approval_model: "quality_gate + cross_plane_policy",
         },
@@ -217,8 +217,8 @@ async fn skill_files_handler(
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let item = find_catalog_item(&state, &id)?;
-    if item.scope == "iacc" {
-        return Ok(Json(iacc_virtual_files(&item)));
+    if item.scope == "mfg" {
+        return Ok(Json(mfg_virtual_files(&item)));
     }
 
     let root = local_skill_root(&item)?;
@@ -247,7 +247,7 @@ async fn skill_file_raw_handler(
     let item = find_catalog_item(&state, &id)?;
     let requested = query.path.unwrap_or_else(|| "SKILL.md".to_string());
 
-    if item.scope == "iacc" {
+    if item.scope == "mfg" {
         if requested != "SKILL.md" {
             return Err(api_error(StatusCode::NOT_FOUND, "skill file not found"));
         }
@@ -257,7 +257,7 @@ async fn skill_file_raw_handler(
             "skill": item,
             "path": "SKILL.md",
             "content_type": "text/markdown",
-            "content": iacc_virtual_skill_markdown(&item),
+            "content": mfg_virtual_skill_markdown(&item),
         })));
     }
 
@@ -282,12 +282,12 @@ async fn skill_validate_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let item = find_catalog_item(&state, &id)?;
     let validation = match item.scope.as_str() {
-        "iacc" => {
-            let skill = find_iacc_skill(&item.name)
-                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+        "mfg" => {
+            let skill = find_mfg_skill(&item.name)
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
             serde_json::json!({
                 "status": "pass",
-                "scope": "iacc",
+                "scope": "mfg",
                 "skill_id": skill.skill_id,
                 "checks": [
                     {"id":"manifest.present","status":"pass"},
@@ -324,7 +324,7 @@ async fn skill_plan_handler(
     Json(request): Json<SkillActionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let item = find_catalog_item(&state, &id)?;
-    if item.scope != "iacc" {
+    if item.scope != "mfg" {
         return Ok(Json(serde_json::json!({
             "kind": "skills.action.plan",
             "schema_version": 1,
@@ -337,16 +337,16 @@ async fn skill_plan_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_iacc_store(&state)
+    let store = open_matrix_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let (incident, analysis, packet) = iacc_incident_context(&store, &incident_id)?;
+    let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
     let mut plan = plan_server_manufacturing_skills(
         &incident,
         analysis.as_ref(),
         packet.as_ref(),
         request.limit.unwrap_or(3).clamp(1, 8),
     );
-    if let Some(skill) = find_iacc_skill(&item.name) {
+    if let Some(skill) = find_mfg_skill(&item.name) {
         let contains_selected = plan
             .selected_skills
             .iter()
@@ -387,7 +387,7 @@ async fn skill_run_handler(
     Json(request): Json<SkillActionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let item = find_catalog_item(&state, &id)?;
-    if item.scope != "iacc" {
+    if item.scope != "mfg" {
         return Ok(Json(serde_json::json!({
             "kind": "skills.action.run",
             "schema_version": 1,
@@ -400,11 +400,11 @@ async fn skill_run_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_iacc_store(&state)
+    let store = open_matrix_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let (incident, analysis, packet) = iacc_incident_context(&store, &incident_id)?;
-    let skill = find_iacc_skill(&item.name)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
+    let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
+    let skill = find_mfg_skill(&item.name)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
     let run = run_server_manufacturing_skill(&incident, &skill, analysis.as_ref(), packet.as_ref());
     let run = store
         .record_skill_run(&run)
@@ -424,7 +424,7 @@ async fn skill_run_handler(
 async fn skill_runs_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)
+    let store = open_matrix_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let runs = store
         .list_recent_skill_runs(50)
@@ -440,7 +440,7 @@ async fn skill_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)
+    let store = open_matrix_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let run = store
         .get_skill_run(&id)
@@ -456,7 +456,7 @@ async fn skill_run_get_handler(
 fn collect_skill_catalog(state: &AppState) -> std::io::Result<Vec<SkillCatalogItem>> {
     let mut items = server_manufacturing_skill_pack()
         .into_iter()
-        .map(iacc_skill_catalog_item)
+        .map(mfg_skill_catalog_item)
         .collect::<Vec<_>>();
 
     let registry = SkillRegistry::discover(&state.workspace_root);
@@ -483,24 +483,24 @@ fn find_catalog_item(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill not found"))
 }
 
-fn find_iacc_skill(skill_id: &str) -> Option<IaccSkillManifest> {
+fn find_mfg_skill(skill_id: &str) -> Option<MfgSkillManifest> {
     server_manufacturing_skill_pack()
         .into_iter()
         .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
 }
 
-fn open_iacc_store(state: &AppState) -> Result<IaccStore, IaccStoreError> {
-    let path = iacc_store_path(&state.workspace_root);
+fn open_matrix_store(state: &AppState) -> Result<MatrixStore, MatrixStoreError> {
+    let path = matrix_store_path(&state.workspace_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            IaccStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            MatrixStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
     }
-    IaccStore::open(path)
+    MatrixStore::open(path)
 }
 
-fn iacc_store_path(workspace_root: &std::path::Path) -> PathBuf {
-    workspace_root.join(".cowd").join("iacc.sqlite")
+fn matrix_store_path(workspace_root: &std::path::Path) -> PathBuf {
+    workspace_root.join(".cowd").join("matrix.sqlite")
 }
 
 fn required_incident_id(
@@ -514,21 +514,21 @@ fn required_incident_id(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "incident_id is required"))
 }
 
-fn iacc_incident_context(
-    store: &IaccStore,
+fn mfg_incident_context(
+    store: &MatrixStore,
     incident_id: &str,
 ) -> Result<
     (
-        IaccIncident,
-        Option<IaccOperationalAnalysis>,
-        Option<IaccEvidencePacket>,
+        MfgIncident,
+        Option<MfgOperationalAnalysis>,
+        Option<MatrixEvidencePacket>,
     ),
     (StatusCode, Json<ErrorResponse>),
 > {
     let incident = store
         .get_incident(incident_id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     let analysis = store.analyze_incident(incident_id).ok();
     let packet = incident
         .evidence_packet_id
@@ -537,9 +537,9 @@ fn iacc_incident_context(
     Ok((incident, analysis, packet))
 }
 
-fn iacc_skill_catalog_item(skill: IaccSkillManifest) -> SkillCatalogItem {
-    let risk = iacc_risk(&skill).to_string();
-    let tags = vec![skill.domain.clone(), "iacc".to_string()];
+fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
+    let risk = mfg_risk(&skill).to_string();
+    let tags = vec![skill.domain.clone(), "mfg".to_string()];
     let capabilities = skill
         .output_actions
         .iter()
@@ -547,11 +547,11 @@ fn iacc_skill_catalog_item(skill: IaccSkillManifest) -> SkillCatalogItem {
         .cloned()
         .collect();
     SkillCatalogItem {
-        id: format!("iacc:{}", skill.skill_id),
+        id: format!("mfg:{}", skill.skill_id),
         name: skill.skill_id,
         description: Some(skill.role),
-        scope: "iacc".to_string(),
-        source: "runtime.iacc.server_manufacturing".to_string(),
+        scope: "mfg".to_string(),
+        source: "runtime.mfg.server_manufacturing".to_string(),
         domain: Some(skill.domain),
         status: "ready".to_string(),
         risk,
@@ -679,28 +679,28 @@ fn collect_skill_files(
     Ok(())
 }
 
-fn iacc_virtual_files(item: &SkillCatalogItem) -> serde_json::Value {
+fn mfg_virtual_files(item: &SkillCatalogItem) -> serde_json::Value {
     serde_json::json!({
         "kind": "skills.files",
         "schema_version": 1,
         "skill": item,
-        "root": "virtual://iacc/server-manufacturing",
+        "root": "virtual://mfg/server-manufacturing",
         "primary": "SKILL.md",
         "files": [{
             "path": "SKILL.md",
             "name": "SKILL.md",
             "kind": "file",
-            "size": iacc_virtual_skill_markdown(item).len(),
+            "size": mfg_virtual_skill_markdown(item).len(),
             "primary": true
         }],
     })
 }
 
-fn iacc_virtual_skill_markdown(item: &SkillCatalogItem) -> String {
+fn mfg_virtual_skill_markdown(item: &SkillCatalogItem) -> String {
     format!(
         "# {}\n\n{}\n\n- Scope: {}\n- Source: {}\n- Domain: {}\n- Status: {}\n- Risk: {}\n\n## Tools\n{}\n\n## Required Evidence\n{}\n\n## Capabilities\n{}\n",
         item.name,
-        item.description.as_deref().unwrap_or("IACC manufacturing skill."),
+        item.description.as_deref().unwrap_or("MFG manufacturing skill."),
         item.scope,
         item.source,
         item.domain.as_deref().unwrap_or("manufacturing"),
@@ -723,7 +723,7 @@ fn markdown_list(values: &[String]) -> String {
         .join("\n")
 }
 
-fn iacc_risk(skill: &IaccSkillManifest) -> &'static str {
+fn mfg_risk(skill: &MfgSkillManifest) -> &'static str {
     if skill
         .output_actions
         .iter()
@@ -865,8 +865,8 @@ fn projection_facets(items: &[SkillCatalogItem]) -> SkillProjectionFacets {
 
 fn projection_diagnostics(items: &[SkillCatalogItem]) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    if !items.iter().any(|item| item.scope == "iacc") {
-        diagnostics.push("iacc_skill_pack_unavailable".to_string());
+    if !items.iter().any(|item| item.scope == "mfg") {
+        diagnostics.push("mfg_skill_pack_unavailable".to_string());
     }
     if !items.iter().any(|item| item.scope == "local") {
         diagnostics.push("local_skill_registry_empty".to_string());
@@ -909,12 +909,12 @@ mod tests {
     }
 
     #[test]
-    fn iacc_virtual_markdown_includes_skill_fields() {
+    fn mfg_virtual_markdown_includes_skill_fields() {
         let item = SkillCatalogItem {
-            id: "iacc:test".to_string(),
+            id: "mfg:test".to_string(),
             name: "test".to_string(),
             description: Some("desc".to_string()),
-            scope: "iacc".to_string(),
+            scope: "mfg".to_string(),
             source: "runtime".to_string(),
             domain: Some("manufacturing".to_string()),
             status: "ready".to_string(),
@@ -926,7 +926,7 @@ mod tests {
             path: None,
             shadowed_by: None,
         };
-        let markdown = iacc_virtual_skill_markdown(&item);
+        let markdown = mfg_virtual_skill_markdown(&item);
         assert!(markdown.contains("# test"));
         assert!(markdown.contains("tool.a"));
         assert!(markdown.contains("evidence.a"));

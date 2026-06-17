@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::iacc::{
-    IaccDataPlaneIngestPlan, IaccDataPlaneWatermark, IaccEvidencePacket, IaccFact,
-    IaccSourceDeltaPlan, IaccSourceEntityMapping, IaccSourceFactMapping, IaccSourcePack,
+use crate::matrix::{
+    MatrixDataPlaneIngestPlan, MatrixDataPlaneWatermark, MatrixEvidencePacket, MatrixFact,
+    MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourcePack,
 };
 use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
@@ -177,23 +177,23 @@ pub struct CowdDeltaPlan {
     pub planned_at: DateTime<Utc>,
 }
 
-impl From<&IaccSourcePack> for CowdStructuredSource {
-    fn from(pack: &IaccSourcePack) -> Self {
+impl From<&MatrixSourcePack> for CowdStructuredSource {
+    fn from(pack: &MatrixSourcePack) -> Self {
         let mut mappings = pack
             .entity_mappings
             .iter()
-            .map(|mapping| CowdStructuredMapping::from_iacc_entity(&pack.source_pack_id, mapping))
+            .map(|mapping| CowdStructuredMapping::from_matrix_entity(&pack.source_pack_id, mapping))
             .collect::<Vec<_>>();
         mappings.extend(
             pack.fact_mappings.iter().map(|mapping| {
-                CowdStructuredMapping::from_iacc_fact(&pack.source_pack_id, mapping)
+                CowdStructuredMapping::from_matrix_fact(&pack.source_pack_id, mapping)
             }),
         );
 
         Self {
             source_id: pack.source_pack_id.clone(),
             source_name: pack.source_name.clone(),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             owner: pack.owner.clone(),
             access_mode: pack.access_mode.clone(),
             refresh_mode: pack.refresh_mode.clone(),
@@ -211,13 +211,13 @@ impl From<&IaccSourcePack> for CowdStructuredSource {
 
 impl CowdStructuredMapping {
     #[must_use]
-    pub fn from_iacc_entity(source_ref: &str, mapping: &IaccSourceEntityMapping) -> Self {
+    pub fn from_matrix_entity(source_ref: &str, mapping: &MatrixSourceEntityMapping) -> Self {
         Self {
             mapping_id: format!("{source_ref}:entity:{}", mapping.source_entity),
             source_ref: source_ref.to_string(),
             source_collection: mapping.source_entity.clone(),
             target_kind: CowdStructuredTargetKind::Entity,
-            target_type: mapping.iacc_entity_type.clone(),
+            target_type: mapping.matrix_entity_type.clone(),
             metric_key: None,
             key_fields: vec![mapping.source_key_field.clone()],
             measure_fields: Vec::new(),
@@ -228,7 +228,7 @@ impl CowdStructuredMapping {
     }
 
     #[must_use]
-    pub fn from_iacc_fact(source_ref: &str, mapping: &IaccSourceFactMapping) -> Self {
+    pub fn from_matrix_fact(source_ref: &str, mapping: &MatrixSourceFactMapping) -> Self {
         Self {
             mapping_id: format!("{source_ref}:fact:{}", mapping.fact_type),
             source_ref: source_ref.to_string(),
@@ -245,20 +245,20 @@ impl CowdStructuredMapping {
     }
 }
 
-impl From<&IaccSourceEntityMapping> for CowdStructuredMapping {
-    fn from(mapping: &IaccSourceEntityMapping) -> Self {
-        Self::from_iacc_entity("iacc:inline-source", mapping)
+impl From<&MatrixSourceEntityMapping> for CowdStructuredMapping {
+    fn from(mapping: &MatrixSourceEntityMapping) -> Self {
+        Self::from_matrix_entity("matrix:inline-source", mapping)
     }
 }
 
-impl From<&IaccSourceFactMapping> for CowdStructuredMapping {
-    fn from(mapping: &IaccSourceFactMapping) -> Self {
-        Self::from_iacc_fact("iacc:inline-source", mapping)
+impl From<&MatrixSourceFactMapping> for CowdStructuredMapping {
+    fn from(mapping: &MatrixSourceFactMapping) -> Self {
+        Self::from_matrix_fact("matrix:inline-source", mapping)
     }
 }
 
-impl From<&IaccFact> for CowdStructuredFact {
-    fn from(fact: &IaccFact) -> Self {
+impl From<&MatrixFact> for CowdStructuredFact {
+    fn from(fact: &MatrixFact) -> Self {
         Self {
             fact_id: fact.fact_id.clone(),
             snapshot_id: fact.snapshot_id.clone(),
@@ -273,7 +273,7 @@ impl From<&IaccFact> for CowdStructuredFact {
             source_ref: fact.source_ref.clone(),
             confidence: fact.confidence,
             raw_hash: fact.raw_hash.clone(),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
         }
     }
 }
@@ -303,13 +303,13 @@ impl CowdStructuredFact {
     }
 }
 
-impl From<&IaccEvidencePacket> for CowdStructuredEvidence {
-    fn from(packet: &IaccEvidencePacket) -> Self {
+impl From<&MatrixEvidencePacket> for CowdStructuredEvidence {
+    fn from(packet: &MatrixEvidencePacket) -> Self {
         Self {
             evidence_id: packet.packet_id.clone(),
             attention_id: packet.attention_id.clone(),
             problem_statement: packet.problem_statement.clone(),
-            domain: Some("iacc".to_string()),
+            domain: Some("matrix".to_string()),
             business_context: packet.business_context.clone(),
             metric_evidence: packet.metric_evidence.clone(),
             change_evidence: packet.change_evidence.clone(),
@@ -390,8 +390,8 @@ pub struct CowdStructuredMemorySummary {
     pub raw_hash: String,
 }
 
-impl From<&IaccDataPlaneWatermark> for CowdWatermark {
-    fn from(watermark: &IaccDataPlaneWatermark) -> Self {
+impl From<&MatrixDataPlaneWatermark> for CowdWatermark {
+    fn from(watermark: &MatrixDataPlaneWatermark) -> Self {
         Self {
             source_ref: watermark.source_ref.clone(),
             fact_type: watermark.fact_type.clone(),
@@ -403,8 +403,8 @@ impl From<&IaccDataPlaneWatermark> for CowdWatermark {
     }
 }
 
-impl From<&IaccDataPlaneIngestPlan> for CowdIngestPlan {
-    fn from(plan: &IaccDataPlaneIngestPlan) -> Self {
+impl From<&MatrixDataPlaneIngestPlan> for CowdIngestPlan {
+    fn from(plan: &MatrixDataPlaneIngestPlan) -> Self {
         Self {
             batch_id: plan.batch_id.clone(),
             source_ref: plan.source_ref.clone(),
@@ -433,8 +433,8 @@ impl From<&IaccDataPlaneIngestPlan> for CowdIngestPlan {
     }
 }
 
-impl From<&IaccSourceDeltaPlan> for CowdDeltaPlan {
-    fn from(plan: &IaccSourceDeltaPlan) -> Self {
+impl From<&MatrixSourceDeltaPlan> for CowdDeltaPlan {
+    fn from(plan: &MatrixSourceDeltaPlan) -> Self {
         Self {
             source_ref: plan.source_pack_id.clone(),
             fact_types: plan.fact_types.clone(),
@@ -448,25 +448,25 @@ impl From<&IaccSourceDeltaPlan> for CowdDeltaPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::{
-        IaccComputeJobInput, IaccDataPlaneIngestPlan, IaccDataPlaneWatermark,
-        IaccEvidenceSourceRef, IaccFactInput,
+    use crate::matrix::{
+        MatrixComputeJobInput, MatrixDataPlaneIngestPlan, MatrixDataPlaneWatermark,
+        MatrixEvidenceSourceRef, MatrixFactInput,
     };
 
     #[test]
-    fn structured_source_from_iacc_pack_preserves_owner_policy_and_mappings() {
-        let pack = IaccSourcePack {
+    fn structured_source_from_matrix_pack_preserves_owner_policy_and_mappings() {
+        let pack = MatrixSourcePack {
             source_pack_id: "pack-1".to_string(),
             source_name: "erp".to_string(),
             owner: "ops".to_string(),
             access_mode: "read_only".to_string(),
             refresh_mode: "incremental".to_string(),
-            entity_mappings: vec![IaccSourceEntityMapping {
+            entity_mappings: vec![MatrixSourceEntityMapping {
                 source_entity: "item_master".to_string(),
-                iacc_entity_type: "material".to_string(),
+                matrix_entity_type: "material".to_string(),
                 source_key_field: "item_id".to_string(),
             }],
-            fact_mappings: vec![IaccSourceFactMapping {
+            fact_mappings: vec![MatrixSourceFactMapping {
                 source_table: "inventory_snapshots".to_string(),
                 fact_type: "inventory_balance".to_string(),
                 metric_key: "stock_on_hand".to_string(),
@@ -487,7 +487,7 @@ mod tests {
         let source = CowdStructuredSource::from(&pack);
 
         assert_eq!(source.source_id, "pack-1");
-        assert_eq!(source.domain.as_deref(), Some("iacc"));
+        assert_eq!(source.domain.as_deref(), Some("matrix"));
         assert_eq!(source.owner, "ops");
         assert_eq!(source.quality_rules, vec!["quantity_non_negative"]);
         assert_eq!(source.mappings.len(), 2);
@@ -508,8 +508,8 @@ mod tests {
     }
 
     #[test]
-    fn ingest_plan_from_iacc_preserves_idempotency_watermark_and_jobs() {
-        let plan = IaccDataPlaneIngestPlan {
+    fn ingest_plan_from_matrix_preserves_idempotency_watermark_and_jobs() {
+        let plan = MatrixDataPlaneIngestPlan {
             batch_id: "batch-1".to_string(),
             source_ref: "pack-1".to_string(),
             fact_type: "inventory_balance".to_string(),
@@ -518,16 +518,16 @@ mod tests {
             replay_policy: "replace_partition_by_idempotency_key".to_string(),
             estimated_rows: 42,
             affected_metric_ids: vec!["stock_on_hand".to_string()],
-            compute_jobs: vec![IaccComputeJobInput {
+            compute_jobs: vec![MatrixComputeJobInput {
                 job_id: Some("job-1".to_string()),
                 trigger_fact_type: "inventory_balance".to_string(),
-                trigger_fact_refs: vec!["iacc:data-plane-batch:batch-1".to_string()],
+                trigger_fact_refs: vec!["matrix:data-plane-batch:batch-1".to_string()],
                 entity_scope: Some("site:cn-1".to_string()),
                 period: Some("2026-06-14".to_string()),
                 metric_ids: vec!["stock_on_hand".to_string()],
                 priority: Some(0.9),
             }],
-            watermark: IaccDataPlaneWatermark {
+            watermark: MatrixDataPlaneWatermark {
                 source_ref: "pack-1".to_string(),
                 fact_type: "inventory_balance".to_string(),
                 partition_ref: "2026-06-14".to_string(),
@@ -554,8 +554,8 @@ mod tests {
     }
 
     #[test]
-    fn structured_fact_and_evidence_from_iacc_preserve_refs_and_confidence() {
-        let fact = IaccFact::from_input(IaccFactInput {
+    fn structured_fact_and_evidence_from_matrix_preserve_refs_and_confidence() {
+        let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-1".to_string()),
             snapshot_id: Some("snapshot-1".to_string()),
             fact_type: "inventory_balance".to_string(),
@@ -570,9 +570,9 @@ mod tests {
             confidence: Some(0.8),
             raw_hash: Some("sha256:test".to_string()),
         });
-        let mut packet = IaccEvidencePacket::new("inventory changed");
+        let mut packet = MatrixEvidencePacket::new("inventory changed");
         packet.packet_id = "packet-1".to_string();
-        packet.source_refs.push(IaccEvidenceSourceRef {
+        packet.source_refs.push(MatrixEvidenceSourceRef {
             kind: "fact".to_string(),
             reference: "fact-1".to_string(),
             summary: "inventory fact".to_string(),
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn structured_fact_memory_summary_keeps_reference_without_raw_payload_copy() {
-        let fact = IaccFact::from_input(IaccFactInput {
+        let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-1".to_string()),
             snapshot_id: Some("snapshot-1".to_string()),
             fact_type: "inventory_balance".to_string(),
@@ -625,9 +625,9 @@ mod tests {
 
     #[test]
     fn structured_evidence_context_item_uses_summary_and_source_refs() {
-        let mut packet = IaccEvidencePacket::new("supplier delivery risk changed");
+        let mut packet = MatrixEvidencePacket::new("supplier delivery risk changed");
         packet.packet_id = "packet-1".to_string();
-        packet.source_refs.push(IaccEvidenceSourceRef {
+        packet.source_refs.push(MatrixEvidenceSourceRef {
             kind: "fact".to_string(),
             reference: "fact-1".to_string(),
             summary: "inventory fact".to_string(),

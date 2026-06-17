@@ -1,3 +1,0 @@
-[2026-06-09T14:17:16+08:00] START session_lifecycle
-v0.9.68 session lifecycle scenario passed
-[2026-06-09T14:17:17+08:00] END session_lifecycle status=0 elapsed=1s target_before=2206646099 target_after=2206646099

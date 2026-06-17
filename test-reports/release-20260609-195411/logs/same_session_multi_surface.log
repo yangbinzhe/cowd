@@ -1,3 +1,0 @@
-[2026-06-09T19:55:03+08:00] START same_session_multi_surface
-v0.9.56 same-session multi-surface sync scenario passed
-[2026-06-09T19:55:04+08:00] END same_session_multi_surface status=0 elapsed=1s target_before=2217462044 target_after=2217462044

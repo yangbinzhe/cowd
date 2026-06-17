@@ -8,10 +8,11 @@ use axum::{
     Json, Router,
 };
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
-use runtime::iacc::{
-    server_manufacturing_skill_pack, IaccDataPlaneIngestPlanInput, IaccEvidencePacket,
-    IaccEvidenceSourceRef, IaccStore, IaccStoreError,
+use runtime::matrix::{
+    MatrixDataPlaneIngestPlanInput, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixStore,
+    MatrixStoreError,
 };
+use runtime::mfg::server_manufacturing_skill_pack;
 use runtime::projection::CowdProjection;
 use runtime::quality_gate::CowdStructuredQualityGate;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
@@ -87,7 +88,7 @@ async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 async fn structured_sources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_source_packs(100)
         .map_err(store_error)?
@@ -105,7 +106,7 @@ async fn structured_source_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let Some(source_pack) = store.get_source_pack(&id).map_err(store_error)? else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -117,9 +118,9 @@ async fn structured_source_get_handler(
 
 async fn structured_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(input): Json<IaccDataPlaneIngestPlanInput>,
+    Json(input): Json<MatrixDataPlaneIngestPlanInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let plan = store.plan_data_plane_ingest(input).map_err(store_error)?;
     Ok(Json(CowdIngestPlan::from(&plan)))
 }
@@ -127,7 +128,7 @@ async fn structured_ingest_plan_handler(
 async fn structured_facts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_facts(100)
         .map_err(store_error)?
@@ -144,7 +145,7 @@ async fn structured_facts_handler(
 async fn structured_evidence_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_evidence_packets(100)
         .map_err(store_error)?
@@ -161,7 +162,7 @@ async fn structured_evidence_handler(
 async fn structured_watermarks_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_iacc_store(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_data_plane_watermarks(100)
         .map_err(store_error)?
@@ -204,18 +205,18 @@ where
         "count": count,
         "limit": limit,
         "source": "cowd.structured_data.core",
-        "backing": "iacc_adapter",
+        "backing": "matrix",
         "list_status": "ready",
     })
 }
 
 async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
-    let store_path = iacc_store_path(&state.workspace_root);
+    let store_path = matrix_store_path(&state.workspace_root);
     if let Some(parent) = store_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let (structured_indexes_ready, structured_watermark_persistent) =
-        match IaccStore::open(store_path) {
+        match MatrixStore::open(store_path) {
             Ok(store) => {
                 let indexes_ready = store.list_source_packs(1).is_ok()
                     && store.list_facts(1).is_ok()
@@ -289,13 +290,13 @@ fn graph_skill_quality_contract_smoke() -> bool {
         return false;
     }
 
-    let mut packet = IaccEvidencePacket::new("release gate structured quality smoke");
+    let mut packet = MatrixEvidencePacket::new("release gate structured quality smoke");
     packet.packet_id = "release-gate-smoke".to_string();
     packet.confidence = 0.9;
     packet
         .metric_evidence
         .push(serde_json::json!({"metric": "material_shortage_risk"}));
-    packet.source_refs.push(IaccEvidenceSourceRef {
+    packet.source_refs.push(MatrixEvidenceSourceRef {
         kind: "fact".to_string(),
         reference: "structured-fact:release-gate-smoke".to_string(),
         summary: "release gate smoke fact".to_string(),
@@ -308,26 +309,26 @@ fn graph_skill_quality_contract_smoke() -> bool {
             .contains(&"structured-fact:release-gate-smoke".to_string())
 }
 
-fn open_iacc_store(state: &AppState) -> Result<IaccStore, (StatusCode, Json<ErrorResponse>)> {
-    let path = iacc_store_path(&state.workspace_root);
+fn open_matrix_store(state: &AppState) -> Result<MatrixStore, (StatusCode, Json<ErrorResponse>)> {
+    let path = matrix_store_path(&state.workspace_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to create iacc store directory: {error}"),
+                format!("failed to create matrix store directory: {error}"),
             )
         })?;
     }
-    IaccStore::open(path).map_err(store_error)
+    MatrixStore::open(path).map_err(store_error)
 }
 
-fn iacc_store_path(workspace_root: &Path) -> std::path::PathBuf {
-    workspace_root.join(".cowd").join("iacc.sqlite")
+fn matrix_store_path(workspace_root: &Path) -> std::path::PathBuf {
+    workspace_root.join(".cowd").join("matrix.sqlite")
 }
 
-fn store_error(error: IaccStoreError) -> (StatusCode, Json<ErrorResponse>) {
+fn store_error(error: MatrixStoreError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }

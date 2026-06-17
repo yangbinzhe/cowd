@@ -34,15 +34,8 @@ pub(crate) fn resolve_static_webui_source() -> StaticWebUiSource {
         }
         tracing::warn!(
             path = %source.path.display(),
-            "COWD_WEBUI_DIR does not contain index.html; trying fallback paths"
+            "COWD_WEBUI_DIR does not contain index.html; trying packaged asset paths"
         );
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let source = StaticWebUiSource::new("source-tree:webui", cwd.join("webui"));
-        if source.available {
-            return source;
-        }
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -128,6 +121,7 @@ mod tests {
         let source = resolve_static_webui_source();
 
         assert_ne!(source.path, dir);
+        assert_ne!(source.kind, "source-tree:webui");
         assert!(!source.kind.is_empty());
         restore_env(previous);
         let _ = std::fs::remove_dir_all(dir);

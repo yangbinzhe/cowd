@@ -118,6 +118,14 @@ pub struct PromptCacheEvent {
     pub token_drop: u32,
 }
 
+fn preview_chars(value: &str, max_chars: usize) -> String {
+    let mut preview: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
 /// Streaming API contract. Implementors produce AssistantEvents lazily.
 /// Consumers poll the stream and process each event as it arrives.
 ///
@@ -1382,12 +1390,7 @@ where
         }
 
         self.record_turn_started(&user_input);
-        self.record_context_event(
-            "user_input",
-            "user",
-            &user_input[..user_input.len().min(200)],
-            8,
-        );
+        self.record_context_event("user_input", "user", &preview_chars(&user_input, 200), 8);
         self.session
             .write()
             .await
@@ -1544,7 +1547,7 @@ where
                                     model_stream_events.push((
                                         "text_delta".into(),
                                         "assistant".into(),
-                                        text[..text.len().min(80)].to_string(),
+                                        preview_chars(&text, 80),
                                         3,
                                     ));
                                     if let Some(ref cb) = self.sse_callback {
@@ -1560,7 +1563,7 @@ where
                                     model_stream_events.push((
                                         "thinking".into(),
                                         "reasoning".into(),
-                                        thinking[..thinking.len().min(80)].to_string(),
+                                        preview_chars(&thinking, 80),
                                         2,
                                     ));
                                     if let Some(ref cb) = self.sse_callback {
@@ -2171,7 +2174,7 @@ where
                                 source: memory::types::MemorySource::Import,
                                 title: format!(
                                     "collaboration-synthesis: {}",
-                                    &task[..task.len().min(80)]
+                                    preview_chars(&task, 80)
                                 ),
                                 content: synthesis,
                                 embedding: None,
@@ -3715,8 +3718,8 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
-        PromptCacheEvent, RuntimeError, StaticToolExecutor,
+        preview_chars, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
+        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
     use crate::agent_collaboration::{
         AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
@@ -3757,6 +3760,15 @@ mod tests {
         events: Vec<AssistantEvent>,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+
+    #[test]
+    fn preview_chars_handles_multibyte_text() {
+        let text = "再次美化模型与状态展示，确保中文截断不会 panic".repeat(8);
+        let preview = preview_chars(&text, 20);
+
+        assert!(preview.ends_with("..."));
+        assert!(text.starts_with(preview.trim_end_matches("...")));
     }
 
     struct ScriptedApiClient {

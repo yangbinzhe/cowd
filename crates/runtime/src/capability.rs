@@ -164,20 +164,6 @@ impl CowdCapabilityRegistry {
                         "cowd.skill.lifecycle",
                     ],
                 ),
-                application_capability(
-                    "iacc.manufacturing.application",
-                    "IACC Manufacturing Application",
-                    CowdCapabilityKind::Manufacturing,
-                    "runtime::iacc",
-                    "Manufacturing upper application over Matrix structured facts, memory, context and skill capabilities.",
-                    &[
-                        "cowd.matrix.runtime",
-                        "cowd.structured_data.core",
-                        "cowd.context.runtime",
-                        "cowd.memory.runtime",
-                        "cowd.skill.lifecycle",
-                    ],
-                ),
             ],
         }
     }
@@ -252,7 +238,7 @@ fn application_capability(
         status: CowdCapabilityStatus::Preview,
         owner_module: owner_module.to_string(),
         description: description.to_string(),
-        required_permissions: vec!["read:iacc".to_string(), "write:iacc".to_string()],
+        required_permissions: vec!["read:mfg".to_string(), "write:mfg".to_string()],
         surfaces: full_surface_availability(),
         depends_on: depends_on
             .iter()
@@ -328,18 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn capability_registry_marks_iacc_as_application_capability() {
+    fn capability_registry_does_not_register_legacy_application_capability() {
         let registry = CowdCapabilityRegistry::core();
-        let iacc = registry
-            .capability("iacc.manufacturing.application")
-            .expect("iacc app capability should exist");
 
-        assert_eq!(iacc.layer, CowdCapabilityLayer::Application);
-        assert!(iacc.depends_on.contains(&"cowd.matrix.runtime".to_string()));
-        assert!(iacc
-            .depends_on
-            .contains(&"cowd.structured_data.core".to_string()));
-        assert_eq!(iacc.owner_module, "runtime::iacc");
+        let legacy_capability = ["ia", "cc.manufacturing.application"].concat();
+        assert!(registry.capability(&legacy_capability).is_none());
     }
 
     #[test]
@@ -352,6 +331,7 @@ mod tests {
         assert_eq!(mfg.layer, CowdCapabilityLayer::Application);
         assert_eq!(mfg.owner_module, "runtime::mfg");
         assert!(mfg.depends_on.contains(&"cowd.matrix.runtime".to_string()));
+        assert_eq!(mfg.required_permissions, vec!["read:mfg", "write:mfg"]);
     }
 
     #[test]

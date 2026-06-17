@@ -144,11 +144,12 @@ impl DeepCompactor {
 
         // --- Extract and persist decisions ---
         for decision in extract_decisions(&body) {
+            let decision_title: String = decision.chars().take(80).collect();
             orchestrator
                 .write(
                     MemoryLayer::L2,
                     MemoryCategory::Decision,
-                    &format!("Deep decision: {}", &decision[..decision.len().min(80)]),
+                    &format!("Deep decision: {decision_title}"),
                     &decision,
                     Priority::High,
                     MemorySource::Compression,
@@ -331,8 +332,12 @@ impl DeepCompactor {
         // Combine content digests.
         let combined_digest = format!(
             "**Previous context:**\n{}\n\n**New activity:**\n{}",
-            &previous[..previous.len().min(800)],
-            &incremental.content_digest[..incremental.content_digest.len().min(800)]
+            previous.chars().take(800).collect::<String>(),
+            incremental
+                .content_digest
+                .chars()
+                .take(800)
+                .collect::<String>()
         );
 
         IncrementalSummary {

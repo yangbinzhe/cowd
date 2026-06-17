@@ -17,7 +17,7 @@ const selectedLayer = ref('L2');
 const layerEntries = ref<any>({});
 const selectedEntryId = ref('');
 const query = ref('manufacturing quality anomaly');
-const symbolQuery = ref('iacc.manufacturing.line_a');
+const symbolQuery = ref('mfg.manufacturing.line_a');
 const searchResult = ref<any>({});
 const recallExplain = ref<any>({});
 const packet = ref<any>({});
@@ -38,7 +38,7 @@ const entryTitle = ref('Manufacturing quality signal');
 const entryContent = ref('Manufacturing line A reported repeated torque deviation on station 3 with batch QA-2026-0616.');
 const entryTags = ref('manufacturing,quality,webui');
 const entryPriority = ref('high');
-const sourceRef = ref('service://iacc/manufacturing/webui-line-a');
+const sourceRef = ref('service://mfg/manufacturing/webui-line-a');
 const factType = ref('manufacturing_quality_event');
 
 const layerItems = computed(() => Array.isArray(layers.value?.layers) ? layers.value.layers : []);
@@ -371,7 +371,7 @@ onMounted(refresh);
             <h2>Structured data core</h2>
             <span>cowd kernel data substrate</span>
           </header>
-          <p>结构化数据作为 cowd 底层数据处理能力沉淀，IACC 只作为制造领域应用在其上使用。</p>
+          <p>结构化数据作为 cowd 底层数据处理能力沉淀，MFG 只作为制造领域应用在其上使用。</p>
           <div class="memory-form-row">
             <label class="field-line">
               Source ref

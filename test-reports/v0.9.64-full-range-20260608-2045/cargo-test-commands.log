@@ -1,8 +1,0 @@
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-error: failed to create directory `/media/yi/Datas/workspace/cowd/.test-target-full/debug/.fingerprint/commands-e41adb8f96e4b004`
-
-Caused by:
-  No space left on device (os error 28)

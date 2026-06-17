@@ -413,10 +413,11 @@ impl ToolResultBudget {
 
         match self.truncation_strategy {
             TruncationStrategy::HeadOnly => {
+                let end = char_prefix_end(output, max_chars);
                 format!(
                     "{}...\n[truncated: {} chars omitted]",
-                    &output[..max_chars.min(output.len())],
-                    output.len().saturating_sub(max_chars)
+                    &output[..end],
+                    output.chars().count().saturating_sub(max_chars)
                 )
             }
             TruncationStrategy::TailOnly => {
@@ -808,6 +809,21 @@ mod tests {
         let truncated = budget.truncate(&long_text);
         assert!(truncated.contains("[truncated"));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn truncation_head_only_is_utf8_boundary_safe() {
+        let budget = ToolResultBudget {
+            per_tool_max_tokens: 750,
+            truncation_strategy: TruncationStrategy::HeadOnly,
+            ..ToolResultBudget::default()
+        };
+        let long_text = format!("{}{}", "─".repeat(1200), "中文内容".repeat(1200));
+
+        let truncated = budget.truncate(&long_text);
+
+        assert!(truncated.contains("[truncated"));
+        assert!(truncated.starts_with('─'));
     }
 
     #[test]

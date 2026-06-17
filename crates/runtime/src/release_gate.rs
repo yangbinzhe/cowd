@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability::CowdCapabilityRegistry;
-use crate::iacc::manufacturing_app_descriptor as iacc_manufacturing_app_descriptor;
 use crate::mfg::manufacturing_app_descriptor as mfg_manufacturing_app_descriptor;
 use crate::surface_contract::CowdSurfaceParityContract;
 
@@ -58,7 +57,6 @@ impl CowdReleaseGateReport {
     pub fn evaluate_with(evidence: CowdReleaseGateRuntimeEvidence) -> Self {
         let registry = CowdCapabilityRegistry::core();
         let surface = CowdSurfaceParityContract::from_registry(&registry);
-        let iacc = iacc_manufacturing_app_descriptor();
         let mfg = mfg_manufacturing_app_descriptor();
         let checks = vec![
             check(
@@ -86,14 +84,6 @@ impl CowdReleaseGateReport {
                         .cowd_capabilities
                         .contains(&"cowd.matrix.runtime".to_string()),
                 "MFG is an application descriptor over Matrix, Memory and runtime capabilities.",
-            ),
-            check(
-                "iacc.application.boundary",
-                iacc.layer == "application"
-                    && iacc
-                        .cowd_capabilities
-                        .contains(&"cowd.structured_data.core".to_string()),
-                "IACC is an application descriptor over cowd capabilities.",
             ),
             check(
                 "surface.webui_tui.parity",

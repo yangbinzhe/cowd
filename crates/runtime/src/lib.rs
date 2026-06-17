@@ -72,10 +72,10 @@ pub mod context_fanout;
 pub mod cowd_event;
 pub mod cross_plane_policy;
 pub mod execution_scheduler;
-pub mod iacc;
 pub mod intent_planner;
 pub mod joint_problem_solving;
 pub mod matrix;
+mod matrix_store;
 pub mod mfg;
 pub mod mirror;
 pub mod model_registry;
@@ -202,33 +202,6 @@ pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
-pub use iacc::{
-    iacc_reference, match_candidate, plan_server_manufacturing_skills,
-    run_server_manufacturing_skill, server_manufacturing_domain_pack,
-    server_manufacturing_ontology_pack, server_manufacturing_seed_plan,
-    server_manufacturing_skill_pack, skill_agent_node_id, IaccActionExecution,
-    IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem, IaccAttributionCandidate,
-    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection,
-    IaccCockpitReportDeliveryPayload, IaccCockpitReportDeliveryPayloadRequest,
-    IaccCockpitReportDeliveryReceipt, IaccCockpitReportDeliveryState, IaccCockpitReportRequest,
-    IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput,
-    IaccComputePlan, IaccConnectorQualityReport, IaccConnectorReceipt, IaccConnectorRun,
-    IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt, IaccDataPlane, IaccDataPlaneCapability,
-    IaccDataPlaneHealth, IaccDataPlaneIngestPlan, IaccDataPlaneIngestPlanInput,
-    IaccDataPlaneWatermark, IaccDomainPack, IaccDomainScenario, IaccDomainSeedPlan,
-    IaccDomainSeedResult, IaccEntity, IaccEntityConflictDecision, IaccEntityInput,
-    IaccEntityMatchCandidate, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccFactInput,
-    IaccHealth, IaccImpactHop, IaccImpactPath, IaccImpactTrace, IaccIncident, IaccMemoryCase,
-    IaccMetricAttentionPlan, IaccMetricAttentionScore, IaccMetricDefinition, IaccMetricDependency,
-    IaccMetricDependencyInput, IaccMetricLineage, IaccMetricRecomputeResult, IaccMetricSnapshot,
-    IaccMetricSnapshotItem, IaccMetricState, IaccMetricStatus, IaccOntologyConcept,
-    IaccOntologyMetricBinding, IaccOntologyPack, IaccOntologyRelation, IaccOperationalAnalysis,
-    IaccPlaybook, IaccPlaybookStep, IaccQualityGateDecision, IaccRecommendedAction, IaccRelation,
-    IaccRelationInput, IaccSeverity, IaccSkillManifest, IaccSkillPlan, IaccSkillRun,
-    IaccSourceDeltaPlan, IaccSourceEntityMapping, IaccSourceFactMapping, IaccSourceKey,
-    IaccSourceKind, IaccSourcePack, IaccSourcePackValidation, IaccSourceSnapshot,
-    IaccSqliteDataPlane, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
-};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,
@@ -239,30 +212,21 @@ pub use lane_events::{
     LaneEventName, LaneEventStatus, LaneFailureClass,
 };
 pub use matrix::{
-    matrix_reference, MatrixActionExecution, MatrixActionExecutionRequest, MatrixActionFeedback,
-    MatrixAttentionItem, MatrixAttributionCandidate, MatrixChangeEvent, MatrixCockpitProfile,
-    MatrixCockpitProfileInput, MatrixCockpitProjection, MatrixCockpitReportDeliveryPayload,
-    MatrixCockpitReportDeliveryPayloadRequest, MatrixCockpitReportDeliveryReceipt,
-    MatrixCockpitReportDeliveryState, MatrixCockpitReportRequest, MatrixCockpitReportSnapshot,
-    MatrixCockpitWidget, MatrixComputeJob, MatrixComputeJobInput, MatrixComputePlan,
-    MatrixConnectorQualityReport, MatrixConnectorReceipt, MatrixConnectorRun,
-    MatrixConnectorRunInput, MatrixCrossPlaneBridgeReceipt, MatrixDataPlane,
-    MatrixDataPlaneCapability, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixDomainPack,
-    MatrixDomainScenario, MatrixDomainSeedPlan, MatrixDomainSeedResult, MatrixEntity,
-    MatrixEntityConflictDecision, MatrixEntityInput, MatrixEntityMatchCandidate,
-    MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact, MatrixFactInput, MatrixHealth,
-    MatrixImpactHop, MatrixImpactPath, MatrixImpactTrace, MatrixIncident, MatrixMemoryCase,
-    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixMetricLineage,
-    MatrixMetricRecomputeResult, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
-    MatrixMetricStatus, MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack,
-    MatrixOntologyRelation, MatrixOperationalAnalysis, MatrixPlaybook, MatrixPlaybookStep,
-    MatrixQualityGateDecision, MatrixRecommendedAction, MatrixRelation, MatrixRelationInput,
-    MatrixSeverity, MatrixSkillManifest, MatrixSkillPlan, MatrixSkillRun, MatrixSourceDeltaPlan,
-    MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKey, MatrixSourceKind,
-    MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSqliteDataPlane,
-    MatrixStore, MatrixStoreError,
+    matrix_reference, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
+    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorQualityReport, MatrixConnectorReceipt,
+    MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane, MatrixDataPlaneCapability,
+    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
+    MatrixDataPlaneWatermark, MatrixEntity, MatrixEntityConflictDecision, MatrixEntityInput,
+    MatrixEntityMatchCandidate, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
+    MatrixFactInput, MatrixHealth, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
+    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
+    MatrixMetricDependencyInput, MatrixMetricLineage, MatrixMetricRecomputeResult,
+    MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState, MatrixMetricStatus,
+    MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
+    MatrixQualityGateDecision, MatrixRelation, MatrixRelationInput, MatrixSeverity,
+    MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKey,
+    MatrixSourceKind, MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
+    MatrixSqliteDataPlane, MatrixStore, MatrixStoreError, MATRIX_SCHEMA_VERSION,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -285,6 +249,21 @@ pub use mcp_stdio::{
     McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
+};
+pub use mfg::{
+    manufacturing_app_descriptor, mfg_ontology_pack, mfg_seed_plan,
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_domain_pack, server_manufacturing_ontology_pack,
+    server_manufacturing_seed_plan, server_manufacturing_skill_pack, skill_agent_node_id,
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgApplicationDescriptor,
+    MfgApplicationDomain, MfgApplicationSurface, MfgApplicationSurfaceKind,
+    MfgAttributionCandidate, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProfileInput,
+    MfgCockpitProjection, MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgCrossPlaneBridgeReceipt, MfgDomainPack,
+    MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult, MfgImpactPath, MfgIncident,
+    MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgPlaybookStep, MfgRecommendedAction,
+    MfgSkillManifest, MfgSkillPlan, MfgSkillRun,
 };
 pub use model_registry::{
     global_registry, CircularAliasError, ModelInfo, ModelRegistry, ModelRegistryError,

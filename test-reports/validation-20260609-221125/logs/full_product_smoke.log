@@ -1,3 +1,0 @@
-[2026-06-09T22:12:13+08:00] START full_product_smoke
-release full-product smoke passed
-[2026-06-09T22:12:14+08:00] END full_product_smoke status=0 elapsed=1s target_before=2218405245 target_after=2218405245

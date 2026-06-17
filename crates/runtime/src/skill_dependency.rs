@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::iacc::IaccSkillManifest;
+use crate::mfg::MfgSkillManifest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CowdSkillStructuredDependency {
@@ -15,10 +15,10 @@ pub struct CowdSkillStructuredDependency {
     pub quality_gate: String,
 }
 
-impl From<&IaccSkillManifest> for CowdSkillStructuredDependency {
-    fn from(skill: &IaccSkillManifest) -> Self {
+impl From<&MfgSkillManifest> for CowdSkillStructuredDependency {
+    fn from(skill: &MfgSkillManifest) -> Self {
         Self {
-            skill_id: format!("iacc:{}", skill.skill_id),
+            skill_id: format!("mfg:{}", skill.skill_id),
             domain: skill.domain.clone(),
             required_fact_types: skill
                 .input_fact_types
@@ -35,7 +35,7 @@ impl From<&IaccSkillManifest> for CowdSkillStructuredDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::server_manufacturing_skill_pack;
+    use crate::mfg::server_manufacturing_skill_pack;
 
     #[test]
     fn skill_dependency_declares_structured_fact_types_and_quality_gate() {
@@ -46,7 +46,7 @@ mod tests {
 
         let dependency = CowdSkillStructuredDependency::from(&skill);
 
-        assert_eq!(dependency.skill_id, "iacc:supply-risk-analyst");
+        assert_eq!(dependency.skill_id, "mfg:supply-risk-analyst");
         assert!(dependency
             .required_fact_types
             .contains(&"structured-fact-type:supply.material_shortage".to_string()));

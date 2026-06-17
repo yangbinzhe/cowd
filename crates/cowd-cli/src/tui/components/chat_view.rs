@@ -849,11 +849,14 @@ impl ChatView {
                             remaining = "";
                         }
                     } else {
+                        let mut chars = remaining.char_indices();
+                        let (_, ch) = chars.next().expect("remaining is not empty");
+                        let next = chars.next().map(|(idx, _)| idx).unwrap_or(remaining.len());
                         spans.push(Span::styled(
-                            remaining[..1].to_string(),
+                            ch.to_string(),
                             Style::default().fg(base_color),
                         ));
-                        remaining = &remaining[1..];
+                        remaining = &remaining[next..];
                     }
                 }
             }

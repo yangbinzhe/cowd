@@ -7,13 +7,13 @@ use memory::{
 };
 use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
 use runtime::doc_ingestion::{DocumentCategory, DocumentIngestor};
-use runtime::iacc::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill, IaccIncident,
-    IaccMetricStatus, IaccStore,
-};
 use runtime::platform::feishu::doc::{
     DocumentContent, DocumentElement, DocumentMetadata as FeishuDocumentMetadata, DocumentType,
     ListItem, TableCell, TableRow, TextElement,
+};
+use runtime::{
+    plan_server_manufacturing_skills, run_server_manufacturing_skill, MatrixMetricStatus,
+    MatrixStore, MfgIncident,
 };
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -87,7 +87,7 @@ fn complex_manufacturing_document() -> DocumentContent {
         elements: vec![
             DocumentElement::Heading {
                 level: 1,
-                elements: vec![text("Architecture: Manufacturing memory and IACC evaluation")],
+                elements: vec![text("Architecture: Manufacturing memory and Matrix/MFG evaluation")],
                 style: None,
             },
             DocumentElement::Paragraph {
@@ -104,7 +104,7 @@ fn complex_manufacturing_document() -> DocumentContent {
                     )],
                     children: vec![ListItem {
                         elements: vec![text(
-                            "Reviewer must see document evidence and structured IACC evidence.",
+                            "Reviewer must see document evidence and structured Matrix/MFG evidence.",
                         )],
                         children: Vec::new(),
                     }],
@@ -209,7 +209,7 @@ fn session_record(session_id: &str) -> SessionRecord {
         metadata_json: Some(
             serde_json::json!({
                 "workspace_root": "/tmp/cowd-full-capability-eval",
-                "scenario": "document_memory_fact_session_agents_iacc"
+                "scenario": "document_memory_fact_session_agents_matrix_mfg"
             })
             .to_string(),
         ),
@@ -221,7 +221,7 @@ fn session_record(session_id: &str) -> SessionRecord {
 }
 
 #[tokio::test]
-async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_and_iacc() {
+async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_and_matrix_mfg() {
     let tmp = tempfile::TempDir::new().expect("temp dir creates");
     let session_id = "session-full-capability-eval";
     let memory = CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
@@ -294,33 +294,32 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     assert!(!fact_result.is_consistent);
     assert!(fact_result.contradiction.is_some());
 
-    let iacc = IaccStore::in_memory().expect("iacc store opens");
-    iacc.seed_server_manufacturing_domain()
-        .expect("manufacturing seed runs");
-    let recompute = iacc.recompute_metrics().expect("metrics recompute");
+    let matrix = MatrixStore::in_memory().expect("matrix store opens");
+    matrix.seed_mfg_domain().expect("manufacturing seed runs");
+    let recompute = matrix.recompute_metrics().expect("metrics recompute");
     let shortage_state = recompute
         .metric_states
         .iter()
         .find(|state| state.metric_id == "material_shortage_risk")
         .expect("shortage metric state exists");
-    assert_eq!(shortage_state.status, IaccMetricStatus::Critical);
+    assert_eq!(shortage_state.status, MatrixMetricStatus::Critical);
 
     let attention = recompute
         .attention
         .iter()
         .find(|item| item.title.contains("material_shortage_risk"))
         .expect("shortage attention exists");
-    let packet = iacc
+    let packet = matrix
         .build_evidence_packet(
             Some(&attention.attention_id),
             Some("Full capability eval GPU shortage"),
         )
         .expect("evidence packet builds");
-    let mut incident = IaccIncident::new("Full capability eval GPU shortage");
+    let mut incident = MfgIncident::new("Full capability eval GPU shortage");
     incident.attention_id = packet.attention_id.clone();
     incident.evidence_packet_id = Some(packet.packet_id.clone());
-    iacc.create_incident(&incident).expect("incident creates");
-    let analysis = iacc
+    matrix.create_incident(&incident).expect("incident creates");
+    let analysis = matrix
         .analyze_incident(&incident.incident_id)
         .expect("incident analyzes");
     assert_eq!(
@@ -331,11 +330,11 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         analysis.recommended_actions[0].action_type,
         "supplier_recovery"
     );
-    let gate = iacc
+    let gate = matrix
         .evaluate_evidence_quality(&packet.packet_id)
         .expect("quality gate evaluates");
     assert_eq!(gate.decision, "pass");
-    let updated_packet = iacc
+    let updated_packet = matrix
         .get_evidence_packet(&packet.packet_id)
         .expect("updated packet loads")
         .expect("updated packet exists");
@@ -377,12 +376,13 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
             created_at_ms: 1_000,
         },
         AgentEvidence {
-            id: "evidence-executor-iacc".to_string(),
+            id: "evidence-executor-mfg".to_string(),
             node_id: "agent-executor".to_string(),
-            kind: "iacc_analysis".to_string(),
-            reference: format!("iacc:analysis:{}", analysis.analysis_id),
-            summary: "Executor generated IACC shortage attribution and supplier recovery action."
-                .to_string(),
+            kind: "mfg_analysis".to_string(),
+            reference: format!("mfg:analysis:{}", analysis.analysis_id),
+            summary:
+                "Executor generated Matrix/MFG shortage attribution and supplier recovery action."
+                    .to_string(),
             created_at_ms: 2_000,
         },
         AgentEvidence {
@@ -399,7 +399,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         node_id: "agent-reviewer".to_string(),
         reviewer: "agent-reviewer".to_string(),
         verdict: ReviewVerdict::Accept,
-        comment: "All evidence, memory, session, and IACC checks are connected.".to_string(),
+        comment: "All evidence, memory, session, and Matrix/MFG checks are connected.".to_string(),
         created_at_ms: 4_000,
     };
 

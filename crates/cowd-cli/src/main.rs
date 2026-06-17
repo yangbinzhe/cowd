@@ -3096,8 +3096,8 @@ fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
                                 text_parts.clear();
                             }
                             // Create a collapsed tool card via ToolStart event
-                            let preview = if input.len() > 100 {
-                                format!("{}...", &input[..100])
+                            let preview = if input.chars().count() > 100 {
+                                format!("{}...", input.chars().take(100).collect::<String>())
                             } else {
                                 input.clone()
                             };
@@ -3210,10 +3210,10 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
             description: skill.role,
             installed: true,
             category: skill.domain.clone(),
-            source: "iacc".to_string(),
+            source: "mfg".to_string(),
             status: "ready".to_string(),
             risk: risk.to_string(),
-            tags: vec![skill.domain, "iacc".to_string()],
+            tags: vec![skill.domain, "mfg".to_string()],
         });
     }
     match SkillRegistry::discover(&cwd).list() {
@@ -3411,7 +3411,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 }
             }
             let projection =
-                match tui::projection_client::DaemonProjectionClient::from_running_gateway(
+                match tui::projection_client::DaemonProjectionClient::from_running_gateway_with_retry(
                     daemon_projection_auth_token(),
                 ) {
                     Ok(client) => client,

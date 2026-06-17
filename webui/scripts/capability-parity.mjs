@@ -18,7 +18,7 @@ const modules = [
   { id: 'agents', page: 'AgentsPage.vue', routes: ['/api/agents', '/api/tasks'], tui: ['agent_team_panel.rs', 'agents_overlay.rs'], cli: ['prompt'] },
   { id: 'tools', page: 'ToolsPage.vue', routes: ['/api/tools', '/api/commands'], tui: ['activity_panel.rs', 'runtime_activity_panel.rs'], cli: ['prompt'] },
   { id: 'gateway', page: 'GatewayPage.vue', routes: ['/api/connectors', '/api/cross-plane', '/api/platforms'], tui: ['gateway_panel.rs', 'approval_cockpit_panel.rs'], cli: ['gateway'] },
-  { id: 'iacc', page: 'IaccPage.vue', routes: ['/api/iacc'], tui: ['goal_workbench_panel.rs', 'task_decomposition_view.rs'], cli: ['gateway'] },
+  { id: 'mfg', page: 'MfgPage.vue', routes: ['/api/apps/mfg', '/api/matrix'], tui: ['goal_workbench_panel.rs', 'task_decomposition_view.rs'], cli: ['gateway'] },
   { id: 'audit', page: 'AuditPage.vue', routes: ['/api/audit', '/api/usage', '/api/cowd/release-gate'], tui: ['export_dialog.rs', 'approval_cockpit_panel.rs'], cli: ['doctor'] },
 ];
 
@@ -93,8 +93,8 @@ const moduleReports = modules.map((module) => {
   if (!capability.length) findings.push('missing capability projection endpoint');
   if (!tui.length) findings.push('missing TUI projection evidence');
   if (!cli.length) findings.push('missing CLI core access evidence');
-  if (module.id === 'iacc' && !(pageText.includes('manufacturing application layer') && pageText.includes('cowd kernel'))) {
-    findings.push('IACC boundary text is missing from WebUI');
+  if (module.id === 'mfg' && !(pageText.includes('manufacturing application layer') && pageText.includes('cowd kernel'))) {
+    findings.push('MFG boundary text is missing from WebUI');
   }
   if (module.id === 'memory' && !referencesAny(pageText, ['Structured Data Core', 'structured'])) {
     findings.push('structured data core is not visible in Memory page');
@@ -135,7 +135,7 @@ const report = {
     'WebUI is the strongest management surface and must expose complete management workflows.',
     'TUI keeps the same core capability set with console-appropriate interaction density.',
     'CLI stays minimal and controls only kernel entry, import/view/status/start workflows.',
-    'IACC remains an application layer over cowd; structured data remains cowd kernel capability.',
+    'MFG remains an application layer over cowd; structured data remains cowd kernel capability.',
   ],
   totals: {
     modules: moduleReports.length,

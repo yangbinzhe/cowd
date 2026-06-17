@@ -1,5 +1,0 @@
-[2026-06-09T14:17:00+08:00] START same_session_multi_surface
-   Compiling cowd-cli v0.9.69 (/media/yi/Datas/workspace/cowd/crates/cowd-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.56s
-v0.9.56 same-session multi-surface sync scenario passed
-[2026-06-09T14:17:16+08:00] END same_session_multi_surface status=0 elapsed=16s target_before=2206646099 target_after=2206646099
