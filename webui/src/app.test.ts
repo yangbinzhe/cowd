@@ -301,6 +301,15 @@ describe('Cowd Vue WebUI shell', () => {
       if (url === '/api/matrix/health') return Promise.resolve(new Response(JSON.stringify({ status: 'ready', fact_count: 2, schema_version: 'test' })));
       if (url === '/api/matrix/metrics') return Promise.resolve(new Response(JSON.stringify({ metrics: [{ metric_id: 'torque_deviation_rate', name: 'Torque deviation', unit: '%' }] })));
       if (url === '/api/matrix/entities') return Promise.resolve(new Response(JSON.stringify({ entities: [{ entity_id: 'line-a', entity_type: 'manufacturing_line', canonical_key: 'line:A', display_name: 'Line A' }] })));
+      if (url === '/api/apps/mfg/decision-trace') return Promise.resolve(new Response(JSON.stringify({
+        kind: 'mfg.decision_trace',
+        chain: 'source -> fact -> metric -> evidence -> incident -> action -> report',
+        rows: [
+          { stage: 'source', ref: 'source-pack://line-a', domain: 'Matrix data plane', signal: 'mes', next: 'fact' },
+          { stage: 'fact', ref: 'fact-1', domain: 'cowd structured core', signal: 'manufacturing_quality_event', next: 'metric' },
+          { stage: 'action', ref: 'action-1', domain: 'MFG + cross-plane', signal: 'recommended', next: 'report' },
+        ],
+      })));
       if (url === '/api/apps/mfg/incidents') return Promise.resolve(new Response(JSON.stringify({ items: [{ incident_id: 'incident-1', title: 'Line A deviation' }] })));
       if (url === '/api/apps/mfg/skills') return Promise.resolve(new Response(JSON.stringify({ items: [{ skill_id: 'skill-1', name: 'Root cause analysis' }] })));
       if (url === '/api/apps/mfg/incidents/incident-1/room') return Promise.resolve(new Response(JSON.stringify({ analysis: { recommended_actions: [{ action_id: 'action-1', title: 'Notify QA' }] }, executions: [] })));
@@ -318,6 +327,12 @@ describe('Cowd Vue WebUI shell', () => {
     expect(wrapper.text()).toContain('Source pack upsert');
     expect(wrapper.text()).toContain('Manufacturing fact ingest');
     expect(wrapper.text()).toContain('Metric compute run');
+    expect(wrapper.text()).toContain('Decision Trace');
+    expect(wrapper.text()).toContain('source -> fact -> metric -> evidence -> incident -> action -> report');
+    expect(fetchMock).toHaveBeenCalledWith('/api/apps/mfg/decision-trace', expect.any(Object));
+    expect(wrapper.text()).toContain('Matrix turns structured manufacturing signals');
+    expect(wrapper.text()).toContain('cowd structured core');
+    expect(wrapper.text()).toContain('MFG + cross-plane');
   });
 
   it('loads audit, usage, and release gate from real governance endpoints', async () => {

@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
 const webuiRoot = path.join(repoRoot, 'webui');
-const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0616-前端彻底重构/10-模块化管理重构方案');
+const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0617-最终目标收口');
 const reportDir = path.join(planRoot, 'reports');
 const version = process.env.COWD_VERSION || 'v0.9.246';
 const gate = process.argv.includes('--gate');
@@ -24,6 +24,9 @@ const files = {
   page: path.join(webuiRoot, 'src/pages/ToolsPage.vue'),
   capabilities: path.join(webuiRoot, 'src/data/capabilities.ts'),
   styles: path.join(webuiRoot, 'src/styles/base.css'),
+  tuiPanel: path.join(repoRoot, 'crates/cowd-cli/src/tui/components/tool_ops_panel.rs'),
+  tuiProjection: path.join(repoRoot, 'crates/cowd-cli/src/tui/projection_client.rs'),
+  tuiState: path.join(repoRoot, 'crates/cowd-cli/src/tui/state.rs'),
 };
 
 const requiredBackendRoutes = [
@@ -78,6 +81,9 @@ const clientText = read(files.client);
 const pageText = read(files.page);
 const capabilitiesText = read(files.capabilities);
 const stylesText = read(files.styles);
+const tuiPanelText = read(files.tuiPanel);
+const tuiProjectionText = read(files.tuiProjection);
+const tuiStateText = read(files.tuiState);
 const failures = [];
 
 for (const route of hasAll(backendText, requiredBackendRoutes)) failures.push(`backend missing route ${route}`);
@@ -115,14 +121,55 @@ if (!backendText.includes('is_webui_generic_tool_allowed')) failures.push('backe
 if (!backendText.includes('validate_workspace_relative_path')) failures.push('backend workspace path guard missing');
 if (!backendText.includes('TOOL_CWD_LOCK')) failures.push('backend workspace cwd lock missing');
 
+const requiredTuiPanelTerms = [
+  'pub struct ToolOpsPanel',
+  'ToolOpsMode::Registry',
+  'ToolOpsMode::Operations',
+  'ToolOpsMode::Mutations',
+  'ToolOpsMode::Checkpoints',
+  'ToolOpsMode::Cache',
+  'ToolOpsMode::Ledger',
+  'ToolOpsMode::Risk',
+  'arm_apply_mutation',
+  'arm_restore_checkpoint',
+  'tool_ops_panel_requires_second_confirmation_for_dangerous_actions',
+];
+for (const term of hasAll(tuiPanelText, requiredTuiPanelTerms)) failures.push(`TUI ToolOpsPanel missing ${term}`);
+
+const requiredTuiProjectionTerms = [
+  'tool_execute',
+  'tool_cache_stats',
+  'tool_batch_readonly',
+  'tool_mutation_preview',
+  'tool_mutation_apply',
+  'tool_checkpoints',
+  'tool_checkpoint_create',
+  'tool_checkpoint_diff',
+  'tool_checkpoint_restore',
+  'tool_intent_plan',
+  'tool_context_fanout_plan',
+];
+for (const term of hasAll(tuiProjectionText, requiredTuiProjectionTerms)) failures.push(`TUI projection client missing ${term}`);
+
+const requiredTuiStateTerms = [
+  'ToolOpsPanel',
+  'TAB_TOOLS',
+  'handle_tool_ops_action',
+  'refresh_tool_ops_panel_overview',
+  'record_tool_ops_result',
+];
+for (const term of hasAll(tuiStateText, requiredTuiStateTerms)) failures.push(`TUI state missing ${term}`);
+
 const report = {
   version,
   generated_at: new Date().toISOString(),
   status: failures.length ? 'fail' : 'pass',
   scope: 'tool operation management closure: backend routes, WebUI client, page sections, navigation filters, and structured rendering',
+  tui_scope: 'TUI parity closure: ToolOpsPanel, projection client, sidebar action handling, and dangerous-action confirmation',
   required_sections: requiredSections,
   required_backend_routes: requiredBackendRoutes,
   required_client_methods: requiredClientMethods,
+  required_tui_projection_methods: requiredTuiProjectionTerms,
   failures,
 };
 

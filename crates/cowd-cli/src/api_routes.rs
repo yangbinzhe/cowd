@@ -1158,6 +1158,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_decision_trace_projects_matrix_to_cockpit_report() {
+        let workspace = test_temp_dir("mfg-decision-trace");
+        let config_home = test_temp_dir("mfg-decision-trace-config");
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+
+        let profile = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "profile_id": "trace-profile",
+                                "owner_ref": "user:test",
+                                "display_name": "Trace Profile",
+                                "focus_refs": ["line:A"],
+                                "focus_metric_ids": ["torque_deviation_rate"],
+                                "thresholds": {"torque_deviation_rate": 0.08},
+                                "cadence": "daily"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+
+        let report = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/trace-profile/reports/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "report": {
+                                "report_id": "trace-report",
+                                "cadence": "daily",
+                                "delivery_ref": "channel://test/operator",
+                                "note": "decision trace test"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/decision-trace?report_id=trace-report")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["kind"], "mfg.decision_trace");
+        assert_eq!(
+            json["chain"],
+            "source -> fact -> metric -> evidence -> incident -> action -> report"
+        );
+        assert!(json["rows"].as_array().unwrap().iter().any(|row| {
+            row["stage"] == "report"
+                && row["ref"] == "trace-report"
+                && row["endpoint"] == "/api/apps/mfg/cockpit/reports/:id/delivery-state"
+        }));
+        assert_eq!(json["objects"]["report"]["report_id"], "trace-report");
+    }
+
+    #[tokio::test]
     async fn cowd_structured_routes_expose_contract_and_ingest_plan_adapter() {
         let workspace = test_temp_dir("cowd-structured-index");
         let config_home = test_temp_dir("cowd-structured-config");

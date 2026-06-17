@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
 const webuiRoot = path.join(repoRoot, 'webui');
-const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0616-前端彻底重构/10-模块化管理重构方案');
+const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0617-最终目标收口');
 const reportDir = path.join(planRoot, 'reports');
 const version = process.env.COWD_VERSION || 'v0.9.245';
 const gate = process.argv.includes('--gate');
@@ -50,6 +50,32 @@ function titleOf(tag) {
 const files = walk(path.join(webuiRoot, 'src')).filter((file) => /\.(vue|ts)$/.test(file));
 const entries = [];
 const failures = [];
+const pageRequirements = [
+  {
+    file: 'webui/src/pages/MfgPage.vue',
+    terms: ['Decision Trace', 'source -> fact -> action', 'Matrix turns structured manufacturing signals', 'api.mfgDecisionTrace', '<DataTable :rows="decisionTraceRows"'],
+  },
+  {
+    file: 'webui/src/pages/MemoryPage.vue',
+    terms: ['Structured data core', 'api.structuredSources()', 'api.structuredFacts()', 'api.structuredEvidence()', 'api.structuredWatermarks()'],
+  },
+  {
+    file: 'webui/src/pages/ToolsPage.vue',
+    terms: ['Tool registry', 'Execution planner', 'Mutation transactions', 'Checkpoints', 'Tool cache', 'Tool ledger', 'Risk preflight'],
+  },
+  {
+    file: 'webui/src/pages/SkillsPage.vue',
+    terms: ['api.skillCatalog()', 'api.skillProjection()', 'api.skillRuns()', 'api.skillDetail', 'api.skillFiles', 'Runs and governance'],
+  },
+  {
+    file: 'webui/src/pages/AgentsPage.vue',
+    terms: ['Team profiles', 'Evaluation JSON', 'api.agentTeamProfiles()', 'api.agentAssemble', 'api.agentRuns()', 'api.taskAgentGraph'],
+  },
+  {
+    file: 'webui/src/pages/SettingsPage.vue',
+    terms: ['Model count', 'Profiles', 'Approval policy', 'Auth token', 'Appearance'],
+  },
+];
 
 for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
@@ -80,11 +106,24 @@ for (const file of files) {
   }
 }
 
+for (const requirement of pageRequirements) {
+  const file = path.join(repoRoot, requirement.file);
+  const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  if (!text) {
+    failures.push(`${requirement.file}: missing page for structured primary view audit`);
+    continue;
+  }
+  for (const term of requirement.terms) {
+    if (!text.includes(term)) failures.push(`${requirement.file}: missing structured primary view term ${term}`);
+  }
+}
+
 const report = {
   version,
   generated_at: new Date().toISOString(),
   status: failures.length ? 'fail' : 'pass',
   policy: 'Raw JSON is allowed only as named evidence, debug, detail, payload, result, or audit drill-down; primary management views must use structured UI.',
+  page_requirements: pageRequirements,
   totals: {
     raw_payload_instances: entries.length,
     failures: failures.length,

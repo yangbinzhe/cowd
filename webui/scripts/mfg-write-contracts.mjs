@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..', '..');
 const webuiRoot = resolve(__dirname, '..');
-const planRoot = resolve(repoRoot, '..', 'plan', '0616-前端彻底重构', '10-模块化管理重构方案');
+const planRoot = process.env.COWD_PLAN_ROOT || resolve(repoRoot, '..', 'plan', '0617-最终目标收口');
 const version = process.env.COWD_VERSION || 'v0.9.243';
 const sourcePath = resolve(webuiRoot, 'src', 'data', 'mfgWriteContracts.json');
 const reportPath = resolve(planRoot, 'reports', `${version}-mfg-write-contracts.json`);
@@ -20,16 +20,23 @@ const domains = new Set();
 
 for (const contract of contracts) {
   domains.add(contract.domain);
+  const serialized = JSON.stringify(contract);
+  if (serialized.includes('/api/iacc/') || serialized.includes('IACC')) {
+    failures.push(`${contract.id || 'unknown'} still uses legacy IACC runtime naming`);
+  }
   for (const key of requiredKeys) {
     if (!(key in contract) || contract[key] === '' || contract[key] === null) {
       failures.push(`${contract.id || 'unknown'} missing ${key}`);
     }
   }
-  if (contract.live && !contract.receipt) failures.push(`${contract.id} live endpoint lacks receipt requirement`);
-  if (contract.live && !contract.live_policy) failures.push(`${contract.id} live endpoint lacks live_policy`);
-  if (contract.endpoint.includes('/api/apps/mfg/') && !String(contract.kernel_boundary || '').includes('cowd')) {
+  if (String(contract.endpoint || '').startsWith('/api/apps/mfg/') && !String(contract.kernel_boundary || '').includes('cowd')) {
     failures.push(`${contract.id} does not explain cowd/MFG boundary`);
   }
+  if (String(contract.endpoint || '').startsWith('/api/matrix/') && !String(contract.kernel_boundary || '').match(/cowd|Matrix|structured/i)) {
+    failures.push(`${contract.id} does not explain Matrix/cowd structured boundary`);
+  }
+  if (contract.live && !contract.receipt) failures.push(`${contract.id} live endpoint lacks receipt requirement`);
+  if (contract.live && !contract.live_policy) failures.push(`${contract.id} live endpoint lacks live_policy`);
 }
 
 for (const domain of requiredDomains) {

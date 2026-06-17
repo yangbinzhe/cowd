@@ -1,0 +1,1 @@
+import{d as n,c as e,a as o,t as a,g as c,n as s}from"./index.dev-ZZ9KwfsG.js";const i={class:"empty-state"},l={key:0},p=n({__name:"EmptyState",props:{title:{},detail:{}},setup(t){return(r,d)=>(s(),e("div",i,[o("strong",null,a(t.title),1),t.detail?(s(),e("p",l,a(t.detail),1)):c("",!0)]))}});export{p as _};

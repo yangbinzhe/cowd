@@ -68,6 +68,81 @@ const contractSummary = computed(() => ({
   domains: Array.from(new Set((mfgWriteContracts as any[]).map((contract) => contract.domain))).join(', '),
   quarantined: (mfgWriteContracts as any[]).filter((contract) => String(contract.live_policy || '').includes('quarantined')).length,
 }));
+const decisionTraceRows = computed(() => {
+  const traceRows = items(state.value?.decisionTrace, 'rows');
+  if (traceRows.length) return traceRows;
+  const firstMetric = metrics.value[0] || {};
+  const firstEntity = entities.value[0] || {};
+  const firstAttention = attention.value[0] || {};
+  const firstIncident = incidents.value[0] || {};
+  const firstAction = recommendedActions.value[0] || {};
+  const reportRef = cockpitReportId.value || result.value?.report?.report?.report_id || result.value?.report_id || '';
+  return [
+    {
+      stage: 'source',
+      ref: `source-pack://${sourcePackId.value}`,
+      domain: 'Matrix data plane',
+      signal: state.value?.dataPlane?.status || state.value?.dataPlane?.mode || 'configured',
+      next: 'validate source pack / ingest plan',
+    },
+    {
+      stage: 'fact',
+      ref: state.value?.health?.fact_count ? `${state.value.health.fact_count} structured facts` : 'manufacturing_quality_event',
+      domain: 'cowd structured core',
+      signal: state.value?.health?.schema_version || 'schema pending',
+      next: 'bind facts to entities and metrics',
+    },
+    {
+      stage: 'entity',
+      ref: firstEntity.entity_id || selectedEntityId.value || 'entity pending',
+      domain: firstEntity.entity_type || 'Matrix entity graph',
+      signal: firstEntity.canonical_key || firstEntity.display_name || 'resolution pending',
+      next: 'trace relations and impact paths',
+    },
+    {
+      stage: 'metric',
+      ref: firstMetric.metric_id || selectedMetricId.value || 'metric pending',
+      domain: 'Matrix metric engine',
+      signal: firstMetric.status || firstMetric.name || 'lineage pending',
+      next: 'materialize snapshot / attention plan',
+    },
+    {
+      stage: 'attention',
+      ref: firstAttention.attention_id || 'attention pending',
+      domain: 'Matrix attention',
+      signal: firstAttention.severity || firstAttention.reason || 'hot queue pending',
+      next: 'build evidence packet',
+    },
+    {
+      stage: 'evidence',
+      ref: evidenceId.value || evidenceResult.value?.packet?.packet_id || 'evidence pending',
+      domain: 'cowd context evidence',
+      signal: qualityGateId.value || evidenceResult.value?.quality_gate?.status || 'quality gate pending',
+      next: 'open incident room',
+    },
+    {
+      stage: 'incident',
+      ref: firstIncident.incident_id || selectedIncidentId.value || 'incident pending',
+      domain: 'MFG application',
+      signal: firstIncident.status || firstIncident.title || 'analysis pending',
+      next: 'plan skills and actions',
+    },
+    {
+      stage: 'action',
+      ref: firstAction.action_id || selectedActionId.value || 'action pending',
+      domain: 'MFG + cross-plane',
+      signal: firstAction.title || result.value?.execution?.status || 'dry-run pending',
+      next: 'receipt / feedback / report',
+    },
+    {
+      stage: 'report',
+      ref: reportRef || cockpitProfileId.value,
+      domain: 'MFG cockpit',
+      signal: cockpitReportId.value ? 'delivery trackable' : 'profile ready',
+      next: 'delivery state / retry governance',
+    },
+  ];
+});
 
 function quarantineReceipt(action: string, endpoint: string, payload: Record<string, unknown> = {}) {
   return {
@@ -232,7 +307,7 @@ async function refresh() {
   loading.value = true;
   error.value = '';
   try {
-    const [app, health, governance, dataPlane, commandCenter, live, metricsData, entitiesData, changes, attentionData, incidentsData, skillsData] = await Promise.all([
+    const [app, health, governance, dataPlane, commandCenter, live, metricsData, entitiesData, changes, attentionData, incidentsData, skillsData, decisionTrace] = await Promise.all([
       api.mfgApp(),
       api.mfgHealth(),
       api.mfgProductionGovernance(),
@@ -245,6 +320,7 @@ async function refresh() {
       api.mfgAttentionHot(),
       api.mfgIncidents(),
       api.mfgSkills(),
+      api.mfgDecisionTrace({ incident_id: selectedIncidentId.value || undefined, report_id: cockpitReportId.value || undefined }),
     ]);
     state.value = {
       app,
@@ -259,6 +335,7 @@ async function refresh() {
       attention: attentionData,
       incidents: incidentsData,
       skills: skillsData,
+      decisionTrace,
       room: state.value?.room,
     };
     const firstIncident = items(incidentsData, 'items')[0]?.incident_id;
@@ -737,6 +814,16 @@ onMounted(refresh);
           <dt>Core boundary</dt>
           <dd>cowd owns structured data, memory, context, cross-plane policy, and audit; MFG owns manufacturing schema, workflows, metrics, incidents, and cockpit intent.</dd>
         </dl>
+      </article>
+
+      <article class="management-panel mfg-trace-panel wide" data-section="overview">
+        <header>
+          <h2>Decision Trace</h2>
+          <span>source -> fact -> action</span>
+        </header>
+        <p class="panel-note">Matrix turns structured manufacturing signals into facts, metrics, attention, evidence and incidents; MFG consumes that kernel trace to plan actions and reports.</p>
+        <p class="panel-note">Trace source: {{ state?.decisionTrace?.kind || 'local fallback' }} / {{ state?.decisionTrace?.chain || 'source -> fact -> action' }}</p>
+        <DataTable :rows="decisionTraceRows" :columns="['stage', 'ref', 'domain', 'signal', 'next']" />
       </article>
 
       <article class="management-panel" data-section="data-plane">

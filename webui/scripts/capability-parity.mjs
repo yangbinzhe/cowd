@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
 const webuiRoot = path.join(repoRoot, 'webui');
-const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0616-前端彻底重构/10-模块化管理重构方案');
+const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0617-最终目标收口');
 const reportDir = path.join(planRoot, 'reports');
 const version = process.env.COWD_VERSION || 'v0.9.245';
 const gate = process.argv.includes('--gate');
@@ -16,7 +16,7 @@ const modules = [
   { id: 'memory', page: 'MemoryPage.vue', routes: ['/api/memory', '/api/cowd/structured'], tui: ['memory_panel.rs', 'l4_knowledge_view.rs'], cli: ['import-session'] },
   { id: 'skills', page: 'SkillsPage.vue', routes: ['/api/skills'], tui: ['skills_panel.rs'], cli: ['skills'] },
   { id: 'agents', page: 'AgentsPage.vue', routes: ['/api/agents', '/api/tasks'], tui: ['agent_team_panel.rs', 'agents_overlay.rs'], cli: ['prompt'] },
-  { id: 'tools', page: 'ToolsPage.vue', routes: ['/api/tools', '/api/commands'], tui: ['activity_panel.rs', 'runtime_activity_panel.rs'], cli: ['prompt'] },
+  { id: 'tools', page: 'ToolsPage.vue', routes: ['/api/tools', '/api/commands'], tui: ['tool_ops_panel.rs', 'projection_client.rs', 'runtime_activity_panel.rs'], cli: ['prompt'] },
   { id: 'gateway', page: 'GatewayPage.vue', routes: ['/api/connectors', '/api/cross-plane', '/api/platforms'], tui: ['gateway_panel.rs', 'approval_cockpit_panel.rs'], cli: ['gateway'] },
   { id: 'mfg', page: 'MfgPage.vue', routes: ['/api/apps/mfg', '/api/matrix'], tui: ['goal_workbench_panel.rs', 'task_decomposition_view.rs'], cli: ['gateway'] },
   { id: 'audit', page: 'AuditPage.vue', routes: ['/api/audit', '/api/usage', '/api/cowd/release-gate'], tui: ['export_dialog.rs', 'approval_cockpit_panel.rs'], cli: ['doctor'] },
@@ -74,9 +74,17 @@ const backendRoutes = extractBackendRoutes();
 const clientEndpoints = extractClientEndpoints();
 const capabilityEndpoints = extractCapabilityEndpoints();
 const tuiFiles = walk(path.join(repoRoot, 'crates/cowd-cli/src/tui')).map((file) => path.basename(file));
+const tuiSources = walk(path.join(repoRoot, 'crates/cowd-cli/src/tui'))
+  .filter((file) => file.endsWith('.rs'))
+  .map((file) => read(file))
+  .join('\n');
 const cliMain = read(path.join(repoRoot, 'crates/cowd-cli/src/main.rs'));
 const cliMod = read(path.join(repoRoot, 'crates/cowd-cli/src/cli/mod.rs'));
 const cliText = `${cliMain}\n${cliMod}`;
+const runtimeCapability = read(path.join(repoRoot, 'crates/runtime/src/capability.rs'));
+const matrixBoundaryTest = read(path.join(repoRoot, 'crates/runtime/tests/matrix_mfg_boundary.rs'));
+const matrixMfgRoutes = read(path.join(repoRoot, 'crates/cowd-cli/src/api_routes/matrix_mfg_routes.rs'));
+const mfgContracts = read(path.join(webuiRoot, 'src/data/mfgWriteContracts.json'));
 
 const moduleReports = modules.map((module) => {
   const pagePath = path.join(webuiRoot, 'src/pages', module.page);
@@ -96,8 +104,47 @@ const moduleReports = modules.map((module) => {
   if (module.id === 'mfg' && !(pageText.includes('manufacturing application layer') && pageText.includes('cowd kernel'))) {
     findings.push('MFG boundary text is missing from WebUI');
   }
+  if (module.id === 'mfg') {
+    if (!runtimeCapability.includes('cowd.matrix.runtime') || !runtimeCapability.includes('CowdCapabilityLayer::Kernel')) {
+      findings.push('Matrix kernel capability is not declared');
+    }
+    if (!runtimeCapability.includes('mfg.manufacturing.application') || !runtimeCapability.includes('CowdCapabilityLayer::Application')) {
+      findings.push('MFG application capability is not declared');
+    }
+    if (!runtimeCapability.includes('"cowd.matrix.runtime".to_string()')) {
+      findings.push('MFG capability dependency on Matrix is missing');
+    }
+    if (!matrixBoundaryTest.includes('matrix_kernel_has_no_mfg_or_manufacturing_coupling')) {
+      findings.push('Matrix/MFG source boundary test is missing');
+    }
+    if (!matrixMfgRoutes.includes('/api/matrix/') || !matrixMfgRoutes.includes('/api/apps/mfg/')) {
+      findings.push('Matrix and MFG routes are not split by kernel/application boundary');
+    }
+    if (mfgContracts.includes('/api/iacc/') || mfgContracts.includes('IACC')) {
+      findings.push('MFG write contracts still contain legacy IACC runtime endpoints');
+    }
+  }
   if (module.id === 'memory' && !referencesAny(pageText, ['Structured Data Core', 'structured'])) {
     findings.push('structured data core is not visible in Memory page');
+  }
+  if (module.id === 'memory' && !referencesAny(tuiSources, ['structured_sources', 'structured_facts', 'structured_evidence', 'structured_watermarks'])) {
+    findings.push('TUI structured data projection is missing');
+  }
+  if (module.id === 'tools') {
+    const requiredToolOpsTerms = [
+      'ToolOpsPanel',
+      'tool_cache_stats',
+      'tool_batch_readonly',
+      'tool_mutation_preview',
+      'tool_checkpoints',
+      'tool_intent_plan',
+      'tool_context_fanout_plan',
+      'arm_restore_checkpoint',
+      'arm_apply_mutation',
+    ];
+    for (const term of requiredToolOpsTerms) {
+      if (!tuiSources.includes(term)) findings.push(`TUI tool operations evidence missing ${term}`);
+    }
   }
   return {
     id: module.id,

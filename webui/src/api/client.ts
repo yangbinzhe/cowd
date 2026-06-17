@@ -564,6 +564,13 @@ export const api = {
   }),
   mfgCommandCenter: () => read('/api/apps/mfg/command-center', {}),
   mfgCommandCenterLive: () => read('/api/apps/mfg/command-center/live', {}),
+  mfgDecisionTrace: (params: { incident_id?: string; report_id?: string } = {}) => {
+    const query = new URLSearchParams();
+    if (params.incident_id) query.set('incident_id', params.incident_id);
+    if (params.report_id) query.set('report_id', params.report_id);
+    const suffix = query.toString();
+    return read('/api/apps/mfg/decision-trace' + (suffix ? `?${suffix}` : ''), {});
+  },
   mfgSourcePackUpsert: (source_pack: Record<string, unknown>) => write('/api/matrix/source-packs/upsert', {
     method: 'POST',
     body: JSON.stringify({ source_pack, session_id: 'webui-mfg' }),

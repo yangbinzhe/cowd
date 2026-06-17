@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
 const webuiRoot = path.join(repoRoot, 'webui');
-const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0616-前端彻底重构/10-模块化管理重构方案');
+const planRoot = process.env.COWD_PLAN_ROOT || path.resolve(repoRoot, '../plan/0617-最终目标收口');
 const reportDir = path.join(planRoot, 'reports');
 const version = process.env.COWD_VERSION || 'v0.9.241';
 const gate = process.argv.includes('--gate');
