@@ -19,8 +19,9 @@ use matrix::{
     MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
     MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixSeverity,
-    MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack, MatrixSourcePackValidation,
+    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
+    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
+    MatrixSourcePackValidation,
 };
 
 #[derive(Debug, Error)]

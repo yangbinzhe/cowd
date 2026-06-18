@@ -1,5 +1,5 @@
 // ── Agent Team Panel ─────────────────────────────────────────────
-// Displays registered sub-agents from the global AgentDirectory.
+// Displays delegated sub-agent projections from App state.
 //
 // Shows:
 //   - Agent ID and role with emoji indicators
@@ -8,10 +8,9 @@
 //   - Composite reputation scores (when available)
 //   - Keyboard navigation (j/k/↑/↓, Enter detail, Tab toggle)
 //
-// Data source: `AgentDirectory::global().list_active()` provides
-// a snapshot of all non-offline agents from the shared global registry.
-// Reputation scores are read from each AgentInfo's optional
-// `reputation` field and formatted via `ReputationScore::composite()`.
+// Data source: `App::delegate_tasks` and runtime workgraph summaries.
+// Reputation scores are read from each AgentInfo's optional field and
+// formatted via `ReputationScore::composite()`.
 
 #![allow(dead_code)]
 
@@ -32,6 +31,8 @@ pub struct AgentInfo {
     pub role: String,
     pub capabilities: Vec<String>,
     pub status: AgentStatus,
+    pub registered_at_ms: u64,
+    pub last_heartbeat_ms: u64,
     pub reputation: Option<ReputationScore>,
 }
 
@@ -56,10 +57,10 @@ impl ReputationScore {
 
 // ── AgentTeamPanel ─────────────────────────────────────────────────
 
-/// Panel displaying the live agent team roster from AgentDirectory.
+/// Panel displaying the live agent team roster from App projections.
 ///
 /// Features:
-/// - Real-time roster from `AgentDirectory::global().list_active()`
+/// - Real-time roster from the current App projection
 /// - Status icons: ● Active, ◉ Busy, ○ Idle, ✕ Offline
 /// - Role emoji: 📋 Planner, 🔧 Executor, 🔍 Reviewer, 🤖 Other
 /// - Capability tag display
@@ -67,7 +68,7 @@ impl ReputationScore {
 /// - Keyboard navigation: j/k/↑/↓, Enter select, Tab toggle
 /// - Scroll offset for long lists
 pub struct AgentTeamPanel {
-    /// Current agent roster snapshot (from AgentDirectory).
+    /// Current agent roster snapshot.
     pub agents: Vec<AgentInfo>,
     /// Currently selected agent index (None when roster is empty).
     pub selected_idx: usize,
@@ -107,7 +108,7 @@ impl AgentTeamPanel {
         }
     }
 
-    /// Sync from App state and the global AgentDirectory.
+    /// Sync from App state.
     pub fn sync_from_app(&mut self, app: &App) {
         let prev_len = self.agents.len();
         self.agents = app
@@ -401,6 +402,8 @@ fn delegate_task_to_agent(task: &DelegateTask) -> AgentInfo {
         role: "Delegate".to_string(),
         capabilities: vec![task.description.clone()],
         status,
+        registered_at_ms: 0,
+        last_heartbeat_ms: 0,
         reputation: None,
     }
 }
@@ -440,7 +443,7 @@ impl Component for AgentTeamPanel {
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Agents register via AgentDirectory when spawned by the runtime.",
+                "Delegated runtime work appears here when projected by App state.",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -519,10 +522,7 @@ impl Component for AgentTeamPanel {
                     };
                     lines.push(Line::from(vec![
                         Span::styled("      rep: ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{composite:.1}/10"),
-                            Style::default().fg(rep_color),
-                        ),
+                        Span::styled(format!("{composite:.1}/10"), Style::default().fg(rep_color)),
                     ]));
                 }
 
@@ -663,6 +663,47 @@ mod tests {
             .expect("agent directory test lock poisoned")
     }
 
+    struct AgentDirectory;
+
+    impl AgentDirectory {
+        fn global() -> Self {
+            Self
+        }
+
+        fn clear_all(&self) {
+            test_agents().lock().unwrap().clear();
+        }
+
+        fn register(&self, agent: AgentInfo) {
+            test_agents().lock().unwrap().push(agent);
+        }
+
+        fn unregister(&self, agent_id: &str) {
+            test_agents()
+                .lock()
+                .unwrap()
+                .retain(|agent| agent.agent_id != agent_id);
+        }
+
+        fn list_active(&self) -> Vec<AgentInfo> {
+            test_agents().lock().unwrap().clone()
+        }
+    }
+
+    fn sync_from_test_directory(panel: &mut AgentTeamPanel, dir: &AgentDirectory) {
+        let prev_len = panel.agents.len();
+        panel.agents = dir.list_active();
+        if panel.agents.len() != prev_len {
+            panel.detail_idx = None;
+        }
+        panel.sync();
+    }
+
+    fn test_agents() -> &'static Mutex<Vec<AgentInfo>> {
+        static AGENTS: OnceLock<Mutex<Vec<AgentInfo>>> = OnceLock::new();
+        AGENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
     fn dummy_agent(id: &str, role: &str, status: AgentStatus, caps: Vec<&str>) -> AgentInfo {
         AgentInfo {
             agent_id: id.to_string(),
@@ -716,7 +757,7 @@ mod tests {
         ));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         assert!(!panel.agents.is_empty());
         assert!(panel.agents.iter().any(|a| a.agent_id == "test-1"));
 
@@ -742,7 +783,7 @@ mod tests {
         ));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         assert!(
             panel.agents.len() >= 2,
             "Expected at least 2 agents, got {}",
@@ -838,7 +879,7 @@ mod tests {
         ));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
 
         let lines = render_panel(&mut panel, 60, 15);
@@ -869,7 +910,7 @@ mod tests {
         dir.register(dummy_agent("c", "Reviewer", AgentStatus::Idle, vec![]));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
         let agent_count = panel.agents.len();
         assert!(agent_count >= 3, "Expected at least 3 agents");
@@ -928,7 +969,7 @@ mod tests {
         dir.register(dummy_agent("c", "R", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
 
         // Jump to bottom
@@ -963,7 +1004,7 @@ mod tests {
         ));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
         assert!(panel.detail_idx.is_none());
 
@@ -989,7 +1030,7 @@ mod tests {
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
         panel.detail_idx = Some(0);
 
@@ -1044,25 +1085,18 @@ mod tests {
 
     #[test]
     fn sync_from_app_delegates_to_sync() {
-        let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
-        dir.clear_all();
-        dir.register(dummy_agent(
-            "via-app",
-            "Planner",
-            AgentStatus::Active,
-            vec![],
-        ));
-
-        let app = App::new("m", "s");
+        let mut app = App::new("m", "s");
+        app.delegate_tasks = vec![DelegateTask {
+            id: "via-app".to_string(),
+            description: "plan delegated work".to_string(),
+            status: "running".to_string(),
+        }];
         let mut panel = AgentTeamPanel::new();
         panel.sync_from_app(&app);
         assert!(
             panel.agents.iter().any(|a| a.agent_id == "via-app"),
             "Agent 'via-app' should be present after sync_from_app"
         );
-
-        dir.clear_all();
     }
 
     #[test]
@@ -1121,11 +1155,11 @@ mod tests {
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.detail_idx = Some(0);
 
         dir.register(dummy_agent("y", "P", AgentStatus::Active, vec![]));
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         // Roster length changed, detail should reset
         assert!(panel.detail_idx.is_none());
 
@@ -1155,11 +1189,11 @@ mod tests {
         dir.register(dummy_agent("c", "R", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.selected_idx = 2; // last entry
 
         dir.unregister("c");
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         // selected_idx should be clamped to 1 (the new last index)
         assert_eq!(panel.selected_idx, 1);
 
@@ -1181,7 +1215,7 @@ mod tests {
         }
 
         let mut panel = AgentTeamPanel::new();
-        panel.sync();
+        sync_from_test_directory(&mut panel, &dir);
         panel.visible = true;
         panel.selected_idx = 0;
         panel.scroll_offset = 0;

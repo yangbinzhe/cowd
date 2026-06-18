@@ -67,22 +67,31 @@ impl CowdStructuredQualityGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
+    use crate::structured_data::CowdStructuredEvidenceSourceRef;
 
     #[test]
     fn structured_quality_gate_uses_structured_evidence_refs() {
-        let mut packet = MatrixEvidencePacket::new("shortage risk changed");
-        packet.packet_id = "packet-1".to_string();
-        packet.confidence = 0.8;
-        packet
-            .metric_evidence
-            .push(serde_json::json!({"metric": "material_shortage_risk"}));
-        packet.source_refs.push(MatrixEvidenceSourceRef {
-            kind: "fact".to_string(),
-            reference: "structured-fact:fact-1".to_string(),
-            summary: "shortage fact".to_string(),
-        });
-        let evidence = CowdStructuredEvidence::from(&packet);
+        let evidence = CowdStructuredEvidence {
+            evidence_id: "packet-1".to_string(),
+            attention_id: None,
+            problem_statement: "shortage risk changed".to_string(),
+            domain: Some("manufacturing".to_string()),
+            business_context: serde_json::json!({}),
+            metric_evidence: vec![serde_json::json!({"metric": "material_shortage_risk"})],
+            change_evidence: Vec::new(),
+            anomaly_evidence: Vec::new(),
+            attribution_candidates: Vec::new(),
+            impact_paths: Vec::new(),
+            source_refs: vec![CowdStructuredEvidenceSourceRef {
+                kind: "fact".to_string(),
+                reference: "structured-fact:fact-1".to_string(),
+                summary: "shortage fact".to_string(),
+            }],
+            missing_evidence: Vec::new(),
+            confidence: 0.8,
+            token_budget: 4096,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
 
         let gate = CowdStructuredQualityGate::for_structured_evidence(&evidence);
 

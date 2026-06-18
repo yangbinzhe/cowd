@@ -100,6 +100,7 @@ impl PartialEq for RoutedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CowdEvent;
     use crossterm::event::Event;
 
     // ── priority_ordering ─────────────────────────────────────
@@ -150,9 +151,7 @@ mod tests {
         })
         .unwrap();
         let event = rx.recv().unwrap();
-        assert!(
-            matches!(event, CowdEvent::TextDelta { text } if text == "backward-compat")
-        );
+        assert!(matches!(event, CowdEvent::TextDelta { text } if text == "backward-compat"));
     }
 
     // ── drain_clears_queue ────────────────────────────────────

@@ -244,6 +244,7 @@ mod tests {
     use super::*;
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
+    use crate::CowdEvent;
     use crossterm::event::KeyEvent;
 
     fn make_tool_call(id: &str, name: &str, done: bool, exit_code: Option<i32>) -> TimelineEntry {

@@ -37,7 +37,7 @@ check_empty "daemon business management" \
   rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|UnixStream|socket business" crates --glob '*.rs' --glob '!**/tests/**'
 
 check_empty "tui direct business dependencies" \
-  rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix::|matrix::|use storage::|storage::|rusqlite|use tools::|tools::|use memory::|memory::" crates/tui/src --glob '*.rs' --glob '!lib.rs'
+  rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix::|matrix::|use storage::|storage::|rusqlite|use tools::|tools::|use memory::|memory::" crates/tui/src --glob '*.rs' --glob '!lib.rs' --glob '!boundary_policy.rs'
 
 check_empty "runtime entrypoint reverse dependencies" \
   rg -n "gateway::|tui::|cli::|app_mfg::" crates/runtime/src --glob '*.rs'
@@ -54,21 +54,21 @@ check_empty "AI bin install residue" \
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features
 
-if cargo tree -p tui --no-default-features | rg "runtime|app-mfg|app_mfg|matrix|storage|rusqlite|tools|memory"; then
+if cargo tree -p tui --no-default-features | rg "(^|[ ├└│─])((runtime|matrix|storage|tools) v|cowd-memory|cowd-app-mfg|app_mfg|rusqlite)"; then
   echo "FAIL tui forbidden dependency tree"
   fail=1
 else
   echo "PASS tui forbidden dependency tree"
 fi
 
-if cargo tree -p cowd-app-mfg --no-default-features | rg "runtime|gateway::|gateway ="; then
+if cargo tree -p cowd-app-mfg --no-default-features | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
   echo "FAIL app-mfg forbidden dependency tree"
   fail=1
 else
   echo "PASS app-mfg forbidden dependency tree"
 fi
 
-if cargo tree -p matrix --no-default-features | rg "runtime|gateway|app-mfg|app_mfg|mfg"; then
+if cargo tree -p matrix --no-default-features | rg "(^|[ ├└│─])((runtime|gateway|app-mfg) v|app_mfg|mfg)"; then
   echo "FAIL matrix forbidden dependency tree"
   fail=1
 else

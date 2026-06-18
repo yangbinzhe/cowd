@@ -29,7 +29,7 @@ fn read_rs_files(root: &Path) -> Vec<(PathBuf, String)> {
 
 #[test]
 fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
-    let matrix_root = repo_root().join("crates/runtime/src/matrix");
+    let matrix_root = repo_root().join("crates/matrix/src");
     let forbidden = [
         "server_manufacturing",
         "runtime::mfg",
@@ -129,7 +129,7 @@ fn structured_data_contract_has_no_matrix_or_context_dependency() {
 }
 
 #[test]
-fn cowd_cli_depends_on_mfg_application_crate() {
+fn gateway_depends_on_mfg_application_crate() {
     let manifest = repo_root().join("crates/gateway/Cargo.toml");
     let content = fs::read_to_string(&manifest)
         .unwrap_or_else(|_| panic!("read manifest {}", manifest.display()));

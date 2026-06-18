@@ -200,7 +200,6 @@ mod tests {
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
-    use memory::{L4Event, L4Operation};
     use ratatui::Frame;
 
     // ── Basic lifecycle ─────────────────────────────────────────

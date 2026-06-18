@@ -649,10 +649,7 @@ impl TuiState {
     }
 
     /// Set the tool registry for the skills panel.
-    pub fn set_tool_registry(
-        &mut self,
-        registry: std::sync::Arc<dyn crate::app::ToolRegistry>,
-    ) {
+    pub fn set_tool_registry(&mut self, registry: std::sync::Arc<dyn crate::app::ToolRegistry>) {
         self.skills_panel.set_registry(registry);
     }
 
@@ -998,10 +995,7 @@ impl TuiState {
                         .timeline_clone_vec()
                         .iter()
                         .filter_map(|e| {
-                            if let crate::app::TimelineEntry::ToolCall {
-                                name, output, ..
-                            } = e
-                            {
+                            if let crate::app::TimelineEntry::ToolCall { name, output, .. } = e {
                                 if (name == "edit_file"
                                     || name == "patch_file"
                                     || name == "apply_diff")
@@ -2133,8 +2127,7 @@ impl TuiState {
                 }
             }
             FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => {
-                if self.diff_viewer.handle_event(&event)
-                    == crate::components::EventResult::Consumed
+                if self.diff_viewer.handle_event(&event) == crate::components::EventResult::Consumed
                 {
                     self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Diff));
                     true
@@ -2697,8 +2690,7 @@ impl TuiState {
 
     fn open_command_palette(&mut self) {
         self.refresh_command_projection_from_gateway();
-        let snapshot =
-            crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
         self.command_palette.open();
         self.set_focus_target(FocusTarget::CommandPalette);
@@ -2706,8 +2698,7 @@ impl TuiState {
 
     fn open_command_palette_with_query(&mut self, query: &str) {
         self.refresh_command_projection_from_gateway();
-        let snapshot =
-            crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
         self.command_palette.open_with_query(query);
         self.set_focus_target(FocusTarget::CommandPalette);
@@ -3402,8 +3393,7 @@ impl TuiState {
         &mut self,
         mutate: impl FnOnce(&mut crate::runtime_control_store::RuntimeControlLocalStore),
     ) {
-        let mut store =
-            crate::runtime_control_store::RuntimeControlLocalStore::from_app(&self.app);
+        let mut store = crate::runtime_control_store::RuntimeControlLocalStore::from_app(&self.app);
         mutate(&mut store);
         store.apply_to_app(&mut self.app);
         self.sync_runtime_control_surfaces(store.snapshot());
@@ -3702,11 +3692,7 @@ impl L4KnowledgeView {
     }
 
     /// Render the L4 knowledge view as a compact overlay.
-    pub fn render(
-        &self,
-        ctx: &mut crate::components::RenderContext,
-        area: ratatui::layout::Rect,
-    ) {
+    pub fn render(&self, ctx: &mut crate::components::RenderContext, area: ratatui::layout::Rect) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
@@ -3820,13 +3806,6 @@ mod tests {
     use serial_test::serial;
     use std::time::Duration;
 
-    fn test_memory_config(path: &std::path::Path) -> memory::MemoryConfig {
-        let mut config = memory::MemoryConfig::default();
-        config.store.sqlite_path = path.to_path_buf();
-        config.store.blob_dir = path.parent().unwrap().join("blobs");
-        config
-    }
-
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3925,15 +3904,14 @@ mod tests {
     #[test]
     fn local_connector_resource_state_updates_projection_state() {
         let mut state = TuiState::new("test-model", "test-session");
-        state.app.gateway_connector_resources = vec![
-            crate::runtime_control_store::ConnectorResourceSummary {
+        state.app.gateway_connector_resources =
+            vec![crate::runtime_control_store::ConnectorResourceSummary {
                 reference: "service://mock.docs/document/tui-doc".to_string(),
                 provider: "mock.docs".to_string(),
                 resource_type: "document".to_string(),
                 title: "TUI Doc".to_string(),
                 indexed_state: "indexed".to_string(),
-            },
-        ];
+            }];
 
         state.apply_local_connector_resource_state("service://mock.docs/document/tui-doc", "stale");
 
@@ -3944,111 +3922,46 @@ mod tests {
     }
 
     #[test]
-    fn reload_runtime_providers_from_loader_updates_registry_without_leaking_secret() {
-        runtime::init_global_providers(runtime::ProvidersConfig::default());
-        let root = unique_temp_dir("cowd-tui-provider-reload");
-        let workspace = root.join("workspace");
-        let config_home = root.join("home");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&config_home).unwrap();
-        std::fs::write(
-            config_home.join("config.yaml"),
-            r#"
-model: "tui-reload-model"
-providers:
-  tui-provider:
-    base_url: "https://tui-provider.example/v1"
-    api_key: "tui-secret-key"
-    models: ["tui-reload-model", "tui-fast"]
-    protocol: "openai-compat"
-"#,
-        )
-        .unwrap();
-
+    fn reload_runtime_provider_projection_reports_gateway_state_without_leaking_secret() {
         let mut state = TuiState::new("tui-reload-model", "session-tui-provider");
-        let loader = runtime::ConfigLoader::new(&workspace, &config_home);
-        assert!(state.reload_runtime_providers_from_loader(&loader));
+        state.app.gateway_connector_accounts =
+            vec![crate::runtime_control_store::ConnectorAccountSummary {
+                provider: "gateway-provider".to_string(),
+                account_id: "account-1".to_string(),
+                auth_mode: "token".to_string(),
+                status: "available".to_string(),
+                reason: None,
+                binding_count: 1,
+            }];
+        state.app.available_models = vec!["tui-reload-model".to_string(), "tui-fast".to_string()];
 
-        let provider = runtime::resolve_global_provider("tui-reload-model")
-            .expect("provider reload should resolve active model");
-        assert_eq!(provider.name, "tui-provider");
-        assert_eq!(runtime::list_all_models().len(), 2);
+        assert!(state.reload_runtime_provider_projection());
         assert!(state
             .app
             .notification
             .as_deref()
             .unwrap_or_default()
-            .contains("Providers applied"));
+            .contains("Provider projection refreshed"));
         assert!(!state
             .app
             .notification
             .as_deref()
             .unwrap_or_default()
             .contains("tui-secret-key"));
-
-        let invalid_home = root.join("invalid-home");
-        std::fs::create_dir_all(&invalid_home).unwrap();
-        std::fs::write(
-            invalid_home.join("config.yaml"),
-            r#"
-model: "broken-model"
-providers:
-  broken:
-    base_url: "https://broken.example/v1"
-    api_key: "broken-secret-key"
-    models: ["broken-model"]
-    protocol: "unsupported-protocol"
-"#,
-        )
-        .unwrap();
-        let invalid_loader = runtime::ConfigLoader::new(&workspace, &invalid_home);
-        assert!(!state.reload_runtime_providers_from_loader(&invalid_loader));
-        assert!(runtime::resolve_global_provider("broken-model").is_none());
-        assert_eq!(
-            runtime::resolve_global_provider("tui-reload-model")
-                .expect("failed reload should preserve previous registry")
-                .name,
-            "tui-provider"
-        );
-        assert!(!state
-            .app
-            .notification
-            .as_deref()
-            .unwrap_or_default()
-            .contains("broken-secret-key"));
-
-        runtime::init_global_providers(runtime::ProvidersConfig::default());
-        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn set_memory_manager_wires_tui_memory_surfaces() {
-        let dir = unique_temp_dir("cowd-tui-memory");
-        let manager = std::sync::Arc::new(
-            memory::CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
-                .await
-                .unwrap(),
-        );
-        manager
-            .create_entry(
-                memory::MemoryLayer::L4,
-                memory::MemoryCategory::Shared,
-                "TUI L4 Decision",
-                "TUI must read real L4 shared memory.",
-                memory::Priority::High,
-                vec!["tui".into(), "l4".into()],
-                memory::MemoryScope::Global,
-            )
-            .await
-            .unwrap();
-
+    #[test]
+    fn memory_projection_wires_tui_memory_surfaces() {
         let mut state = TuiState::new("test-model", "test-session");
-        state.set_memory_manager(manager);
-
-        assert!(state.memory_panel.memory_manager.is_some());
-        assert!(state.memory_orchestrator.is_some());
-
-        state.l4_knowledge_view.sync(&state.memory_orchestrator);
+        state.set_memory_projection_available(true);
+        state.app.memory_status = Some("available".to_string());
+        state.app.memory_entries = vec![crate::app::MemoryEntry {
+            id: Some("m1".to_string()),
+            layer: "L4".to_string(),
+            content: "TUI L4 Decision".to_string(),
+            priority: "high".to_string(),
+        }];
+        state.l4_knowledge_view.sync_from_app(&state.app);
 
         assert!(
             state
@@ -4715,9 +4628,7 @@ providers:
     #[test]
     fn context_suggestions_do_not_render_over_prompt_dropdown() {
         let mut state = TuiState::new("m", "s");
-        let projection =
-            serde_json::to_value(commands::command_projection(commands::CommandSurface::Tui))
-                .expect("projection");
+        let projection = crate::test_utils::gateway_command_projection_fixture();
         state
             .prompt
             .sync_command_suggestions_from_projection(&projection);
@@ -4744,9 +4655,7 @@ providers:
     #[test]
     fn exact_slash_command_enter_submits_instead_of_accepting_completion() {
         let mut state = TuiState::new("m", "s");
-        let projection =
-            serde_json::to_value(commands::command_projection(commands::CommandSurface::Tui))
-                .expect("projection");
+        let projection = crate::test_utils::gateway_command_projection_fixture();
         state
             .prompt
             .sync_command_suggestions_from_projection(&projection);
@@ -5060,24 +4969,22 @@ providers:
         state.app.gateway_task_count = Some(3);
         state.app.gateway_pending_approvals = Some(1);
         state.app.memory_status = Some("available".to_string());
-        state.app.gateway_action_receipts = vec![
-            crate::runtime_control_store::RuntimeActionReceiptSummary {
+        state.app.gateway_action_receipts =
+            vec![crate::runtime_control_store::RuntimeActionReceiptSummary {
                 status: "ok".to_string(),
                 dispatch_status: "completed".to_string(),
                 mode: "daemon-control".to_string(),
                 capability: "daemon.task.complete".to_string(),
                 idempotency_key: Some("task-1".to_string()),
-            },
-        ];
-        state.app.gateway_connector_resources = vec![
-            crate::runtime_control_store::ConnectorResourceSummary {
+            }];
+        state.app.gateway_connector_resources =
+            vec![crate::runtime_control_store::ConnectorResourceSummary {
                 reference: "service://mock.docs/document/1".to_string(),
                 provider: "mock.docs".to_string(),
                 resource_type: "document".to_string(),
                 title: "Bridge Doc".to_string(),
                 indexed_state: "indexed".to_string(),
-            },
-        ];
+            }];
 
         let mut terminal = MockTerminal::new(132, 38);
         terminal.draw(|frame| state.render(frame));

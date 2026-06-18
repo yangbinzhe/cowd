@@ -1384,24 +1384,12 @@ mod tests {
 
     #[test]
     fn context_envelope_event_updates_app_state() {
-        let identity = runtime::ContextIdentity::main("sess".to_string());
-        let envelope =
-            runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
-                profile: runtime::ContextProfile::from(identity.mode),
-                identity,
-                intent: "inspect".to_string(),
-                stable_head: vec!["stable".to_string()],
-                runtime_header: vec!["runtime".to_string()],
-                dynamic_items: vec![runtime::ContextItem::new(
-                    "ctx-1",
-                    runtime::ContextSourceKind::Memory,
-                    runtime::ContextRole::Evidence,
-                    "durable context",
-                )],
-                omitted: Vec::new(),
-                total_budget_tokens: 8_000,
-            });
-        let expected_id = envelope.id.clone();
+        let envelope = crate::test_utils::context_envelope_fixture();
+        let expected_id = envelope
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
         let mut app = App::new("test", "sess");
 
         app.apply_event(CowdEvent::ContextEnvelope { envelope });
@@ -1409,7 +1397,8 @@ mod tests {
         assert_eq!(
             app.latest_context_envelope
                 .as_ref()
-                .map(|env| env.id.as_str()),
+                .and_then(|env| env.get("id"))
+                .and_then(serde_json::Value::as_str),
             Some(expected_id.as_str())
         );
     }

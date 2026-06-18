@@ -107,7 +107,10 @@ impl Component for MemoryPanel {
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            for (idx, entry) in entries.iter().take(area.height.saturating_sub(4) as usize).enumerate()
+            for (idx, entry) in entries
+                .iter()
+                .take(area.height.saturating_sub(4) as usize)
+                .enumerate()
             {
                 let selected = idx == self.selected;
                 let marker = if selected { "> " } else { "  " };
@@ -120,8 +123,14 @@ impl Component for MemoryPanel {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(marker, Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("[{}] ", entry.layer), Style::default().fg(Color::Green)),
-                    Span::styled(preview(&entry.content, area.width.saturating_sub(8) as usize), style),
+                    Span::styled(
+                        format!("[{}] ", entry.layer),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        preview(&entry.content, area.width.saturating_sub(8) as usize),
+                        style,
+                    ),
                 ]));
             }
         }
@@ -131,7 +140,9 @@ impl Component for MemoryPanel {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
         ctx.frame_mut().render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -142,7 +153,8 @@ impl Component for MemoryPanel {
         };
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(self.filtered_entries().len().saturating_sub(1));
+                self.selected =
+                    (self.selected + 1).min(self.filtered_entries().len().saturating_sub(1));
                 EventResult::Consumed
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -187,6 +199,12 @@ fn preview(text: &str, max: usize) -> String {
     if normalized.chars().count() <= max {
         normalized
     } else {
-        format!("{}...", normalized.chars().take(max.saturating_sub(3)).collect::<String>())
+        format!(
+            "{}...",
+            normalized
+                .chars()
+                .take(max.saturating_sub(3))
+                .collect::<String>()
+        )
     }
 }

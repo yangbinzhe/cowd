@@ -689,7 +689,7 @@ mod tests {
     use super::*;
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
-    use std::collections::HashMap;
+    use crate::CowdEvent;
 
     fn render_panel(panel: &mut RuntimeActivityPanel, width: u16, height: u16) -> String {
         let mut terminal = MockTerminal::new(width, height);
@@ -703,20 +703,18 @@ mod tests {
 
     #[test]
     fn syncs_runtime_and_context_from_app() {
-        runtime::init_global_providers(runtime::ProvidersConfig {
-            providers: HashMap::from([(
-                "anthropic".to_string(),
-                runtime::ProviderConfig {
-                    name: "anthropic".to_string(),
-                    base_url: "https://anthropic.example/v1".to_string(),
-                    api_key: "secret".to_string(),
-                    models: vec!["m".to_string(), "m-fast".to_string()],
-                    protocol: Some("anthropic".to_string()),
-                },
-            )]),
-        });
         let mut app = App::new("m", "session-runtime-123456789");
         app.yolo_mode = true;
+        app.available_models = vec!["m".to_string(), "m-fast".to_string()];
+        app.gateway_connector_accounts =
+            vec![crate::runtime_control_store::ConnectorAccountSummary {
+                provider: "anthropic".to_string(),
+                account_id: "account-1".to_string(),
+                auth_mode: "token".to_string(),
+                status: "available".to_string(),
+                reason: None,
+                binding_count: 1,
+            }];
         app.token_count = 42_000;
         app.context_window = 200_000;
         app.turn_input_tokens = 12_000;
@@ -757,24 +755,7 @@ mod tests {
             },
         });
 
-        let identity = runtime::ContextIdentity::main("session-runtime-123456789".to_string());
-        app.latest_context_envelope = Some(runtime::ContextRuntimeKernel::build_envelope(
-            runtime::ContextEnvelopeRequest {
-                profile: runtime::ContextProfile::YoloGoal,
-                identity,
-                intent: "ship".to_string(),
-                stable_head: vec!["stable".to_string()],
-                runtime_header: vec!["runtime".to_string()],
-                dynamic_items: vec![runtime::ContextItem::new(
-                    "ctx-1",
-                    runtime::ContextSourceKind::Memory,
-                    runtime::ContextRole::Evidence,
-                    "runtime evidence",
-                )],
-                omitted: Vec::new(),
-                total_budget_tokens: 8_000,
-            },
-        ));
+        app.latest_context_envelope = Some(crate::test_utils::context_envelope_fixture());
 
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
@@ -793,8 +774,6 @@ mod tests {
         // The runtime panel owns tool process details; the separate Activity
         // panel remains a manually opened recent-event stream.
         assert!(!rendered.contains("user: ship the runtime console"));
-
-        runtime::init_global_providers(runtime::ProvidersConfig::default());
     }
 
     #[test]

@@ -154,11 +154,16 @@ impl Component for DiscussionThreadView {
         }
 
         let block = Block::default()
-            .title(format!(" Discussion [{}] ", Self::phase_label(discussion.phase)))
+            .title(format!(
+                " Discussion [{}] ",
+                Self::phase_label(discussion.phase)
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Self::phase_color(discussion.phase)));
         ctx.frame_mut().render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
             area,
         );
     }

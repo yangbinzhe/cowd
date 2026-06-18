@@ -1035,8 +1035,7 @@ mod tests {
     use super::*;
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
-    use crate::test_utils::MockTerminal;
-    use commands::{command_projection, CommandSurface};
+    use crate::test_utils::{gateway_command_projection_fixture, MockTerminal};
     use crossterm::event::KeyModifiers;
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1058,9 +1057,7 @@ mod tests {
     }
 
     fn setup_palette() -> CommandPalette {
-        CommandPalette::new_with_projection(
-            &serde_json::to_value(command_projection(CommandSurface::Tui)).expect("projection"),
-        )
+        CommandPalette::new_with_projection(&gateway_command_projection_fixture())
     }
 
     // ── Registration and construction ─────────────────────────────
@@ -1068,9 +1065,14 @@ mod tests {
     #[test]
     fn new_has_default_commands() {
         let p = setup_palette();
-        let projection = command_projection(CommandSurface::Tui);
+        let projection = gateway_command_projection_fixture();
+        let command_count = projection
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
         assert!(
-            p.command_count() >= projection.commands.len(),
+            p.command_count() >= command_count,
             "expected at least all projected commands, got {}",
             p.command_count()
         );
@@ -1080,22 +1082,38 @@ mod tests {
     fn registry_entries_include_every_projected_command_and_alias() {
         let p = setup_palette();
 
-        for command in command_projection(CommandSurface::Tui).commands {
+        for command in gateway_command_projection_fixture()
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = command
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let description = command
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             assert!(
                 p.all_commands
                     .iter()
-                    .any(|entry| entry.name == command.name
-                        && entry.description == command.description),
-                "palette missing projected command {}",
-                command.name
+                    .any(|entry| entry.name == name && entry.description == description),
+                "palette missing projected command {name}",
             );
 
-            for alias in command.aliases {
+            for alias in command
+                .get("aliases")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
                 assert!(
                     p.all_commands.iter().any(|entry| entry.name == alias
-                        && entry.action == Action::Execute(alias.clone())),
-                    "palette missing alias {alias} for {}",
-                    command.name
+                        && entry.action == Action::Execute(alias.to_string())),
+                    "palette missing alias {alias} for {name}"
                 );
             }
         }
@@ -1265,15 +1283,13 @@ mod tests {
                     requires_approval: false,
                 },
             ],
-            connector_resources: vec![
-                crate::runtime_control_store::ConnectorResourceSummary {
-                    reference: "service://feishu/docx/doccn-ready".to_string(),
-                    provider: "feishu".to_string(),
-                    resource_type: "docx".to_string(),
-                    title: "Ready Feishu Doc".to_string(),
-                    indexed_state: "indexed".to_string(),
-                },
-            ],
+            connector_resources: vec![crate::runtime_control_store::ConnectorResourceSummary {
+                reference: "service://feishu/docx/doccn-ready".to_string(),
+                provider: "feishu".to_string(),
+                resource_type: "docx".to_string(),
+                title: "Ready Feishu Doc".to_string(),
+                indexed_state: "indexed".to_string(),
+            }],
             connector_degraded_reasons: vec!["resource_directory: locked".to_string()],
             ..RuntimeControlSnapshot::default()
         };

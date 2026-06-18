@@ -61,7 +61,11 @@ impl Component for L4KnowledgeView {
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            for (idx, entry) in self.entries.iter().take(area.height.saturating_sub(2) as usize).enumerate()
+            for (idx, entry) in self
+                .entries
+                .iter()
+                .take(area.height.saturating_sub(2) as usize)
+                .enumerate()
             {
                 let style = if idx == self.selected {
                     Style::default()
@@ -71,8 +75,14 @@ impl Component for L4KnowledgeView {
                     Style::default().fg(Color::White)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(if idx == self.selected { "> " } else { "  " }, Style::default().fg(Color::Yellow)),
-                    Span::styled(preview(&entry.content, area.width.saturating_sub(4) as usize), style),
+                    Span::styled(
+                        if idx == self.selected { "> " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        preview(&entry.content, area.width.saturating_sub(4) as usize),
+                        style,
+                    ),
                 ]));
             }
         }
@@ -81,7 +91,9 @@ impl Component for L4KnowledgeView {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
         ctx.frame_mut().render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -117,6 +129,12 @@ fn preview(text: &str, max: usize) -> String {
     if normalized.chars().count() <= max {
         normalized
     } else {
-        format!("{}...", normalized.chars().take(max.saturating_sub(3)).collect::<String>())
+        format!(
+            "{}...",
+            normalized
+                .chars()
+                .take(max.saturating_sub(3))
+                .collect::<String>()
+        )
     }
 }

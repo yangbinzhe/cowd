@@ -349,10 +349,10 @@ impl Component for PerformanceDashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
     use chrono::Utc;
-    use memory::TuningConfig;
 
     fn make_report(
         latency_ms: f64,
@@ -367,7 +367,7 @@ mod tests {
             cache_hit_rate: hit_rate,
             total_samples: 50,
             window_size: 100,
-            last_updated: Utc::now(),
+            last_updated: Some(Utc::now()),
             tuning_applied: false,
             last_tuning: None,
             current_tuning: TuningConfig::default(),
@@ -448,14 +448,14 @@ mod tests {
     fn sync_does_nothing_when_hidden() {
         let mut dashboard = PerformanceDashboard::new();
         assert!(!dashboard.visible);
-        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
-        dashboard.sync(&orchestrator);
+        let app = App::new("m", "s");
+        dashboard.sync_from_app(&app);
         assert!(dashboard.last_report.is_none());
         assert!(dashboard.sparkline_data.is_empty());
     }
 
     #[test]
-    fn sync_clears_report_when_no_orchestrator() {
+    fn sync_clears_report_when_no_projection() {
         let mut dashboard = PerformanceDashboard::new();
         dashboard.visible = true;
         dashboard.last_report = Some(make_report(100.0, 50.0, 0.7, 0.85));
@@ -464,8 +464,8 @@ mod tests {
             .checked_sub(REFRESH_INTERVAL + Duration::from_millis(100))
             .unwrap();
 
-        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
-        dashboard.sync(&orchestrator);
+        let app = App::new("m", "s");
+        dashboard.sync_from_app(&app);
         assert!(dashboard.last_report.is_none());
     }
 
@@ -473,15 +473,15 @@ mod tests {
     fn sync_respects_rate_limit() {
         let mut dashboard = PerformanceDashboard::new();
         dashboard.visible = true;
-        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
+        let app = App::new("m", "s");
 
         // First sync: within rate limit window — last_sync is fresh
-        dashboard.sync(&orchestrator);
+        dashboard.sync_from_app(&app);
         let first_sync = dashboard.last_sync;
 
         // Second sync: immediately after — should be rate-limited
         std::thread::sleep(Duration::from_millis(1));
-        dashboard.sync(&orchestrator);
+        dashboard.sync_from_app(&app);
         assert_eq!(
             dashboard.last_sync, first_sync,
             "rate limit should prevent re-sync"
@@ -572,8 +572,8 @@ mod tests {
     fn hidden_dashboard_skips_sync() {
         let mut dashboard = PerformanceDashboard::new();
         dashboard.visible = false;
-        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
-        dashboard.sync(&orchestrator);
+        let app = App::new("m", "s");
+        dashboard.sync_from_app(&app);
         assert!(dashboard.last_report.is_none());
     }
 

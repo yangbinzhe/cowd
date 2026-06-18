@@ -1154,9 +1154,9 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|capability| capability["id"] == "cowd.structured_data.core"));
-        assert!(capabilities.iter().any(|capability| capability["id"]
-            == "mfg.manufacturing.application"
-            && capability["layer"] == "application"));
+        assert!(!capabilities
+            .iter()
+            .any(|capability| capability["id"] == "mfg.manufacturing.application"));
     }
 
     #[tokio::test]
@@ -1250,6 +1250,11 @@ mod tests {
         assert_eq!(json["app_id"], "mfg.manufacturing");
         assert_eq!(json["layer"], "application");
         assert!(json["cowd_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "cowd.structured_data.core"));
+        assert!(!json["cowd_capabilities"]
             .as_array()
             .unwrap()
             .iter()
@@ -2356,7 +2361,7 @@ mod tests {
         let context_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             context_json["context_item"]["id"],
-            format!("matrix:evidence:{packet_id}")
+            format!("matrix-evidence:{packet_id}")
         );
 
         let incident = app

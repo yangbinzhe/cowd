@@ -714,9 +714,9 @@ fn gateway_listener_reachable(base_url: &str) -> bool {
     let Ok(addrs) = host_port.to_socket_addrs() else {
         return false;
     };
-    addrs.into_iter().any(|addr| {
-        TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
-    })
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok())
 }
 
 pub fn default_auth_token() -> Option<String> {

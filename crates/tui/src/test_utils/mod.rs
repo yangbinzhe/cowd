@@ -24,6 +24,130 @@ pub struct MockTerminal {
     terminal: Terminal<TestBackend>,
 }
 
+pub fn gateway_command_projection_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "command.projection",
+        "surface": "tui",
+        "commands": [
+            {
+                "name": "/status",
+                "description": "Show gateway status",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:status" }
+            },
+            {
+                "name": "/help",
+                "description": "Show available slash command",
+                "aliases": [],
+                "action": { "kind": "client", "action": "toggle-help" }
+            },
+            {
+                "name": "/model",
+                "description": "Switch model",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:model" }
+            },
+            {
+                "name": "/runtime",
+                "description": "Open runtime activity panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:runtime" }
+            },
+            {
+                "name": "/activity",
+                "description": "Open activity panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:activity" }
+            },
+            {
+                "name": "/tools",
+                "description": "Open tools panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:tools" }
+            },
+            {
+                "name": "/files",
+                "description": "Open files panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:files" }
+            },
+            {
+                "name": "/gateway",
+                "description": "Open gateway panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:gateway" }
+            },
+            {
+                "name": "/memory",
+                "description": "Open memory panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:memory" }
+            },
+            {
+                "name": "/diff",
+                "description": "Open diff panel",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:diff" }
+            },
+            {
+                "name": "Reload Providers",
+                "description": "Reload provider projection",
+                "aliases": [],
+                "action": { "kind": "client", "action": "reload-providers" }
+            },
+            {
+                "name": "/setup",
+                "description": "Open setup center",
+                "aliases": [],
+                "action": { "kind": "client", "action": "slash:setup" }
+            }
+        ]
+    })
+}
+
+pub fn context_envelope_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "id": "ctx-fixture",
+        "profile": "YoloGoal",
+        "selected": [
+            {
+                "id": "mem-1",
+                "source": "memory",
+                "role": "Evidence",
+                "content": "SessionKernel owns durable sessions",
+                "evidence": ["session://session-1/memory/mem-1"]
+            },
+            {
+                "id": "tool-1",
+                "source": "tool_trace",
+                "role": "Evidence",
+                "content": "cargo test completed successfully",
+                "evidence": ["tool://tool-1"]
+            }
+        ],
+        "omitted": [
+            {
+                "source": "memory",
+                "reason": "context lease exhausted",
+                "token_estimate": 24
+            }
+        ],
+        "assembled": {
+            "stable_head": ["stable system prompt"],
+            "runtime_header": ["session:session-1 agent:primary"],
+            "dynamic_tail": ["SessionKernel owns durable sessions"]
+        },
+        "diagnostics": {
+            "pressure_bp": 4200,
+            "stable_head_hash": "stable-hash-fixture",
+            "runtime_header_hash": "runtime-hash-fixture",
+            "dynamic_tail_hash": "dynamic-hash-fixture",
+            "degraded_sources": [],
+            "recommendations": ["Keep stable context reusable"]
+        }
+    })
+}
+
 impl MockTerminal {
     /// Create a new MockTerminal with the given (columns, rows) dimensions.
     #[must_use]

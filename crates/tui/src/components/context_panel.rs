@@ -354,7 +354,10 @@ impl Component for ContextPanel {
             let pressure_bp = Self::pressure_bp(envelope);
             lines.push(Line::from(vec![
                 Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(Self::envelope_profile(envelope), Style::default().fg(Color::White)),
+                Span::styled(
+                    Self::envelope_profile(envelope),
+                    Style::default().fg(Color::White),
+                ),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Pressure: ", Style::default().fg(Color::DarkGray)),
@@ -382,9 +385,18 @@ impl Component for ContextPanel {
                 Span::styled(
                     format!(
                         "stable {} runtime {} dynamic {}",
-                        Self::short_hash(Self::string_at(envelope, "/diagnostics/stable_head_hash")),
-                        Self::short_hash(Self::string_at(envelope, "/diagnostics/runtime_header_hash")),
-                        Self::short_hash(Self::string_at(envelope, "/diagnostics/dynamic_tail_hash"))
+                        Self::short_hash(Self::string_at(
+                            envelope,
+                            "/diagnostics/stable_head_hash"
+                        )),
+                        Self::short_hash(Self::string_at(
+                            envelope,
+                            "/diagnostics/runtime_header_hash"
+                        )),
+                        Self::short_hash(Self::string_at(
+                            envelope,
+                            "/diagnostics/dynamic_tail_hash"
+                        ))
                     ),
                     Style::default().fg(Color::White),
                 ),
@@ -396,7 +408,10 @@ impl Component for ContextPanel {
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(
-                    format!("  segments {}", Self::array_len(envelope, "/assembled/stable_head")),
+                    format!(
+                        "  segments {}",
+                        Self::array_len(envelope, "/assembled/stable_head")
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -463,7 +478,10 @@ impl Component for ContextPanel {
                             format!("{}: ", Self::item_string(item, "role")),
                             Style::default().fg(Color::Yellow),
                         ),
-                        Span::styled(Self::preview(Self::item_string(item, "content"), 52), Style::default()),
+                        Span::styled(
+                            Self::preview(Self::item_string(item, "content"), 52),
+                            Style::default(),
+                        ),
                     ]));
                     let item_evidence = Self::item_evidence(item);
                     if !item_evidence.is_empty() {
@@ -498,7 +516,10 @@ impl Component for ContextPanel {
                             format!("{}: ", Self::item_string(omitted, "source")),
                             Style::default().fg(Color::DarkGray),
                         ),
-                        Span::styled(Self::preview(Self::item_string(omitted, "reason"), 54), Style::default()),
+                        Span::styled(
+                            Self::preview(Self::item_string(omitted, "reason"), 54),
+                            Style::default(),
+                        ),
                     ]));
                 }
             }
@@ -662,43 +683,8 @@ mod tests {
         terminal.buffer_lines()
     }
 
-    fn test_envelope_with_evidence() -> ContextEnvelope {
-        let identity = runtime::ContextIdentity::main("session-1".to_string());
-        runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
-            profile: runtime::ContextProfile::from(identity.mode),
-            identity,
-            intent: "inspect".to_string(),
-            stable_head: vec!["stable system prompt".to_string()],
-            runtime_header: vec!["session:session-1 agent:primary".to_string()],
-            dynamic_items: vec![
-                {
-                    let mut item = runtime::ContextItem::new(
-                        "mem-1",
-                        runtime::ContextSourceKind::Memory,
-                        runtime::ContextRole::Evidence,
-                        "SessionKernel owns durable sessions",
-                    );
-                    item.evidence = vec!["session://session-1/memory/mem-1".to_string()];
-                    item
-                },
-                {
-                    let mut item = runtime::ContextItem::new(
-                        "tool-1",
-                        runtime::ContextSourceKind::ToolTrace,
-                        runtime::ContextRole::Evidence,
-                        "cargo test completed successfully",
-                    );
-                    item.evidence = vec!["tool://tool-1".to_string()];
-                    item
-                },
-            ],
-            omitted: vec![runtime::ContextOmission {
-                source: runtime::ContextSourceKind::Memory,
-                reason: "context lease exhausted".to_string(),
-                token_estimate: 24,
-            }],
-            total_budget_tokens: 8_000,
-        })
+    fn test_envelope_with_evidence() -> serde_json::Value {
+        crate::test_utils::context_envelope_fixture()
     }
 
     #[test]
@@ -778,7 +764,12 @@ mod tests {
     #[test]
     fn renders_runtime_envelope_diagnostics() {
         let envelope = test_envelope_with_evidence();
-        let stable_hash = ContextPanel::short_hash(&envelope.diagnostics.stable_head_hash);
+        let stable_hash = ContextPanel::short_hash(
+            envelope
+                .pointer("/diagnostics/stable_head_hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        );
         let mut panel = ContextPanel::new();
         panel.latest_envelope = Some(envelope);
         panel.memory_status = Some("available".to_string());

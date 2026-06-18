@@ -126,14 +126,19 @@ mod tests {
 
     #[test]
     fn projection_for_webui_contains_full_management_fields() {
-        let projection =
-            CowdProjection::for_surface(&CowdCapabilityRegistry::core(), CowdSurface::Webui);
+        let registry = CowdCapabilityRegistry::core();
+        let projection = CowdProjection::for_surface(&registry, CowdSurface::Webui);
 
-        assert!(projection.capability_count >= 8);
+        assert_eq!(projection.capability_count, registry.capabilities.len());
         assert!(projection
             .capabilities
             .iter()
             .any(|capability| capability.id == "cowd.structured_data.core"));
+        assert!(!projection
+            .capabilities
+            .iter()
+            .any(|capability| capability.id == "cowd.matrix.runtime"
+                || capability.id == "mfg.manufacturing.application"));
         assert!(projection.capabilities.iter().all(|capability| capability
             .management_fields
             .contains(&"bulk_actions".to_string())));
@@ -163,10 +168,15 @@ mod tests {
 
     #[test]
     fn projection_for_cli_contains_minimal_core_controls() {
-        let projection =
-            CowdProjection::for_surface(&CowdCapabilityRegistry::core(), CowdSurface::Cli);
+        let registry = CowdCapabilityRegistry::core();
+        let projection = CowdProjection::for_surface(&registry, CowdSurface::Cli);
 
-        assert!(projection.capability_count >= 8);
+        assert_eq!(projection.capability_count, registry.capabilities.len());
+        assert!(!projection
+            .capabilities
+            .iter()
+            .any(|capability| capability.id == "cowd.matrix.runtime"
+                || capability.id == "mfg.manufacturing.application"));
         assert!(projection.capabilities.iter().all(|capability| {
             capability.surface_mode == CowdSurfaceMode::Minimal
                 && capability.management_fields

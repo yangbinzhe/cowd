@@ -68,7 +68,6 @@ pub fn manufacturing_app_descriptor() -> MfgApplicationDescriptor {
             "Manufacturing operations application over Matrix structured facts, Memory, context, skills and governance."
                 .to_string(),
         cowd_capabilities: vec![
-            "cowd.matrix.runtime".to_string(),
             "cowd.structured_data.core".to_string(),
             "cowd.context.runtime".to_string(),
             "cowd.memory.runtime".to_string(),
@@ -150,6 +149,9 @@ mod tests {
         assert_eq!(descriptor.app_id, "mfg.manufacturing");
         assert_eq!(descriptor.layer, "application");
         assert!(descriptor
+            .cowd_capabilities
+            .contains(&"cowd.structured_data.core".to_string()));
+        assert!(!descriptor
             .cowd_capabilities
             .contains(&"cowd.matrix.runtime".to_string()));
         assert!(!descriptor.source_contracts.is_empty());

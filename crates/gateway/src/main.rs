@@ -6,8 +6,8 @@
 )]
 #![deny(deprecated)]
 mod api_routes;
-mod boundary_policy;
 mod bootstrap;
+mod boundary_policy;
 mod checks;
 mod cli;
 mod compat_manifest;
@@ -15880,8 +15880,8 @@ mod dump_manifests_tests {
 #[cfg(test)]
 mod skill_pipeline_tests {
     #![allow(unused_imports)]
-    use tui::{App, SkillSummary};
     use std::path::PathBuf;
+    use tui::{App, SkillSummary};
 
     #[test]
     fn skill_summary_fields_populate_correctly() {

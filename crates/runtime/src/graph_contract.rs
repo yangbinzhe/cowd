@@ -35,26 +35,41 @@ pub struct CowdGraphPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix::MatrixMetricDependencyInput;
 
     #[test]
-    fn metric_dependency_maps_to_graph_path_with_structured_refs() {
-        let dependency = MatrixMetricDependency::from_input(MatrixMetricDependencyInput {
-            dependency_id: Some("dep-1".to_string()),
-            upstream_metric_id: "material_shortage_risk".to_string(),
-            downstream_metric_id: "order_delivery_risk".to_string(),
-            dependency_type: "drives".to_string(),
-            entity_relation_type: None,
-            required_fact_types: vec![
+    fn graph_path_preserves_structured_refs_without_matrix_dependency() {
+        let path = CowdGraphPath {
+            path_id: "dep-1".to_string(),
+            path_type: "metric_dependency".to_string(),
+            nodes: vec![
+                CowdGraphNode {
+                    node_id: "metric:material_shortage_risk".to_string(),
+                    node_type: "metric".to_string(),
+                    label: "material_shortage_risk".to_string(),
+                },
+                CowdGraphNode {
+                    node_id: "metric:order_delivery_risk".to_string(),
+                    node_type: "metric".to_string(),
+                    label: "order_delivery_risk".to_string(),
+                },
+            ],
+            edges: vec![CowdGraphEdge {
+                edge_id: "dep-1".to_string(),
+                from: "metric:material_shortage_risk".to_string(),
+                to: "metric:order_delivery_risk".to_string(),
+                relation: "drives".to_string(),
+                evidence_refs: vec!["structured-fact-type:inventory_balance".to_string()],
+            }],
+            structured_refs: vec![
                 "inventory_balance".to_string(),
                 "supplier_commit".to_string(),
-            ],
-            transformation_ref: None,
-            confidence: Some(0.82),
-            notes: None,
-        });
-
-        let path = CowdGraphPath::from(&dependency);
+            ]
+            .into_iter()
+            .map(|fact_type| format!("structured-fact-type:{fact_type}"))
+            .collect(),
+            confidence: 0.82,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
 
         assert_eq!(path.path_type, "metric_dependency");
         assert_eq!(path.nodes.len(), 2);

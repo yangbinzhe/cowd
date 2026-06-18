@@ -3,7 +3,6 @@ use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CowdExecutionOutcomeKind {
@@ -106,36 +105,26 @@ fn created_at_ms(created_at: DateTime<Utc>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix::{
-        MatrixComputeJob, MatrixComputeJobInput, MatrixDataPlaneIngestPlan,
-        MatrixDataPlaneWatermark, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
-        MatrixFactInput,
-    };
 
     #[test]
     fn ingest_plan_outcome_preserves_structured_refs_and_metrics() {
-        let plan = MatrixDataPlaneIngestPlan {
-            batch_id: "batch-1".to_string(),
-            source_ref: "pack-1".to_string(),
-            fact_type: "inventory_balance".to_string(),
-            partition_ref: "2026-W30".to_string(),
-            idempotency_key: "idem-1".to_string(),
-            replay_policy: "replace_partition_by_idempotency_key".to_string(),
-            estimated_rows: 12,
-            affected_metric_ids: vec!["stock_on_hand".to_string()],
-            compute_jobs: Vec::new(),
-            watermark: MatrixDataPlaneWatermark {
-                source_ref: "pack-1".to_string(),
-                fact_type: "inventory_balance".to_string(),
-                partition_ref: "2026-W30".to_string(),
-                high_watermark: "2026-06-14T00:00:00Z".to_string(),
-                last_batch_id: "batch-1".to_string(),
-                updated_at: DateTime::<Utc>::UNIX_EPOCH,
-            },
-            planned_at: DateTime::<Utc>::UNIX_EPOCH,
+        let outcome = CowdExecutionOutcome {
+            outcome_id: "batch-1".to_string(),
+            kind: CowdExecutionOutcomeKind::StructuredIngest,
+            status: CowdExecutionOutcomeStatus::Planned,
+            title: "Ingest inventory balance".to_string(),
+            summary: "12 rows planned for partition 2026-W30".to_string(),
+            domain: Some("manufacturing".to_string()),
+            refs: vec![CowdExecutionRef {
+                ref_type: "structured_batch".to_string(),
+                id: "batch-1".to_string(),
+                label: Some("pack-1".to_string()),
+            }],
+            evidence_refs: Vec::new(),
+            metrics: vec!["stock_on_hand".to_string()],
+            payload: serde_json::json!({"source_ref": "pack-1"}),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
         };
-
-        let outcome = CowdExecutionOutcome::from(&plan);
         let event = outcome.to_runtime_event("session-1", 7);
 
         assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredIngest);
@@ -154,44 +143,56 @@ mod tests {
 
     #[test]
     fn compute_job_outcome_maps_status_and_evidence_refs() {
-        let mut job = MatrixComputeJob::from_input(MatrixComputeJobInput {
-            job_id: Some("job-1".to_string()),
-            trigger_fact_type: "inventory_balance".to_string(),
-            trigger_fact_refs: vec!["fact-1".to_string()],
-            entity_scope: None,
-            period: Some("2026-W30".to_string()),
-            metric_ids: vec!["stock_on_hand".to_string()],
-            priority: Some(0.8),
-        });
-        job.status = "completed".to_string();
-
-        let outcome = CowdExecutionOutcome::from(&job);
+        let outcome = CowdExecutionOutcome {
+            outcome_id: "job-1".to_string(),
+            kind: CowdExecutionOutcomeKind::ApplicationCompute,
+            status: CowdExecutionOutcomeStatus::Succeeded,
+            title: "Compute stock on hand".to_string(),
+            summary: "Compute job completed".to_string(),
+            domain: Some("manufacturing".to_string()),
+            refs: vec![CowdExecutionRef {
+                ref_type: "structured_compute_job".to_string(),
+                id: "job-1".to_string(),
+                label: Some("inventory_balance".to_string()),
+            }],
+            evidence_refs: vec!["structured-fact:fact-1".to_string()],
+            metrics: vec!["stock_on_hand".to_string()],
+            payload: serde_json::json!({"period": "2026-W30"}),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
 
         assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Succeeded);
-        assert_eq!(outcome.evidence_refs, vec!["fact-1"]);
+        assert_eq!(outcome.evidence_refs, vec!["structured-fact:fact-1"]);
         assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
-        assert_eq!(outcome.refs[0].ref_type, "matrix_compute_job");
+        assert_eq!(outcome.refs[0].ref_type, "structured_compute_job");
     }
 
     #[test]
     fn structured_fact_outcome_keeps_fact_source_and_metric_refs() {
-        let fact = MatrixFact::from_input(MatrixFactInput {
-            fact_id: Some("fact-1".to_string()),
-            snapshot_id: Some("snapshot-1".to_string()),
-            fact_type: "inventory_balance".to_string(),
-            entity_refs: vec!["factory:sz".to_string()],
-            metric_key: Some("stock_on_hand".to_string()),
-            dimensions: serde_json::json!({"week": "2026-W30"}),
-            measures: serde_json::json!({"qty": 42}),
-            event_time: Some(DateTime::<Utc>::UNIX_EPOCH),
-            valid_from: None,
-            valid_to: None,
-            source_ref: Some("pack-1".to_string()),
-            confidence: Some(0.95),
-            raw_hash: Some("sha256:fact".to_string()),
-        });
-
-        let outcome = CowdExecutionOutcome::from(&fact);
+        let outcome = CowdExecutionOutcome {
+            outcome_id: "fact-1".to_string(),
+            kind: CowdExecutionOutcomeKind::StructuredFact,
+            status: CowdExecutionOutcomeStatus::Succeeded,
+            title: "Inventory balance fact".to_string(),
+            summary: "Fact persisted".to_string(),
+            domain: Some("manufacturing".to_string()),
+            refs: vec![
+                CowdExecutionRef {
+                    ref_type: "structured_fact".to_string(),
+                    id: "fact-1".to_string(),
+                    label: Some("inventory_balance".to_string()),
+                },
+                CowdExecutionRef {
+                    ref_type: "structured_source".to_string(),
+                    id: "pack-1".to_string(),
+                    label: None,
+                },
+            ],
+            evidence_refs: Vec::new(),
+            metrics: vec!["stock_on_hand".to_string()],
+            payload: serde_json::json!({"confidence": 0.95}),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
         let event = outcome.to_runtime_event("session-1", 2);
 
         assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredFact);
@@ -207,23 +208,29 @@ mod tests {
 
     #[test]
     fn structured_evidence_outcome_keeps_packet_refs_and_partial_status() {
-        let mut packet = MatrixEvidencePacket::new("Inventory balance needs review");
-        packet.packet_id = "evidence-1".to_string();
-        packet.attention_id = Some("attention-1".to_string());
-        packet.metric_evidence = vec![serde_json::json!({"metric_id": "stock_on_hand"})];
-        packet.source_refs = vec![MatrixEvidenceSourceRef {
-            kind: "fact".to_string(),
-            reference: "matrix:fact:fact-1".to_string(),
-            summary: "Fact source".to_string(),
-        }];
-
-        let outcome = CowdExecutionOutcome::from(&packet);
+        let outcome = CowdExecutionOutcome {
+            outcome_id: "evidence-1".to_string(),
+            kind: CowdExecutionOutcomeKind::StructuredEvidence,
+            status: CowdExecutionOutcomeStatus::Partial,
+            title: "Inventory balance needs review".to_string(),
+            summary: "Evidence packet contains one metric signal".to_string(),
+            domain: Some("manufacturing".to_string()),
+            refs: vec![CowdExecutionRef {
+                ref_type: "structured_evidence".to_string(),
+                id: "evidence-1".to_string(),
+                label: Some("attention-1".to_string()),
+            }],
+            evidence_refs: vec!["structured-fact:fact-1".to_string()],
+            metrics: vec!["stock_on_hand".to_string()],
+            payload: serde_json::json!({"metric_id": "stock_on_hand"}),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
         let event = outcome.to_runtime_event("session-1", 3);
 
         assert_eq!(outcome.kind, CowdExecutionOutcomeKind::StructuredEvidence);
         assert_eq!(outcome.status, CowdExecutionOutcomeStatus::Partial);
         assert_eq!(outcome.metrics, vec!["stock_on_hand"]);
-        assert_eq!(outcome.evidence_refs, vec!["matrix:fact:fact-1"]);
+        assert_eq!(outcome.evidence_refs, vec!["structured-fact:fact-1"]);
         assert!(event.refs.iter().any(|reference| {
             reference.ref_type == "structured_evidence" && reference.id == "evidence-1"
         }));

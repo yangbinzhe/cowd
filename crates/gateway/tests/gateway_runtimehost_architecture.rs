@@ -166,17 +166,22 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/agent_routes.rs",
         "api_routes/approval_routes.rs",
         "api_routes/audit_routes.rs",
+        "api_routes/channel_routes.rs",
         "api_routes/connector_routes.rs",
         "api_routes/context_routes.rs",
-        "api_routes/cowd_routes.rs",
+        "api_routes/core_routes.rs",
+        "api_routes/cross_plane_routes.rs",
         "api_routes/matrix_mfg_routes.rs",
         "api_routes/memory_routes.rs",
         "api_routes/message_routes.rs",
+        "api_routes/profile_routes.rs",
+        "api_routes/public_routes.rs",
         "api_routes/runtime_routes.rs",
         "api_routes/session_routes.rs",
         "api_routes/skill_routes.rs",
         "api_routes/system_routes.rs",
         "api_routes/task_routes.rs",
+        "api_routes/workspace_routes.rs",
     ];
     for file in scanned_files {
         let source = read_repo(&format!("crates/gateway/src/{file}"));

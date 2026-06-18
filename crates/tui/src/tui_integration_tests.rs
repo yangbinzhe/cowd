@@ -247,9 +247,7 @@ fn integration_slash_keeps_input_control_without_opening_palette() {
 #[test]
 fn integration_mid_text_slash_completion_replaces_current_token() {
     let mut state = TuiState::new("test-model", "test-session");
-    let projection =
-        serde_json::to_value(commands::command_projection(commands::CommandSurface::Tui))
-            .expect("projection");
+    let projection = crate::test_utils::gateway_command_projection_fixture();
     state
         .prompt
         .sync_command_suggestions_from_projection(&projection);

@@ -247,21 +247,22 @@ mod tests {
         assert!(registry.capability("cowd.runtime.session").is_some());
         assert!(registry.capability("cowd.context.runtime").is_some());
         assert!(registry.capability("cowd.memory.runtime").is_some());
-        assert!(registry.capability("cowd.matrix.runtime").is_some());
         assert!(registry.capability("cowd.structured_data.core").is_some());
     }
 
     #[test]
-    fn capability_registry_declares_matrix_as_kernel_fact_engine() {
+    fn capability_registry_declares_structured_data_as_kernel_contract() {
         let registry = CowdCapabilityRegistry::core();
-        let matrix = registry
-            .capability("cowd.matrix.runtime")
-            .expect("matrix runtime capability should exist");
+        let structured_data = registry
+            .capability("cowd.structured_data.core")
+            .expect("structured data core capability should exist");
 
-        assert_eq!(matrix.layer, CowdCapabilityLayer::Kernel);
-        assert_eq!(matrix.kind, CowdCapabilityKind::Matrix);
-        assert_eq!(matrix.owner_module, "matrix");
-        assert!(matrix.description.contains("Structured fact engine"));
+        assert_eq!(structured_data.layer, CowdCapabilityLayer::Kernel);
+        assert_eq!(structured_data.kind, CowdCapabilityKind::StructuredData);
+        assert_eq!(structured_data.owner_module, "runtime::structured_data");
+        assert!(structured_data
+            .description
+            .contains("Source, mapping, fact"));
     }
 
     #[test]
@@ -273,16 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_registry_declares_mfg_as_application_over_matrix() {
+    fn capability_registry_excludes_matrix_and_mfg_application_boundaries() {
         let registry = CowdCapabilityRegistry::core();
-        let mfg = registry
-            .capability("mfg.manufacturing.application")
-            .expect("mfg app capability should exist");
 
-        assert_eq!(mfg.layer, CowdCapabilityLayer::Application);
-        assert_eq!(mfg.owner_module, "cowd-app-mfg");
-        assert!(mfg.depends_on.contains(&"cowd.matrix.runtime".to_string()));
-        assert_eq!(mfg.required_permissions, vec!["read:mfg", "write:mfg"]);
+        assert!(registry.capability("cowd.matrix.runtime").is_none());
+        assert!(registry
+            .capability("mfg.manufacturing.application")
+            .is_none());
+        assert!(registry.capabilities.iter().all(|capability| {
+            !capability.id.contains("matrix")
+                && !capability.id.starts_with("mfg.")
+                && capability.owner_module != "matrix"
+                && capability.owner_module != "cowd-app-mfg"
+        }));
     }
 
     #[test]

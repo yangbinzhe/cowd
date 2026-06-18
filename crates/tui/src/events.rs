@@ -39,10 +39,8 @@ mod tests {
             preview: "ls".into(),
         };
         let cloned = event.clone();
-        assert!(
-            matches!(cloned, CowdEvent::ToolStart { id, name, preview }
-            if id == "t1" && name == "bash" && preview == "ls")
-        );
+        assert!(matches!(cloned, CowdEvent::ToolStart { id, name, preview }
+            if id == "t1" && name == "bash" && preview == "ls"));
     }
 
     #[test]

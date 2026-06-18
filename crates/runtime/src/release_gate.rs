@@ -140,11 +140,11 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.check_id == "structured_data.core.registered"));
-        assert!(report
+        assert!(!report
             .checks
             .iter()
             .any(|check| check.check_id == "matrix.kernel.registered"));
-        assert!(report
+        assert!(!report
             .checks
             .iter()
             .any(|check| check.check_id == "mfg.application.boundary"));

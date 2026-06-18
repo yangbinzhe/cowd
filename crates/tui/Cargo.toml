@@ -25,5 +25,9 @@ unicode-width = "0.2"
 [features]
 default = []
 
+[dev-dependencies]
+serial_test = "3"
+uuid = { workspace = true }
+
 [lints.rust]
 unsafe_code = "allow"

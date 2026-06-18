@@ -17,21 +17,20 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::SessionRecord;
 use matrix::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlan,
     MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixEvidencePacket,
-    MatrixFact, MatrixFactInput, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
-    MATRIX_SCHEMA_VERSION,
+    MatrixFact, MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput,
+    MatrixRelation, MatrixRelationInput, MatrixSourcePack, MATRIX_SCHEMA_VERSION,
 };
 use matrix_store::{MatrixRuntimeStore, MatrixRuntimeStoreError as MatrixStoreError};
+use memory::store::session::SessionRecord;
 use runtime::execution_outcome::{
     CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
 };
 use runtime::{
-    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, CrossPlaneAction,
-    ContextItem, ContextRole, ContextSourceKind, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt,
+    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, ContextItem, ContextRole,
+    ContextSourceKind, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt,
     CrossPlaneRisk, DataClassification, IdentityTrust, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
@@ -1954,13 +1953,9 @@ async fn matrix_fact_ingest_handler(
         let item = store
             .ingest_fact(&fact)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        append_matrix_execution_outcome(
-            &state,
-            session_id.as_deref(),
-            matrix_fact_outcome(&fact),
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        append_matrix_execution_outcome(&state, session_id.as_deref(), matrix_fact_outcome(&fact))
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         facts.push(fact);
         attention.push(item);
     }
