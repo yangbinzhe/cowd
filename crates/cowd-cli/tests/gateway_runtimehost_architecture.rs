@@ -116,6 +116,33 @@ fn compat_harness_is_not_a_workspace_dependency() {
 }
 
 #[test]
+fn entry_boundary_crates_exist_as_migration_targets() {
+    let root = repo_root();
+    for crate_name in ["cli", "gateway", "tui"] {
+        let manifest = root.join(format!("crates/{crate_name}/Cargo.toml"));
+        assert!(
+            manifest.is_file(),
+            "missing entry boundary crate manifest: {}",
+            manifest.display()
+        );
+    }
+
+    let cli_manifest = read_repo("crates/cli/Cargo.toml");
+    assert!(cli_manifest.contains("name = \"cli\""));
+    assert!(!cli_manifest.contains("runtime"));
+    assert!(!cli_manifest.contains("ratatui"));
+    assert!(!cli_manifest.contains("axum"));
+
+    let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
+    assert!(gateway_manifest.contains("name = \"gateway\""));
+
+    let tui_manifest = read_repo("crates/tui/Cargo.toml");
+    assert!(tui_manifest.contains("name = \"tui\""));
+    assert!(!tui_manifest.contains("runtime"));
+    assert!(!tui_manifest.contains("rusqlite"));
+}
+
+#[test]
 fn api_route_direct_dependencies_are_frozen_by_allowlist() {
     let allowlist = read_repo("crates/cowd-cli/src/api_routes/service_transition_allowlist.txt");
 
