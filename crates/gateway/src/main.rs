@@ -23,7 +23,9 @@ mod init;
 mod logging;
 mod matrix_sqlite_repository;
 mod mcp_serve;
+mod plugin_static;
 mod render;
+mod runtime_bootstrap;
 mod runtime_boundary;
 mod runtime_host;
 mod runtime_protocol;
@@ -32,6 +34,7 @@ mod server;
 mod services;
 mod session_kernel;
 mod session_lifecycle_kernel;
+mod skill_projection;
 mod slash_catalog;
 mod suggestions;
 mod task_kernel;
@@ -70,10 +73,8 @@ use command_service::{
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
-use plugins::{
-    PluginError, PluginHooks, PluginLoadFailure, PluginManager, PluginManagerConfig,
-    PluginRegistry, PluginSummary,
-};
+use plugin_static::handle_plugins_slash_command;
+use plugins::{PluginHooks, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::ContextProfile;
 use runtime::{
@@ -87,7 +88,6 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use skill_service::SkillRegistry;
 use slash_catalog::{
     handle_agents_slash_command, handle_agents_slash_command_json, handle_skills_slash_command,
     handle_skills_slash_command_json, resolve_skill_invocation,
@@ -3260,54 +3260,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
     }
 
     // P1: Skills data pipeline, aligned with the WebUI unified skill catalog.
-    app.skill_list.clear();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for skill in app_mfg::server_manufacturing_skill_pack() {
-        let risk = if skill
-            .output_actions
-            .iter()
-            .any(|action| action.contains("dispatch") || action.contains("escalation"))
-        {
-            "controlled"
-        } else if skill.tools.iter().any(|tool| tool.contains("cross_plane")) {
-            "governed"
-        } else {
-            "review"
-        };
-        app.skill_list.push(tui::SkillSummary {
-            name: skill.skill_id,
-            description: skill.role,
-            installed: true,
-            category: skill.domain.clone(),
-            source: "mfg".to_string(),
-            status: "ready".to_string(),
-            risk: risk.to_string(),
-            tags: vec![skill.domain, "mfg".to_string()],
-        });
-    }
-    match SkillRegistry::discover(&cwd).list() {
-        Ok(skills) => {
-            for skill in skills {
-                app.skill_list.push(tui::SkillSummary {
-                    name: skill.name,
-                    description: skill.description.unwrap_or_default(),
-                    installed: skill.shadowed_by.is_none(),
-                    category: "local".to_string(),
-                    source: format!("{:?}", skill.source),
-                    status: if skill.shadowed_by.is_some() {
-                        "shadowed".to_string()
-                    } else {
-                        "ready".to_string()
-                    },
-                    risk: "operator_review".to_string(),
-                    tags: skill.tags,
-                });
-            }
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to load skill registry for TUI");
-        }
-    }
+    app.skill_list = skill_projection::load_tui_skill_summaries_for_current_dir();
 
     app.mcp_count = runtime.mcp_state.as_ref().map_or(0, |mcp| {
         mcp.lock()
@@ -6323,7 +6276,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let mut manager = runtime_bootstrap::build_plugin_manager(&cwd, &loader, &runtime_config);
         let result = handle_plugins_slash_command(action, target, &mut manager)?;
         match output_format {
             CliOutputFormat::Text => println!("{}", result.message),
@@ -6521,7 +6474,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let mut manager = runtime_bootstrap::build_plugin_manager(&cwd, &loader, &runtime_config);
         let result = handle_plugins_slash_command(action, target, &mut manager)?;
         println!("{}", result.message);
         if result.reload_runtime {
@@ -9438,7 +9391,7 @@ fn build_runtime_plugin_state_with_loader(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
+    let plugin_manager = runtime_bootstrap::build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
@@ -9455,233 +9408,6 @@ fn build_runtime_plugin_state_with_loader(
         plugin_registry,
         mcp_state,
     })
-}
-
-fn build_plugin_manager(
-    cwd: &Path,
-    loader: &ConfigLoader,
-    runtime_config: &runtime::RuntimeConfig,
-) -> PluginManager {
-    let plugin_settings = runtime_config.plugins();
-    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
-    // Start with config.yaml's enabled_plugins (user-defined defaults)
-    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
-    // Merge plugin-state.json runtime overrides (take precedence over config.yaml)
-    let state_path = runtime::cowd_dirs::config_home_dir().join("plugin-state.json");
-    if let Ok(content) = std::fs::read_to_string(&state_path) {
-        if !content.trim().is_empty() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(map) = val.get("enabledPlugins").and_then(|v| v.as_object()) {
-                    for (k, v) in map {
-                        if let Some(enabled) = v.as_bool() {
-                            plugin_config.enabled_plugins.insert(k.clone(), enabled);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    plugin_config.external_dirs = plugin_settings
-        .external_directories()
-        .iter()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
-        .collect();
-    plugin_config.install_root = plugin_settings
-        .install_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.registry_path = plugin_settings
-        .registry_path()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.bundled_root = plugin_settings
-        .bundled_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    PluginManager::new(plugin_config)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PluginsCommandResult {
-    message: String,
-    reload_runtime: bool,
-}
-
-fn handle_plugins_slash_command(
-    action: Option<&str>,
-    target: Option<&str>,
-    manager: &mut PluginManager,
-) -> Result<PluginsCommandResult, PluginError> {
-    match action {
-        None | Some("list") => {
-            let report = manager.installed_plugin_registry_report()?;
-            Ok(PluginsCommandResult {
-                message: render_plugins_report_with_failures(&report.summaries(), report.failures()),
-                reload_runtime: false,
-            })
-        }
-        Some("install") => {
-            let Some(target) = target else {
-                return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins install <path>".to_string(),
-                    reload_runtime: false,
-                });
-            };
-            let install = manager.install(target)?;
-            let plugin = manager
-                .list_installed_plugins()?
-                .into_iter()
-                .find(|plugin| plugin.metadata.id == install.plugin_id);
-            Ok(PluginsCommandResult {
-                message: render_plugin_install_report(&install.plugin_id, plugin.as_ref()),
-                reload_runtime: true,
-            })
-        }
-        Some("enable") => {
-            let Some(target) = target else {
-                return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins enable <name>".to_string(),
-                    reload_runtime: false,
-                });
-            };
-            let plugin = resolve_plugin_target(manager, target)?;
-            manager.enable(&plugin.metadata.id)?;
-            Ok(PluginsCommandResult {
-                message: format!(
-                    "Plugins\n  Result           enabled {}\n  Name             {}\n  Version          {}\n  Status           enabled",
-                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
-                ),
-                reload_runtime: true,
-            })
-        }
-        Some("disable") => {
-            let Some(target) = target else {
-                return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins disable <name>".to_string(),
-                    reload_runtime: false,
-                });
-            };
-            let plugin = resolve_plugin_target(manager, target)?;
-            manager.disable(&plugin.metadata.id)?;
-            Ok(PluginsCommandResult {
-                message: format!(
-                    "Plugins\n  Result           disabled {}\n  Name             {}\n  Version          {}\n  Status           disabled",
-                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
-                ),
-                reload_runtime: true,
-            })
-        }
-        Some("uninstall") => {
-            let Some(target) = target else {
-                return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins uninstall <plugin-id>".to_string(),
-                    reload_runtime: false,
-                });
-            };
-            manager.uninstall(target)?;
-            Ok(PluginsCommandResult {
-                message: format!("Plugins\n  Result           uninstalled {target}"),
-                reload_runtime: true,
-            })
-        }
-        Some("update") => {
-            let Some(target) = target else {
-                return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins update <plugin-id>".to_string(),
-                    reload_runtime: false,
-                });
-            };
-            let update = manager.update(target)?;
-            let plugin = manager
-                .list_installed_plugins()?
-                .into_iter()
-                .find(|plugin| plugin.metadata.id == update.plugin_id);
-            Ok(PluginsCommandResult {
-                message: format!(
-                    "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
-                    update.plugin_id,
-                    plugin
-                        .as_ref()
-                        .map_or_else(|| update.plugin_id.clone(), |plugin| plugin.metadata.name.clone()),
-                    update.old_version,
-                    update.new_version,
-                    plugin
-                        .as_ref()
-                        .map_or("unknown", |plugin| if plugin.enabled { "enabled" } else { "disabled" }),
-                ),
-                reload_runtime: true,
-            })
-        }
-        Some(other) => Ok(PluginsCommandResult {
-            message: format!(
-                "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, or update."
-            ),
-            reload_runtime: false,
-        }),
-    }
-}
-
-fn render_plugins_report_with_failures(
-    plugins: &[PluginSummary],
-    failures: &[PluginLoadFailure],
-) -> String {
-    let mut lines = vec!["Plugins".to_string()];
-    if plugins.is_empty() {
-        lines.push("  No plugins installed.".to_string());
-    } else {
-        for plugin in plugins {
-            let enabled = if plugin.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            lines.push(format!(
-                "  {name:<20} v{version:<10} {enabled}",
-                name = plugin.metadata.name,
-                version = plugin.metadata.version,
-            ));
-        }
-    }
-    if !failures.is_empty() {
-        lines.push(String::new());
-        lines.push("Warnings:".to_string());
-        for failure in failures {
-            lines.push(format!(
-                "  Failed to load {} plugin from `{}`",
-                failure.kind,
-                failure.plugin_root.display()
-            ));
-            lines.push(format!("      Error: {}", failure.error()));
-        }
-    }
-    lines.join("\n")
-}
-
-fn render_plugin_install_report(plugin_id: &str, plugin: Option<&PluginSummary>) -> String {
-    let name = plugin.map_or(plugin_id, |plugin| plugin.metadata.name.as_str());
-    let version = plugin.map_or("unknown", |plugin| plugin.metadata.version.as_str());
-    let enabled = plugin.is_some_and(|plugin| plugin.enabled);
-    format!(
-        "Plugins\n  Result           installed {plugin_id}\n  Name             {name}\n  Version          {version}\n  Status           {}",
-        if enabled { "enabled" } else { "disabled" }
-    )
-}
-
-fn resolve_plugin_target(
-    manager: &PluginManager,
-    target: &str,
-) -> Result<PluginSummary, PluginError> {
-    let mut matches = manager
-        .list_installed_plugins()?
-        .into_iter()
-        .filter(|plugin| plugin.metadata.id == target || plugin.metadata.name == target)
-        .collect::<Vec<_>>();
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(PluginError::NotFound(format!(
-            "plugin `{target}` is not installed or discoverable"
-        ))),
-        _ => Err(PluginError::InvalidManifest(format!(
-            "plugin name `{target}` is ambiguous; use the full plugin id"
-        ))),
-    }
 }
 
 fn handle_mcp_slash_command(
@@ -10121,17 +9847,6 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
         "enabled".to_string()
     } else {
         parts.join(", ")
-    }
-}
-
-fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else if value.starts_with('.') {
-        cwd.join(path)
-    } else {
-        config_home.join(path)
     }
 }
 

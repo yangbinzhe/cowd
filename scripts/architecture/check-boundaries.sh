@@ -76,21 +76,7 @@ check_empty "app-mfg must not depend on gateway or runtime internals" \
     crates/app-mfg/src crates/app-mfg/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
-  rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" \
-    crates \
-    --glob '*.rs' \
-    --glob '!**/tests/**' \
-    --glob '!crates/storage/**' \
-    --glob '!crates/memory/src/store/sqlite.rs' \
-    --glob '!crates/memory/src/store/session.rs' \
-    --glob '!crates/memory/src/store/verbatim.rs' \
-    --glob '!crates/memory/src/session_store.rs' \
-    --glob '!crates/memory/src/sqlite_persistence.rs' \
-    --glob '!crates/memory/src/maintenance.rs' \
-    --glob '!crates/matrix/repository/**' \
-    --glob '!crates/app-mfg/src/repository.rs' \
-    --glob '!crates/app-mfg/src/store.rs' \
-  | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes.rs:|^crates/gateway/src/task_kernel.rs:|^crates/gateway/src/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example|//!|///)"
+  bash -c 'rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" crates --glob "*.rs" --glob "!**/tests/**" --glob "!crates/storage/**" --glob "!crates/memory/src/store/sqlite.rs" --glob "!crates/memory/src/store/session.rs" --glob "!crates/memory/src/store/verbatim.rs" --glob "!crates/memory/src/session_store.rs" --glob "!crates/memory/src/sqlite_persistence.rs" --glob "!crates/memory/src/maintenance.rs" --glob "!crates/matrix/repository/**" --glob "!crates/app-mfg/src/repository.rs" --glob "!crates/app-mfg/src/store.rs" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes.rs:|^crates/gateway/src/task_kernel.rs:|^crates/gateway/src/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example|//!|///)" || true'
 
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features
