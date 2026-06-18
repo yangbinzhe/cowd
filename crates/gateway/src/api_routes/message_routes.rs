@@ -435,13 +435,14 @@ async fn send_message(
                 tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
             }
             if let Some(collaboration_result) = collaboration_result {
+                let memory_manager = state.services.memory.manager();
                 if let Err(e) = state
                     .services
                     .session
                     .persist_workgraph_review(
                         &collaboration_result.work_graph,
                         &collaboration_result.review_packet,
-                        state.memory_manager.as_ref(),
+                        memory_manager.as_ref(),
                     )
                     .await
                 {

@@ -129,8 +129,8 @@ async fn context_current_handler(
     let mut omitted_items = Vec::new();
     let mut degraded = Vec::new();
 
-    if let Some(ref mgr) = state.memory_manager {
-        let mgr = Arc::clone(mgr);
+    if let Some(mgr) = state.services.memory.manager() {
+        let mgr = Arc::clone(&mgr);
         let session_for_packet = session_id.clone();
         let query_for_packet = query.clone();
         let packet_result = tokio::task::spawn_blocking(move || {

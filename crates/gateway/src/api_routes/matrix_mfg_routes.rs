@@ -3419,7 +3419,7 @@ async fn append_matrix_execution_outcome(
     let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return Ok(());
     };
     ensure_matrix_outcome_session_record(state, session_id)
@@ -3657,7 +3657,7 @@ async fn ensure_matrix_outcome_session_record(
     state: &AppState,
     session_id: &str,
 ) -> Result<(), String> {
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return Ok(());
     };
     let now = chrono::Utc::now().to_rfc3339();
@@ -3705,7 +3705,7 @@ async fn ensure_matrix_task_session_record(
     state: &AppState,
     task: &TaskRecord,
 ) -> Result<(), String> {
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return Ok(());
     };
     let now = chrono::Utc::now().to_rfc3339();

@@ -144,8 +144,21 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     let tui_manifest = read_repo("crates/tui/Cargo.toml");
     let tui_dependencies = manifest_dependencies(&tui_manifest);
     assert!(tui_manifest.contains("name = \"tui\""));
-    assert!(!tui_dependencies.contains("runtime"));
-    assert!(!tui_dependencies.contains("rusqlite"));
+    for forbidden in [
+        "runtime",
+        "matrix",
+        "memory",
+        "commands",
+        "command-runtime",
+        "storage",
+        "tools",
+        "rusqlite",
+    ] {
+        assert!(
+            !tui_dependencies.contains(forbidden),
+            "tui manifest must not depend directly on {forbidden}"
+        );
+    }
 }
 
 #[test]

@@ -160,7 +160,7 @@ fn try_read_image_bytes(cmd: &str, args: &[&str]) -> Option<ClipboardContent> {
 }
 
 fn try_read_macos_image() -> Option<ClipboardContent> {
-    let tmp_path = std::env::temp_dir().join("cowd-clipboard.png");
+    let tmp_path = std::env::temp_dir().join("tui-clipboard.png");
     let tmp_path_str = tmp_path.to_string_lossy().to_string();
     let args = macos_image_osascript_args(&tmp_path_str);
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();

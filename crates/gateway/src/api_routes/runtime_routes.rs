@@ -499,7 +499,7 @@ pub(super) async fn get_runtime_control_plane(
         .filter(|task| matches!(task.status.as_str(), "pending" | "running" | "reviewing"))
         .count();
 
-    let memory = if let Some(memory_manager) = state.memory_manager.as_ref() {
+    let memory = if let Some(memory_manager) = state.services.memory.manager() {
         serde_json::json!({
             "status": "available",
             "enabled": true,
@@ -531,7 +531,7 @@ pub(super) async fn get_runtime_control_plane(
     let degraded = !degraded_reasons.is_empty();
     let status = if degraded {
         "degraded"
-    } else if state.memory_manager.is_none()
+    } else if state.services.memory.manager().is_none()
         || !control.policy.enabled
         || !provider_configured
         || !configured_model_resolved
@@ -550,7 +550,7 @@ pub(super) async fn get_runtime_control_plane(
             acc
         });
     let session_lease_projection = session_lease_projection(&state).await;
-    let memory_attached = state.memory_manager.is_some();
+    let memory_attached = state.services.memory.manager().is_some();
     let component_count = 10usize;
     let degraded_component_count =
         usize::from(!durable_session_store) * 2 + usize::from(!connector_ready);

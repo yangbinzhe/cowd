@@ -155,7 +155,7 @@ struct ToolOperationReceipt {
 
 async fn usage_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     let active_session_count = state.list_active_session_ids().len();
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return Json(serde_json::json!({
             "kind": "usage.summary",
             "status": "degraded",

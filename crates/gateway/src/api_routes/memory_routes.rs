@@ -97,9 +97,9 @@ fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value 
 }
 
 pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         let layers = mgr.list_layers().await;
-        let kernel = MemoryKernel::new(Arc::clone(mgr));
+        let kernel = MemoryKernel::new(Arc::clone(&mgr));
         let kernel_ctx = MemoryTurnContext::new("api-memory-status", "api");
         let kernel_health = kernel
             .health(&kernel_ctx)
@@ -175,7 +175,7 @@ async fn memory_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
 }
 
 async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         let layers = mgr.list_layers().await;
         let total_entries: usize = layers
             .iter()
@@ -214,7 +214,7 @@ async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 }
 
 async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         Json(serde_json::json!({
             "enabled": true,
             "layers": mgr.list_layers().await,
@@ -228,7 +228,7 @@ async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
 }
 
 async fn performance_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         let report = mgr.performance_report();
         Json(serde_json::json!(report))
     } else {
@@ -313,7 +313,7 @@ async fn memory_maintenance_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<MemoryMaintenanceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Ok(Json(serde_json::json!({
             "enabled": false,
             "candidates": [],
@@ -352,7 +352,7 @@ async fn scan_memory_maintenance_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<MemoryMaintenanceScanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Ok(Json(serde_json::json!({
             "enabled": false,
             "candidates": [],
@@ -388,7 +388,7 @@ async fn update_memory_maintenance_handler(
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryMaintenanceRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -445,7 +445,7 @@ async fn memory_layer_handler(
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
     };
 
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         match mgr.list_layer_full_entries(layer).await {
             Ok(entries) => Ok(Json(serde_json::json!({
                 "enabled": true,
@@ -474,7 +474,7 @@ async fn create_memory_entry_handler(
     let Some(layer) = parse_memory_layer(&layer) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
     };
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -539,7 +539,7 @@ async fn create_memory_entry_handler(
         source_agent: None,
         visibility: AgentVisibility::Shared,
     };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     let memory_ctx = MemoryTurnContext::new("api-memory-create", "api");
 
     match kernel.remember(&memory_ctx, entry).await {
@@ -562,7 +562,7 @@ async fn delete_memory_entry_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((_layer, id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -570,7 +570,7 @@ async fn delete_memory_entry_handler(
     };
     let memory_id = MemoryId::try_parse(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid memory id"))?;
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     let memory_ctx = MemoryTurnContext::new("api-memory-delete", "api");
     kernel
         .archive(&memory_ctx, memory_id, "archived by API delete request")
@@ -584,7 +584,7 @@ async fn update_memory_entry_handler(
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryEntryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -615,7 +615,7 @@ async fn update_memory_entry_handler(
 }
 
 async fn memory_entities_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         let entities = mgr.list_entities().await.unwrap_or_default();
         Json(serde_json::json!({
             "enabled": true,
@@ -630,7 +630,7 @@ async fn memory_entities_handler(AxumState(state): AxumState<Arc<AppState>>) -> 
 }
 
 async fn memory_triples_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         let triples = mgr.list_triples().await.unwrap_or_default();
         Json(serde_json::json!({
             "enabled": true,
@@ -648,7 +648,7 @@ async fn create_memory_symbol_link_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<CreateSymbolLinkRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -687,7 +687,7 @@ async fn memory_symbol_links_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -724,7 +724,7 @@ async fn memory_search_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let query = params.get("q").cloned().unwrap_or_default();
-    if let Some(ref mgr) = state.memory_manager {
+    if let Some(mgr) = state.services.memory.manager() {
         match mgr.search(&query).await {
             Ok(results) => Json(serde_json::json!({ "results": results })),
             Err(error) => Json(serde_json::json!({ "error": error.to_string() })),
@@ -745,7 +745,7 @@ async fn memory_recall_explain_handler(
         .unwrap_or(10)
         .clamp(1, 50);
 
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Json(serde_json::json!({
             "enabled": false,
             "query": query,
@@ -837,7 +837,7 @@ async fn memory_packet_handler(
         .unwrap_or(2_000)
         .clamp(64, 32_000);
 
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Json(serde_json::json!({
             "enabled": false,
             "query": query,
@@ -847,7 +847,7 @@ async fn memory_packet_handler(
         }));
     };
 
-    let mgr = Arc::clone(mgr);
+    let mgr = Arc::clone(&mgr);
     let query_for_packet = query.clone();
     let packet_result = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -888,7 +888,7 @@ async fn memory_packet_handler(
 async fn memory_links_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Json(serde_json::json!({
             "enabled": false,
             "links": [],
@@ -896,7 +896,7 @@ async fn memory_links_handler(
             "degraded_reason": "memory not configured",
         }));
     };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     match kernel.links().await {
         Ok(links) => Json(serde_json::json!({
             "enabled": true,
@@ -918,7 +918,7 @@ async fn memory_links_handler(
 async fn memory_runtime_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Json(serde_json::json!({
             "enabled": false,
             "runtime": null,
@@ -926,7 +926,7 @@ async fn memory_runtime_handler(
             "degraded_reason": "memory not configured",
         }));
     };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     match kernel.runtime_snapshot().await {
         Ok(runtime) => Json(serde_json::json!({
             "enabled": true,
@@ -953,7 +953,7 @@ async fn memory_clusters_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<MemoryClusterQuery>,
 ) -> Json<serde_json::Value> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Json(serde_json::json!({
             "enabled": false,
             "clusters": [],
@@ -961,7 +961,7 @@ async fn memory_clusters_handler(
             "degraded_reason": "memory not configured",
         }));
     };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     match kernel.clusters(query.limit.unwrap_or(24).min(200)).await {
         Ok(clusters) => Json(serde_json::json!({
             "enabled": true,
@@ -984,7 +984,7 @@ async fn memory_lifecycle_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
+    let Some(mgr) = state.services.memory.manager() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory not configured",
@@ -992,7 +992,7 @@ async fn memory_lifecycle_handler(
     };
     let memory_id = MemoryId::try_parse(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid memory id"))?;
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let kernel = MemoryKernel::new(Arc::clone(&mgr));
     let events = kernel
         .lifecycle_events(memory_id)
         .await

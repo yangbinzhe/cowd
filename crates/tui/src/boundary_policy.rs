@@ -23,7 +23,15 @@ impl TuiBoundaryPolicy {
                 TuiBackendAccess::GatewayCommandProjection,
             ],
             forbidden_direct_dependencies: [
-                "runtime", "app_mfg", "matrix", "storage", "tools", "memory", "rusqlite",
+                "runtime",
+                "app_mfg",
+                "matrix",
+                "storage",
+                "tools",
+                "memory",
+                "commands",
+                "command-runtime",
+                "rusqlite",
             ]
             .into_iter()
             .map(str::to_string)

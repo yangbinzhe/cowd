@@ -69,7 +69,6 @@ macro_rules! define_gateway_service {
 }
 
 define_gateway_service!(TaskService, "task");
-define_gateway_service!(MemoryService, "memory");
 define_gateway_service!(ContextService, "context");
 define_gateway_service!(ConnectorService, "connector");
 define_gateway_service!(ToolService, "tool");
@@ -78,6 +77,52 @@ define_gateway_service!(AuditService, "audit");
 define_gateway_service!(SkillService, "skill");
 define_gateway_service!(AgentService, "agent");
 define_gateway_service!(MfgService, "mfg");
+
+#[derive(Clone)]
+pub(crate) struct MemoryService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+    manager: Option<Arc<GatewayMemoryManager>>,
+}
+
+impl MemoryService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "memory",
+            owner: "0.9.292 Gateway RuntimeHost",
+            manager: None,
+        }
+    }
+
+    pub(crate) fn with_manager(manager: Option<Arc<GatewayMemoryManager>>) -> Self {
+        Self {
+            manager,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        ServiceEnvelope {
+            service: self.label,
+            operation,
+            status: if self.manager.is_some() {
+                "service_ready"
+            } else {
+                "service_boundary_ready"
+            },
+            owner: self.owner,
+            boundary_status: "reviewed_0.9.307",
+        }
+    }
+
+    pub(crate) fn manager(&self) -> Option<Arc<GatewayMemoryManager>> {
+        self.manager.clone()
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.manager.is_some()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct MatrixService {
@@ -768,6 +813,7 @@ pub(crate) struct GatewayServices {
 impl GatewayServices {
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
     ) -> Self {
@@ -777,6 +823,7 @@ impl GatewayServices {
             runtime: Some(runtime),
             command: CommandService::new(Some(command_runtime)),
             session: SessionService::with_kernel(session_kernel),
+            memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
             ..Self::transition_only()
         }
@@ -818,6 +865,16 @@ impl GatewayServices {
         );
         Self {
             approval: ApprovalService::with_gate_and_repository(approval_gate, repository),
+            ..Self::transition_only()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_with_memory_for_tests(
+        memory_manager: Arc<GatewayMemoryManager>,
+    ) -> Self {
+        Self {
+            memory: MemoryService::with_manager(Some(memory_manager)),
             ..Self::transition_only()
         }
     }

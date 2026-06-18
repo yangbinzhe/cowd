@@ -224,7 +224,7 @@ async fn append_task_runtime_event(
 }
 
 async fn ensure_task_session_record(state: &AppState, task: &TaskRecord) -> Result<(), String> {
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return Ok(());
     };
     let now = chrono::Utc::now().to_rfc3339();

@@ -59,7 +59,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
     let runtime = GatewayRuntimeSnapshot {
         service_layer: state.services.has_minimum_service_contract(),
         unified_store: state.has_unified_store(),
-        memory_manager: state.memory_manager.is_some(),
+        memory_manager: state.services.memory.manager().is_some(),
         platform_runtime: state.platform_runtime.is_some(),
         event_bus: true,
         session_kernel: true,

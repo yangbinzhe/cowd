@@ -694,7 +694,7 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
     reference: &str,
     session_id: Option<String>,
 ) -> serde_json::Value {
-    let Some(memory_manager) = state.memory_manager.as_ref() else {
+    let Some(memory_manager) = state.services.memory.manager() else {
         return serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": false,
@@ -731,7 +731,7 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         }
     };
     let content = connector_resource_memory_content(&resource);
-    match find_existing_connector_resource_memory(memory_manager, reference).await {
+    match find_existing_connector_resource_memory(&memory_manager, reference).await {
         Ok(Some(existing_id)) => {
             return serde_json::json!({
                 "kind": "connector_resource_memory_promotion",
@@ -788,7 +788,7 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         source_agent: Some("connector-resource-bridge".to_string()),
         visibility: AgentVisibility::Shared,
     };
-    let kernel = MemoryKernel::new(Arc::clone(memory_manager));
+    let kernel = MemoryKernel::new(Arc::clone(&memory_manager));
     let memory_ctx = MemoryTurnContext::new("connector-resource-bridge", "api");
     match kernel.remember(&memory_ctx, entry).await {
         Ok(()) => serde_json::json!({

@@ -234,7 +234,7 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {
-    let Some(store) = state.unified_store() else {
+    let Some(store) = state.services.session.unified_store() else {
         return false;
     };
     let Ok(sessions) = store.list_sessions().await else {

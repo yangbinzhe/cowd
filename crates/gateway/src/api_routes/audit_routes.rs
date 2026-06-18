@@ -39,7 +39,7 @@ async fn audit_export_handler(
         (Vec::new(), 0)
     };
     let memory = if include_memory {
-        match &state.memory_manager {
+        match state.services.memory.manager() {
             Some(manager) => manager.audit_entries(limit + offset).unwrap_or_default(),
             None => Vec::new(),
         }
