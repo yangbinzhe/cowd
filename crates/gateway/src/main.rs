@@ -38,6 +38,7 @@ mod skill_projection;
 mod slash_catalog;
 mod suggestions;
 mod task_kernel;
+mod tool_projection;
 mod tui_callbacks;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
@@ -96,29 +97,6 @@ use tools::{GlobalToolRegistry, RuntimeToolDefinition};
 
 use futures::StreamExt;
 use tui::state::TuiState;
-
-struct TuiToolRegistryAdapter {
-    _inner: GlobalToolRegistry,
-}
-
-impl TuiToolRegistryAdapter {
-    fn new(inner: GlobalToolRegistry) -> Self {
-        Self { _inner: inner }
-    }
-}
-
-impl tui::app::ToolRegistry for TuiToolRegistryAdapter {
-    fn enable_tool(&self, name: &str) {
-        // GlobalToolRegistry is read-only at this layer;
-        // enable/disable is tracked in SkillsPanel entries.
-        // Validation: check the tool name is registered.
-        let _ = name;
-    }
-
-    fn disable_tool(&self, name: &str) {
-        let _ = name;
-    }
-}
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -3558,7 +3536,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // ── Wire tool registry to SkillsPanel (T27) ──
     tracing::debug!("tui init: loading tool registry");
     if let Ok(registry) = current_tool_registry() {
-        state.set_tool_registry(std::sync::Arc::new(TuiToolRegistryAdapter::new(registry)));
+        state.set_tool_registry(std::sync::Arc::new(
+            tool_projection::TuiToolRegistryAdapter::new(registry),
+        ));
     }
 
     // ── Wire TUI into ActiveSessions (T6) ──
