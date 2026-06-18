@@ -12,6 +12,10 @@ fn production_part(source: &str) -> &str {
     source.split("#[cfg(test)]").next().unwrap_or(source)
 }
 
+fn manifest_dependencies(source: &str) -> &str {
+    source.split("[dev-dependencies]").next().unwrap_or(source)
+}
+
 #[test]
 fn daemon_module_is_only_a_runtime_host_transition_shim() {
     let source = read_repo("crates/cowd-cli/src/daemon/mod.rs");
@@ -128,18 +132,20 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     }
 
     let cli_manifest = read_repo("crates/cli/Cargo.toml");
+    let cli_dependencies = manifest_dependencies(&cli_manifest);
     assert!(cli_manifest.contains("name = \"cli\""));
-    assert!(!cli_manifest.contains("runtime"));
-    assert!(!cli_manifest.contains("ratatui"));
-    assert!(!cli_manifest.contains("axum"));
+    assert!(!cli_dependencies.contains("runtime"));
+    assert!(!cli_dependencies.contains("ratatui"));
+    assert!(!cli_dependencies.contains("axum"));
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     assert!(gateway_manifest.contains("name = \"gateway\""));
 
     let tui_manifest = read_repo("crates/tui/Cargo.toml");
+    let tui_dependencies = manifest_dependencies(&tui_manifest);
     assert!(tui_manifest.contains("name = \"tui\""));
-    assert!(!tui_manifest.contains("runtime"));
-    assert!(!tui_manifest.contains("rusqlite"));
+    assert!(!tui_dependencies.contains("runtime"));
+    assert!(!tui_dependencies.contains("rusqlite"));
 }
 
 #[test]

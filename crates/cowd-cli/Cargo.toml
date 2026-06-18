@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+autobins = false
 
-[[bin]]
-name = "cowd"
+[lib]
+name = "entrypoint_legacy"
 path = "src/main.rs"
 
 [dependencies]

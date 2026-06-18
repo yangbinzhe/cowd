@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::{StorageBackend, StorageError};
@@ -51,15 +51,55 @@ impl SqliteConnectionFactory {
     }
 
     pub fn apply_pragmas(&self, connection: &Connection) -> Result<(), StorageError> {
-        connection.pragma_update(None, "busy_timeout", self.pragma.busy_timeout_ms)?;
-        connection.pragma_update(None, "journal_mode", self.pragma.journal_mode.as_str())?;
-        connection.pragma_update(None, "foreign_keys", self.pragma.foreign_keys)?;
-        connection.pragma_update(None, "synchronous", self.pragma.synchronous.as_str())?;
-        connection.pragma_update(None, "temp_store", self.pragma.temp_store.as_str())?;
+        set_pragma(
+            connection,
+            "busy_timeout",
+            &self.pragma.busy_timeout_ms.to_string(),
+        )?;
+        set_pragma(
+            connection,
+            "journal_mode",
+            &quote_pragma(&self.pragma.journal_mode),
+        )?;
+        set_pragma(
+            connection,
+            "foreign_keys",
+            if self.pragma.foreign_keys {
+                "ON"
+            } else {
+                "OFF"
+            },
+        )?;
+        set_pragma(
+            connection,
+            "synchronous",
+            &quote_pragma(&self.pragma.synchronous),
+        )?;
+        set_pragma(
+            connection,
+            "temp_store",
+            &quote_pragma(&self.pragma.temp_store),
+        )?;
         if let Some(mmap_size) = self.pragma.mmap_size_bytes {
-            connection.pragma_update(None, "mmap_size", mmap_size)?;
+            set_pragma(connection, "mmap_size", &mmap_size.to_string())?;
         }
         Ok(())
+    }
+}
+
+fn quote_pragma(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn set_pragma(connection: &Connection, name: &str, value: &str) -> Result<(), StorageError> {
+    let sql = format!("PRAGMA {name} = {value}");
+    match connection.execute(&sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::ExecuteReturnedResults) => {
+            let _: Value = connection.query_row(&sql, [], |row| row.get(0))?;
+            Ok(())
+        }
+        Err(error) => Err(StorageError::from(error)),
     }
 }
 

@@ -44,7 +44,7 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
 fi
 
 cd "$ROOT"
-cargo build -p cowd-cli
+cargo build -p cli
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF

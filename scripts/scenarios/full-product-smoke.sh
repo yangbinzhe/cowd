@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_DIR="${1:-${COWD_INSTALL_DIR:-}}"
 if [[ -n "$INSTALL_DIR" ]]; then
-  BIN="${COWD_BIN:-$INSTALL_DIR/bin/cowd}"
+  BIN="${COWD_BIN:-$INSTALL_DIR/cowd}"
 else
   TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
   BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"

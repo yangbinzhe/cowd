@@ -37,7 +37,7 @@ where it must not be used as an internal Rust boundary name.
 | `runtime::cowd_event` | Rust module | runtime | 0.9.305 | event bus rename must be coordinated with TUI/Gateway SSE DTOs |
 | `cowd_storage` | Rust dependency alias | runtime | 0.9.305 | avoids conflict while storage governance settles |
 | `cowd_memory` | Rust crate import | memory | 0.9.305 | Rust package rename requires broad test and docs update |
-| `crates/cowd-cli` | crate directory | entrypoints | 0.9.300 | will be replaced by physical `cli/gateway/tui` split |
+| `crates/cowd-cli` | crate directory | entrypoints | 0.9.305 | temporary `entrypoint_legacy` library while implementation moves into `cli/gateway/tui` |
 
 ## Forbidden For New Code
 

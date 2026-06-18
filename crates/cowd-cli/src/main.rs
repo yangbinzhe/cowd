@@ -349,7 +349,7 @@ fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     }
 }
 
-fn main() {
+pub fn main_entry() {
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream

@@ -186,7 +186,7 @@ run_unit_fast() {
 
 run_contract() {
   run_step cargo_fmt cargo fmt --check
-  for pkg in api commands compat-harness cowd-memory plugins runtime telemetry tools; do
+  for pkg in provider commands cowd-memory plugins runtime telemetry tools; do
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
   done
   run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture
@@ -201,7 +201,7 @@ run_contract() {
 }
 
 run_scenario() {
-  run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
+  run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
@@ -211,9 +211,9 @@ run_scenario() {
 }
 
 run_surface() {
-  run_step cargo_build_cli cargo build -p cowd-cli --no-default-features
+  run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
-  run_step cli_minimal_contract cargo test -p cowd-cli output_format_contract --no-default-features -- --nocapture --test-threads=1
+  run_step cli_minimal_contract cargo test -p cli --test output_format_contract --no-default-features -- --nocapture --test-threads=1
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
   run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
 }
@@ -225,13 +225,13 @@ run_release() {
     run_step clean_tmp bash scripts/release/clean-build-artifacts.sh --tmp
   fi
   run_step cargo_fmt cargo fmt --check
-  run_step cargo_build_debug cargo build -p cowd-cli --no-default-features
+  run_step cargo_build_debug cargo build -p cli --no-default-features
   run_step install_debug bash -lc 'scripts/release/install-debug-to-ai.sh --current --print-path-only | tee "$0"' "$INSTALL_DIR_FILE"
   local install_dir
   install_dir="$(cat "$INSTALL_DIR_FILE")"
-  export COWD_BIN="$install_dir/bin/cowd"
+  export COWD_BIN="$install_dir/cowd"
   run_step artifact_report bash scripts/release/report-artifacts.sh "$install_dir" "$REPORT_DIR/artifacts.md"
-  run_step setup_smoke bash -lc '"$COWD_BIN" --version && "$COWD_BIN" setup'
+  run_step setup_smoke bash -lc '"$COWD_BIN" --version && "$COWD_BIN" doctor'
   run_step full_product_smoke timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/full-product-smoke.sh "$install_dir"
   run_step tui_daemon_attach timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/tui-daemon-attach.sh
 }

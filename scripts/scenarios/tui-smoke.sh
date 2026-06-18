@@ -27,7 +27,7 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 if [[ ! -x "$BIN" ]]; then
-  echo "missing cowd binary at $BIN; run cargo build -p cowd-cli first" >&2
+  echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
   exit 1
 fi
 

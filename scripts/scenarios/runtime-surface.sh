@@ -75,10 +75,10 @@ fi
 
 cd "$ROOT"
 if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
-  cargo build -p cowd-cli --no-default-features
+  cargo build -p cli --no-default-features
 fi
 if [[ ! -x "$BIN" ]]; then
-  echo "missing cowd binary at $BIN; run cargo build -p cowd-cli first" >&2
+  echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
   exit 1
 fi
 
