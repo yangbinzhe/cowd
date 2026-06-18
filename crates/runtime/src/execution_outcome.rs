@@ -6,7 +6,6 @@ use serde_json::Value;
 use crate::matrix::{
     MatrixComputeJob, MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact,
 };
-use crate::mfg::{MfgActionExecution, MfgSkillRun};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,88 +227,6 @@ impl From<&MatrixEvidencePacket> for CowdExecutionOutcome {
                 .collect(),
             payload: serde_json::to_value(packet).unwrap_or(Value::Null),
             created_at: packet.created_at,
-        }
-    }
-}
-
-impl From<&MfgActionExecution> for CowdExecutionOutcome {
-    fn from(execution: &MfgActionExecution) -> Self {
-        Self {
-            outcome_id: format!("manufacturing-action:{}", execution.execution_id),
-            kind: CowdExecutionOutcomeKind::ManufacturingAction,
-            status: status_from_matrix(&execution.status),
-            title: execution.title.clone(),
-            summary: format!(
-                "MFG action {} for incident {} is {}.",
-                execution.action_id, execution.incident_id, execution.status
-            ),
-            domain: Some("mfg".to_string()),
-            refs: vec![
-                CowdExecutionRef {
-                    ref_type: "mfg_execution".to_string(),
-                    id: execution.execution_id.clone(),
-                    label: Some(execution.action_type.clone()),
-                },
-                CowdExecutionRef {
-                    ref_type: "mfg_incident".to_string(),
-                    id: execution.incident_id.clone(),
-                    label: None,
-                },
-            ],
-            evidence_refs: execution
-                .cross_plane_receipts
-                .iter()
-                .filter_map(|receipt| receipt.audit_record_id.clone())
-                .collect(),
-            metrics: Vec::new(),
-            payload: execution.receipt.clone(),
-            created_at: execution.created_at,
-        }
-    }
-}
-
-impl From<&MfgSkillRun> for CowdExecutionOutcome {
-    fn from(run: &MfgSkillRun) -> Self {
-        Self {
-            outcome_id: format!(
-                "skill-run:{}",
-                run.execution_id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}:{}", run.incident_id, run.skill_id))
-            ),
-            kind: CowdExecutionOutcomeKind::SkillRun,
-            status: status_from_matrix(&run.status),
-            title: format!("Skill run {}", run.skill_id),
-            summary: run.summary.clone(),
-            domain: Some("mfg".to_string()),
-            refs: vec![
-                CowdExecutionRef {
-                    ref_type: "mfg_skill".to_string(),
-                    id: run.skill_id.clone(),
-                    label: run.agent_node_id.clone(),
-                },
-                CowdExecutionRef {
-                    ref_type: "mfg_incident".to_string(),
-                    id: run.incident_id.clone(),
-                    label: None,
-                },
-            ],
-            evidence_refs: run
-                .execution_context
-                .as_ref()
-                .map(|context| context.evidence_refs.clone())
-                .unwrap_or_default(),
-            metrics: run
-                .execution_context
-                .as_ref()
-                .map(|context| context.metric_keys.clone())
-                .unwrap_or_default(),
-            payload: run.structured_report.clone(),
-            created_at: run
-                .telemetry
-                .as_ref()
-                .map(|telemetry| telemetry.completed_at)
-                .unwrap_or_else(Utc::now),
         }
     }
 }

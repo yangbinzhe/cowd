@@ -1,4 +1,4 @@
-use crate::matrix::{
+use matrix::{
     MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
 };
 

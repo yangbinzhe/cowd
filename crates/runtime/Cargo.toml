@@ -47,6 +47,7 @@ lru = "0.12"
 libc = "0.2.186"
 
 [dev-dependencies]
+cowd-app-mfg = { path = "../app-mfg" }
 httpmock = "0.7"
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"

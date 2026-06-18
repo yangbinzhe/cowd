@@ -3108,7 +3108,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
     // P1: Skills data pipeline, aligned with the WebUI unified skill catalog.
     app.skill_list.clear();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for skill in cowd_app_mfg::server_manufacturing_skill_pack() {
+    for skill in app_mfg::server_manufacturing_skill_pack() {
         let risk = if skill
             .output_actions
             .iter()

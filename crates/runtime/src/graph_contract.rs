@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::matrix::MatrixMetricDependency;
-use crate::mfg::MfgImpactPath;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CowdGraphNode {
@@ -72,37 +71,6 @@ impl From<&MatrixMetricDependency> for CowdGraphPath {
                 .collect(),
             confidence: dependency.confidence,
             created_at: dependency.created_at,
-        }
-    }
-}
-
-impl From<&MfgImpactPath> for CowdGraphPath {
-    fn from(path: &MfgImpactPath) -> Self {
-        Self {
-            path_id: format!("graph-path:{}", path.path_id),
-            path_type: "impact_path".to_string(),
-            nodes: vec![
-                CowdGraphNode {
-                    node_id: path.from_entity.clone(),
-                    node_type: "entity".to_string(),
-                    label: path.from_entity.clone(),
-                },
-                CowdGraphNode {
-                    node_id: path.to_scope.clone(),
-                    node_type: "impact_scope".to_string(),
-                    label: path.to_scope.clone(),
-                },
-            ],
-            edges: vec![CowdGraphEdge {
-                edge_id: format!("{}:edge:0", path.path_id),
-                from: path.from_entity.clone(),
-                to: path.to_scope.clone(),
-                relation: path.impact_type.clone(),
-                evidence_refs: path.evidence_refs.clone(),
-            }],
-            structured_refs: path.evidence_refs.clone(),
-            confidence: path.confidence,
-            created_at: Utc::now(),
         }
     }
 }

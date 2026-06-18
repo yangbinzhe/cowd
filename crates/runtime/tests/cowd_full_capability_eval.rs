@@ -1,4 +1,8 @@
+use app_mfg::{
+    plan_server_manufacturing_skills, run_server_manufacturing_skill, MfgIncident, MfgStore,
+};
 use chrono::Utc;
+use matrix::MatrixMetricStatus;
 use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
@@ -10,10 +14,6 @@ use runtime::doc_ingestion::{DocumentCategory, DocumentIngestor};
 use runtime::platform::feishu::doc::{
     DocumentContent, DocumentElement, DocumentMetadata as FeishuDocumentMetadata, DocumentType,
     ListItem, TableCell, TableRow, TextElement,
-};
-use runtime::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill, MatrixMetricStatus,
-    MfgIncident, MfgMatrixAdapter,
 };
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -294,7 +294,8 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     assert!(!fact_result.is_consistent);
     assert!(fact_result.contradiction.is_some());
 
-    let matrix = MfgMatrixAdapter::in_memory().expect("matrix store opens");
+    let matrix_path = tmp.path().join("mfg-matrix.db");
+    let matrix = MfgStore::open(&matrix_path).expect("matrix store opens");
     matrix.seed_mfg_domain().expect("manufacturing seed runs");
     let recompute = matrix.recompute_metrics().expect("metrics recompute");
     let shortage_state = recompute

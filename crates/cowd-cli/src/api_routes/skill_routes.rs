@@ -2,6 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use app_mfg::{
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack, skill_agent_node_id, MfgIncident, MfgMatrixAdapterError,
+    MfgOperationalAnalysis, MfgSkillManifest, MfgStore,
+};
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
@@ -10,11 +15,7 @@ use axum::{
     Json, Router,
 };
 use command_runtime::{SkillInfo, SkillRegistry, SkillRouter};
-use cowd_app_mfg::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack, MfgIncident, MfgOperationalAnalysis, MfgSkillManifest,
-};
-use runtime::{MatrixEvidencePacket, MfgMatrixAdapter, MfgMatrixAdapterError};
+use runtime::MatrixEvidencePacket;
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};
@@ -337,7 +338,7 @@ async fn skill_plan_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_mfg_matrix_adapter(&state)
+    let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
     let mut plan = plan_server_manufacturing_skills(
@@ -365,7 +366,7 @@ async fn skill_plan_handler(
             plan.planned_agent_nodes = plan
                 .selected_skills
                 .iter()
-                .map(|skill| runtime::skill_agent_node_id(&skill.skill_id))
+                .map(|skill| skill_agent_node_id(&skill.skill_id))
                 .collect();
         }
     }
@@ -400,7 +401,7 @@ async fn skill_run_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_mfg_matrix_adapter(&state)
+    let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
     let skill = find_mfg_skill(&item.name)
@@ -424,7 +425,7 @@ async fn skill_run_handler(
 async fn skill_runs_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)
+    let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let runs = store
         .list_recent_skill_runs(50)
@@ -440,7 +441,7 @@ async fn skill_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)
+    let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let run = store
         .get_skill_run(&id)
@@ -489,8 +490,15 @@ fn find_mfg_skill(skill_id: &str) -> Option<MfgSkillManifest> {
         .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
 }
 
-fn open_mfg_matrix_adapter(state: &AppState) -> Result<MfgMatrixAdapter, MfgMatrixAdapterError> {
-    state.services.matrix.open_runtime_store(&state.config_home)
+fn open_mfg_store(state: &AppState) -> Result<MfgStore, MfgMatrixAdapterError> {
+    let path = state
+        .services
+        .matrix
+        .store_path(&state.config_home)
+        .map_err(|error| {
+            MfgMatrixAdapterError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+    MfgStore::open(path)
 }
 
 fn required_incident_id(
@@ -505,7 +513,7 @@ fn required_incident_id(
 }
 
 fn mfg_incident_context(
-    store: &MfgMatrixAdapter,
+    store: &MfgStore,
     incident_id: &str,
 ) -> Result<
     (
@@ -541,7 +549,7 @@ fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
         name: skill.skill_id,
         description: Some(skill.role),
         scope: "mfg".to_string(),
-        source: "runtime.mfg.server_manufacturing".to_string(),
+        source: "app_mfg.server_manufacturing".to_string(),
         domain: Some(skill.domain),
         status: "ready".to_string(),
         risk,

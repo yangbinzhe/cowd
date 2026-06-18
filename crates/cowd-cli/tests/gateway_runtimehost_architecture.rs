@@ -106,7 +106,6 @@ fn api_route_direct_dependencies_are_frozen_by_allowlist() {
         "api_routes/cowd_routes.rs",
         "api_routes/matrix_mfg_routes.rs",
         "api_routes/memory_routes.rs",
-        "api_routes/message_routes.rs",
         "api_routes/runtime_routes.rs",
         "api_routes/session_routes.rs",
         "api_routes/skill_routes.rs",
@@ -125,91 +124,85 @@ fn api_route_direct_dependencies_are_frozen_by_allowlist() {
             "api_routes/agent_routes.rs",
             "TaskKernel/AppState",
             "AgentService+TaskService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/approval_routes.rs",
             "SmartApprovalGate/AppState",
             "ApprovalService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/audit_routes.rs",
             "SmartApprovalGate/AppState",
             "AuditService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/connector_routes.rs",
             "CognitiveContextManager",
             "ConnectorService+MemoryService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/context_routes.rs",
             "SessionKernel/AppState",
             "ContextService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/cowd_routes.rs",
-            "MatrixStore::open",
+            "open_runtime_store",
             "MatrixService",
-            "0.9.297",
+            "0.9.299",
         ),
         (
             "api_routes/matrix_mfg_routes.rs",
-            "MatrixStore::open",
+            "open_runtime_store",
             "MatrixService",
-            "0.9.297",
+            "0.9.299",
         ),
         (
             "api_routes/matrix_mfg_routes.rs",
             "MfgStore::open",
             "MfgService",
-            "0.9.298",
+            "0.9.299",
         ),
         (
             "api_routes/memory_routes.rs",
             "CognitiveContextManager/AppState",
             "MemoryService",
-            "0.9.296",
-        ),
-        (
-            "api_routes/message_routes.rs",
-            "SessionKernel",
-            "SessionService",
-            "0.9.293",
+            "0.9.299",
         ),
         (
             "api_routes/runtime_routes.rs",
             "SessionKernel/AppState",
             "RuntimeService",
-            "0.9.293",
+            "0.9.299",
         ),
         (
             "api_routes/session_routes.rs",
             "SessionKernel/AppState",
             "SessionService",
-            "0.9.293",
+            "0.9.299",
         ),
         (
             "api_routes/skill_routes.rs",
-            "MatrixStore::open",
-            "SkillService+MatrixService",
-            "0.9.297",
+            "MfgStore::open",
+            "SkillService+MfgService",
+            "0.9.299",
         ),
         (
             "api_routes/system_routes.rs",
             "UnifiedSessionStore/AppState",
             "SystemService",
-            "0.9.296",
+            "0.9.299",
         ),
         (
             "api_routes/task_routes.rs",
             "TaskKernel/AppState",
             "TaskService",
-            "0.9.296",
+            "0.9.299",
         ),
     ];
     for (file, dependency, service, delete_by) in required_entries {
@@ -242,12 +235,11 @@ fn api_route_direct_dependencies_are_frozen_by_allowlist() {
     }
 
     let direct_dependency_files = [
-        ("api_routes/message_routes.rs", "SessionKernel"),
         ("api_routes/connector_routes.rs", "CognitiveContextManager"),
-        ("api_routes/cowd_routes.rs", "MatrixStore::open"),
-        ("api_routes/matrix_mfg_routes.rs", "MatrixStore::open"),
+        ("api_routes/cowd_routes.rs", "open_runtime_store"),
+        ("api_routes/matrix_mfg_routes.rs", "open_runtime_store"),
         ("api_routes/matrix_mfg_routes.rs", "MfgStore::open"),
-        ("api_routes/skill_routes.rs", "MatrixStore::open"),
+        ("api_routes/skill_routes.rs", "MfgStore::open"),
     ];
     for (file, dependency) in direct_dependency_files {
         let source = read_repo(&format!("crates/cowd-cli/src/{file}"));
@@ -278,7 +270,7 @@ fn api_route_direct_dependencies_are_frozen_by_allowlist() {
     for file in scanned_files {
         let source = read_repo(&format!("crates/cowd-cli/src/{file}"));
         for dependency in [
-            "MatrixStore::open",
+            "open_runtime_store",
             "MfgStore::open",
             "SessionKernel",
             "UnifiedSessionStore",

@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::mfg::MfgSkillManifest;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CowdSkillStructuredDependency {
     pub skill_id: String,
@@ -15,19 +13,22 @@ pub struct CowdSkillStructuredDependency {
     pub quality_gate: String,
 }
 
-impl From<&MfgSkillManifest> for CowdSkillStructuredDependency {
-    fn from(skill: &MfgSkillManifest) -> Self {
+impl CowdSkillStructuredDependency {
+    pub fn new(
+        skill_id: impl Into<String>,
+        domain: impl Into<String>,
+        required_fact_types: Vec<String>,
+        required_metric_keys: Vec<String>,
+        required_evidence: Vec<String>,
+        quality_gate: impl Into<String>,
+    ) -> Self {
         Self {
-            skill_id: format!("mfg:{}", skill.skill_id),
-            domain: skill.domain.clone(),
-            required_fact_types: skill
-                .input_fact_types
-                .iter()
-                .map(|fact_type| format!("structured-fact-type:{fact_type}"))
-                .collect(),
-            required_metric_keys: skill.input_metric_keys.clone(),
-            required_evidence: skill.required_evidence.clone(),
-            quality_gate: skill.quality_gate.clone(),
+            skill_id: skill_id.into(),
+            domain: domain.into(),
+            required_fact_types,
+            required_metric_keys,
+            required_evidence,
+            quality_gate: quality_gate.into(),
         }
     }
 }
@@ -35,18 +36,18 @@ impl From<&MfgSkillManifest> for CowdSkillStructuredDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mfg::server_manufacturing_skill_pack;
-
     #[test]
     fn skill_dependency_declares_structured_fact_types_and_quality_gate() {
-        let skill = server_manufacturing_skill_pack()
-            .into_iter()
-            .find(|skill| skill.skill_id == "supply-risk-analyst")
-            .expect("skill");
+        let dependency = CowdSkillStructuredDependency::new(
+            "structured:supply-risk-analyst",
+            "supply_chain",
+            vec!["structured-fact-type:supply.material_shortage".to_string()],
+            vec!["material_shortage_risk".to_string()],
+            vec!["recent_supplier_evidence".to_string()],
+            "evidence_quality_gate_required",
+        );
 
-        let dependency = CowdSkillStructuredDependency::from(&skill);
-
-        assert_eq!(dependency.skill_id, "mfg:supply-risk-analyst");
+        assert_eq!(dependency.skill_id, "structured:supply-risk-analyst");
         assert!(dependency
             .required_fact_types
             .contains(&"structured-fact-type:supply.material_shortage".to_string()));

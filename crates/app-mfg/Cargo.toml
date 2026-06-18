@@ -6,8 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 matrix = { path = "../matrix" }
-runtime = { path = "../runtime" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+uuid.workspace = true
+
+[lib]
+name = "app_mfg"
 
 [lints.rust]
 unsafe_code = "allow"

@@ -9,39 +9,95 @@ owner=0.9.292 Gateway RuntimeHost
 direct_dependency=TaskKernel/AppState
 reason=agent execution and inspection routes still share task kernel state until AgentService and TaskService own orchestration
 replacement_service=AgentService+TaskService
-delete_by=0.9.296
+delete_by=0.9.299
+
+file=api_routes/approval_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SmartApprovalGate/AppState
+reason=approval routes still inspect approval gate and gateway state directly until ApprovalService owns approval lifecycle projection
+replacement_service=ApprovalService
+delete_by=0.9.299
+
+file=api_routes/audit_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SmartApprovalGate/AppState
+reason=audit routes still inspect approval gate state directly until AuditService owns audit projections
+replacement_service=AuditService
+delete_by=0.9.299
 
 file=api_routes/connector_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=CognitiveContextManager
 reason=connector resource promotion still writes memory evidence until ConnectorService migration
 replacement_service=ConnectorService+MemoryService
-delete_by=0.9.296
+delete_by=0.9.299
+
+file=api_routes/context_routes.rs
+owner=0.9.292 Gateway RuntimeHost
+direct_dependency=SessionKernel/AppState
+reason=context routes still read session kernel and app state directly until ContextService owns context projection
+replacement_service=ContextService
+delete_by=0.9.299
+
+file=api_routes/cowd_routes.rs
+owner=0.9.297 Matrix core boundary
+direct_dependency=open_runtime_store
+reason=structured-data routes still open Matrix runtime store directly until MatrixService owns all structured projections
+replacement_service=MatrixService
+delete_by=0.9.299
+
+file=api_routes/matrix_mfg_routes.rs
+owner=0.9.297 Matrix core boundary
+direct_dependency=open_runtime_store
+reason=Matrix kernel routes still open Matrix runtime store directly until MatrixService owns all Matrix projections
+replacement_service=MatrixService
+delete_by=0.9.299
 
 file=api_routes/memory_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=CognitiveContextManager/AppState
 reason=memory status and evidence routes still use context manager directly until MemoryService owns memory projections
 replacement_service=MemoryService
-delete_by=0.9.296
+delete_by=0.9.299
+
+file=api_routes/runtime_routes.rs
+owner=0.9.293 TUI Gateway API
+direct_dependency=SessionKernel/AppState
+reason=runtime routes still read session kernel and gateway state directly until RuntimeService owns runtime control API
+replacement_service=RuntimeService
+delete_by=0.9.299
+
+file=api_routes/session_routes.rs
+owner=0.9.293 TUI Gateway API
+direct_dependency=SessionKernel/AppState
+reason=session routes still call session kernel directly until SessionService owns session lifecycle API
+replacement_service=SessionService
+delete_by=0.9.299
+
+file=api_routes/skill_routes.rs
+owner=0.9.298 MFG application boundary
+direct_dependency=MfgStore::open
+reason=skill routes still open MFG application store for evidence-backed MFG skill context until SkillService owns the orchestration
+replacement_service=SkillService+MfgService
+delete_by=0.9.299
 
 file=api_routes/system_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=UnifiedSessionStore/AppState
 reason=system diagnostics still inspect store and app state directly until SystemService owns diagnostics
 replacement_service=SystemService
-delete_by=0.9.296
+delete_by=0.9.299
 
 file=api_routes/task_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=TaskKernel/AppState
 reason=task operations still use task kernel directly until TaskService owns task lifecycle API
 replacement_service=TaskService
-delete_by=0.9.296
+delete_by=0.9.299
 
 file=api_routes/matrix_mfg_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=MfgStore::open
 reason=MFG application routes remain upper-layer app routes until app extraction
 replacement_service=MfgService
-delete_by=0.9.298
+delete_by=0.9.299

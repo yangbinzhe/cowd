@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use app_mfg::server_manufacturing_skill_pack;
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
@@ -7,7 +8,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use cowd_app_mfg::server_manufacturing_skill_pack;
 use matrix::structured::{
     StructuredEvidence as CowdStructuredEvidence, StructuredFact as CowdStructuredFact,
     StructuredIngestPlan as CowdIngestPlan,
@@ -19,10 +19,9 @@ use runtime::matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
 use runtime::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
-use runtime::skill_dependency::CowdSkillStructuredDependency;
 use runtime::skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 use runtime::surface_contract::CowdSurfaceParityContract;
-use runtime::{MfgMatrixAdapter, MfgMatrixAdapterError};
+use runtime::{MatrixRuntimeStore, MatrixRuntimeStoreError};
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};
@@ -88,7 +87,7 @@ async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 async fn structured_sources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_source_packs(100)
         .map_err(store_error)?
@@ -106,7 +105,7 @@ async fn structured_source_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let Some(source_pack) = store.get_source_pack(&id).map_err(store_error)? else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -120,7 +119,7 @@ async fn structured_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(input): Json<CowdStructuredIngestPlanInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let plan = store
         .plan_data_plane_ingest(input.into())
         .map_err(store_error)?;
@@ -130,7 +129,7 @@ async fn structured_ingest_plan_handler(
 async fn structured_facts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_facts(100)
         .map_err(store_error)?
@@ -147,7 +146,7 @@ async fn structured_facts_handler(
 async fn structured_evidence_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_evidence_packets(100)
         .map_err(store_error)?
@@ -164,7 +163,7 @@ async fn structured_evidence_handler(
 async fn structured_watermarks_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_mfg_matrix_adapter(&state)?;
+    let store = open_matrix_store(&state)?;
     let items = store
         .list_data_plane_watermarks(100)
         .map_err(store_error)?
@@ -283,8 +282,7 @@ fn graph_skill_quality_contract_smoke() -> bool {
     else {
         return false;
     };
-    let dependency = CowdSkillStructuredDependency::from(&skill);
-    if dependency.required_fact_types.is_empty() || dependency.quality_gate.is_empty() {
+    if skill.input_fact_types.is_empty() || skill.quality_gate.is_empty() {
         return false;
     }
 
@@ -306,9 +304,9 @@ fn graph_skill_quality_contract_smoke() -> bool {
             .any(|source| source.reference == "structured-fact:release-gate-smoke")
 }
 
-fn open_mfg_matrix_adapter(
+fn open_matrix_store(
     state: &AppState,
-) -> Result<MfgMatrixAdapter, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<MatrixRuntimeStore, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .matrix
@@ -316,9 +314,9 @@ fn open_mfg_matrix_adapter(
         .map_err(store_error)
 }
 
-fn store_error(error: MfgMatrixAdapterError) -> (StatusCode, Json<ErrorResponse>) {
+fn store_error(error: MatrixRuntimeStoreError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MatrixRuntimeStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }

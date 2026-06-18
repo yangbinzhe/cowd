@@ -51,17 +51,56 @@ fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
 }
 
 #[test]
+fn runtime_production_source_has_no_mfg_application_implementation() {
+    let runtime_root = repo_root().join("crates/runtime/src");
+    let forbidden = [
+        "runtime::mfg",
+        "crate::mfg",
+        "mod mfg",
+        "pub mod mfg",
+        "MfgMatrixAdapter",
+        "open_mfg_matrix_adapter",
+        "seed_mfg",
+        "server_manufacturing",
+        "matrix_incident",
+        "matrix_operational_analysis",
+        "matrix_action_execution",
+        "matrix_cockpit_profile",
+        "matrix_cockpit_report",
+        "matrix_memory_case",
+        "matrix_playbook",
+        "matrix_skill_execution",
+    ];
+
+    for (path, content) in read_rs_files(&runtime_root) {
+        let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
+        for term in forbidden {
+            assert!(
+                !production.contains(term),
+                "runtime production source {} must not contain MFG application implementation term {term}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
     let mfg_root = repo_root().join("crates/app-mfg/src");
     let files = read_rs_files(&mfg_root);
     assert!(
         files
             .iter()
-            .any(|(_, content)| content.contains("runtime::mfg")),
-        "MFG application crate should own the public application boundary during migration"
+            .any(|(_, content)| content.contains("use matrix::") || content.contains("matrix::")),
+        "MFG application crate should depend on Matrix contracts"
     );
 
     for (path, content) in files {
+        assert!(
+            !content.contains("runtime::mfg"),
+            "MFG application source {} must not depend on runtime::mfg",
+            path.display()
+        );
         assert!(
             !content.contains("webui"),
             "MFG runtime source {} must not depend on WebUI",

@@ -1,16 +1,19 @@
 use std::path::Path;
 
+use crate::matrix_adapter::{
+    MatrixHealth, MatrixMetricRecomputeResult, MfgMatrixAdapter, MfgMatrixAdapterError,
+};
 use matrix::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
-use runtime::{
-    open_mfg_matrix_adapter, MatrixHealth, MfgActionExecution, MfgActionExecutionRequest,
-    MfgActionFeedback, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgIncident,
-    MfgMatrixAdapter as RuntimeMfgMatrixAdapter, MfgMatrixAdapterError, MfgMemoryCase,
-    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
+
+use crate::{
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCasePromotion,
+    MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCrossPlaneBridgeReceipt,
+    MfgDomainSeedResult, MfgIncident, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook,
+    MfgSkillRun,
 };
 
 /// Application-layer store facade for MFG.
@@ -20,13 +23,13 @@ use runtime::{
 /// shared during migration.
 #[derive(Debug)]
 pub struct MfgStore {
-    matrix: RuntimeMfgMatrixAdapter,
+    matrix: MfgMatrixAdapter,
 }
 
 impl MfgStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MfgMatrixAdapterError> {
         Ok(Self {
-            matrix: open_mfg_matrix_adapter(path)?,
+            matrix: MfgMatrixAdapter::open(path)?,
         })
     }
 
@@ -75,6 +78,10 @@ impl MfgStore {
         &self,
     ) -> Result<Vec<MatrixMetricDefinition>, MfgMatrixAdapterError> {
         self.matrix.list_metric_definitions()
+    }
+
+    pub fn recompute_metrics(&self) -> Result<MatrixMetricRecomputeResult, MfgMatrixAdapterError> {
+        self.matrix.recompute_metrics()
     }
 
     pub fn list_evidence_packets(
