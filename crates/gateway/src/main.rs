@@ -12557,6 +12557,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn user_defined_aliases_resolve_before_provider_dispatch() {
         // given
         let _guard = env_lock();
@@ -12698,6 +12699,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn yolo_flag_forces_danger_full_access_and_marks_repl_mode() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -12722,6 +12724,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn yolo_mode_creates_and_reuses_durable_task() {
         let _guard = env_lock();
         let config_home = temp_dir();
@@ -12749,6 +12752,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn yolo_system_prompt_adds_continuous_execution_instruction() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -13212,6 +13216,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn setup_report_and_json_are_redacted_and_actionable() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -13689,6 +13694,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -13709,6 +13715,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn resolve_repl_model_returns_default_when_env_unset_and_no_config() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -14247,6 +14254,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn resume_diff_command_renders_report_for_saved_session() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -14276,6 +14284,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn resume_session_switch_updates_outcome_session_and_path() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -14584,6 +14593,7 @@ UU conflicted.rs",
 
     #[test]
     #[serial_test::serial(provider_registry)]
+    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
     fn tui_sidebar_switch_replaces_live_runtime_session() {
         let _cwd_guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = env_lock();
@@ -14678,6 +14688,7 @@ providers:
         let config_home = temp_workspace("latest-session-alias-config");
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::create_dir_all(&config_home).expect("config home should create");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
@@ -14689,8 +14700,8 @@ providers:
         assert_eq!(resolved.id, newer.id);
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
-        std::fs::remove_dir_all(config_home).expect("config home should clean up");
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
         if let Some(v) = config_home_original {
             std::env::set_var("COWD_CONFIG_HOME", v);
         } else {

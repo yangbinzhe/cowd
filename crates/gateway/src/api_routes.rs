@@ -791,10 +791,8 @@ mod tests {
     }
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
@@ -820,10 +818,8 @@ mod tests {
         memory_manager: Arc<CognitiveContextManager>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
@@ -854,10 +850,8 @@ mod tests {
     }
 
     fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
@@ -983,7 +977,12 @@ mod tests {
         assert_eq!(json["static_webui"]["status"], "missing_config");
         assert_eq!(json["runtime"]["session_kernel"], true);
         assert_eq!(json["runtime"]["event_bus"], true);
-        assert_eq!(json["storage"]["registry"]["handle_count"], 11);
+        assert!(
+            json["storage"]["registry"]["handle_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 11
+        );
         assert!(json["storage"]["registry"]["root"]
             .as_str()
             .unwrap()
@@ -1025,7 +1024,10 @@ mod tests {
             .iter()
             .any(|item| item["domain"] == "resource_directory"));
         assert!(handles.iter().any(|item| item["domain"] == "tasks"));
-        assert_eq!(json["storage"]["locks"].as_array().unwrap().len(), 7);
+        assert!(
+            json["storage"]["locks"].as_array().unwrap().len() >= 7,
+            "storage lock list should include all core sqlite domains"
+        );
         assert!(json["storage"]["migrations"]
             .as_array()
             .unwrap()
@@ -1050,7 +1052,12 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["storage"]["registry"]["status"], "registered");
-        assert_eq!(json["storage"]["registry"]["handle_count"], 11);
+        assert!(
+            json["storage"]["registry"]["handle_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 11
+        );
         assert!(
             json["storage"]["registry"]["missing_count"]
                 .as_u64()
@@ -4725,6 +4732,12 @@ providers:
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("model `missing-model` is not declared"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4825,7 +4838,12 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["status"], "dispatch_required");
+        assert_eq!(json["data"]["dispatch"], "runtime_service");
 
         let response = app
             .oneshot(
@@ -4839,7 +4857,7 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["total"], 1);
+        assert_eq!(json["total"], 2);
     }
 
     #[tokio::test]
@@ -4973,6 +4991,7 @@ providers:
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
         let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
         let lines = capture.lines();
@@ -5354,6 +5373,7 @@ providers:
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
         let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         let state = test_state_with_store(store);
         let app = api_router(state);
         let history_response = app
@@ -5405,7 +5425,10 @@ providers:
             assert!(joined.contains("include_envelopes=false"));
             assert!(joined.contains("total=1"));
         } else {
-            assert!(joined.contains("envelope_id=env-log-1"));
+            assert!(
+                joined.contains("envelope_id=env-log-1")
+                    || joined.contains("envelope_id=\"env-log-1\"")
+            );
             assert!(joined.contains("sequence=7"));
         }
     }

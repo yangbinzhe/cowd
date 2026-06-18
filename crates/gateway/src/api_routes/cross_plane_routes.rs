@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    path::{Path as FsPath, PathBuf},
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, path::Path as FsPath, sync::Arc};
 
 use axum::{
     extract::{Path, State as AxumState},
@@ -13,9 +9,9 @@ use axum::{
 use runtime::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
 use runtime::{
     ConnectorActionContext, ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord,
-    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
-    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind, ProviderAccount,
+    CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget,
+    CrossPlaneExecutionReceipt, CrossPlaneGrant, CrossPlaneIdentityBinding,
+    CrossPlanePolicyDecision, PolicyDecisionKind, ProviderAccount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -107,35 +103,15 @@ fn default_execute_mode() -> String {
     "dry_run".to_string()
 }
 
-static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
-
-pub(super) fn cross_plane_control() -> &'static CrossPlaneControlPlane {
-    CROSS_PLANE_CONTROL.get_or_init(CrossPlaneControlPlane::new)
-}
-
-fn cross_plane_state_path(state: &AppState) -> PathBuf {
-    state
-        .config_home
-        .join("cross-plane")
-        .join("control-state.json")
-}
-
-pub(super) fn ensure_cross_plane_loaded(state: &AppState) {
-    static CROSS_PLANE_LOADED: OnceLock<()> = OnceLock::new();
-    let _ = CROSS_PLANE_LOADED.get_or_init(|| {
-        let _ = cross_plane_control().load_from_path(&cross_plane_state_path(state));
-    });
-}
-
-pub(super) fn save_cross_plane_state(state: &AppState) {
-    let _ = cross_plane_control().save_to_path(&cross_plane_state_path(state));
-}
-
 async fn cross_plane_summary_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let summary = cross_plane_control().summary(chrono::Utc::now());
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let summary = state
+        .services
+        .cross_plane
+        .control()
+        .summary(chrono::Utc::now());
     Json(serde_json::json!({
         "kind": "cross_plane_summary",
         "providers": [],
@@ -167,8 +143,8 @@ async fn cross_plane_summary_handler(
 async fn cross_plane_grants_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let grants = cross_plane_control().list_grants();
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let grants = state.services.cross_plane.control().list_grants();
     Json(serde_json::json!({
         "kind": "cross_plane_grants",
         "grants": grants
@@ -178,8 +154,8 @@ async fn cross_plane_grants_handler(
 async fn cross_plane_identities_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let identities = cross_plane_control().list_identities();
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let identities = state.services.cross_plane.control().list_identities();
     Json(serde_json::json!({
         "kind": "cross_plane_identities",
         "identities": identities
@@ -190,9 +166,13 @@ async fn cross_plane_create_identity_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(binding): Json<CrossPlaneIdentityBinding>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let binding = cross_plane_control().upsert_identity(binding);
-    save_cross_plane_state(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let binding = state
+        .services
+        .cross_plane
+        .control()
+        .upsert_identity(binding);
+    state.services.cross_plane.save_state(&state.config_home);
     Json(serde_json::json!({
         "kind": "cross_plane_identity",
         "identity": binding
@@ -203,9 +183,9 @@ async fn cross_plane_revoke_identity_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let revoked = cross_plane_control().revoke_identity(&id);
-    save_cross_plane_state(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let revoked = state.services.cross_plane.control().revoke_identity(&id);
+    state.services.cross_plane.save_state(&state.config_home);
     Json(serde_json::json!({
         "kind": "cross_plane_identity_revoked",
         "id": id,
@@ -217,9 +197,9 @@ async fn cross_plane_create_grant_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(grant): Json<CrossPlaneGrant>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let grant = cross_plane_control().upsert_grant(grant);
-    save_cross_plane_state(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let grant = state.services.cross_plane.control().upsert_grant(grant);
+    state.services.cross_plane.save_state(&state.config_home);
     Json(serde_json::json!({
         "kind": "cross_plane_grant",
         "grant": grant
@@ -230,9 +210,9 @@ async fn cross_plane_revoke_grant_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let revoked = cross_plane_control().revoke_grant(&id);
-    save_cross_plane_state(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let revoked = state.services.cross_plane.control().revoke_grant(&id);
+    state.services.cross_plane.save_state(&state.config_home);
     Json(serde_json::json!({
         "kind": "cross_plane_grant_revoked",
         "id": id,
@@ -243,8 +223,8 @@ async fn cross_plane_revoke_grant_handler(
 async fn cross_plane_audit_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let records = cross_plane_control().list_audit(100, 0);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let records = state.services.cross_plane.control().list_audit(100, 0);
     let total = records.len();
     Json(serde_json::json!({
         "kind": "cross_plane_audit",
@@ -271,8 +251,8 @@ async fn cross_plane_action_adapters_handler(
 async fn cross_plane_action_executions_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let executions = cross_plane_control().list_executions(100, 0);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let executions = state.services.cross_plane.control().list_executions(100, 0);
     let total = executions.len();
     Json(serde_json::json!({
         "kind": "cross_plane_action_executions",
@@ -285,10 +265,10 @@ async fn cross_plane_policy_simulate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let (action, decision, evidence) =
         decide_connector_action(&state, action, "dry_run", chrono::Utc::now());
-    save_cross_plane_state(&state);
+    state.services.cross_plane.save_state(&state.config_home);
     Json(serde_json::json!({
         "kind": "cross_plane_policy_simulation",
         "action": action,
@@ -301,7 +281,7 @@ async fn cross_plane_action_preflight_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let readiness = evaluate_action_readiness(&state, action, "dry_run", chrono::Utc::now()).await;
     Json(serde_json::json!({
         "kind": "cross_plane_action_preflight",
@@ -321,7 +301,7 @@ async fn cross_plane_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<CrossPlaneActionExecuteRequest>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let now = chrono::Utc::now();
     let mode = normalize_execute_mode(&request.mode);
     let idempotency_key = request
@@ -331,7 +311,11 @@ async fn cross_plane_action_execute_handler(
         .filter(|key| !key.is_empty())
         .map(str::to_string);
     if let Some(key) = &idempotency_key {
-        if let Some(receipt) = cross_plane_control().find_execution_by_idempotency_key(key) {
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
+        {
             let target_platform = target_platform_from_action(&receipt.action);
             return Json(serde_json::json!({
                 "kind": "cross_plane_action_execution",
@@ -405,7 +389,9 @@ async fn cross_plane_action_execute_handler(
                         audit_summary = "live_dispatch_sent".to_string();
                         dispatched = true;
                         dispatch_outcome = Some(outcome);
-                        if let Some((grant_id, remaining)) = cross_plane_control()
+                        if let Some((grant_id, remaining)) = state
+                            .services
+                            .cross_plane
                             .consume_matched_grant_for_decision(&readiness.decision)
                         {
                             evidence.consumed_grant_id = Some(grant_id);
@@ -456,7 +442,11 @@ async fn cross_plane_action_execute_handler(
     )
     .with_evidence(evidence.clone());
     let audit_record_id = audit_record.id.clone();
-    cross_plane_control().record_audit(audit_record);
+    state
+        .services
+        .cross_plane
+        .control()
+        .record_audit(audit_record);
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key.clone(),
         mode.clone(),
@@ -469,8 +459,12 @@ async fn cross_plane_action_execute_handler(
     )
     .with_dispatch_target(readiness.dispatch_target.clone())
     .with_dispatch_outcome(dispatch_outcome.clone());
-    cross_plane_control().record_execution(receipt.clone());
-    save_cross_plane_state(&state);
+    state
+        .services
+        .cross_plane
+        .control()
+        .record_execution(receipt.clone());
+    state.services.cross_plane.save_state(&state.config_home);
 
     Json(serde_json::json!({
         "kind": "cross_plane_action_execution",
@@ -498,9 +492,12 @@ async fn cross_plane_identity_resolve_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<CrossPlaneIdentityResolveRequest>,
 ) -> impl IntoResponse {
-    ensure_cross_plane_loaded(&state);
-    let resolved =
-        cross_plane_control().resolve_identity(&request.identity_ref, chrono::Utc::now());
+    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let resolved = state
+        .services
+        .cross_plane
+        .control()
+        .resolve_identity(&request.identity_ref, chrono::Utc::now());
     Json(serde_json::json!({
         "kind": "cross_plane_identity_resolution",
         "identity_ref": request.identity_ref,
@@ -529,8 +526,11 @@ async fn evaluate_action_readiness(
     now: chrono::DateTime<chrono::Utc>,
 ) -> CrossPlaneActionReadiness {
     let connector_context = connector_context_for_action(state, &action, mode);
-    let (action, decision, evidence) =
-        cross_plane_control().decide_with_connector_context(action, connector_context, now);
+    let (action, decision, evidence) = state
+        .services
+        .cross_plane
+        .control()
+        .decide_with_connector_context(action, connector_context, now);
     let target_platform = target_platform_from_action(&action);
     let platforms = channel_routes::configured_platforms(state.config.as_ref());
     let platform_readiness = target_platform.as_ref().and_then(|target| {
@@ -583,7 +583,11 @@ pub(super) fn decide_connector_action(
     CrossPlaneDecisionEvidence,
 ) {
     let connector_context = connector_context_for_action(state, &action, mode);
-    cross_plane_control().decide_with_connector_context(action, connector_context, now)
+    state
+        .services
+        .cross_plane
+        .control()
+        .decide_with_connector_context(action, connector_context, now)
 }
 
 fn connector_context_for_action(

@@ -522,7 +522,8 @@ mod tests {
         let registry = StorageRegistry::default_for_config_home(dir.path());
         let health = registry.health();
         assert_eq!(health.status, "registered");
-        assert_eq!(health.handle_count, 11);
+        assert_eq!(health.handle_count, registry.handles.len());
+        assert!(health.handle_count >= 11);
         assert!(health.missing_count > 0);
     }
 

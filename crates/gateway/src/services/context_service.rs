@@ -139,6 +139,15 @@ impl GatewayServices {
             Vec::new()
         };
 
+        tracing::info!(
+            session_id = session_id,
+            include_envelopes = include_envelopes,
+            total = total,
+            from_seq = from_seq,
+            limit = limit,
+            "context history loaded"
+        );
+
         Ok(serde_json::json!({
             "session_id": session_id,
             "envelopes": envelopes,
@@ -168,6 +177,13 @@ impl GatewayServices {
                 "context envelope {envelope_id} not found"
             )));
         };
+
+        tracing::info!(
+            envelope_id = envelope_id,
+            session_id = event.session_id.as_str(),
+            sequence = event.sequence,
+            "context envelope loaded"
+        );
 
         Ok(serde_json::json!({
             "enabled": true,
