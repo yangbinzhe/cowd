@@ -1,4 +1,3 @@
-pub mod handlers;
 pub mod parser;
 pub mod skill_manifest;
 pub mod skill_registry;
@@ -14,14 +13,10 @@ pub use command_contract::{
     SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
 
-pub use handlers::handle_slash_command;
 pub use parser::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_detail, render_slash_command_help_filtered, resolve_skill_invocation,
-    resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-    suggest_slash_commands, validate_slash_command_input, SlashCommandResult,
+    classify_skills_slash_command, render_slash_command_help, render_slash_command_help_detail,
+    render_slash_command_help_filtered, resume_supported_slash_commands, slash_command_specs,
+    suggest_slash_commands, validate_slash_command_input,
 };
 pub use skill_manifest::{
     check_prerequisites, get_config_vars, get_related_skills, get_skill_description,

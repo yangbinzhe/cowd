@@ -1,10 +1,10 @@
 //! LongMemEval R@5 benchmark harness (mempalace 96.6% target).
 //!
 //! Tests retrieval recall using verbatim-stored entries.
-//! Run: cargo test --release -p cowd-memory --test longmem_eval_harness -- --nocapture
+//! Run: cargo test --release -p memory --test longmem_eval_harness -- --nocapture
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     evaluate_retrieval, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
     MemoryEvalCase, MemoryEvalOptions, MemoryLayer, MemoryScope, MemorySource, Priority,
 };
@@ -53,7 +53,7 @@ fn fact_entry(i: usize, fact: &str) -> MemoryEntry {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     }
 }
 
@@ -156,7 +156,7 @@ async fn test_longmem_persistence_recall() {
                 scope: MemoryScope::default(),
                 session_id: None,
                 source_agent: None,
-                visibility: cowd_memory::AgentVisibility::default(),
+                visibility: memory::AgentVisibility::default(),
             };
             ids.push(entry.id);
             mgr.remember(entry).await.unwrap();

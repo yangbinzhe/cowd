@@ -493,7 +493,7 @@ pub(super) async fn get_runtime_control_plane(
             None
         }
     };
-    let task_records = state.task_kernel.list();
+    let task_records = state.services.task.list_records().unwrap_or_default();
     let open_tasks = task_records
         .iter()
         .filter(|task| matches!(task.status.as_str(), "pending" | "running" | "reviewing"))

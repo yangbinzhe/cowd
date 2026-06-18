@@ -54,14 +54,14 @@ check_empty "AI bin install residue" \
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features
 
-if cargo tree -p tui --no-default-features | rg "(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|cowd-memory|cowd-app-mfg|app_mfg|rusqlite)"; then
+if cargo tree -p tui --no-default-features | rg "(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg|rusqlite)"; then
   echo "FAIL tui forbidden dependency tree"
   fail=1
 else
   echo "PASS tui forbidden dependency tree"
 fi
 
-if cargo tree -p cowd-app-mfg --no-default-features | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
+if cargo tree -p app-mfg --no-default-features | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
   echo "FAIL app-mfg forbidden dependency tree"
   fail=1
 else

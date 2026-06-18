@@ -15,3 +15,9 @@ pub fn open_matrix_sqlite_repository(
 ) -> Result<MatrixSqliteRepository, MatrixSqliteRepositoryError> {
     MatrixSqliteRepository::open(path)
 }
+
+pub fn open_matrix_sqlite_repository_handle(
+    handle: &storage::StorageHandle,
+) -> Result<MatrixSqliteRepository, MatrixSqliteRepositoryError> {
+    MatrixSqliteRepository::open_storage_handle(handle)
+}

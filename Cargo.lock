@@ -68,6 +68,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "app-mfg"
+version = "0.9.309"
+dependencies = [
+ "chrono",
+ "matrix-core",
+ "matrix-repository",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "storage",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "approval"
 version = "0.9.309"
 dependencies = [
@@ -560,8 +575,8 @@ dependencies = [
 name = "cli"
 version = "0.9.309"
 dependencies = [
- "cowd-memory",
  "gateway",
+ "memory",
  "runtime",
  "serde",
  "serde_json",
@@ -590,10 +605,7 @@ version = "0.9.309"
 dependencies = [
  "chrono",
  "command-contract",
- "cowd-memory",
- "plugins",
  "regex",
- "runtime",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -648,51 +660,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "cowd-app-mfg"
-version = "0.9.309"
-dependencies = [
- "chrono",
- "matrix-core",
- "matrix-repository",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "cowd-memory"
-version = "0.9.309"
-dependencies = [
- "async-trait",
- "chrono",
- "lz4_flex",
- "notify",
- "parking_lot",
- "r2d2",
- "r2d2_sqlite",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "uuid",
- "walkdir",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -1206,20 +1173,20 @@ dependencies = [
 name = "gateway"
 version = "0.9.309"
 dependencies = [
+ "app-mfg",
  "approval",
  "async-trait",
  "axum",
  "chrono",
  "command-contract",
  "command-service",
- "cowd-app-mfg",
- "cowd-memory",
  "crossterm",
  "futures",
  "libc",
  "matrix-core",
  "matrix-repository",
  "mcp",
+ "memory",
  "plugins",
  "provider",
  "pulldown-cmark",
@@ -2171,6 +2138,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
+name = "memory"
+version = "0.9.309"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "lz4_flex",
+ "notify",
+ "parking_lot",
+ "r2d2",
+ "r2d2_sqlite",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "storage",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3059,7 +3058,6 @@ dependencies = [
  "base64 0.22.1",
  "cbc",
  "chrono",
- "cowd-memory",
  "fs2",
  "futures",
  "glob",
@@ -3070,6 +3068,7 @@ dependencies = [
  "libc",
  "lru",
  "mail-parser",
+ "memory",
  "native-tls",
  "plugins",
  "prost",

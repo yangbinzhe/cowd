@@ -168,7 +168,7 @@ impl ReversibleEffect for FileEditEffect {
 /// # Example
 ///
 /// ```rust,no_run
-/// use cowd_memory::transaction::{TransactionManager, FileEditEffect};
+/// use memory::transaction::{TransactionManager, FileEditEffect};
 ///
 /// let manager = TransactionManager::new();
 /// let mut guard = manager.begin();
@@ -349,7 +349,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_file() -> PathBuf {
-        let dir = std::env::temp_dir().join("cowd_memory_transaction_test");
+        let dir = std::env::temp_dir().join("memory_transaction_test");
         let _ = fs::create_dir_all(&dir);
         dir.join(format!("test_{}.txt", uuid::Uuid::new_v4()))
     }

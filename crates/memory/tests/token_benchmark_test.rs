@@ -3,8 +3,8 @@
 //! Goal: verify code_injection adds <500 tokens and is only triggered
 //! on code-related queries.
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{CognitiveContextManager, MemoryConfig};
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{CognitiveContextManager, MemoryConfig};
 
 fn test_config(db_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {

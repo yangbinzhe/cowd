@@ -1,9 +1,9 @@
-//! Integration tests for [`cowd_memory::project_scope`].
+//! Integration tests for [`memory::project_scope`].
 //!
 //! Tests project registration, idempotent re-registration, active-project
 //! switching, and the always-available global store.
 
-use cowd_memory::{store::MemoryStore, ProjectScopeManager};
+use memory::{store::MemoryStore, ProjectScopeManager};
 
 /// Helper: create a temporary directory and a `ProjectScopeManager` using
 /// `memory.db` inside it.

@@ -32,8 +32,10 @@ use tools::GlobalToolRegistry;
 use crate::event_bus::SessionEventBus;
 #[cfg(test)]
 use crate::gateway::ActiveSessions;
-use crate::gateway_services::GatewayServices;
+use crate::services::GatewayServices;
+#[cfg(test)]
 use crate::session_kernel::SessionKernel;
+#[cfg(test)]
 use crate::task_kernel::TaskKernel;
 #[cfg(test)]
 use memory::cognitive::CognitiveContextManager;
@@ -69,7 +71,6 @@ mod workspace_routes;
 // ── Shared application state ───────────────────────────────────
 
 pub struct AppState {
-    pub session_kernel: Arc<SessionKernel>,
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
     pub platform_runtime: Option<Arc<PlatformRuntime>>,
@@ -81,7 +82,6 @@ pub struct AppState {
     pub config_home: PathBuf,
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
-    pub task_kernel: Arc<TaskKernel>,
     pub services: Arc<GatewayServices>,
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
 }
@@ -90,19 +90,22 @@ type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
 
 impl AppState {
     pub(crate) fn has_unified_store(&self) -> bool {
-        self.session_kernel.has_unified_store()
+        self.services.session.has_unified_store()
     }
 
     fn event_bus(&self) -> Arc<SessionEventBus> {
-        self.session_kernel.event_bus()
+        self.services
+            .session
+            .event_bus()
+            .unwrap_or_else(|| Arc::clone(&self.event_bus))
     }
 
-    fn list_active_session_ids(&self) -> Vec<String> {
-        self.session_kernel.list_active_session_ids()
+    pub(crate) fn list_active_session_ids(&self) -> Vec<String> {
+        self.services.session.list_active_session_ids()
     }
 
-    fn active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
-        self.session_kernel.active_runtime(session_id)
+    pub(crate) fn active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
+        self.services.session.active_runtime(session_id)
     }
 
     fn register_runtime(
@@ -110,11 +113,11 @@ impl AppState {
         session_id: String,
         runtime: crate::BuiltRuntime,
     ) -> Result<Option<RuntimeEntry>, String> {
-        self.session_kernel.register_runtime(session_id, runtime)
+        self.services.session.register_runtime(session_id, runtime)
     }
 
     fn remove_active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
-        self.session_kernel.remove_active_runtime(session_id)
+        self.services.session.remove_active_runtime(session_id)
     }
 }
 
@@ -447,6 +450,18 @@ mod tests {
         Arc::new(TaskKernel::open(path).expect("task kernel should open"))
     }
 
+    fn test_services(
+        session_kernel: Arc<SessionKernel>,
+        task_kernel: Arc<TaskKernel>,
+    ) -> Arc<crate::services::GatewayServices> {
+        Arc::new(
+            crate::services::GatewayServices::transition_with_kernels_for_tests(
+                session_kernel,
+                task_kernel,
+            ),
+        )
+    }
+
     struct MockPlatformAdapter {
         name: String,
         connected: bool,
@@ -610,8 +625,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -623,8 +639,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         })
     }
@@ -639,8 +654,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -652,8 +668,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: Some(registry),
         })
     }
@@ -677,8 +692,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: Some(config),
             platform_runtime,
@@ -690,8 +706,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         })
     }
@@ -708,8 +723,8 @@ mod tests {
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: session_kernel.clone(),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -721,12 +736,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(
-                crate::gateway_services::GatewayServices::transition_with_session_kernel_for_tests(
-                    session_kernel,
-                ),
-            ),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         })
     }
@@ -741,8 +751,8 @@ mod tests {
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: session_kernel.clone(),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -754,12 +764,7 @@ mod tests {
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(
-                crate::gateway_services::GatewayServices::transition_with_session_kernel_for_tests(
-                    session_kernel,
-                ),
-            ),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         })
     }
@@ -785,8 +790,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -798,11 +804,9 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
             services: Arc::new(
-                crate::gateway_services::GatewayServices::transition_with_memory_for_tests(
-                    memory_manager,
-                ),
+                crate::services::GatewayServices::transition_with_memory_for_tests(memory_manager)
+                    .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
         })
@@ -815,8 +819,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -828,11 +833,9 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
             services: Arc::new(
-                crate::gateway_services::GatewayServices::transition_with_memory_for_tests(
-                    memory_manager,
-                ),
+                crate::services::GatewayServices::transition_with_memory_for_tests(memory_manager)
+                    .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
         })
@@ -850,8 +853,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -863,9 +867,9 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
             services: Arc::new(
-                crate::gateway_services::GatewayServices::transition_with_approval_for_tests(gate),
+                crate::services::GatewayServices::transition_with_approval_for_tests(gate)
+                    .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
         })
@@ -875,8 +879,9 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -888,8 +893,7 @@ mod tests {
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         })
     }
@@ -899,14 +903,19 @@ mod tests {
         let state = test_state_with_store(Arc::new(UnifiedSessionStore::open_in_memory().unwrap()));
 
         assert!(Arc::ptr_eq(
-            &state.session_kernel.event_bus(),
+            &state
+                .services
+                .session
+                .event_bus()
+                .expect("service event bus should exist"),
             &state.event_bus
         ));
         assert!(Arc::ptr_eq(
             &state
-                .session_kernel
+                .services
+                .session
                 .unified_store()
-                .expect("kernel store should exist"),
+                .expect("service store should exist"),
             &state
                 .services
                 .session
@@ -1095,11 +1104,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["kind"], "cowd.webui.manifest");
-        assert_eq!(json["daemon"], "compat alias for runtime_host");
+        assert_eq!(json["daemon"], "runtime host process control surface");
         assert_eq!(json["api_router"], "gateway service route table");
         assert_eq!(
             json["socket_transition"],
-            "temporary local socket transition for TUI; reviewed_0.9.305"
+            "runtime host local control channel"
         );
     }
 
@@ -4384,7 +4393,8 @@ runtime:
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         state
-            .task_kernel
+            .services
+            .task
             .start_goal("control plane smoke task", true)
             .unwrap();
         let app = api_router(state);
@@ -4937,7 +4947,8 @@ providers:
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         state
-            .task_kernel
+            .services
+            .task
             .start_goal("trace control plane", false)
             .unwrap();
         let _trace_guard = trace_capture_lock().lock().await;
@@ -9846,8 +9857,9 @@ providers:
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -9859,8 +9871,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9882,8 +9893,9 @@ providers:
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -9895,8 +9907,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9918,8 +9929,9 @@ providers:
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -9931,8 +9943,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9963,8 +9974,9 @@ providers:
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
-            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             tool_registry: tools,
             config: None,
             platform_runtime: None,
@@ -9976,8 +9988,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: test_services(session_kernel, task_kernel),
             session_lease_registry: None,
         });
         let app = api_router(state);

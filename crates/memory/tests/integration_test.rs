@@ -5,11 +5,11 @@
 
 use std::io::Write;
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::store::sqlite::SqliteStore;
-use cowd_memory::store::MemoryStore;
-use cowd_memory::types::Message;
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::store::sqlite::SqliteStore;
+use memory::store::MemoryStore;
+use memory::types::Message;
+use memory::{
     CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig, SymbolEdge,
     SymbolEdgeType, SymbolKind, TokenBudget, TuningConfig,
 };
@@ -86,7 +86,7 @@ fn authenticate_user(token: &str) -> bool {
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
-        if cowd_memory::IndexLanguage::is_indexable(path) {
+        if memory::IndexLanguage::is_indexable(path) {
             match indexer.index_file(path) {
                 Ok((symbols, _edges)) => {
                     files_processed += 1;

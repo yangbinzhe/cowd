@@ -9,7 +9,7 @@ use axum::{
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::{MemoryKernel, MemoryScope, MemoryTurnContext};
+use memory::MemoryScope;
 use runtime::{
     CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
     ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt,
@@ -18,7 +18,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::gateway_services::GatewayMemoryManager;
+use crate::services::GatewayMemoryManager;
 
 use super::{channel_routes, cross_plane_routes, AppState};
 
@@ -788,9 +788,12 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         source_agent: Some("connector-resource-bridge".to_string()),
         visibility: AgentVisibility::Shared,
     };
-    let kernel = MemoryKernel::new(Arc::clone(&memory_manager));
-    let memory_ctx = MemoryTurnContext::new("connector-resource-bridge", "api");
-    match kernel.remember(&memory_ctx, entry).await {
+    match state
+        .services
+        .memory
+        .remember_entry_with_context(entry, "connector-resource-bridge", "api")
+        .await
+    {
         Ok(()) => serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": true,

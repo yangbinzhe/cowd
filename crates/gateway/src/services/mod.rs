@@ -1,16 +1,6 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use app_mfg::{MfgMatrixAdapterError, MfgStore};
 use approval::{ApprovalRepository, FileApprovalRepository};
-use command_contract::{
-    command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
-    CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
-};
-use matrix_repository::MatrixRepository;
 use memory::store::session::{
     SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
 };
@@ -20,14 +10,35 @@ use memory::{
 use runtime::{
     approval_gate::SmartApprovalGate,
     permission_enforcer::{ApprovalPersistence, ApprovalVerdict},
-    AgentWorkGraph, ApprovalConfig, CollaborationReviewPacket, ExternalResourceRef,
-    SqliteResourceDirectory,
+    AgentRunGraph, AgentWorkGraph, ApprovalConfig, CollaborationReviewPacket,
 };
 
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
+use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
+
+mod agent_service;
+mod command_service;
+mod connector_service;
+mod context_service;
+mod matrix_service;
+mod memory_service;
+mod mfg_service;
+mod skill_service;
+mod system_service;
+mod workspace_service;
+
+pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
+pub(crate) use command_service::CommandService;
+pub(crate) use matrix_service::MatrixService;
+pub(crate) use memory_service::MemoryService;
+pub(crate) use mfg_service::MfgService;
+pub(crate) use skill_service::{
+    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
+};
 
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
+pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixSqliteRepositoryError;
 pub(crate) type RuntimeContextBoundary = runtime::ContextRuntimeKernel;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,64 +50,191 @@ pub(crate) struct ServiceEnvelope {
     pub(crate) boundary_status: &'static str,
 }
 
-macro_rules! define_gateway_service {
-    ($name:ident, $label:literal) => {
-        #[derive(Clone)]
-        pub(crate) struct $name {
-            pub(crate) label: &'static str,
-            pub(crate) owner: &'static str,
-        }
-
-        impl $name {
-            pub(crate) fn new() -> Self {
-                Self {
-                    label: $label,
-                    owner: "0.9.292 Gateway RuntimeHost",
-                }
-            }
-
-            pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
-                ServiceEnvelope {
-                    service: self.label,
-                    operation,
-                    status: "service_boundary_ready",
-                    owner: self.owner,
-                    boundary_status: "reviewed_0.9.305",
-                }
-            }
-        }
-    };
+fn service_envelope(
+    service: &'static str,
+    owner: &'static str,
+    operation: &'static str,
+) -> ServiceEnvelope {
+    ServiceEnvelope {
+        service,
+        operation,
+        status: "service_boundary_ready",
+        owner,
+        boundary_status: "0618_final_boundary",
+    }
 }
-
-define_gateway_service!(TaskService, "task");
-define_gateway_service!(ContextService, "context");
-define_gateway_service!(ConnectorService, "connector");
-define_gateway_service!(ToolService, "tool");
-define_gateway_service!(SystemService, "system");
-define_gateway_service!(AuditService, "audit");
-define_gateway_service!(SkillService, "skill");
-define_gateway_service!(AgentService, "agent");
-define_gateway_service!(MfgService, "mfg");
 
 #[derive(Clone)]
-pub(crate) struct MemoryService {
+pub(crate) struct ContextService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
-    manager: Option<Arc<GatewayMemoryManager>>,
 }
 
-impl MemoryService {
+impl ContextService {
     pub(crate) fn new() -> Self {
         Self {
-            label: "memory",
-            owner: "0.9.292 Gateway RuntimeHost",
-            manager: None,
+            label: "context",
+            owner: "0.9.315 Context service boundary",
         }
     }
 
-    pub(crate) fn with_manager(manager: Option<Arc<GatewayMemoryManager>>) -> Self {
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectorService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl ConnectorService {
+    pub(crate) fn new() -> Self {
         Self {
-            manager,
+            label: "connector",
+            owner: "0.9.315 Connector service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl ToolService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "tool",
+            owner: "0.9.315 Tool service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SystemService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl SystemService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "system",
+            owner: "0.9.315 System service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AuditService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl AuditService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "audit",
+            owner: "0.9.315 Audit service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl WorkspaceService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "workspace",
+            owner: "0.9.315 Workspace service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SkillService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl SkillService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "skill",
+            owner: "0.9.315 Skill service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl AgentService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "agent",
+            owner: "0.9.315 Agent service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TaskService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+    kernel: Option<Arc<TaskKernel>>,
+}
+
+impl TaskService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "task",
+            owner: "0.9.296 Task service boundary",
+            kernel: None,
+        }
+    }
+
+    pub(crate) fn with_kernel(kernel: Arc<TaskKernel>) -> Self {
+        Self {
+            kernel: Some(kernel),
             ..Self::new()
         }
     }
@@ -105,64 +243,105 @@ impl MemoryService {
         ServiceEnvelope {
             service: self.label,
             operation,
-            status: if self.manager.is_some() {
+            status: if self.kernel.is_some() {
                 "service_ready"
             } else {
                 "service_boundary_ready"
             },
             owner: self.owner,
-            boundary_status: "reviewed_0.9.307",
+            boundary_status: "0618_final_boundary",
         }
     }
 
-    pub(crate) fn manager(&self) -> Option<Arc<GatewayMemoryManager>> {
-        self.manager.clone()
+    fn kernel(&self) -> Result<&Arc<TaskKernel>, String> {
+        self.kernel
+            .as_ref()
+            .ok_or_else(|| "task service not configured".to_string())
     }
 
-    pub(crate) fn is_available(&self) -> bool {
-        self.manager.is_some()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct MatrixService {
-    pub(crate) label: &'static str,
-    pub(crate) owner: &'static str,
-}
-
-impl MatrixService {
-    pub(crate) fn new() -> Self {
-        Self {
-            label: "matrix",
-            owner: "0.9.297 Matrix core boundary",
-        }
+    pub(crate) fn list_records(&self) -> Result<Vec<TaskRecord>, String> {
+        Ok(self.kernel()?.list())
     }
 
-    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
-        ServiceEnvelope {
-            service: self.label,
-            operation,
-            status: "service_ready",
-            owner: self.owner,
-            boundary_status: "reviewed_0.9.305",
-        }
+    pub(crate) fn current(&self) -> Result<Option<TaskRecord>, String> {
+        Ok(self.kernel()?.current())
     }
 
-    pub(crate) fn repository_handle(
+    pub(crate) fn list_agent_graphs(&self) -> Result<Vec<runtime::AgentRunGraph>, String> {
+        Ok(self.kernel()?.list_agent_graphs())
+    }
+
+    pub(crate) fn agent_graph(&self, task_id: &str) -> Result<Option<AgentRunGraph>, String> {
+        Ok(self.kernel()?.agent_graph(task_id))
+    }
+
+    pub(crate) fn start_goal(
         &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<
-        ::matrix_repository::MatrixRepositoryHandle,
-        ::matrix_repository::MatrixRepositoryError,
-    > {
-        ::matrix_repository::MatrixRepositoryHandle::from_config_home(config_home)
+        objective: impl Into<String>,
+        yolo_mode: bool,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?.start_goal(objective, yolo_mode)
     }
 
-    pub(crate) fn store_path(
+    pub(crate) fn start_phase(
         &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<PathBuf, ::matrix_repository::MatrixRepositoryError> {
-        Ok(self.repository_handle(config_home)?.db_path().to_path_buf())
+        id: &str,
+        name: String,
+        objective: String,
+        plan: Vec<String>,
+        acceptance: Vec<String>,
+        test_commands: Vec<String>,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?
+            .start_phase(id, name, objective, plan, acceptance, test_commands)
+    }
+
+    pub(crate) fn record_phase_artifact(
+        &self,
+        id: &str,
+        phase_id: &str,
+        kind: String,
+        label: String,
+        value: String,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?
+            .record_phase_artifact(id, phase_id, kind, label, value)
+    }
+
+    pub(crate) fn review_phase(
+        &self,
+        id: &str,
+        phase_id: &str,
+        result: String,
+        completed: bool,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?.review_phase(id, phase_id, result, completed)
+    }
+
+    pub(crate) fn transition(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        current_phase: Option<String>,
+        note: impl Into<String>,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?.transition(id, status, current_phase, note)
+    }
+
+    pub(crate) fn record_failure(
+        &self,
+        id: &str,
+        reason: impl Into<String>,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?.record_failure(id, reason)
+    }
+
+    pub(crate) fn upsert_agent_graph(
+        &self,
+        task_id: &str,
+        graph: AgentRunGraph,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?.upsert_agent_graph(task_id, graph)
     }
 }
 
@@ -199,7 +378,7 @@ impl SessionService {
                 "service_boundary_ready"
             },
             owner: self.owner,
-            boundary_status: "reviewed_0.9.305",
+            boundary_status: "0618_final_boundary",
         }
     }
 
@@ -209,6 +388,10 @@ impl SessionService {
 
     pub(crate) fn unified_store(&self) -> Option<Arc<UnifiedSessionStore>> {
         self.kernel().and_then(|kernel| kernel.unified_store())
+    }
+
+    pub(crate) fn event_bus(&self) -> Option<Arc<crate::event_bus::SessionEventBus>> {
+        self.kernel().map(|kernel| kernel.event_bus())
     }
 
     pub(crate) fn has_unified_store(&self) -> bool {
@@ -530,7 +713,7 @@ impl ApprovalService {
                 "service_boundary_ready"
             },
             owner: self.owner,
-            boundary_status: "reviewed_0.9.305",
+            boundary_status: "0618_final_boundary",
         }
     }
 
@@ -617,182 +800,6 @@ impl ApprovalService {
 }
 
 #[derive(Clone)]
-pub(crate) struct CommandService {
-    runtime: Option<Arc<RuntimeService>>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct CommandResolution {
-    pub(crate) input: String,
-    pub(crate) surface: CommandSurface,
-    pub(crate) command: CommandDefinition,
-    pub(crate) action_request: serde_json::Value,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct CommandExecutionReceipt {
-    pub(crate) ok: bool,
-    pub(crate) command: String,
-    pub(crate) id: String,
-    pub(crate) action: CommandActionTarget,
-    pub(crate) status: String,
-    pub(crate) data: serde_json::Value,
-    pub(crate) executed_at_ms: i64,
-}
-
-impl CommandService {
-    pub(crate) fn new(runtime: Option<Arc<RuntimeService>>) -> Self {
-        Self { runtime }
-    }
-
-    pub(crate) fn label(&self) -> &'static str {
-        "command"
-    }
-
-    pub(crate) fn contracts(&self) -> Vec<ServiceEnvelope> {
-        ["registry", "projection", "detail", "resolve", "execute"]
-            .into_iter()
-            .map(|operation| ServiceEnvelope {
-                service: self.label(),
-                operation,
-                status: "service_boundary_ready",
-                owner: "0.9.294 Commands unified registry",
-                boundary_status: "reviewed_0.9.305",
-            })
-            .collect()
-    }
-
-    pub(crate) fn registry(&self) -> CommandRegistry {
-        unified_command_registry()
-    }
-
-    pub(crate) fn projection(&self, surface: CommandSurface) -> CommandProjection {
-        command_projection(surface)
-    }
-
-    pub(crate) fn detail(&self, id: &str) -> Option<CommandDefinition> {
-        let normalized = normalize_command_name(id);
-        self.registry()
-            .definitions()
-            .iter()
-            .find(|definition| {
-                definition.id == id
-                    || definition.name == normalized
-                    || definition.name.trim_start_matches('/') == id
-            })
-            .cloned()
-    }
-
-    pub(crate) fn resolve(
-        &self,
-        input: &str,
-        surface: CommandSurface,
-        context: serde_json::Value,
-    ) -> Result<CommandResolution, String> {
-        let normalized = normalize_command_name(input);
-        let registry = self.registry();
-        let definition = registry
-            .find(&normalized)
-            .cloned()
-            .ok_or_else(|| format!("unknown command `{input}`"))?;
-        if !definition.surfaces.contains(&surface) {
-            return Err(format!(
-                "command `{}` is not available on {surface:?}",
-                definition.name
-            ));
-        }
-        let action_request = serde_json::json!({
-            "command_id": definition.id,
-            "command": definition.name,
-            "surface": surface,
-            "action": definition.action,
-            "context": context,
-        });
-        Ok(CommandResolution {
-            input: input.to_string(),
-            surface,
-            command: definition,
-            action_request,
-        })
-    }
-
-    pub(crate) async fn execute(
-        &self,
-        command: &str,
-        args: serde_json::Value,
-    ) -> Result<CommandExecutionReceipt, String> {
-        let definition = self
-            .registry()
-            .find(command)
-            .cloned()
-            .ok_or_else(|| format!("unknown command `{command}`"))?;
-        let (ok, status, data) = self.execute_target(&definition.action, args).await;
-        Ok(CommandExecutionReceipt {
-            ok,
-            command: definition.name,
-            id: definition.id,
-            action: definition.action,
-            status: status.to_string(),
-            data,
-            executed_at_ms: chrono::Utc::now().timestamp_millis(),
-        })
-    }
-
-    async fn execute_target(
-        &self,
-        action: &CommandActionTarget,
-        args: serde_json::Value,
-    ) -> (bool, &'static str, serde_json::Value) {
-        match action {
-            CommandActionTarget::Runtime { operation } if operation == "runtime.status" => {
-                match &self.runtime {
-                    Some(runtime) => (true, "complete", runtime.status_value()),
-                    None => (
-                        true,
-                        "degraded",
-                        serde_json::json!({
-                            "ok": true,
-                            "runtime_host": "transition-only",
-                            "active_sessions": 0,
-                            "warning": "runtime service is unavailable in this gateway state",
-                        }),
-                    ),
-                }
-            }
-            CommandActionTarget::Client { action } => (
-                false,
-                "client-action",
-                serde_json::json!({
-                    "error": "client action must be handled by the requesting surface",
-                    "action": action,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Route { path } => (
-                false,
-                "unsupported",
-                serde_json::json!({
-                    "error": "route-backed command execution is not enabled; call resolve and dispatch through the owning service",
-                    "path": path,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Runtime { operation }
-            | CommandActionTarget::Config { operation }
-            | CommandActionTarget::Registry { operation } => (
-                false,
-                "unsupported",
-                serde_json::json!({
-                    "error": "command target is declared but not yet executable through CommandService",
-                    "operation": operation,
-                    "args": args,
-                }),
-            ),
-        }
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) command: CommandService,
@@ -805,6 +812,7 @@ pub(crate) struct GatewayServices {
     pub(crate) tool: ToolService,
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
+    pub(crate) workspace: WorkspaceService,
     pub(crate) skill: SkillService,
     pub(crate) agent: AgentService,
     pub(crate) matrix: MatrixService,
@@ -816,6 +824,7 @@ pub(crate) struct GatewayServices {
 impl GatewayServices {
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
+        task_kernel: Arc<TaskKernel>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
@@ -826,6 +835,7 @@ impl GatewayServices {
             runtime: Some(runtime),
             command: CommandService::new(Some(command_host_runtime)),
             session: SessionService::with_kernel(session_kernel),
+            task: TaskService::with_kernel(task_kernel),
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
             ..Self::transition_only()
@@ -845,12 +855,13 @@ impl GatewayServices {
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
+            workspace: WorkspaceService::new(),
             skill: SkillService::new(),
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
             owner: "0.9.292 Gateway RuntimeHost",
-            boundary_status: "reviewed_0.9.305",
+            boundary_status: "0618_final_boundary",
         }
     }
 
@@ -890,6 +901,24 @@ impl GatewayServices {
             session: SessionService::with_kernel(session_kernel),
             ..Self::transition_only()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_with_kernels_for_tests(
+        session_kernel: Arc<SessionKernel>,
+        task_kernel: Arc<TaskKernel>,
+    ) -> Self {
+        Self {
+            session: SessionService::with_kernel(session_kernel),
+            task: TaskService::with_kernel(task_kernel),
+            ..Self::transition_only()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_task_kernel_for_tests(mut self, task_kernel: Arc<TaskKernel>) -> Self {
+        self.task = TaskService::with_kernel(task_kernel);
+        self
     }
 
     pub(crate) fn service_labels(&self) -> Vec<&'static str> {
@@ -976,7 +1005,10 @@ impl GatewayServices {
             ("agent", "list"),
             ("agent", "task_projection"),
             ("matrix", "health"),
-            ("mfg", "placeholder"),
+            ("mfg", "health"),
+            ("mfg", "incident"),
+            ("mfg", "analysis"),
+            ("mfg", "skill_run"),
         ]
         .into_iter()
         .all(|(service, operation)| has(service, operation))
@@ -1078,116 +1110,6 @@ impl ContextService {
     }
 }
 
-impl ConnectorService {
-    pub(crate) fn resource_list(&self) -> ServiceEnvelope {
-        self.envelope("resource_list")
-    }
-
-    pub(crate) fn resource_revalidate(&self) -> ServiceEnvelope {
-        self.envelope("resource_revalidate")
-    }
-
-    pub(crate) fn resource_promote_memory(&self) -> ServiceEnvelope {
-        self.envelope("resource_promote_memory")
-    }
-
-    pub(crate) fn resource_directory(
-        &self,
-        workspace_root: impl AsRef<Path>,
-    ) -> rusqlite::Result<SqliteResourceDirectory> {
-        let path = self.resource_directory_path(workspace_root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                    error.kind(),
-                    format!("failed to create resource directory parent: {error}"),
-                )))
-            })?;
-        }
-        SqliteResourceDirectory::open(path)
-    }
-
-    pub(crate) fn resource_directory_path(&self, workspace_root: impl AsRef<Path>) -> PathBuf {
-        workspace_root
-            .as_ref()
-            .join(".cowd")
-            .join("resource-directory.sqlite")
-    }
-
-    pub(crate) fn list_resources(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        limit: usize,
-        offset: usize,
-        query: Option<&str>,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
-        let directory = self.resource_directory(workspace_root)?;
-        query
-            .map(|value| directory.search(value, limit))
-            .unwrap_or_else(|| directory.list_page(limit, offset))
-    }
-
-    pub(crate) fn recent_resources(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        limit: usize,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
-        self.resource_directory(workspace_root)?.list_recent(limit)
-    }
-
-    pub(crate) fn search_resources(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        query: &str,
-        limit: usize,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
-        self.resource_directory(workspace_root)?
-            .search(query, limit)
-    }
-
-    pub(crate) fn get_resource(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        reference: &str,
-    ) -> rusqlite::Result<Option<ExternalResourceRef>> {
-        self.resource_directory(workspace_root)?.get(reference)
-    }
-
-    pub(crate) fn upsert_resource(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        resource: &ExternalResourceRef,
-    ) -> rusqlite::Result<()> {
-        self.resource_directory(workspace_root)?
-            .upsert(resource)
-            .map(|_| ())
-    }
-
-    pub(crate) fn mark_resource_state(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        reference: &str,
-        desired_state: &str,
-    ) -> rusqlite::Result<(bool, Option<ExternalResourceRef>, Option<String>)> {
-        let directory = self.resource_directory(workspace_root)?;
-        let changed = match desired_state {
-            "indexed" => directory.mark_indexed(reference)?,
-            "stale" => directory.mark_stale(reference)?,
-            other => return Ok((false, None, Some(format!("unsupported state: {other}")))),
-        };
-        let resource = directory.get(reference)?;
-        Ok((changed, resource, None))
-    }
-
-    fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![
-            self.resource_list(),
-            self.resource_revalidate(),
-            self.resource_promote_memory(),
-        ]
-    }
-}
-
 impl ToolService {
     pub(crate) fn approve(&self) -> ServiceEnvelope {
         self.envelope("approve")
@@ -1243,99 +1165,15 @@ impl AuditService {
     }
 }
 
-impl SkillService {
-    pub(crate) fn list(&self) -> ServiceEnvelope {
-        self.envelope("list")
-    }
-
-    pub(crate) fn view(&self) -> ServiceEnvelope {
-        self.envelope("view")
-    }
-
-    pub(crate) fn validate(&self) -> ServiceEnvelope {
-        self.envelope("validate")
-    }
-
-    fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.list(), self.view(), self.validate()]
-    }
-}
-
-impl AgentService {
-    pub(crate) fn list(&self) -> ServiceEnvelope {
-        self.envelope("list")
-    }
-
-    pub(crate) fn task_projection(&self) -> ServiceEnvelope {
-        self.envelope("task_projection")
-    }
-
-    fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.list(), self.task_projection()]
-    }
-}
-
-impl MatrixService {
-    pub(crate) fn health(&self) -> ServiceEnvelope {
-        self.envelope("health")
-    }
-
-    pub(crate) fn structured_projection(&self) -> ServiceEnvelope {
-        self.envelope("structured_projection")
-    }
-
-    pub(crate) fn repository(&self) -> ServiceEnvelope {
-        self.envelope("repository")
-    }
-
-    fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![
-            self.health(),
-            self.structured_projection(),
-            self.repository(),
-        ]
-    }
-}
-
-impl MfgService {
-    pub(crate) fn placeholder(&self) -> ServiceEnvelope {
-        self.envelope("placeholder")
-    }
-
-    pub(crate) fn open_store(
-        &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<MfgStore, MfgMatrixAdapterError> {
-        let path = ::matrix_repository::MatrixRepositoryHandle::from_config_home(config_home)
-            .map_err(to_mfg_sqlite_error)?
-            .db_path()
-            .to_path_buf();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(to_mfg_sqlite_error)?;
-        }
-        MfgStore::open(path)
-    }
-
-    fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.placeholder()]
-    }
-}
-
-fn to_mfg_sqlite_error(
-    error: impl std::error::Error + Send + Sync + 'static,
-) -> MfgMatrixAdapterError {
-    MfgMatrixAdapterError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn gateway_services_declares_transition_owner() {
+    fn services_declares_transition_owner() {
         let services = GatewayServices::transition_only();
         assert_eq!(services.owner, "0.9.292 Gateway RuntimeHost");
-        assert_eq!(services.boundary_status, "reviewed_0.9.305");
+        assert_eq!(services.boundary_status, "0618_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
             services.service_labels(),
@@ -1383,6 +1221,10 @@ mod tests {
             "task_projection"
         );
         assert_eq!(services.matrix.health().operation, "health");
-        assert_eq!(services.mfg.placeholder().operation, "placeholder");
+        assert!(services
+            .mfg
+            .contracts()
+            .iter()
+            .any(|contract| contract.operation == "incident"));
     }
 }

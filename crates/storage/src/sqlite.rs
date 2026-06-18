@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use rusqlite::{types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::{StorageBackend, StorageError};
+use crate::{StorageBackend, StorageBackendKind, StorageError, StorageHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlitePragmaConfig {
@@ -42,6 +42,16 @@ impl SqliteConnectionFactory {
         let connection = Connection::open(path)?;
         self.apply_pragmas(&connection)?;
         Ok(connection)
+    }
+
+    pub fn open_handle(&self, handle: &StorageHandle) -> Result<Connection, StorageError> {
+        if handle.backend != StorageBackendKind::Sqlite {
+            return Err(StorageError::Other(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        self.open(&handle.path)
     }
 
     pub fn open_in_memory(&self) -> Result<Connection, StorageError> {

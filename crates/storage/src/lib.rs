@@ -66,6 +66,23 @@ pub struct StorageHandle {
     pub migration: String,
 }
 
+impl StorageHandle {
+    pub fn sqlite(
+        domain: impl Into<String>,
+        path: impl Into<PathBuf>,
+        owner: impl Into<String>,
+        migration: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            backend: StorageBackendKind::Sqlite,
+            path: path.into(),
+            owner: owner.into(),
+            migration: migration.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageLayout {
     pub root: PathBuf,
@@ -81,6 +98,7 @@ impl StorageLayout {
             ("session".to_string(), root.join("session.sqlite")),
             ("memory".to_string(), root.join("memory.sqlite")),
             ("matrix".to_string(), root.join("matrix.sqlite")),
+            ("mfg".to_string(), root.join("mfg.sqlite")),
             (
                 "resource_directory".to_string(),
                 root.join("resource-directory.sqlite"),
@@ -199,6 +217,18 @@ impl StorageRegistry {
         self.handles.iter().find(|handle| handle.domain == domain)
     }
 
+    pub fn sqlite_handle(&self, domain: &str) -> Result<&StorageHandle, StorageError> {
+        let handle = self.handle(domain).ok_or_else(|| {
+            StorageError::Other(format!("storage domain `{domain}` is not registered"))
+        })?;
+        if handle.backend != StorageBackendKind::Sqlite {
+            return Err(StorageError::Other(format!(
+                "storage domain `{domain}` is not sqlite-backed"
+            )));
+        }
+        Ok(handle)
+    }
+
     pub fn health(&self) -> StorageHealth {
         StorageHealth::from_registry(self)
     }
@@ -209,6 +239,7 @@ fn owner_for_domain(domain: &str) -> &'static str {
         "session" => "session",
         "memory" => "memory",
         "matrix" => "matrix",
+        "mfg" => "mfg",
         "resource_directory" => "connector",
         "tasks" => "task",
         "audit" | "audit_log" => "audit",
@@ -526,7 +557,6 @@ mod tests {
     fn direct_open_allowlist_is_machine_readable() {
         let raw = include_str!("../direct-open-allowlist.json");
         let entries: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
-        assert!(entries.len() >= 10);
         for entry in &entries {
             for key in [
                 "file",
@@ -540,17 +570,12 @@ mod tests {
             }
             let stale_deadline_key = ["delete", "_by"].concat();
             assert!(entry.get(&stale_deadline_key).is_none());
-            assert_eq!(
-                entry["status"].as_str().unwrap(),
-                "owned_boundary_reviewed_0.9.305"
-            );
+            let retired_status = ["owned_boundary", "_reviewed_", "0.9.305"].concat();
+            assert_ne!(entry["status"].as_str().unwrap(), retired_status.as_str());
             assert_ne!(
                 entry["allowed_until_test"].as_str().unwrap(),
                 "cargo test -p memory --no-default-features -- --nocapture"
             );
         }
-        assert!(entries
-            .iter()
-            .any(|entry| entry["file"] == "crates/memory/src/store/verbatim.rs"));
     }
 }

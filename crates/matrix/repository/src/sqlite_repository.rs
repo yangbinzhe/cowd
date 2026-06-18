@@ -8,6 +8,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use storage::{SqliteConnectionFactory, StorageHandle};
 use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
@@ -28,6 +29,8 @@ use matrix_core::{
 pub enum MatrixSqliteRepositoryError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("storage error: {0}")]
+    Storage(#[from] storage::StorageError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("matrix record not found: {0}")]
@@ -75,6 +78,13 @@ pub struct MatrixSqliteRepository {
 impl MatrixSqliteRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixSqliteRepositoryError> {
         let connection = Connection::open(path)?;
+        Self::from_connection(connection)
+    }
+
+    pub fn open_storage_handle(
+        handle: &StorageHandle,
+    ) -> Result<Self, MatrixSqliteRepositoryError> {
+        let connection = SqliteConnectionFactory::default().open_handle(handle)?;
         Self::from_connection(connection)
     }
 

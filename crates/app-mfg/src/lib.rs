@@ -9,9 +9,9 @@ pub mod cockpit;
 pub mod domain;
 pub mod execution;
 pub mod incident;
-mod matrix_adapter;
 pub mod memory_case;
 pub mod ontology;
+mod repository;
 pub mod skill;
 mod store;
 
@@ -45,7 +45,7 @@ pub use skill::{
 };
 pub use store::MfgStore;
 
-pub use matrix_adapter::{MatrixHealth, MatrixMetricRecomputeResult, MfgMatrixAdapterError};
+pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepositoryError};
 
 #[must_use]
 pub fn mfg_seed_plan() -> MfgDomainSeedPlan {

@@ -6,8 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-memory = { package = "cowd-memory", path = "../memory" }
-cowd-storage = { package = "storage", path = "../storage" }
+memory = { path = "../memory" }
+storage = { path = "../storage" }
 approval = { path = "../approval" }
 async-trait = "0.1"
 base64 = "0.22"

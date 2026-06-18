@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use app_mfg::server_manufacturing_skill_pack;
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
@@ -15,7 +14,6 @@ use matrix_core::structured::{
     StructuredSource as CowdStructuredSource, StructuredWatermark as CowdWatermark,
 };
 use matrix_core::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
-use matrix_repository::{MatrixSqliteRepository, MatrixSqliteRepositoryError};
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
@@ -23,6 +21,8 @@ use runtime::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
 use runtime::skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 use runtime::surface_contract::CowdSurfaceParityContract;
 use serde::{Deserialize, Serialize};
+
+use crate::services::GatewayMatrixRepositoryError;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -87,9 +87,10 @@ async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 async fn structured_sources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let items = store
-        .list_source_packs(100)
+    let items = state
+        .services
+        .matrix
+        .list_source_packs(&state.config_home, 100)
         .map_err(store_error)?
         .iter()
         .map(CowdStructuredSource::from)
@@ -105,8 +106,12 @@ async fn structured_source_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let Some(source_pack) = store.get_source_pack(&id).map_err(store_error)? else {
+    let Some(source_pack) = state
+        .services
+        .matrix
+        .get_source_pack(&state.config_home, &id)
+        .map_err(store_error)?
+    else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
             format!("source not found: {id}"),
@@ -119,9 +124,10 @@ async fn structured_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(input): Json<CowdStructuredIngestPlanInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let plan = store
-        .plan_data_plane_ingest(input.into())
+    let plan = state
+        .services
+        .matrix
+        .plan_data_plane_ingest(&state.config_home, input.into())
         .map_err(store_error)?;
     Ok(Json(CowdIngestPlan::from(&plan)))
 }
@@ -129,9 +135,10 @@ async fn structured_ingest_plan_handler(
 async fn structured_facts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let items = store
-        .list_facts(100)
+    let items = state
+        .services
+        .matrix
+        .list_facts(&state.config_home, 100)
         .map_err(store_error)?
         .iter()
         .map(CowdStructuredFact::from)
@@ -146,9 +153,10 @@ async fn structured_facts_handler(
 async fn structured_evidence_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let items = store
-        .list_evidence_packets(100)
+    let items = state
+        .services
+        .matrix
+        .list_evidence_packets(&state.config_home, 100)
         .map_err(store_error)?
         .iter()
         .map(CowdStructuredEvidence::from)
@@ -163,9 +171,10 @@ async fn structured_evidence_handler(
 async fn structured_watermarks_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_sqlite_repository(&state)?;
-    let items = store
-        .list_data_plane_watermarks(100)
+    let items = state
+        .services
+        .matrix
+        .list_data_plane_watermarks(&state.config_home, 100)
         .map_err(store_error)?
         .iter()
         .map(CowdWatermark::from)
@@ -212,24 +221,17 @@ where
 }
 
 async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
-    let (structured_indexes_ready, structured_watermark_persistent) =
-        match state.services.matrix.sqlite_repository(&state.config_home) {
-            Ok(store) => {
-                let indexes_ready = store.list_source_packs(1).is_ok()
-                    && store.list_facts(1).is_ok()
-                    && store.list_evidence_packets(1).is_ok();
-                let watermarks_ready = store.list_data_plane_watermarks(1).is_ok();
-                (indexes_ready, watermarks_ready)
-            }
-            Err(_) => (false, false),
-        };
+    let (structured_indexes_ready, structured_watermark_persistent) = state
+        .services
+        .matrix
+        .structured_runtime_ready(&state.config_home);
 
     CowdReleaseGateRuntimeEvidence {
         structured_indexes_ready,
         structured_watermark_persistent,
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
         memory_context_bridge_available: memory_context_bridge_smoke(),
-        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(),
+        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(state),
     }
 }
 
@@ -275,11 +277,8 @@ fn memory_context_bridge_smoke() -> bool {
         .unwrap_or(false)
 }
 
-fn graph_skill_quality_contract_smoke() -> bool {
-    let Some(skill) = server_manufacturing_skill_pack()
-        .into_iter()
-        .find(|skill| skill.skill_id == "supply-risk-analyst")
-    else {
+fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
+    let Some(skill) = state.services.mfg.skill_manifest("supply-risk-analyst") else {
         return false;
     };
     if skill.input_fact_types.is_empty() || skill.quality_gate.is_empty() {
@@ -304,19 +303,11 @@ fn graph_skill_quality_contract_smoke() -> bool {
             .any(|source| source.reference == "structured-fact:release-gate-smoke")
 }
 
-fn matrix_sqlite_repository(
-    state: &AppState,
-) -> Result<MatrixSqliteRepository, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .matrix
-        .sqlite_repository(&state.config_home)
-        .map_err(store_error)
-}
-
-fn store_error(error: MatrixSqliteRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
+fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        MatrixSqliteRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        GatewayMatrixRepositoryError::NotFound(message) => {
+            api_error(StatusCode::NOT_FOUND, message)
+        }
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }

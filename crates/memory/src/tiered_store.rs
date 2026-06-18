@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use cowd_memory::{UnifiedSessionStore, TieredSessionStore};
+//! use memory::{UnifiedSessionStore, TieredSessionStore};
 //! use std::path::Path;
 //!
 //! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();

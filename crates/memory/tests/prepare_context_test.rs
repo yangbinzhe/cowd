@@ -4,9 +4,9 @@
 //! through direct lookup, FTS cache paths, and the lightweight semantic bridge
 //! used when local keyword matching has no direct overlap.
 
-use cowd_memory::config::TuningConfig;
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::TuningConfig;
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
@@ -63,7 +63,7 @@ fn test_entry(layer: MemoryLayer, title: &str, content: &str) -> MemoryEntry {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     }
 }
 
@@ -133,7 +133,7 @@ async fn test_recall_semantic_bridge_finds_related_memory_without_keyword_overla
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     };
     let entry_id = entry.id;
     mgr.remember(entry).await.unwrap();

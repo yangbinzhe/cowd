@@ -17,8 +17,8 @@ mod event_bus;
 mod gateway;
 mod gateway_health;
 mod gateway_service;
-mod gateway_services;
 mod gateway_static;
+mod gateway_storage;
 mod init;
 mod logging;
 mod matrix_sqlite_repository;
@@ -29,8 +29,10 @@ mod runtime_host;
 mod runtime_protocol;
 mod runtime_service;
 mod server;
+mod services;
 mod session_kernel;
 mod session_lifecycle_kernel;
+mod slash_catalog;
 mod suggestions;
 mod task_kernel;
 mod tui_callbacks;
@@ -63,27 +65,32 @@ use provider::{
 #[cfg(test)]
 use command_service::resume_supported_slash_commands;
 use command_service::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json,
-    render_slash_command_help_filtered, resolve_skill_invocation, slash_command_specs,
+    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
     SkillRegistry, SkillSlashDispatch, SlashCommand,
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
-use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
+use plugins::{
+    PluginError, PluginHooks, PluginLoadFailure, PluginManager, PluginManagerConfig,
+    PluginRegistry, PluginSummary,
+};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::ContextProfile;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonValue,
-    McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    McpOAuthConfig, McpServerConfig, McpServerManager, McpTool, MessageRole, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    ResumeContextPacket, ResumeContextSource, RuntimeError, ScopedMcpServerConfig, Session,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
+use slash_catalog::{
+    handle_agents_slash_command, handle_agents_slash_command_json, handle_skills_slash_command,
+    handle_skills_slash_command_json, resolve_skill_invocation,
+};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition};
 
 use futures::StreamExt;
@@ -4458,7 +4465,7 @@ impl BuiltRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_placeholder() -> Self {
+    pub(crate) fn test_runtime_shell() -> Self {
         Self {
             runtime: None,
             plugin_registry: PluginRegistry::default(),
@@ -6665,19 +6672,9 @@ fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn s
         return Ok(store);
     }
 
-    let storage_layout =
-        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
-    let db_path = storage_layout
-        .sqlite_path("session")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("sessions.db"));
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = memory::UnifiedSessionStore::open(&db_path).map_err(|e| {
-        let msg = format!("failed to open unified session store at {:?}: {e}", db_path);
-        Box::<dyn std::error::Error>::from(msg)
-    })?;
+    let store = gateway_storage::GatewayStorage::open_unified_session_store(
+        runtime::cowd_dirs::config_home_dir(),
+    )?;
 
     // set() fails if another thread already initialised — either way get() works.
     UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
@@ -9420,13 +9417,8 @@ pub(crate) fn ensure_yolo_task(
     if !yolo_mode {
         return Ok(None);
     }
-    let storage_layout =
-        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
-    let task_path = storage_layout
-        .sqlite_path("tasks")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("tasks.db"));
-    let kernel = task_kernel::TaskKernel::open(task_path)?;
+    let kernel =
+        gateway_storage::GatewayStorage::open_task_kernel(runtime::cowd_dirs::config_home_dir())?;
     if let Some(current) = kernel.current() {
         return Ok(Some(current));
     }
@@ -9503,6 +9495,632 @@ fn build_plugin_manager(
         .bundled_root()
         .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
     PluginManager::new(plugin_config)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginsCommandResult {
+    message: String,
+    reload_runtime: bool,
+}
+
+fn handle_plugins_slash_command(
+    action: Option<&str>,
+    target: Option<&str>,
+    manager: &mut PluginManager,
+) -> Result<PluginsCommandResult, PluginError> {
+    match action {
+        None | Some("list") => {
+            let report = manager.installed_plugin_registry_report()?;
+            Ok(PluginsCommandResult {
+                message: render_plugins_report_with_failures(&report.summaries(), report.failures()),
+                reload_runtime: false,
+            })
+        }
+        Some("install") => {
+            let Some(target) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins install <path>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            let install = manager.install(target)?;
+            let plugin = manager
+                .list_installed_plugins()?
+                .into_iter()
+                .find(|plugin| plugin.metadata.id == install.plugin_id);
+            Ok(PluginsCommandResult {
+                message: render_plugin_install_report(&install.plugin_id, plugin.as_ref()),
+                reload_runtime: true,
+            })
+        }
+        Some("enable") => {
+            let Some(target) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins enable <name>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            let plugin = resolve_plugin_target(manager, target)?;
+            manager.enable(&plugin.metadata.id)?;
+            Ok(PluginsCommandResult {
+                message: format!(
+                    "Plugins\n  Result           enabled {}\n  Name             {}\n  Version          {}\n  Status           enabled",
+                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+                ),
+                reload_runtime: true,
+            })
+        }
+        Some("disable") => {
+            let Some(target) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins disable <name>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            let plugin = resolve_plugin_target(manager, target)?;
+            manager.disable(&plugin.metadata.id)?;
+            Ok(PluginsCommandResult {
+                message: format!(
+                    "Plugins\n  Result           disabled {}\n  Name             {}\n  Version          {}\n  Status           disabled",
+                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+                ),
+                reload_runtime: true,
+            })
+        }
+        Some("uninstall") => {
+            let Some(target) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins uninstall <plugin-id>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            manager.uninstall(target)?;
+            Ok(PluginsCommandResult {
+                message: format!("Plugins\n  Result           uninstalled {target}"),
+                reload_runtime: true,
+            })
+        }
+        Some("update") => {
+            let Some(target) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins update <plugin-id>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            let update = manager.update(target)?;
+            let plugin = manager
+                .list_installed_plugins()?
+                .into_iter()
+                .find(|plugin| plugin.metadata.id == update.plugin_id);
+            Ok(PluginsCommandResult {
+                message: format!(
+                    "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
+                    update.plugin_id,
+                    plugin
+                        .as_ref()
+                        .map_or_else(|| update.plugin_id.clone(), |plugin| plugin.metadata.name.clone()),
+                    update.old_version,
+                    update.new_version,
+                    plugin
+                        .as_ref()
+                        .map_or("unknown", |plugin| if plugin.enabled { "enabled" } else { "disabled" }),
+                ),
+                reload_runtime: true,
+            })
+        }
+        Some(other) => Ok(PluginsCommandResult {
+            message: format!(
+                "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, or update."
+            ),
+            reload_runtime: false,
+        }),
+    }
+}
+
+fn render_plugins_report_with_failures(
+    plugins: &[PluginSummary],
+    failures: &[PluginLoadFailure],
+) -> String {
+    let mut lines = vec!["Plugins".to_string()];
+    if plugins.is_empty() {
+        lines.push("  No plugins installed.".to_string());
+    } else {
+        for plugin in plugins {
+            let enabled = if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            lines.push(format!(
+                "  {name:<20} v{version:<10} {enabled}",
+                name = plugin.metadata.name,
+                version = plugin.metadata.version,
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        lines.push(String::new());
+        lines.push("Warnings:".to_string());
+        for failure in failures {
+            lines.push(format!(
+                "  Failed to load {} plugin from `{}`",
+                failure.kind,
+                failure.plugin_root.display()
+            ));
+            lines.push(format!("      Error: {}", failure.error()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_plugin_install_report(plugin_id: &str, plugin: Option<&PluginSummary>) -> String {
+    let name = plugin.map_or(plugin_id, |plugin| plugin.metadata.name.as_str());
+    let version = plugin.map_or("unknown", |plugin| plugin.metadata.version.as_str());
+    let enabled = plugin.is_some_and(|plugin| plugin.enabled);
+    format!(
+        "Plugins\n  Result           installed {plugin_id}\n  Name             {name}\n  Version          {version}\n  Status           {}",
+        if enabled { "enabled" } else { "disabled" }
+    )
+}
+
+fn resolve_plugin_target(
+    manager: &PluginManager,
+    target: &str,
+) -> Result<PluginSummary, PluginError> {
+    let mut matches = manager
+        .list_installed_plugins()?
+        .into_iter()
+        .filter(|plugin| plugin.metadata.id == target || plugin.metadata.name == target)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(PluginError::NotFound(format!(
+            "plugin `{target}` is not installed or discoverable"
+        ))),
+        _ => Err(PluginError::InvalidManifest(format!(
+            "plugin name `{target}` is ambiguous; use the full plugin id"
+        ))),
+    }
+}
+
+fn handle_mcp_slash_command(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<String, runtime::ConfigError> {
+    let loader = ConfigLoader::default_for(cwd);
+    render_mcp_report_for(&loader, cwd, args)
+}
+
+fn handle_mcp_slash_command_json(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<serde_json::Value, runtime::ConfigError> {
+    let loader = ConfigLoader::default_for(cwd);
+    render_mcp_report_json_for(&loader, cwd, args)
+}
+
+fn render_mcp_report_for(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<String, runtime::ConfigError> {
+    if let Some(args) = normalize_command_args(args) {
+        if let Some(help_path) = command_help_path(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_mcp_usage(None),
+                ["show", ..] => render_mcp_usage(Some("show")),
+                _ => render_mcp_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
+    match normalize_command_args(args) {
+        None | Some("list") => {
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_summary_report(
+                cwd,
+                runtime_config.mcp().servers(),
+            ))
+        }
+        Some(args) if is_command_help_arg(args) => Ok(render_mcp_usage(None)),
+        Some("show") => Ok(render_mcp_usage(Some("show"))),
+        Some(args) if args.split_whitespace().next() == Some("show") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let Some(server_name) = parts.next() else {
+                return Ok(render_mcp_usage(Some("show")));
+            };
+            if parts.next().is_some() {
+                return Ok(render_mcp_usage(Some(args)));
+            }
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_server_report(
+                cwd,
+                server_name,
+                runtime_config.mcp().get(server_name),
+            ))
+        }
+        Some(args) => Ok(render_mcp_usage(Some(args))),
+    }
+}
+
+fn render_mcp_report_json_for(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<serde_json::Value, runtime::ConfigError> {
+    if let Some(args) = normalize_command_args(args) {
+        if let Some(help_path) = command_help_path(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_mcp_usage_json(None),
+                ["show", ..] => render_mcp_usage_json(Some("show")),
+                _ => render_mcp_usage_json(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
+    match normalize_command_args(args) {
+        None | Some("list") => {
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_summary_report_json(
+                cwd,
+                runtime_config.mcp().servers(),
+            ))
+        }
+        Some(args) if is_command_help_arg(args) => Ok(render_mcp_usage_json(None)),
+        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
+        Some(args) if args.split_whitespace().next() == Some("show") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let Some(server_name) = parts.next() else {
+                return Ok(render_mcp_usage_json(Some("show")));
+            };
+            if parts.next().is_some() {
+                return Ok(render_mcp_usage_json(Some(args)));
+            }
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_server_report_json(
+                cwd,
+                server_name,
+                runtime_config.mcp().get(server_name),
+            ))
+        }
+        Some(args) => Ok(render_mcp_usage_json(Some(args))),
+    }
+}
+
+fn render_mcp_summary_report(
+    cwd: &Path,
+    servers: &BTreeMap<String, ScopedMcpServerConfig>,
+) -> String {
+    let mut lines = vec![
+        "MCP".to_string(),
+        format!("  Working directory {}", cwd.display()),
+        format!("  Configured servers {}", servers.len()),
+    ];
+    if servers.is_empty() {
+        lines.push("  No MCP servers configured.".to_string());
+        return lines.join("\n");
+    }
+    lines.push(String::new());
+    for (name, server) in servers {
+        lines.push(format!(
+            "  {name:<16} {transport:<13} {scope:<7} {summary}",
+            transport = mcp_transport_label(&server.config),
+            scope = config_source_label(server.scope),
+            summary = mcp_server_summary(&server.config)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_mcp_summary_report_json(
+    cwd: &Path,
+    servers: &BTreeMap<String, ScopedMcpServerConfig>,
+) -> serde_json::Value {
+    json!({
+        "kind": "mcp",
+        "action": "list",
+        "working_directory": cwd.display().to_string(),
+        "configured_servers": servers.len(),
+        "servers": servers
+            .iter()
+            .map(|(name, server)| mcp_server_json(name, server))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn render_mcp_server_report(
+    cwd: &Path,
+    server_name: &str,
+    server: Option<&ScopedMcpServerConfig>,
+) -> String {
+    let Some(server) = server else {
+        return format!(
+            "MCP\n  Working directory {}\n  Result            server `{server_name}` is not configured",
+            cwd.display()
+        );
+    };
+    let mut lines = vec![
+        "MCP".to_string(),
+        format!("  Working directory {}", cwd.display()),
+        format!("  Name              {server_name}"),
+        format!("  Scope             {}", config_source_label(server.scope)),
+        format!(
+            "  Transport         {}",
+            mcp_transport_label(&server.config)
+        ),
+    ];
+    match &server.config {
+        McpServerConfig::Stdio(config) => {
+            lines.push(format!("  Command           {}", config.command));
+            lines.push(format!(
+                "  Args              {}",
+                format_optional_list(&config.args)
+            ));
+            lines.push(format!(
+                "  Env keys          {}",
+                format_optional_keys(config.env.keys().cloned().collect())
+            ));
+            lines.push(format!(
+                "  Tool timeout      {}",
+                config
+                    .tool_call_timeout_ms
+                    .map_or_else(|| "<default>".to_string(), |value| format!("{value} ms"))
+            ));
+        }
+        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => {
+            lines.push(format!("  URL               {}", config.url));
+            lines.push(format!(
+                "  Header keys       {}",
+                format_optional_keys(config.headers.keys().cloned().collect())
+            ));
+            lines.push(format!(
+                "  Header helper     {}",
+                config.headers_helper.as_deref().unwrap_or("<none>")
+            ));
+            lines.push(format!(
+                "  OAuth             {}",
+                format_mcp_oauth(config.oauth.as_ref())
+            ));
+        }
+        McpServerConfig::Ws(config) => {
+            lines.push(format!("  URL               {}", config.url));
+            lines.push(format!(
+                "  Header keys       {}",
+                format_optional_keys(config.headers.keys().cloned().collect())
+            ));
+            lines.push(format!(
+                "  Header helper     {}",
+                config.headers_helper.as_deref().unwrap_or("<none>")
+            ));
+        }
+        McpServerConfig::Sdk(config) => {
+            lines.push(format!("  SDK name          {}", config.name));
+        }
+        McpServerConfig::ManagedProxy(config) => {
+            lines.push(format!("  URL               {}", config.url));
+            lines.push(format!("  Proxy id          {}", config.id));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_mcp_server_report_json(
+    cwd: &Path,
+    server_name: &str,
+    server: Option<&ScopedMcpServerConfig>,
+) -> serde_json::Value {
+    match server {
+        Some(server) => json!({
+            "kind": "mcp",
+            "action": "show",
+            "working_directory": cwd.display().to_string(),
+            "found": true,
+            "server": mcp_server_json(server_name, server),
+        }),
+        None => json!({
+            "kind": "mcp",
+            "action": "show",
+            "working_directory": cwd.display().to_string(),
+            "found": false,
+            "server_name": server_name,
+            "message": format!("server `{server_name}` is not configured"),
+        }),
+    }
+}
+
+fn render_mcp_usage(unexpected: Option<&str>) -> String {
+    let mut lines = vec![
+        "MCP".to_string(),
+        "  Usage            /mcp [list|show <server>|help]".to_string(),
+        "  Direct CLI       cowd mcp [list|show <server>|help]".to_string(),
+        "  Sources          .cowd/config.yaml, .cowd/config.local.yaml".to_string(),
+    ];
+    if let Some(args) = unexpected {
+        lines.push(format!("  Unexpected       {args}"));
+    }
+    lines.join("\n")
+}
+
+fn render_mcp_usage_json(unexpected: Option<&str>) -> serde_json::Value {
+    json!({
+        "kind": "mcp",
+        "action": "help",
+        "usage": {
+            "slash_command": "/mcp [list|show <server>|help]",
+            "direct_cli": "cowd mcp [list|show <server>|help]",
+            "sources": [".cowd/config.yaml", ".cowd/config.local.yaml"],
+        },
+        "unexpected": unexpected,
+    })
+}
+
+fn normalize_command_args(args: Option<&str>) -> Option<&str> {
+    args.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn is_command_help_arg(arg: &str) -> bool {
+    matches!(arg, "help" | "-h" | "--help")
+}
+
+fn command_help_path(args: &str) -> Option<Vec<&str>> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    let help_index = parts.iter().position(|part| is_command_help_arg(part))?;
+    Some(parts[..help_index].to_vec())
+}
+
+fn config_source_label(source: ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+        ConfigSource::Environment => "env",
+        ConfigSource::Cli => "cli",
+    }
+}
+
+fn config_source_id(source: ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+        ConfigSource::Environment => "env",
+        ConfigSource::Cli => "cli",
+    }
+}
+
+fn config_source_json(source: ConfigSource) -> serde_json::Value {
+    json!({
+        "id": config_source_id(source),
+        "label": config_source_label(source),
+    })
+}
+
+fn mcp_transport_label(config: &McpServerConfig) -> &'static str {
+    match config {
+        McpServerConfig::Stdio(_) => "stdio",
+        McpServerConfig::Sse(_) => "sse",
+        McpServerConfig::Http(_) => "http",
+        McpServerConfig::Ws(_) => "ws",
+        McpServerConfig::Sdk(_) => "sdk",
+        McpServerConfig::ManagedProxy(_) => "managed-proxy",
+    }
+}
+
+fn mcp_server_summary(config: &McpServerConfig) -> String {
+    match config {
+        McpServerConfig::Stdio(config) => {
+            if config.args.is_empty() {
+                config.command.clone()
+            } else {
+                format!("{} {}", config.command, config.args.join(" "))
+            }
+        }
+        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => config.url.clone(),
+        McpServerConfig::Ws(config) => config.url.clone(),
+        McpServerConfig::Sdk(config) => config.name.clone(),
+        McpServerConfig::ManagedProxy(config) => format!("{} ({})", config.id, config.url),
+    }
+}
+
+fn mcp_transport_json(config: &McpServerConfig) -> serde_json::Value {
+    let label = mcp_transport_label(config);
+    json!({
+        "id": label,
+        "label": label,
+    })
+}
+
+fn mcp_oauth_json(oauth: Option<&McpOAuthConfig>) -> serde_json::Value {
+    let Some(oauth) = oauth else {
+        return serde_json::Value::Null;
+    };
+    json!({
+        "client_id": &oauth.client_id,
+        "callback_port": oauth.callback_port,
+        "auth_server_metadata_url": &oauth.auth_server_metadata_url,
+        "xaa": oauth.xaa,
+    })
+}
+
+fn mcp_server_details_json(config: &McpServerConfig) -> serde_json::Value {
+    match config {
+        McpServerConfig::Stdio(config) => json!({
+            "command": &config.command,
+            "args": &config.args,
+            "env_keys": config.env.keys().cloned().collect::<Vec<_>>(),
+            "tool_call_timeout_ms": config.tool_call_timeout_ms,
+        }),
+        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => json!({
+            "url": &config.url,
+            "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
+            "headers_helper": &config.headers_helper,
+            "oauth": mcp_oauth_json(config.oauth.as_ref()),
+        }),
+        McpServerConfig::Ws(config) => json!({
+            "url": &config.url,
+            "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
+            "headers_helper": &config.headers_helper,
+        }),
+        McpServerConfig::Sdk(config) => json!({
+            "name": &config.name,
+        }),
+        McpServerConfig::ManagedProxy(config) => json!({
+            "url": &config.url,
+            "id": &config.id,
+        }),
+    }
+}
+
+fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> serde_json::Value {
+    json!({
+        "name": name,
+        "scope": config_source_json(server.scope),
+        "transport": mcp_transport_json(&server.config),
+        "summary": mcp_server_summary(&server.config),
+        "details": mcp_server_details_json(&server.config),
+    })
+}
+
+fn format_optional_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_string()
+    } else {
+        values.join(" ")
+    }
+}
+
+fn format_optional_keys(mut keys: Vec<String>) -> String {
+    if keys.is_empty() {
+        return "<none>".to_string();
+    }
+    keys.sort();
+    keys.join(", ")
+}
+
+fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
+    let Some(oauth) = oauth else {
+        return "<none>".to_string();
+    };
+    let mut parts = Vec::new();
+    if let Some(client_id) = &oauth.client_id {
+        parts.push(format!("client_id={client_id}"));
+    }
+    if let Some(port) = oauth.callback_port {
+        parts.push(format!("callback_port={port}"));
+    }
+    if let Some(url) = &oauth.auth_server_metadata_url {
+        parts.push(format!("metadata_url={url}"));
+    }
+    if let Some(xaa) = oauth.xaa {
+        parts.push(format!("xaa={xaa}"));
+    }
+    if parts.is_empty() {
+        "enabled".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {

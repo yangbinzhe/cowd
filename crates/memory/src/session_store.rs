@@ -9,7 +9,7 @@
 //! Replace:
 //!
 //! ```rust,no_run
-//! use cowd_memory::store::session::SqliteSessionStore;
+//! use memory::store::session::SqliteSessionStore;
 //! use std::path::Path;
 //! let store = SqliteSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
@@ -17,7 +17,7 @@
 //! with:
 
 //! ```rust,no_run
-//! use cowd_memory::UnifiedSessionStore;
+//! use memory::UnifiedSessionStore;
 //! use std::path::Path;
 //! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
@@ -47,7 +47,7 @@ use crate::store::Result;
 /// # Example
 ///
 /// ```rust,no_run
-/// use cowd_memory::UnifiedSessionStore;
+/// use memory::UnifiedSessionStore;
 /// use std::path::Path;
 ///
 /// let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
@@ -71,6 +71,17 @@ impl UnifiedSessionStore {
         Ok(Self {
             inner: Arc::new(Mutex::new(store)),
         })
+    }
+
+    /// Open a session database from the storage registry session handle.
+    pub fn open_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
+        if handle.backend != storage::StorageBackendKind::Sqlite {
+            return Err(crate::error::MemoryError::Store(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        Self::open(&handle.path)
     }
 
     /// Open an in-memory session database (useful for testing).

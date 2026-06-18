@@ -48,8 +48,8 @@ if [[ "$CLEAN_TMP" -eq 1 ]]; then
     -name 'cowd-context-*' -o \
     -name 'cowd-feishu-*' -o \
     -name 'cowd-l4-*' -o \
-    -name 'cowd-memory-*' -o \
-    -name 'cowd-memory-panel-*' -o \
+    -name 'memory-*' -o \
+    -name 'memory-panel-*' -o \
     -name 'cowd-native-*' -o \
     -name 'cowd-output-format-*' -o \
     -name 'cowd-resource-*' -o \
@@ -57,7 +57,7 @@ if [[ "$CLEAN_TMP" -eq 1 ]]; then
     -name 'cowd-sqlite-*' -o \
     -name 'cowd-state-*' -o \
     -name 'cowd-status-*' -o \
-    -name 'cowd-storage-*' -o \
+    -name 'storage-*' -o \
     -name 'cowd-tui-*' -o \
     -name 'cowd-webui-*' -o \
     -name 'cowd_*' \

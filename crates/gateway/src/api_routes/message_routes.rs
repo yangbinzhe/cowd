@@ -22,7 +22,7 @@ use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
-use crate::gateway_services::SessionService;
+use crate::services::SessionService;
 use crate::task_kernel::TaskRecord;
 
 use super::{AppState, ErrorResponse};
@@ -211,7 +211,7 @@ async fn send_message(
     let event_bus = state.event_bus();
     let run_id = uuid::Uuid::new_v4().to_string();
     let run_started_at_ms = current_time_ms();
-    let active_task = state.task_kernel.current();
+    let active_task = state.services.task.current().unwrap_or_default();
     let run_profile = if active_task.as_ref().is_some_and(|task| task.yolo_mode) {
         ContextProfile::YoloGoal
     } else {

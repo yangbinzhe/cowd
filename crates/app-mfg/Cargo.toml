@@ -1,5 +1,5 @@
 [package]
-name = "cowd-app-mfg"
+name = "app-mfg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ publish.workspace = true
 chrono.workspace = true
 matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
+storage = { path = "../storage" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true

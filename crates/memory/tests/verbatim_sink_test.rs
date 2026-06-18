@@ -3,8 +3,8 @@
 //! Tests that verbatim entries survive intact, never pass through compression,
 //! and remain searchable after restart.
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
@@ -55,7 +55,7 @@ async fn test_verbatim_sink_stores_and_retrieves() {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     };
     let entry_id = entry.id;
     mgr.remember(entry).await.unwrap();
@@ -102,7 +102,7 @@ async fn test_verbatim_survives_restart() {
             scope: MemoryScope::default(),
             session_id: None,
             source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+            visibility: memory::AgentVisibility::default(),
         };
         mgr.remember(entry).await.unwrap();
     }

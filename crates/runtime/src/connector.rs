@@ -568,6 +568,13 @@ impl SqliteResourceDirectory {
         Self::from_connection(connection)
     }
 
+    pub fn open_storage_handle(handle: &storage::StorageHandle) -> rusqlite::Result<Self> {
+        let connection = storage::SqliteConnectionFactory::default()
+            .open_handle(handle)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        Self::from_connection(connection)
+    }
+
     pub fn in_memory() -> rusqlite::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }

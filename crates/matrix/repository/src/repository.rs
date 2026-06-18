@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use storage::StorageLayout;
+use storage::{StorageHandle, StorageLayout, StorageRegistry};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,16 +14,17 @@ pub enum MatrixRepositoryError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixRepositoryConfig {
-    pub db_path: PathBuf,
+    pub handle: StorageHandle,
 }
 
 impl MatrixRepositoryConfig {
     pub fn from_storage_layout(layout: &StorageLayout) -> Result<Self, MatrixRepositoryError> {
-        let db_path = layout
-            .sqlite_path("matrix")
-            .ok_or_else(|| MatrixRepositoryError::MissingHandle("matrix".to_string()))?
-            .to_path_buf();
-        Ok(Self { db_path })
+        let registry = StorageRegistry::from_layout(layout.clone());
+        let handle = registry
+            .sqlite_handle("matrix")
+            .map_err(|_| MatrixRepositoryError::MissingHandle("matrix".to_string()))?
+            .clone();
+        Ok(Self { handle })
     }
 
     pub fn from_config_home(config_home: impl AsRef<Path>) -> Result<Self, MatrixRepositoryError> {
@@ -51,18 +52,23 @@ impl MatrixRepositoryHandle {
             config_home,
         )?))
     }
+
+    pub fn storage_handle(&self) -> &StorageHandle {
+        &self.config.handle
+    }
 }
 
 impl MatrixRepository for MatrixRepositoryHandle {
     fn db_path(&self) -> &Path {
-        &self.config.db_path
+        &self.config.handle.path
     }
 
     fn health_projection(&self) -> Result<serde_json::Value, MatrixRepositoryError> {
         Ok(serde_json::json!({
-            "db_path": self.config.db_path,
+            "db_path": self.config.handle.path,
             "backend": "sqlite",
-            "owner": "matrix",
+            "owner": self.config.handle.owner,
+            "storage_domain": self.config.handle.domain,
         }))
     }
 }

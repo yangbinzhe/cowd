@@ -5,8 +5,9 @@ use std::{
 };
 
 use runtime::{AgentNodeStatus, AgentRunGraph, ReviewVerdict};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use storage::{SqliteConnectionFactory, StorageHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,16 +113,29 @@ struct TaskStore {
 #[derive(Debug, Clone)]
 pub(crate) struct TaskKernel {
     path: PathBuf,
+    storage_handle: Option<StorageHandle>,
     store: Arc<Mutex<TaskStore>>,
 }
 
 impl TaskKernel {
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
         let path = normalize_task_db_path(path);
-        ensure_schema(&path)?;
-        let store = load_store(&path)?;
+        ensure_schema_path(&path)?;
+        let store = load_store_path(&path)?;
         Ok(Self {
             path,
+            storage_handle: None,
+            store: Arc::new(Mutex::new(store)),
+        })
+    }
+
+    pub(crate) fn open_storage_handle(handle: &StorageHandle) -> Result<Self, String> {
+        let path = normalize_task_db_path(handle.path.clone());
+        ensure_schema_handle(handle)?;
+        let store = load_store_handle(handle)?;
+        Ok(Self {
+            path,
+            storage_handle: Some(handle.clone()),
             store: Arc::new(Mutex::new(store)),
         })
     }
@@ -526,7 +540,11 @@ impl TaskKernel {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        ensure_schema(&self.path)?;
+        if let Some(handle) = &self.storage_handle {
+            ensure_schema_handle(handle)?;
+        } else {
+            ensure_schema_path(&self.path)?;
+        }
         let store = {
             let store = self
                 .store
@@ -534,7 +552,13 @@ impl TaskKernel {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.tasks.clone()
         };
-        let mut conn = Connection::open(&self.path).map_err(|e| e.to_string())?;
+        let mut conn = if let Some(handle) = &self.storage_handle {
+            SqliteConnectionFactory::default()
+                .open_handle(handle)
+                .map_err(|e| e.to_string())?
+        } else {
+            open_task_connection_path(&self.path)?
+        };
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM tasks", [])
             .map_err(|e| e.to_string())?;
@@ -568,11 +592,25 @@ fn normalize_task_db_path(path: PathBuf) -> PathBuf {
     path
 }
 
-fn ensure_schema(path: &PathBuf) -> Result<(), String> {
+fn ensure_schema_path(path: &PathBuf) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    let conn = open_task_connection_path(path)?;
+    ensure_schema_connection(&conn)
+}
+
+fn ensure_schema_handle(handle: &StorageHandle) -> Result<(), String> {
+    if let Some(parent) = handle.path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let conn = SqliteConnectionFactory::default()
+        .open_handle(handle)
+        .map_err(|e| e.to_string())?;
+    ensure_schema_connection(&conn)
+}
+
+fn ensure_schema_connection(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY NOT NULL,
@@ -587,8 +625,19 @@ fn ensure_schema(path: &PathBuf) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn load_store(path: &PathBuf) -> Result<TaskStore, String> {
-    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+fn load_store_path(path: &PathBuf) -> Result<TaskStore, String> {
+    let conn = open_task_connection_path(path)?;
+    load_store_connection(&conn)
+}
+
+fn load_store_handle(handle: &StorageHandle) -> Result<TaskStore, String> {
+    let conn = SqliteConnectionFactory::default()
+        .open_handle(handle)
+        .map_err(|e| e.to_string())?;
+    load_store_connection(&conn)
+}
+
+fn load_store_connection(conn: &rusqlite::Connection) -> Result<TaskStore, String> {
     let mut stmt = conn
         .prepare("SELECT record_json FROM tasks ORDER BY created_at_ms ASC, id ASC")
         .map_err(|e| e.to_string())?;
@@ -601,6 +650,12 @@ fn load_store(path: &PathBuf) -> Result<TaskStore, String> {
         tasks.push(serde_json::from_str::<TaskRecord>(&raw).map_err(|e| e.to_string())?);
     }
     Ok(TaskStore { tasks })
+}
+
+fn open_task_connection_path(path: &PathBuf) -> Result<rusqlite::Connection, String> {
+    SqliteConnectionFactory::default()
+        .open(path)
+        .map_err(|e| e.to_string())
 }
 
 fn now_ms() -> u64 {

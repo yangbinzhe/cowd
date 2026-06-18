@@ -3,8 +3,8 @@
 //! T6: Verifies that embed_batch retries on transient HTTP failures
 //! with exponential backoff.
 
-use cowd_memory::config::VectorConfig;
-use cowd_memory::EmbeddingClient;
+use memory::config::VectorConfig;
+use memory::EmbeddingClient;
 
 #[tokio::test]
 async fn embedding_retries_on_transient_http_failure() {

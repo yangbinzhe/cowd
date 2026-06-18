@@ -1,9 +1,9 @@
 //! Cross-agent conflict detection and arbitration tests
 //! Verifies Phase 2 features of the 3D memory framework
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::project_scope::MemoryScope;
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::project_scope::MemoryScope;
+use memory::{
     AgentVisibility, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
     MemoryLayer, MemorySource, Priority,
 };

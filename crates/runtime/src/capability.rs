@@ -104,7 +104,7 @@ impl CowdCapabilityRegistry {
                     "cowd.memory.runtime",
                     "Memory Runtime",
                     CowdCapabilityKind::Memory,
-                    "cowd-memory",
+                    "memory",
                     "Long-term recall, cognitive layers, links and maintenance state.",
                     &["read:memory", "write:memory"],
                 ),
@@ -285,7 +285,7 @@ mod tests {
             !capability.id.contains("matrix")
                 && !capability.id.starts_with("mfg.")
                 && capability.owner_module != "matrix"
-                && capability.owner_module != "cowd-app-mfg"
+                && capability.owner_module != "app-mfg"
         }));
     }
 

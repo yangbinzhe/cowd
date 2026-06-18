@@ -8,8 +8,8 @@
 //! Currently KG is in-memory only. After GREEN implementation, entity
 //! data will be persisted alongside MemoryEntries.
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
@@ -75,7 +75,7 @@ async fn test_kg_survives_restart() {
             scope: MemoryScope::default(),
             session_id: None,
             source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+            visibility: memory::AgentVisibility::default(),
         };
         mgr.remember(entry_rust)
             .await
@@ -101,7 +101,7 @@ async fn test_kg_survives_restart() {
             scope: MemoryScope::default(),
             session_id: None,
             source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+            visibility: memory::AgentVisibility::default(),
         };
         mgr.remember(entry_cowd)
             .await
@@ -200,7 +200,7 @@ async fn test_kg_entities_restored_after_reboot() {
                 scope: MemoryScope::default(),
                 session_id: None,
                 source_agent: None,
-                visibility: cowd_memory::AgentVisibility::default(),
+                visibility: memory::AgentVisibility::default(),
             };
             mgr.remember(entry).await.expect("Should remember entry");
         }
@@ -295,7 +295,7 @@ async fn test_kg_triples_restored_with_correct_confidence() {
                 scope: MemoryScope::default(),
                 session_id: None,
                 source_agent: None,
-                visibility: cowd_memory::AgentVisibility::default(),
+                visibility: memory::AgentVisibility::default(),
             };
             mgr.remember(entry).await.expect("Should remember entry");
         }

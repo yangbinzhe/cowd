@@ -12,7 +12,7 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use cowd_memory::{MemoryOrchestrator, MemoryConfig};
+//! use memory::{MemoryOrchestrator, MemoryConfig};
 //!
 //! #[tokio::main]
 //! async fn main() {

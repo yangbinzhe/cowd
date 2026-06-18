@@ -37,7 +37,7 @@ tracing = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
-cowd-memory = { path = "crates/memory" }
+memory = { path = "crates/memory" }
 gateway = { path = "crates/gateway" }
 
 [workspace.lints.rust]

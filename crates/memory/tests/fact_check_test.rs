@@ -7,8 +7,8 @@
 //! Current state: FactChecker is designed but NOT wired into remember().
 //! These tests SHOULD FAIL until the GREEN implementation is complete.
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer,
     MemoryScope, MemorySource, Priority,
 };
@@ -42,7 +42,7 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 // =========================================================================
 #[test]
 fn test_fact_checker_detects_contradiction() {
-    use cowd_memory::temporal_graph::{EntityFacts, Triple};
+    use memory::temporal_graph::{EntityFacts, Triple};
 
     let mut checker = FactChecker::new();
     let mut facts = EntityFacts::default();
@@ -127,7 +127,7 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     };
     mgr.remember(identity_entry)
         .await
@@ -155,7 +155,7 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     };
 
     let original_confidence = contradictory_entry.confidence;
@@ -232,7 +232,7 @@ async fn test_remember_accepts_consistent_entry() {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     };
 
     mgr.remember(entry).await.expect("Should remember entry");

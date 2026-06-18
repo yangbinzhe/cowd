@@ -1,10 +1,10 @@
 //! Performance benchmarks for the memory system (Task 22-23).
 //!
 //! Tests key operations with timing assertions to catch regression.
-//! Run with: cargo test --release -p cowd-memory --test performance_bench -- --nocapture
+//! Run with: cargo test --release -p memory --test performance_bench -- --nocapture
 
-use cowd_memory::config::{BudgetConfig, StoreConfig, TuningConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig, TuningConfig};
+use memory::{
     CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
@@ -62,7 +62,7 @@ fn test_entry(content: &str) -> MemoryEntry {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     }
 }
 

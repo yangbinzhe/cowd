@@ -15,11 +15,11 @@ provider = { path = "../provider" }
 storage = { path = "../storage" }
 approval = { path = "../approval" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
-memory = { package = "cowd-memory", path = "../memory" }
+memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 command-contract = { path = "../command/contract" }
 command-service = { path = "../command/service" }
-cowd-app-mfg = { path = "../app-mfg" }
+app-mfg = { path = "../app-mfg" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 libc = "0.2"

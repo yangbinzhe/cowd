@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     AgentVisibility, CognitiveContextManager, MemoryAtomView, MemoryCategory, MemoryConfig,
     MemoryHealth, MemoryInformationState, MemoryKernel, MemoryLayer, MemoryLayerView,
     MemoryLinkKind, MemoryPacketRole, MemoryPrimitive, MemoryScope, MemorySource, MemoryState,
@@ -28,8 +28,8 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     }
 }
 
-fn entry(layer: MemoryLayer, source: MemorySource, title: &str) -> cowd_memory::MemoryEntry {
-    cowd_memory::MemoryEntry {
+fn entry(layer: MemoryLayer, source: MemorySource, title: &str) -> memory::MemoryEntry {
+    memory::MemoryEntry {
         id: uuid::Uuid::new_v4(),
         layer,
         category: MemoryCategory::Reference,
@@ -116,7 +116,7 @@ fn memory_health_reports_degradation_state() {
     assert!(!health.is_degraded());
     health
         .degraded
-        .push(cowd_memory::MemoryDegradation::VectorUnavailable);
+        .push(memory::MemoryDegradation::VectorUnavailable);
     assert!(health.is_degraded());
 }
 
@@ -403,9 +403,9 @@ async fn memory_links_unify_relation_session_agent_and_tag_edges() {
         MemorySource::UserExplicit,
         "source summary",
     );
-    source.relations.push(cowd_memory::types::Relation {
+    source.relations.push(memory::types::Relation {
         target_id,
-        kind: cowd_memory::types::RelationKind::Summarizes,
+        kind: memory::types::RelationKind::Summarizes,
         strength: 0.9,
         temporal: None,
         entity: None,
@@ -451,9 +451,9 @@ async fn path_recall_finds_related_decision() {
     );
     let decision_id = decision.id;
     let mut evidence = entry(MemoryLayer::L3, MemorySource::Import, "linked evidence");
-    evidence.relations.push(cowd_memory::types::Relation {
+    evidence.relations.push(memory::types::Relation {
         target_id: decision_id,
-        kind: cowd_memory::types::RelationKind::DependsOn,
+        kind: memory::types::RelationKind::DependsOn,
         strength: 0.8,
         temporal: None,
         entity: None,
@@ -828,8 +828,8 @@ async fn memory_kernel_post_turn_preserves_turn_success() {
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx = MemoryTurnContext::new("session-post-turn", "agent-primary");
     let mut messages = vec![
-        cowd_memory::types::Message::user("remember that Cowd memory must be explainable"),
-        cowd_memory::types::Message::assistant("acknowledged"),
+        memory::types::Message::user("remember that Cowd memory must be explainable"),
+        memory::types::Message::assistant("acknowledged"),
     ];
 
     let result = kernel.post_turn(&ctx, &mut messages).await;

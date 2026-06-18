@@ -3513,7 +3513,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
 
     let mem = feature_config.memory();
     let storage_layout =
-        cowd_storage::StorageLayout::default_for_config_home(crate::cowd_dirs::config_home_dir());
+        storage::StorageLayout::default_for_config_home(crate::cowd_dirs::config_home_dir());
     let (sqlite_path, blob_dir) = if let Some(store_path) = mem.store_path.as_ref() {
         (store_path.join("memory.db"), store_path.join("blobs"))
     } else {

@@ -19,7 +19,7 @@ fn manifest_dependencies(source: &str) -> &str {
 #[test]
 fn daemon_module_is_only_a_runtime_host_transition_shim() {
     let source = read_repo("crates/gateway/src/daemon/mod.rs");
-    assert!(source.contains("status: reviewed_0.9.305"));
+    assert!(source.contains("status: 0618_final_boundary"));
     assert!(source.contains("pub(crate) use crate::runtime_host::*;"));
     assert!(!source.contains("fn "));
     assert!(!source.contains("struct "));

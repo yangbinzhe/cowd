@@ -11,8 +11,8 @@
 //! - scope isolation
 //! - peer perception (each agent can see prior agents' L4 entries)
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     AgentVisibility, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
     MemoryLayer, MemoryScope, MemorySource, Priority,
 };

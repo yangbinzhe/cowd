@@ -4,8 +4,8 @@
 //! Verifies that memory entries, KG entities, and compression summaries all
 //! survive the full lifecycle.
 
-use cowd_memory::config::{BudgetConfig, StoreConfig};
-use cowd_memory::{
+use memory::config::{BudgetConfig, StoreConfig};
+use memory::{
     CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
@@ -50,7 +50,7 @@ fn entry(content: &str, layer: MemoryLayer) -> MemoryEntry {
         scope: MemoryScope::default(),
         session_id: None,
         source_agent: None,
-        visibility: cowd_memory::AgentVisibility::default(),
+        visibility: memory::AgentVisibility::default(),
     }
 }
 
@@ -166,7 +166,7 @@ async fn test_e2e_memory_lifecycle() {
             scope: MemoryScope::default(),
             session_id: None,
             source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+            visibility: memory::AgentVisibility::default(),
         };
         mgr.remember(identity).await.unwrap();
 
@@ -191,7 +191,7 @@ async fn test_e2e_memory_lifecycle() {
             scope: MemoryScope::default(),
             session_id: None,
             source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+            visibility: memory::AgentVisibility::default(),
         };
         let contradictory_id = contradictory.id;
         mgr.remember(contradictory).await.unwrap();

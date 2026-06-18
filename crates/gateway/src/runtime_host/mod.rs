@@ -499,8 +499,8 @@ async fn handle_platform_inbound_message(
         .map_err(|error| format!("send response failed: {error}"))?;
 
     if let (Some(store), Some(runtime_entry)) = (
-        app_state.session_kernel.unified_store(),
-        app_state.session_kernel.active_runtime(&session_id),
+        app_state.services.session.unified_store(),
+        app_state.services.session.active_runtime(&session_id),
     ) {
         let runtime = runtime_entry.lock().await;
         let session = runtime.session();
@@ -522,13 +522,13 @@ async fn ensure_platform_session_runtime(
     app_state: &api_routes::AppState,
     session_id: &str,
 ) -> Result<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>, String> {
-    if let Some(entry) = app_state.session_kernel.active_runtime(session_id) {
+    if let Some(entry) = app_state.services.session.active_runtime(session_id) {
         return Ok(entry);
     }
 
     let model = default_platform_session_model(app_state);
     let session = runtime::Session::new();
-    let runtime = if let Some(store) = app_state.session_kernel.unified_store() {
+    let runtime = if let Some(store) = app_state.services.session.unified_store() {
         crate::build_runtime_with_session_store(
             store.clone(),
             session,
@@ -559,11 +559,12 @@ async fn ensure_platform_session_runtime(
     .map_err(|error| format!("failed to build platform session runtime: {error}"))?;
 
     app_state
-        .session_kernel
+        .services
+        .session
         .register_runtime(session_id.to_string(), runtime)
         .map_err(|error| format!("failed to register platform session runtime: {error}"))?;
 
-    if app_state.session_kernel.unified_store().is_some() {
+    if app_state.services.session.unified_store().is_some() {
         let mut record = crate::api_routes::new_api_session_record(session_id, Some(model));
         record.platform = "platform".to_string();
         record.chat_id = session_id.to_string();
@@ -575,7 +576,8 @@ async fn ensure_platform_session_runtime(
             .to_string(),
         );
         if let Err(error) = app_state
-            .session_kernel
+            .services
+            .session
             .upsert_stored_session(&record)
             .await
         {
@@ -584,7 +586,8 @@ async fn ensure_platform_session_runtime(
     }
 
     app_state
-        .session_kernel
+        .services
+        .session
         .active_runtime(session_id)
         .ok_or_else(|| "registered platform runtime missing".to_string())
 }
@@ -767,11 +770,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let approval_repository =
         approval::FileApprovalRepository::from_storage_layout(&storage_config.layout)
             .map_err(|e| format!("failed to initialize approval repository: {e}"))?;
-    let task_db_path = storage_config
-        .layout
-        .sqlite_path("tasks")
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| approval_dir.join("tasks.db"));
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
             runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
@@ -795,7 +793,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     let profile_id = profile_manager.active_id();
     let task_kernel = Arc::new(
-        crate::task_kernel::TaskKernel::open(task_db_path)
+        crate::gateway_storage::GatewayStorage::open_task_kernel(&approval_dir)
             .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
     );
 
@@ -828,7 +826,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     emit_startup_diagnostics(&startup_diagnostics);
 
     let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
-    let gateway_services = Arc::new(crate::gateway_services::GatewayServices::new(
+    let services = Arc::new(crate::services::GatewayServices::new(
         Arc::new(RuntimeService::new(
             sessions.clone(),
             lease_registry.clone(),
@@ -836,13 +834,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             lifecycle_kernel.clone(),
             started_at,
         )),
+        task_kernel.clone(),
         cognitive.clone(),
         approval_gate.clone(),
         approval_repository,
     ));
 
     let app_state = Arc::new(api_routes::AppState {
-        session_kernel: session_kernel.clone(),
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         platform_runtime: Some(platform_runtime.clone()),
@@ -854,8 +852,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         config_home: approval_dir.clone(),
         profile_id,
         profile_manager,
-        task_kernel,
-        services: gateway_services,
+        services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
 

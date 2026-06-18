@@ -22,8 +22,6 @@ where it must not be used as an internal Rust boundary name.
 | `.cowd` | project/user config directory | config | external-stable |
 | `cowd-serve.pid` | local process status file | gateway | external-stable |
 | `cowd-webui` | external WebUI repository/package name | webui | external-stable |
-| `cowd-memory` | package name retained for API compatibility | memory | owned-boundary-reviewed |
-| `cowd-app-mfg` | package name retained for MFG app compatibility | app-mfg | owned-boundary-reviewed |
 | `cowd_capabilities` | HTTP response field | gateway API | external-stable |
 | `cowd_projection` | HTTP response field | gateway API | external-stable |
 | `cowd_surfaces` | HTTP response field | gateway API | external-stable |
@@ -35,14 +33,12 @@ where it must not be used as an internal Rust boundary name.
 |---|---|---|---|---|
 | `runtime::cowd_dirs` | Rust module | runtime | owned-boundary-reviewed | directory helpers expose stable external paths |
 | `runtime::cowd_event` | Rust module | runtime | owned-boundary-reviewed | event DTO names are part of the Gateway/TUI SSE contract |
-| `cowd_storage` | Rust dependency alias | runtime | owned-boundary-reviewed | dependency alias avoids crate-name conflict |
-| `cowd_memory` | Rust crate import | memory | owned-boundary-reviewed | external package import retained for API compatibility |
 | `crates/gateway` | crate directory | entrypoints | owned-boundary-reviewed | implementation crate retained as `gateway` while entry crates own user-facing boundaries |
 
 ## Forbidden For New Code
 
 - `cowd_app_mfg::`
-- `cowd_memory::` outside memory crate tests or migration allowlist
+- `cowd_memory::`
 - new modules named `cowd_*`
 - new service names prefixed with `Cowd` when the enclosing project context is
   already cowd

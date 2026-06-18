@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use cowd_memory::config::MemoryConfig;
-use cowd_memory::store::{sqlite::SqliteStore, MemoryStore};
-use cowd_memory::{
+use memory::config::MemoryConfig;
+use memory::store::{sqlite::SqliteStore, MemoryStore};
+use memory::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemoryOrchestrator, MemoryScope,
     MemorySource, Priority,
 };

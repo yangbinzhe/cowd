@@ -76,9 +76,11 @@ fn default_task_artifact_kind() -> String {
 }
 
 async fn tasks_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let tasks = state.services.task.list_records().unwrap_or_default();
+    let current = state.services.task.current().unwrap_or_default();
     Json(serde_json::json!({
-        "tasks": state.task_kernel.list(),
-        "current": state.task_kernel.current(),
+        "tasks": tasks,
+        "current": current,
     }))
 }
 
@@ -87,7 +89,8 @@ async fn start_task_handler(
     Json(body): Json<StartTaskRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .start_goal(body.objective, body.yolo_mode)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     append_task_runtime_event(&state, &task, "task.started")
@@ -102,7 +105,8 @@ async fn start_task_phase_handler(
     Json(body): Json<StartTaskPhaseRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .start_phase(
             &id,
             body.name,
@@ -124,7 +128,8 @@ async fn record_task_phase_artifact_handler(
     Json(body): Json<TaskPhaseArtifactRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .record_phase_artifact(&id, &phase_id, body.kind, body.label, body.value)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     append_task_runtime_event(&state, &task, "task.phase.artifact.recorded")
@@ -139,7 +144,8 @@ async fn review_task_phase_handler(
     Json(body): Json<TaskPhaseReviewRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .review_phase(&id, &phase_id, body.result, body.completed)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     append_task_runtime_event(&state, &task, "task.phase.reviewed")
@@ -153,7 +159,8 @@ async fn cancel_task_handler(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .transition(&id, TaskStatus::Cancelled, None, "cancelled by user")
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
     append_task_runtime_event(&state, &task, "task.cancelled")
@@ -167,7 +174,8 @@ async fn complete_task_handler(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .transition(&id, TaskStatus::Completed, None, "accepted")
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
     append_task_runtime_event(&state, &task, "task.completed")
@@ -182,7 +190,8 @@ async fn record_task_failure_handler(
     Json(body): Json<TaskFailureRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let task = state
-        .task_kernel
+        .services
+        .task
         .record_failure(&id, body.reason)
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
     let kind = if task.status == TaskStatus::Blocked {

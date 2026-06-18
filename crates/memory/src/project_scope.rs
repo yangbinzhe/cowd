@@ -45,7 +45,7 @@ impl MemoryScope {
     /// # Examples
     ///
     /// ```
-    /// use cowd_memory::project_scope::MemoryScope;
+    /// use memory::project_scope::MemoryScope;
     ///
     /// assert_eq!(MemoryScope::Global.scope_key(), "global");
     /// assert_eq!(MemoryScope::Project("abc".into()).scope_key(), "project_abc");
@@ -142,7 +142,7 @@ struct Inner {
 ///
 /// ```rust,no_run
 /// use std::path::PathBuf;
-/// use cowd_memory::project_scope::ProjectScopeManager;
+/// use memory::project_scope::ProjectScopeManager;
 ///
 /// let manager = ProjectScopeManager::new(PathBuf::from("memory.db")).unwrap();
 /// let pid = manager.register_project(std::path::Path::new("/my/project")).unwrap();

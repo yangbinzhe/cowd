@@ -740,7 +740,7 @@ pub struct DestructivePatternDetector {
 impl DestructivePatternDetector {
     /// Create a new detector with all built-in patterns
     pub fn new(config_dir: PathBuf) -> Self {
-        let storage_layout = cowd_storage::StorageLayout::default_for_config_home(&config_dir);
+        let storage_layout = storage::StorageLayout::default_for_config_home(&config_dir);
         let approval_repository = FileApprovalRepository::from_storage_layout(&storage_layout)
             .unwrap_or_else(|_| {
                 FileApprovalRepository::new(

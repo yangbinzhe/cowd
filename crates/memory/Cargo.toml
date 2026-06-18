@@ -1,5 +1,5 @@
 [package]
-name = "cowd-memory"
+name = "memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 parking_lot = "0.12"
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
+storage = { path = "../storage" }
 walkdir = "2"
 tempfile = "3"
 regex = "1"

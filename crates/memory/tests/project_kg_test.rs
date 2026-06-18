@@ -3,8 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cowd_memory::entity::EntityType;
-use cowd_memory::project_scope::{build_project_kg, ProjectScopeManager};
+use memory::entity::EntityType;
+use memory::project_scope::{build_project_kg, ProjectScopeManager};
 
 fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     let path = dir.join(name);
@@ -1179,8 +1179,8 @@ fn test_is_kg_stale_unknown_project() {
 
 #[test]
 fn test_unified_scan_produces_both_entities_and_symbols() {
-    use cowd_memory::code_indexer::CodeIndexer;
-    use cowd_memory::project_scope::unified_scan;
+    use memory::code_indexer::CodeIndexer;
+    use memory::project_scope::unified_scan;
 
     let tmp = tempfile::TempDir::new().unwrap();
 
@@ -1249,13 +1249,13 @@ pub enum AuthError {
     let has_calls = result
         .edges
         .iter()
-        .any(|e| e.edge_type == cowd_memory::code_indexer::SymbolEdgeType::Calls);
+        .any(|e| e.edge_type == memory::code_indexer::SymbolEdgeType::Calls);
     assert!(has_calls, "should find call edges between functions");
 }
 
 #[test]
 fn test_regex_cached_on_second_call() {
-    use cowd_memory::project_scope::unified_scan;
+    use memory::project_scope::unified_scan;
     use std::time::Instant;
 
     let tmp = tempfile::TempDir::new().unwrap();

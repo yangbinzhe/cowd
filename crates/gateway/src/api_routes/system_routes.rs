@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Path,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -13,15 +8,9 @@ use axum::{
     Json, Router,
 };
 use command_contract::CommandSurface;
-use runtime::{
-    classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
-    ToolSafetyCategory,
-};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::{api_error, AppState, ErrorResponse};
-
-static TOOL_CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -137,20 +126,6 @@ struct ToolIntentPlanRequest {
 #[derive(Deserialize)]
 struct ToolContextFanoutPlanRequest {
     prompt: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ToolOperationReceipt {
-    request_id: String,
-    tool_name: String,
-    mode: String,
-    risk: String,
-    status: String,
-    changed_refs: Vec<String>,
-    audit_ref: String,
-    data: serde_json::Value,
-    warnings: Vec<String>,
-    next_actions: Vec<String>,
 }
 
 async fn usage_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -304,26 +279,12 @@ fn accumulate_usage_bucket(
 }
 
 async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let tools: Vec<serde_json::Value> = state
-        .tool_registry
-        .definitions(None)
-        .iter()
-        .map(|tool| {
-            let profile = tool_execution_profile(&tool.name);
-            serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "enabled": true,
-                "safety_category": profile.safety_category,
-                "cache_policy": profile.cache_policy,
-                "prepared_readonly_supported": profile.prepared_readonly_supported,
-                "max_concurrency": profile.max_concurrency,
-                "timeout_secs": profile.timeout_secs,
-                "managed_tags": managed_tool_tags(&tool.name),
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "tools": tools, "count": tools.len() }))
+    Json(
+        state
+            .services
+            .system
+            .tool_catalog(state.tool_registry.definitions(None)),
+    )
 }
 
 async fn tool_execute_handler(
@@ -340,27 +301,37 @@ async fn tool_execute_handler(
             ),
         ));
     }
-    let input = ensure_tool_input_within_workspace(&state.workspace_root, body.input)?;
-    let receipt = execute_tool_receipt(
-        &state,
-        &tool_name,
-        input,
-        body.mode.unwrap_or_else(|| "read_only".to_string()),
-        "low",
-    )?;
+    let input = ensure_tool_input_within_workspace(&state, &state.workspace_root, body.input)?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            &tool_name,
+            input,
+            body.mode.unwrap_or_else(|| "read_only".to_string()),
+            "low",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
 async fn tool_cache_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = execute_tool_receipt(
-        &state,
-        "tool_cache_stats",
-        serde_json::json!({}),
-        "stats",
-        "low",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "tool_cache_stats",
+            serde_json::json!({}),
+            "stats",
+            "low",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -374,7 +345,7 @@ async fn tool_batch_readonly_handler(
             .and_then(serde_json::Value::as_str)
             .map(normalize_tool_name)
             .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "batch call name is required"))?;
-        if !is_prepared_readonly_tool(&name) {
+        if !state.services.system.is_prepared_readonly_tool(&name) {
             return Err(api_error(
                 StatusCode::FORBIDDEN,
                 format!("tool_batch_readonly rejects non read-only tool `{name}`"),
@@ -384,18 +355,23 @@ async fn tool_batch_readonly_handler(
             .get("input")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        ensure_tool_input_within_workspace(&state.workspace_root, input)?;
+        ensure_tool_input_within_workspace(&state, &state.workspace_root, input)?;
     }
-    let receipt = execute_tool_receipt(
-        &state,
-        "tool_batch_readonly",
-        serde_json::json!({
-            "calls": body.calls,
-            "max_concurrency": body.max_concurrency,
-        }),
-        "read_only_batch",
-        "low",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "tool_batch_readonly",
+            serde_json::json!({
+                "calls": body.calls,
+                "max_concurrency": body.max_concurrency,
+            }),
+            "read_only_batch",
+            "low",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -403,14 +379,19 @@ async fn tool_mutation_preview_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolMutationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let edits = ensure_edits_within_workspace(&state.workspace_root, body.edits)?;
-    let receipt = execute_tool_receipt(
-        &state,
-        "mutation_preview",
-        serde_json::json!({ "edits": edits }),
-        "preview",
-        "medium",
-    )?;
+    let edits = ensure_edits_within_workspace(&state, &state.workspace_root, body.edits)?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "mutation_preview",
+            serde_json::json!({ "edits": edits }),
+            "preview",
+            "medium",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -418,30 +399,40 @@ async fn tool_mutation_apply_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolMutationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let edits = ensure_edits_within_workspace(&state.workspace_root, body.edits)?;
-    let receipt = execute_tool_receipt(
-        &state,
-        "apply_patch_transaction",
-        serde_json::json!({
-            "edits": edits,
-            "expected_hashes": body.expected_hashes,
-        }),
-        "transaction",
-        "high",
-    )?;
+    let edits = ensure_edits_within_workspace(&state, &state.workspace_root, body.edits)?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "apply_patch_transaction",
+            serde_json::json!({
+                "edits": edits,
+                "expected_hashes": body.expected_hashes,
+            }),
+            "transaction",
+            "high",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
 async fn tool_checkpoints_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = execute_tool_receipt(
-        &state,
-        "checkpoint_list",
-        serde_json::json!({}),
-        "read_only",
-        "low",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "checkpoint_list",
+            serde_json::json!({}),
+            "read_only",
+            "low",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -449,13 +440,18 @@ async fn tool_checkpoint_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolCheckpointCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = execute_tool_receipt(
-        &state,
-        "checkpoint_create",
-        serde_json::json!({ "label": body.label }),
-        "checkpoint",
-        "medium",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "checkpoint_create",
+            serde_json::json!({ "label": body.label }),
+            "checkpoint",
+            "medium",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -463,13 +459,18 @@ async fn tool_checkpoint_diff_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = execute_tool_receipt(
-        &state,
-        "checkpoint_diff",
-        serde_json::json!({ "id": id }),
-        "read_only",
-        "low",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "checkpoint_diff",
+            serde_json::json!({ "id": id }),
+            "read_only",
+            "low",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
@@ -477,43 +478,40 @@ async fn tool_checkpoint_restore_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = execute_tool_receipt(
-        &state,
-        "checkpoint_restore",
-        serde_json::json!({ "id": id }),
-        "restore",
-        "high",
-    )?;
+    let receipt = state
+        .services
+        .system
+        .execute_tool_receipt(
+            &state.tool_registry,
+            &state.workspace_root,
+            "checkpoint_restore",
+            serde_json::json!({ "id": id }),
+            "restore",
+            "high",
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(receipt))
 }
 
 async fn tool_intent_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolIntentPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = classify_intent(&body.prompt);
-    Ok(Json(serde_json::json!({
-        "kind": "tool.intent_plan",
-        "status": "ok",
-        "intent": plan.intent,
-        "recommended_tools": plan.recommended_tools,
-        "selected_tools": body.selected_tools,
-        "reason": plan.reason,
-        "batch_ready": plan.recommended_tools.iter().any(|tool| tool == "tool_batch_readonly"),
-    })))
+    Ok(Json(
+        state
+            .services
+            .system
+            .intent_plan(&body.prompt, body.selected_tools),
+    ))
 }
 
 async fn tool_context_fanout_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolContextFanoutPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = plan_context_fanout(&body.prompt);
-    Ok(Json(serde_json::json!({
-        "kind": "tool.context_fanout_plan",
-        "status": "ok",
-        "intent": plan.intent,
-        "calls": plan.calls,
-        "reason": plan.reason,
-        "batch_ready": plan.calls.iter().any(|call| call.name == "tool_batch_readonly"),
-    })))
+    Ok(Json(
+        state.services.system.context_fanout_plan(&body.prompt),
+    ))
 }
 
 fn normalize_tool_name(name: &str) -> String {
@@ -537,232 +535,44 @@ fn is_webui_generic_tool_allowed(tool_name: &str) -> bool {
     )
 }
 
-fn is_prepared_readonly_tool(tool_name: &str) -> bool {
-    let profile = tool_execution_profile(tool_name);
-    profile.safety_category == ToolSafetyCategory::ReadOnly && profile.prepared_readonly_supported
-}
-
-fn managed_tool_tags(tool_name: &str) -> Vec<&'static str> {
-    let normalized = normalize_tool_name(tool_name);
-    let mut tags = Vec::new();
-    if matches!(
-        normalized.as_str(),
-        "mutation_preview" | "edit_many_preview" | "patch_plan" | "apply_patch_transaction"
-    ) {
-        tags.push("mutation");
-    }
-    if normalized.starts_with("checkpoint_") {
-        tags.push("checkpoint");
-    }
-    if normalized == "tool_batch_readonly" {
-        tags.push("batch");
-    }
-    if normalized == "tool_cache_stats" {
-        tags.push("cache");
-    }
-    if tool_execution_profile(&normalized).prepared_readonly_supported {
-        tags.push("prepared");
-    }
-    tags
-}
-
 fn ensure_tool_input_within_workspace(
+    state: &AppState,
     workspace_root: &Path,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-    validate_value_paths(workspace_root, &input)?;
+    state
+        .services
+        .system
+        .validate_tool_input_paths(workspace_root, &input)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(input)
 }
 
 fn ensure_edits_within_workspace(
+    state: &AppState,
     workspace_root: &Path,
     edits: Vec<serde_json::Value>,
 ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    for edit in &edits {
-        let Some(path) = edit.get("path").and_then(serde_json::Value::as_str) else {
-            return Err(api_error(StatusCode::BAD_REQUEST, "edit path is required"));
-        };
-        validate_workspace_relative_path(workspace_root, path)?;
-    }
+    state
+        .services
+        .system
+        .validate_tool_edits(workspace_root, &edits)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(edits)
 }
 
-fn validate_value_paths(
-    workspace_root: &Path,
-    value: &serde_json::Value,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if matches!(key.as_str(), "path" | "root" | "dir") {
-                    if let Some(path) = child.as_str() {
-                        validate_workspace_relative_path(workspace_root, path)?;
-                    }
-                }
-                validate_value_paths(workspace_root, child)?;
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                validate_value_paths(workspace_root, child)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_workspace_relative_path(
-    workspace_root: &Path,
-    raw_path: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let path = Path::new(raw_path);
-    if path.is_absolute() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "absolute paths are not allowed for tool operations",
-        ));
-    }
-    let candidate = workspace_root.join(path);
-    if !candidate.starts_with(workspace_root) || raw_path.split('/').any(|part| part == "..") {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "tool path escapes workspace root",
-        ));
-    }
-    Ok(())
-}
-
-fn execute_tool_receipt(
-    state: &AppState,
-    tool_name: &str,
-    input: serde_json::Value,
-    mode: impl Into<String>,
-    risk: impl Into<String>,
-) -> Result<ToolOperationReceipt, (StatusCode, Json<ErrorResponse>)> {
-    let mode = mode.into();
-    let risk = risk.into();
-    let output = with_workspace_root(&state.workspace_root, || {
-        state
-            .tool_registry
-            .execute(tool_name, &input)
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
-    })?;
-    let data = serde_json::from_str::<serde_json::Value>(&output)
-        .unwrap_or_else(|_| serde_json::json!({ "text": output }));
-    let changed_refs = changed_refs_for_tool(tool_name, &data);
-    let status = if data.get("error").is_some() {
-        "failed"
-    } else {
-        "ok"
-    };
-    Ok(ToolOperationReceipt {
-        request_id: format!("tool-op-{}", chrono::Utc::now().timestamp_millis()),
-        tool_name: tool_name.to_string(),
-        mode,
-        risk,
-        status: status.to_string(),
-        changed_refs,
-        audit_ref: format!(
-            "tool://{tool_name}/{}",
-            chrono::Utc::now().timestamp_millis()
-        ),
-        warnings: warnings_for_tool(tool_name, &data),
-        next_actions: next_actions_for_tool(tool_name, &data),
-        data,
-    })
-}
-
-fn with_workspace_root<T>(
-    workspace_root: &Path,
-    action: impl FnOnce() -> Result<T, (StatusCode, Json<ErrorResponse>)>,
-) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
-    let lock = TOOL_CWD_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to lock tool workspace root guard: {error}"),
-        )
-    })?;
-    let previous = std::env::current_dir()
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    std::env::set_current_dir(workspace_root)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let result = action();
-    let restore = std::env::set_current_dir(previous);
-    if let Err(error) = restore {
-        return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to restore process cwd after tool operation: {error}"),
-        ));
-    }
-    result
-}
-
-fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
-    match tool_name {
-        "apply_patch_transaction" => data
-            .get("applied")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.get("path").and_then(serde_json::Value::as_str))
-            .map(|path| format!("file:{path}"))
-            .collect(),
-        "checkpoint_create" | "checkpoint_restore" => data
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(|id| vec![format!("checkpoint:{id}")])
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn warnings_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if tool_name == "checkpoint_restore" {
-        warnings.push("restore replaces workspace files from a checkpoint".to_string());
-    }
-    if data
-        .get("conflictCount")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default()
-        > 0
-    {
-        warnings.push("mutation preview contains conflicts".to_string());
-    }
-    warnings
-}
-
-fn next_actions_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
-    match tool_name {
-        "mutation_preview" | "patch_plan" | "edit_many_preview" => {
-            if data
-                .get("conflictCount")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default()
-                == 0
-            {
-                vec!["Apply transaction with expected hashes".to_string()]
-            } else {
-                vec!["Resolve conflicts before applying".to_string()]
-            }
-        }
-        "checkpoint_create" => vec!["Use checkpoint diff before restore".to_string()],
-        "checkpoint_restore" => vec!["Refresh workspace and inspect diff".to_string()],
-        _ => Vec::new(),
-    }
-}
-
 async fn config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let mut config = load_runtime_config_json(&state).unwrap_or_else(|error| {
-        serde_json::json!({
-            "error": error,
-            "model": "unknown",
-            "version": env!("CARGO_PKG_VERSION"),
-        })
-    });
-    redact_config_secrets(&mut config);
+    let config = state
+        .services
+        .system
+        .redacted_runtime_config_json(&state.workspace_root, &state.config_home)
+        .unwrap_or_else(|error| {
+            serde_json::json!({
+                "error": error,
+                "model": "unknown",
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        });
     Json(config)
 }
 
@@ -781,7 +591,13 @@ async fn update_config_handler(
             "model is required for config update",
         ));
     };
-    let providers = load_runtime_config(&state)?.providers().clone();
+    let providers = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .providers()
+        .clone();
     if !providers.is_empty() && providers.resolve_full(model).is_none() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -789,44 +605,34 @@ async fn update_config_handler(
         ));
     }
 
-    let path = state.config_home.join("config.yaml");
-    fs::create_dir_all(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let mut value = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        serde_yaml::from_str::<serde_yaml::Value>(&raw)
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?
-    } else {
-        serde_yaml::Value::Mapping(Default::default())
-    };
-    let mapping = value.as_mapping_mut().ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "config root must be a mapping before it can be updated",
-        )
-    })?;
-    mapping.insert(
-        serde_yaml::Value::String("model".to_string()),
-        serde_yaml::Value::String(model.to_string()),
-    );
-    let rendered = serde_yaml::to_string(&value)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    fs::write(&path, rendered)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let config_path = state
+        .services
+        .system
+        .update_config_model(&state.config_home, model)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "changed": true,
-        "config_path": path.display().to_string(),
-        "config": redacted_config_json(load_runtime_config_json(&state).unwrap_or_else(|_| serde_json::json!({"model": model}))),
+        "config_path": config_path,
+        "config": state.services.system.redact_config_json(
+            state
+                .services
+                .system
+                .runtime_config_json(&state.workspace_root, &state.config_home)
+                .unwrap_or_else(|_| serde_json::json!({"model": model}))
+        ),
     })))
 }
 
 async fn config_providers_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_config = load_runtime_config(&state)?;
+    let runtime_config = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let providers = runtime_config.providers();
     let configured_model = runtime_config.model().map(str::to_string);
     let configured_model_provider = configured_model
@@ -915,15 +721,7 @@ async fn command_detail_handler(
 async fn commands_history_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let path = state.config_home.join("command_history.jsonl");
-    let entries = fs::read_to_string(path)
-        .ok()
-        .map(|raw| {
-            raw.lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let entries = state.services.system.command_history(&state.config_home);
     Json(serde_json::json!({ "history": entries, "total": entries.len() }))
 }
 
@@ -948,7 +746,10 @@ async fn commands_execute_handler(
     }
     let receipt = serde_json::to_value(receipt)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    append_command_history(&state, &receipt);
+    state
+        .services
+        .system
+        .append_command_history(&state.config_home, &receipt);
     Ok(Json(receipt))
 }
 
@@ -966,88 +767,4 @@ async fn commands_resolve_handler(
         "ok": true,
         "resolution": resolution,
     })))
-}
-
-fn append_command_history(state: &AppState, receipt: &serde_json::Value) {
-    if fs::create_dir_all(&state.config_home).is_err() {
-        return;
-    }
-    let path = state.config_home.join("command_history.jsonl");
-    let Ok(line) = serde_json::to_string(receipt) else {
-        return;
-    };
-    let mut options = fs::OpenOptions::new();
-    let _ = options
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| {
-            use std::io::Write;
-            writeln!(file, "{line}")
-        });
-}
-
-fn load_runtime_config(
-    state: &AppState,
-) -> Result<runtime::RuntimeConfig, (StatusCode, Json<ErrorResponse>)> {
-    ConfigLoader::new(&state.workspace_root, &state.config_home)
-        .load()
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
-}
-
-fn load_runtime_config_json(state: &AppState) -> Result<serde_json::Value, String> {
-    let runtime_config = ConfigLoader::new(&state.workspace_root, &state.config_home)
-        .load()
-        .map_err(|error| error.to_string())?;
-    Ok(json_value_to_serde(&runtime_config.as_json()))
-}
-
-fn redacted_config_json(mut value: serde_json::Value) -> serde_json::Value {
-    redact_config_secrets(&mut value);
-    value
-}
-
-fn redact_config_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, item) in map.iter_mut() {
-                let normalized = key.to_ascii_lowercase();
-                if normalized.contains("api_key")
-                    || normalized == "token"
-                    || normalized.ends_with("_token")
-                    || normalized == "secret"
-                    || normalized.ends_with("_secret")
-                    || normalized == "password"
-                {
-                    *item = serde_json::Value::String("[redacted]".to_string());
-                } else {
-                    redact_config_secrets(item);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_config_secrets(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn json_value_to_serde(value: &JsonValue) -> serde_json::Value {
-    match value {
-        JsonValue::Null => serde_json::Value::Null,
-        JsonValue::Bool(value) => serde_json::Value::Bool(*value),
-        JsonValue::Number(value) => serde_json::Value::Number((*value).into()),
-        JsonValue::String(value) => serde_json::Value::String(value.clone()),
-        JsonValue::Array(values) => {
-            serde_json::Value::Array(values.iter().map(json_value_to_serde).collect())
-        }
-        JsonValue::Object(entries) => serde_json::Value::Object(
-            entries
-                .iter()
-                .map(|(key, value)| (key.clone(), json_value_to_serde(value)))
-                .collect(),
-        ),
-    }
 }

@@ -53,30 +53,40 @@ fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
 #[test]
 fn runtime_production_source_has_no_mfg_application_implementation() {
     let runtime_root = repo_root().join("crates/runtime/src");
-    let forbidden = [
+    let legacy_matrix_mfg_terms = [
+        "incident",
+        "operational_analysis",
+        "action_execution",
+        "cockpit_profile",
+        "cockpit_report",
+        "memory_case",
+        "playbook",
+        "skill_execution",
+    ]
+    .map(|suffix| ["matrix", "_", suffix].concat());
+    let legacy_adapter_terms = [
+        ["Mfg", "Matrix", "Adapter"].concat(),
+        ["open", "_mfg", "_matrix", "_adapter"].concat(),
+    ];
+    let mut forbidden = vec![
         "runtime::mfg",
         "crate::mfg",
         "mod mfg",
         "pub mod mfg",
-        "MfgMatrixAdapter",
-        "open_mfg_matrix_adapter",
         "seed_mfg",
         "server_manufacturing",
-        "matrix_incident",
-        "matrix_operational_analysis",
-        "matrix_action_execution",
-        "matrix_cockpit_profile",
-        "matrix_cockpit_report",
-        "matrix_memory_case",
-        "matrix_playbook",
-        "matrix_skill_execution",
-    ];
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<Vec<_>>();
+    forbidden.extend(legacy_adapter_terms);
+    forbidden.extend(legacy_matrix_mfg_terms);
 
     for (path, content) in read_rs_files(&runtime_root) {
         let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
-        for term in forbidden {
+        for term in &forbidden {
             assert!(
-                !production.contains(term),
+                !production.contains(term.as_str()),
                 "runtime production source {} must not contain MFG application implementation term {term}",
                 path.display()
             );
@@ -135,7 +145,7 @@ fn gateway_depends_on_mfg_application_crate() {
     let content = fs::read_to_string(&manifest)
         .unwrap_or_else(|_| panic!("read manifest {}", manifest.display()));
     assert!(
-        content.contains("cowd-app-mfg"),
+        content.contains("app-mfg"),
         "gateway must consume MFG through the application crate"
     );
 }

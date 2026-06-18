@@ -136,8 +136,8 @@ impl Default for ActiveSessions {
 mod tests {
     use super::*;
 
-    fn dummy_runtime() -> crate::BuiltRuntime {
-        crate::BuiltRuntime::test_placeholder()
+    fn test_runtime() -> crate::BuiltRuntime {
+        crate::BuiltRuntime::test_runtime_shell()
     }
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn register_and_get() {
         let sessions = ActiveSessions::new();
-        let rt = dummy_runtime();
+        let rt = test_runtime();
         sessions.register("sess-1".into(), rt).unwrap();
         let entry = sessions.get("sess-1");
         assert!(entry.is_some(), "should find registered session");
@@ -158,9 +158,9 @@ mod tests {
     #[test]
     fn list_returns_sorted_ids() {
         let sessions = ActiveSessions::new();
-        sessions.register("b".into(), dummy_runtime()).unwrap();
-        sessions.register("a".into(), dummy_runtime()).unwrap();
-        sessions.register("c".into(), dummy_runtime()).unwrap();
+        sessions.register("b".into(), test_runtime()).unwrap();
+        sessions.register("a".into(), test_runtime()).unwrap();
+        sessions.register("c".into(), test_runtime()).unwrap();
         let ids = sessions.list();
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn remove_drops_session() {
         let sessions = ActiveSessions::new();
-        sessions.register("sess-1".into(), dummy_runtime()).unwrap();
+        sessions.register("sess-1".into(), test_runtime()).unwrap();
         let removed = sessions.remove("sess-1");
         assert!(removed.is_some(), "remove should return the entry");
         assert!(
@@ -192,8 +192,8 @@ mod tests {
     #[test]
     fn register_overwrite() {
         let sessions = ActiveSessions::new();
-        sessions.register("sess-1".into(), dummy_runtime()).unwrap();
-        let prev = sessions.register("sess-1".into(), dummy_runtime()).unwrap();
+        sessions.register("sess-1".into(), test_runtime()).unwrap();
+        let prev = sessions.register("sess-1".into(), test_runtime()).unwrap();
         assert!(prev.is_some(), "overwrite should return the previous entry");
     }
 }
