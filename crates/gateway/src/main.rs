@@ -66,7 +66,7 @@ use provider::{
 use command_service::resume_supported_slash_commands;
 use command_service::{
     classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
-    SkillRegistry, SkillSlashDispatch, SlashCommand,
+    SkillSlashDispatch, SlashCommand,
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -87,6 +87,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use skill_service::SkillRegistry;
 use slash_catalog::{
     handle_agents_slash_command, handle_agents_slash_command_json, handle_skills_slash_command,
     handle_skills_slash_command_json, resolve_skill_invocation,

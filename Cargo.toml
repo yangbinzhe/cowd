@@ -14,6 +14,7 @@ members = [
     "crates/provider",
     "crates/runtime",
     "crates/session",
+    "crates/skill/service",
     "crates/storage",
     "crates/telemetry",
     "crates/tools",

@@ -564,8 +564,13 @@ pub struct SqliteResourceDirectory {
 
 impl SqliteResourceDirectory {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
-        let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        let handle = storage::StorageHandle::sqlite(
+            "resource_directory",
+            path.as_ref(),
+            "runtime.connector",
+            "storage_handle_since_0618_hardening",
+        );
+        Self::open_storage_handle(&handle)
     }
 
     pub fn open_storage_handle(handle: &storage::StorageHandle) -> rusqlite::Result<Self> {

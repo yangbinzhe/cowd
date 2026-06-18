@@ -30,9 +30,13 @@ mod workspace_service;
 
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use command_service::CommandService;
+pub(crate) use context_service::ContextServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
-pub(crate) use mfg_service::MfgService;
+pub(crate) use mfg_service::{
+    MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
+    MfgService,
+};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };

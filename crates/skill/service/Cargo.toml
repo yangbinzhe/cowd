@@ -1,5 +1,5 @@
 [package]
-name = "command-service"
+name = "skill-service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-command-contract = { path = "../contract" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-chrono = { version = "0.4", features = ["serde"] }
+serde_yaml.workspace = true
 thiserror = "2"

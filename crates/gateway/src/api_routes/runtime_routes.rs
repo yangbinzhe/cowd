@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::{connector_routes, AppState, ErrorResponse};
 use memory::store::session::SessionListOptions;
 use memory::RuntimeEvent;
-use runtime::{init_global_providers, AgentControlPolicy, ConfigLoader, RuntimeConfig};
+use runtime::{init_global_providers, AgentControlPolicy, RuntimeConfig};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -257,8 +257,10 @@ pub(super) async fn get_runtime_timeline(
 }
 
 fn load_agent_control_policy(state: &AppState) -> AgentControlPolicy {
-    ConfigLoader::new(&state.workspace_root, &state.config_home)
-        .load()
+    state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
         .map(|config| config.runtime_control().policy.agent.clone())
         .unwrap_or_else(|error| {
             tracing::warn!(
@@ -273,22 +275,25 @@ fn load_agent_control_policy(state: &AppState) -> AgentControlPolicy {
 pub(super) async fn get_runtime_effective_config(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    let (source, runtime_config, warnings) =
-        match ConfigLoader::new(&state.workspace_root, &state.config_home).load() {
-            Ok(config) => {
-                let source = if config.loaded_entries().is_empty() {
-                    "default"
-                } else {
-                    "config"
-                };
-                (source, config, Vec::<String>::new())
-            }
-            Err(error) => (
-                "default",
-                RuntimeConfig::empty(),
-                vec![format!("failed to load runtime config: {error}")],
-            ),
-        };
+    let (source, runtime_config, warnings) = match state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+    {
+        Ok(config) => {
+            let source = if config.loaded_entries().is_empty() {
+                "default"
+            } else {
+                "config"
+            };
+            (source, config, Vec::<String>::new())
+        }
+        Err(error) => (
+            "default",
+            RuntimeConfig::empty(),
+            vec![format!("failed to load runtime config: {error}")],
+        ),
+    };
     let control = runtime_config.runtime_control();
     Json(serde_json::json!({
         "source": source,
@@ -303,7 +308,10 @@ pub(super) async fn get_runtime_effective_config(
 pub(super) async fn reload_runtime_providers(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    let loaded = ConfigLoader::new(&state.workspace_root, &state.config_home).load();
+    let loaded = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home);
     match loaded {
         Ok(runtime_config) => {
             let source = if runtime_config.loaded_entries().is_empty() {
@@ -426,22 +434,25 @@ pub(super) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
     let started_at = Instant::now();
-    let (config_source, runtime_config, config_warnings) =
-        match ConfigLoader::new(&state.workspace_root, &state.config_home).load() {
-            Ok(config) => {
-                let source = if config.loaded_entries().is_empty() {
-                    "default"
-                } else {
-                    "config"
-                };
-                (source, config, Vec::<String>::new())
-            }
-            Err(error) => (
-                "default",
-                RuntimeConfig::empty(),
-                vec![format!("failed to load runtime config: {error}")],
-            ),
-        };
+    let (config_source, runtime_config, config_warnings) = match state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+    {
+        Ok(config) => {
+            let source = if config.loaded_entries().is_empty() {
+                "default"
+            } else {
+                "config"
+            };
+            (source, config, Vec::<String>::new())
+        }
+        Err(error) => (
+            "default",
+            RuntimeConfig::empty(),
+            vec![format!("failed to load runtime config: {error}")],
+        ),
+    };
     let control = runtime_config.runtime_control();
     let providers = runtime_config.providers();
     let provider_count = providers.providers.len();

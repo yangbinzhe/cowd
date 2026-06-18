@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use app_mfg::{
     MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCockpitProfile,
-    MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
-    MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
-    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCrossPlaneBridgeReceipt, MfgIncident, MfgPlaybook, MfgRepositoryError, MfgSkillRun,
+    MfgCockpitProfileInput, MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCrossPlaneBridgeReceipt, MfgIncident,
+    MfgPlaybook, MfgRepositoryError, MfgSkillRun,
 };
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -24,14 +23,14 @@ use memory::store::session::SessionRecord;
 use runtime::execution_outcome::{
     CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
 };
-use runtime::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk,
-    DataClassification, IdentityTrust, PolicyDecisionKind,
-};
+use runtime::{CrossPlaneAuditRecord, CrossPlaneExecutionReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::services::GatewayMatrixRepositoryError as MatrixStoreError;
+use crate::services::{
+    GatewayMatrixRepositoryError as MatrixStoreError, MfgCockpitReportDeliveryOutcome,
+    MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
+};
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -610,57 +609,9 @@ struct MfgConnectorRunRequest {
     run: Option<MatrixConnectorRunInput>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MfgCrossPlaneBridgeRequest {
-    #[serde(default = "default_matrix_bridge_mode")]
-    mode: String,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    actor_principal: Option<String>,
-    #[serde(default)]
-    actor_identity_ref: Option<String>,
-    #[serde(default)]
-    source_channel: Option<String>,
-    #[serde(default)]
-    requested_capability: Option<String>,
-    #[serde(default)]
-    provider_account: Option<String>,
-    #[serde(default)]
-    target_ref: Option<String>,
-    #[serde(default)]
-    resource_ref: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MfgCockpitReportDeliveryRequest {
-    #[serde(default = "default_matrix_bridge_mode")]
-    mode: String,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    actor_principal: Option<String>,
-    #[serde(default)]
-    actor_identity_ref: Option<String>,
-    #[serde(default)]
-    source_channel: Option<String>,
-    #[serde(default)]
-    requested_capability: Option<String>,
-    #[serde(default)]
-    provider_account: Option<String>,
-    #[serde(default)]
-    target_ref: Option<String>,
-    #[serde(default)]
-    resource_ref: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    template_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct MfgCockpitReportDeliveryRetryRequest {
-    #[serde(default = "default_matrix_bridge_mode")]
+    #[serde(default)]
     mode: String,
     #[serde(default)]
     idempotency_key: Option<String>,
@@ -684,17 +635,6 @@ struct MfgCockpitReportDeliveryRetryRequest {
     channel: Option<String>,
     #[serde(default)]
     template_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MfgCockpitReportDeliveryOutcome {
-    mode: String,
-    status: String,
-    dispatch_status: String,
-    report: MfgCockpitReportSnapshot,
-    delivery_payload: MfgCockpitReportDeliveryPayload,
-    cross_plane_execution_receipt: CrossPlaneExecutionReceipt,
-    idempotent_replay: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2807,7 +2747,7 @@ async fn matrix_execution_cross_plane_bridge_handler(
         .get_execution(&state.config_home, &id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG action execution not found"))?;
-    let mode = normalize_matrix_bridge_mode(&request.mode);
+    let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
     let idempotency_key = request
         .idempotency_key
         .as_deref()
@@ -2833,12 +2773,15 @@ async fn matrix_execution_cross_plane_bridge_handler(
         }
     }
 
-    let action = matrix_cross_plane_action_from_execution(&execution, &request);
+    let action = state
+        .services
+        .mfg
+        .cross_plane_action_from_execution(&execution, &request);
     let now = chrono::Utc::now();
     let (action, decision, evidence) =
         super::cross_plane_routes::decide_connector_action(&state, action, &mode, now);
     let (status, dispatch_status, blockers, audit_result, audit_summary) =
-        matrix_cross_plane_bridge_outcome(&mode, &decision);
+        state.services.mfg.bridge_outcome(&mode, &decision);
     let audit_record = CrossPlaneAuditRecord::new(
         action.clone(),
         decision.clone(),
@@ -2920,20 +2863,27 @@ fn deliver_mfg_cockpit_report(
     request: MfgCockpitReportDeliveryRequest,
 ) -> Result<MfgCockpitReportDeliveryOutcome, (StatusCode, Json<ErrorResponse>)> {
     super::cross_plane_routes::ensure_cross_plane_loaded(state);
-    let mode = normalize_matrix_bridge_mode(&request.mode);
+    let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
     let idempotency_key = request
         .idempotency_key
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_string);
-    let delivery_payload = mfg_report_delivery_payload(&report, &request);
+    let delivery_payload = state
+        .services
+        .mfg
+        .report_delivery_payload(&report, &request);
 
     if let Some(key) = &idempotency_key {
         if let Some(receipt) =
             super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
         {
-            if !mfg_report_delivery_receipt_matches(&receipt, &report) {
+            if !state
+                .services
+                .mfg
+                .report_delivery_receipt_matches(&receipt, &report)
+            {
                 return Err(api_error(
                     StatusCode::CONFLICT,
                     "MFG cockpit report delivery idempotency key belongs to another cross-plane action",
@@ -2953,12 +2903,15 @@ fn deliver_mfg_cockpit_report(
         }
     }
 
-    let action = mfg_report_delivery_action(&report, &request, &delivery_payload);
+    let action = state
+        .services
+        .mfg
+        .report_delivery_action(&report, &request, &delivery_payload);
     let now = chrono::Utc::now();
     let (action, decision, evidence) =
         super::cross_plane_routes::decide_connector_action(state, action, &mode, now);
     let (status, dispatch_status, blockers, audit_result, audit_summary) =
-        matrix_cross_plane_bridge_outcome(&mode, &decision);
+        state.services.mfg.bridge_outcome(&mode, &decision);
     let audit_record = CrossPlaneAuditRecord::new(
         action.clone(),
         decision.clone(),
@@ -3099,179 +3052,6 @@ fn mfg_retry_delivery_request(
         channel: request.channel,
         template_id: request.template_id,
     }
-}
-
-fn mfg_report_delivery_receipt_matches(
-    receipt: &CrossPlaneExecutionReceipt,
-    report: &MfgCockpitReportSnapshot,
-) -> bool {
-    receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
-}
-
-fn mfg_report_delivery_payload(
-    report: &MfgCockpitReportSnapshot,
-    request: &MfgCockpitReportDeliveryRequest,
-) -> MfgCockpitReportDeliveryPayload {
-    MfgCockpitReportDeliveryPayload::from_report(
-        report,
-        MfgCockpitReportDeliveryPayloadRequest {
-            channel: request.channel.clone(),
-            template_id: request.template_id.clone(),
-            target_ref: request
-                .target_ref
-                .clone()
-                .or_else(|| report.delivery_ref.clone()),
-            requested_capability: request.requested_capability.clone(),
-        },
-    )
-}
-
-fn mfg_report_delivery_action(
-    report: &MfgCockpitReportSnapshot,
-    request: &MfgCockpitReportDeliveryRequest,
-    delivery_payload: &MfgCockpitReportDeliveryPayload,
-) -> CrossPlaneAction {
-    let actor_principal = request
-        .actor_principal
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(report.owner_ref.as_str());
-    let requested_capability = request
-        .requested_capability
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(delivery_payload.requested_capability.as_str());
-    let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
-    action.actor_identity_ref = request.actor_identity_ref.clone();
-    action.source_channel = Some(
-        request
-            .source_channel
-            .clone()
-            .unwrap_or_else(|| "mfg.report".to_string()),
-    );
-    action.session_id = Some(report.report_id.clone());
-    action.provider_account = request.provider_account.clone();
-    action.target_ref = request
-        .target_ref
-        .clone()
-        .or_else(|| delivery_payload.target_ref.clone())
-        .or_else(|| report.delivery_ref.clone());
-    action.resource_ref = request
-        .resource_ref
-        .clone()
-        .or_else(|| Some(delivery_payload.resource_ref.clone()));
-    action.risk = CrossPlaneRisk::Low;
-    action.data_classification = DataClassification::Internal;
-    action.identity_trust = IdentityTrust::Unknown;
-    action
-}
-
-fn matrix_cross_plane_action_from_execution(
-    execution: &MfgActionExecution,
-    request: &MfgCrossPlaneBridgeRequest,
-) -> CrossPlaneAction {
-    let actor_principal = request
-        .actor_principal
-        .as_deref()
-        .or(execution.operator_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("mfg:operator");
-    let requested_capability = request
-        .requested_capability
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default_matrix_cross_plane_capability(execution));
-    let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
-    action.actor_identity_ref = request.actor_identity_ref.clone();
-    action.source_channel = Some(
-        request
-            .source_channel
-            .clone()
-            .unwrap_or_else(|| "mfg".to_string()),
-    );
-    action.session_id = Some(execution.incident_id.clone());
-    action.provider_account = request.provider_account.clone();
-    action.target_ref = request.target_ref.clone();
-    action.resource_ref = request.resource_ref.clone().or_else(|| {
-        Some(format!(
-            "text://{}",
-            default_matrix_bridge_message(execution)
-        ))
-    });
-    action.risk = matrix_cross_plane_risk(execution);
-    action.data_classification = DataClassification::Internal;
-    action.identity_trust = IdentityTrust::Unknown;
-    action
-}
-
-fn default_matrix_cross_plane_capability(execution: &MfgActionExecution) -> &'static str {
-    match execution.action_type.as_str() {
-        "supplier_recovery" | "plan_bom_reconciliation" | "evidence_review" => {
-            "channel.feishu.send_text"
-        }
-        _ => "channel.feishu.send_text",
-    }
-}
-
-fn default_matrix_bridge_message(execution: &MfgActionExecution) -> String {
-    format!(
-        "MFG action {} [{}]: {}; incident={}; execution={}",
-        execution.action_type,
-        execution.owner_role,
-        execution.title,
-        execution.incident_id,
-        execution.execution_id
-    )
-}
-
-fn matrix_cross_plane_risk(execution: &MfgActionExecution) -> CrossPlaneRisk {
-    if execution.governance.contains("human_review") || execution.mode == "commit" {
-        CrossPlaneRisk::Medium
-    } else {
-        CrossPlaneRisk::Low
-    }
-}
-
-fn normalize_matrix_bridge_mode(mode: &str) -> String {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "commit" | "live" | "execute" => "commit".to_string(),
-        _ => "dry_run".to_string(),
-    }
-}
-
-fn matrix_cross_plane_bridge_outcome(
-    mode: &str,
-    decision: &runtime::CrossPlanePolicyDecision,
-) -> (String, String, Vec<String>, String, String) {
-    if decision.decision == PolicyDecisionKind::Allow {
-        if mode == "dry_run" {
-            return (
-                "planned".to_string(),
-                "dry_run".to_string(),
-                Vec::new(),
-                "dry_run".to_string(),
-                "matrix_cross_plane_bridge_dry_run_plan".to_string(),
-            );
-        }
-        return (
-            "planned".to_string(),
-            "human_review_required".to_string(),
-            vec!["mfg:human_review_required".to_string()],
-            "planned".to_string(),
-            "matrix_cross_plane_bridge_queued_for_human_review".to_string(),
-        );
-    }
-    (
-        "blocked".to_string(),
-        "policy_blocked".to_string(),
-        vec![format!("policy:{}", decision.reason)],
-        "blocked".to_string(),
-        "matrix_cross_plane_bridge_policy_blocked".to_string(),
-    )
 }
 
 async fn append_matrix_execution_outcome(

@@ -46,7 +46,19 @@ impl TeamDiscoveryProtocol {
     ///
     /// The `teams` table is created on first open if it does not exist.
     pub fn with_db(db_path: &Path) -> Result<Self, String> {
-        let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {e}"))?;
+        let handle = storage::StorageHandle::sqlite(
+            "team_discovery",
+            db_path,
+            "runtime.team_discovery",
+            "storage_handle_since_0618_hardening",
+        );
+        Self::with_storage_handle(&handle)
+    }
+
+    pub fn with_storage_handle(handle: &storage::StorageHandle) -> Result<Self, String> {
+        let conn = storage::SqliteConnectionFactory::default()
+            .open_handle(handle)
+            .map_err(|e| format!("open db: {e}"))?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
             .map_err(|e| format!("WAL pragma: {e}"))?;
         let _ = conn.execute("PRAGMA foreign_keys=ON", []);

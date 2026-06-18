@@ -8,8 +8,8 @@ use app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillManifest,
 };
-use command_service::{SkillInfo, SkillRegistry, SkillRouter};
 use serde::{Deserialize, Serialize};
+use skill_service::{SkillInfo, SkillRegistry, SkillRouter};
 
 use super::{ServiceEnvelope, SkillService};
 

@@ -608,7 +608,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "thiserror 2.0.18",
 ]
 
@@ -1202,6 +1201,7 @@ dependencies = [
  "serial_test",
  "session",
  "sha2",
+ "skill-service",
  "storage",
  "syntect",
  "thiserror 2.0.18",
@@ -3504,6 +3504,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
+name = "skill-service"
+version = "0.9.309"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3984,7 +3995,6 @@ name = "tools"
 version = "0.9.309"
 dependencies = [
  "base64 0.22.1",
- "command-service",
  "flate2",
  "futures",
  "mcp",
@@ -3995,6 +4005,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "skill-service",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

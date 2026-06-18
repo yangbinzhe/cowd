@@ -80,8 +80,10 @@ fn default_order() -> String {
 }
 
 fn default_session_model(state: &AppState) -> String {
-    runtime::ConfigLoader::new(&state.workspace_root, &state.config_home)
-        .load()
+    state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
         .ok()
         .and_then(|config| config.model().map(str::to_string))
         .filter(|model| !model.trim().is_empty())

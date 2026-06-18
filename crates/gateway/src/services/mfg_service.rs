@@ -14,6 +14,102 @@ use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
+use runtime::{
+    CrossPlaneAction, CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, CrossPlaneRisk,
+    DataClassification, IdentityTrust, PolicyDecisionKind,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MfgCrossPlaneBridgeRequest {
+    #[serde(default = "default_mfg_bridge_mode")]
+    pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
+    #[serde(default)]
+    pub(crate) actor_principal: Option<String>,
+    #[serde(default)]
+    pub(crate) actor_identity_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) source_channel: Option<String>,
+    #[serde(default)]
+    pub(crate) requested_capability: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_account: Option<String>,
+    #[serde(default)]
+    pub(crate) target_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) resource_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MfgCockpitReportDeliveryRequest {
+    #[serde(default = "default_mfg_bridge_mode")]
+    pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
+    #[serde(default)]
+    pub(crate) actor_principal: Option<String>,
+    #[serde(default)]
+    pub(crate) actor_identity_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) source_channel: Option<String>,
+    #[serde(default)]
+    pub(crate) requested_capability: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_account: Option<String>,
+    #[serde(default)]
+    pub(crate) target_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) resource_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) channel: Option<String>,
+    #[serde(default)]
+    pub(crate) template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MfgCockpitReportDeliveryOutcome {
+    pub(crate) mode: String,
+    pub(crate) status: String,
+    pub(crate) dispatch_status: String,
+    pub(crate) report: MfgCockpitReportSnapshot,
+    pub(crate) delivery_payload: app_mfg::MfgCockpitReportDeliveryPayload,
+    pub(crate) cross_plane_execution_receipt: CrossPlaneExecutionReceipt,
+    pub(crate) idempotent_replay: bool,
+}
+
+fn default_mfg_bridge_mode() -> String {
+    "dry_run".to_string()
+}
+
+fn default_cross_plane_capability(execution: &MfgActionExecution) -> &'static str {
+    match execution.action_type.as_str() {
+        "supplier_recovery" | "plan_bom_reconciliation" | "evidence_review" => {
+            "channel.feishu.send_text"
+        }
+        _ => "channel.feishu.send_text",
+    }
+}
+
+fn default_bridge_message(execution: &MfgActionExecution) -> String {
+    format!(
+        "MFG action {} [{}]: {}; incident={}; execution={}",
+        execution.action_type,
+        execution.owner_role,
+        execution.title,
+        execution.incident_id,
+        execution.execution_id
+    )
+}
+
+fn cross_plane_risk(execution: &MfgActionExecution) -> CrossPlaneRisk {
+    if execution.governance.contains("human_review") || execution.mode == "commit" {
+        CrossPlaneRisk::Medium
+    } else {
+        CrossPlaneRisk::Low
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct MfgService {
@@ -85,6 +181,154 @@ impl MfgService {
         packet: Option<&MatrixEvidencePacket>,
     ) -> MfgSkillRun {
         run_server_manufacturing_skill(incident, skill, analysis, packet)
+    }
+
+    pub(crate) fn normalize_bridge_mode(&self, mode: &str) -> String {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "commit" | "live" | "execute" => "commit".to_string(),
+            _ => "dry_run".to_string(),
+        }
+    }
+
+    pub(crate) fn cross_plane_action_from_execution(
+        &self,
+        execution: &MfgActionExecution,
+        request: &MfgCrossPlaneBridgeRequest,
+    ) -> CrossPlaneAction {
+        let actor_principal = request
+            .actor_principal
+            .as_deref()
+            .or(execution.operator_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("mfg:operator");
+        let requested_capability = request
+            .requested_capability
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default_cross_plane_capability(execution));
+        let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
+        action.actor_identity_ref = request.actor_identity_ref.clone();
+        action.source_channel = Some(
+            request
+                .source_channel
+                .clone()
+                .unwrap_or_else(|| "mfg".to_string()),
+        );
+        action.session_id = Some(execution.incident_id.clone());
+        action.provider_account = request.provider_account.clone();
+        action.target_ref = request.target_ref.clone();
+        action.resource_ref = request
+            .resource_ref
+            .clone()
+            .or_else(|| Some(format!("text://{}", default_bridge_message(execution))));
+        action.risk = cross_plane_risk(execution);
+        action.data_classification = DataClassification::Internal;
+        action.identity_trust = IdentityTrust::Unknown;
+        action
+    }
+
+    pub(crate) fn bridge_outcome(
+        &self,
+        mode: &str,
+        decision: &CrossPlanePolicyDecision,
+    ) -> (String, String, Vec<String>, String, String) {
+        if decision.decision == PolicyDecisionKind::Allow {
+            if mode == "dry_run" {
+                return (
+                    "planned".to_string(),
+                    "dry_run".to_string(),
+                    Vec::new(),
+                    "dry_run".to_string(),
+                    "mfg_cross_plane_bridge_dry_run_plan".to_string(),
+                );
+            }
+            return (
+                "planned".to_string(),
+                "human_review_required".to_string(),
+                vec!["mfg:human_review_required".to_string()],
+                "planned".to_string(),
+                "mfg_cross_plane_bridge_queued_for_human_review".to_string(),
+            );
+        }
+        (
+            "blocked".to_string(),
+            "policy_blocked".to_string(),
+            vec![format!("policy:{}", decision.reason)],
+            "blocked".to_string(),
+            "mfg_cross_plane_bridge_policy_blocked".to_string(),
+        )
+    }
+
+    pub(crate) fn report_delivery_payload(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        request: &MfgCockpitReportDeliveryRequest,
+    ) -> app_mfg::MfgCockpitReportDeliveryPayload {
+        app_mfg::MfgCockpitReportDeliveryPayload::from_report(
+            report,
+            app_mfg::MfgCockpitReportDeliveryPayloadRequest {
+                channel: request.channel.clone(),
+                template_id: request.template_id.clone(),
+                target_ref: request
+                    .target_ref
+                    .clone()
+                    .or_else(|| report.delivery_ref.clone()),
+                requested_capability: request.requested_capability.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn report_delivery_action(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        request: &MfgCockpitReportDeliveryRequest,
+        delivery_payload: &app_mfg::MfgCockpitReportDeliveryPayload,
+    ) -> CrossPlaneAction {
+        let actor_principal = request
+            .actor_principal
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(report.owner_ref.as_str());
+        let requested_capability = request
+            .requested_capability
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(delivery_payload.requested_capability.as_str());
+        let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
+        action.actor_identity_ref = request.actor_identity_ref.clone();
+        action.source_channel = Some(
+            request
+                .source_channel
+                .clone()
+                .unwrap_or_else(|| "mfg.report".to_string()),
+        );
+        action.session_id = Some(report.report_id.clone());
+        action.provider_account = request.provider_account.clone();
+        action.target_ref = request
+            .target_ref
+            .clone()
+            .or_else(|| delivery_payload.target_ref.clone())
+            .or_else(|| report.delivery_ref.clone());
+        action.resource_ref = request
+            .resource_ref
+            .clone()
+            .or_else(|| Some(delivery_payload.resource_ref.clone()));
+        action.risk = CrossPlaneRisk::Low;
+        action.data_classification = DataClassification::Internal;
+        action.identity_trust = IdentityTrust::Unknown;
+        action
+    }
+
+    pub(crate) fn report_delivery_receipt_matches(
+        &self,
+        receipt: &CrossPlaneExecutionReceipt,
+        report: &MfgCockpitReportSnapshot,
+    ) -> bool {
+        receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
     }
 
     pub(crate) fn open_store(

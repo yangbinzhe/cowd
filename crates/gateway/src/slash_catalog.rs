@@ -4,11 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use command_contract::SkillSlashDispatch;
-use command_service::{
+use serde_json::{json, Value};
+use skill_service::{
     SkillInfo, SkillManager, SkillRegistry, SkillRegistryRootKind, SkillRegistrySource,
     SkillViewInput, SkillViewOutput,
 };
-use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DefinitionSource {
