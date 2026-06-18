@@ -53,7 +53,7 @@ fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
 #[test]
 fn runtime_production_source_has_no_mfg_application_implementation() {
     let runtime_root = repo_root().join("crates/runtime/src");
-    let legacy_matrix_mfg_terms = [
+    let legacy_structured_mfg_terms = [
         "incident",
         "operational_analysis",
         "action_execution",
@@ -80,7 +80,7 @@ fn runtime_production_source_has_no_mfg_application_implementation() {
     .map(String::from)
     .collect::<Vec<_>>();
     forbidden.extend(legacy_adapter_terms);
-    forbidden.extend(legacy_matrix_mfg_terms);
+    forbidden.extend(legacy_structured_mfg_terms);
 
     for (path, content) in read_rs_files(&runtime_root) {
         let production = content.split("#[cfg(test)]").next().unwrap_or(&content);

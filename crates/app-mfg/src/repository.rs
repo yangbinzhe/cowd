@@ -1009,6 +1009,18 @@ impl MfgRepository {
         find_evidence_packet(&connection, packet_id)
     }
 
+    pub fn upsert_evidence_packet(
+        &self,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_evidence_packet(&connection, packet)?;
+        Ok(packet.clone())
+    }
+
     pub fn list_evidence_packets(
         &self,
         limit: usize,

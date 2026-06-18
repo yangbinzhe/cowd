@@ -100,6 +100,13 @@ impl MfgStore {
         self.repository.get_evidence_packet(packet_id)
     }
 
+    pub fn upsert_evidence_packet(
+        &self,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        self.repository.upsert_evidence_packet(packet)
+    }
+
     pub fn build_evidence_packet(
         &self,
         attention_id: Option<&str>,

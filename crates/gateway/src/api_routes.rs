@@ -56,9 +56,12 @@ pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
-mod matrix_mfg_routes;
+mod matrix_outcomes;
+mod matrix_routes;
 pub(crate) mod memory_routes;
 mod message_routes;
+mod mfg_outcomes;
+mod mfg_routes;
 mod profile_routes;
 mod public_routes;
 mod runtime_routes;
@@ -164,7 +167,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(context_routes::router())
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
-        .merge(matrix_mfg_routes::router())
+        .merge(matrix_routes::router())
+        .merge(mfg_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
@@ -1280,7 +1284,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(profile.status(), StatusCode::OK);
+        let profile_status = profile.status();
+        let profile_body = to_bytes(profile.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            profile_status,
+            StatusCode::OK,
+            "profile response: {}",
+            String::from_utf8_lossy(&profile_body)
+        );
 
         let report = app
             .clone()
@@ -1316,8 +1327,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "decision trace response: {}",
+            String::from_utf8_lossy(&body)
+        );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["kind"], "mfg.decision_trace");
@@ -1598,9 +1615,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cowd_matrix_mfg_full_loop_passes_release_gate() {
-        let workspace = test_temp_dir("cowd-matrix-mfg-full-loop");
-        let config_home = test_temp_dir("cowd-matrix-mfg-full-loop-config");
+    async fn cowd_structured_mfg_full_loop_passes_release_gate() {
+        let workspace = test_temp_dir("cowd-structured-mfg-full-loop");
+        let config_home = test_temp_dir("cowd-structured-mfg-full-loop-config");
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "session-full-loop";
         store
@@ -2340,7 +2357,7 @@ mod tests {
         let context_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             context_json["context_item"]["id"],
-            format!("matrix-evidence:{packet_id}")
+            format!("structured-evidence:{packet_id}")
         );
 
         let incident = app
@@ -2369,7 +2386,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|node| node["id"] == "matrix_researcher"));
+            .any(|node| node["id"] == "mfg_researcher"));
         assert!(incident_json["agent_graph"]["evidence"]
             .as_array()
             .unwrap()

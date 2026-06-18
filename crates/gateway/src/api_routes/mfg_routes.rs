@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCockpitProfile,
-    MfgCockpitProfileInput, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook, MfgRepositoryError, MfgSkillRun,
+    MfgActionExecutionRequest, MfgActionFeedback, MfgCockpitProfile, MfgCockpitProfileInput,
+    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident,
+    MfgPlaybook, MfgRepositoryError,
 };
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -12,38 +12,23 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use matrix_core::{
-    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixEvidencePacket,
-    MatrixFact, MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput,
-    MatrixRelation, MatrixRelationInput, MatrixSourcePack, MATRIX_SCHEMA_VERSION,
-};
-use memory::store::session::SessionRecord;
-use runtime::execution_outcome::{
-    CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
-};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::services::{
-    GatewayMatrixRepositoryError as MatrixStoreError, MfgCockpitReportDeliveryOutcome,
-    MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
+    MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
 };
 
+use super::mfg_outcomes::{
+    append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
+};
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .merge(matrix_kernel_router())
-        .merge(mfg_app_router())
-}
-
-fn mfg_app_router() -> Router<Arc<AppState>> {
-    Router::new()
         .route("/api/apps/mfg/app", get(mfg_app_handler))
         .route(
             "/api/apps/mfg/production/governance",
-            get(matrix_production_governance_handler),
+            get(mfg_production_governance_handler),
         )
         .route("/api/apps/mfg/skills", get(mfg_skills_handler))
         .route("/api/apps/mfg/skills/:id", get(mfg_skill_get_handler))
@@ -53,31 +38,31 @@ fn mfg_app_router() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/apps/mfg/command-center",
-            get(matrix_command_center_handler),
+            get(mfg_command_center_handler),
         )
         .route(
             "/api/apps/mfg/command-center/live",
-            get(matrix_command_center_live_handler),
+            get(mfg_command_center_live_handler),
         )
         .route(
             "/api/apps/mfg/decision-trace",
-            get(matrix_decision_trace_handler),
+            get(mfg_decision_trace_handler),
         )
         .route(
             "/api/apps/mfg/domain/server-manufacturing",
-            get(matrix_server_manufacturing_domain_handler),
+            get(mfg_server_manufacturing_domain_handler),
         )
         .route(
             "/api/apps/mfg/domain/server-manufacturing/seed",
-            post(matrix_server_manufacturing_seed_handler),
+            post(mfg_server_manufacturing_seed_handler),
         )
         .route(
             "/api/apps/mfg/ontology/server-manufacturing",
-            get(matrix_server_manufacturing_ontology_handler),
+            get(mfg_server_manufacturing_ontology_handler),
         )
         .route(
             "/api/apps/mfg/ontology/server-manufacturing/seed",
-            post(matrix_server_manufacturing_ontology_seed_handler),
+            post(mfg_server_manufacturing_ontology_seed_handler),
         )
         .route("/api/apps/mfg/incidents", get(mfg_incidents_list_handler))
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
@@ -120,25 +105,22 @@ fn mfg_app_router() -> Router<Arc<AppState>> {
             post(mfg_playbook_upsert_handler),
         )
         .route("/api/apps/mfg/playbooks/:id", get(mfg_playbook_get_handler))
-        .route(
-            "/api/apps/mfg/analyses/:id",
-            get(matrix_analysis_get_handler),
-        )
+        .route("/api/apps/mfg/analyses/:id", get(mfg_analysis_get_handler))
         .route(
             "/api/apps/mfg/analyses/:analysis_id/actions/:action_id/execute",
-            post(matrix_action_execute_handler),
+            post(mfg_action_execute_handler),
         )
         .route(
             "/api/apps/mfg/executions/:id",
-            get(matrix_execution_get_handler),
+            get(mfg_execution_get_handler),
         )
         .route(
             "/api/apps/mfg/executions/:id/cross-plane/execute",
-            post(matrix_execution_cross_plane_bridge_handler),
+            post(mfg_execution_cross_plane_bridge_handler),
         )
         .route(
             "/api/apps/mfg/executions/:id/feedback",
-            post(matrix_execution_feedback_handler),
+            post(mfg_execution_feedback_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/upsert",
@@ -178,158 +160,8 @@ fn mfg_app_router() -> Router<Arc<AppState>> {
         )
 }
 
-fn matrix_kernel_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/matrix/health", get(matrix_health_handler))
-        .route(
-            "/api/matrix/data-plane/health",
-            get(matrix_data_plane_health_handler),
-        )
-        .route(
-            "/api/matrix/data-plane/ingest-plan",
-            post(matrix_data_plane_ingest_plan_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/upsert",
-            post(matrix_source_pack_upsert_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id",
-            get(matrix_source_pack_get_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id/validate",
-            post(matrix_source_pack_validate_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id/ingest-file",
-            post(matrix_source_pack_ingest_file_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id/delta-plan",
-            post(matrix_source_pack_delta_plan_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id/connector-runs/plan",
-            post(matrix_source_pack_connector_run_plan_handler),
-        )
-        .route(
-            "/api/matrix/source-packs/:id/connector-runs/run",
-            post(matrix_source_pack_connector_run_execute_handler),
-        )
-        .route(
-            "/api/matrix/connector-runs/:id",
-            get(matrix_connector_run_get_handler),
-        )
-        .route("/api/matrix/entities", get(matrix_entities_handler))
-        .route(
-            "/api/matrix/entities/upsert",
-            post(matrix_entity_upsert_handler),
-        )
-        .route(
-            "/api/matrix/entities/resolve-source-key",
-            post(matrix_entity_resolve_source_key_handler),
-        )
-        .route(
-            "/api/matrix/entities/match-candidate",
-            post(matrix_entity_match_candidate_handler),
-        )
-        .route(
-            "/api/matrix/entities/conflict-decision",
-            post(matrix_entity_conflict_decision_handler),
-        )
-        .route("/api/matrix/entities/:id", get(matrix_entity_get_handler))
-        .route(
-            "/api/matrix/entities/:id/relations",
-            get(matrix_entity_relations_handler),
-        )
-        .route(
-            "/api/matrix/entities/:id/impact-path",
-            get(matrix_entity_impact_path_handler),
-        )
-        .route(
-            "/api/matrix/relations/upsert",
-            post(matrix_relation_upsert_handler),
-        )
-        .route("/api/matrix/facts/ingest", post(matrix_fact_ingest_handler))
-        .route("/api/matrix/metrics", get(matrix_metrics_handler))
-        .route("/api/matrix/metrics/:id", get(matrix_metric_detail_handler))
-        .route(
-            "/api/matrix/metrics/:id/lineage",
-            get(matrix_metric_lineage_handler),
-        )
-        .route(
-            "/api/matrix/metrics/attention-plan",
-            post(matrix_metric_attention_plan_handler),
-        )
-        .route(
-            "/api/matrix/metrics/snapshots/materialize",
-            post(matrix_metric_snapshot_materialize_handler),
-        )
-        .route(
-            "/api/matrix/metrics/recompute",
-            post(matrix_metric_recompute_handler),
-        )
-        .route(
-            "/api/matrix/metric-dependencies/upsert",
-            post(matrix_metric_dependency_upsert_handler),
-        )
-        .route(
-            "/api/matrix/metric-dependencies/affected-by-fact-type",
-            post(matrix_metric_affected_by_fact_type_handler),
-        )
-        .route(
-            "/api/matrix/compute/jobs/plan",
-            post(matrix_compute_job_plan_handler),
-        )
-        .route(
-            "/api/matrix/compute/jobs/:id",
-            get(matrix_compute_job_get_handler),
-        )
-        .route(
-            "/api/matrix/compute/jobs/:id/run",
-            post(matrix_compute_job_run_handler),
-        )
-        .route("/api/matrix/changes", get(matrix_changes_handler))
-        .route(
-            "/api/matrix/attention/hot",
-            get(matrix_attention_hot_handler),
-        )
-        .route(
-            "/api/matrix/evidence/build",
-            post(matrix_evidence_build_handler),
-        )
-        .route("/api/matrix/evidence/:id", get(matrix_evidence_get_handler))
-        .route(
-            "/api/matrix/evidence/:id/quality-gate",
-            post(matrix_evidence_quality_gate_handler),
-        )
-        .route(
-            "/api/matrix/evidence/:id/context",
-            get(matrix_evidence_context_handler),
-        )
-        .route(
-            "/api/matrix/quality-gates/:id",
-            get(matrix_quality_gate_get_handler),
-        )
-}
-
-async fn matrix_app_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.mfg.app_descriptor())
-}
-
 async fn mfg_app_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.services.mfg.app_descriptor())
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixFactIngestRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    facts: Vec<MatrixFactInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,132 +215,6 @@ struct MfgCockpitReportScheduleRunRequest {
     channel: Option<String>,
     #[serde(default)]
     template_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixEntityUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    entity: MatrixEntityInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixEntityResolveSourceKeyRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    source_system: String,
-    source_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixEntityMatchCandidateRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    left_entity_id: String,
-    right_entity_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixEntityConflictDecisionRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    candidate_id: String,
-    survivor_entity_id: String,
-    retired_entity_id: String,
-    survivorship_rule: String,
-    #[serde(default)]
-    notes: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixRelationUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    relation: MatrixRelationInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixMetricDependencyUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    dependency: MatrixMetricDependencyInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixMetricAttentionPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    trigger_fact_type: String,
-    #[serde(default)]
-    entity_scope: Option<String>,
-    #[serde(default)]
-    period: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixMetricSnapshotMaterializeRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    metric_ids: Vec<String>,
-    #[serde(default)]
-    scope_ref: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MfgAffectedByFactTypeRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    fact_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MfgComputeJobPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    job: MatrixComputeJobInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixDataPlaneIngestPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    ingest: MatrixDataPlaneIngestPlanInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixEvidenceBuildRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    attention_id: Option<String>,
-    #[serde(default)]
-    problem_statement: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,35 +284,6 @@ struct MfgSkillRunRequest {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MatrixSourcePackUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    source_pack: MatrixSourcePack,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatrixSourcePackIngestFileRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    facts: Vec<MatrixFactInput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MfgConnectorRunRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    run: Option<MatrixConnectorRunInput>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct MfgCockpitReportDeliveryRetryRequest {
     #[serde(default)]
@@ -647,48 +324,6 @@ fn default_matrix_bridge_mode() -> String {
     "dry_run".to_string()
 }
 
-async fn matrix_health_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .repository_health(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let capabilities = matrix_health_capabilities();
-    let store_path = state
-        .services
-        .matrix
-        .store_path(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "matrix.health",
-        "status": "ready",
-        "schema_version": health.schema_version,
-        "expected_schema_version": MATRIX_SCHEMA_VERSION,
-        "fact_count": health.fact_count,
-        "metric_definition_count": health.metric_definition_count,
-        "metric_state_count": health.metric_state_count,
-        "change_count": health.change_count,
-        "attention_count": health.attention_count,
-        "evidence_count": health.evidence_count,
-        "entity_count": health.entity_count,
-        "relation_count": health.relation_count,
-        "metric_dependency_count": health.metric_dependency_count,
-        "compute_job_count": health.compute_job_count,
-        "quality_gate_count": health.quality_gate_count,
-        "source_pack_count": health.source_pack_count,
-        "data_plane_watermark_count": health.data_plane_watermark_count,
-        "connector_run_count": health.connector_run_count,
-        "ontology_pack_count": health.ontology_pack_count,
-        "entity_match_candidate_count": health.entity_match_candidate_count,
-        "entity_conflict_decision_count": health.entity_conflict_decision_count,
-        "metric_snapshot_count": health.metric_snapshot_count,
-        "store": store_path,
-        "capabilities": capabilities,
-    })))
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct MfgProductionGovernanceBundle {
     auth_token_configured: bool,
@@ -701,7 +336,7 @@ struct MfgProductionGovernanceBundle {
     health_capability_present: bool,
 }
 
-async fn matrix_production_governance_handler(
+async fn mfg_production_governance_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let bundle = MfgProductionGovernanceBundle {
@@ -715,7 +350,7 @@ async fn matrix_production_governance_handler(
             .workspace_root
             .join("docs/operator/mfg-production-runbook.md")
             .is_file(),
-        health_capability_present: matrix_health_capabilities()
+        health_capability_present: mfg_application_capabilities()
             .contains(&"production_governance_bundle"),
     };
 
@@ -770,7 +405,7 @@ async fn matrix_production_governance_handler(
     })))
 }
 
-fn matrix_health_capabilities() -> Vec<&'static str> {
+fn mfg_application_capabilities() -> Vec<&'static str> {
     vec![
         "data_plane_adapter",
         "data_plane_ingest_plan",
@@ -839,45 +474,6 @@ fn matrix_health_capabilities() -> Vec<&'static str> {
     ]
 }
 
-async fn matrix_data_plane_health_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .data_plane_health(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "matrix.data_plane.health",
-        "health": health,
-    })))
-}
-
-async fn matrix_data_plane_ingest_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixDataPlaneIngestPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = request.session_id.clone();
-    let plan = state
-        .services
-        .matrix
-        .plan_data_plane_ingest(&state.config_home, request.ingest)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    append_matrix_execution_outcome(
-        &state,
-        session_id.as_deref(),
-        matrix_ingest_plan_outcome(&plan),
-    )
-    .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    Ok(Json(serde_json::json!({
-        "kind": "matrix.data_plane.ingest_plan",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "plan": plan,
-    })))
-}
-
 async fn mfg_skills_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -903,7 +499,7 @@ async fn mfg_skill_get_handler(
     })))
 }
 
-async fn matrix_command_center_handler(
+async fn mfg_command_center_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let health = state
@@ -940,7 +536,7 @@ async fn matrix_command_center_handler(
     })))
 }
 
-async fn matrix_command_center_live_handler(
+async fn mfg_command_center_live_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let incidents = state
@@ -973,7 +569,7 @@ async fn matrix_command_center_live_handler(
     })))
 }
 
-async fn matrix_decision_trace_handler(
+async fn mfg_decision_trace_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<MatrixDecisionTraceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -1255,186 +851,6 @@ async fn mfg_incidents_list_handler(
     })))
 }
 
-async fn matrix_source_pack_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixSourcePackUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
-        .services
-        .matrix
-        .upsert_source_pack(&state.config_home, request.source_pack)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.source_pack",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_pack": source_pack,
-    })))
-}
-
-async fn matrix_source_pack_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
-        .services
-        .matrix
-        .get_source_pack(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG source pack not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.source_pack",
-        "source_pack": source_pack,
-    })))
-}
-
-async fn matrix_source_pack_validate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let validation = state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.source_pack.validation",
-        "validation": validation,
-    })))
-}
-
-async fn matrix_source_pack_delta_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let delta_plan = state
-        .services
-        .matrix
-        .source_pack_delta_plan(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.source_pack.delta_plan",
-        "delta_plan": delta_plan,
-    })))
-}
-
-async fn matrix_source_pack_ingest_file_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MatrixSourcePackIngestFileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    let mut attention = Vec::new();
-    for input in request.facts {
-        let fact = MatrixFact::from_input(input);
-        let item = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        attention.push(item);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.source_pack.ingest_file",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_pack_id": id,
-        "ingested": attention.len(),
-        "attention": attention,
-    })))
-}
-
-async fn matrix_source_pack_connector_run_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgConnectorRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
-        run_id: None,
-        mode: Some("plan".to_string()),
-        resource_ref: None,
-        partition_ref: None,
-        credential_ref: None,
-        expected_rows: None,
-        checksum: None,
-    });
-    input.mode = Some("plan".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.connector_run.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "run": run,
-    })))
-}
-
-async fn matrix_source_pack_connector_run_execute_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgConnectorRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
-        run_id: None,
-        mode: Some("run".to_string()),
-        resource_ref: None,
-        partition_ref: None,
-        credential_ref: None,
-        expected_rows: None,
-        checksum: None,
-    });
-    input.mode = Some("run".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.connector_run",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "run": run,
-    })))
-}
-
-async fn matrix_connector_run_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let run = state
-        .services
-        .matrix
-        .get_connector_run(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG connector run not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.connector_run",
-        "run": run,
-    })))
-}
-
 async fn mfg_cockpit_profile_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgCockpitProfileUpsertRequest>,
@@ -1680,7 +1096,7 @@ async fn mfg_cockpit_report_schedule_run_handler(
     })))
 }
 
-async fn matrix_server_manufacturing_domain_handler(
+async fn mfg_server_manufacturing_domain_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     Ok(Json(serde_json::json!({
@@ -1689,7 +1105,7 @@ async fn matrix_server_manufacturing_domain_handler(
     })))
 }
 
-async fn matrix_server_manufacturing_seed_handler(
+async fn mfg_server_manufacturing_seed_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let result = state
@@ -1703,7 +1119,7 @@ async fn matrix_server_manufacturing_seed_handler(
     })))
 }
 
-async fn matrix_server_manufacturing_ontology_handler(
+async fn mfg_server_manufacturing_ontology_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     Ok(Json(serde_json::json!({
@@ -1712,7 +1128,7 @@ async fn matrix_server_manufacturing_ontology_handler(
     })))
 }
 
-async fn matrix_server_manufacturing_ontology_seed_handler(
+async fn mfg_server_manufacturing_ontology_seed_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let pack = state
@@ -1726,564 +1142,41 @@ async fn matrix_server_manufacturing_ontology_seed_handler(
     })))
 }
 
-async fn matrix_entities_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entities = state
-        .services
-        .matrix
-        .list_entities(&state.config_home, 100)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entities",
-        "entities": entities,
-    })))
-}
-
-async fn matrix_entity_match_candidate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixEntityMatchCandidateRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let candidate = state
-        .services
-        .matrix
-        .propose_entity_match(
-            &state.config_home,
-            &request.left_entity_id,
-            &request.right_entity_id,
-        )
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity.match_candidate",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "candidate": candidate,
-    })))
-}
-
-async fn matrix_entity_conflict_decision_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixEntityConflictDecisionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let decision = state
-        .services
-        .matrix
-        .decide_entity_conflict(
-            &state.config_home,
-            &request.candidate_id,
-            &request.survivor_entity_id,
-            &request.retired_entity_id,
-            &request.survivorship_rule,
-            request.notes,
-        )
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity.conflict_decision",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "decision": decision,
-    })))
-}
-
-async fn matrix_entity_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixEntityUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entity = state
-        .services
-        .matrix
-        .upsert_entity(
-            &state.config_home,
-            &MatrixEntity::from_input(request.entity),
-        )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "entity": entity,
-    })))
-}
-
-async fn matrix_entity_resolve_source_key_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixEntityResolveSourceKeyRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entity = state
-        .services
-        .matrix
-        .resolve_entity_by_source_key(
-            &state.config_home,
-            &request.source_system,
-            &request.source_key,
-        )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG entity source key not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity.resolution",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_system": request.source_system,
-        "source_key": request.source_key,
-        "entity": entity,
-    })))
-}
-
-async fn matrix_entity_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entity = state
-        .services
-        .matrix
-        .get_entity(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG entity not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity",
-        "entity": entity,
-    })))
-}
-
-async fn matrix_relation_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixRelationUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let relation = state
-        .services
-        .matrix
-        .upsert_relation(
-            &state.config_home,
-            &MatrixRelation::from_input(request.relation),
-        )
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.relation",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "relation": relation,
-    })))
-}
-
-async fn matrix_entity_relations_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let relations = state
-        .services
-        .matrix
-        .list_entity_relations(&state.config_home, &id, 100)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity.relations",
-        "entity_id": id,
-        "relations": relations,
-    })))
-}
-
-async fn matrix_entity_impact_path_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let trace = state
-        .services
-        .matrix
-        .impact_trace(&state.config_home, &id, 3)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.entity.impact_path",
-        "trace": trace,
-    })))
-}
-
-async fn matrix_fact_ingest_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixFactIngestRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if request.facts.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "at least one MFG fact is required",
-        ));
-    }
-    let session_id = request.session_id.clone();
-    let mut facts = Vec::with_capacity(request.facts.len());
-    let mut attention = Vec::with_capacity(request.facts.len());
-    for input in request.facts {
-        let fact = MatrixFact::from_input(input);
-        let item = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        append_matrix_execution_outcome(&state, session_id.as_deref(), matrix_fact_outcome(&fact))
-            .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-        facts.push(fact);
-        attention.push(item);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.fact.ingest",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "ingested": facts.len(),
-        "facts": facts,
-        "attention": attention,
-    })))
-}
-
-async fn matrix_metrics_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let metrics = state
-        .services
-        .matrix
-        .list_metric_definitions(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metrics",
-        "metrics": metrics,
-    })))
-}
-
-async fn matrix_metric_detail_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let states = state
-        .services
-        .matrix
-        .metric_states(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    if states.is_empty() {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "MFG metric state not found",
-        ));
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric",
-        "metric_id": id,
-        "states": states,
-    })))
-}
-
-async fn matrix_metric_lineage_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let lineage = state
-        .services
-        .matrix
-        .metric_lineage(&state.config_home, &id, 6)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric.lineage",
-        "lineage": lineage,
-    })))
-}
-
-async fn matrix_metric_attention_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixMetricAttentionPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = state
-        .services
-        .matrix
-        .plan_metric_attention(
-            &state.config_home,
-            &request.trigger_fact_type,
-            request.entity_scope,
-            request.period,
-            request.limit.unwrap_or(12),
-        )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric_attention.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "plan": plan,
-    })))
-}
-
-async fn matrix_metric_snapshot_materialize_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixMetricSnapshotMaterializeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if request.metric_ids.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "at least one metric_id is required",
-        ));
-    }
-    let snapshot = state
-        .services
-        .matrix
-        .materialize_metric_snapshot(&state.config_home, request.metric_ids, request.scope_ref)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric_snapshot",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "snapshot": snapshot,
-    })))
-}
-
-async fn matrix_metric_dependency_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixMetricDependencyUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let dependency = state
-        .services
-        .matrix
-        .upsert_metric_dependency(
-            &state.config_home,
-            &MatrixMetricDependency::from_input(request.dependency),
-        )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric_dependency",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "dependency": dependency,
-    })))
-}
-
-async fn matrix_metric_affected_by_fact_type_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgAffectedByFactTypeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let metric_ids = state
-        .services
-        .matrix
-        .metrics_affected_by_fact_type(&state.config_home, &request.fact_type)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metric_dependency.affected_by_fact_type",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "fact_type": request.fact_type,
-        "metric_ids": metric_ids,
-    })))
-}
-
-async fn matrix_compute_job_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgComputeJobPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = state
-        .services
-        .matrix
-        .plan_compute_job_for_fact_type(&state.config_home, request.job)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.compute.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "plan": plan,
-    })))
-}
-
-async fn matrix_compute_job_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let job = state
-        .services
-        .matrix
-        .get_compute_job(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG compute job not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.compute.job",
-        "job": job,
-    })))
-}
-
-async fn matrix_compute_job_run_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let job = state
-        .services
-        .matrix
-        .run_compute_job(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.compute.job",
-        "job": job,
-    })))
-}
-
-async fn matrix_metric_recompute_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = state
-        .services
-        .matrix
-        .recompute_metrics(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.metrics.recompute",
-        "result": result,
-    })))
-}
-
-async fn matrix_changes_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let changes = state
-        .services
-        .matrix
-        .list_changes(&state.config_home, 100)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.changes",
-        "changes": changes,
-    })))
-}
-
-async fn matrix_attention_hot_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let items = state
-        .services
-        .matrix
-        .list_attention(&state.config_home, 50)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.attention.hot",
-        "items": items,
-    })))
-}
-
-async fn matrix_evidence_build_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MatrixEvidenceBuildRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = request.session_id.clone();
-    let packet = state
-        .services
-        .matrix
-        .build_evidence_packet(
-            &state.config_home,
-            request.attention_id.as_deref(),
-            request.problem_statement.as_deref(),
-        )
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    append_matrix_execution_outcome(
-        &state,
-        session_id.as_deref(),
-        matrix_evidence_packet_outcome(&packet),
-    )
-    .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.evidence.packet",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "packet": packet,
-    })))
-}
-
-async fn matrix_evidence_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let packet = state
-        .services
-        .matrix
-        .get_evidence_packet(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.evidence.packet",
-        "packet": packet,
-    })))
-}
-
-async fn matrix_evidence_quality_gate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let gate = state
-        .services
-        .matrix
-        .evaluate_evidence_quality(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.quality_gate",
-        "gate": gate,
-    })))
-}
-
-async fn matrix_quality_gate_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let gate = state
-        .services
-        .matrix
-        .get_quality_gate(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG quality gate not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.quality_gate",
-        "gate": gate,
-    })))
-}
-
-async fn matrix_evidence_context_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let packet = state
-        .services
-        .matrix
-        .get_evidence_packet(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.evidence.context_item",
-        "context_item": state.services.context.structured_evidence_item(&packet),
-    })))
-}
-
 async fn mfg_incident_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgIncidentCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let packet = match request.evidence_packet_id.as_deref() {
-        Some(packet_id) => state
-            .services
-            .mfg
-            .get_evidence_packet(&state.config_home, packet_id)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found"))?,
+        Some(packet_id) => {
+            let mfg_packet = state
+                .services
+                .mfg
+                .get_evidence_packet(&state.config_home, packet_id)
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            match mfg_packet {
+                Some(packet) => packet,
+                None => state
+                    .services
+                    .matrix
+                    .get_evidence_packet(&state.config_home, packet_id)
+                    .map_err(|error| {
+                        api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    })?
+                    .map(|packet| {
+                        state
+                            .services
+                            .mfg
+                            .upsert_evidence_packet(&state.config_home, &packet)
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found")
+                    })?,
+            }
+        }
         None => state
             .services
             .mfg
@@ -2610,7 +1503,7 @@ async fn mfg_incident_skill_run_handler(
         .complete_mfg_skill_agent_node(&context.incident, &run)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    append_matrix_execution_outcome(
+    append_mfg_execution_outcome(
         &state,
         session_id
             .as_deref()
@@ -2667,7 +1560,7 @@ async fn mfg_skill_run_get_handler(
     })))
 }
 
-async fn matrix_analysis_get_handler(
+async fn mfg_analysis_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -2683,7 +1576,7 @@ async fn matrix_analysis_get_handler(
     })))
 }
 
-async fn matrix_action_execute_handler(
+async fn mfg_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath((analysis_id, action_id)): AxumPath<(String, String)>,
     Json(request): Json<MfgActionExecutionRequest>,
@@ -2701,7 +1594,7 @@ async fn matrix_action_execute_handler(
         .mfg
         .get_incident(&state.config_home, &execution.incident_id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    append_matrix_execution_outcome(
+    append_mfg_execution_outcome(
         &state,
         incident
             .as_ref()
@@ -2717,7 +1610,7 @@ async fn matrix_action_execute_handler(
     })))
 }
 
-async fn matrix_execution_get_handler(
+async fn mfg_execution_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -2733,7 +1626,7 @@ async fn matrix_execution_get_handler(
     })))
 }
 
-async fn matrix_execution_cross_plane_bridge_handler(
+async fn mfg_execution_cross_plane_bridge_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgCrossPlaneBridgeRequest>,
@@ -2811,7 +1704,7 @@ async fn matrix_execution_cross_plane_bridge_handler(
     })))
 }
 
-async fn matrix_execution_feedback_handler(
+async fn mfg_execution_feedback_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgExecutionFeedbackRequest>,
@@ -3008,275 +1901,4 @@ fn mfg_retry_delivery_request(
         channel: request.channel,
         template_id: request.template_id,
     }
-}
-
-async fn append_matrix_execution_outcome(
-    state: &AppState,
-    session_id: Option<&str>,
-    outcome: CowdExecutionOutcome,
-) -> Result<(), String> {
-    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
-        return Ok(());
-    };
-    let Some(store) = state.services.session.unified_store() else {
-        return Ok(());
-    };
-    ensure_matrix_outcome_session_record(state, session_id)
-        .await
-        .map_err(|error| format!("failed to prepare MFG outcome session: {error}"))?;
-    let sequence = store
-        .next_event_sequence(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let event = outcome.to_runtime_event(session_id.to_string(), sequence);
-    store
-        .append_runtime_event(&event)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-fn matrix_ingest_plan_outcome(plan: &MatrixDataPlaneIngestPlan) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
-        outcome_id: format!("structured-ingest:{}", plan.batch_id),
-        kind: CowdExecutionOutcomeKind::StructuredIngest,
-        status: CowdExecutionOutcomeStatus::Planned,
-        title: format!("Structured ingest plan for {}", plan.fact_type),
-        summary: format!(
-            "Plan {} ingests {} estimated rows from {} partition {}.",
-            plan.batch_id, plan.estimated_rows, plan.source_ref, plan.partition_ref
-        ),
-        domain: Some("matrix".to_string()),
-        refs: vec![
-            CowdExecutionRef {
-                ref_type: "structured_source".to_string(),
-                id: plan.source_ref.clone(),
-                label: Some(plan.source_ref.clone()),
-            },
-            CowdExecutionRef {
-                ref_type: "structured_batch".to_string(),
-                id: plan.batch_id.clone(),
-                label: Some(plan.fact_type.clone()),
-            },
-        ],
-        evidence_refs: Vec::new(),
-        metrics: plan.affected_metric_ids.clone(),
-        payload: serde_json::to_value(plan).unwrap_or(Value::Null),
-        created_at: plan.planned_at,
-    }
-}
-
-fn matrix_fact_outcome(fact: &MatrixFact) -> CowdExecutionOutcome {
-    let mut refs = vec![CowdExecutionRef {
-        ref_type: "structured_fact".to_string(),
-        id: fact.fact_id.clone(),
-        label: Some(fact.fact_type.clone()),
-    }];
-    if let Some(source_ref) = fact.source_ref.as_ref() {
-        refs.push(CowdExecutionRef {
-            ref_type: "structured_source".to_string(),
-            id: source_ref.clone(),
-            label: Some(source_ref.clone()),
-        });
-    }
-    CowdExecutionOutcome {
-        outcome_id: format!("structured-fact:{}", fact.fact_id),
-        kind: CowdExecutionOutcomeKind::StructuredFact,
-        status: CowdExecutionOutcomeStatus::Succeeded,
-        title: format!("Structured fact {}", fact.fact_type),
-        summary: format!(
-            "Fact {} of type {} references {} entities with confidence {:.2}.",
-            fact.fact_id,
-            fact.fact_type,
-            fact.entity_refs.len(),
-            fact.confidence
-        ),
-        domain: Some("matrix".to_string()),
-        refs,
-        evidence_refs: fact
-            .source_ref
-            .iter()
-            .map(|source_ref| format!("structured-source:{source_ref}"))
-            .collect(),
-        metrics: fact.metric_key.iter().cloned().collect(),
-        payload: serde_json::to_value(fact).unwrap_or(Value::Null),
-        created_at: fact.event_time,
-    }
-}
-
-fn matrix_evidence_packet_outcome(packet: &MatrixEvidencePacket) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
-        outcome_id: format!("structured-evidence:{}", packet.packet_id),
-        kind: CowdExecutionOutcomeKind::StructuredEvidence,
-        status: if packet.missing_evidence.is_empty() {
-            CowdExecutionOutcomeStatus::Succeeded
-        } else {
-            CowdExecutionOutcomeStatus::Partial
-        },
-        title: format!("Evidence packet {}", packet.packet_id),
-        summary: format!(
-            "Evidence packet for '{}' has {} metric items, {} change items and confidence {:.2}.",
-            packet.problem_statement,
-            packet.metric_evidence.len(),
-            packet.change_evidence.len(),
-            packet.confidence
-        ),
-        domain: Some("matrix".to_string()),
-        refs: vec![CowdExecutionRef {
-            ref_type: "structured_evidence".to_string(),
-            id: packet.packet_id.clone(),
-            label: packet.attention_id.clone(),
-        }],
-        evidence_refs: packet
-            .source_refs
-            .iter()
-            .map(|source| source.reference.clone())
-            .collect(),
-        metrics: packet
-            .metric_evidence
-            .iter()
-            .filter_map(|item| item.get("metric_id").and_then(Value::as_str))
-            .map(ToString::to_string)
-            .collect(),
-        payload: serde_json::to_value(packet).unwrap_or(Value::Null),
-        created_at: packet.created_at,
-    }
-}
-
-fn mfg_action_execution_outcome(execution: &MfgActionExecution) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
-        outcome_id: format!("manufacturing-action:{}", execution.execution_id),
-        kind: CowdExecutionOutcomeKind::ApplicationAction,
-        status: execution_status(&execution.status),
-        title: execution.title.clone(),
-        summary: format!(
-            "MFG action {} for incident {} is {}.",
-            execution.action_id, execution.incident_id, execution.status
-        ),
-        domain: Some("mfg".to_string()),
-        refs: vec![
-            CowdExecutionRef {
-                ref_type: "mfg_execution".to_string(),
-                id: execution.execution_id.clone(),
-                label: Some(execution.action_type.clone()),
-            },
-            CowdExecutionRef {
-                ref_type: "mfg_incident".to_string(),
-                id: execution.incident_id.clone(),
-                label: None,
-            },
-        ],
-        evidence_refs: execution
-            .cross_plane_receipts
-            .iter()
-            .filter_map(|receipt| receipt.audit_record_id.clone())
-            .collect(),
-        metrics: Vec::new(),
-        payload: execution.receipt.clone(),
-        created_at: execution.created_at,
-    }
-}
-
-fn mfg_skill_run_execution_outcome(run: &MfgSkillRun) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
-        outcome_id: format!(
-            "skill-run:{}",
-            run.execution_id
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}", run.incident_id, run.skill_id))
-        ),
-        kind: CowdExecutionOutcomeKind::SkillRun,
-        status: execution_status(&run.status),
-        title: format!("Skill run {}", run.skill_id),
-        summary: run.summary.clone(),
-        domain: Some("mfg".to_string()),
-        refs: vec![
-            CowdExecutionRef {
-                ref_type: "mfg_skill".to_string(),
-                id: run.skill_id.clone(),
-                label: run.agent_node_id.clone(),
-            },
-            CowdExecutionRef {
-                ref_type: "mfg_incident".to_string(),
-                id: run.incident_id.clone(),
-                label: None,
-            },
-        ],
-        evidence_refs: run
-            .execution_context
-            .as_ref()
-            .map(|context| context.evidence_refs.clone())
-            .unwrap_or_default(),
-        metrics: run
-            .execution_context
-            .as_ref()
-            .map(|context| context.metric_keys.clone())
-            .unwrap_or_default(),
-        payload: run.structured_report.clone(),
-        created_at: run
-            .telemetry
-            .as_ref()
-            .map(|telemetry| telemetry.completed_at)
-            .unwrap_or_else(chrono::Utc::now),
-    }
-}
-
-fn execution_status(status: &str) -> CowdExecutionOutcomeStatus {
-    match status {
-        "planned" | "dry_run_ready" | "queued_for_human_review" => {
-            CowdExecutionOutcomeStatus::Planned
-        }
-        "running" | "cross_plane_dispatched" => CowdExecutionOutcomeStatus::Running,
-        "completed" | "success" | "feedback_resolved" => CowdExecutionOutcomeStatus::Succeeded,
-        "failed" | "error" | "feedback_rejected" => CowdExecutionOutcomeStatus::Failed,
-        "blocked" | "cross_plane_blocked" => CowdExecutionOutcomeStatus::Blocked,
-        _ => CowdExecutionOutcomeStatus::Partial,
-    }
-}
-
-async fn ensure_matrix_outcome_session_record(
-    state: &AppState,
-    session_id: &str,
-) -> Result<(), String> {
-    let Some(store) = state.services.session.unified_store() else {
-        return Ok(());
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Some(mut record) = store
-        .get_session(session_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        record.last_activity = now;
-        record.platform = "mfg".to_string();
-        store
-            .update_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-    let metadata_json = serde_json::json!({
-        "kind": "mfg.execution_outcome.session",
-        "session_id": session_id,
-    })
-    .to_string();
-    let record = SessionRecord {
-        session_id: session_id.to_string(),
-        platform: "mfg".to_string(),
-        chat_id: session_id.to_string(),
-        user_id: None,
-        model: None,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(metadata_json),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    };
-    store
-        .create_session(&record)
-        .await
-        .map_err(|error| error.to_string())
 }

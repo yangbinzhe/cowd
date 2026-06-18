@@ -371,6 +371,10 @@ impl MfgService {
         config_home: impl AsRef<Path>,
     ) -> Result<MfgStore, MfgRepositoryError> {
         let registry = storage::StorageRegistry::default_for_config_home(config_home);
+        registry
+            .layout
+            .ensure_directories()
+            .map_err(to_mfg_storage_error)?;
         let handle = registry
             .sqlite_handle("mfg")
             .map_err(to_mfg_storage_error)?;
@@ -466,6 +470,14 @@ impl MfgService {
         packet_id: &str,
     ) -> Result<Option<MatrixEvidencePacket>, MfgRepositoryError> {
         self.open_store(config_home)?.get_evidence_packet(packet_id)
+    }
+
+    pub(crate) fn upsert_evidence_packet(
+        &self,
+        config_home: impl AsRef<Path>,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        self.open_store(config_home)?.upsert_evidence_packet(packet)
     }
 
     pub(crate) fn build_evidence_packet(

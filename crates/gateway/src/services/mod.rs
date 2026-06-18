@@ -1021,9 +1021,8 @@ impl GatewayServices {
             ("system", "runtime_summary"),
             ("audit", "approval_projection"),
             ("audit", "audit_projection"),
-            ("skill", "list"),
-            ("skill", "view"),
-            ("skill", "validate"),
+            ("skill", "catalog"),
+            ("skill", "projection"),
             ("agent", "list"),
             ("agent", "task_projection"),
             ("matrix", "health"),
@@ -1237,7 +1236,13 @@ mod tests {
             services.audit.approval_projection().operation,
             "approval_projection"
         );
-        assert_eq!(services.skill.validate().operation, "validate");
+        let skill_contracts = services.skill.contracts();
+        assert!(skill_contracts
+            .iter()
+            .any(|contract| contract.operation == "catalog"));
+        assert!(skill_contracts
+            .iter()
+            .any(|contract| contract.operation == "projection"));
         assert_eq!(
             services.agent.task_projection().operation,
             "task_projection"

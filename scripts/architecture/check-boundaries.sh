@@ -48,6 +48,17 @@ check_empty "compat harness workspace residue" \
 check_empty "api crate naming residue" \
   rg -n "crates/api|api::" crates --glob '*.rs' --glob 'Cargo.toml'
 
+check_empty "mixed matrix mfg route module residue" \
+  bash -c 'mixed="matrix_""mfg"; file="crates/gateway/src/api_routes/${mixed}_routes.rs"; if test -e "$file"; then echo "$file"; fi; rg -n "${mixed}_routes|cowd_${mixed}|${mixed}" crates/gateway/src crates/gateway/tests --glob "*.rs" || true'
+
+check_empty "matrix routes must stay free of mfg application semantics" \
+  rg -n "Mfg|mfg|manufacturing|cockpit|incident|playbook|skill" \
+    crates/gateway/src/api_routes/matrix_routes.rs
+
+check_empty "mfg routes must not keep legacy matrix handler names" \
+  rg -n "matrix_(production_governance|command_center|decision_trace|server_manufacturing|analysis|action|execution)|matrix_health_capabilities" \
+    crates/gateway/src/api_routes/mfg_routes.rs
+
 check_empty "AI bin install residue" \
   rg -n "~/AI/bin|AI/bin" README.md docs scripts crates --glob '*.rs' --glob '*.md' --glob '*.sh' --glob 'Cargo.toml' --glob '!scripts/architecture/check-boundaries.sh'
 
@@ -67,8 +78,7 @@ check_empty "gateway main must not own business registries" \
   bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open|current_tool_registry|build_runtime_plugin_state|RuntimePluginState" || true'
 
 check_empty "matrix core must not contain mfg application semantics" \
-  rg -n "Mfg|mfg|manufacturing|server_manufacturing|matrix_mfg|mfg_matrix|MfgMatrixAdapter" \
-    crates/matrix/core crates/matrix/repository --glob '*.rs' --glob 'Cargo.toml'
+  bash -c 'mixed="matrix_""mfg"; reverse="mfg_""matrix"; adapter="Mfg""Matrix""Adapter"; rg -n "Mfg|mfg|manufacturing|server_manufacturing|${mixed}|${reverse}|${adapter}" crates/matrix/core crates/matrix/repository --glob "*.rs" --glob "Cargo.toml"'
 
 check_empty "app-mfg must not depend on gateway or runtime internals" \
   rg -n "gateway::|runtime::|use gateway|use runtime|crate::runtime" \
