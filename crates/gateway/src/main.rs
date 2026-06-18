@@ -75,25 +75,25 @@ use command_service::{
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugin_static::handle_plugins_slash_command;
-use plugins::{PluginHooks, PluginRegistry};
+use plugins::PluginRegistry;
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::ContextProfile;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonValue,
-    McpOAuthConfig, McpServerConfig, McpServerManager, McpTool, MessageRole, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    ResumeContextPacket, ResumeContextSource, RuntimeError, ScopedMcpServerConfig, Session,
-    TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    McpOAuthConfig, McpServerConfig, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource,
+    RuntimeError, ScopedMcpServerConfig, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
+use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpState};
 use serde::Deserialize;
 use serde_json::json;
 use slash_catalog::{
     handle_agents_slash_command, handle_agents_slash_command_json, handle_skills_slash_command,
     handle_skills_slash_command_json, resolve_skill_invocation,
 };
-use tools::{GlobalToolRegistry, RuntimeToolDefinition};
 
 use futures::StreamExt;
 use tui::state::TuiState;
@@ -231,11 +231,6 @@ const REMOVED_PROMPT_SUBCOMMAND: &str = "prompt";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 
 type AllowedToolSet = BTreeSet<String>;
-type RuntimePluginStateBuildOutput = (
-    Option<Arc<Mutex<RuntimeMcpState>>>,
-    Vec<RuntimeToolDefinition>,
-);
-
 /// Expand `~` at the start of a path to the user's home directory.
 fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
     if path.starts_with("~") {
@@ -1552,24 +1547,7 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
     if values.is_empty() {
         return Ok(None);
     }
-    current_tool_registry()?.normalize_allowed_tools(values)
-}
-
-fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
-        .map_err(|error| error.to_string())?;
-    let registry = state.tool_registry.clone();
-    if let Some(mcp_state) = state.mcp_state {
-        mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(registry)
+    runtime_bootstrap::load_tool_registry_for_current_dir()?.normalize_allowed_tools(values)
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
@@ -1650,7 +1628,7 @@ fn format_connected_line(model: &str) -> String {
 }
 
 fn filter_tool_specs(
-    tool_registry: &GlobalToolRegistry,
+    tool_registry: &GatewayToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
     tool_registry.definitions(allowed_tools)
@@ -3535,7 +3513,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     // ── Wire tool registry to SkillsPanel (T27) ──
     tracing::debug!("tui init: loading tool registry");
-    if let Ok(registry) = current_tool_registry() {
+    if let Ok(registry) = runtime_bootstrap::load_tool_registry_for_current_dir() {
         state.set_tool_registry(std::sync::Arc::new(
             tool_projection::TuiToolRegistryAdapter::new(registry),
         ));
@@ -4358,20 +4336,6 @@ pub(crate) struct PromptHistoryEntry {
     text: String,
 }
 
-struct RuntimePluginState {
-    feature_config: runtime::RuntimeFeatureConfig,
-    tool_registry: GlobalToolRegistry,
-    plugin_registry: PluginRegistry,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-}
-
-struct RuntimeMcpState {
-    runtime: tokio::runtime::Runtime,
-    manager: McpServerManager,
-    pending_servers: Vec<String>,
-    degraded_report: Option<runtime::McpDegradedReport>,
-}
-
 pub(crate) struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
@@ -4527,308 +4491,6 @@ struct ListMcpResourcesRequest {
 struct ReadMcpResourceRequest {
     server: String,
     uri: String,
-}
-
-impl RuntimeMcpState {
-    fn new(
-        runtime_config: &runtime::RuntimeConfig,
-    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
-        if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
-            return Ok(None);
-        }
-
-        // Avoid nested-runtime crash: skip MCP discovery if already inside a runtime
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Ok(None);
-        }
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
-        let pending_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| failure.server_name.clone())
-            .chain(
-                discovery
-                    .unsupported_servers
-                    .iter()
-                    .map(|server| server.server_name.clone()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let available_tools = discovery
-            .tools
-            .iter()
-            .map(|tool| tool.qualified_name.clone())
-            .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
-            .server_names()
-            .into_iter()
-            .filter(|server_name| !failed_server_names.contains(server_name))
-            .collect::<Vec<_>>();
-        let failed_servers =
-            discovery
-                .failed_servers
-                .iter()
-                .map(|failure| runtime::McpFailedServer {
-                    server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some(failure.server_name.clone()),
-                        failure.error.clone(),
-                        std::collections::BTreeMap::new(),
-                        true,
-                    ),
-                })
-                .chain(discovery.unsupported_servers.iter().map(|server| {
-                    runtime::McpFailedServer {
-                        server_name: server.server_name.clone(),
-                        phase: runtime::McpLifecyclePhase::ServerRegistration,
-                        error: runtime::McpErrorSurface::new(
-                            runtime::McpLifecyclePhase::ServerRegistration,
-                            Some(server.server_name.clone()),
-                            server.reason.clone(),
-                            std::collections::BTreeMap::from([(
-                                "transport".to_string(),
-                                format!("{:?}", server.transport).to_ascii_lowercase(),
-                            )]),
-                            false,
-                        ),
-                    }
-                }))
-                .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
-            runtime::McpDegradedReport::new(
-                working_servers,
-                failed_servers,
-                available_tools.clone(),
-                available_tools,
-            )
-        });
-
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-            },
-            discovery,
-        )))
-    }
-
-    fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.block_on(self.manager.shutdown())?;
-        Ok(())
-    }
-
-    fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
-    }
-
-    fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
-        self.degraded_report.clone()
-    }
-
-    fn server_names(&self) -> Vec<String> {
-        self.manager.server_names()
-    }
-
-    fn call_tool(
-        &mut self,
-        qualified_tool_name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<String, ToolError> {
-        let response = self
-            .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
-                error.message, error.code
-            )));
-        }
-
-        let result = response.result.ok_or_else(|| {
-            ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned no result payload"
-            ))
-        })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.list_resources(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "resources": result.resources,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut resources = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
-                .runtime
-                .block_on(self.manager.list_resources(&server_name))
-            {
-                Ok(result) => resources.push(json!({
-                    "server": server_name,
-                    "resources": result.resources,
-                })),
-                Err(error) => failures.push(json!({
-                    "server": server_name,
-                    "error": error.to_string(),
-                })),
-            }
-        }
-
-        if resources.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "resources": resources,
-            "failures": failures,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.read_resource(server_name, uri))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "contents": result.contents,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-}
-
-fn build_runtime_mcp_state(
-    runtime_config: &runtime::RuntimeConfig,
-) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
-        return Ok((None, Vec::new()));
-    };
-
-    let mut runtime_tools = discovery
-        .tools
-        .iter()
-        .map(mcp_runtime_tool_definition)
-        .collect::<Vec<_>>();
-    if !mcp_state.server_names().is_empty() {
-        runtime_tools.extend(mcp_wrapper_tool_definitions());
-    }
-
-    Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
-}
-
-fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
-    RuntimeToolDefinition {
-        name: tool.qualified_name.clone(),
-        description: Some(
-            tool.tool
-                .description
-                .clone()
-                .unwrap_or_else(|| format!("Invoke MCP tool `{}`.", tool.qualified_name)),
-        ),
-        input_schema: tool
-            .tool
-            .input_schema
-            .clone()
-            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
-        required_permission: permission_mode_for_mcp_tool(&tool.tool),
-    }
-}
-
-fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
-    vec![
-        RuntimeToolDefinition {
-            name: "MCPTool".to_string(),
-            description: Some(
-                "Call a configured MCP tool by its qualified name and JSON arguments.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "qualifiedName": { "type": "string" },
-                    "arguments": {}
-                },
-                "required": ["qualifiedName"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        RuntimeToolDefinition {
-            name: "ListMcpResourcesTool".to_string(),
-            description: Some(
-                "List MCP resources from one configured server or from every connected server."
-                    .to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        RuntimeToolDefinition {
-            name: "ReadMcpResourceTool".to_string(),
-            description: Some("Read a specific MCP resource from a configured server.".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "uri": { "type": "string" }
-                },
-                "required": ["server", "uri"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-    ]
-}
-
-fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
-    let read_only = mcp_annotation_flag(tool, "readOnlyHint");
-    let destructive = mcp_annotation_flag(tool, "destructiveHint");
-    let open_world = mcp_annotation_flag(tool, "openWorldHint");
-
-    if read_only && !destructive && !open_world {
-        PermissionMode::ReadOnly
-    } else if destructive || open_world {
-        PermissionMode::DangerFullAccess
-    } else {
-        PermissionMode::WorkspaceWrite
-    }
-}
-
-fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
-    tool.annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(key))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9359,37 +9021,6 @@ pub(crate) fn ensure_yolo_task(
     kernel.start_goal(objective, true).map(Some)
 }
 
-fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let runtime_config = loader.load()?;
-    build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
-}
-
-fn build_runtime_plugin_state_with_loader(
-    cwd: &Path,
-    loader: &ConfigLoader,
-    runtime_config: &runtime::RuntimeConfig,
-) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let plugin_manager = runtime_bootstrap::build_plugin_manager(cwd, loader, runtime_config);
-    let plugin_registry = plugin_manager.plugin_registry()?;
-    let plugin_hook_config =
-        runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
-    let feature_config = runtime_config
-        .feature_config()
-        .clone()
-        .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
-        .with_runtime_tools(runtime_tools)?;
-    Ok(RuntimePluginState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    })
-}
-
 fn handle_mcp_slash_command(
     args: Option<&str>,
     cwd: &Path,
@@ -9830,14 +9461,6 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
     }
 }
 
-fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::RuntimeHookConfig {
-    runtime::RuntimeHookConfig::new(
-        hooks.pre_tool_use,
-        hooks.post_tool_use,
-        hooks.post_tool_use_failure,
-    )
-}
-
 fn compact_message_text(message: &ConversationMessage) -> String {
     message
         .blocks
@@ -10161,7 +9784,7 @@ pub(crate) fn build_runtime(
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let runtime_plugin_state = runtime_bootstrap::assemble_runtime_state()?;
     build_runtime_with_plugin_state(
         None,
         session,
@@ -10193,7 +9816,7 @@ pub(crate) fn build_runtime_with_session_store(
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let runtime_plugin_state = runtime_bootstrap::assemble_runtime_state()?;
     build_runtime_with_plugin_state(
         Some(session_store),
         session,
@@ -10226,14 +9849,14 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-    runtime_plugin_state: RuntimePluginState,
+    runtime_plugin_state: RuntimeBootstrapState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
     let session_resume_packet = session_db_resume_context_packet(&session);
-    let RuntimePluginState {
+    let RuntimeBootstrapState {
         feature_config,
         tool_registry,
         plugin_registry,
@@ -10423,7 +10046,7 @@ struct AnthropicRuntimeClient {
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
+    tool_registry: GatewayToolRegistry,
     reasoning_effort: Option<String>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 }
@@ -10435,7 +10058,7 @@ impl AnthropicRuntimeClient {
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
-        tool_registry: GlobalToolRegistry,
+        tool_registry: GatewayToolRegistry,
         stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
@@ -11873,7 +11496,7 @@ pub(crate) struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
+    tool_registry: GatewayToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
@@ -11881,7 +11504,7 @@ impl CliToolExecutor {
     fn new(
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
-        tool_registry: GlobalToolRegistry,
+        tool_registry: GatewayToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
@@ -12002,7 +11625,7 @@ impl ToolExecutor for CliToolExecutor {
 fn permission_policy(
     mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
-    tool_registry: &GlobalToolRegistry,
+    tool_registry: &GatewayToolRegistry,
 ) -> Result<PermissionPolicy, String> {
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
         PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
@@ -12179,9 +11802,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     #![allow(unused_imports)]
     use super::{
-        activate_live_cli_session, build_runtime_plugin_state_with_loader,
-        build_runtime_with_plugin_state, build_system_prompt_for_mode, cli_turn_context_profile,
-        collect_session_prompt_history, create_managed_session_handle,
+        activate_live_cli_session, build_runtime_with_plugin_state, build_system_prompt_for_mode,
+        cli_turn_context_profile, collect_session_prompt_history, create_managed_session_handle,
         current_task_summary_from_record, discover_local_session_import_candidates,
         ensure_yolo_task, filter_tool_specs, format_bughunter_report,
         format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
@@ -12213,11 +11835,13 @@ mod tests {
         LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
         DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
     };
+    use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
     use plugins::{
-        PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
+        PluginManager as Pm, PluginManagerConfig as Pmc, PluginTool, PluginToolDefinition,
+        PluginToolPermission,
     };
     use provider::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use runtime::{
@@ -12235,7 +11859,6 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tools::GlobalToolRegistry;
 
     fn gateway_platform_with_auth_token(auth_token: &str) -> GatewayPlatformConfig {
         let mut extra = BTreeMap::new();
@@ -12373,8 +11996,8 @@ mod tests {
         assert!(parse_gateway_cross_plane_slash_command(Some("unknown {}")).is_err());
     }
 
-    fn registry_with_plugin_tool() -> GlobalToolRegistry {
-        GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+    fn registry_with_plugin_tool() -> TestToolRegistry {
+        TestToolRegistry::with_plugin_tools(vec![PluginTool::new(
             "plugin-demo@external",
             "plugin-demo",
             PluginToolDefinition {
@@ -13759,7 +13382,7 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let filtered = filter_tool_specs(&GlobalToolRegistry::builtin(), Some(&allowed));
+        let filtered = filter_tool_specs(&TestToolRegistry::builtin(), Some(&allowed));
         let names = filtered
             .into_iter()
             .map(|spec| spec.name)
@@ -15646,7 +15269,7 @@ providers:
 
     #[ignore]
     #[test]
-    fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
+    fn runtime_bootstrap_state_merges_plugin_hooks_into_runtime_features() {
         let config_home = temp_dir();
         let workspace = temp_dir();
         let source_root = temp_dir();
@@ -15655,14 +15278,18 @@ providers:
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "hook-runtime-demo", true, false);
 
-        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let mut manager = Pm::new(Pmc::new(&config_home));
         manager
             .install(source_root.to_str().expect("utf8 source path"))
             .expect("plugin install should succeed");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("plugin state should load");
+        let state = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+            &workspace,
+            &loader,
+            &runtime_config,
+        )
+        .expect("plugin state should load");
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
         assert!(
@@ -15677,7 +15304,7 @@ providers:
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+    fn runtime_bootstrap_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -15706,8 +15333,12 @@ providers:
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("runtime plugin state should load");
+        let state = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+            &workspace,
+            &loader,
+            &runtime_config,
+        )
+        .expect("runtime plugin state should load");
 
         let allowed = state
             .tool_registry
@@ -15794,7 +15425,7 @@ providers:
     }
 
     #[test]
-    fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
+    fn runtime_bootstrap_state_surfaces_unsupported_mcp_servers_structurally() {
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -15813,8 +15444,12 @@ providers:
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("runtime plugin state should load");
+        let state = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+            &workspace,
+            &loader,
+            &runtime_config,
+        )
+        .expect("runtime plugin state should load");
         let executor = CliToolExecutor::new(
             None,
             false,
@@ -15862,16 +15497,19 @@ providers:
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
 
-        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let mut manager = Pm::new(Pmc::new(&config_home));
         let install = manager
             .install(source_root.to_str().expect("utf8 source path"))
             .expect("plugin install should succeed");
         let log_path = install.install_path.join("lifecycle.log");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let runtime_plugin_state =
-            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-                .expect("plugin state should load");
+        let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+            &workspace,
+            &loader,
+            &runtime_config,
+        )
+        .expect("plugin state should load");
         let mut runtime = build_runtime_with_plugin_state(
             None,
             Session::new(),

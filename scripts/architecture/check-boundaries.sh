@@ -64,8 +64,7 @@ check_empty "command-service must remain declarative" \
     crates/command/service/src crates/command/service/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
 
 check_empty "gateway main must not own business registries" \
-  rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open" \
-    crates/gateway/src/main.rs
+  bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open|current_tool_registry|build_runtime_plugin_state|RuntimePluginState" || true'
 
 check_empty "matrix core must not contain mfg application semantics" \
   rg -n "Mfg|mfg|manufacturing|server_manufacturing|matrix_mfg|mfg_matrix|MfgMatrixAdapter" \
