@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::matrix_adapter::{
     MatrixHealth, MatrixMetricRecomputeResult, MfgMatrixAdapter, MfgMatrixAdapterError,
 };
-use matrix::{
+use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };

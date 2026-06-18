@@ -11,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
-use matrix::{
+use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
     MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
     MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
@@ -25,7 +25,7 @@ use matrix::{
 };
 
 #[derive(Debug, Error)]
-pub enum MatrixRuntimeStoreError {
+pub enum MatrixSqliteRepositoryError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
@@ -68,21 +68,21 @@ pub struct MatrixMetricRecomputeResult {
 }
 
 #[derive(Debug)]
-pub struct MatrixRuntimeStore {
+pub struct MatrixSqliteRepository {
     connection: Mutex<Connection>,
 }
 
-impl MatrixRuntimeStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixRuntimeStoreError> {
+impl MatrixSqliteRepository {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixSqliteRepositoryError> {
         let connection = Connection::open(path)?;
         Self::from_connection(connection)
     }
 
-    pub fn in_memory() -> Result<Self, MatrixRuntimeStoreError> {
+    pub fn in_memory() -> Result<Self, MatrixSqliteRepositoryError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, MatrixRuntimeStoreError> {
+    fn from_connection(connection: Connection) -> Result<Self, MatrixSqliteRepositoryError> {
         connection.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         connection.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -92,7 +92,7 @@ impl MatrixRuntimeStore {
         })
     }
 
-    pub fn health(&self) -> Result<MatrixHealth, MatrixRuntimeStoreError> {
+    pub fn health(&self) -> Result<MatrixHealth, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -126,7 +126,7 @@ impl MatrixRuntimeStore {
         })
     }
 
-    pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MatrixRuntimeStoreError> {
+    pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MatrixSqliteRepositoryError> {
         let health = self.health()?;
         Ok(MatrixSqliteDataPlane::new(health.data_plane_watermark_count).health())
     }
@@ -134,7 +134,7 @@ impl MatrixRuntimeStore {
     pub fn plan_data_plane_ingest(
         &self,
         input: MatrixDataPlaneIngestPlanInput,
-    ) -> Result<MatrixDataPlaneIngestPlan, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixDataPlaneIngestPlan, MatrixSqliteRepositoryError> {
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
@@ -171,7 +171,7 @@ impl MatrixRuntimeStore {
     pub fn upsert_entity(
         &self,
         entity: &MatrixEntity,
-    ) -> Result<MatrixEntity, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixEntity, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -182,7 +182,7 @@ impl MatrixRuntimeStore {
     pub fn get_entity(
         &self,
         entity_id: &str,
-    ) -> Result<Option<MatrixEntity>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -194,7 +194,7 @@ impl MatrixRuntimeStore {
         &self,
         source_system: &str,
         source_key: &str,
-    ) -> Result<Option<MatrixEntity>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -205,7 +205,7 @@ impl MatrixRuntimeStore {
     pub fn list_entities(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixEntity>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixEntity>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -216,7 +216,7 @@ impl MatrixRuntimeStore {
     pub fn get_ontology_pack(
         &self,
         ontology_id: &str,
-    ) -> Result<Option<MatrixOntologyPack>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixOntologyPack>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -228,17 +228,17 @@ impl MatrixRuntimeStore {
         &self,
         left_entity_id: &str,
         right_entity_id: &str,
-    ) -> Result<matrix::MatrixEntityMatchCandidate, MatrixRuntimeStoreError> {
+    ) -> Result<matrix_core::MatrixEntityMatchCandidate, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let left = find_entity(&connection, left_entity_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(left_entity_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(left_entity_id.to_string()))?;
         let right = find_entity(&connection, right_entity_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(right_entity_id.to_string()))?;
-        let candidate = matrix::match_candidate(&left, &right).ok_or_else(|| {
-            MatrixRuntimeStoreError::NotFound(
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(right_entity_id.to_string()))?;
+        let candidate = matrix_core::match_candidate(&left, &right).ok_or_else(|| {
+            MatrixSqliteRepositoryError::NotFound(
                 "entity match candidate below confidence threshold".to_string(),
             )
         })?;
@@ -253,18 +253,18 @@ impl MatrixRuntimeStore {
         retired_entity_id: &str,
         survivorship_rule: &str,
         notes: Option<String>,
-    ) -> Result<matrix::MatrixEntityConflictDecision, MatrixRuntimeStoreError> {
+    ) -> Result<matrix_core::MatrixEntityConflictDecision, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_entity_match_candidate(&connection, candidate_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(candidate_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(candidate_id.to_string()))?;
         let survivor = find_entity(&connection, survivor_entity_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(survivor_entity_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(survivor_entity_id.to_string()))?;
         let retired = find_entity(&connection, retired_entity_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(retired_entity_id.to_string()))?;
-        let decision = matrix::MatrixEntityConflictDecision {
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(retired_entity_id.to_string()))?;
+        let decision = matrix_core::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
             decision: "merge".to_string(),
@@ -288,7 +288,7 @@ impl MatrixRuntimeStore {
         entity_scope: Option<String>,
         period: Option<String>,
         limit: usize,
-    ) -> Result<MatrixMetricAttentionPlan, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricAttentionPlan, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -312,7 +312,7 @@ impl MatrixRuntimeStore {
         &self,
         metric_ids: Vec<String>,
         scope_ref: Option<String>,
-    ) -> Result<MatrixMetricSnapshot, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricSnapshot, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -325,7 +325,7 @@ impl MatrixRuntimeStore {
     pub fn upsert_relation(
         &self,
         relation: &MatrixRelation,
-    ) -> Result<MatrixRelation, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixRelation, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -337,13 +337,13 @@ impl MatrixRuntimeStore {
         &self,
         entity_id: &str,
         limit: usize,
-    ) -> Result<Vec<MatrixRelation>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixRelation>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if find_entity(&connection, entity_id)?.is_none() {
-            return Err(MatrixRuntimeStoreError::NotFound(entity_id.to_string()));
+            return Err(MatrixSqliteRepositoryError::NotFound(entity_id.to_string()));
         }
         list_entity_relations(&connection, entity_id, limit)
     }
@@ -352,13 +352,13 @@ impl MatrixRuntimeStore {
         &self,
         entity_id: &str,
         max_depth: usize,
-    ) -> Result<MatrixImpactTrace, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixImpactTrace, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if find_entity(&connection, entity_id)?.is_none() {
-            return Err(MatrixRuntimeStoreError::NotFound(entity_id.to_string()));
+            return Err(MatrixSqliteRepositoryError::NotFound(entity_id.to_string()));
         }
         build_impact_trace(&connection, entity_id, max_depth)
     }
@@ -366,7 +366,7 @@ impl MatrixRuntimeStore {
     pub fn register_metric_definition(
         &self,
         definition: &MatrixMetricDefinition,
-    ) -> Result<(), MatrixRuntimeStoreError> {
+    ) -> Result<(), MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -377,7 +377,7 @@ impl MatrixRuntimeStore {
     pub fn upsert_metric_dependency(
         &self,
         dependency: &MatrixMetricDependency,
-    ) -> Result<MatrixMetricDependency, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricDependency, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -389,7 +389,7 @@ impl MatrixRuntimeStore {
         &self,
         metric_id: &str,
         max_depth: usize,
-    ) -> Result<MatrixMetricLineage, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricLineage, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -400,7 +400,7 @@ impl MatrixRuntimeStore {
     pub fn metrics_affected_by_fact_type(
         &self,
         fact_type: &str,
-    ) -> Result<Vec<String>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<String>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -411,7 +411,7 @@ impl MatrixRuntimeStore {
     pub fn plan_compute_job_for_fact_type(
         &self,
         input: MatrixComputeJobInput,
-    ) -> Result<MatrixComputePlan, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixComputePlan, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -442,7 +442,7 @@ impl MatrixRuntimeStore {
     pub fn get_compute_job(
         &self,
         job_id: &str,
-    ) -> Result<Option<MatrixComputeJob>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixComputeJob>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -453,14 +453,14 @@ impl MatrixRuntimeStore {
     pub fn run_compute_job(
         &self,
         job_id: &str,
-    ) -> Result<MatrixComputeJob, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixComputeJob, MatrixSqliteRepositoryError> {
         let mut job = {
             let connection = self
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut job = find_compute_job(&connection, job_id)?
-                .ok_or_else(|| MatrixRuntimeStoreError::NotFound(job_id.to_string()))?;
+                .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(job_id.to_string()))?;
             job.status = "running".to_string();
             job.attempts += 1;
             job.updated_at = Utc::now();
@@ -487,7 +487,7 @@ impl MatrixRuntimeStore {
     pub fn ingest_fact(
         &self,
         fact: &MatrixFact,
-    ) -> Result<MatrixAttentionItem, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixAttentionItem, MatrixSqliteRepositoryError> {
         let attention = MatrixAttentionItem::from_fact(
             &fact.fact_id,
             &fact.fact_type,
@@ -528,7 +528,7 @@ impl MatrixRuntimeStore {
     pub fn upsert_source_pack(
         &self,
         source_pack: MatrixSourcePack,
-    ) -> Result<MatrixSourcePack, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixSourcePack, MatrixSqliteRepositoryError> {
         let source_pack = source_pack.normalized();
         let connection = self
             .connection
@@ -541,7 +541,7 @@ impl MatrixRuntimeStore {
     pub fn get_source_pack(
         &self,
         source_pack_id: &str,
-    ) -> Result<Option<MatrixSourcePack>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixSourcePack>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -552,7 +552,7 @@ impl MatrixRuntimeStore {
     pub fn list_source_packs(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixSourcePack>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixSourcePack>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -563,26 +563,26 @@ impl MatrixRuntimeStore {
     pub fn validate_source_pack(
         &self,
         source_pack_id: &str,
-    ) -> Result<MatrixSourcePackValidation, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixSourcePackValidation, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         Ok(source_pack.validate())
     }
 
     pub fn source_pack_delta_plan(
         &self,
         source_pack_id: &str,
-    ) -> Result<MatrixSourceDeltaPlan, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixSourceDeltaPlan, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         source_pack_delta_plan_for(&connection, &source_pack)
     }
 
@@ -590,13 +590,13 @@ impl MatrixRuntimeStore {
         &self,
         source_pack_id: &str,
         input: MatrixConnectorRunInput,
-    ) -> Result<MatrixConnectorRun, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixConnectorRun, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
         let run = MatrixConnectorRun::from_source_pack(&source_pack, &delta_plan, input);
         insert_connector_run(&connection, &run)?;
@@ -606,7 +606,7 @@ impl MatrixRuntimeStore {
     pub fn get_connector_run(
         &self,
         run_id: &str,
-    ) -> Result<Option<MatrixConnectorRun>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixConnectorRun>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -617,7 +617,7 @@ impl MatrixRuntimeStore {
     pub fn list_attention(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixAttentionItem>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixAttentionItem>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -632,7 +632,7 @@ impl MatrixRuntimeStore {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    pub fn list_facts(&self, limit: usize) -> Result<Vec<MatrixFact>, MatrixRuntimeStoreError> {
+    pub fn list_facts(&self, limit: usize) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -642,14 +642,14 @@ impl MatrixRuntimeStore {
 
     pub fn recompute_metrics(
         &self,
-    ) -> Result<MatrixMetricRecomputeResult, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         self.recompute_metrics_with_filter(None)
     }
 
     pub fn recompute_metrics_for_metric_ids(
         &self,
         metric_ids: &[String],
-    ) -> Result<MatrixMetricRecomputeResult, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         let filter = metric_ids.iter().cloned().collect::<BTreeSet<_>>();
         self.recompute_metrics_with_filter(Some(&filter))
     }
@@ -657,7 +657,7 @@ impl MatrixRuntimeStore {
     fn recompute_metrics_with_filter(
         &self,
         metric_filter: Option<&BTreeSet<String>>,
-    ) -> Result<MatrixMetricRecomputeResult, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -740,7 +740,7 @@ impl MatrixRuntimeStore {
 
     pub fn list_metric_definitions(
         &self,
-    ) -> Result<Vec<MatrixMetricDefinition>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixMetricDefinition>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -757,7 +757,7 @@ impl MatrixRuntimeStore {
     pub fn metric_states(
         &self,
         metric_id: &str,
-    ) -> Result<Vec<MatrixMetricState>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixMetricState>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -775,7 +775,7 @@ impl MatrixRuntimeStore {
     pub fn list_changes(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixChangeEvent>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixChangeEvent>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -794,7 +794,7 @@ impl MatrixRuntimeStore {
         &self,
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
-    ) -> Result<MatrixEvidencePacket, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixEvidencePacket, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -802,7 +802,7 @@ impl MatrixRuntimeStore {
         let attention = match attention_id {
             Some(id) => Some(
                 find_attention(&connection, id)?
-                    .ok_or_else(|| MatrixRuntimeStoreError::NotFound(id.to_string()))?,
+                    .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(id.to_string()))?,
             ),
             None => latest_attention(&connection)?,
         };
@@ -856,7 +856,7 @@ impl MatrixRuntimeStore {
     pub fn get_evidence_packet(
         &self,
         packet_id: &str,
-    ) -> Result<Option<MatrixEvidencePacket>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -867,7 +867,7 @@ impl MatrixRuntimeStore {
     pub fn list_evidence_packets(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixEvidencePacket>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -878,13 +878,13 @@ impl MatrixRuntimeStore {
     pub fn evaluate_evidence_quality(
         &self,
         packet_id: &str,
-    ) -> Result<MatrixQualityGateDecision, MatrixRuntimeStoreError> {
+    ) -> Result<MatrixQualityGateDecision, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let packet = find_evidence_packet(&connection, packet_id)?
-            .ok_or_else(|| MatrixRuntimeStoreError::NotFound(packet_id.to_string()))?;
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(packet_id.to_string()))?;
         let decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
         insert_quality_gate(&connection, &decision)?;
         Ok(decision)
@@ -893,7 +893,7 @@ impl MatrixRuntimeStore {
     pub fn get_quality_gate(
         &self,
         gate_id: &str,
-    ) -> Result<Option<MatrixQualityGateDecision>, MatrixRuntimeStoreError> {
+    ) -> Result<Option<MatrixQualityGateDecision>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -904,7 +904,7 @@ impl MatrixRuntimeStore {
     pub fn list_data_plane_watermarks(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixRuntimeStoreError> {
+    ) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
@@ -1193,7 +1193,7 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
 fn insert_ontology_pack(
     connection: &Connection,
     pack: &MatrixOntologyPack,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_ontology_pack (
             ontology_id, domain, version, pack_json, updated_at
@@ -1212,7 +1212,7 @@ fn insert_ontology_pack(
 fn find_ontology_pack(
     connection: &Connection,
     ontology_id: &str,
-) -> Result<Option<MatrixOntologyPack>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixOntologyPack>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT pack_json FROM matrix_ontology_pack WHERE ontology_id = ?1",
@@ -1220,14 +1220,14 @@ fn find_ontology_pack(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn insert_entity_match_candidate(
     connection: &Connection,
-    candidate: &matrix::MatrixEntityMatchCandidate,
-) -> Result<(), MatrixRuntimeStoreError> {
+    candidate: &matrix_core::MatrixEntityMatchCandidate,
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_match_candidate (
             candidate_id, left_entity_id, right_entity_id, confidence, status,
@@ -1249,7 +1249,7 @@ fn insert_entity_match_candidate(
 fn find_entity_match_candidate(
     connection: &Connection,
     candidate_id: &str,
-) -> Result<Option<matrix::MatrixEntityMatchCandidate>, MatrixRuntimeStoreError> {
+) -> Result<Option<matrix_core::MatrixEntityMatchCandidate>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT candidate_json FROM matrix_entity_match_candidate WHERE candidate_id = ?1",
@@ -1257,14 +1257,14 @@ fn find_entity_match_candidate(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn insert_entity_conflict_decision(
     connection: &Connection,
-    decision: &matrix::MatrixEntityConflictDecision,
-) -> Result<(), MatrixRuntimeStoreError> {
+    decision: &matrix_core::MatrixEntityConflictDecision,
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_conflict_decision (
             decision_id, candidate_id, survivor_entity_id, retired_entity_id,
@@ -1285,7 +1285,7 @@ fn insert_entity_conflict_decision(
 fn upsert_entity(
     connection: &Connection,
     entity: &MatrixEntity,
-) -> Result<MatrixEntity, MatrixRuntimeStoreError> {
+) -> Result<MatrixEntity, MatrixSqliteRepositoryError> {
     let mut entity = entity.clone();
     if let Some(existing) =
         find_entity_by_canonical(connection, &entity.entity_type, &entity.canonical_key)?
@@ -1364,7 +1364,7 @@ fn merged_source_keys(
 fn find_entity(
     connection: &Connection,
     entity_id: &str,
-) -> Result<Option<MatrixEntity>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT entity_json FROM matrix_entity WHERE entity_id = ?1",
@@ -1372,7 +1372,7 @@ fn find_entity(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
@@ -1380,7 +1380,7 @@ fn find_entity_by_canonical(
     connection: &Connection,
     entity_type: &str,
     canonical_key: &str,
-) -> Result<Option<MatrixEntity>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT entity_json
@@ -1390,7 +1390,7 @@ fn find_entity_by_canonical(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
@@ -1398,7 +1398,7 @@ fn find_entity_by_source_key(
     connection: &Connection,
     source_system: &str,
     source_key: &str,
-) -> Result<Option<MatrixEntity>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT e.entity_json
@@ -1406,20 +1406,20 @@ fn find_entity_by_source_key(
               JOIN matrix_entity e ON e.entity_id = s.entity_id
               WHERE s.source_system = ?1 AND s.source_key = ?2",
             params![
-                matrix::normalize_key(source_system),
-                matrix::normalize_key(source_key),
+                matrix_core::normalize_key(source_system),
+                matrix_core::normalize_key(source_key),
             ],
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn list_entities(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixEntity>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixEntity>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT entity_json
           FROM matrix_entity
@@ -1434,14 +1434,14 @@ fn list_entities(
 fn upsert_relation(
     connection: &Connection,
     relation: &MatrixRelation,
-) -> Result<MatrixRelation, MatrixRuntimeStoreError> {
+) -> Result<MatrixRelation, MatrixSqliteRepositoryError> {
     if find_entity(connection, &relation.from_entity_id)?.is_none() {
-        return Err(MatrixRuntimeStoreError::NotFound(
+        return Err(MatrixSqliteRepositoryError::NotFound(
             relation.from_entity_id.clone(),
         ));
     }
     if find_entity(connection, &relation.to_entity_id)?.is_none() {
-        return Err(MatrixRuntimeStoreError::NotFound(
+        return Err(MatrixSqliteRepositoryError::NotFound(
             relation.to_entity_id.clone(),
         ));
     }
@@ -1490,7 +1490,7 @@ fn find_relation_by_key(
     relation_type: &str,
     from_entity_id: &str,
     to_entity_id: &str,
-) -> Result<Option<MatrixRelation>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixRelation>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT relation_json
@@ -1500,7 +1500,7 @@ fn find_relation_by_key(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
@@ -1508,7 +1508,7 @@ fn list_entity_relations(
     connection: &Connection,
     entity_id: &str,
     limit: usize,
-) -> Result<Vec<MatrixRelation>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixRelation>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT relation_json
           FROM matrix_relation
@@ -1527,7 +1527,7 @@ fn build_impact_trace(
     connection: &Connection,
     root_entity_id: &str,
     max_depth: usize,
-) -> Result<MatrixImpactTrace, MatrixRuntimeStoreError> {
+) -> Result<MatrixImpactTrace, MatrixSqliteRepositoryError> {
     let max_depth = max_depth.clamp(1, 5);
     let mut queue = VecDeque::from([(root_entity_id.to_string(), 0usize)]);
     let mut seen_entities = BTreeSet::from([root_entity_id.to_string()]);
@@ -1586,7 +1586,7 @@ fn build_impact_trace(
 fn upsert_attention(
     connection: &Connection,
     item: &MatrixAttentionItem,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_attention_item (
             attention_id, priority_score, status, attention_json, created_at, updated_at
@@ -1606,7 +1606,7 @@ fn upsert_attention(
 fn list_attention(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixAttentionItem>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixAttentionItem>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT attention_json
           FROM matrix_attention_item
@@ -1621,7 +1621,7 @@ fn list_attention(
 fn find_attention(
     connection: &Connection,
     attention_id: &str,
-) -> Result<Option<MatrixAttentionItem>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixAttentionItem>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT attention_json FROM matrix_attention_item WHERE attention_id = ?1",
@@ -1629,13 +1629,13 @@ fn find_attention(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn latest_attention(
     connection: &Connection,
-) -> Result<Option<MatrixAttentionItem>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixAttentionItem>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT attention_json
@@ -1646,14 +1646,14 @@ fn latest_attention(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn insert_evidence_packet(
     connection: &Connection,
     packet: &MatrixEvidencePacket,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_evidence_packet (
             packet_id, attention_id, packet_json, created_at
@@ -1671,7 +1671,7 @@ fn insert_evidence_packet(
 fn find_evidence_packet(
     connection: &Connection,
     packet_id: &str,
-) -> Result<Option<MatrixEvidencePacket>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT packet_json FROM matrix_evidence_packet WHERE packet_id = ?1",
@@ -1679,14 +1679,14 @@ fn find_evidence_packet(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn list_evidence_packets(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixEvidencePacket>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT packet_json
           FROM matrix_evidence_packet
@@ -1701,7 +1701,7 @@ fn list_evidence_packets(
 fn insert_quality_gate(
     connection: &Connection,
     gate: &MatrixQualityGateDecision,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_quality_gate (
             gate_id, target_ref, gate_type, decision, score, gate_json, created_at
@@ -1722,7 +1722,7 @@ fn insert_quality_gate(
 fn find_quality_gate(
     connection: &Connection,
     gate_id: &str,
-) -> Result<Option<MatrixQualityGateDecision>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixQualityGateDecision>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT gate_json FROM matrix_quality_gate WHERE gate_id = ?1",
@@ -1730,14 +1730,14 @@ fn find_quality_gate(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn list_recent_quality_gates(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixQualityGateDecision>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixQualityGateDecision>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT gate_json
           FROM matrix_quality_gate
@@ -1803,7 +1803,9 @@ impl MetricAccumulator {
     }
 }
 
-fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, MatrixRuntimeStoreError> {
+fn metric_facts(
+    connection: &Connection,
+) -> Result<Vec<MetricFactRow>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT fact_id, fact_type, entity_refs_json, metric_key, dimensions_json,
             measures_json, confidence
@@ -1863,7 +1865,7 @@ fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, MatrixRun
 fn list_facts(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixFact>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
             dimensions_json, measures_json, event_time, valid_from, valid_to,
@@ -1938,7 +1940,7 @@ fn numeric_measure_sum(value: &Value) -> f64 {
 fn upsert_metric_definition(
     connection: &Connection,
     definition: &MatrixMetricDefinition,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT INTO matrix_metric_definition (
             metric_id, definition_json, created_at, updated_at
@@ -1959,7 +1961,7 @@ fn upsert_metric_definition(
 fn find_metric_definition(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Option<MatrixMetricDefinition>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixMetricDefinition>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT definition_json FROM matrix_metric_definition WHERE metric_id = ?1",
@@ -1967,14 +1969,14 @@ fn find_metric_definition(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn upsert_metric_dependency(
     connection: &Connection,
     dependency: &MatrixMetricDependency,
-) -> Result<MatrixMetricDependency, MatrixRuntimeStoreError> {
+) -> Result<MatrixMetricDependency, MatrixSqliteRepositoryError> {
     let mut dependency = dependency.clone();
     if let Some(existing) = find_metric_dependency_by_key(
         connection,
@@ -2017,7 +2019,7 @@ fn find_metric_dependency_by_key(
     upstream_metric_id: &str,
     downstream_metric_id: &str,
     dependency_type: &str,
-) -> Result<Option<MatrixMetricDependency>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT dependency_json
@@ -2029,14 +2031,14 @@ fn find_metric_dependency_by_key(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn list_upstream_metric_dependencies(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Vec<MatrixMetricDependency>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT dependency_json
           FROM matrix_metric_dependency
@@ -2050,7 +2052,7 @@ fn list_upstream_metric_dependencies(
 fn list_downstream_metric_dependencies(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Vec<MatrixMetricDependency>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT dependency_json
           FROM matrix_metric_dependency
@@ -2065,7 +2067,7 @@ fn build_metric_lineage(
     connection: &Connection,
     metric_id: &str,
     max_depth: usize,
-) -> Result<MatrixMetricLineage, MatrixRuntimeStoreError> {
+) -> Result<MatrixMetricLineage, MatrixSqliteRepositoryError> {
     let max_depth = max_depth.clamp(1, 6);
     let upstream_dependencies = list_upstream_metric_dependencies(connection, metric_id)?;
     let downstream_dependencies = list_downstream_metric_dependencies(connection, metric_id)?;
@@ -2093,7 +2095,7 @@ fn build_metric_lineage(
 fn metrics_affected_by_fact_type(
     connection: &Connection,
     fact_type: &str,
-) -> Result<Vec<String>, MatrixRuntimeStoreError> {
+) -> Result<Vec<String>, MatrixSqliteRepositoryError> {
     let mut impacted = BTreeSet::new();
     let mut statement = connection.prepare(
         r"SELECT dependency_json
@@ -2123,7 +2125,7 @@ fn metrics_affected_by_fact_type(
 fn metric_ids_for_fact_type(
     connection: &Connection,
     fact_type: &str,
-) -> Result<Vec<String>, MatrixRuntimeStoreError> {
+) -> Result<Vec<String>, MatrixSqliteRepositoryError> {
     let mut impacted = BTreeSet::new();
     let mut statement = connection.prepare(
         r"SELECT definition_json
@@ -2147,7 +2149,7 @@ fn build_metric_attention_plan(
     period: Option<String>,
     metric_ids: Vec<String>,
     limit: usize,
-) -> Result<MatrixMetricAttentionPlan, MatrixRuntimeStoreError> {
+) -> Result<MatrixMetricAttentionPlan, MatrixSqliteRepositoryError> {
     let limit = limit.clamp(1, 24);
     let mut scores = Vec::new();
     for metric_id in metric_ids {
@@ -2209,7 +2211,7 @@ fn build_metric_snapshot(
     connection: &Connection,
     metric_ids: Vec<String>,
     scope_ref: Option<String>,
-) -> Result<MatrixMetricSnapshot, MatrixRuntimeStoreError> {
+) -> Result<MatrixMetricSnapshot, MatrixSqliteRepositoryError> {
     let mut unique_metric_ids = metric_ids;
     unique_metric_ids.sort();
     unique_metric_ids.dedup();
@@ -2235,7 +2237,7 @@ fn build_metric_snapshot(
 fn insert_metric_snapshot(
     connection: &Connection,
     snapshot: &MatrixMetricSnapshot,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_metric_snapshot (
             snapshot_id, scope_ref, metric_ids_json, snapshot_json, created_at
@@ -2267,7 +2269,7 @@ fn priority_for_compute_job(job: &MatrixComputeJob) -> f32 {
 fn upsert_compute_job(
     connection: &Connection,
     job: &MatrixComputeJob,
-) -> Result<MatrixComputeJob, MatrixRuntimeStoreError> {
+) -> Result<MatrixComputeJob, MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT INTO matrix_compute_job (
             job_id, trigger_fact_type, status, priority, job_json, created_at, updated_at
@@ -2294,7 +2296,7 @@ fn upsert_compute_job(
 fn find_compute_job(
     connection: &Connection,
     job_id: &str,
-) -> Result<Option<MatrixComputeJob>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixComputeJob>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT job_json FROM matrix_compute_job WHERE job_id = ?1",
@@ -2302,7 +2304,7 @@ fn find_compute_job(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
@@ -2311,7 +2313,7 @@ fn latest_metric_state(
     metric_id: &str,
     entity_scope: &str,
     period: &str,
-) -> Result<Option<MatrixMetricState>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixMetricState>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT state_json
@@ -2323,14 +2325,14 @@ fn latest_metric_state(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn insert_metric_state(
     connection: &Connection,
     state: &MatrixMetricState,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT INTO matrix_metric_state (
             state_id, metric_id, entity_scope, period, value, previous_value,
@@ -2355,7 +2357,7 @@ fn insert_metric_state(
 fn insert_change_event(
     connection: &Connection,
     change: &MatrixChangeEvent,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT INTO matrix_change_event (
             change_id, metric_id, entity_ref, period, delta, severity_hint,
@@ -2378,7 +2380,7 @@ fn insert_change_event(
 fn find_change(
     connection: &Connection,
     change_id: &str,
-) -> Result<Option<MatrixChangeEvent>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixChangeEvent>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT change_json FROM matrix_change_event WHERE change_id = ?1",
@@ -2386,14 +2388,14 @@ fn find_change(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn latest_metric_state_for_metric(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Option<MatrixMetricState>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixMetricState>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             r"SELECT state_json
@@ -2405,14 +2407,14 @@ fn latest_metric_state_for_metric(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn insert_source_pack(
     connection: &Connection,
     source_pack: &MatrixSourcePack,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_source_pack (
             source_pack_id, source_name, access_mode, refresh_mode,
@@ -2434,7 +2436,7 @@ fn insert_source_pack(
 fn find_source_pack(
     connection: &Connection,
     source_pack_id: &str,
-) -> Result<Option<MatrixSourcePack>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixSourcePack>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT source_pack_json FROM matrix_source_pack WHERE source_pack_id = ?1",
@@ -2442,14 +2444,14 @@ fn find_source_pack(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn list_source_packs(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixSourcePack>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixSourcePack>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT source_pack_json
           FROM matrix_source_pack
@@ -2463,7 +2465,7 @@ fn list_source_packs(
 fn source_pack_delta_plan_for(
     connection: &Connection,
     source_pack: &MatrixSourcePack,
-) -> Result<MatrixSourceDeltaPlan, MatrixRuntimeStoreError> {
+) -> Result<MatrixSourceDeltaPlan, MatrixSqliteRepositoryError> {
     let mut fact_types = source_pack
         .fact_mappings
         .iter()
@@ -2496,7 +2498,7 @@ fn source_pack_delta_plan_for(
 fn insert_connector_run(
     connection: &Connection,
     run: &MatrixConnectorRun,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_connector_run (
             run_id, source_pack_id, connector_kind, status, run_json, created_at, updated_at
@@ -2517,7 +2519,7 @@ fn insert_connector_run(
 fn find_connector_run(
     connection: &Connection,
     run_id: &str,
-) -> Result<Option<MatrixConnectorRun>, MatrixRuntimeStoreError> {
+) -> Result<Option<MatrixConnectorRun>, MatrixSqliteRepositoryError> {
     connection
         .query_row(
             "SELECT run_json FROM matrix_connector_run WHERE run_id = ?1",
@@ -2525,14 +2527,14 @@ fn find_connector_run(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixRuntimeStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
         .transpose()
 }
 
 fn upsert_data_plane_watermark(
     connection: &Connection,
     watermark: &MatrixDataPlaneWatermark,
-) -> Result<(), MatrixRuntimeStoreError> {
+) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_data_plane_watermark (
             source_ref, fact_type, partition_ref, high_watermark, last_batch_id,
@@ -2554,7 +2556,7 @@ fn upsert_data_plane_watermark(
 fn list_data_plane_watermarks(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixRuntimeStoreError> {
+) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT watermark_json
           FROM matrix_data_plane_watermark
@@ -2565,10 +2567,10 @@ fn list_data_plane_watermarks(
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
-fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixRuntimeStoreError> {
+fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixSqliteRepositoryError> {
     Ok(chrono::DateTime::parse_from_rfc3339(value)
         .map_err(|error| {
-            MatrixRuntimeStoreError::Json(serde_json::Error::io(std::io::Error::new(
+            MatrixSqliteRepositoryError::Json(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 error,
             )))
@@ -2578,7 +2580,7 @@ fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixRuntime
 
 fn parse_optional_rfc3339_utc(
     value: Option<String>,
-) -> Result<Option<chrono::DateTime<Utc>>, MatrixRuntimeStoreError> {
+) -> Result<Option<chrono::DateTime<Utc>>, MatrixSqliteRepositoryError> {
     value.as_deref().map(parse_rfc3339_utc).transpose()
 }
 

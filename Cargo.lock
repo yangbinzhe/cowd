@@ -69,7 +69,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "approval"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "serde",
  "serde_json",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "cowd-memory",
  "gateway",
@@ -578,11 +578,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "command-runtime"
-version = "0.9.308"
+name = "command-contract"
+version = "0.9.309"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "command-service"
+version = "0.9.309"
 dependencies = [
  "chrono",
- "commands",
+ "command-contract",
  "cowd-memory",
  "plugins",
  "regex",
@@ -591,13 +598,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "commands"
-version = "0.9.308"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -651,11 +651,11 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-mfg"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "chrono",
- "matrix",
- "matrix-store",
+ "matrix-core",
+ "matrix-repository",
  "rusqlite",
  "serde",
  "serde_json",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-memory"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1204,21 +1204,21 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "approval",
  "async-trait",
  "axum",
  "chrono",
- "command-runtime",
- "commands",
+ "command-contract",
+ "command-service",
  "cowd-app-mfg",
  "cowd-memory",
  "crossterm",
  "futures",
  "libc",
- "matrix",
- "matrix-store",
+ "matrix-core",
+ "matrix-repository",
  "mcp",
  "plugins",
  "provider",
@@ -2129,8 +2129,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
-name = "matrix"
-version = "0.9.308"
+name = "matrix-core"
+version = "0.9.309"
 dependencies = [
  "chrono",
  "serde",
@@ -2140,11 +2140,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-store"
-version = "0.9.308"
+name = "matrix-repository"
+version = "0.9.309"
 dependencies = [
  "chrono",
- "matrix",
+ "matrix-core",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "serde",
  "serde_json",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "serde",
  "serde_json",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "reqwest",
  "runtime",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "aes",
  "approval",
@@ -3404,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "serde",
  "serde_json",
@@ -3556,7 +3556,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3709,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "serde",
  "serde_json",
@@ -3982,10 +3982,10 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "base64 0.22.1",
- "command-runtime",
+ "command-service",
  "flate2",
  "futures",
  "mcp",
@@ -4238,7 +4238,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.308"
+version = "0.9.309"
 dependencies = [
  "chrono",
  "crossterm",

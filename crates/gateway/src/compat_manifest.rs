@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use commands::{CommandManifestEntry, CommandRegistry, CommandSource};
+use command_contract::{CommandManifestEntry, CommandRegistry, CommandSource};
 use runtime::{BootstrapPhase, BootstrapPlan};
 use tools::{ToolManifestEntry, ToolRegistry, ToolSource};
 

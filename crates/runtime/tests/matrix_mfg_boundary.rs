@@ -29,7 +29,7 @@ fn read_rs_files(root: &Path) -> Vec<(PathBuf, String)> {
 
 #[test]
 fn matrix_kernel_has_no_mfg_or_manufacturing_coupling() {
-    let matrix_root = repo_root().join("crates/matrix/src");
+    let matrix_root = repo_root().join("crates/matrix/core/src");
     let forbidden = [
         "server_manufacturing",
         "runtime::mfg",
@@ -91,7 +91,8 @@ fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
     assert!(
         files
             .iter()
-            .any(|(_, content)| content.contains("use matrix::") || content.contains("matrix::")),
+            .any(|(_, content)| content.contains("use matrix_core::")
+                || content.contains("matrix_core::")),
         "MFG application crate should depend on Matrix contracts"
     );
 

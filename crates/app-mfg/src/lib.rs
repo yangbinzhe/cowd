@@ -53,6 +53,6 @@ pub fn mfg_seed_plan() -> MfgDomainSeedPlan {
 }
 
 #[must_use]
-pub fn mfg_ontology_pack() -> matrix::MatrixOntologyPack {
+pub fn mfg_ontology_pack() -> matrix_core::MatrixOntologyPack {
     server_manufacturing_ontology_pack()
 }

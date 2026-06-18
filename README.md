@@ -63,7 +63,7 @@ entrypoints
 
 runtime services
   provider/config
-  commands
+  command
   session
   approval
   mcp
@@ -102,14 +102,15 @@ crates/cli
 crates/gateway
 crates/tui
 crates/provider
-crates/commands
-crates/command-runtime
+crates/command/contract
+crates/command/service
 crates/runtime
 crates/session
 crates/approval
 crates/mcp
 crates/memory
-crates/matrix
+crates/matrix/core
+crates/matrix/repository
 crates/tools
 crates/storage
 crates/app-mfg

@@ -21,7 +21,7 @@ mod gateway_services;
 mod gateway_static;
 mod init;
 mod logging;
-mod matrix_runtime_store;
+mod matrix_sqlite_repository;
 mod mcp_serve;
 mod render;
 mod runtime_boundary;
@@ -61,8 +61,8 @@ use provider::{
 };
 
 #[cfg(test)]
-use command_runtime::resume_supported_slash_commands;
-use command_runtime::{
+use command_service::resume_supported_slash_commands;
+use command_service::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json,
@@ -13479,7 +13479,7 @@ mod tests {
 
     #[test]
     fn shared_help_uses_resume_annotation_copy() {
-        let help = command_runtime::render_slash_command_help();
+        let help = command_service::render_slash_command_help();
         assert!(help.contains("Slash commands"));
         assert!(
             help.contains("[resumed TUI]     available after `cowd --resume <session-id|latest>`")

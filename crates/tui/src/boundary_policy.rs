@@ -25,12 +25,13 @@ impl TuiBoundaryPolicy {
             forbidden_direct_dependencies: [
                 "runtime",
                 "app_mfg",
-                "matrix",
+                "matrix-core",
+                "matrix-repository",
                 "storage",
                 "tools",
                 "memory",
-                "commands",
-                "command-runtime",
+                "command-contract",
+                "command-service",
                 "rusqlite",
             ]
             .into_iter()

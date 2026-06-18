@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use matrix::MatrixEvidencePacket;
+use matrix_core::MatrixEvidencePacket;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MfgAttributionCandidate {

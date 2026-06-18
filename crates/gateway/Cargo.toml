@@ -17,8 +17,8 @@ approval = { path = "../approval" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
-commands = { path = "../commands" }
-command-runtime = { path = "../command-runtime" }
+command-contract = { path = "../command/contract" }
+command-service = { path = "../command/service" }
 cowd-app-mfg = { path = "../app-mfg" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
@@ -37,8 +37,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 session = { path = "../session" }
 mcp = { path = "../mcp" }
-matrix = { path = "../matrix" }
-matrix-store = { path = "../matrix-store" }
+matrix-core = { path = "../matrix/core" }
+matrix-repository = { path = "../matrix/repository" }
 sha2 = "0.10"
 toml = "0.8"
 syntect = "5"

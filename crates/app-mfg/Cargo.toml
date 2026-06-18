@@ -7,8 +7,8 @@ publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
-matrix = { path = "../matrix" }
-matrix-store = { path = "../matrix-store" }
+matrix-core = { path = "../matrix/core" }
+matrix-repository = { path = "../matrix/repository" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true

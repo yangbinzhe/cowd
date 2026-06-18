@@ -6,7 +6,7 @@ pub mod skill_router;
 pub mod skill_security;
 pub mod skill_tools;
 
-pub use commands::{
+pub use command_contract::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandArgumentSchema, CommandCapabilityRequirement, CommandCategory, CommandDefinition,
     CommandDisplayHints, CommandKind, CommandManifestEntry, CommandProjection,

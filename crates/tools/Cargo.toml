@@ -9,7 +9,7 @@ publish.workspace = true
 futures = "0.3"
 provider = { path = "../provider" }
 base64 = "0.22"
-command-runtime = { path = "../command-runtime" }
+command-service = { path = "../command/service" }
 flate2 = "1"
 mcp = { path = "../mcp" }
 plugins = { path = "../plugins" }

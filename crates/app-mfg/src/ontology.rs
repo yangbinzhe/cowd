@@ -1,4 +1,4 @@
-use matrix::{
+use matrix_core::{
     MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
 };
 

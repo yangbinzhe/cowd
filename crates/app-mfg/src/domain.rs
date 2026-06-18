@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use matrix::{
+use matrix_core::{
     MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDefinition,
     MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
     MatrixSourceKey,

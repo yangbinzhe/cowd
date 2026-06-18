@@ -17,13 +17,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use matrix::{
+use matrix_core::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlan,
     MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixEvidencePacket,
     MatrixFact, MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput,
     MatrixRelation, MatrixRelationInput, MatrixSourcePack, MATRIX_SCHEMA_VERSION,
 };
-use matrix_store::{MatrixRuntimeStore, MatrixRuntimeStoreError as MatrixStoreError};
+use matrix_repository::{MatrixSqliteRepository, MatrixSqliteRepositoryError as MatrixStoreError};
 use memory::store::session::SessionRecord;
 use runtime::execution_outcome::{
     CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
@@ -732,7 +732,7 @@ fn default_matrix_bridge_mode() -> String {
 async fn matrix_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let health = store
         .health()
@@ -924,7 +924,7 @@ fn matrix_health_capabilities() -> Vec<&'static str> {
 async fn matrix_data_plane_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let health = store
         .data_plane_health()
@@ -940,7 +940,7 @@ async fn matrix_data_plane_ingest_plan_handler(
     Json(request): Json<MatrixDataPlaneIngestPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = request.session_id.clone();
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_data_plane_ingest(request.ingest)
@@ -1305,7 +1305,7 @@ async fn matrix_source_pack_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixSourcePackUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let source_pack = store
         .upsert_source_pack(request.source_pack)
@@ -1322,7 +1322,7 @@ async fn matrix_source_pack_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let source_pack = store
         .get_source_pack(&id)
@@ -1338,7 +1338,7 @@ async fn matrix_source_pack_validate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let validation = store
         .validate_source_pack(&id)
@@ -1356,7 +1356,7 @@ async fn matrix_source_pack_delta_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let delta_plan = store
         .source_pack_delta_plan(&id)
@@ -1375,7 +1375,7 @@ async fn matrix_source_pack_ingest_file_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MatrixSourcePackIngestFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     store
         .validate_source_pack(&id)
@@ -1406,7 +1406,7 @@ async fn matrix_source_pack_connector_run_plan_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgConnectorRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
         run_id: None,
@@ -1437,7 +1437,7 @@ async fn matrix_source_pack_connector_run_execute_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgConnectorRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
         run_id: None,
@@ -1467,7 +1467,7 @@ async fn matrix_connector_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let run = store
         .get_connector_run(&id)
@@ -1768,7 +1768,7 @@ async fn matrix_server_manufacturing_ontology_seed_handler(
 async fn matrix_entities_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entities = store
         .list_entities(100)
@@ -1783,7 +1783,7 @@ async fn matrix_entity_match_candidate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityMatchCandidateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let candidate = store
         .propose_entity_match(&request.left_entity_id, &request.right_entity_id)
@@ -1803,7 +1803,7 @@ async fn matrix_entity_conflict_decision_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityConflictDecisionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let decision = store
         .decide_entity_conflict(
@@ -1829,7 +1829,7 @@ async fn matrix_entity_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .upsert_entity(&MatrixEntity::from_input(request.entity))
@@ -1846,7 +1846,7 @@ async fn matrix_entity_resolve_source_key_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityResolveSourceKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .resolve_entity_by_source_key(&request.source_system, &request.source_key)
@@ -1866,7 +1866,7 @@ async fn matrix_entity_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .get_entity(&id)
@@ -1882,7 +1882,7 @@ async fn matrix_relation_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixRelationUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let relation = store
         .upsert_relation(&MatrixRelation::from_input(request.relation))
@@ -1902,7 +1902,7 @@ async fn matrix_entity_relations_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let relations = store
         .list_entity_relations(&id, 100)
@@ -1921,7 +1921,7 @@ async fn matrix_entity_impact_path_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let trace = store.impact_trace(&id, 3).map_err(|error| match error {
         MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
@@ -1944,7 +1944,7 @@ async fn matrix_fact_ingest_handler(
         ));
     }
     let session_id = request.session_id.clone();
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut facts = Vec::with_capacity(request.facts.len());
     let mut attention = Vec::with_capacity(request.facts.len());
@@ -1972,7 +1972,7 @@ async fn matrix_fact_ingest_handler(
 async fn matrix_metrics_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let metrics = store
         .list_metric_definitions()
@@ -1987,7 +1987,7 @@ async fn matrix_metric_detail_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let states = store
         .metric_states(&id)
@@ -2009,7 +2009,7 @@ async fn matrix_metric_lineage_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let lineage = store
         .metric_lineage(&id, 6)
@@ -2024,7 +2024,7 @@ async fn matrix_metric_attention_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixMetricAttentionPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_metric_attention(
@@ -2052,7 +2052,7 @@ async fn matrix_metric_snapshot_materialize_handler(
             "at least one metric_id is required",
         ));
     }
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let snapshot = store
         .materialize_metric_snapshot(request.metric_ids, request.scope_ref)
@@ -2069,7 +2069,7 @@ async fn matrix_metric_dependency_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixMetricDependencyUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let dependency = store
         .upsert_metric_dependency(&MatrixMetricDependency::from_input(request.dependency))
@@ -2086,7 +2086,7 @@ async fn matrix_metric_affected_by_fact_type_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgAffectedByFactTypeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let metric_ids = store
         .metrics_affected_by_fact_type(&request.fact_type)
@@ -2104,7 +2104,7 @@ async fn matrix_compute_job_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgComputeJobPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_compute_job_for_fact_type(request.job)
@@ -2121,7 +2121,7 @@ async fn matrix_compute_job_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let job = store
         .get_compute_job(&id)
@@ -2137,7 +2137,7 @@ async fn matrix_compute_job_run_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let job = store.run_compute_job(&id).map_err(|error| match error {
         MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
@@ -2152,7 +2152,7 @@ async fn matrix_compute_job_run_handler(
 async fn matrix_metric_recompute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let result = store
         .recompute_metrics()
@@ -2166,7 +2166,7 @@ async fn matrix_metric_recompute_handler(
 async fn matrix_changes_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let changes = store
         .list_changes(100)
@@ -2180,7 +2180,7 @@ async fn matrix_changes_handler(
 async fn matrix_attention_hot_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let items = store
         .list_attention(50)
@@ -2196,7 +2196,7 @@ async fn matrix_evidence_build_handler(
     Json(request): Json<MatrixEvidenceBuildRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = request.session_id.clone();
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .build_evidence_packet(
@@ -2226,7 +2226,7 @@ async fn matrix_evidence_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .get_evidence_packet(&id)
@@ -2242,7 +2242,7 @@ async fn matrix_evidence_quality_gate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let gate = store
         .evaluate_evidence_quality(&id)
@@ -2260,7 +2260,7 @@ async fn matrix_quality_gate_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let gate = store
         .get_quality_gate(&id)
@@ -2276,7 +2276,7 @@ async fn matrix_evidence_context_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)
+    let store = matrix_sqlite_repository(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .get_evidence_packet(&id)
@@ -3307,7 +3307,7 @@ fn matrix_cross_plane_bridge_outcome(
 
 fn enrich_matrix_agent_graph(
     graph: &mut AgentRunGraph,
-    packet: &matrix::MatrixEvidencePacket,
+    packet: &matrix_core::MatrixEvidencePacket,
 ) -> Result<(), runtime::AgentGraphError> {
     let now = now_ms();
     ensure_agent_node(
@@ -3759,8 +3759,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn matrix_runtime_store(state: &AppState) -> Result<MatrixRuntimeStore, MatrixStoreError> {
-    state.services.matrix.runtime_store(&state.config_home)
+fn matrix_sqlite_repository(state: &AppState) -> Result<MatrixSqliteRepository, MatrixStoreError> {
+    state.services.matrix.sqlite_repository(&state.config_home)
 }
 
 fn open_mfg_store(state: &AppState) -> Result<MfgStore, MfgMatrixAdapterError> {

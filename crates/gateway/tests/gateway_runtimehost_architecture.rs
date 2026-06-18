@@ -146,10 +146,11 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     assert!(tui_manifest.contains("name = \"tui\""));
     for forbidden in [
         "runtime",
-        "matrix",
+        "matrix-core",
+        "matrix-repository",
         "memory",
-        "commands",
-        "command-runtime",
+        "command-contract",
+        "command-service",
         "storage",
         "tools",
         "rusqlite",

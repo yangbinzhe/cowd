@@ -179,14 +179,15 @@ run_unit_fast() {
   run_step cargo_fmt cargo fmt --check
   run_step cargo_test_plugins cargo test -p plugins --no-default-features -- --nocapture
   run_step cargo_test_telemetry cargo test -p telemetry --no-default-features -- --nocapture
-  run_step cargo_test_commands cargo test -p commands --no-default-features -- --nocapture
+  run_step cargo_test_command_contract cargo test -p command-contract --no-default-features -- --nocapture
+  run_step cargo_test_command_service cargo test -p command-service --no-default-features -- --nocapture
   run_step cargo_test_memory_tuner cargo test -p cowd-memory performance_monitor::tests::test_tuner --no-default-features -- --nocapture
   run_step cargo_test_runtime_worker_state cargo test -p runtime worker_boot::tests::emit_state_file_writes_worker_status_on_transition --no-default-features -- --nocapture
 }
 
 run_contract() {
   run_step cargo_fmt cargo fmt --check
-  for pkg in provider commands cowd-memory plugins runtime telemetry tools; do
+  for pkg in provider command-contract command-service cowd-memory plugins runtime telemetry tools; do
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
   done
   run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture

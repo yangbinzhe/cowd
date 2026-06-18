@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use commands::CommandSurface;
+use command_contract::CommandSurface;
 use runtime::{
     classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
     ToolSafetyCategory,

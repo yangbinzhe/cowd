@@ -1,13 +1,5 @@
 [
   {
-    "file": "crates/runtime/src/matrix_store.rs",
-    "direct_open": "MatrixStore::open / MatrixStore::in_memory",
-    "owner": "matrix",
-    "replacement": "StorageRegistry matrix handle plus SqliteConnectionFactory",
-    "status": "owned_boundary_reviewed_0.9.305",
-    "allowed_until_test": "cargo test -p runtime matrix --no-default-features -- --nocapture"
-  },
-  {
     "file": "crates/memory/src/store/sqlite.rs",
     "direct_open": "r2d2_sqlite::SqliteConnectionManager::file",
     "owner": "memory",

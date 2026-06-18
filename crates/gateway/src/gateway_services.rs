@@ -6,11 +6,11 @@ use std::{
 
 use app_mfg::{MfgMatrixAdapterError, MfgStore};
 use approval::{ApprovalRepository, FileApprovalRepository};
-use commands::{
+use command_contract::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
-use matrix_store::MatrixRepository;
+use matrix_repository::MatrixRepository;
 use memory::store::session::{
     SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
 };
@@ -151,14 +151,17 @@ impl MatrixService {
     pub(crate) fn repository_handle(
         &self,
         config_home: impl AsRef<Path>,
-    ) -> Result<::matrix_store::MatrixRepositoryHandle, ::matrix_store::MatrixRepositoryError> {
-        ::matrix_store::MatrixRepositoryHandle::from_config_home(config_home)
+    ) -> Result<
+        ::matrix_repository::MatrixRepositoryHandle,
+        ::matrix_repository::MatrixRepositoryError,
+    > {
+        ::matrix_repository::MatrixRepositoryHandle::from_config_home(config_home)
     }
 
     pub(crate) fn store_path(
         &self,
         config_home: impl AsRef<Path>,
-    ) -> Result<PathBuf, ::matrix_store::MatrixRepositoryError> {
+    ) -> Result<PathBuf, ::matrix_repository::MatrixRepositoryError> {
         Ok(self.repository_handle(config_home)?.db_path().to_path_buf())
     }
 }
@@ -817,11 +820,11 @@ impl GatewayServices {
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
     ) -> Self {
-        let command_runtime = Arc::clone(&runtime);
+        let command_host_runtime = Arc::clone(&runtime);
         let session_kernel = runtime.session_kernel();
         Self {
             runtime: Some(runtime),
-            command: CommandService::new(Some(command_runtime)),
+            command: CommandService::new(Some(command_host_runtime)),
             session: SessionService::with_kernel(session_kernel),
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
@@ -1303,7 +1306,7 @@ impl MfgService {
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<MfgStore, MfgMatrixAdapterError> {
-        let path = ::matrix_store::MatrixRepositoryHandle::from_config_home(config_home)
+        let path = ::matrix_repository::MatrixRepositoryHandle::from_config_home(config_home)
             .map_err(to_mfg_sqlite_error)?
             .db_path()
             .to_path_buf();

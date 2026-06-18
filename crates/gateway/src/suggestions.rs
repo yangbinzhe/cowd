@@ -1,6 +1,6 @@
 //! Suggestion engine — fuzzy matching and ranked suggestions for CLI and slash commands.
 
-use commands::slash_command_specs;
+use command_contract::slash_command_specs;
 use std::str;
 
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[

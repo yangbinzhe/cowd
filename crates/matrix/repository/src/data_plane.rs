@@ -1,5 +1,5 @@
 use chrono::Utc;
-use matrix::{
+use matrix_core::{
     MatrixComputeJobInput, MatrixDataPlane, MatrixDataPlaneCapability, MatrixDataPlaneHealth,
     MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
 };

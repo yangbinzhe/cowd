@@ -14,8 +14,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use command_runtime::{SkillInfo, SkillRegistry, SkillRouter};
-use matrix::MatrixEvidencePacket;
+use command_service::{SkillInfo, SkillRegistry, SkillRouter};
+use matrix_core::MatrixEvidencePacket;
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};

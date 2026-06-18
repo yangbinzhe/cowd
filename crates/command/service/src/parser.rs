@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::skill_tools::{SkillManager, SkillViewInput, SkillViewOutput};
 use crate::{SkillInfo, SkillRegistry, SkillRegistryRootKind, SkillRegistrySource};
-use commands::{
+use command_contract::{
     SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
 #[allow(clippy::too_many_lines)]

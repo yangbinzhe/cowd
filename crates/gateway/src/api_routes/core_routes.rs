@@ -8,14 +8,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use matrix::structured::{
+use matrix_core::structured::{
     StructuredEvidence as CowdStructuredEvidence, StructuredFact as CowdStructuredFact,
     StructuredIngestPlan as CowdIngestPlan,
     StructuredIngestPlanInput as CowdStructuredIngestPlanInput,
     StructuredSource as CowdStructuredSource, StructuredWatermark as CowdWatermark,
 };
-use matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
-use matrix_store::{MatrixRuntimeStore, MatrixRuntimeStoreError};
+use matrix_core::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
+use matrix_repository::{MatrixSqliteRepository, MatrixSqliteRepositoryError};
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
@@ -87,7 +87,7 @@ async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 async fn structured_sources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let items = store
         .list_source_packs(100)
         .map_err(store_error)?
@@ -105,7 +105,7 @@ async fn structured_source_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let Some(source_pack) = store.get_source_pack(&id).map_err(store_error)? else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -119,7 +119,7 @@ async fn structured_ingest_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(input): Json<CowdStructuredIngestPlanInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let plan = store
         .plan_data_plane_ingest(input.into())
         .map_err(store_error)?;
@@ -129,7 +129,7 @@ async fn structured_ingest_plan_handler(
 async fn structured_facts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let items = store
         .list_facts(100)
         .map_err(store_error)?
@@ -146,7 +146,7 @@ async fn structured_facts_handler(
 async fn structured_evidence_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let items = store
         .list_evidence_packets(100)
         .map_err(store_error)?
@@ -163,7 +163,7 @@ async fn structured_evidence_handler(
 async fn structured_watermarks_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = matrix_runtime_store(&state)?;
+    let store = matrix_sqlite_repository(&state)?;
     let items = store
         .list_data_plane_watermarks(100)
         .map_err(store_error)?
@@ -213,7 +213,7 @@ where
 
 async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRuntimeEvidence {
     let (structured_indexes_ready, structured_watermark_persistent) =
-        match state.services.matrix.runtime_store(&state.config_home) {
+        match state.services.matrix.sqlite_repository(&state.config_home) {
             Ok(store) => {
                 let indexes_ready = store.list_source_packs(1).is_ok()
                     && store.list_facts(1).is_ok()
@@ -304,19 +304,19 @@ fn graph_skill_quality_contract_smoke() -> bool {
             .any(|source| source.reference == "structured-fact:release-gate-smoke")
 }
 
-fn matrix_runtime_store(
+fn matrix_sqlite_repository(
     state: &AppState,
-) -> Result<MatrixRuntimeStore, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<MatrixSqliteRepository, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .matrix
-        .runtime_store(&state.config_home)
+        .sqlite_repository(&state.config_home)
         .map_err(store_error)
 }
 
-fn store_error(error: MatrixRuntimeStoreError) -> (StatusCode, Json<ErrorResponse>) {
+fn store_error(error: MatrixSqliteRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        MatrixRuntimeStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MatrixSqliteRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }

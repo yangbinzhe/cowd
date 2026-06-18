@@ -7,7 +7,7 @@ active contract groups that must remain available during the entrypoint split.
 |---|---|---|---|
 | health/ready/root | active | TUI, WebUI, operators | RuntimeHost, storage, provider, WebUI static status |
 | config/provider/model | active | TUI, WebUI, CLI doctor | model/provider projection and updates |
-| commands | active | TUI, WebUI | command registry, slash projection, action dispatch |
+| command | active | TUI, WebUI | command registry, slash projection, action dispatch |
 | sessions/timeline | active | TUI, WebUI | session metadata, event log, timeline projection |
 | memory/context | active | TUI, WebUI | recall, context packets, maintenance state |
 | matrix | active | WebUI, MFG, reports | structured facts, entities, relations, evidence |

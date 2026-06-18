@@ -19,7 +19,7 @@ daemon business management are intentionally not part of the CLI surface.
 Gateway hosts RuntimeHost and coordinates these services:
 
 - provider/config
-- commands
+- command
 - session
 - approval
 - mcp
@@ -31,7 +31,7 @@ Gateway hosts RuntimeHost and coordinates these services:
 
 Routes should call Gateway services rather than opening concrete stores or
 kernels directly. TUI/WebUI should consume Gateway projections instead of
-importing runtime, matrix, storage, memory, or tool internals.
+importing runtime, command, matrix, storage, memory, or tool internals.
 
 ## Fact Engines
 

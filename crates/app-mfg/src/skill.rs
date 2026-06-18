@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use matrix::MatrixEvidencePacket;
+use matrix_core::MatrixEvidencePacket;
 
 use super::{MfgIncident, MfgOperationalAnalysis};
 

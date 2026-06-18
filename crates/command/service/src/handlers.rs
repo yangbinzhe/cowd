@@ -1,6 +1,6 @@
 use runtime::{compact_session, CompactionConfig, Session};
 
-use commands::SlashCommand;
+use command_contract::SlashCommand;
 // bring impl blocks into scope
 use crate::parser::{render_slash_command_help, SlashCommandResult};
 /// Return a result that redirects the command to the agent alias system.
@@ -193,7 +193,7 @@ mod tests {
         resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
         validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot,
     };
-    use commands::{SkillSlashDispatch, SlashCommand};
+    use command_contract::{SkillSlashDispatch, SlashCommand};
 
     use plugins::{
         PluginError, PluginKind, PluginLoadFailure, PluginManager, PluginManagerConfig,

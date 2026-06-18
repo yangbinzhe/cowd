@@ -25,7 +25,7 @@ use crate::{
     MfgPlaybook as MatrixPlaybook, MfgSkillRun as MatrixSkillRun,
 };
 
-use matrix::{
+use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
     MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
     MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
@@ -36,7 +36,7 @@ use matrix::{
     MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
     MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation,
 };
-use matrix_store::MatrixSqliteDataPlane;
+use matrix_repository::MatrixSqliteDataPlane;
 
 #[derive(Debug, Error)]
 pub enum MfgMatrixAdapterError {
@@ -356,7 +356,7 @@ impl MfgMatrixAdapter {
         &self,
         left_entity_id: &str,
         right_entity_id: &str,
-    ) -> Result<matrix::MatrixEntityMatchCandidate, MfgMatrixAdapterError> {
+    ) -> Result<matrix_core::MatrixEntityMatchCandidate, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -365,7 +365,7 @@ impl MfgMatrixAdapter {
             .ok_or_else(|| MfgMatrixAdapterError::NotFound(left_entity_id.to_string()))?;
         let right = find_entity(&connection, right_entity_id)?
             .ok_or_else(|| MfgMatrixAdapterError::NotFound(right_entity_id.to_string()))?;
-        let candidate = matrix::match_candidate(&left, &right).ok_or_else(|| {
+        let candidate = matrix_core::match_candidate(&left, &right).ok_or_else(|| {
             MfgMatrixAdapterError::NotFound(
                 "entity match candidate below confidence threshold".to_string(),
             )
@@ -381,7 +381,7 @@ impl MfgMatrixAdapter {
         retired_entity_id: &str,
         survivorship_rule: &str,
         notes: Option<String>,
-    ) -> Result<matrix::MatrixEntityConflictDecision, MfgMatrixAdapterError> {
+    ) -> Result<matrix_core::MatrixEntityConflictDecision, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -392,7 +392,7 @@ impl MfgMatrixAdapter {
             .ok_or_else(|| MfgMatrixAdapterError::NotFound(survivor_entity_id.to_string()))?;
         let retired = find_entity(&connection, retired_entity_id)?
             .ok_or_else(|| MfgMatrixAdapterError::NotFound(retired_entity_id.to_string()))?;
-        let decision = matrix::MatrixEntityConflictDecision {
+        let decision = matrix_core::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
             decision: "merge".to_string(),
@@ -2090,7 +2090,7 @@ fn find_ontology_pack(
 
 fn insert_entity_match_candidate(
     connection: &Connection,
-    candidate: &matrix::MatrixEntityMatchCandidate,
+    candidate: &matrix_core::MatrixEntityMatchCandidate,
 ) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_match_candidate (
@@ -2113,7 +2113,7 @@ fn insert_entity_match_candidate(
 fn find_entity_match_candidate(
     connection: &Connection,
     candidate_id: &str,
-) -> Result<Option<matrix::MatrixEntityMatchCandidate>, MfgMatrixAdapterError> {
+) -> Result<Option<matrix_core::MatrixEntityMatchCandidate>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT candidate_json FROM matrix_entity_match_candidate WHERE candidate_id = ?1",
@@ -2127,7 +2127,7 @@ fn find_entity_match_candidate(
 
 fn insert_entity_conflict_decision(
     connection: &Connection,
-    decision: &matrix::MatrixEntityConflictDecision,
+    decision: &matrix_core::MatrixEntityConflictDecision,
 ) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_conflict_decision (
@@ -2211,9 +2211,9 @@ fn upsert_entity(
 }
 
 fn merged_source_keys(
-    existing: &[matrix::MatrixSourceKey],
-    incoming: &[matrix::MatrixSourceKey],
-) -> Vec<matrix::MatrixSourceKey> {
+    existing: &[matrix_core::MatrixSourceKey],
+    incoming: &[matrix_core::MatrixSourceKey],
+) -> Vec<matrix_core::MatrixSourceKey> {
     let mut seen = BTreeSet::new();
     let mut keys = Vec::new();
     for source_key in existing.iter().chain(incoming.iter()) {
@@ -2270,8 +2270,8 @@ fn find_entity_by_source_key(
               JOIN matrix_entity e ON e.entity_id = s.entity_id
               WHERE s.source_system = ?1 AND s.source_key = ?2",
             params![
-                matrix::normalize_key(source_system),
-                matrix::normalize_key(source_key),
+                matrix_core::normalize_key(source_system),
+                matrix_core::normalize_key(source_key),
             ],
             |row| row.get::<_, String>(0),
         )
@@ -3951,7 +3951,7 @@ mod tests {
         MfgCockpitReportDeliveryState as MatrixCockpitReportDeliveryState,
         MfgCockpitReportRequest as MatrixCockpitReportRequest,
     };
-    use matrix::{
+    use matrix_core::{
         MatrixComputeJobInput, MatrixEntityInput, MatrixFactInput, MatrixMetricStatus,
         MatrixRelationInput, MatrixSourceKey,
     };
@@ -4393,7 +4393,7 @@ mod tests {
         assert!(!packet.source_refs.is_empty());
 
         let health = store.health().expect("health loads");
-        assert_eq!(health.schema_version, matrix::MATRIX_SCHEMA_VERSION);
+        assert_eq!(health.schema_version, matrix_core::MATRIX_SCHEMA_VERSION);
         assert_eq!(health.fact_count, 1);
         assert_eq!(health.attention_count, 1);
         assert_eq!(health.evidence_count, 1);

@@ -1,9 +1,28 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/app-mfg",
+    "crates/approval",
+    "crates/cli",
+    "crates/command/contract",
+    "crates/command/service",
+    "crates/gateway",
+    "crates/matrix/core",
+    "crates/matrix/repository",
+    "crates/mcp",
+    "crates/memory",
+    "crates/plugins",
+    "crates/provider",
+    "crates/runtime",
+    "crates/session",
+    "crates/storage",
+    "crates/telemetry",
+    "crates/tools",
+    "crates/tui",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.308"
+version = "0.9.309"
 edition = "2021"
 license = "MIT"
 publish = false
