@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::matrix::MatrixQualityGateDecision;
 use crate::structured_data::CowdStructuredEvidence;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,25 +64,10 @@ impl CowdStructuredQualityGate {
     }
 }
 
-impl From<&MatrixQualityGateDecision> for CowdStructuredQualityGate {
-    fn from(gate: &MatrixQualityGateDecision) -> Self {
-        Self {
-            gate_id: gate.gate_id.clone(),
-            target_ref: gate.target_ref.clone(),
-            decision: gate.decision.clone(),
-            score: gate.score,
-            structured_refs: Vec::new(),
-            reasons: gate.reasons.clone(),
-            required_actions: gate.required_actions.clone(),
-            created_at: gate.created_at,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
+    use matrix::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 
     #[test]
     fn structured_quality_gate_uses_structured_evidence_refs() {

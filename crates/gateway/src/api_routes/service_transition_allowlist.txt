@@ -1,0 +1,6 @@
+# Gateway service-layer transition allowlist
+#
+# owner: 0.9.292 Gateway RuntimeHost
+# policy: route direct store/kernel dependencies are closed.
+# new_usage_policy: do not add route direct store/kernel dependencies; add service methods instead.
+# status: closed_by=0.9.303

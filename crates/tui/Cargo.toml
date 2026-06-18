@@ -6,10 +6,24 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+libc = "0.2.186"
+pulldown-cmark = "0.13"
+ratatui = "0.29"
+reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+syntect = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+toml = "0.8"
+tui-textarea = "0.7"
+unicode-width = "0.2"
 
 [features]
 default = []
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "allow"

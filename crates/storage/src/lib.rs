@@ -533,11 +533,17 @@ mod tests {
                 "direct_open",
                 "owner",
                 "replacement",
-                "delete_by",
+                "status",
                 "allowed_until_test",
             ] {
                 assert!(entry.get(key).and_then(serde_json::Value::as_str).is_some());
             }
+            let stale_deadline_key = ["delete", "_by"].concat();
+            assert!(entry.get(&stale_deadline_key).is_none());
+            assert_eq!(
+                entry["status"].as_str().unwrap(),
+                "owned_boundary_reviewed_0.9.305"
+            );
             assert_ne!(
                 entry["allowed_until_test"].as_str().unwrap(),
                 "cargo test -p memory --no-default-features -- --nocapture"

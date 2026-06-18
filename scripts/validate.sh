@@ -190,14 +190,14 @@ run_contract() {
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
   done
   run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture
-  run_step cargo_test_cowd_cli_setup timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p cowd-cli setup --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_cowd_cli_gateway timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p cowd-cli gateway::tests:: --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_cowd_cli_runtime_control timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p cowd-cli runtime_control --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_cowd_cli_connector timeout "${COWD_CLI_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p cowd-cli connector --no-default-features -- --nocapture --test-threads=1
+  run_step cargo_test_gateway_setup timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
+    cargo test -p gateway setup --no-default-features -- --nocapture --test-threads=1
+  run_step cargo_test_gateway_gateway timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
+    cargo test -p gateway gateway::tests:: --no-default-features -- --nocapture --test-threads=1
+  run_step cargo_test_gateway_runtime_control timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
+    cargo test -p gateway runtime_control --no-default-features -- --nocapture --test-threads=1
+  run_step cargo_test_gateway_connector timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
+    cargo test -p gateway connector --no-default-features -- --nocapture --test-threads=1
 }
 
 run_scenario() {

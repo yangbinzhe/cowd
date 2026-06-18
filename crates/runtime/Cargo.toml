@@ -9,7 +9,6 @@ publish.workspace = true
 memory = { package = "cowd-memory", path = "../memory" }
 cowd-storage = { package = "storage", path = "../storage" }
 approval = { path = "../approval" }
-matrix = { path = "../matrix" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -47,7 +46,6 @@ lru = "0.12"
 libc = "0.2.186"
 
 [dev-dependencies]
-cowd-app-mfg = { path = "../app-mfg" }
 httpmock = "0.7"
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"

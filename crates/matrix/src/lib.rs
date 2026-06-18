@@ -14,7 +14,6 @@ mod metric_graph;
 mod ontology;
 mod quality;
 mod relation;
-pub mod repository;
 mod source;
 mod source_pack;
 pub mod structured;
@@ -28,7 +27,7 @@ pub use connector_runtime::{
 };
 pub use data_plane::{
     MatrixDataPlane, MatrixDataPlaneCapability, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixSqliteDataPlane,
+    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
 };
 pub use entity::{normalize_key, MatrixEntity, MatrixEntityInput, MatrixSourceKey};
 pub use evidence::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
@@ -45,9 +44,6 @@ pub use ontology::{
 };
 pub use quality::MatrixQualityGateDecision;
 pub use relation::{MatrixImpactHop, MatrixImpactTrace, MatrixRelation, MatrixRelationInput};
-pub use repository::{
-    MatrixRepository, MatrixRepositoryConfig, MatrixRepositoryError, MatrixRepositoryHandle,
-};
 pub use source::{MatrixSourceKind, MatrixSourceSnapshot};
 pub use source_pack::{
     MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourcePack,

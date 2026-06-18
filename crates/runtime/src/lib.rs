@@ -26,7 +26,6 @@ pub mod gates;
 mod git_context;
 pub mod graph_contract;
 pub mod green_contract;
-pub mod storage;
 pub mod wave;
 pub use green_contract::GreenLevel;
 mod hooks;
@@ -74,8 +73,6 @@ pub mod cross_plane_policy;
 pub mod execution_scheduler;
 pub mod intent_planner;
 pub mod joint_problem_solving;
-pub mod matrix;
-mod matrix_store;
 pub mod mirror;
 pub mod model_registry;
 pub mod mutation_plan;
@@ -210,32 +207,6 @@ pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass,
 };
-pub use matrix::{
-    matrix_reference, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
-    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorQualityReport, MatrixConnectorReceipt,
-    MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane, MatrixDataPlaneCapability,
-    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
-    MatrixDataPlaneWatermark, MatrixEntity, MatrixEntityConflictDecision, MatrixEntityInput,
-    MatrixEntityMatchCandidate, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
-    MatrixFactInput, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
-    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixMetricLineage, MatrixMetricSnapshot,
-    MatrixMetricSnapshotItem, MatrixMetricState, MatrixMetricStatus, MatrixOntologyConcept,
-    MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
-    MatrixQualityGateDecision, MatrixRelation, MatrixRelationInput, MatrixSeverity,
-    MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKey,
-    MatrixSourceKind, MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
-    MatrixSqliteDataPlane, MATRIX_SCHEMA_VERSION,
-};
-pub use matrix_store::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixRuntimeStore, MatrixRuntimeStoreError,
-};
-
-pub fn open_matrix_runtime_store(
-    path: impl AsRef<std::path::Path>,
-) -> Result<MatrixRuntimeStore, MatrixRuntimeStoreError> {
-    MatrixRuntimeStore::open(path)
-}
 
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,

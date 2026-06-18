@@ -1,8 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::matrix::MatrixMetricDependency;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CowdGraphNode {
     pub node_id: String,
@@ -34,51 +32,10 @@ pub struct CowdGraphPath {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<&MatrixMetricDependency> for CowdGraphPath {
-    fn from(dependency: &MatrixMetricDependency) -> Self {
-        let upstream = format!("metric:{}", dependency.upstream_metric_id);
-        let downstream = format!("metric:{}", dependency.downstream_metric_id);
-        Self {
-            path_id: format!("graph-path:{}", dependency.dependency_id),
-            path_type: "metric_dependency".to_string(),
-            nodes: vec![
-                CowdGraphNode {
-                    node_id: upstream.clone(),
-                    node_type: "metric".to_string(),
-                    label: dependency.upstream_metric_id.clone(),
-                },
-                CowdGraphNode {
-                    node_id: downstream.clone(),
-                    node_type: "metric".to_string(),
-                    label: dependency.downstream_metric_id.clone(),
-                },
-            ],
-            edges: vec![CowdGraphEdge {
-                edge_id: dependency.dependency_id.clone(),
-                from: upstream,
-                to: downstream,
-                relation: dependency.dependency_type.clone(),
-                evidence_refs: dependency
-                    .required_fact_types
-                    .iter()
-                    .map(|fact_type| format!("structured-fact-type:{fact_type}"))
-                    .collect(),
-            }],
-            structured_refs: dependency
-                .required_fact_types
-                .iter()
-                .map(|fact_type| format!("structured-fact-type:{fact_type}"))
-                .collect(),
-            confidence: dependency.confidence,
-            created_at: dependency.created_at,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix::MatrixMetricDependencyInput;
+    use matrix::MatrixMetricDependencyInput;
 
     #[test]
     fn metric_dependency_maps_to_graph_path_with_structured_refs() {

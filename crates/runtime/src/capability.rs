@@ -15,13 +15,11 @@ pub enum CowdCapabilityKind {
     Context,
     Memory,
     StructuredData,
-    Matrix,
     Event,
     Graph,
     Skill,
     Governance,
     Connector,
-    Manufacturing,
     Surface,
 }
 
@@ -119,14 +117,6 @@ impl CowdCapabilityRegistry {
                     &["read:structured_data", "write:structured_data"],
                 ),
                 kernel_capability(
-                    "cowd.matrix.runtime",
-                    "Matrix Runtime",
-                    CowdCapabilityKind::Matrix,
-                    "runtime::matrix",
-                    "Structured fact engine for entities, relations, facts, metrics, evidence, lineage and compute.",
-                    &["read:matrix", "write:matrix"],
-                ),
-                kernel_capability(
                     "cowd.runtime.event",
                     "Runtime Event",
                     CowdCapabilityKind::Event,
@@ -149,20 +139,6 @@ impl CowdCapabilityRegistry {
                     "runtime::connector",
                     "External account, service, resource and cross-plane connector management.",
                     &["read:connector", "write:connector"],
-                ),
-                application_capability(
-                    "mfg.manufacturing.application",
-                    "MFG Manufacturing Application",
-                    CowdCapabilityKind::Manufacturing,
-                    "cowd-app-mfg",
-                    "Manufacturing upper application over Matrix structured facts, memory, context and skill capabilities.",
-                    &[
-                        "cowd.matrix.runtime",
-                        "cowd.structured_data.core",
-                        "cowd.context.runtime",
-                        "cowd.memory.runtime",
-                        "cowd.skill.lifecycle",
-                    ],
                 ),
             ],
         }
@@ -219,31 +195,6 @@ fn kernel_capability(
             .collect(),
         surfaces: full_surface_availability(),
         depends_on: Vec::new(),
-    }
-}
-
-fn application_capability(
-    id: &str,
-    name: &str,
-    kind: CowdCapabilityKind,
-    owner_module: &str,
-    description: &str,
-    depends_on: &[&str],
-) -> CowdCapability {
-    CowdCapability {
-        id: id.to_string(),
-        name: name.to_string(),
-        layer: CowdCapabilityLayer::Application,
-        kind,
-        status: CowdCapabilityStatus::Preview,
-        owner_module: owner_module.to_string(),
-        description: description.to_string(),
-        required_permissions: vec!["read:mfg".to_string(), "write:mfg".to_string()],
-        surfaces: full_surface_availability(),
-        depends_on: depends_on
-            .iter()
-            .map(|capability_id| (*capability_id).to_string())
-            .collect(),
     }
 }
 
@@ -309,7 +260,7 @@ mod tests {
 
         assert_eq!(matrix.layer, CowdCapabilityLayer::Kernel);
         assert_eq!(matrix.kind, CowdCapabilityKind::Matrix);
-        assert_eq!(matrix.owner_module, "runtime::matrix");
+        assert_eq!(matrix.owner_module, "matrix");
         assert!(matrix.description.contains("Structured fact engine"));
     }
 

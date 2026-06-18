@@ -8,7 +8,7 @@
 //!   fallback table. Cycle detection with max 10 hops.
 //!
 //! This module replaces:
-//! * the CLI built-in alias table (`crates/cowd-cli/src/cli/mod.rs`)
+//! * the CLI built-in alias table (`crates/gateway/src/cli/mod.rs`)
 //! * the API `MODEL_REGISTRY` and `resolve_model_alias` in
 //!   `crates/provider/src/providers/mod.rs`
 //!

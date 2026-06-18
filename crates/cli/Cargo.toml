@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-entrypoint-legacy = { package = "cowd-cli", path = "../cowd-cli" }
+gateway = { path = "../gateway" }
 serde = { workspace = true, features = ["derive"] }
 
 [[bin]]

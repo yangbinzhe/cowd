@@ -56,7 +56,6 @@ impl CowdReleaseGateReport {
     pub fn evaluate_with(evidence: CowdReleaseGateRuntimeEvidence) -> Self {
         let registry = CowdCapabilityRegistry::core();
         let surface = CowdSurfaceParityContract::from_registry(&registry);
-        let mfg = registry.capability("mfg.manufacturing.application");
         let checks = vec![
             check(
                 "capability.registry.unique_ids",
@@ -67,19 +66,6 @@ impl CowdReleaseGateReport {
                 "structured_data.core.registered",
                 registry.capability("cowd.structured_data.core").is_some(),
                 "Structured data core is registered as cowd kernel capability.",
-            ),
-            check(
-                "matrix.kernel.registered",
-                registry.capability("cowd.matrix.runtime").is_some(),
-                "Matrix structured fact engine is registered as a kernel capability.",
-            ),
-            check(
-                "mfg.application.boundary",
-                mfg.is_some_and(|mfg| {
-                    mfg.layer == crate::capability::CowdCapabilityLayer::Application
-                        && mfg.depends_on.contains(&"cowd.matrix.runtime".to_string())
-                }),
-                "MFG is an application descriptor over Matrix, Memory and runtime capabilities.",
             ),
             check(
                 "surface.webui_tui.parity",

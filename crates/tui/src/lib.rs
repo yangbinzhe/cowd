@@ -1,52 +1,34 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TuiBackendAccess {
-    GatewayHttp,
-    GatewaySse,
-    GatewayCommandProjection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TuiBoundaryPolicy {
-    pub allowed_backend_access: Vec<TuiBackendAccess>,
-    pub forbidden_direct_dependencies: Vec<String>,
-}
-
-impl TuiBoundaryPolicy {
-    #[must_use]
-    pub fn gateway_client_only() -> Self {
-        Self {
-            allowed_backend_access: vec![
-                TuiBackendAccess::GatewayHttp,
-                TuiBackendAccess::GatewaySse,
-                TuiBackendAccess::GatewayCommandProjection,
-            ],
-            forbidden_direct_dependencies: [
-                "runtime", "app_mfg", "matrix", "storage", "tools", "memory", "rusqlite",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        }
-    }
-}
+pub mod accessibility;
+pub mod animation;
+pub mod app;
+mod boundary_policy;
+pub mod clipboard;
+pub mod components;
+pub mod config_migration;
+pub mod context_tokens;
+pub mod error_recovery;
+pub mod event;
+pub mod events;
+pub mod gateway_client;
+pub mod keybind;
+pub mod layout;
+pub mod md_renderer;
+pub mod osc52;
+pub mod profiler;
+pub mod protocol;
+pub mod render;
+pub mod runtime_control_store;
+pub mod scroll_state;
+pub mod skin;
+pub mod state;
+pub mod test_utils;
+pub mod theme;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tui_integration_tests;
 
-    #[test]
-    fn tui_policy_only_allows_gateway_backend_access() {
-        let policy = TuiBoundaryPolicy::gateway_client_only();
-        assert!(policy
-            .allowed_backend_access
-            .contains(&TuiBackendAccess::GatewayHttp));
-        assert!(policy
-            .forbidden_direct_dependencies
-            .contains(&"runtime".to_string()));
-        assert!(policy
-            .forbidden_direct_dependencies
-            .contains(&"rusqlite".to_string()));
-    }
-}
+pub use app::{App, DelegateTask, FileEntry, MemoryEntry, SkillSummary};
+pub use boundary_policy::{TuiBackendAccess, TuiBoundaryPolicy};
+#[allow(unused_imports)]
+pub use events::{cowd_event_channel, CowdEventReceiver};
+pub use protocol::{CowdEvent, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary};

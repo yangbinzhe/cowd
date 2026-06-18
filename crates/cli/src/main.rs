@@ -1,3 +1,3 @@
 fn main() {
-    entrypoint_legacy::main_entry();
+    gateway::main_entry();
 }

@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "cowd skills [list|view <name>|install <path>|help|<skill> [args]]"
+            "cowd skill [list|view <name>|install <path>|help]"
         );
 
         let _ = fs::remove_dir_all(workspace);

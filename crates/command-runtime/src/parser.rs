@@ -2399,7 +2399,7 @@ Example:
                 "Skills".to_string(),
                 "  Usage            /skills [list|view <name>|install <path>|help|<skill> [args]]".to_string(),
                 "  Alias            /skill".to_string(),
-                "  Direct CLI       cowd skills [list|view <name>|install <path>|help|<skill> [args]]".to_string(),
+                "  Direct CLI       cowd skill [list|view <name>|install <path>|help]".to_string(),
                 "  Local controls   list, view <name>, install <path>".to_string(),
                 "  Managed in UI    create, edit, delete, generate, validate, run, governance".to_string(),
                 "  Invoke           /skills help overview -> $help overview".to_string(),
@@ -2453,7 +2453,7 @@ Example:
             "usage": {
                 "slash_command": "/skills [list|view <name>|install <path>|help|<skill> [args]]",
                 "aliases": ["/skill"],
-                "direct_cli": "cowd skills [list|view <name>|install <path>|help|<skill> [args]]",
+                "direct_cli": "cowd skill [list|view <name>|install <path>|help]",
                 "local_controls": ["list", "view <name>", "install <path>"],
                 "managed_in_ui": ["create", "edit", "delete", "generate", "validate", "run", "governance"],
                 "invoke": "/skills help overview -> $help overview",

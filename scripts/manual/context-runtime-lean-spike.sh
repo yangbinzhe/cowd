@@ -8,6 +8,6 @@ cd "$ROOT"
 
 cargo test -p runtime stable_head_comparison -- --nocapture
 cargo test -p runtime lean_probe -- --nocapture
-cargo check -p cowd-cli
+cargo check -p gateway
 
 echo "context runtime lean spike passed"

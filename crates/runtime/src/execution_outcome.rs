@@ -3,9 +3,6 @@ use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::matrix::{
-    MatrixComputeJob, MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,8 +13,8 @@ pub enum CowdExecutionOutcomeKind {
     StructuredIngest,
     StructuredFact,
     StructuredEvidence,
-    ManufacturingCompute,
-    ManufacturingAction,
+    ApplicationCompute,
+    ApplicationAction,
     SkillRun,
 }
 
@@ -91,159 +88,6 @@ impl CowdExecutionOutcome {
     }
 }
 
-impl From<&MatrixDataPlaneIngestPlan> for CowdExecutionOutcome {
-    fn from(plan: &MatrixDataPlaneIngestPlan) -> Self {
-        Self {
-            outcome_id: format!("structured-ingest:{}", plan.batch_id),
-            kind: CowdExecutionOutcomeKind::StructuredIngest,
-            status: CowdExecutionOutcomeStatus::Planned,
-            title: format!("Structured ingest plan for {}", plan.fact_type),
-            summary: format!(
-                "Plan {} ingests {} estimated rows from {} partition {}.",
-                plan.batch_id, plan.estimated_rows, plan.source_ref, plan.partition_ref
-            ),
-            domain: Some("matrix".to_string()),
-            refs: vec![
-                CowdExecutionRef {
-                    ref_type: "structured_source".to_string(),
-                    id: plan.source_ref.clone(),
-                    label: Some(plan.source_ref.clone()),
-                },
-                CowdExecutionRef {
-                    ref_type: "structured_batch".to_string(),
-                    id: plan.batch_id.clone(),
-                    label: Some(plan.fact_type.clone()),
-                },
-            ],
-            evidence_refs: Vec::new(),
-            metrics: plan.affected_metric_ids.clone(),
-            payload: serde_json::to_value(plan).unwrap_or(Value::Null),
-            created_at: plan.planned_at,
-        }
-    }
-}
-
-impl From<&MatrixComputeJob> for CowdExecutionOutcome {
-    fn from(job: &MatrixComputeJob) -> Self {
-        Self {
-            outcome_id: format!("manufacturing-compute:{}", job.job_id),
-            kind: CowdExecutionOutcomeKind::ManufacturingCompute,
-            status: status_from_matrix(&job.status),
-            title: format!("Manufacturing compute {}", job.trigger_fact_type),
-            summary: format!(
-                "Compute job {} status {} affects {} metrics.",
-                job.job_id,
-                job.status,
-                job.metric_ids.len()
-            ),
-            domain: Some("matrix".to_string()),
-            refs: vec![CowdExecutionRef {
-                ref_type: "matrix_compute_job".to_string(),
-                id: job.job_id.clone(),
-                label: Some(job.trigger_fact_type.clone()),
-            }],
-            evidence_refs: job.trigger_fact_refs.clone(),
-            metrics: job.metric_ids.clone(),
-            payload: serde_json::to_value(job).unwrap_or(Value::Null),
-            created_at: job.created_at,
-        }
-    }
-}
-
-impl From<&MatrixFact> for CowdExecutionOutcome {
-    fn from(fact: &MatrixFact) -> Self {
-        let mut refs = vec![CowdExecutionRef {
-            ref_type: "structured_fact".to_string(),
-            id: fact.fact_id.clone(),
-            label: Some(fact.fact_type.clone()),
-        }];
-        if let Some(source_ref) = fact.source_ref.as_ref() {
-            refs.push(CowdExecutionRef {
-                ref_type: "structured_source".to_string(),
-                id: source_ref.clone(),
-                label: Some(source_ref.clone()),
-            });
-        }
-        Self {
-            outcome_id: format!("structured-fact:{}", fact.fact_id),
-            kind: CowdExecutionOutcomeKind::StructuredFact,
-            status: CowdExecutionOutcomeStatus::Succeeded,
-            title: format!("Structured fact {}", fact.fact_type),
-            summary: format!(
-                "Fact {} of type {} references {} entities with confidence {:.2}.",
-                fact.fact_id,
-                fact.fact_type,
-                fact.entity_refs.len(),
-                fact.confidence
-            ),
-            domain: Some("matrix".to_string()),
-            refs,
-            evidence_refs: fact
-                .source_ref
-                .iter()
-                .map(|source_ref| format!("structured-source:{source_ref}"))
-                .collect(),
-            metrics: fact.metric_key.iter().cloned().collect(),
-            payload: serde_json::to_value(fact).unwrap_or(Value::Null),
-            created_at: fact.event_time,
-        }
-    }
-}
-
-impl From<&MatrixEvidencePacket> for CowdExecutionOutcome {
-    fn from(packet: &MatrixEvidencePacket) -> Self {
-        Self {
-            outcome_id: format!("structured-evidence:{}", packet.packet_id),
-            kind: CowdExecutionOutcomeKind::StructuredEvidence,
-            status: if packet.missing_evidence.is_empty() {
-                CowdExecutionOutcomeStatus::Succeeded
-            } else {
-                CowdExecutionOutcomeStatus::Partial
-            },
-            title: format!("Evidence packet {}", packet.packet_id),
-            summary: format!(
-                "Evidence packet for '{}' has {} metric items, {} change items and confidence {:.2}.",
-                packet.problem_statement,
-                packet.metric_evidence.len(),
-                packet.change_evidence.len(),
-                packet.confidence
-            ),
-            domain: Some("matrix".to_string()),
-            refs: vec![CowdExecutionRef {
-                ref_type: "structured_evidence".to_string(),
-                id: packet.packet_id.clone(),
-                label: packet.attention_id.clone(),
-            }],
-            evidence_refs: packet
-                .source_refs
-                .iter()
-                .map(|source| source.reference.clone())
-                .collect(),
-            metrics: packet
-                .metric_evidence
-                .iter()
-                .filter_map(|item| item.get("metric_id").and_then(Value::as_str))
-                .map(ToString::to_string)
-                .collect(),
-            payload: serde_json::to_value(packet).unwrap_or(Value::Null),
-            created_at: packet.created_at,
-        }
-    }
-}
-
-fn status_from_matrix(status: &str) -> CowdExecutionOutcomeStatus {
-    match status {
-        "planned" | "dry_run_ready" | "queued_for_human_review" => {
-            CowdExecutionOutcomeStatus::Planned
-        }
-        "running" | "cross_plane_dispatched" => CowdExecutionOutcomeStatus::Running,
-        "completed" | "success" | "feedback_resolved" => CowdExecutionOutcomeStatus::Succeeded,
-        "failed" | "error" | "feedback_rejected" => CowdExecutionOutcomeStatus::Failed,
-        "blocked" | "cross_plane_blocked" => CowdExecutionOutcomeStatus::Blocked,
-        _ => CowdExecutionOutcomeStatus::Partial,
-    }
-}
-
 fn status_label(status: CowdExecutionOutcomeStatus) -> &'static str {
     match status {
         CowdExecutionOutcomeStatus::Planned => "planned",
@@ -262,7 +106,7 @@ fn created_at_ms(created_at: DateTime<Utc>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix::{
+    use matrix::{
         MatrixComputeJob, MatrixComputeJobInput, MatrixDataPlaneIngestPlan,
         MatrixDataPlaneWatermark, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
         MatrixFactInput,

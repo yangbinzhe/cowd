@@ -43,7 +43,7 @@ if [[ "$CLEAN_TMP" -eq 1 ]]; then
     -name 'cowd-fix-target' -o \
     -name 'cowd-validation-*' -o \
     -name 'cowd-api-*' -o \
-    -name 'cowd-cli-*' -o \
+    -name 'gateway-*' -o \
     -name 'cowd-connector-*' -o \
     -name 'cowd-context-*' -o \
     -name 'cowd-feishu-*' -o \

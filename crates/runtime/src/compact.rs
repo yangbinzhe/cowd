@@ -748,10 +748,10 @@ mod tests {
     #[test]
     fn extracts_key_files_from_message_content() {
         let files = collect_key_files(&[ConversationMessage::user_text(
-            "Update rust/crates/runtime/src/compact.rs and rust/crates/cowd-cli/src/main.rs next.",
+            "Update rust/crates/runtime/src/compact.rs and rust/crates/gateway/src/main.rs next.",
         )]);
         assert!(files.contains(&"rust/crates/runtime/src/compact.rs".to_string()));
-        assert!(files.contains(&"rust/crates/cowd-cli/src/main.rs".to_string()));
+        assert!(files.contains(&"rust/crates/gateway/src/main.rs".to_string()));
     }
 
     /// Regression: compaction must not split an assistant(ToolUse) /

@@ -35,8 +35,8 @@ use matrix::{
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
     MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
     MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation,
-    MatrixSqliteDataPlane,
 };
+use matrix_store::MatrixSqliteDataPlane;
 
 #[derive(Debug, Error)]
 pub enum MfgMatrixAdapterError {

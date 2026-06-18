@@ -61,14 +61,14 @@ else
   echo "PASS tui forbidden dependency tree"
 fi
 
-if cargo tree -p cowd-app-mfg --no-default-features | rg "runtime|cowd-cli|cowd_cli"; then
+if cargo tree -p cowd-app-mfg --no-default-features | rg "runtime|gateway::|gateway ="; then
   echo "FAIL app-mfg forbidden dependency tree"
   fail=1
 else
   echo "PASS app-mfg forbidden dependency tree"
 fi
 
-if cargo tree -p matrix --no-default-features | rg "runtime|cowd-cli|cowd_cli|app-mfg|app_mfg|mfg"; then
+if cargo tree -p matrix --no-default-features | rg "runtime|gateway|app-mfg|app_mfg|mfg"; then
   echo "FAIL matrix forbidden dependency tree"
   fail=1
 else

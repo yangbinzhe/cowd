@@ -117,9 +117,10 @@ crates/plugins
 crates/telemetry
 ```
 
-`crates/cowd-cli` is a temporary legacy entrypoint library named
-`entrypoint_legacy`; it is retained only while CLI/Gateway/TUI implementation is
-physically split into the new entry crates.
+`crates/gateway` remains the implementation crate behind the slim `cowd`
+binary entrypoint. Its library target is `gateway` while CLI, Gateway,
+and TUI responsibilities continue to be separated by crate and service
+boundaries.
 
 ## Development
 
@@ -127,7 +128,7 @@ physically split into the new entry crates.
 cargo fmt --check
 cargo check --workspace --no-default-features
 cargo test -p cli --no-default-features -- --nocapture
-cargo test -p cowd-cli --test gateway_runtimehost_architecture --no-default-features -- --nocapture
+cargo test -p gateway --test gateway_runtimehost_architecture --no-default-features -- --nocapture
 cargo build -p cli --no-default-features
 ```
 
@@ -140,5 +141,5 @@ cp target/debug/cowd ~/AI/cowd
 ```
 
 Use `scripts/validate.sh` for curated validation lanes. Full legacy
-`cowd-cli` unit tests are not the default entry migration gate because some old
+`gateway` unit tests are not the default entry migration gate because some old
 tests still spawn long-running Gateway child processes.

@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.300"
+version = "0.9.306"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -19,7 +19,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 cowd-memory = { path = "crates/memory" }
-cowd-cli = { path = "crates/cowd-cli" }
+gateway = { path = "crates/gateway" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

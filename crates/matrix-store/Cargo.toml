@@ -1,0 +1,27 @@
+[package]
+name = "matrix-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "matrix_store"
+path = "src/lib.rs"
+
+[dependencies]
+chrono.workspace = true
+matrix = { path = "../matrix" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+storage = { path = "../storage" }
+thiserror = "2"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

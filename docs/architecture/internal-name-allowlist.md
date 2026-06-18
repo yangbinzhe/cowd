@@ -10,8 +10,8 @@ where it must not be used as an internal Rust boundary name.
   file names may keep `cowd` when changing them would break operator workflows.
 - Rust crate paths, module names, service names, and new internal imports should
   not use `cowd_` or `cowd-*` unless explicitly listed below.
-- New exceptions require an owner and a delete-by version, or the
-  `external-stable` marker.
+- New exceptions require an owner and either `external-stable` or an
+  `owned-boundary-reviewed` marker.
 
 ## External Stable Names
 
@@ -22,26 +22,25 @@ where it must not be used as an internal Rust boundary name.
 | `.cowd` | project/user config directory | config | external-stable |
 | `cowd-serve.pid` | local process status file | gateway | external-stable |
 | `cowd-webui` | external WebUI repository/package name | webui | external-stable |
-| `cowd-memory` | published/internal package name during migration | memory | delete_by=0.9.305 |
-| `cowd-app-mfg` | package name during MFG app extraction | app-mfg | delete_by=0.9.305 |
+| `cowd-memory` | package name retained for API compatibility | memory | owned-boundary-reviewed |
+| `cowd-app-mfg` | package name retained for MFG app compatibility | app-mfg | owned-boundary-reviewed |
 | `cowd_capabilities` | HTTP response field | gateway API | external-stable |
 | `cowd_projection` | HTTP response field | gateway API | external-stable |
 | `cowd_surfaces` | HTTP response field | gateway API | external-stable |
 | `cowd_release_gate` | HTTP response field | gateway API | external-stable |
 
-## Temporary Internal Exceptions
+## Reviewed Internal Exceptions
 
-| name | kind | owner | delete_by | rationale |
+| name | kind | owner | status | rationale |
 |---|---|---|---|---|
-| `runtime::cowd_dirs` | Rust module | runtime | 0.9.305 | directory helpers still expose stable external paths |
-| `runtime::cowd_event` | Rust module | runtime | 0.9.305 | event bus rename must be coordinated with TUI/Gateway SSE DTOs |
-| `cowd_storage` | Rust dependency alias | runtime | 0.9.305 | avoids conflict while storage governance settles |
-| `cowd_memory` | Rust crate import | memory | 0.9.305 | Rust package rename requires broad test and docs update |
-| `crates/cowd-cli` | crate directory | entrypoints | 0.9.305 | temporary `entrypoint_legacy` library while implementation moves into `cli/gateway/tui` |
+| `runtime::cowd_dirs` | Rust module | runtime | owned-boundary-reviewed | directory helpers expose stable external paths |
+| `runtime::cowd_event` | Rust module | runtime | owned-boundary-reviewed | event DTO names are part of the Gateway/TUI SSE contract |
+| `cowd_storage` | Rust dependency alias | runtime | owned-boundary-reviewed | dependency alias avoids crate-name conflict |
+| `cowd_memory` | Rust crate import | memory | owned-boundary-reviewed | external package import retained for API compatibility |
+| `crates/gateway` | crate directory | entrypoints | owned-boundary-reviewed | implementation crate retained as `gateway` while entry crates own user-facing boundaries |
 
 ## Forbidden For New Code
 
-- `cowd_cli::`
 - `cowd_app_mfg::`
 - `cowd_memory::` outside memory crate tests or migration allowlist
 - new modules named `cowd_*`
@@ -53,7 +52,7 @@ where it must not be used as an internal Rust boundary name.
 Every architecture review should run:
 
 ```bash
-rg -n "cowd_cli|cowd_app_mfg|cowd_memory|mod cowd_|pub mod cowd_|use cowd_" crates --glob '*.rs'
+rg -n "cowd_app_mfg|cowd_memory|mod cowd_|pub mod cowd_|use cowd_" crates --glob '*.rs'
 ```
 
 Matches must either be removed or mapped to this allowlist.

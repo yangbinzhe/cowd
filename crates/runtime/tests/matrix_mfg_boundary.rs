@@ -130,12 +130,12 @@ fn structured_data_contract_has_no_matrix_or_context_dependency() {
 
 #[test]
 fn cowd_cli_depends_on_mfg_application_crate() {
-    let manifest = repo_root().join("crates/cowd-cli/Cargo.toml");
+    let manifest = repo_root().join("crates/gateway/Cargo.toml");
     let content = fs::read_to_string(&manifest)
         .unwrap_or_else(|_| panic!("read manifest {}", manifest.display()));
     assert!(
         content.contains("cowd-app-mfg"),
-        "cowd-cli must consume MFG through the application crate"
+        "gateway must consume MFG through the application crate"
     );
 }
 

@@ -35,8 +35,8 @@ check:
 test:
 	@echo "=== cargo test -p runtime config ($(SAFE_TEST_THREADS) threads) ==="
 	cargo test -p runtime config -- --test-threads=$(SAFE_TEST_THREADS)
-	@echo "=== cargo test -p cowd-cli logging::tests ($(SAFE_TEST_THREADS) threads) ==="
-	cargo test -p cowd-cli logging::tests:: -- --test-threads=$(SAFE_TEST_THREADS)
+	@echo "=== cargo test -p gateway logging::tests ($(SAFE_TEST_THREADS) threads) ==="
+	cargo test -p gateway logging::tests:: -- --test-threads=$(SAFE_TEST_THREADS)
 
 test-config:
 	@echo "=== cargo test -p runtime config ($(SAFE_TEST_THREADS) threads) ==="
