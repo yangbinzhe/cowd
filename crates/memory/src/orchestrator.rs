@@ -108,8 +108,14 @@ impl MemoryOrchestrator {
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
         // Open the SQLite store.
+        let handle = storage::StorageHandle::sqlite(
+            "memory",
+            config.store.sqlite_path.clone(),
+            "memory",
+            "memory_orchestrator_storage_handle_since_0.9.315",
+        );
         let store: Arc<dyn MemoryStore> = Arc::new(
-            SqliteStore::open(&config.store)
+            SqliteStore::open_storage_handle(&handle)
                 .map_err(|e| MemoryError::Store(format!("open sqlite: {e}")))?,
         );
 

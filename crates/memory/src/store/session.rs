@@ -691,6 +691,24 @@ impl SqliteSessionStore {
     /// Creates any missing parent directories and initialises the schema if
     /// the database is new.
     pub fn open(path: &Path) -> Result<Self> {
+        let handle = storage::StorageHandle::sqlite(
+            "session",
+            path.to_path_buf(),
+            "memory",
+            "session_store_path_adapter_since_0.9.315",
+        );
+        Self::open_storage_handle(&handle)
+    }
+
+    /// Open a session database through a typed storage handle.
+    pub fn open_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
+        if handle.backend != storage::StorageBackendKind::Sqlite {
+            return Err(MemoryError::Store(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        let path = &handle.path;
         let db_path = path
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 session db path".to_string()))?

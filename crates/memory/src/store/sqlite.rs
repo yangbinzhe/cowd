@@ -860,8 +860,25 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open (or create) the `SQLite` database at the path specified in `config`.
     pub fn open(config: &StoreConfig) -> Result<Self> {
-        let db_path = config
-            .sqlite_path
+        let handle = storage::StorageHandle::sqlite(
+            "memory",
+            config.sqlite_path.clone(),
+            "memory",
+            "memory_store_config_adapter_since_0.9.315",
+        );
+        Self::open_storage_handle(&handle)
+    }
+
+    /// Open a database through a typed storage handle.
+    pub fn open_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
+        if handle.backend != storage::StorageBackendKind::Sqlite {
+            return Err(MemoryError::Store(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        let db_path = handle
+            .path
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
             .to_owned();
@@ -878,19 +895,13 @@ impl SqliteStore {
 
     /// Open a database at an arbitrary `path`.
     pub fn open_path(path: &Path) -> Result<Self> {
-        let db_path = path
-            .to_str()
-            .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
-            .to_owned();
-        let pool = new_pool(&db_path, 10)
-            .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
-        let store = Self { pool };
-        let conn = store.conn()?;
-        init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
-        store
-            .ensure_kv_table(&conn)
-            .map_err(|e| MemoryError::Store(format!("ensure sqlite kv table: {e}")))?;
-        Ok(store)
+        let handle = storage::StorageHandle::sqlite(
+            "memory",
+            path.to_path_buf(),
+            "memory",
+            "memory_store_path_adapter_since_0.9.315",
+        );
+        Self::open_storage_handle(&handle)
     }
 
     /// Create an in-memory database (useful for testing).

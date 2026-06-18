@@ -1,10 +1,80 @@
 use std::path::{Path, PathBuf};
 
-use runtime::{ExternalResourceRef, SqliteResourceDirectory};
+use runtime::{
+    CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
+    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, ExternalResourceRef, PolicyDecisionKind,
+    SqliteResourceDirectory,
+};
 
 use super::{ConnectorService, ServiceEnvelope};
 
 impl ConnectorService {
+    pub(crate) fn service_action(
+        &self,
+        actor_principal: String,
+        tool_id: String,
+        actor_identity_ref: Option<String>,
+        source_channel: Option<String>,
+        session_id: Option<String>,
+        provider_account: impl Into<String>,
+        resource_ref: Option<String>,
+    ) -> CrossPlaneAction {
+        let mut action = CrossPlaneAction::new(actor_principal, tool_id);
+        action.actor_identity_ref = actor_identity_ref;
+        action.source_channel = source_channel;
+        action.session_id = session_id;
+        action.provider_account = Some(provider_account.into());
+        action.resource_ref = resource_ref;
+        action
+    }
+
+    pub(crate) fn policy_allows(&self, decision: &CrossPlanePolicyDecision) -> bool {
+        decision.decision == PolicyDecisionKind::Allow
+    }
+
+    pub(crate) fn record_service_execution_receipt(
+        &self,
+        control: &CrossPlaneControlPlane,
+        idempotency_key: Option<String>,
+        mode: &str,
+        status: &str,
+        dispatch_status: &str,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+        blockers: Vec<String>,
+        evidence: CrossPlaneDecisionEvidence,
+        audit_summary: String,
+    ) -> CrossPlaneExecutionReceipt {
+        let audit_result = if mode == "commit" && status == "executed" {
+            "executed"
+        } else if status == "dry_run" {
+            "dry_run"
+        } else {
+            "blocked"
+        };
+        let audit_record = runtime::CrossPlaneAuditRecord::new(
+            action.clone(),
+            decision.clone(),
+            audit_result,
+            audit_summary,
+        )
+        .with_evidence(evidence);
+        let audit_record_id = audit_record.id.clone();
+        control.record_audit(audit_record);
+        let receipt = CrossPlaneExecutionReceipt::new(
+            idempotency_key,
+            mode,
+            status,
+            dispatch_status,
+            action,
+            decision,
+            blockers,
+            Some(audit_record_id),
+        );
+        control.record_execution(receipt.clone());
+        receipt
+    }
+
     pub(crate) fn resource_list(&self) -> ServiceEnvelope {
         self.envelope("resource_list")
     }

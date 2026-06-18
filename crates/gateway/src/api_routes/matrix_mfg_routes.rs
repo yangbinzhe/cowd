@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use app_mfg::{
     MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCockpitProfile,
-    MfgCockpitProfileInput, MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState,
-    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCrossPlaneBridgeReceipt, MfgIncident,
-    MfgPlaybook, MfgRepositoryError, MfgSkillRun,
+    MfgCockpitProfileInput, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook, MfgRepositoryError, MfgSkillRun,
 };
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -23,7 +22,6 @@ use memory::store::session::SessionRecord;
 use runtime::execution_outcome::{
     CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
 };
-use runtime::{CrossPlaneAuditRecord, CrossPlaneExecutionReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -2740,7 +2738,7 @@ async fn matrix_execution_cross_plane_bridge_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgCrossPlaneBridgeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    super::cross_plane_routes::ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let execution = state
         .services
         .mfg
@@ -2756,10 +2754,15 @@ async fn matrix_execution_cross_plane_bridge_handler(
         .map(str::to_string);
 
     if let Some(key) = &idempotency_key {
-        if let Some(receipt) =
-            super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
         {
-            let execution = attach_matrix_cross_plane_receipt(&state, &execution, &receipt)
+            let execution = state
+                .services
+                .mfg
+                .attach_execution_cross_plane_receipt(&state.config_home, &execution, &receipt)
                 .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
             return Ok(Json(serde_json::json!({
                 "kind": "mfg.cross_plane_action_bridge",
@@ -2778,38 +2781,30 @@ async fn matrix_execution_cross_plane_bridge_handler(
         .mfg
         .cross_plane_action_from_execution(&execution, &request);
     let now = chrono::Utc::now();
-    let (action, decision, evidence) =
-        super::cross_plane_routes::decide_connector_action(&state, action, &mode, now);
-    let (status, dispatch_status, blockers, audit_result, audit_summary) =
-        state.services.mfg.bridge_outcome(&mode, &decision);
-    let audit_record = CrossPlaneAuditRecord::new(
-        action.clone(),
-        decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence);
-    let audit_record_id = audit_record.id.clone();
-    super::cross_plane_routes::cross_plane_control().record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
+    let snapshot = super::connector_routes::connector_snapshot(&state);
+    let (action, decision, evidence) = state
+        .services
+        .cross_plane
+        .decide_connector_action(&snapshot, action, &mode, now);
+    let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
+        state.services.cross_plane.control(),
         idempotency_key,
         mode.clone(),
-        status.clone(),
-        dispatch_status.clone(),
         action,
         decision,
-        blockers,
-        Some(audit_record_id),
+        evidence,
     );
-    super::cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
-    super::cross_plane_routes::save_cross_plane_state(&state);
-    let execution = attach_matrix_cross_plane_receipt(&state, &execution, &receipt)
+    state.services.cross_plane.save_state(&state.config_home);
+    let execution = state
+        .services
+        .mfg
+        .attach_execution_cross_plane_receipt(&state.config_home, &execution, &receipt)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.cross_plane_action_bridge",
-        "mode": mode,
-        "status": status,
-        "dispatch_status": dispatch_status,
+        "mode": receipt.mode.clone(),
+        "status": receipt.status.clone(),
+        "dispatch_status": receipt.dispatch_status.clone(),
         "execution": execution,
         "cross_plane_execution_receipt": receipt,
         "idempotent_replay": false,
@@ -2839,30 +2834,12 @@ async fn matrix_execution_feedback_handler(
     })))
 }
 
-fn attach_matrix_cross_plane_receipt(
-    state: &AppState,
-    execution: &MfgActionExecution,
-    receipt: &CrossPlaneExecutionReceipt,
-) -> Result<MfgActionExecution, MfgRepositoryError> {
-    state.services.mfg.attach_cross_plane_receipt(
-        &state.config_home,
-        &execution.execution_id,
-        MfgCrossPlaneBridgeReceipt::new(
-            execution.execution_id.clone(),
-            receipt.id.clone(),
-            receipt.status.clone(),
-            receipt.dispatch_status.clone(),
-            receipt.audit_record_id.clone(),
-        ),
-    )
-}
-
 fn deliver_mfg_cockpit_report(
     state: &AppState,
     report: MfgCockpitReportSnapshot,
     request: MfgCockpitReportDeliveryRequest,
 ) -> Result<MfgCockpitReportDeliveryOutcome, (StatusCode, Json<ErrorResponse>)> {
-    super::cross_plane_routes::ensure_cross_plane_loaded(state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
     let idempotency_key = request
         .idempotency_key
@@ -2876,8 +2853,10 @@ fn deliver_mfg_cockpit_report(
         .report_delivery_payload(&report, &request);
 
     if let Some(key) = &idempotency_key {
-        if let Some(receipt) =
-            super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
         {
             if !state
                 .services
@@ -2889,7 +2868,10 @@ fn deliver_mfg_cockpit_report(
                     "MFG cockpit report delivery idempotency key belongs to another cross-plane action",
                 ));
             }
-            let report = attach_mfg_report_delivery_receipt(state, &report, &receipt)
+            let report = state
+                .services
+                .mfg
+                .attach_report_delivery_receipt(&state.config_home, &report, &receipt)
                 .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
             return Ok(MfgCockpitReportDeliveryOutcome {
                 mode: receipt.mode.clone(),
@@ -2908,60 +2890,34 @@ fn deliver_mfg_cockpit_report(
         .mfg
         .report_delivery_action(&report, &request, &delivery_payload);
     let now = chrono::Utc::now();
-    let (action, decision, evidence) =
-        super::cross_plane_routes::decide_connector_action(state, action, &mode, now);
-    let (status, dispatch_status, blockers, audit_result, audit_summary) =
-        state.services.mfg.bridge_outcome(&mode, &decision);
-    let audit_record = CrossPlaneAuditRecord::new(
-        action.clone(),
-        decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence);
-    let audit_record_id = audit_record.id.clone();
-    super::cross_plane_routes::cross_plane_control().record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
+    let snapshot = super::connector_routes::connector_snapshot(state);
+    let (action, decision, evidence) = state
+        .services
+        .cross_plane
+        .decide_connector_action(&snapshot, action, &mode, now);
+    let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
+        state.services.cross_plane.control(),
         idempotency_key,
         mode.clone(),
-        status.clone(),
-        dispatch_status.clone(),
         action,
         decision,
-        blockers,
-        Some(audit_record_id),
+        evidence,
     );
-    super::cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
-    super::cross_plane_routes::save_cross_plane_state(state);
-    let report = attach_mfg_report_delivery_receipt(state, &report, &receipt)
+    state.services.cross_plane.save_state(&state.config_home);
+    let report = state
+        .services
+        .mfg
+        .attach_report_delivery_receipt(&state.config_home, &report, &receipt)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(MfgCockpitReportDeliveryOutcome {
-        mode,
-        status,
-        dispatch_status,
+        mode: receipt.mode.clone(),
+        status: receipt.status.clone(),
+        dispatch_status: receipt.dispatch_status.clone(),
         report,
         delivery_payload,
         cross_plane_execution_receipt: receipt,
         idempotent_replay: false,
     })
-}
-
-fn attach_mfg_report_delivery_receipt(
-    state: &AppState,
-    report: &MfgCockpitReportSnapshot,
-    receipt: &CrossPlaneExecutionReceipt,
-) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
-    state.services.mfg.attach_cockpit_report_delivery(
-        &state.config_home,
-        &report.report_id,
-        MfgCockpitReportDeliveryReceipt::new(
-            report.report_id.clone(),
-            receipt.id.clone(),
-            receipt.status.clone(),
-            receipt.dispatch_status.clone(),
-            receipt.audit_record_id.clone(),
-        ),
-    )
 }
 
 fn default_mfg_schedule_delivery_ref(

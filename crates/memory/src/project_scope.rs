@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::code_indexer::{CodeIndexer, CodeSymbol, SymbolEdge};
-use crate::config::StoreConfig;
 use crate::entity::{Entity, EntityType, KnowledgeGraph};
 use crate::entity_registry::EntityRegistry;
 use crate::error::MemoryError;
@@ -159,11 +158,13 @@ impl ProjectScopeManager {
     /// The global store is opened immediately; per-project stores are created
     /// lazily on [`register_project`](Self::register_project).
     pub fn new(global_path: PathBuf) -> Result<Self, MemoryError> {
-        let config = StoreConfig {
-            sqlite_path: global_path.clone(),
-            ..Default::default()
-        };
-        let global_store = SqliteStore::open(&config)?;
+        let global_handle = storage::StorageHandle::sqlite(
+            "memory",
+            global_path.clone(),
+            "memory",
+            "project_scope_global_storage_handle_since_0.9.315",
+        );
+        let global_store = SqliteStore::open_storage_handle(&global_handle)?;
 
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -223,11 +224,13 @@ impl ProjectScopeManager {
         }
 
         // Open (or create) the per-project SQLite store.
-        let config = StoreConfig {
-            sqlite_path: db_path,
-            ..Default::default()
-        };
-        let store = SqliteStore::open(&config)?;
+        let handle = storage::StorageHandle::sqlite(
+            "memory",
+            db_path,
+            "memory",
+            "project_scope_project_storage_handle_since_0.9.315",
+        );
+        let store = SqliteStore::open_storage_handle(&handle)?;
 
         let canonical_clone = canonical.clone();
         let now = Utc::now();

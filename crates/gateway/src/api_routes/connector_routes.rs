@@ -12,15 +12,15 @@ use memory::types::{
 use memory::MemoryScope;
 use runtime::{
     CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
-    ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt,
-    ExternalResourceRef, FeishuReadOnlyServiceConnector, MockDocsServiceConnector,
-    PolicyDecisionKind, ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    ConnectorRegistrySnapshot, ExternalResourceRef, FeishuReadOnlyServiceConnector,
+    MockDocsServiceConnector, ProviderAccount, ServiceConnector, ServiceToolRequest,
+    ServiceToolResult,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::services::GatewayMemoryManager;
 
-use super::{channel_routes, cross_plane_routes, AppState};
+use super::{channel_routes, AppState};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -842,7 +842,7 @@ async fn mock_docs_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MockDocsExecuteRequest>,
 ) -> impl IntoResponse {
-    cross_plane_routes::ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let mode = request.mode.as_deref().unwrap_or("dry_run");
     let idempotency_key = request
         .idempotency_key
@@ -851,8 +851,10 @@ async fn mock_docs_execute_handler(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     if let Some(key) = &idempotency_key {
-        if let Some(receipt) =
-            cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
         {
             return Json(serde_json::json!({
                 "kind": "connector_service_execution",
@@ -875,18 +877,26 @@ async fn mock_docs_execute_handler(
         &service_request.resource_id,
         &service_request.title,
     );
-    let mut action = CrossPlaneAction::new(request.actor_principal, request.tool_id);
-    action.actor_identity_ref = request.actor_identity_ref;
-    action.source_channel = request.source_channel;
-    action.session_id = request.session_id;
-    action.provider_account = Some("mock.docs".to_string());
-    action.resource_ref = Some(preview_resource.reference.clone());
+    let action = state.services.connector.service_action(
+        request.actor_principal,
+        request.tool_id,
+        request.actor_identity_ref,
+        request.source_channel,
+        request.session_id,
+        "mock.docs",
+        Some(preview_resource.reference.clone()),
+    );
 
-    let (action, decision, mut evidence) =
-        cross_plane_routes::decide_connector_action(&state, action, mode, chrono::Utc::now());
-    cross_plane_routes::save_cross_plane_state(&state);
+    let snapshot = connector_snapshot(&state);
+    let (action, decision, mut evidence) = state.services.cross_plane.decide_connector_action(
+        &snapshot,
+        action,
+        mode,
+        chrono::Utc::now(),
+    );
+    state.services.cross_plane.save_state(&state.config_home);
 
-    let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
+    let policy_allowed = state.services.connector.policy_allows(&decision);
     let mut allowed = policy_allowed;
     let mut bulkhead_guard = None;
     let mut bulkhead_blocker = None;
@@ -921,35 +931,22 @@ async fn mock_docs_execute_handler(
         blockers.push(blocker);
     }
     if mode == "commit" && allowed {
-        if let Some((grant_id, remaining)) =
-            cross_plane_routes::cross_plane_control().consume_matched_grant_for_decision(&decision)
+        if let Some((grant_id, remaining)) = state
+            .services
+            .cross_plane
+            .consume_matched_grant_for_decision(&decision)
         {
             evidence.consumed_grant_id = Some(grant_id);
             evidence.remaining_uses_after = Some(remaining);
         }
     }
-    let audit_result = if mode == "commit" && allowed {
-        "executed"
-    } else if allowed {
-        "dry_run"
-    } else {
-        "blocked"
-    };
     let audit_summary = if blockers.is_empty() {
-        format!("mock.docs {audit_result}")
+        format!("mock.docs {status}")
     } else {
         blockers.join("; ")
     };
-    let audit_record = CrossPlaneAuditRecord::new(
-        action.clone(),
-        decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence);
-    let audit_record_id = audit_record.id.clone();
-    cross_plane_routes::cross_plane_control().record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
+    let receipt = state.services.connector.record_service_execution_receipt(
+        state.services.cross_plane.control(),
         idempotency_key,
         mode,
         status,
@@ -957,10 +954,10 @@ async fn mock_docs_execute_handler(
         action,
         decision,
         blockers,
-        Some(audit_record_id),
+        evidence,
+        audit_summary,
     );
-    cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
-    cross_plane_routes::save_cross_plane_state(&state);
+    state.services.cross_plane.save_state(&state.config_home);
     let service_result = if mode == "commit" && allowed {
         let result = MockDocsServiceConnector::new().execute_tool(service_request);
         connector_service_bulkhead().record_success("mock.docs");
@@ -1022,7 +1019,7 @@ async fn feishu_readonly_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MockDocsExecuteRequest>,
 ) -> impl IntoResponse {
-    cross_plane_routes::ensure_cross_plane_loaded(&state);
+    state.services.cross_plane.ensure_loaded(&state.config_home);
     let connector = FeishuReadOnlyServiceConnector::new();
     let snapshot = connector_snapshot(&state);
     let health = connector.probe(&snapshot.accounts);
@@ -1035,8 +1032,10 @@ async fn feishu_readonly_execute_handler(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     if let Some(key) = &idempotency_key {
-        if let Some(receipt) =
-            cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
         {
             return Json(serde_json::json!({
                 "kind": "connector_service_execution",
@@ -1055,20 +1054,27 @@ async fn feishu_readonly_execute_handler(
     };
     let preview_result = connector.execute_tool(service_request.clone());
     let preview_resource = preview_result.resource.clone();
-    let mut action = CrossPlaneAction::new(request.actor_principal, request.tool_id);
-    action.actor_identity_ref = request.actor_identity_ref;
-    action.source_channel = request.source_channel;
-    action.session_id = request.session_id;
-    action.provider_account = Some("feishu".to_string());
-    action.resource_ref = preview_resource
-        .as_ref()
-        .map(|resource| resource.reference.clone());
+    let action = state.services.connector.service_action(
+        request.actor_principal,
+        request.tool_id,
+        request.actor_identity_ref,
+        request.source_channel,
+        request.session_id,
+        "feishu",
+        preview_resource
+            .as_ref()
+            .map(|resource| resource.reference.clone()),
+    );
 
-    let (action, decision, mut evidence) =
-        cross_plane_routes::decide_connector_action(&state, action, mode, chrono::Utc::now());
-    cross_plane_routes::save_cross_plane_state(&state);
+    let (action, decision, mut evidence) = state.services.cross_plane.decide_connector_action(
+        &snapshot,
+        action,
+        mode,
+        chrono::Utc::now(),
+    );
+    state.services.cross_plane.save_state(&state.config_home);
 
-    let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
+    let policy_allowed = state.services.connector.policy_allows(&decision);
     let mut allowed = account_ready && policy_allowed;
     let mut bulkhead_guard = None;
     let mut bulkhead_blocker = None;
@@ -1112,35 +1118,22 @@ async fn feishu_readonly_execute_handler(
         blockers.push(blocker);
     }
     if mode == "commit" && allowed {
-        if let Some((grant_id, remaining)) =
-            cross_plane_routes::cross_plane_control().consume_matched_grant_for_decision(&decision)
+        if let Some((grant_id, remaining)) = state
+            .services
+            .cross_plane
+            .consume_matched_grant_for_decision(&decision)
         {
             evidence.consumed_grant_id = Some(grant_id);
             evidence.remaining_uses_after = Some(remaining);
         }
     }
-    let audit_result = if mode == "commit" && allowed {
-        "executed"
-    } else if allowed {
-        "dry_run"
-    } else {
-        "blocked"
-    };
     let audit_summary = if blockers.is_empty() {
-        format!("feishu.readonly {audit_result}")
+        format!("feishu.readonly {status}")
     } else {
         blockers.join("; ")
     };
-    let audit_record = CrossPlaneAuditRecord::new(
-        action.clone(),
-        decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence);
-    let audit_record_id = audit_record.id.clone();
-    cross_plane_routes::cross_plane_control().record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
+    let receipt = state.services.connector.record_service_execution_receipt(
+        state.services.cross_plane.control(),
         idempotency_key,
         mode,
         status,
@@ -1148,10 +1141,10 @@ async fn feishu_readonly_execute_handler(
         action,
         decision,
         blockers,
-        Some(audit_record_id),
+        evidence,
+        audit_summary,
     );
-    cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
-    cross_plane_routes::save_cross_plane_state(&state);
+    state.services.cross_plane.save_state(&state.config_home);
     let service_result = if allowed {
         let result = connector.execute_tool(service_request);
         connector_service_bulkhead().record_success("feishu");

@@ -81,7 +81,10 @@ impl UnifiedSessionStore {
                 handle.domain
             )));
         }
-        Self::open(&handle.path)
+        let store = SqliteSessionStore::open_storage_handle(handle)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(store)),
+        })
     }
 
     /// Open an in-memory session database (useful for testing).

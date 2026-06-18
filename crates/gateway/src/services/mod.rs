@@ -21,6 +21,7 @@ mod agent_service;
 mod command_service;
 mod connector_service;
 mod context_service;
+mod cross_plane_service;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
@@ -103,6 +104,21 @@ impl ConnectorService {
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         service_envelope(self.label, self.owner, operation)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CrossPlaneService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl CrossPlaneService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "cross_plane",
+            owner: "0.9.315 Cross-plane service boundary",
+        }
     }
 }
 
@@ -813,6 +829,7 @@ pub(crate) struct GatewayServices {
     pub(crate) memory: MemoryService,
     pub(crate) context: ContextService,
     pub(crate) connector: ConnectorService,
+    pub(crate) cross_plane: CrossPlaneService,
     pub(crate) tool: ToolService,
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
@@ -856,6 +873,7 @@ impl GatewayServices {
             memory: MemoryService::new(),
             context: ContextService::new(),
             connector: ConnectorService::new(),
+            cross_plane: CrossPlaneService::new(),
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),

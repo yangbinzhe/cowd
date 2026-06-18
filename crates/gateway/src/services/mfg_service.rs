@@ -15,8 +15,9 @@ use matrix_core::{
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, CrossPlaneRisk,
-    DataClassification, IdentityTrust, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
+    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, CrossPlaneRisk, DataClassification,
+    IdentityTrust, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -259,6 +260,40 @@ impl MfgService {
             "blocked".to_string(),
             "mfg_cross_plane_bridge_policy_blocked".to_string(),
         )
+    }
+
+    pub(crate) fn record_cross_plane_bridge_receipt(
+        &self,
+        control: &CrossPlaneControlPlane,
+        idempotency_key: Option<String>,
+        mode: String,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+        evidence: CrossPlaneDecisionEvidence,
+    ) -> CrossPlaneExecutionReceipt {
+        let (status, dispatch_status, blockers, audit_result, audit_summary) =
+            self.bridge_outcome(&mode, &decision);
+        let audit_record = runtime::CrossPlaneAuditRecord::new(
+            action.clone(),
+            decision.clone(),
+            audit_result,
+            audit_summary,
+        )
+        .with_evidence(evidence);
+        let audit_record_id = audit_record.id.clone();
+        control.record_audit(audit_record);
+        let receipt = CrossPlaneExecutionReceipt::new(
+            idempotency_key,
+            mode,
+            status,
+            dispatch_status,
+            action,
+            decision,
+            blockers,
+            Some(audit_record_id),
+        );
+        control.record_execution(receipt.clone());
+        receipt
     }
 
     pub(crate) fn report_delivery_payload(
@@ -570,6 +605,25 @@ impl MfgService {
             .attach_cross_plane_receipt(execution_id, receipt)
     }
 
+    pub(crate) fn attach_execution_cross_plane_receipt(
+        &self,
+        config_home: impl AsRef<Path>,
+        execution: &MfgActionExecution,
+        receipt: &CrossPlaneExecutionReceipt,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.attach_cross_plane_receipt(
+            config_home,
+            &execution.execution_id,
+            MfgCrossPlaneBridgeReceipt::new(
+                execution.execution_id.clone(),
+                receipt.id.clone(),
+                receipt.status.clone(),
+                receipt.dispatch_status.clone(),
+                receipt.audit_record_id.clone(),
+            ),
+        )
+    }
+
     pub(crate) fn record_execution_feedback(
         &self,
         config_home: impl AsRef<Path>,
@@ -729,6 +783,25 @@ impl MfgService {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.open_store(config_home)?
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub(crate) fn attach_report_delivery_receipt(
+        &self,
+        config_home: impl AsRef<Path>,
+        report: &MfgCockpitReportSnapshot,
+        receipt: &CrossPlaneExecutionReceipt,
+    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        self.attach_cockpit_report_delivery(
+            config_home,
+            &report.report_id,
+            MfgCockpitReportDeliveryReceipt::new(
+                report.report_id.clone(),
+                receipt.id.clone(),
+                receipt.status.clone(),
+                receipt.dispatch_status.clone(),
+                receipt.audit_record_id.clone(),
+            ),
+        )
     }
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {
