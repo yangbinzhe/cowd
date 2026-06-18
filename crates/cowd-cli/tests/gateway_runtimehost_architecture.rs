@@ -94,6 +94,28 @@ fn socket_business_commands_are_removed_after_tui_gateway_migration() {
 }
 
 #[test]
+fn compat_harness_is_not_a_workspace_dependency() {
+    let root = repo_root();
+    assert!(
+        !root.join("crates/compat-harness/Cargo.toml").exists(),
+        "compat-harness must stay outside the main crates workspace"
+    );
+
+    let manifests = [
+        "Cargo.toml",
+        "crates/cowd-cli/Cargo.toml",
+        "crates/runtime/Cargo.toml",
+    ];
+    for manifest in manifests {
+        let source = read_repo(manifest);
+        assert!(
+            !source.contains("compat-harness") && !source.contains("compat_harness"),
+            "{manifest} must not depend on compat-harness"
+        );
+    }
+}
+
+#[test]
 fn api_route_direct_dependencies_are_frozen_by_allowlist() {
     let allowlist = read_repo("crates/cowd-cli/src/api_routes/service_transition_allowlist.txt");
 

@@ -9,6 +9,7 @@ mod api_routes;
 mod bootstrap;
 mod checks;
 mod cli;
+mod compat_manifest;
 mod daemon;
 mod doctor;
 mod event_bus;
@@ -65,7 +66,7 @@ use command_runtime::{
     render_slash_command_help_filtered, resolve_skill_invocation, slash_command_specs,
     SkillRegistry, SkillSlashDispatch, SlashCommand,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
+use compat_manifest::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
