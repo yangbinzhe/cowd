@@ -9,6 +9,7 @@ publish.workspace = true
 memory = { package = "cowd-memory", path = "../memory" }
 cowd-storage = { package = "storage", path = "../storage" }
 approval = { path = "../approval" }
+matrix = { path = "../matrix" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

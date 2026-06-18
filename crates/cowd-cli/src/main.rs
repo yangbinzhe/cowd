@@ -19,6 +19,7 @@ mod gateway_services;
 mod gateway_static;
 mod init;
 mod logging;
+mod matrix_runtime_store;
 mod mcp_serve;
 mod render;
 mod runtime_boundary;

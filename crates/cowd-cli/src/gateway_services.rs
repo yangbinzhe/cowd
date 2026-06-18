@@ -1,10 +1,14 @@
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use approval::{ApprovalRepository, FileApprovalRepository};
 use commands::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
+use matrix::MatrixRepository;
 use memory::store::session::{
     SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
 };
@@ -67,8 +71,46 @@ define_gateway_service!(SystemService, "system");
 define_gateway_service!(AuditService, "audit");
 define_gateway_service!(SkillService, "skill");
 define_gateway_service!(AgentService, "agent");
-define_gateway_service!(MatrixService, "matrix");
 define_gateway_service!(MfgService, "mfg");
+
+#[derive(Clone)]
+pub(crate) struct MatrixService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl MatrixService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "matrix",
+            owner: "0.9.297 Matrix core boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        ServiceEnvelope {
+            service: self.label,
+            operation,
+            status: "service_ready",
+            owner: self.owner,
+            route_transition_delete_by: "0.9.298",
+        }
+    }
+
+    pub(crate) fn repository_handle(
+        &self,
+        config_home: impl AsRef<Path>,
+    ) -> Result<::matrix::MatrixRepositoryHandle, ::matrix::MatrixRepositoryError> {
+        ::matrix::MatrixRepositoryHandle::from_config_home(config_home)
+    }
+
+    pub(crate) fn store_path(
+        &self,
+        config_home: impl AsRef<Path>,
+    ) -> Result<PathBuf, ::matrix::MatrixRepositoryError> {
+        Ok(self.repository_handle(config_home)?.db_path().to_path_buf())
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct SessionService {
@@ -774,6 +816,16 @@ impl GatewayServices {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn transition_with_session_kernel_for_tests(
+        session_kernel: Arc<SessionKernel>,
+    ) -> Self {
+        Self {
+            session: SessionService::with_kernel(session_kernel),
+            ..Self::transition_only()
+        }
+    }
+
     pub(crate) fn service_labels(&self) -> Vec<&'static str> {
         vec![
             "runtime",
@@ -1070,12 +1122,24 @@ impl AgentService {
 }
 
 impl MatrixService {
-    pub(crate) fn placeholder(&self) -> ServiceEnvelope {
-        self.envelope("placeholder")
+    pub(crate) fn health(&self) -> ServiceEnvelope {
+        self.envelope("health")
+    }
+
+    pub(crate) fn structured_projection(&self) -> ServiceEnvelope {
+        self.envelope("structured_projection")
+    }
+
+    pub(crate) fn repository(&self) -> ServiceEnvelope {
+        self.envelope("repository")
     }
 
     fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.placeholder()]
+        vec![
+            self.health(),
+            self.structured_projection(),
+            self.repository(),
+        ]
     }
 }
 
@@ -1143,7 +1207,7 @@ mod tests {
             services.agent.task_projection().operation,
             "task_projection"
         );
-        assert_eq!(services.matrix.placeholder().operation, "placeholder");
+        assert_eq!(services.matrix.health().operation, "health");
         assert_eq!(services.mfg.placeholder().operation, "placeholder");
     }
 }

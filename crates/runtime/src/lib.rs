@@ -218,16 +218,28 @@ pub use matrix::{
     MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
     MatrixDataPlaneWatermark, MatrixEntity, MatrixEntityConflictDecision, MatrixEntityInput,
     MatrixEntityMatchCandidate, MatrixEvidencePacket, MatrixEvidenceSourceRef, MatrixFact,
-    MatrixFactInput, MatrixHealth, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
+    MatrixFactInput, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
     MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixMetricLineage, MatrixMetricRecomputeResult,
-    MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState, MatrixMetricStatus,
-    MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
+    MatrixMetricDependencyInput, MatrixMetricLineage, MatrixMetricSnapshot,
+    MatrixMetricSnapshotItem, MatrixMetricState, MatrixMetricStatus, MatrixOntologyConcept,
+    MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
     MatrixQualityGateDecision, MatrixRelation, MatrixRelationInput, MatrixSeverity,
     MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKey,
     MatrixSourceKind, MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
-    MatrixSqliteDataPlane, MatrixStore, MatrixStoreError, MATRIX_SCHEMA_VERSION,
+    MatrixSqliteDataPlane, MATRIX_SCHEMA_VERSION,
 };
+pub use matrix_store::{
+    MatrixHealth, MatrixMetricRecomputeResult, MfgMatrixAdapter, MfgMatrixAdapterError,
+};
+
+// owner=0.9.297 Matrix core boundary; delete_by=0.9.298 after MFG persistence
+// moves behind app-mfg/MfgService and no longer needs a runtime bridge.
+pub fn open_mfg_matrix_adapter(
+    path: impl AsRef<std::path::Path>,
+) -> Result<MfgMatrixAdapter, MfgMatrixAdapterError> {
+    MfgMatrixAdapter::open(path)
+}
+
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,

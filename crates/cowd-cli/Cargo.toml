@@ -37,6 +37,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 session = { path = "../session" }
 mcp = { path = "../mcp" }
+matrix = { path = "../matrix" }
 sha2 = "0.10"
 toml = "0.8"
 syntect = "5"

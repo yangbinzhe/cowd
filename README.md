@@ -2,7 +2,7 @@
 
 Rust 原生 AI Agent 运行时，提供 CLI、TUI、WebUI、HTTP Gateway、统一会话、记忆系统、工具执行、技能管理、Capability 投影、Structured Data Core、Surface Parity Contract、Matrix 事实引擎、MFG 应用层和生产 Release Gate。
 
-当前内核版本：`0.9.296`
+当前内核版本：`0.9.297`
 
 当前 WebUI 重构验收版本：`v0.9.245`
 

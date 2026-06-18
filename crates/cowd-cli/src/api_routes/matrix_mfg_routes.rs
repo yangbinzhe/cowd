@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -27,7 +26,7 @@ use runtime::{
     IdentityTrust, MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput,
     MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
     MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
-    MatrixStore, MatrixStoreError, PolicyDecisionKind, MATRIX_SCHEMA_VERSION,
+    MfgMatrixAdapter, MfgMatrixAdapterError, PolicyDecisionKind, MATRIX_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -727,12 +726,17 @@ fn default_matrix_bridge_mode() -> String {
 async fn matrix_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let health = store
         .health()
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let capabilities = matrix_health_capabilities();
+    let store_path = state
+        .services
+        .matrix
+        .store_path(&state.config_home)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.health",
         "status": "ready",
@@ -764,7 +768,7 @@ async fn matrix_health_handler(
         "entity_conflict_decision_count": health.entity_conflict_decision_count,
         "metric_snapshot_count": health.metric_snapshot_count,
         "skill_execution_count": health.skill_execution_count,
-        "store": matrix_store_path(&state.workspace_root),
+        "store": store_path,
         "capabilities": capabilities,
     })))
 }
@@ -922,7 +926,7 @@ fn matrix_health_capabilities() -> Vec<&'static str> {
 async fn matrix_data_plane_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let health = store
         .data_plane_health()
@@ -938,7 +942,7 @@ async fn matrix_data_plane_ingest_plan_handler(
     Json(request): Json<MatrixDataPlaneIngestPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = request.session_id.clone();
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_data_plane_ingest(request.ingest)
@@ -1303,7 +1307,7 @@ async fn matrix_source_pack_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixSourcePackUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let source_pack = store
         .upsert_source_pack(request.source_pack)
@@ -1320,7 +1324,7 @@ async fn matrix_source_pack_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let source_pack = store
         .get_source_pack(&id)
@@ -1336,12 +1340,12 @@ async fn matrix_source_pack_validate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let validation = store
         .validate_source_pack(&id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1354,12 +1358,12 @@ async fn matrix_source_pack_delta_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let delta_plan = store
         .source_pack_delta_plan(&id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1373,12 +1377,12 @@ async fn matrix_source_pack_ingest_file_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MatrixSourcePackIngestFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     store
         .validate_source_pack(&id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     let mut attention = Vec::new();
@@ -1404,7 +1408,7 @@ async fn matrix_source_pack_connector_run_plan_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgConnectorRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
         run_id: None,
@@ -1419,7 +1423,7 @@ async fn matrix_source_pack_connector_run_plan_handler(
     let run = store
         .plan_connector_run(&id, input)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1435,7 +1439,7 @@ async fn matrix_source_pack_connector_run_execute_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MfgConnectorRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
         run_id: None,
@@ -1450,7 +1454,7 @@ async fn matrix_source_pack_connector_run_execute_handler(
     let run = store
         .plan_connector_run(&id, input)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1465,7 +1469,7 @@ async fn matrix_connector_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let run = store
         .get_connector_run(&id)
@@ -1517,7 +1521,7 @@ async fn matrix_cockpit_projection_handler(
     let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let projection = store.cockpit_projection(&id).map_err(|error| match error {
-        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(serde_json::json!({
@@ -1537,7 +1541,9 @@ async fn matrix_cockpit_report_generate_handler(
         store
             .generate_cockpit_report(&id, request.report)
             .map_err(|error| match error {
-                MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+                MfgMatrixAdapterError::NotFound(message) => {
+                    api_error(StatusCode::NOT_FOUND, message)
+                }
                 other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?;
     Ok(Json(serde_json::json!({
@@ -1676,7 +1682,9 @@ async fn matrix_cockpit_report_schedule_run_handler(
                 },
             )
             .map_err(|error| match error {
-                MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+                MfgMatrixAdapterError::NotFound(message) => {
+                    api_error(StatusCode::NOT_FOUND, message)
+                }
                 other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?;
 
@@ -1762,7 +1770,7 @@ async fn matrix_server_manufacturing_ontology_seed_handler(
 async fn matrix_entities_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entities = store
         .list_entities(100)
@@ -1777,12 +1785,12 @@ async fn matrix_entity_match_candidate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityMatchCandidateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let candidate = store
         .propose_entity_match(&request.left_entity_id, &request.right_entity_id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1797,7 +1805,7 @@ async fn matrix_entity_conflict_decision_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityConflictDecisionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let decision = store
         .decide_entity_conflict(
@@ -1808,7 +1816,7 @@ async fn matrix_entity_conflict_decision_handler(
             request.notes,
         )
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1823,7 +1831,7 @@ async fn matrix_entity_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .upsert_entity(&MatrixEntity::from_input(request.entity))
@@ -1840,7 +1848,7 @@ async fn matrix_entity_resolve_source_key_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixEntityResolveSourceKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .resolve_entity_by_source_key(&request.source_system, &request.source_key)
@@ -1860,7 +1868,7 @@ async fn matrix_entity_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let entity = store
         .get_entity(&id)
@@ -1876,12 +1884,12 @@ async fn matrix_relation_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixRelationUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let relation = store
         .upsert_relation(&MatrixRelation::from_input(request.relation))
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1896,12 +1904,12 @@ async fn matrix_entity_relations_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let relations = store
         .list_entity_relations(&id, 100)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -1915,10 +1923,10 @@ async fn matrix_entity_impact_path_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let trace = store.impact_trace(&id, 3).map_err(|error| match error {
-        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(serde_json::json!({
@@ -1938,7 +1946,7 @@ async fn matrix_fact_ingest_handler(
         ));
     }
     let session_id = request.session_id.clone();
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let mut facts = Vec::with_capacity(request.facts.len());
     let mut attention = Vec::with_capacity(request.facts.len());
@@ -1970,7 +1978,7 @@ async fn matrix_fact_ingest_handler(
 async fn matrix_metrics_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let metrics = store
         .list_metric_definitions()
@@ -1985,7 +1993,7 @@ async fn matrix_metric_detail_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let states = store
         .metric_states(&id)
@@ -2007,7 +2015,7 @@ async fn matrix_metric_lineage_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let lineage = store
         .metric_lineage(&id, 6)
@@ -2022,7 +2030,7 @@ async fn matrix_metric_attention_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixMetricAttentionPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_metric_attention(
@@ -2050,7 +2058,7 @@ async fn matrix_metric_snapshot_materialize_handler(
             "at least one metric_id is required",
         ));
     }
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let snapshot = store
         .materialize_metric_snapshot(request.metric_ids, request.scope_ref)
@@ -2067,7 +2075,7 @@ async fn matrix_metric_dependency_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixMetricDependencyUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let dependency = store
         .upsert_metric_dependency(&MatrixMetricDependency::from_input(request.dependency))
@@ -2084,7 +2092,7 @@ async fn matrix_metric_affected_by_fact_type_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgAffectedByFactTypeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let metric_ids = store
         .metrics_affected_by_fact_type(&request.fact_type)
@@ -2102,7 +2110,7 @@ async fn matrix_compute_job_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgComputeJobPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let plan = store
         .plan_compute_job_for_fact_type(request.job)
@@ -2119,7 +2127,7 @@ async fn matrix_compute_job_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let job = store
         .get_compute_job(&id)
@@ -2135,10 +2143,10 @@ async fn matrix_compute_job_run_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let job = store.run_compute_job(&id).map_err(|error| match error {
-        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(serde_json::json!({
@@ -2150,7 +2158,7 @@ async fn matrix_compute_job_run_handler(
 async fn matrix_metric_recompute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let result = store
         .recompute_metrics()
@@ -2164,7 +2172,7 @@ async fn matrix_metric_recompute_handler(
 async fn matrix_changes_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let changes = store
         .list_changes(100)
@@ -2178,7 +2186,7 @@ async fn matrix_changes_handler(
 async fn matrix_attention_hot_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let items = store
         .list_attention(50)
@@ -2194,7 +2202,7 @@ async fn matrix_evidence_build_handler(
     Json(request): Json<MatrixEvidenceBuildRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = request.session_id.clone();
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .build_evidence_packet(
@@ -2202,7 +2210,7 @@ async fn matrix_evidence_build_handler(
             request.problem_statement.as_deref(),
         )
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     append_matrix_execution_outcome(
@@ -2224,7 +2232,7 @@ async fn matrix_evidence_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .get_evidence_packet(&id)
@@ -2240,12 +2248,12 @@ async fn matrix_evidence_quality_gate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let gate = store
         .evaluate_evidence_quality(&id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -2258,7 +2266,7 @@ async fn matrix_quality_gate_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let gate = store
         .get_quality_gate(&id)
@@ -2274,7 +2282,7 @@ async fn matrix_evidence_context_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let packet = store
         .get_evidence_packet(&id)
@@ -2282,7 +2290,7 @@ async fn matrix_evidence_context_handler(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.evidence.context_item",
-        "context_item": packet.to_context_item(),
+        "context_item": runtime::matrix::evidence_to_context_item(&packet),
     })))
 }
 
@@ -2300,7 +2308,9 @@ async fn matrix_incident_create_handler(
         None => store
             .build_evidence_packet(request.attention_id.as_deref(), request.title.as_deref())
             .map_err(|error| match error {
-                MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+                MfgMatrixAdapterError::NotFound(message) => {
+                    api_error(StatusCode::NOT_FOUND, message)
+                }
                 other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?,
     };
@@ -2341,7 +2351,7 @@ async fn matrix_incident_create_handler(
         "incident": incident,
         "task": task,
         "agent_graph": graph,
-        "context_item": packet.to_context_item(),
+        "context_item": runtime::matrix::evidence_to_context_item(&packet),
     })))
 }
 
@@ -2412,7 +2422,7 @@ async fn matrix_incident_analyze_handler(
     let store = open_mfg_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let analysis = store.analyze_incident(&id).map_err(|error| match error {
-        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(serde_json::json!({
@@ -2430,7 +2440,7 @@ async fn matrix_incident_case_promote_handler(
     let promotion = store
         .promote_incident_to_memory_case(&id)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -2514,7 +2524,7 @@ async fn matrix_incident_playbook_recommend_handler(
     let playbooks = store
         .recommend_playbooks_for_incident(&id, request.limit.unwrap_or(5).min(20))
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -2666,7 +2676,7 @@ async fn matrix_action_execute_handler(
     let execution = store
         .execute_recommended_action(&analysis_id, &action_id, &request)
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     let incident = store
@@ -2795,7 +2805,7 @@ async fn matrix_execution_feedback_handler(
             MfgActionFeedback::new(request.outcome, request.note, request.metric_delta),
         )
         .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            MfgMatrixAdapterError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
@@ -2808,7 +2818,7 @@ fn attach_matrix_cross_plane_receipt(
     store: &MfgStore,
     execution: &MfgActionExecution,
     receipt: &CrossPlaneExecutionReceipt,
-) -> Result<MfgActionExecution, MatrixStoreError> {
+) -> Result<MfgActionExecution, MfgMatrixAdapterError> {
     store.attach_cross_plane_receipt(
         &execution.execution_id,
         MfgCrossPlaneBridgeReceipt::new(
@@ -2905,7 +2915,7 @@ fn attach_matrix_report_delivery_receipt(
     store: &MfgStore,
     report: &MfgCockpitReportSnapshot,
     receipt: &CrossPlaneExecutionReceipt,
-) -> Result<MfgCockpitReportSnapshot, MatrixStoreError> {
+) -> Result<MfgCockpitReportSnapshot, MfgMatrixAdapterError> {
     store.attach_cockpit_report_delivery(
         &report.report_id,
         MfgCockpitReportDeliveryReceipt::new(
@@ -3538,26 +3548,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn open_matrix_store(state: &AppState) -> Result<MatrixStore, MatrixStoreError> {
-    let path = matrix_store_path(&state.workspace_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            MatrixStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
-    }
-    MatrixStore::open(path)
+fn open_mfg_matrix_adapter(state: &AppState) -> Result<MfgMatrixAdapter, MfgMatrixAdapterError> {
+    state.services.matrix.open_runtime_store(&state.config_home)
 }
 
-fn open_mfg_store(state: &AppState) -> Result<MfgStore, MatrixStoreError> {
-    let path = matrix_store_path(&state.workspace_root);
+fn open_mfg_store(state: &AppState) -> Result<MfgStore, MfgMatrixAdapterError> {
+    let path = state
+        .services
+        .matrix
+        .store_path(&state.config_home)
+        .map_err(|error| {
+            MfgMatrixAdapterError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            MatrixStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            MfgMatrixAdapterError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
     }
     MfgStore::open(path)
-}
-
-pub(super) fn matrix_store_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".cowd").join("matrix.sqlite")
 }

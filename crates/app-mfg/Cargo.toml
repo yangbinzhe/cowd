@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+matrix = { path = "../matrix" }
 runtime = { path = "../runtime" }
 
 [lints.rust]

@@ -39,30 +39,9 @@ reason=task operations still use task kernel directly until TaskService owns tas
 replacement_service=TaskService
 delete_by=0.9.296
 
-file=api_routes/cowd_routes.rs
-owner=0.9.292 Gateway RuntimeHost
-direct_dependency=MatrixStore::open
-reason=release gate and matrix evidence routes still read matrix facts directly
-replacement_service=MatrixService
-delete_by=0.9.297
-
-file=api_routes/matrix_mfg_routes.rs
-owner=0.9.292 Gateway RuntimeHost
-direct_dependency=MatrixStore::open
-reason=matrix cockpit routes are scheduled for MatrixService extraction
-replacement_service=MatrixService
-delete_by=0.9.297
-
 file=api_routes/matrix_mfg_routes.rs
 owner=0.9.292 Gateway RuntimeHost
 direct_dependency=MfgStore::open
 reason=MFG application routes remain upper-layer app routes until app extraction
 replacement_service=MfgService
 delete_by=0.9.298
-
-file=api_routes/skill_routes.rs
-owner=0.9.292 Gateway RuntimeHost
-direct_dependency=MatrixStore::open
-reason=skill evidence projection still reads matrix evidence directly
-replacement_service=SkillService+MatrixService
-delete_by=0.9.297

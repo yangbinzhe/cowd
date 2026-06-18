@@ -36,10 +36,8 @@ use crate::matrix::{
     MatrixSqliteDataPlane,
 };
 
-pub const MATRIX_SCHEMA_VERSION: i64 = 17;
-
 #[derive(Debug, Error)]
-pub enum MatrixStoreError {
+pub enum MfgMatrixAdapterError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
@@ -90,21 +88,21 @@ pub struct MatrixMetricRecomputeResult {
 }
 
 #[derive(Debug)]
-pub struct MatrixStore {
+pub struct MfgMatrixAdapter {
     connection: Mutex<Connection>,
 }
 
-impl MatrixStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixStoreError> {
+impl MfgMatrixAdapter {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MfgMatrixAdapterError> {
         let connection = Connection::open(path)?;
         Self::from_connection(connection)
     }
 
-    pub fn in_memory() -> Result<Self, MatrixStoreError> {
+    pub fn in_memory() -> Result<Self, MfgMatrixAdapterError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, MatrixStoreError> {
+    fn from_connection(connection: Connection) -> Result<Self, MfgMatrixAdapterError> {
         connection.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         connection.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -114,7 +112,7 @@ impl MatrixStore {
         })
     }
 
-    pub fn health(&self) -> Result<MatrixHealth, MatrixStoreError> {
+    pub fn health(&self) -> Result<MatrixHealth, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -156,7 +154,7 @@ impl MatrixStore {
         })
     }
 
-    pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MatrixStoreError> {
+    pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MfgMatrixAdapterError> {
         let health = self.health()?;
         Ok(MatrixSqliteDataPlane::new(health.data_plane_watermark_count).health())
     }
@@ -164,7 +162,7 @@ impl MatrixStore {
     pub fn plan_data_plane_ingest(
         &self,
         input: MatrixDataPlaneIngestPlanInput,
-    ) -> Result<MatrixDataPlaneIngestPlan, MatrixStoreError> {
+    ) -> Result<MatrixDataPlaneIngestPlan, MfgMatrixAdapterError> {
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
@@ -201,7 +199,7 @@ impl MatrixStore {
     pub fn upsert_cockpit_profile(
         &self,
         profile: &MatrixCockpitProfile,
-    ) -> Result<MatrixCockpitProfile, MatrixStoreError> {
+    ) -> Result<MatrixCockpitProfile, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -212,7 +210,7 @@ impl MatrixStore {
     pub fn get_cockpit_profile(
         &self,
         profile_id: &str,
-    ) -> Result<Option<MatrixCockpitProfile>, MatrixStoreError> {
+    ) -> Result<Option<MatrixCockpitProfile>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -224,7 +222,7 @@ impl MatrixStore {
         &self,
         cadence: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<MatrixCockpitProfile>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixCockpitProfile>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -235,13 +233,13 @@ impl MatrixStore {
     pub fn cockpit_projection(
         &self,
         profile_id: &str,
-    ) -> Result<MatrixCockpitProjection, MatrixStoreError> {
+    ) -> Result<MatrixCockpitProjection, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = find_cockpit_profile(&connection, profile_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(profile_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(profile_id.to_string()))?;
         build_cockpit_projection(&connection, profile)
     }
 
@@ -249,13 +247,13 @@ impl MatrixStore {
         &self,
         profile_id: &str,
         request: MatrixCockpitReportRequest,
-    ) -> Result<MatrixCockpitReportSnapshot, MatrixStoreError> {
+    ) -> Result<MatrixCockpitReportSnapshot, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = find_cockpit_profile(&connection, profile_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(profile_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(profile_id.to_string()))?;
         let projection = build_cockpit_projection(&connection, profile)?;
         let report = MatrixCockpitReportSnapshot::from_projection(projection, request);
         insert_cockpit_report(&connection, &report)?;
@@ -265,7 +263,7 @@ impl MatrixStore {
     pub fn get_cockpit_report(
         &self,
         report_id: &str,
-    ) -> Result<Option<MatrixCockpitReportSnapshot>, MatrixStoreError> {
+    ) -> Result<Option<MatrixCockpitReportSnapshot>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -277,19 +275,22 @@ impl MatrixStore {
         &self,
         report_id: &str,
         receipt: MatrixCockpitReportDeliveryReceipt,
-    ) -> Result<MatrixCockpitReportSnapshot, MatrixStoreError> {
+    ) -> Result<MatrixCockpitReportSnapshot, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut report = find_cockpit_report(&connection, report_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(report_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(report_id.to_string()))?;
         report.attach_delivery_receipt(receipt);
         insert_cockpit_report(&connection, &report)?;
         Ok(report)
     }
 
-    pub fn upsert_entity(&self, entity: &MatrixEntity) -> Result<MatrixEntity, MatrixStoreError> {
+    pub fn upsert_entity(
+        &self,
+        entity: &MatrixEntity,
+    ) -> Result<MatrixEntity, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -297,7 +298,10 @@ impl MatrixStore {
         upsert_entity(&connection, entity)
     }
 
-    pub fn get_entity(&self, entity_id: &str) -> Result<Option<MatrixEntity>, MatrixStoreError> {
+    pub fn get_entity(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<MatrixEntity>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -309,7 +313,7 @@ impl MatrixStore {
         &self,
         source_system: &str,
         source_key: &str,
-    ) -> Result<Option<MatrixEntity>, MatrixStoreError> {
+    ) -> Result<Option<MatrixEntity>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -317,7 +321,7 @@ impl MatrixStore {
         find_entity_by_source_key(&connection, source_system, source_key)
     }
 
-    pub fn list_entities(&self, limit: usize) -> Result<Vec<MatrixEntity>, MatrixStoreError> {
+    pub fn list_entities(&self, limit: usize) -> Result<Vec<MatrixEntity>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -325,7 +329,7 @@ impl MatrixStore {
         list_entities(&connection, limit)
     }
 
-    pub fn seed_mfg_ontology(&self) -> Result<MatrixOntologyPack, MatrixStoreError> {
+    pub fn seed_mfg_ontology(&self) -> Result<MatrixOntologyPack, MfgMatrixAdapterError> {
         let pack = mfg_ontology_pack();
         let connection = self
             .connection
@@ -338,7 +342,7 @@ impl MatrixStore {
     pub fn get_ontology_pack(
         &self,
         ontology_id: &str,
-    ) -> Result<Option<MatrixOntologyPack>, MatrixStoreError> {
+    ) -> Result<Option<MatrixOntologyPack>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -350,17 +354,17 @@ impl MatrixStore {
         &self,
         left_entity_id: &str,
         right_entity_id: &str,
-    ) -> Result<crate::matrix::MatrixEntityMatchCandidate, MatrixStoreError> {
+    ) -> Result<crate::matrix::MatrixEntityMatchCandidate, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let left = find_entity(&connection, left_entity_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(left_entity_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(left_entity_id.to_string()))?;
         let right = find_entity(&connection, right_entity_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(right_entity_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(right_entity_id.to_string()))?;
         let candidate = crate::matrix::match_candidate(&left, &right).ok_or_else(|| {
-            MatrixStoreError::NotFound(
+            MfgMatrixAdapterError::NotFound(
                 "entity match candidate below confidence threshold".to_string(),
             )
         })?;
@@ -375,17 +379,17 @@ impl MatrixStore {
         retired_entity_id: &str,
         survivorship_rule: &str,
         notes: Option<String>,
-    ) -> Result<super::MatrixEntityConflictDecision, MatrixStoreError> {
+    ) -> Result<super::MatrixEntityConflictDecision, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_entity_match_candidate(&connection, candidate_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(candidate_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(candidate_id.to_string()))?;
         let survivor = find_entity(&connection, survivor_entity_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(survivor_entity_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(survivor_entity_id.to_string()))?;
         let retired = find_entity(&connection, retired_entity_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(retired_entity_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(retired_entity_id.to_string()))?;
         let decision = super::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
@@ -410,7 +414,7 @@ impl MatrixStore {
         entity_scope: Option<String>,
         period: Option<String>,
         limit: usize,
-    ) -> Result<MatrixMetricAttentionPlan, MatrixStoreError> {
+    ) -> Result<MatrixMetricAttentionPlan, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -434,7 +438,7 @@ impl MatrixStore {
         &self,
         metric_ids: Vec<String>,
         scope_ref: Option<String>,
-    ) -> Result<MatrixMetricSnapshot, MatrixStoreError> {
+    ) -> Result<MatrixMetricSnapshot, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -447,7 +451,7 @@ impl MatrixStore {
     pub fn upsert_relation(
         &self,
         relation: &MatrixRelation,
-    ) -> Result<MatrixRelation, MatrixStoreError> {
+    ) -> Result<MatrixRelation, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -459,13 +463,13 @@ impl MatrixStore {
         &self,
         entity_id: &str,
         limit: usize,
-    ) -> Result<Vec<MatrixRelation>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixRelation>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if find_entity(&connection, entity_id)?.is_none() {
-            return Err(MatrixStoreError::NotFound(entity_id.to_string()));
+            return Err(MfgMatrixAdapterError::NotFound(entity_id.to_string()));
         }
         list_entity_relations(&connection, entity_id, limit)
     }
@@ -474,13 +478,13 @@ impl MatrixStore {
         &self,
         entity_id: &str,
         max_depth: usize,
-    ) -> Result<MatrixImpactTrace, MatrixStoreError> {
+    ) -> Result<MatrixImpactTrace, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if find_entity(&connection, entity_id)?.is_none() {
-            return Err(MatrixStoreError::NotFound(entity_id.to_string()));
+            return Err(MfgMatrixAdapterError::NotFound(entity_id.to_string()));
         }
         build_impact_trace(&connection, entity_id, max_depth)
     }
@@ -488,7 +492,7 @@ impl MatrixStore {
     pub fn register_metric_definition(
         &self,
         definition: &MatrixMetricDefinition,
-    ) -> Result<(), MatrixStoreError> {
+    ) -> Result<(), MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -499,7 +503,7 @@ impl MatrixStore {
     pub fn upsert_metric_dependency(
         &self,
         dependency: &MatrixMetricDependency,
-    ) -> Result<MatrixMetricDependency, MatrixStoreError> {
+    ) -> Result<MatrixMetricDependency, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -511,7 +515,7 @@ impl MatrixStore {
         &self,
         metric_id: &str,
         max_depth: usize,
-    ) -> Result<MatrixMetricLineage, MatrixStoreError> {
+    ) -> Result<MatrixMetricLineage, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -522,7 +526,7 @@ impl MatrixStore {
     pub fn metrics_affected_by_fact_type(
         &self,
         fact_type: &str,
-    ) -> Result<Vec<String>, MatrixStoreError> {
+    ) -> Result<Vec<String>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -533,7 +537,7 @@ impl MatrixStore {
     pub fn plan_compute_job_for_fact_type(
         &self,
         input: MatrixComputeJobInput,
-    ) -> Result<MatrixComputePlan, MatrixStoreError> {
+    ) -> Result<MatrixComputePlan, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -564,7 +568,7 @@ impl MatrixStore {
     pub fn get_compute_job(
         &self,
         job_id: &str,
-    ) -> Result<Option<MatrixComputeJob>, MatrixStoreError> {
+    ) -> Result<Option<MatrixComputeJob>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -572,14 +576,14 @@ impl MatrixStore {
         find_compute_job(&connection, job_id)
     }
 
-    pub fn run_compute_job(&self, job_id: &str) -> Result<MatrixComputeJob, MatrixStoreError> {
+    pub fn run_compute_job(&self, job_id: &str) -> Result<MatrixComputeJob, MfgMatrixAdapterError> {
         let mut job = {
             let connection = self
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut job = find_compute_job(&connection, job_id)?
-                .ok_or_else(|| MatrixStoreError::NotFound(job_id.to_string()))?;
+                .ok_or_else(|| MfgMatrixAdapterError::NotFound(job_id.to_string()))?;
             job.status = "running".to_string();
             job.attempts += 1;
             job.updated_at = Utc::now();
@@ -603,7 +607,7 @@ impl MatrixStore {
         upsert_compute_job(&connection, &job)
     }
 
-    pub fn seed_mfg_domain(&self) -> Result<MatrixDomainSeedResult, MatrixStoreError> {
+    pub fn seed_mfg_domain(&self) -> Result<MatrixDomainSeedResult, MfgMatrixAdapterError> {
         let plan = mfg_seed_plan();
         for entity in &plan.entities {
             self.upsert_entity(entity)?;
@@ -633,7 +637,10 @@ impl MatrixStore {
         })
     }
 
-    pub fn ingest_fact(&self, fact: &MatrixFact) -> Result<MatrixAttentionItem, MatrixStoreError> {
+    pub fn ingest_fact(
+        &self,
+        fact: &MatrixFact,
+    ) -> Result<MatrixAttentionItem, MfgMatrixAdapterError> {
         let attention = MatrixAttentionItem::from_fact(
             &fact.fact_id,
             &fact.fact_type,
@@ -674,7 +681,7 @@ impl MatrixStore {
     pub fn upsert_source_pack(
         &self,
         source_pack: MatrixSourcePack,
-    ) -> Result<MatrixSourcePack, MatrixStoreError> {
+    ) -> Result<MatrixSourcePack, MfgMatrixAdapterError> {
         let source_pack = source_pack.normalized();
         let connection = self
             .connection
@@ -687,7 +694,7 @@ impl MatrixStore {
     pub fn get_source_pack(
         &self,
         source_pack_id: &str,
-    ) -> Result<Option<MatrixSourcePack>, MatrixStoreError> {
+    ) -> Result<Option<MatrixSourcePack>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -698,7 +705,7 @@ impl MatrixStore {
     pub fn list_source_packs(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixSourcePack>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixSourcePack>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -709,26 +716,26 @@ impl MatrixStore {
     pub fn validate_source_pack(
         &self,
         source_pack_id: &str,
-    ) -> Result<MatrixSourcePackValidation, MatrixStoreError> {
+    ) -> Result<MatrixSourcePackValidation, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(source_pack_id.to_string()))?;
         Ok(source_pack.validate())
     }
 
     pub fn source_pack_delta_plan(
         &self,
         source_pack_id: &str,
-    ) -> Result<MatrixSourceDeltaPlan, MatrixStoreError> {
+    ) -> Result<MatrixSourceDeltaPlan, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(source_pack_id.to_string()))?;
         source_pack_delta_plan_for(&connection, &source_pack)
     }
 
@@ -736,13 +743,13 @@ impl MatrixStore {
         &self,
         source_pack_id: &str,
         input: MatrixConnectorRunInput,
-    ) -> Result<MatrixConnectorRun, MatrixStoreError> {
+    ) -> Result<MatrixConnectorRun, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(source_pack_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(source_pack_id.to_string()))?;
         let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
         let run = MatrixConnectorRun::from_source_pack(&source_pack, &delta_plan, input);
         insert_connector_run(&connection, &run)?;
@@ -752,7 +759,7 @@ impl MatrixStore {
     pub fn get_connector_run(
         &self,
         run_id: &str,
-    ) -> Result<Option<MatrixConnectorRun>, MatrixStoreError> {
+    ) -> Result<Option<MatrixConnectorRun>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -763,7 +770,7 @@ impl MatrixStore {
     pub fn list_attention(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixAttentionItem>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixAttentionItem>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -778,7 +785,7 @@ impl MatrixStore {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    pub fn list_facts(&self, limit: usize) -> Result<Vec<MatrixFact>, MatrixStoreError> {
+    pub fn list_facts(&self, limit: usize) -> Result<Vec<MatrixFact>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -786,14 +793,14 @@ impl MatrixStore {
         list_facts(&connection, limit)
     }
 
-    pub fn recompute_metrics(&self) -> Result<MatrixMetricRecomputeResult, MatrixStoreError> {
+    pub fn recompute_metrics(&self) -> Result<MatrixMetricRecomputeResult, MfgMatrixAdapterError> {
         self.recompute_metrics_with_filter(None)
     }
 
     pub fn recompute_metrics_for_metric_ids(
         &self,
         metric_ids: &[String],
-    ) -> Result<MatrixMetricRecomputeResult, MatrixStoreError> {
+    ) -> Result<MatrixMetricRecomputeResult, MfgMatrixAdapterError> {
         let filter = metric_ids.iter().cloned().collect::<BTreeSet<_>>();
         self.recompute_metrics_with_filter(Some(&filter))
     }
@@ -801,7 +808,7 @@ impl MatrixStore {
     fn recompute_metrics_with_filter(
         &self,
         metric_filter: Option<&BTreeSet<String>>,
-    ) -> Result<MatrixMetricRecomputeResult, MatrixStoreError> {
+    ) -> Result<MatrixMetricRecomputeResult, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -882,7 +889,9 @@ impl MatrixStore {
         })
     }
 
-    pub fn list_metric_definitions(&self) -> Result<Vec<MatrixMetricDefinition>, MatrixStoreError> {
+    pub fn list_metric_definitions(
+        &self,
+    ) -> Result<Vec<MatrixMetricDefinition>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -899,7 +908,7 @@ impl MatrixStore {
     pub fn metric_states(
         &self,
         metric_id: &str,
-    ) -> Result<Vec<MatrixMetricState>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixMetricState>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -914,7 +923,10 @@ impl MatrixStore {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    pub fn list_changes(&self, limit: usize) -> Result<Vec<MatrixChangeEvent>, MatrixStoreError> {
+    pub fn list_changes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MatrixChangeEvent>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -933,7 +945,7 @@ impl MatrixStore {
         &self,
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
-    ) -> Result<MatrixEvidencePacket, MatrixStoreError> {
+    ) -> Result<MatrixEvidencePacket, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -941,7 +953,7 @@ impl MatrixStore {
         let attention = match attention_id {
             Some(id) => Some(
                 find_attention(&connection, id)?
-                    .ok_or_else(|| MatrixStoreError::NotFound(id.to_string()))?,
+                    .ok_or_else(|| MfgMatrixAdapterError::NotFound(id.to_string()))?,
             ),
             None => latest_attention(&connection)?,
         };
@@ -995,7 +1007,7 @@ impl MatrixStore {
     pub fn get_evidence_packet(
         &self,
         packet_id: &str,
-    ) -> Result<Option<MatrixEvidencePacket>, MatrixStoreError> {
+    ) -> Result<Option<MatrixEvidencePacket>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1006,7 +1018,7 @@ impl MatrixStore {
     pub fn list_evidence_packets(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixEvidencePacket>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixEvidencePacket>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1017,13 +1029,13 @@ impl MatrixStore {
     pub fn evaluate_evidence_quality(
         &self,
         packet_id: &str,
-    ) -> Result<MatrixQualityGateDecision, MatrixStoreError> {
+    ) -> Result<MatrixQualityGateDecision, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let packet = find_evidence_packet(&connection, packet_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(packet_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(packet_id.to_string()))?;
         let decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
         insert_quality_gate(&connection, &decision)?;
         Ok(decision)
@@ -1032,7 +1044,7 @@ impl MatrixStore {
     pub fn get_quality_gate(
         &self,
         gate_id: &str,
-    ) -> Result<Option<MatrixQualityGateDecision>, MatrixStoreError> {
+    ) -> Result<Option<MatrixQualityGateDecision>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1043,7 +1055,7 @@ impl MatrixStore {
     pub fn list_data_plane_watermarks(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixDataPlaneWatermark>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1054,7 +1066,7 @@ impl MatrixStore {
     pub fn create_incident(
         &self,
         incident: &MatrixIncident,
-    ) -> Result<MatrixIncident, MatrixStoreError> {
+    ) -> Result<MatrixIncident, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1066,7 +1078,7 @@ impl MatrixStore {
     pub fn get_incident(
         &self,
         incident_id: &str,
-    ) -> Result<Option<MatrixIncident>, MatrixStoreError> {
+    ) -> Result<Option<MatrixIncident>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1074,7 +1086,10 @@ impl MatrixStore {
         find_incident(&connection, incident_id)
     }
 
-    pub fn list_incidents(&self, limit: usize) -> Result<Vec<MatrixIncident>, MatrixStoreError> {
+    pub fn list_incidents(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MatrixIncident>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1085,19 +1100,18 @@ impl MatrixStore {
     pub fn analyze_incident(
         &self,
         incident_id: &str,
-    ) -> Result<MatrixOperationalAnalysis, MatrixStoreError> {
+    ) -> Result<MatrixOperationalAnalysis, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut incident = find_incident(&connection, incident_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(incident_id.to_string()))?;
-        let packet_id = incident
-            .evidence_packet_id
-            .clone()
-            .ok_or_else(|| MatrixStoreError::NotFound("incident evidence packet".to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(incident_id.to_string()))?;
+        let packet_id = incident.evidence_packet_id.clone().ok_or_else(|| {
+            MfgMatrixAdapterError::NotFound("incident evidence packet".to_string())
+        })?;
         let mut packet = find_evidence_packet(&connection, &packet_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(packet_id.clone()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(packet_id.clone()))?;
         let analysis = MatrixOperationalAnalysis::from_evidence(incident_id, &packet);
 
         packet.attribution_candidates = analysis
@@ -1127,7 +1141,7 @@ impl MatrixStore {
     pub fn get_analysis(
         &self,
         analysis_id: &str,
-    ) -> Result<Option<MatrixOperationalAnalysis>, MatrixStoreError> {
+    ) -> Result<Option<MatrixOperationalAnalysis>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1138,7 +1152,7 @@ impl MatrixStore {
     pub fn latest_analysis_for_incident(
         &self,
         incident_id: &str,
-    ) -> Result<Option<MatrixOperationalAnalysis>, MatrixStoreError> {
+    ) -> Result<Option<MatrixOperationalAnalysis>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1151,19 +1165,19 @@ impl MatrixStore {
         analysis_id: &str,
         action_id: &str,
         request: &MatrixActionExecutionRequest,
-    ) -> Result<MatrixActionExecution, MatrixStoreError> {
+    ) -> Result<MatrixActionExecution, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let analysis = find_analysis(&connection, analysis_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(analysis_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(analysis_id.to_string()))?;
         let action = analysis
             .recommended_actions
             .iter()
             .find(|action| action.action_id == action_id)
             .cloned()
-            .ok_or_else(|| MatrixStoreError::NotFound(action_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(action_id.to_string()))?;
         let execution = MatrixActionExecution::from_action(&analysis, &action, request);
         insert_execution(&connection, &execution)?;
         Ok(execution)
@@ -1172,7 +1186,7 @@ impl MatrixStore {
     pub fn get_execution(
         &self,
         execution_id: &str,
-    ) -> Result<Option<MatrixActionExecution>, MatrixStoreError> {
+    ) -> Result<Option<MatrixActionExecution>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1183,7 +1197,7 @@ impl MatrixStore {
     pub fn record_skill_run(
         &self,
         run: &MatrixSkillRun,
-    ) -> Result<MatrixSkillRun, MatrixStoreError> {
+    ) -> Result<MatrixSkillRun, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1194,7 +1208,7 @@ impl MatrixStore {
     pub fn get_skill_run(
         &self,
         execution_id: &str,
-    ) -> Result<Option<MatrixSkillRun>, MatrixStoreError> {
+    ) -> Result<Option<MatrixSkillRun>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1206,7 +1220,7 @@ impl MatrixStore {
         &self,
         incident_id: &str,
         limit: usize,
-    ) -> Result<Vec<MatrixSkillRun>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixSkillRun>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1217,7 +1231,7 @@ impl MatrixStore {
     pub fn list_recent_skill_runs(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixSkillRun>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixSkillRun>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1229,7 +1243,7 @@ impl MatrixStore {
         &self,
         incident_id: &str,
         limit: usize,
-    ) -> Result<Vec<MatrixActionExecution>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixActionExecution>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1240,7 +1254,7 @@ impl MatrixStore {
     pub fn list_recent_action_executions(
         &self,
         limit: usize,
-    ) -> Result<Vec<MatrixActionExecution>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixActionExecution>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1252,13 +1266,13 @@ impl MatrixStore {
         &self,
         execution_id: &str,
         receipt: MatrixCrossPlaneBridgeReceipt,
-    ) -> Result<MatrixActionExecution, MatrixStoreError> {
+    ) -> Result<MatrixActionExecution, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut execution = find_execution(&connection, execution_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(execution_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(execution_id.to_string()))?;
         execution.attach_cross_plane_receipt(receipt);
         insert_execution(&connection, &execution)?;
         Ok(execution)
@@ -1268,13 +1282,13 @@ impl MatrixStore {
         &self,
         execution_id: &str,
         feedback: MatrixActionFeedback,
-    ) -> Result<MatrixActionExecution, MatrixStoreError> {
+    ) -> Result<MatrixActionExecution, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut execution = find_execution(&connection, execution_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(execution_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(execution_id.to_string()))?;
         execution.apply_feedback(feedback);
         insert_execution(&connection, &execution)?;
         if execution.status == "feedback_resolved" {
@@ -1290,13 +1304,13 @@ impl MatrixStore {
     pub fn promote_incident_to_memory_case(
         &self,
         incident_id: &str,
-    ) -> Result<MatrixCasePromotion, MatrixStoreError> {
+    ) -> Result<MatrixCasePromotion, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let incident = find_incident(&connection, incident_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(incident_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(incident_id.to_string()))?;
         let analysis = latest_analysis_for_incident(&connection, incident_id)?;
         let packet = incident
             .evidence_packet_id
@@ -1324,7 +1338,7 @@ impl MatrixStore {
     pub fn get_memory_case(
         &self,
         case_id: &str,
-    ) -> Result<Option<MatrixMemoryCase>, MatrixStoreError> {
+    ) -> Result<Option<MatrixMemoryCase>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1336,7 +1350,7 @@ impl MatrixStore {
         &self,
         query: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<MatrixMemoryCase>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixMemoryCase>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1347,7 +1361,7 @@ impl MatrixStore {
     pub fn upsert_playbook(
         &self,
         playbook: &MatrixPlaybook,
-    ) -> Result<MatrixPlaybook, MatrixStoreError> {
+    ) -> Result<MatrixPlaybook, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1359,7 +1373,7 @@ impl MatrixStore {
     pub fn get_playbook(
         &self,
         playbook_id: &str,
-    ) -> Result<Option<MatrixPlaybook>, MatrixStoreError> {
+    ) -> Result<Option<MatrixPlaybook>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
@@ -1371,13 +1385,13 @@ impl MatrixStore {
         &self,
         incident_id: &str,
         limit: usize,
-    ) -> Result<Vec<MatrixPlaybook>, MatrixStoreError> {
+    ) -> Result<Vec<MatrixPlaybook>, MfgMatrixAdapterError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let incident = find_incident(&connection, incident_id)?
-            .ok_or_else(|| MatrixStoreError::NotFound(incident_id.to_string()))?;
+            .ok_or_else(|| MfgMatrixAdapterError::NotFound(incident_id.to_string()))?;
         let analysis = latest_analysis_for_incident(&connection, incident_id)?;
         let packet = incident
             .evidence_packet_id
@@ -1770,7 +1784,7 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
 fn upsert_cockpit_profile(
     connection: &Connection,
     profile: &MatrixCockpitProfile,
-) -> Result<MatrixCockpitProfile, MatrixStoreError> {
+) -> Result<MatrixCockpitProfile, MfgMatrixAdapterError> {
     let mut profile = profile.clone();
     if let Some(existing) = find_cockpit_profile(connection, &profile.profile_id)? {
         profile.created_at = existing.created_at;
@@ -1798,7 +1812,7 @@ fn upsert_cockpit_profile(
 fn find_cockpit_profile(
     connection: &Connection,
     profile_id: &str,
-) -> Result<Option<MatrixCockpitProfile>, MatrixStoreError> {
+) -> Result<Option<MatrixCockpitProfile>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT profile_json FROM matrix_cockpit_profile WHERE profile_id = ?1",
@@ -1806,7 +1820,7 @@ fn find_cockpit_profile(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -1814,7 +1828,7 @@ fn list_cockpit_profiles(
     connection: &Connection,
     cadence: Option<&str>,
     limit: usize,
-) -> Result<Vec<MatrixCockpitProfile>, MatrixStoreError> {
+) -> Result<Vec<MatrixCockpitProfile>, MfgMatrixAdapterError> {
     let cadence = cadence
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1826,7 +1840,7 @@ fn list_cockpit_profiles(
         .query_map([], |row| row.get::<_, String>(0))?
         .map(|row| {
             let json = row?;
-            serde_json::from_str::<MatrixCockpitProfile>(&json).map_err(MatrixStoreError::from)
+            serde_json::from_str::<MatrixCockpitProfile>(&json).map_err(MfgMatrixAdapterError::from)
         })
         .filter_map(|result| match result {
             Ok(profile)
@@ -1847,7 +1861,7 @@ fn list_cockpit_profiles(
 fn insert_cockpit_report(
     connection: &Connection,
     report: &MatrixCockpitReportSnapshot,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_cockpit_report (
             report_id, profile_id, owner_ref, status, report_json, created_at
@@ -1867,7 +1881,7 @@ fn insert_cockpit_report(
 fn find_cockpit_report(
     connection: &Connection,
     report_id: &str,
-) -> Result<Option<MatrixCockpitReportSnapshot>, MatrixStoreError> {
+) -> Result<Option<MatrixCockpitReportSnapshot>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT report_json FROM matrix_cockpit_report WHERE report_id = ?1",
@@ -1875,14 +1889,14 @@ fn find_cockpit_report(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn build_cockpit_projection(
     connection: &Connection,
     profile: MatrixCockpitProfile,
-) -> Result<MatrixCockpitProjection, MatrixStoreError> {
+) -> Result<MatrixCockpitProjection, MfgMatrixAdapterError> {
     let attention = list_attention(connection, 50)?
         .into_iter()
         .filter(|item| attention_matches_profile(item, &profile))
@@ -2041,7 +2055,7 @@ fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MatrixCockpit
 fn insert_ontology_pack(
     connection: &Connection,
     pack: &MatrixOntologyPack,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_ontology_pack (
             ontology_id, domain, version, pack_json, updated_at
@@ -2060,7 +2074,7 @@ fn insert_ontology_pack(
 fn find_ontology_pack(
     connection: &Connection,
     ontology_id: &str,
-) -> Result<Option<MatrixOntologyPack>, MatrixStoreError> {
+) -> Result<Option<MatrixOntologyPack>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT pack_json FROM matrix_ontology_pack WHERE ontology_id = ?1",
@@ -2068,14 +2082,14 @@ fn find_ontology_pack(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn insert_entity_match_candidate(
     connection: &Connection,
     candidate: &super::MatrixEntityMatchCandidate,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_match_candidate (
             candidate_id, left_entity_id, right_entity_id, confidence, status,
@@ -2097,7 +2111,7 @@ fn insert_entity_match_candidate(
 fn find_entity_match_candidate(
     connection: &Connection,
     candidate_id: &str,
-) -> Result<Option<super::MatrixEntityMatchCandidate>, MatrixStoreError> {
+) -> Result<Option<super::MatrixEntityMatchCandidate>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT candidate_json FROM matrix_entity_match_candidate WHERE candidate_id = ?1",
@@ -2105,14 +2119,14 @@ fn find_entity_match_candidate(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn insert_entity_conflict_decision(
     connection: &Connection,
     decision: &super::MatrixEntityConflictDecision,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_entity_conflict_decision (
             decision_id, candidate_id, survivor_entity_id, retired_entity_id,
@@ -2133,7 +2147,7 @@ fn insert_entity_conflict_decision(
 fn upsert_entity(
     connection: &Connection,
     entity: &MatrixEntity,
-) -> Result<MatrixEntity, MatrixStoreError> {
+) -> Result<MatrixEntity, MfgMatrixAdapterError> {
     let mut entity = entity.clone();
     if let Some(existing) =
         find_entity_by_canonical(connection, &entity.entity_type, &entity.canonical_key)?
@@ -2212,7 +2226,7 @@ fn merged_source_keys(
 fn find_entity(
     connection: &Connection,
     entity_id: &str,
-) -> Result<Option<MatrixEntity>, MatrixStoreError> {
+) -> Result<Option<MatrixEntity>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT entity_json FROM matrix_entity WHERE entity_id = ?1",
@@ -2220,7 +2234,7 @@ fn find_entity(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -2228,7 +2242,7 @@ fn find_entity_by_canonical(
     connection: &Connection,
     entity_type: &str,
     canonical_key: &str,
-) -> Result<Option<MatrixEntity>, MatrixStoreError> {
+) -> Result<Option<MatrixEntity>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT entity_json
@@ -2238,7 +2252,7 @@ fn find_entity_by_canonical(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -2246,7 +2260,7 @@ fn find_entity_by_source_key(
     connection: &Connection,
     source_system: &str,
     source_key: &str,
-) -> Result<Option<MatrixEntity>, MatrixStoreError> {
+) -> Result<Option<MatrixEntity>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT e.entity_json
@@ -2260,14 +2274,14 @@ fn find_entity_by_source_key(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_entities(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixEntity>, MatrixStoreError> {
+) -> Result<Vec<MatrixEntity>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT entity_json
           FROM matrix_entity
@@ -2281,12 +2295,16 @@ fn list_entities(
 fn upsert_relation(
     connection: &Connection,
     relation: &MatrixRelation,
-) -> Result<MatrixRelation, MatrixStoreError> {
+) -> Result<MatrixRelation, MfgMatrixAdapterError> {
     if find_entity(connection, &relation.from_entity_id)?.is_none() {
-        return Err(MatrixStoreError::NotFound(relation.from_entity_id.clone()));
+        return Err(MfgMatrixAdapterError::NotFound(
+            relation.from_entity_id.clone(),
+        ));
     }
     if find_entity(connection, &relation.to_entity_id)?.is_none() {
-        return Err(MatrixStoreError::NotFound(relation.to_entity_id.clone()));
+        return Err(MfgMatrixAdapterError::NotFound(
+            relation.to_entity_id.clone(),
+        ));
     }
 
     let mut relation = relation.clone();
@@ -2333,7 +2351,7 @@ fn find_relation_by_key(
     relation_type: &str,
     from_entity_id: &str,
     to_entity_id: &str,
-) -> Result<Option<MatrixRelation>, MatrixStoreError> {
+) -> Result<Option<MatrixRelation>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT relation_json
@@ -2343,7 +2361,7 @@ fn find_relation_by_key(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -2351,7 +2369,7 @@ fn list_entity_relations(
     connection: &Connection,
     entity_id: &str,
     limit: usize,
-) -> Result<Vec<MatrixRelation>, MatrixStoreError> {
+) -> Result<Vec<MatrixRelation>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT relation_json
           FROM matrix_relation
@@ -2369,7 +2387,7 @@ fn build_impact_trace(
     connection: &Connection,
     root_entity_id: &str,
     max_depth: usize,
-) -> Result<MatrixImpactTrace, MatrixStoreError> {
+) -> Result<MatrixImpactTrace, MfgMatrixAdapterError> {
     let max_depth = max_depth.clamp(1, 5);
     let mut queue = VecDeque::from([(root_entity_id.to_string(), 0usize)]);
     let mut seen_entities = BTreeSet::from([root_entity_id.to_string()]);
@@ -2428,7 +2446,7 @@ fn build_impact_trace(
 fn upsert_attention(
     connection: &Connection,
     item: &MatrixAttentionItem,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_attention_item (
             attention_id, priority_score, status, attention_json, created_at, updated_at
@@ -2448,7 +2466,7 @@ fn upsert_attention(
 fn list_attention(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixAttentionItem>, MatrixStoreError> {
+) -> Result<Vec<MatrixAttentionItem>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT attention_json
           FROM matrix_attention_item
@@ -2462,7 +2480,7 @@ fn list_attention(
 fn find_attention(
     connection: &Connection,
     attention_id: &str,
-) -> Result<Option<MatrixAttentionItem>, MatrixStoreError> {
+) -> Result<Option<MatrixAttentionItem>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT attention_json FROM matrix_attention_item WHERE attention_id = ?1",
@@ -2470,13 +2488,13 @@ fn find_attention(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn latest_attention(
     connection: &Connection,
-) -> Result<Option<MatrixAttentionItem>, MatrixStoreError> {
+) -> Result<Option<MatrixAttentionItem>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT attention_json
@@ -2487,14 +2505,14 @@ fn latest_attention(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn insert_evidence_packet(
     connection: &Connection,
     packet: &MatrixEvidencePacket,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_evidence_packet (
             packet_id, attention_id, packet_json, created_at
@@ -2512,7 +2530,7 @@ fn insert_evidence_packet(
 fn find_evidence_packet(
     connection: &Connection,
     packet_id: &str,
-) -> Result<Option<MatrixEvidencePacket>, MatrixStoreError> {
+) -> Result<Option<MatrixEvidencePacket>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT packet_json FROM matrix_evidence_packet WHERE packet_id = ?1",
@@ -2520,14 +2538,14 @@ fn find_evidence_packet(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_evidence_packets(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixEvidencePacket>, MatrixStoreError> {
+) -> Result<Vec<MatrixEvidencePacket>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT packet_json
           FROM matrix_evidence_packet
@@ -2541,7 +2559,7 @@ fn list_evidence_packets(
 fn insert_quality_gate(
     connection: &Connection,
     gate: &MatrixQualityGateDecision,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_quality_gate (
             gate_id, target_ref, gate_type, decision, score, gate_json, created_at
@@ -2562,7 +2580,7 @@ fn insert_quality_gate(
 fn find_quality_gate(
     connection: &Connection,
     gate_id: &str,
-) -> Result<Option<MatrixQualityGateDecision>, MatrixStoreError> {
+) -> Result<Option<MatrixQualityGateDecision>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT gate_json FROM matrix_quality_gate WHERE gate_id = ?1",
@@ -2570,14 +2588,14 @@ fn find_quality_gate(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_recent_quality_gates(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixQualityGateDecision>, MatrixStoreError> {
+) -> Result<Vec<MatrixQualityGateDecision>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT gate_json
           FROM matrix_quality_gate
@@ -2643,7 +2661,7 @@ impl MetricAccumulator {
     }
 }
 
-fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, MatrixStoreError> {
+fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT fact_id, fact_type, entity_refs_json, metric_key, dimensions_json,
             measures_json, confidence
@@ -2700,7 +2718,10 @@ fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, MatrixSto
     Ok(facts)
 }
 
-fn list_facts(connection: &Connection, limit: usize) -> Result<Vec<MatrixFact>, MatrixStoreError> {
+fn list_facts(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<MatrixFact>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
             dimensions_json, measures_json, event_time, valid_from, valid_to,
@@ -2775,7 +2796,7 @@ fn numeric_measure_sum(value: &Value) -> f64 {
 fn upsert_metric_definition(
     connection: &Connection,
     definition: &MatrixMetricDefinition,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT INTO matrix_metric_definition (
             metric_id, definition_json, created_at, updated_at
@@ -2796,7 +2817,7 @@ fn upsert_metric_definition(
 fn find_metric_definition(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Option<MatrixMetricDefinition>, MatrixStoreError> {
+) -> Result<Option<MatrixMetricDefinition>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT definition_json FROM matrix_metric_definition WHERE metric_id = ?1",
@@ -2804,14 +2825,14 @@ fn find_metric_definition(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn upsert_metric_dependency(
     connection: &Connection,
     dependency: &MatrixMetricDependency,
-) -> Result<MatrixMetricDependency, MatrixStoreError> {
+) -> Result<MatrixMetricDependency, MfgMatrixAdapterError> {
     let mut dependency = dependency.clone();
     if let Some(existing) = find_metric_dependency_by_key(
         connection,
@@ -2854,7 +2875,7 @@ fn find_metric_dependency_by_key(
     upstream_metric_id: &str,
     downstream_metric_id: &str,
     dependency_type: &str,
-) -> Result<Option<MatrixMetricDependency>, MatrixStoreError> {
+) -> Result<Option<MatrixMetricDependency>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT dependency_json
@@ -2866,14 +2887,14 @@ fn find_metric_dependency_by_key(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_upstream_metric_dependencies(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Vec<MatrixMetricDependency>, MatrixStoreError> {
+) -> Result<Vec<MatrixMetricDependency>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT dependency_json
           FROM matrix_metric_dependency
@@ -2887,7 +2908,7 @@ fn list_upstream_metric_dependencies(
 fn list_downstream_metric_dependencies(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Vec<MatrixMetricDependency>, MatrixStoreError> {
+) -> Result<Vec<MatrixMetricDependency>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT dependency_json
           FROM matrix_metric_dependency
@@ -2902,7 +2923,7 @@ fn build_metric_lineage(
     connection: &Connection,
     metric_id: &str,
     max_depth: usize,
-) -> Result<MatrixMetricLineage, MatrixStoreError> {
+) -> Result<MatrixMetricLineage, MfgMatrixAdapterError> {
     let max_depth = max_depth.clamp(1, 6);
     let upstream_dependencies = list_upstream_metric_dependencies(connection, metric_id)?;
     let downstream_dependencies = list_downstream_metric_dependencies(connection, metric_id)?;
@@ -2930,7 +2951,7 @@ fn build_metric_lineage(
 fn metrics_affected_by_fact_type(
     connection: &Connection,
     fact_type: &str,
-) -> Result<Vec<String>, MatrixStoreError> {
+) -> Result<Vec<String>, MfgMatrixAdapterError> {
     let mut impacted = BTreeSet::new();
     let mut statement = connection.prepare(
         r"SELECT dependency_json
@@ -2960,7 +2981,7 @@ fn metrics_affected_by_fact_type(
 fn metric_ids_for_fact_type(
     connection: &Connection,
     fact_type: &str,
-) -> Result<Vec<String>, MatrixStoreError> {
+) -> Result<Vec<String>, MfgMatrixAdapterError> {
     let mut impacted = BTreeSet::new();
     let mut statement = connection.prepare(
         r"SELECT definition_json
@@ -2984,7 +3005,7 @@ fn build_metric_attention_plan(
     period: Option<String>,
     metric_ids: Vec<String>,
     limit: usize,
-) -> Result<MatrixMetricAttentionPlan, MatrixStoreError> {
+) -> Result<MatrixMetricAttentionPlan, MfgMatrixAdapterError> {
     let limit = limit.clamp(1, 24);
     let mut scores = Vec::new();
     for metric_id in metric_ids {
@@ -3046,7 +3067,7 @@ fn build_metric_snapshot(
     connection: &Connection,
     metric_ids: Vec<String>,
     scope_ref: Option<String>,
-) -> Result<MatrixMetricSnapshot, MatrixStoreError> {
+) -> Result<MatrixMetricSnapshot, MfgMatrixAdapterError> {
     let mut unique_metric_ids = metric_ids;
     unique_metric_ids.sort();
     unique_metric_ids.dedup();
@@ -3072,7 +3093,7 @@ fn build_metric_snapshot(
 fn insert_metric_snapshot(
     connection: &Connection,
     snapshot: &MatrixMetricSnapshot,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_metric_snapshot (
             snapshot_id, scope_ref, metric_ids_json, snapshot_json, created_at
@@ -3091,7 +3112,7 @@ fn insert_metric_snapshot(
 fn insert_skill_execution(
     connection: &Connection,
     run: &MatrixSkillRun,
-) -> Result<MatrixSkillRun, MatrixStoreError> {
+) -> Result<MatrixSkillRun, MfgMatrixAdapterError> {
     let mut run = run.clone();
     let execution_id = run.execution_id.clone().unwrap_or_else(|| {
         let generated = format!("skill-execution-{}", uuid::Uuid::new_v4());
@@ -3134,7 +3155,7 @@ fn insert_skill_execution(
 fn find_skill_execution(
     connection: &Connection,
     execution_id: &str,
-) -> Result<Option<MatrixSkillRun>, MatrixStoreError> {
+) -> Result<Option<MatrixSkillRun>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT execution_json FROM matrix_skill_execution WHERE execution_id = ?1",
@@ -3142,7 +3163,7 @@ fn find_skill_execution(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -3150,7 +3171,7 @@ fn list_skill_executions_for_incident(
     connection: &Connection,
     incident_id: &str,
     limit: usize,
-) -> Result<Vec<MatrixSkillRun>, MatrixStoreError> {
+) -> Result<Vec<MatrixSkillRun>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT execution_json
           FROM matrix_skill_execution
@@ -3180,7 +3201,7 @@ fn priority_for_compute_job(job: &MatrixComputeJob) -> f32 {
 fn upsert_compute_job(
     connection: &Connection,
     job: &MatrixComputeJob,
-) -> Result<MatrixComputeJob, MatrixStoreError> {
+) -> Result<MatrixComputeJob, MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT INTO matrix_compute_job (
             job_id, trigger_fact_type, status, priority, job_json, created_at, updated_at
@@ -3207,7 +3228,7 @@ fn upsert_compute_job(
 fn find_compute_job(
     connection: &Connection,
     job_id: &str,
-) -> Result<Option<MatrixComputeJob>, MatrixStoreError> {
+) -> Result<Option<MatrixComputeJob>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT job_json FROM matrix_compute_job WHERE job_id = ?1",
@@ -3215,7 +3236,7 @@ fn find_compute_job(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -3224,7 +3245,7 @@ fn latest_metric_state(
     metric_id: &str,
     entity_scope: &str,
     period: &str,
-) -> Result<Option<MatrixMetricState>, MatrixStoreError> {
+) -> Result<Option<MatrixMetricState>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT state_json
@@ -3236,14 +3257,14 @@ fn latest_metric_state(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn insert_metric_state(
     connection: &Connection,
     state: &MatrixMetricState,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT INTO matrix_metric_state (
             state_id, metric_id, entity_scope, period, value, previous_value,
@@ -3268,7 +3289,7 @@ fn insert_metric_state(
 fn insert_change_event(
     connection: &Connection,
     change: &MatrixChangeEvent,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT INTO matrix_change_event (
             change_id, metric_id, entity_ref, period, delta, severity_hint,
@@ -3291,7 +3312,7 @@ fn insert_change_event(
 fn find_change(
     connection: &Connection,
     change_id: &str,
-) -> Result<Option<MatrixChangeEvent>, MatrixStoreError> {
+) -> Result<Option<MatrixChangeEvent>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT change_json FROM matrix_change_event WHERE change_id = ?1",
@@ -3299,14 +3320,14 @@ fn find_change(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn latest_metric_state_for_metric(
     connection: &Connection,
     metric_id: &str,
-) -> Result<Option<MatrixMetricState>, MatrixStoreError> {
+) -> Result<Option<MatrixMetricState>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT state_json
@@ -3318,14 +3339,14 @@ fn latest_metric_state_for_metric(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn upsert_incident(
     connection: &Connection,
     incident: &MatrixIncident,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_incident (
             incident_id, attention_id, evidence_packet_id, task_id, agent_graph_id,
@@ -3349,7 +3370,7 @@ fn upsert_incident(
 fn find_incident(
     connection: &Connection,
     incident_id: &str,
-) -> Result<Option<MatrixIncident>, MatrixStoreError> {
+) -> Result<Option<MatrixIncident>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT incident_json FROM matrix_incident WHERE incident_id = ?1",
@@ -3357,14 +3378,14 @@ fn find_incident(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_incidents(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixIncident>, MatrixStoreError> {
+) -> Result<Vec<MatrixIncident>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT incident_json
           FROM matrix_incident
@@ -3374,10 +3395,10 @@ fn list_incidents(
     let rows = statement.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
     let incidents = rows
         .map(|row| {
-            let json = row.map_err(MatrixStoreError::from)?;
-            serde_json::from_str::<MatrixIncident>(&json).map_err(MatrixStoreError::from)
+            let json = row.map_err(MfgMatrixAdapterError::from)?;
+            serde_json::from_str::<MatrixIncident>(&json).map_err(MfgMatrixAdapterError::from)
         })
-        .collect::<Result<Vec<MatrixIncident>, MatrixStoreError>>()?;
+        .collect::<Result<Vec<MatrixIncident>, MfgMatrixAdapterError>>()?;
     Ok(incidents
         .into_iter()
         .filter(|incident| {
@@ -3392,7 +3413,7 @@ fn list_incidents(
 fn insert_analysis(
     connection: &Connection,
     analysis: &MatrixOperationalAnalysis,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_operational_analysis (
             analysis_id, incident_id, evidence_packet_id, status, confidence,
@@ -3414,7 +3435,7 @@ fn insert_analysis(
 fn find_analysis(
     connection: &Connection,
     analysis_id: &str,
-) -> Result<Option<MatrixOperationalAnalysis>, MatrixStoreError> {
+) -> Result<Option<MatrixOperationalAnalysis>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT analysis_json FROM matrix_operational_analysis WHERE analysis_id = ?1",
@@ -3422,14 +3443,14 @@ fn find_analysis(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn latest_analysis_for_incident(
     connection: &Connection,
     incident_id: &str,
-) -> Result<Option<MatrixOperationalAnalysis>, MatrixStoreError> {
+) -> Result<Option<MatrixOperationalAnalysis>, MfgMatrixAdapterError> {
     connection
         .query_row(
             r"SELECT analysis_json
@@ -3441,14 +3462,14 @@ fn latest_analysis_for_incident(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn insert_execution(
     connection: &Connection,
     execution: &MatrixActionExecution,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_action_execution (
             execution_id, analysis_id, incident_id, action_id, status, mode,
@@ -3472,7 +3493,7 @@ fn insert_execution(
 fn find_execution(
     connection: &Connection,
     execution_id: &str,
-) -> Result<Option<MatrixActionExecution>, MatrixStoreError> {
+) -> Result<Option<MatrixActionExecution>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT execution_json FROM matrix_action_execution WHERE execution_id = ?1",
@@ -3480,14 +3501,14 @@ fn find_execution(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_recent_executions(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixActionExecution>, MatrixStoreError> {
+) -> Result<Vec<MatrixActionExecution>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT execution_json
           FROM matrix_action_execution
@@ -3501,7 +3522,7 @@ fn list_recent_executions(
 fn list_recent_skill_executions(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixSkillRun>, MatrixStoreError> {
+) -> Result<Vec<MatrixSkillRun>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT execution_json
           FROM matrix_skill_execution
@@ -3516,7 +3537,7 @@ fn list_executions_for_incident(
     connection: &Connection,
     incident_id: &str,
     limit: usize,
-) -> Result<Vec<MatrixActionExecution>, MatrixStoreError> {
+) -> Result<Vec<MatrixActionExecution>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT execution_json
           FROM matrix_action_execution
@@ -3533,7 +3554,7 @@ fn list_executions_for_incident(
 fn insert_memory_case(
     connection: &Connection,
     memory_case: &MatrixMemoryCase,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_memory_case (
             case_id, incident_id, problem_signature, outcome, memory_case_json, created_at
@@ -3553,7 +3574,7 @@ fn insert_memory_case(
 fn find_memory_case(
     connection: &Connection,
     case_id: &str,
-) -> Result<Option<MatrixMemoryCase>, MatrixStoreError> {
+) -> Result<Option<MatrixMemoryCase>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT memory_case_json FROM matrix_memory_case WHERE case_id = ?1",
@@ -3561,7 +3582,7 @@ fn find_memory_case(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -3569,7 +3590,7 @@ fn search_memory_cases(
     connection: &Connection,
     query: Option<&str>,
     limit: usize,
-) -> Result<Vec<MatrixMemoryCase>, MatrixStoreError> {
+) -> Result<Vec<MatrixMemoryCase>, MfgMatrixAdapterError> {
     let query = query.map(str::trim).filter(|value| !value.is_empty());
     if let Some(query) = query {
         let pattern = format!("%{}%", query.to_lowercase());
@@ -3599,7 +3620,7 @@ fn search_memory_cases(
 fn insert_playbook(
     connection: &Connection,
     playbook: &MatrixPlaybook,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_playbook (
             playbook_id, domain, scenario, playbook_json, created_at, updated_at
@@ -3619,7 +3640,7 @@ fn insert_playbook(
 fn find_playbook(
     connection: &Connection,
     playbook_id: &str,
-) -> Result<Option<MatrixPlaybook>, MatrixStoreError> {
+) -> Result<Option<MatrixPlaybook>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT playbook_json FROM matrix_playbook WHERE playbook_id = ?1",
@@ -3627,7 +3648,7 @@ fn find_playbook(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
@@ -3636,7 +3657,7 @@ fn recommend_playbooks(
     metric_keys: &[String],
     entity_refs: &[String],
     limit: usize,
-) -> Result<Vec<MatrixPlaybook>, MatrixStoreError> {
+) -> Result<Vec<MatrixPlaybook>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT playbook_json
           FROM matrix_playbook
@@ -3648,7 +3669,7 @@ fn recommend_playbooks(
     })?;
     let mut playbooks = rows
         .map(|row| Ok(serde_json::from_str::<MatrixPlaybook>(&row?)?))
-        .collect::<Result<Vec<_>, MatrixStoreError>>()?;
+        .collect::<Result<Vec<_>, MfgMatrixAdapterError>>()?;
     playbooks.sort_by(|left, right| {
         score_playbook(right, metric_keys, entity_refs).cmp(&score_playbook(
             left,
@@ -3681,7 +3702,7 @@ fn score_playbook(
 fn insert_source_pack(
     connection: &Connection,
     source_pack: &MatrixSourcePack,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_source_pack (
             source_pack_id, source_name, access_mode, refresh_mode,
@@ -3703,7 +3724,7 @@ fn insert_source_pack(
 fn find_source_pack(
     connection: &Connection,
     source_pack_id: &str,
-) -> Result<Option<MatrixSourcePack>, MatrixStoreError> {
+) -> Result<Option<MatrixSourcePack>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT source_pack_json FROM matrix_source_pack WHERE source_pack_id = ?1",
@@ -3711,14 +3732,14 @@ fn find_source_pack(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn list_source_packs(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixSourcePack>, MatrixStoreError> {
+) -> Result<Vec<MatrixSourcePack>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT source_pack_json
           FROM matrix_source_pack
@@ -3732,7 +3753,7 @@ fn list_source_packs(
 fn source_pack_delta_plan_for(
     connection: &Connection,
     source_pack: &MatrixSourcePack,
-) -> Result<MatrixSourceDeltaPlan, MatrixStoreError> {
+) -> Result<MatrixSourceDeltaPlan, MfgMatrixAdapterError> {
     let mut fact_types = source_pack
         .fact_mappings
         .iter()
@@ -3765,7 +3786,7 @@ fn source_pack_delta_plan_for(
 fn insert_connector_run(
     connection: &Connection,
     run: &MatrixConnectorRun,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_connector_run (
             run_id, source_pack_id, connector_kind, status, run_json, created_at, updated_at
@@ -3786,7 +3807,7 @@ fn insert_connector_run(
 fn find_connector_run(
     connection: &Connection,
     run_id: &str,
-) -> Result<Option<MatrixConnectorRun>, MatrixStoreError> {
+) -> Result<Option<MatrixConnectorRun>, MfgMatrixAdapterError> {
     connection
         .query_row(
             "SELECT run_json FROM matrix_connector_run WHERE run_id = ?1",
@@ -3794,14 +3815,14 @@ fn find_connector_run(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MatrixStoreError::from))
+        .map(|json| serde_json::from_str(&json).map_err(MfgMatrixAdapterError::from))
         .transpose()
 }
 
 fn upsert_data_plane_watermark(
     connection: &Connection,
     watermark: &MatrixDataPlaneWatermark,
-) -> Result<(), MatrixStoreError> {
+) -> Result<(), MfgMatrixAdapterError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_data_plane_watermark (
             source_ref, fact_type, partition_ref, high_watermark, last_batch_id,
@@ -3823,7 +3844,7 @@ fn upsert_data_plane_watermark(
 fn list_data_plane_watermarks(
     connection: &Connection,
     limit: usize,
-) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixStoreError> {
+) -> Result<Vec<MatrixDataPlaneWatermark>, MfgMatrixAdapterError> {
     let mut statement = connection.prepare(
         r"SELECT watermark_json
           FROM matrix_data_plane_watermark
@@ -3834,10 +3855,10 @@ fn list_data_plane_watermarks(
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
-fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixStoreError> {
+fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MfgMatrixAdapterError> {
     Ok(chrono::DateTime::parse_from_rfc3339(value)
         .map_err(|error| {
-            MatrixStoreError::Json(serde_json::Error::io(std::io::Error::new(
+            MfgMatrixAdapterError::Json(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 error,
             )))
@@ -3847,7 +3868,7 @@ fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixStoreEr
 
 fn parse_optional_rfc3339_utc(
     value: Option<String>,
-) -> Result<Option<chrono::DateTime<Utc>>, MatrixStoreError> {
+) -> Result<Option<chrono::DateTime<Utc>>, MfgMatrixAdapterError> {
     value.as_deref().map(parse_rfc3339_utc).transpose()
 }
 
@@ -3929,7 +3950,7 @@ mod tests {
 
     #[test]
     fn entity_source_keys_resolve_to_one_canonical_entity() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let first = MatrixEntity::from_input(MatrixEntityInput {
             entity_id: None,
             entity_type: "Component".to_string(),
@@ -3972,7 +3993,7 @@ mod tests {
 
     #[test]
     fn relation_network_traces_component_impact_to_orders() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let component = store
             .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {
                 entity_id: Some("entity-component-gpu".to_string()),
@@ -4048,7 +4069,7 @@ mod tests {
 
     #[test]
     fn mfg_seed_creates_domain_network_and_metric_facts() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let result = store.seed_mfg_domain().expect("domain seed runs");
 
         let expected_domain = ["server", "_manufacturing"].concat();
@@ -4091,7 +4112,7 @@ mod tests {
 
     #[test]
     fn metric_dependency_graph_projects_lineage_and_fact_impact() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let result = store.seed_mfg_domain().expect("domain seed runs");
         assert_eq!(result.metric_dependency_count, 5);
 
@@ -4121,7 +4142,7 @@ mod tests {
 
     #[test]
     fn compute_job_plans_and_runs_scoped_metric_recompute() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         store.seed_mfg_domain().expect("domain seed runs");
 
         let plan = store
@@ -4211,7 +4232,7 @@ mod tests {
         ];
 
         for expected in expectations {
-            let store = MatrixStore::in_memory().expect("store opens");
+            let store = MfgMatrixAdapter::in_memory().expect("store opens");
             let seed = store.seed_mfg_domain().expect("domain seed runs");
             assert_eq!(seed.scenario_count, 3);
 
@@ -4331,7 +4352,7 @@ mod tests {
 
     #[test]
     fn matrix_store_ingests_fact_and_builds_evidence_packet() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-1".to_string()),
             snapshot_id: Some("snapshot-1".to_string()),
@@ -4364,7 +4385,7 @@ mod tests {
         assert!(!packet.source_refs.is_empty());
 
         let health = store.health().expect("health loads");
-        assert_eq!(health.schema_version, MATRIX_SCHEMA_VERSION);
+        assert_eq!(health.schema_version, crate::matrix::MATRIX_SCHEMA_VERSION);
         assert_eq!(health.fact_count, 1);
         assert_eq!(health.attention_count, 1);
         assert_eq!(health.evidence_count, 1);
@@ -4372,7 +4393,7 @@ mod tests {
 
     #[test]
     fn matrix_store_recomputes_metrics_and_emits_changes() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let first = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-plan-1".to_string()),
             snapshot_id: Some("snapshot-plan-a".to_string()),
@@ -4432,7 +4453,7 @@ mod tests {
 
     #[test]
     fn evidence_packet_includes_metric_change_and_context_item() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-plan-context".to_string()),
             snapshot_id: Some("snapshot-plan-context".to_string()),
@@ -4458,7 +4479,7 @@ mod tests {
 
         assert!(!packet.metric_evidence.is_empty());
         assert!(!packet.change_evidence.is_empty());
-        let context_item = packet.to_context_item();
+        let context_item = crate::matrix::evidence_to_context_item(&packet);
         assert_eq!(
             context_item.id,
             format!("matrix:evidence:{}", packet.packet_id)
@@ -4468,7 +4489,7 @@ mod tests {
 
     #[test]
     fn store_persists_incident() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let mut incident = MatrixIncident::new("material risk");
         incident.attention_id = Some("attention-1".to_string());
         incident.evidence_packet_id = Some("packet-1".to_string());
@@ -4486,7 +4507,7 @@ mod tests {
 
     #[test]
     fn quality_gate_reviews_evidence_then_passes_after_analysis() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-quality-shortage".to_string()),
             snapshot_id: Some("snapshot-quality-shortage".to_string()),
@@ -4546,7 +4567,7 @@ mod tests {
 
     #[test]
     fn cockpit_projection_aggregates_focus_quality_and_actions() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-cockpit-shortage".to_string()),
             snapshot_id: Some("snapshot-cockpit-shortage".to_string()),
@@ -4721,7 +4742,7 @@ mod tests {
 
     #[test]
     fn analyze_incident_projects_attribution_impact_and_actions() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-analysis-shortage".to_string()),
             snapshot_id: Some("snapshot-analysis-shortage".to_string()),
@@ -4785,7 +4806,7 @@ mod tests {
 
     #[test]
     fn execute_action_and_feedback_closes_incident() {
-        let store = MatrixStore::in_memory().expect("store opens");
+        let store = MfgMatrixAdapter::in_memory().expect("store opens");
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-execution-shortage".to_string()),
             snapshot_id: Some("snapshot-execution-shortage".to_string()),

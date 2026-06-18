@@ -757,12 +757,10 @@ mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
+        let session_kernel =
+            test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
         Arc::new(AppState {
-            session_kernel: test_session_kernel(
-                sessions.clone(),
-                Some(store.clone()),
-                event_bus.clone(),
-            ),
+            session_kernel: session_kernel.clone(),
             sessions,
             memory_manager: None,
             unified_store: Some(store),
@@ -778,7 +776,11 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
-            services: Arc::new(crate::gateway_services::GatewayServices::transition_only()),
+            services: Arc::new(
+                crate::gateway_services::GatewayServices::transition_with_session_kernel_for_tests(
+                    session_kernel,
+                ),
+            ),
             session_lease_registry: None,
         })
     }
@@ -1346,7 +1348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cowd_structured_routes_expose_contract_and_ingest_plan_adapter() {
+    async fn cowd_structured_sources_and_structured_ingest_plan_routes_expose_contract_adapter() {
         let workspace = test_temp_dir("cowd-structured-index");
         let config_home = test_temp_dir("cowd-structured-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
@@ -1802,7 +1804,10 @@ mod tests {
     async fn matrix_foundation_ingests_fact_and_builds_evidence_packet() {
         let workspace = test_temp_dir("matrix-foundation");
         let config_home = test_temp_dir("matrix-config");
-        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
 
         let health = app
             .clone()
@@ -1905,15 +1910,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert!(workspace.join(".cowd").join("matrix.sqlite").exists());
+        assert!(config_home.join("storage").join("matrix.sqlite").exists());
         let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
     async fn matrix_routes_expose_structured_fact_engine() {
         let workspace = test_temp_dir("matrix-foundation");
         let config_home = test_temp_dir("matrix-config");
-        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
 
         let matrix_health = app
             .clone()
@@ -2020,8 +2029,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert!(workspace.join(".cowd").join("matrix.sqlite").exists());
+        assert!(config_home.join("storage").join("matrix.sqlite").exists());
         let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
@@ -2032,7 +2042,7 @@ mod tests {
         let app = api_router(test_state_with_store_and_workspace(
             store,
             workspace.clone(),
-            config_home,
+            config_home.clone(),
         ));
         let session_id = "matrix-outcome-session";
 
@@ -2130,6 +2140,7 @@ mod tests {
             })
         }));
         let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]

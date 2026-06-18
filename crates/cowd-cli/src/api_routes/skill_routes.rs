@@ -14,7 +14,7 @@ use cowd_app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, MfgIncident, MfgOperationalAnalysis, MfgSkillManifest,
 };
-use runtime::{MatrixEvidencePacket, MatrixStore, MatrixStoreError};
+use runtime::{MatrixEvidencePacket, MfgMatrixAdapter, MfgMatrixAdapterError};
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState, ErrorResponse};
@@ -337,7 +337,7 @@ async fn skill_plan_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
     let mut plan = plan_server_manufacturing_skills(
@@ -400,7 +400,7 @@ async fn skill_run_handler(
     }
 
     let incident_id = required_incident_id(&request)?;
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let (incident, analysis, packet) = mfg_incident_context(&store, &incident_id)?;
     let skill = find_mfg_skill(&item.name)
@@ -424,7 +424,7 @@ async fn skill_run_handler(
 async fn skill_runs_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let runs = store
         .list_recent_skill_runs(50)
@@ -440,7 +440,7 @@ async fn skill_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = open_matrix_store(&state)
+    let store = open_mfg_matrix_adapter(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let run = store
         .get_skill_run(&id)
@@ -489,18 +489,8 @@ fn find_mfg_skill(skill_id: &str) -> Option<MfgSkillManifest> {
         .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
 }
 
-fn open_matrix_store(state: &AppState) -> Result<MatrixStore, MatrixStoreError> {
-    let path = matrix_store_path(&state.workspace_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            MatrixStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
-    }
-    MatrixStore::open(path)
-}
-
-fn matrix_store_path(workspace_root: &std::path::Path) -> PathBuf {
-    workspace_root.join(".cowd").join("matrix.sqlite")
+fn open_mfg_matrix_adapter(state: &AppState) -> Result<MfgMatrixAdapter, MfgMatrixAdapterError> {
+    state.services.matrix.open_runtime_store(&state.config_home)
 }
 
 fn required_incident_id(
@@ -515,7 +505,7 @@ fn required_incident_id(
 }
 
 fn mfg_incident_context(
-    store: &MatrixStore,
+    store: &MfgMatrixAdapter,
     incident_id: &str,
 ) -> Result<
     (
