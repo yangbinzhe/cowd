@@ -1,5 +1,5 @@
 version: 1
-release_version: 0.9.290
+release_version: 0.9.316
 governance_goal: >
   Keep cowd validation focused on critical control points. Default gates should
   protect kernel contracts and a small set of cross-module golden paths. Manual,
@@ -13,6 +13,11 @@ lanes:
   contract:
     default: true
     purpose: kernel/API/CLI contracts without browser or live platform dependencies
+  serial-global:
+    default: true
+    purpose: >
+      high-risk gateway tests that mutate process-global env/cwd/provider/session
+      state; kept out of the default parallel Rust test lane and run serially
   scenario:
     default: true
     purpose: integration gate; V2 will converge it to five golden paths
@@ -29,6 +34,85 @@ promotion_rules:
   - Live platform, LLM-judged, visual, and exploratory checks remain manual or nightly.
   - A check that swallows critical failures or ignores HTTP status cannot be a default gate.
   - Stable capabilities should use key control points rather than step-by-step end-to-end repetition.
+  - Tests that require env_lock/cwd_lock/provider_registry should either be made hermetic or classified in serial-global.
+  - Duplicate tests should be removed only when another default gate covers the same contract and failure mode.
+
+current_counts:
+  measured_at: 2026-06-19
+  workspace_rust_test_entries: 3529
+  gateway_lib_test_entries: 371
+  gateway_serial_global_entries: 10
+  gateway_serial_global_warm_measured_seconds: 2.05
+  gateway_serial_global_script_measured_seconds_after_incremental_compile: 6.44
+  gateway_serial_global_cold_validate_seconds: 51
+  note: >
+    Cold standalone serial-global spends most time compiling gateway into a fresh
+    CARGO_TARGET_DIR; in all/full validation it should reuse artifacts produced
+    by earlier contract steps.
+  default_workspace_test_command: cargo test --workspace --no-default-features
+  serial_global_command: scripts/validate.sh serial-global
+
+serial_global_tests:
+  - name: user_defined_aliases_resolve_before_provider_dispatch
+    path: crates/gateway/src/main.rs
+    capability: config.aliases
+    keep_reason: validates project-defined aliases resolve before provider dispatch.
+    measured_seconds: 0.22
+    optimization: make config resolver accept explicit config home/cwd instead of mutating env and cwd.
+  - name: yolo_flag_forces_danger_full_access_and_marks_repl_mode
+    path: crates/gateway/src/main.rs
+    capability: cli.yolo_permissions
+    keep_reason: protects yolo CLI parsing from permission-mode regressions.
+    measured_seconds: 0.19
+    optimization: extract permission resolution into a pure parser helper.
+  - name: yolo_mode_creates_and_reuses_durable_task
+    path: crates/gateway/src/main.rs
+    capability: task.yolo_durable
+    keep_reason: protects durable task reuse and config-home storage path.
+    measured_seconds: 0.18
+    optimization: inject task store path directly into ensure_yolo_task.
+  - name: yolo_system_prompt_adds_continuous_execution_instruction
+    path: crates/gateway/src/main.rs
+    capability: prompt.yolo_mode
+    keep_reason: protects system prompt contract for continuous execution mode.
+    measured_seconds: 0.19
+    optimization: make prompt builder accept an explicit workspace context.
+  - name: setup_report_and_json_are_redacted_and_actionable
+    path: crates/gateway/src/main.rs
+    capability: setup.redaction
+    keep_reason: protects setup report usability and secret redaction.
+    measured_seconds: 0.27
+    optimization: inject setup snapshot/config source to avoid process env reads.
+  - name: resolve_repl_model_falls_back_to_anthropic_model_env_when_default
+    path: crates/gateway/src/main.rs
+    capability: provider.model_resolution
+    keep_reason: protects env fallback for default REPL model.
+    measured_seconds: 0.20
+    optimization: move env reads behind a small testable provider-model source.
+  - name: resolve_repl_model_returns_default_when_env_unset_and_no_config
+    path: crates/gateway/src/main.rs
+    capability: provider.model_resolution
+    keep_reason: protects default model fallback when env and config are absent.
+    measured_seconds: 0.19
+    optimization: share the provider-model source with the env fallback test.
+  - name: resume_diff_command_renders_report_for_saved_session
+    path: crates/gateway/src/main.rs
+    capability: session.resume_diff
+    keep_reason: protects resume command wiring to real git diff report.
+    measured_seconds: 0.21
+    optimization: keep as integration control point; avoid adding more git-diff variants.
+  - name: resume_session_switch_updates_outcome_session_and_path
+    path: crates/gateway/src/main.rs
+    capability: session.resume_switch
+    keep_reason: protects managed SQLite session switching from resume context.
+    measured_seconds: 0.18
+    optimization: inject config home/session db path to reduce env mutation.
+  - name: tui_sidebar_switch_replaces_live_runtime_session
+    path: crates/gateway/src/main.rs
+    capability: tui.runtime_session_switch
+    keep_reason: protects TUI runtime replacement through configured provider/session state.
+    measured_seconds: 0.30
+    optimization: keep serial until provider registry and runtime session construction are injectable.
 
 structured_data_control_points:
   contract:
@@ -220,6 +304,7 @@ default_gate_summary:
   current:
     - scripts/validate.sh unit-fast
     - scripts/validate.sh contract
+    - scripts/validate.sh serial-global
     - scripts/validate.sh scenario
     - scripts/validate.sh release
   planned_v2_scenario_steps:

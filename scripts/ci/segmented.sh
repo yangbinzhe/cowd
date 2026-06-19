@@ -7,6 +7,7 @@ LANE="${1:-${COWD_VALIDATION_SCOPE:-all}}"
 case "$LANE" in
   fast) LANE="unit-fast" ;;
   core) LANE="contract" ;;
+  serial|global) LANE="serial-global" ;;
   live) LANE="scenario" ;;
   full) LANE="all" ;;
 esac

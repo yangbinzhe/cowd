@@ -11,21 +11,23 @@ case "$LANE" in
   unit-fast|fast) LANE="unit-fast" ;;
   contract|core) LANE="contract" ;;
   scenario|live) LANE="scenario" ;;
+  serial-global|global|serial) LANE="serial-global" ;;
   surface) LANE="surface" ;;
   release) LANE="release" ;;
   all|full) LANE="all" ;;
   manual) LANE="manual" ;;
   -h|--help|help)
     cat <<'EOF'
-Usage: scripts/validate.sh [unit-fast|contract|scenario|surface|release|all|manual <name>]
+Usage: scripts/validate.sh [unit-fast|contract|serial-global|scenario|surface|release|all|manual <name>]
 
 Lanes:
   unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
   contract   package/API/CLI contracts without browser or tmux scenarios
+  serial-global  tests that mutate process-global env/cwd/provider/session state
   scenario   5 golden paths: gateway, session, memory, tool, skill+mfg
   surface    3 surface control points: CLI minimal, TUI projection, WebUI gateway
   release    install artifact smoke; deep scenario checks stay in scenario/manual
-  all        contract + scenario
+  all        contract + serial-global + scenario
   manual     run one manual script from scripts/manual
 
 Governance:
@@ -201,6 +203,10 @@ run_contract() {
     cargo test -p gateway connector --no-default-features -- --nocapture --test-threads=1
 }
 
+run_serial_global() {
+  run_step gateway_global_env bash scripts/test/gateway-global-env.sh
+}
+
 run_scenario() {
   run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
@@ -277,12 +283,14 @@ run_manual() {
 case "$LANE" in
   unit-fast) run_unit_fast ;;
   contract) run_contract ;;
+  serial-global) run_serial_global ;;
   scenario) run_scenario ;;
   surface) run_surface ;;
   release) run_release ;;
   manual) run_manual ;;
   all)
     run_contract
+    run_serial_global
     run_scenario
     ;;
 esac

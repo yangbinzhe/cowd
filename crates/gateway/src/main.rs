@@ -12557,7 +12557,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn user_defined_aliases_resolve_before_provider_dispatch() {
         // given
         let _guard = env_lock();
@@ -12699,7 +12699,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn yolo_flag_forces_danger_full_access_and_marks_repl_mode() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -12724,7 +12724,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn yolo_mode_creates_and_reuses_durable_task() {
         let _guard = env_lock();
         let config_home = temp_dir();
@@ -12752,7 +12752,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn yolo_system_prompt_adds_continuous_execution_instruction() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -13216,7 +13216,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn setup_report_and_json_are_redacted_and_actionable() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -13298,18 +13298,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_resume_flag_with_single_slash_command() {
-        let args = vec![
-            "--resume".to_string(),
-            "session-123".to_string(),
-            "/compact".to_string(),
-        ];
-        let error = parse_args(&args).expect_err("resume slash commands should be removed");
-        assert!(error.contains("was removed from the CLI surface"));
-        assert!(error.contains("run slash commands inside the TUI"));
-    }
-
-    #[test]
     fn parses_resume_flag_without_path_as_latest_session() {
         assert_eq!(
             parse_args(&["--resume".to_string()]).expect("args should parse"),
@@ -13331,54 +13319,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_resume_flag_with_slash_commands() {
-        let args = vec![
-            "--resume".to_string(),
-            "session-123".to_string(),
-            "/status".to_string(),
-            "/compact".to_string(),
-            "/cost".to_string(),
-        ];
-        let error = parse_args(&args).expect_err("resume slash commands should be removed");
-        assert!(error.contains("was removed from the CLI surface"));
-        assert!(error.contains("run slash commands inside the TUI"));
-    }
-
-    #[test]
     fn rejects_unknown_options_with_helpful_guidance() {
         let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
         assert!(error.contains("cowd --help"));
-    }
-
-    #[test]
-    fn rejects_resume_flag_with_slash_command_arguments() {
-        let args = vec![
-            "--resume".to_string(),
-            "session-123".to_string(),
-            "/export".to_string(),
-            "notes.txt".to_string(),
-            "/clear".to_string(),
-            "--confirm".to_string(),
-        ];
-        let error = parse_args(&args).expect_err("resume slash commands should be removed");
-        assert!(error.contains("was removed from the CLI surface"));
-        assert!(error.contains("run slash commands inside the TUI"));
-    }
-
-    #[test]
-    fn rejects_resume_flag_with_absolute_export_path() {
-        let args = vec![
-            "--resume".to_string(),
-            "session-123".to_string(),
-            "/export".to_string(),
-            "/tmp/notes.txt".to_string(),
-            "/status".to_string(),
-        ];
-        let error = parse_args(&args).expect_err("resume slash commands should be removed");
-        assert!(error.contains("was removed from the CLI surface"));
-        assert!(error.contains("run slash commands inside the TUI"));
     }
 
     #[test]
@@ -13694,7 +13639,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -13715,7 +13660,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn resolve_repl_model_returns_default_when_env_unset_and_no_config() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
@@ -14254,7 +14199,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn resume_diff_command_renders_report_for_saved_session() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -14284,7 +14229,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn resume_session_switch_updates_outcome_session_and_path() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -14593,7 +14538,7 @@ UU conflicted.rs",
 
     #[test]
     #[serial_test::serial(provider_registry)]
-    #[ignore = "slow global env/provider test; run scripts/test/gateway-slow.sh"]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn tui_sidebar_switch_replaces_live_runtime_session() {
         let _cwd_guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = env_lock();

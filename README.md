@@ -4,7 +4,7 @@ Cowd is a Rust-native AI agent runtime. It provides a minimal CLI entrypoint,
 an interactive TUI, an HTTP Gateway, session state, memory, tools, skills,
 provider configuration, Matrix structured facts, and an MFG application layer.
 
-Current kernel version: `0.9.300`
+Current kernel version: `0.9.316`
 
 ## Install Layout
 
