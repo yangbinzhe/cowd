@@ -86,6 +86,60 @@ check_empty "gateway main must use agent service owner" \
 check_empty "gateway main must use skill service owner" \
   rg -n "handle_skills_slash_command" crates/gateway/src/main.rs
 
+check_empty "gateway main must not own static config or tool entry handlers" \
+  rg -n "fn print_static_config_command|fn print_static_tool_command|tools::mvp_tool_specs" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own static bootstrap or version projections" \
+  rg -n "fn print_bootstrap_plan|fn render_version_report|fn version_json_value|BootstrapPlan::claude_code_default" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own system prompt projection" \
+  rg -n "fn print_system_prompt|kind\": \"system-prompt\"" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own install entry implementation" \
+  rg -n "fn run_install|cowd-gateway\\.service|Permissions::from_mode" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own init entry implementation" \
+  rg -n "fn run_init|fn init_claude_md|fn init_json_value|initialize_repo" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own plugin entry implementation" \
+  bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "handle_plugins_slash_command|build_plugin_manager|PluginManagerConfig" || true'
+
+check_empty "gateway main must not own env entry implementation" \
+  rg -n "fn resolve_model_alias_with_config\\(|fn config_default_model_alias\\(|fn config_model_alias\\(|fn parse_permission_mode_arg\\(|fn default_permission_mode\\(|fn resolve_repl_model\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own plugin command entry projection" \
+  rg -n "fn execute_plugin_command\\(|fn print_plugin_command\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own mcp command projection" \
+  rg -n "fn handle_mcp_slash_command|fn render_mcp_|McpOAuthConfig|ScopedMcpServerConfig|McpServerConfig" crates/gateway/src/main.rs
+
+check_empty "gateway main must not directly resolve skill invocation" \
+  rg -n "resolve_skill_invocation" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own setup workspace entry projection" \
+  rg -n "fn render_setup_report|fn render_setup_json|fn setup_snapshot|struct SetupItem|struct SetupSnapshot" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own config or memory entry projections" \
+  rg -n "fn render_config_report|fn render_config_json|fn render_memory_report|fn render_memory_json" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own diff entry projection" \
+  rg -n "fn render_diff_report\\(|fn render_diff_report_for\\(|fn render_diff_json_for\\(|fn run_git_diff_command_in\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own status or sandbox entry projections" \
+  rg -n "fn print_status_snapshot\\(|fn status_json_value\\(|fn status_context\\(|fn status_context_for_session\\(|fn format_status_report\\(|fn format_sandbox_report\\(|fn print_sandbox_status_snapshot\\(|fn sandbox_json_value\\(|struct StatusContext|struct StatusUsage|struct GitWorkspaceSummary|fn parse_git_status_metadata\\(|fn parse_git_status_branch\\(|fn parse_git_workspace_summary\\(|fn resolve_git_branch_for\\(|fn run_git_capture_in\\(|fn find_git_root_in\\(|fn parse_git_status_metadata_for\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own local command entry projections" \
+  rg -n "fn render_help_topic\\(|fn print_help_topic\\(|fn print_help_to\\(|fn print_help\\(|fn render_teleport_report\\(|fn render_last_tool_debug_report\\(|fn indent_block\\(|fn format_bughunter_report\\(|fn format_ultraplan_report\\(|fn format_pr_report\\(|fn format_issue_report\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own session store entry implementation" \
+  rg -n "static UNIFIED_STORE|fn get_unified_store\\(|fn jsonl_sessions_dir\\(|fn session_db_path\\(|fn discover_local_session_import_candidates\\(|fn migrate_session_messages\\(|fn import_local_session_file\\(|fn run_import_session\\(|fn session_to_record\\(|fn sync_cli_session_to_unified_store\\(|fn hydrate_session_from_unified_store\\(|fn load_or_create_live_session\\(|fn create_managed_session_handle\\(|fn resolve_session_reference\\(|fn resolve_managed_session_path\\(|fn list_managed_sessions\\(|fn list_workspace_session_records\\(|fn record_to_summary\\(|fn latest_managed_session\\(|fn load_session_reference\\(|fn delete_managed_session\\(|fn confirm_session_deletion\\(|fn render_session_list\\(|fn format_session_modified_age\\(|fn write_session_clear_backup\\(|fn session_clear_backup_path\\(|struct SessionHandle|struct ManagedSessionSummary|struct LocalSessionImportCandidate" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own session archive entry implementation" \
+  rg -n "fn render_export_text\\(|fn resolve_export_path\\(|fn default_export_filename\\(|fn run_export\\(|fn render_session_markdown\\(|fn summarize_tool_payload_for_markdown\\(|fn short_tool_id\\(" crates/gateway/src/main.rs
+
+check_empty "gateway main must not own gateway projection entry implementation" \
+  rg -n "enum GatewayTaskSlashCommand|enum GatewayApprovalSlashCommand|enum GatewayContextSlashCommand|enum GatewayCrossPlaneSlashCommand|fn parse_gateway_task_slash_command\\(|fn parse_gateway_approval_slash_command\\(|fn parse_gateway_context_slash_command\\(|fn parse_gateway_cross_plane_slash_command\\(|fn gateway_projection_auth_token\\(|fn running_gateway_client\\(|fn print_gateway_task_status\\(|fn print_gateway_approval_status\\(|fn print_gateway_projection_response\\(" crates/gateway/src/main.rs
+
 check_empty "interactive tests must not pre-kill named tmux sessions" \
   rg -n 'kill-session.*("-t", name|-t[[:space:]]+\$?name)' tests/interactive/src --glob '*.rs'
 
