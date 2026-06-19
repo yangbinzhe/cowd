@@ -101,26 +101,29 @@ impl AgentWorkGraph {
         let nodes = graph
             .nodes
             .iter()
-            .map(|node| WorkGraphNode {
-                node_id: node.id.clone(),
-                kind: match node.kind {
+            .map(|node| {
+                let kind = match node.kind {
                     ai_workgraph::WorkNodeKind::AgentTask => WorkGraphNodeKind::AgentTask,
                     ai_workgraph::WorkNodeKind::ToolTask => WorkGraphNodeKind::ToolTask,
                     ai_workgraph::WorkNodeKind::ReadOnlyFanout => WorkGraphNodeKind::ToolTask,
                     ai_workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
                     ai_workgraph::WorkNodeKind::Synthesis => WorkGraphNodeKind::Synthesis,
-                },
-                label: node.label.clone(),
-                objective: node.objective.clone(),
-                agent_id: node.agent_id.clone(),
-                agent_spec_id: node.agent_id.as_ref().map(|id| format!("agent-spec-{id}")),
-                status: format!("{:?}", node.status).to_ascii_lowercase(),
-                refs: vec![WorkGraphRef {
-                    ref_type: "ai_workgraph".to_string(),
-                    id: graph_id.clone(),
-                }],
-                created_at_ms: now,
-                updated_at_ms: now,
+                };
+                WorkGraphNode {
+                    node_id: node.id.clone(),
+                    kind,
+                    label: node.label.clone(),
+                    objective: node.objective.clone(),
+                    agent_id: node.agent_id.clone(),
+                    agent_spec_id: Some(agent_spec_for_node_kind(kind).id),
+                    status: format!("{:?}", node.status).to_ascii_lowercase(),
+                    refs: vec![WorkGraphRef {
+                        ref_type: "ai_workgraph".to_string(),
+                        id: graph_id.clone(),
+                    }],
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                }
             })
             .collect::<Vec<_>>();
         let edges = graph
@@ -174,7 +177,7 @@ impl AgentWorkGraph {
                 label: subtask.id.clone(),
                 objective: subtask.description.clone(),
                 agent_id: None,
-                agent_spec_id: Some(AgentSpec::worker().id),
+                agent_spec_id: Some(agent_spec_for_node_kind(WorkGraphNodeKind::AgentTask).id),
                 status: "planned".to_string(),
                 refs: vec![WorkGraphRef {
                     ref_type: "workgraph".to_string(),
@@ -418,6 +421,15 @@ fn workgraph_status_name(status: WorkGraphStatus) -> &'static str {
     }
 }
 
+fn agent_spec_for_node_kind(kind: WorkGraphNodeKind) -> AgentSpec {
+    match kind {
+        WorkGraphNodeKind::Review | WorkGraphNodeKind::Synthesis => AgentSpec::reviewer(),
+        WorkGraphNodeKind::AgentTask
+        | WorkGraphNodeKind::ToolTask
+        | WorkGraphNodeKind::MemoryTask => AgentSpec::worker(),
+    }
+}
+
 fn dedupe_refs(refs: Vec<RuntimeRef>) -> Vec<RuntimeRef> {
     let mut deduped = Vec::new();
     for reference in refs {
@@ -524,6 +536,16 @@ mod tests {
         assert_eq!(projected.nodes.len(), 2);
         assert_eq!(projected.edges.len(), 1);
         assert_eq!(projected.nodes[0].refs[0].ref_type, "ai_workgraph");
+        assert!(projected
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkGraphNodeKind::AgentTask
+                && node.agent_spec_id.as_deref() == Some("agent-spec-worker")));
+        assert!(projected
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkGraphNodeKind::Review
+                && node.agent_spec_id.as_deref() == Some("agent-spec-reviewer")));
     }
 
     #[test]
@@ -553,6 +575,10 @@ mod tests {
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].kind, WorkGraphEdgeKind::DependsOn);
+        assert!(graph
+            .nodes
+            .iter()
+            .all(|node| node.agent_spec_id.as_deref() == Some("agent-spec-worker")));
         assert_eq!(graph.status, WorkGraphStatus::Planned);
     }
 
