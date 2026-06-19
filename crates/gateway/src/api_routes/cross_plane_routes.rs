@@ -8,14 +8,14 @@ use axum::{
 };
 use runtime::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
 use runtime::{
-    ConnectorActionContext, ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord,
-    CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget,
-    CrossPlaneExecutionReceipt, CrossPlaneGrant, CrossPlaneIdentityBinding,
-    CrossPlanePolicyDecision, PolicyDecisionKind, ProviderAccount,
+    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
+    CrossPlaneDispatchTarget, CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision,
+    PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{channel_routes, AppState};
+use crate::services::CrossPlaneExecutionRecord;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -434,36 +434,24 @@ async fn cross_plane_action_execute_handler(
         }
     }
 
-    let audit_record = CrossPlaneAuditRecord::new(
-        readiness.action.clone(),
-        readiness.decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence.clone());
-    let audit_record_id = audit_record.id.clone();
-    state
-        .services
-        .cross_plane
-        .control()
-        .record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
-        idempotency_key.clone(),
-        mode.clone(),
-        status,
-        dispatch_status,
-        readiness.action.clone(),
-        readiness.decision.clone(),
-        readiness.blockers.clone(),
-        Some(audit_record_id.clone()),
-    )
-    .with_dispatch_target(readiness.dispatch_target.clone())
-    .with_dispatch_outcome(dispatch_outcome.clone());
-    state
-        .services
-        .cross_plane
-        .control()
-        .record_execution(receipt.clone());
+    let (audit_record_id, receipt) =
+        state
+            .services
+            .cross_plane
+            .record_action_execution(CrossPlaneExecutionRecord {
+                idempotency_key: idempotency_key.clone(),
+                mode: mode.clone(),
+                status: status.to_string(),
+                dispatch_status: dispatch_status.to_string(),
+                action: readiness.action.clone(),
+                decision: readiness.decision.clone(),
+                blockers: readiness.blockers.clone(),
+                dispatch_target: readiness.dispatch_target.clone(),
+                dispatch_outcome: dispatch_outcome.clone(),
+                evidence,
+                audit_result: audit_result.to_string(),
+                audit_summary,
+            });
     state.services.cross_plane.save_state(&state.config_home);
 
     Json(serde_json::json!({
@@ -525,12 +513,7 @@ async fn evaluate_action_readiness(
     mode: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> CrossPlaneActionReadiness {
-    let connector_context = connector_context_for_action(state, &action, mode);
-    let (action, decision, evidence) = state
-        .services
-        .cross_plane
-        .control()
-        .decide_with_connector_context(action, connector_context, now);
+    let (action, decision, evidence) = decide_connector_action(state, action, mode, now);
     let target_platform = target_platform_from_action(&action);
     let platforms = channel_routes::configured_platforms(state.config.as_ref());
     let platform_readiness = target_platform.as_ref().and_then(|target| {
@@ -582,97 +565,11 @@ pub(super) fn decide_connector_action(
     CrossPlanePolicyDecision,
     CrossPlaneDecisionEvidence,
 ) {
-    let connector_context = connector_context_for_action(state, &action, mode);
+    let snapshot = super::connector_routes::connector_snapshot(state);
     state
         .services
         .cross_plane
-        .control()
-        .decide_with_connector_context(action, connector_context, now)
-}
-
-fn connector_context_for_action(
-    state: &AppState,
-    action: &CrossPlaneAction,
-    mode: &str,
-) -> Option<ConnectorActionContext> {
-    let snapshot = super::connector_routes::connector_snapshot(state);
-    connector_context_from_snapshot(&snapshot, action, mode)
-}
-
-fn connector_context_from_snapshot(
-    snapshot: &ConnectorRegistrySnapshot,
-    action: &CrossPlaneAction,
-    mode: &str,
-) -> Option<ConnectorActionContext> {
-    let capability = snapshot
-        .capabilities
-        .iter()
-        .find(|capability| capability.capability_id == action.requested_capability)?;
-    let account = connector_account_for_action(snapshot, action, &capability.provider);
-    let missing_scopes = account
-        .as_ref()
-        .map(|account| {
-            capability
-                .missing_scopes(account)
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| capability.required_scopes.clone());
-    Some(ConnectorActionContext {
-        provider: capability.provider.clone(),
-        plane: format!("{:?}", capability.plane).to_ascii_lowercase(),
-        capability_id: capability.capability_id.clone(),
-        provider_account: account
-            .as_ref()
-            .map(|account| account.account_id.clone())
-            .or_else(|| action.provider_account.clone()),
-        account_status: account
-            .as_ref()
-            .map(|account| format!("{:?}", account.health.status).to_ascii_lowercase()),
-        account_reason: account
-            .as_ref()
-            .and_then(|account| account.health.reason.clone()),
-        resource_ref: action.resource_ref.clone(),
-        required_scopes: capability.required_scopes.clone(),
-        missing_scopes,
-        supports_commit: capability.supports_commit,
-        requires_approval: capability.requires_approval,
-        risk: capability.risk,
-        data_classification: capability.data_classification,
-        requested_mode: normalize_execute_mode(mode),
-    })
-}
-
-fn connector_account_for_action<'a>(
-    snapshot: &'a ConnectorRegistrySnapshot,
-    action: &CrossPlaneAction,
-    provider: &str,
-) -> Option<&'a ProviderAccount> {
-    if let Some(requested) = action
-        .provider_account
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(account) = snapshot.accounts.iter().find(|account| {
-            account.account_id == requested
-                || account.provider == requested
-                || account
-                    .enabled_bindings
-                    .iter()
-                    .any(|binding| binding == requested)
-        }) {
-            return Some(account);
-        }
-    }
-    snapshot.accounts.iter().find(|account| {
-        account.provider == provider
-            && account
-                .enabled_bindings
-                .iter()
-                .any(|binding| binding == &action.requested_capability)
-    })
+        .decide_connector_action(&snapshot, action, mode, now)
 }
 
 fn normalize_execute_mode(mode: &str) -> String {

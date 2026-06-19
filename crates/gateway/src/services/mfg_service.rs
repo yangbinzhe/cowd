@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::ServiceEnvelope;
+use super::{CrossPlaneExecutionRecord, CrossPlaneService, ServiceEnvelope};
 use app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, MfgActionExecution, MfgActionExecutionRequest,
@@ -15,9 +15,9 @@ use matrix_core::{
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
-    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, CrossPlaneRisk, DataClassification,
-    IdentityTrust, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
+    CrossPlanePolicyDecision, CrossPlaneRisk, DataClassification, IdentityTrust,
+    PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -264,7 +264,7 @@ impl MfgService {
 
     pub(crate) fn record_cross_plane_bridge_receipt(
         &self,
-        control: &CrossPlaneControlPlane,
+        cross_plane: &CrossPlaneService,
         idempotency_key: Option<String>,
         mode: String,
         action: CrossPlaneAction,
@@ -273,26 +273,31 @@ impl MfgService {
     ) -> CrossPlaneExecutionReceipt {
         let (status, dispatch_status, blockers, audit_result, audit_summary) =
             self.bridge_outcome(&mode, &decision);
-        let audit_record = runtime::CrossPlaneAuditRecord::new(
-            action.clone(),
-            decision.clone(),
-            audit_result,
-            audit_summary,
-        )
-        .with_evidence(evidence);
-        let audit_record_id = audit_record.id.clone();
-        control.record_audit(audit_record);
-        let receipt = CrossPlaneExecutionReceipt::new(
+        let (_, receipt) = cross_plane.record_action_execution(CrossPlaneExecutionRecord {
             idempotency_key,
             mode,
-            status,
-            dispatch_status,
+            status: match status.as_str() {
+                "planned" => "planned",
+                "blocked" => "blocked",
+                _ => "blocked",
+            }
+            .to_string(),
+            dispatch_status: match dispatch_status.as_str() {
+                "dry_run" => "dry_run",
+                "human_review_required" => "human_review_required",
+                "policy_blocked" => "policy_blocked",
+                _ => "not_dispatched",
+            }
+            .to_string(),
             action,
             decision,
             blockers,
-            Some(audit_record_id),
-        );
-        control.record_execution(receipt.clone());
+            dispatch_target: None,
+            dispatch_outcome: None,
+            evidence,
+            audit_result,
+            audit_summary,
+        });
         receipt
     }
 

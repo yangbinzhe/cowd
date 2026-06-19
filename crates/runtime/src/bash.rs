@@ -1,5 +1,6 @@
 use std::env;
 use std::io;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -19,6 +20,7 @@ use crate::ConfigLoader;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
     pub command: String,
+    pub cwd: Option<String>,
     pub timeout: Option<u64>,
     pub description: Option<String>,
     #[serde(rename = "run_in_background")]
@@ -69,7 +71,7 @@ pub struct BashCommandOutput {
 
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    let cwd = resolve_cwd(input.cwd.as_deref())?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
@@ -110,6 +112,20 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     });
     rx.recv()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
+}
+
+fn resolve_cwd(cwd: Option<&str>) -> io::Result<PathBuf> {
+    match cwd {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(env::current_dir()?.join(path))
+            }
+        }
+        None => env::current_dir(),
+    }
 }
 
 async fn execute_bash_async(
@@ -269,6 +285,7 @@ mod tests {
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
+            cwd: None,
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
@@ -289,6 +306,7 @@ mod tests {
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
+            cwd: None,
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),

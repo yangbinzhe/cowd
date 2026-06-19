@@ -32,6 +32,7 @@ mod workspace_service;
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use command_service::CommandService;
 pub(crate) use context_service::ContextServiceError;
+pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{

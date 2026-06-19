@@ -946,7 +946,7 @@ async fn mock_docs_execute_handler(
         blockers.join("; ")
     };
     let receipt = state.services.connector.record_service_execution_receipt(
-        state.services.cross_plane.control(),
+        &state.services.cross_plane,
         idempotency_key,
         mode,
         status,
@@ -1133,7 +1133,7 @@ async fn feishu_readonly_execute_handler(
         blockers.join("; ")
     };
     let receipt = state.services.connector.record_service_execution_receipt(
-        state.services.cross_plane.control(),
+        &state.services.cross_plane,
         idempotency_key,
         mode,
         status,

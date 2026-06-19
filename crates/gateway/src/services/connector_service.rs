@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use runtime::{
-    CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
-    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision, ExternalResourceRef, PolicyDecisionKind,
-    SqliteResourceDirectory,
+    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
+    CrossPlanePolicyDecision, ExternalResourceRef, PolicyDecisionKind, SqliteResourceDirectory,
 };
 
-use super::{ConnectorService, ServiceEnvelope};
+use super::{ConnectorService, CrossPlaneExecutionRecord, CrossPlaneService, ServiceEnvelope};
 
 impl ConnectorService {
     pub(crate) fn service_action(
@@ -34,7 +33,7 @@ impl ConnectorService {
 
     pub(crate) fn record_service_execution_receipt(
         &self,
-        control: &CrossPlaneControlPlane,
+        cross_plane: &CrossPlaneService,
         idempotency_key: Option<String>,
         mode: &str,
         status: &str,
@@ -52,26 +51,30 @@ impl ConnectorService {
         } else {
             "blocked"
         };
-        let audit_record = runtime::CrossPlaneAuditRecord::new(
-            action.clone(),
-            decision.clone(),
-            audit_result,
-            audit_summary,
-        )
-        .with_evidence(evidence);
-        let audit_record_id = audit_record.id.clone();
-        control.record_audit(audit_record);
-        let receipt = CrossPlaneExecutionReceipt::new(
+        let (_, receipt) = cross_plane.record_action_execution(CrossPlaneExecutionRecord {
             idempotency_key,
-            mode,
-            status,
-            dispatch_status,
+            mode: mode.to_string(),
+            status: match status {
+                "executed" => "executed",
+                "dry_run" => "dry_run",
+                _ => "blocked",
+            }
+            .to_string(),
+            dispatch_status: match dispatch_status {
+                "service_mock_executed" => "service_mock_executed",
+                "service_feishu_readonly_resolved" => "service_feishu_readonly_resolved",
+                _ => "not_dispatched",
+            }
+            .to_string(),
             action,
             decision,
             blockers,
-            Some(audit_record_id),
-        );
-        control.record_execution(receipt.clone());
+            dispatch_target: None,
+            dispatch_outcome: None,
+            evidence,
+            audit_result: audit_result.to_string(),
+            audit_summary,
+        });
         receipt
     }
 

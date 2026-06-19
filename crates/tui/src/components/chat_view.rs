@@ -671,6 +671,7 @@ impl ChatView {
         stats
     }
 
+    #[cfg(test)]
     fn rebuild_streaming_tail(&mut self) {
         let n = self.timeline.len();
         if n == 0 || n > self.timeline.len() {
@@ -713,54 +714,6 @@ impl ChatView {
                 Style::default().fg(self.theme.accent()),
             )]));
         }
-    }
-
-    /// Build only visible entries for virtual scrolling.
-    fn build_visible(&self, scroll_offset: usize, viewport_h: usize) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut cumulative: usize = 0;
-        let viewport_end = scroll_offset + viewport_h;
-
-        if self.timeline.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Type to start. /help /resume /exit",
-                Style::default().fg(self.theme.muted_color()),
-            )));
-            return lines;
-        }
-
-        for (idx, entry) in self.timeline.iter().enumerate() {
-            if !Self::renders_in_main_chat(entry) {
-                continue;
-            }
-            let is_last = idx == self.timeline.len() - 1;
-            let entry_lines = self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize
-                + if is_last { 0 } else { 1 };
-            let entry_end = cumulative + entry_lines;
-
-            if entry_end > scroll_offset && cumulative < viewport_end {
-                let is_focused = idx == self.timeline_cursor;
-                Self::build_entry(entry, is_focused, &mut lines, &self.theme);
-                if !is_last {
-                    lines.push(Line::raw(""));
-                }
-            }
-
-            cumulative = entry_end;
-            if cumulative >= viewport_end {
-                break;
-            }
-        }
-
-        if self.turn_active {
-            let spinner = self.spinner_char();
-            lines.push(Line::from(vec![Span::styled(
-                format!("{spinner} Processing..."),
-                Style::default().fg(self.theme.accent()),
-            )]));
-        }
-
-        lines
     }
 
     /// Highlight inline markdown spans in a message line.

@@ -4,8 +4,9 @@ use std::{
 };
 
 use runtime::{
-    ConnectorActionContext, ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneControlPlane,
-    CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt, CrossPlanePolicyDecision,
+    ConnectorActionContext, ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord,
+    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
+    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlanePolicyDecision,
     ProviderAccount,
 };
 
@@ -13,6 +14,21 @@ use super::{CrossPlaneService, ServiceEnvelope};
 
 static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
 static CROSS_PLANE_LOADED: OnceLock<()> = OnceLock::new();
+
+pub(crate) struct CrossPlaneExecutionRecord {
+    pub(crate) idempotency_key: Option<String>,
+    pub(crate) mode: String,
+    pub(crate) status: String,
+    pub(crate) dispatch_status: String,
+    pub(crate) action: CrossPlaneAction,
+    pub(crate) decision: CrossPlanePolicyDecision,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) dispatch_target: Option<CrossPlaneDispatchTarget>,
+    pub(crate) dispatch_outcome: Option<CrossPlaneDispatchOutcome>,
+    pub(crate) evidence: CrossPlaneDecisionEvidence,
+    pub(crate) audit_result: String,
+    pub(crate) audit_summary: String,
+}
 
 impl CrossPlaneService {
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -53,6 +69,36 @@ impl CrossPlaneService {
         decision: &CrossPlanePolicyDecision,
     ) -> Option<(String, u32)> {
         self.control().consume_matched_grant_for_decision(decision)
+    }
+
+    pub(crate) fn record_action_execution(
+        &self,
+        record: CrossPlaneExecutionRecord,
+    ) -> (String, CrossPlaneExecutionReceipt) {
+        let audit_record = CrossPlaneAuditRecord::new(
+            record.action.clone(),
+            record.decision.clone(),
+            record.audit_result,
+            record.audit_summary,
+        )
+        .with_evidence(record.evidence);
+        let audit_record_id = audit_record.id.clone();
+        self.control().record_audit(audit_record);
+
+        let receipt = CrossPlaneExecutionReceipt::new(
+            record.idempotency_key,
+            record.mode,
+            record.status,
+            record.dispatch_status,
+            record.action,
+            record.decision,
+            record.blockers,
+            Some(audit_record_id.clone()),
+        )
+        .with_dispatch_target(record.dispatch_target)
+        .with_dispatch_outcome(record.dispatch_outcome);
+        self.control().record_execution(receipt.clone());
+        (audit_record_id, receipt)
     }
 
     pub(crate) fn decide_connector_action(

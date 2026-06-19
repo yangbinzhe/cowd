@@ -5,6 +5,7 @@ use crate::components::chat_view::ChatView;
 // and unit tests for the default split-view layout.
 // --------------------------------------------------------------------
 
+#[cfg(test)]
 use ratatui::layout::Rect;
 
 use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
@@ -21,6 +22,7 @@ use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::ToolOpsPanel;
+#[cfg(test)]
 use crate::components::{Component, EventResult, RenderContext};
 
 // ── Placeholder Component ──────────────────────────────────────────
@@ -28,10 +30,12 @@ use crate::components::{Component, EventResult, RenderContext};
 /// Minimal component used as a structural placeholder in layout
 /// trees. Production code should replace these with real components
 /// before rendering.
+#[cfg(test)]
 struct PlaceholderComponent {
     id: &'static str,
 }
 
+#[cfg(test)]
 impl Component for PlaceholderComponent {
     fn render(&mut self, _ctx: &mut RenderContext, _area: Rect) {}
     fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {

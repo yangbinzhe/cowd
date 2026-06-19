@@ -34,6 +34,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
+                    "cwd": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },

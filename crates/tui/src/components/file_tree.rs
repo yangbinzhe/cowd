@@ -95,6 +95,7 @@ pub struct FileNode {
 impl FileNode {
     /// Format the file size as a human-readable string.
     /// Directories return an empty string.
+    #[cfg(test)]
     fn format_size(&self) -> String {
         format_file_size(self.size, self.is_dir)
     }

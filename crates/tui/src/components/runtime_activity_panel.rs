@@ -505,32 +505,7 @@ impl Component for RuntimeActivityPanel {
     }
 }
 
-// ── Helper methods ───────────────────────────────────────────────────
-
 impl RuntimeActivityPanel {
-    fn progress_bar(used: u64, total: u64, bar_width: usize) -> String {
-        if total == 0 {
-            return "░".repeat(bar_width);
-        }
-        let pct = (used as f64 / total as f64).min(1.0);
-        let filled = (pct * bar_width as f64).round() as usize;
-        let empty = bar_width.saturating_sub(filled);
-        let mut bar = String::with_capacity(bar_width);
-        for _ in 0..filled {
-            bar.push('█');
-        }
-        for _ in 0..empty {
-            bar.push('░');
-        }
-        bar
-    }
-
-    fn cost_estimate(&self) -> f64 {
-        let input_cost = self.token_count as f64 * 3.0 / 1_000_000.0;
-        let output_cost = self.turn_output_tokens as f64 * 15.0 / 1_000_000.0;
-        input_cost + output_cost
-    }
-
     pub fn copy_text(&self) -> bool {
         let mut out = String::new();
         let mut last_turn = 0usize;
@@ -546,27 +521,6 @@ impl RuntimeActivityPanel {
         }
         crate::osc52::write_osc52_clipboard(out.trim())
     }
-}
-
-// ── Free functions ───────────────────────────────────────────────────
-
-fn metric_line(
-    label: impl Into<String>,
-    value: impl Into<String>,
-    detail: impl Into<String>,
-    value_color: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(label.into(), Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(" {}", value.into()),
-            Style::default().fg(value_color),
-        ),
-        Span::styled(
-            format!("  {}", detail.into()),
-            Style::default().fg(Color::White),
-        ),
-    ])
 }
 
 fn process_line(item: &ProcessEvent) -> Line<'static> {
@@ -653,16 +607,6 @@ fn format_tool_process_line(
         format!("{name} {state}")
     } else {
         format!("{name} {state} - {}", preview(detail, 72))
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
     }
 }
 

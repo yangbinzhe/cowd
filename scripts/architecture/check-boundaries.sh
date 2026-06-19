@@ -48,6 +48,9 @@ check_empty "compat harness workspace residue" \
 check_empty "api crate naming residue" \
   rg -n "crates/api|api::" crates --glob '*.rs' --glob 'Cargo.toml'
 
+check_empty "internal cowd package alias residue" \
+  bash -c 'rg -n "cowd_app_mfg|cowd_memory|cowd_storage|mod cowd_|pub mod cowd_|use cowd_" crates --glob "*.rs" | rg -v "^crates/runtime/src/lib.rs:[0-9]+:(pub mod cowd_(dirs|event);|pub use cowd_(dirs|event)(::|;|\\{))" || true'
+
 check_empty "mixed matrix mfg route module residue" \
   bash -c 'mixed="matrix_""mfg"; file="crates/gateway/src/api_routes/${mixed}_routes.rs"; if test -e "$file"; then echo "$file"; fi; rg -n "${mixed}_routes|cowd_${mixed}|${mixed}" crates/gateway/src crates/gateway/tests --glob "*.rs" || true'
 
@@ -70,6 +73,10 @@ check_empty "non-cross-plane routes must not call cross-plane route control help
   rg -n "cross_plane_routes::(cross_plane_control|save_cross_plane_state|ensure_cross_plane_loaded|decide_connector_action)" \
     crates/gateway/src/api_routes --glob '*.rs' --glob '!cross_plane_routes.rs'
 
+check_empty "cross-plane audit and receipt construction owner" \
+  rg -n "CrossPlaneAuditRecord::new|CrossPlaneExecutionReceipt::new" \
+    crates/gateway/src --glob '*.rs' --glob '!**/services/cross_plane_service.rs'
+
 check_empty "command-service must remain declarative" \
   rg -n "runtime::|memory::|matrix::|app_mfg::|plugins::|ConfigLoader|GlobalToolRegistry|Connection::open|SqliteConnectionManager::file|std::fs|fs::|std::env|env::|handle_agents_slash_command|handle_skills_slash_command|resolve_skill_path|resolve_skill_invocation" \
     crates/command/service/src crates/command/service/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
@@ -86,6 +93,9 @@ check_empty "app-mfg must not depend on gateway or runtime internals" \
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
   bash -c 'rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" crates --glob "*.rs" --glob "!**/tests/**" --glob "!crates/storage/**" --glob "!crates/memory/src/store/sqlite.rs" --glob "!crates/memory/src/store/session.rs" --glob "!crates/memory/src/store/verbatim.rs" --glob "!crates/memory/src/session_store.rs" --glob "!crates/memory/src/sqlite_persistence.rs" --glob "!crates/memory/src/maintenance.rs" --glob "!crates/matrix/repository/**" --glob "!crates/app-mfg/src/repository.rs" --glob "!crates/app-mfg/src/store.rs" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes.rs:|^crates/gateway/src/task_kernel.rs:|^crates/gateway/src/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example|//!|///)" || true'
+
+check_empty "storage direct-open allowlist must stay empty" \
+  bash -c 'if [[ "$(tr -d "[:space:]" < crates/storage/direct-open-allowlist.json)" != "[]" ]]; then cat crates/storage/direct-open-allowlist.json; fi'
 
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features

@@ -1680,7 +1680,7 @@ async fn mfg_execution_cross_plane_bridge_handler(
         .cross_plane
         .decide_connector_action(&snapshot, action, &mode, now);
     let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
-        state.services.cross_plane.control(),
+        &state.services.cross_plane,
         idempotency_key,
         mode.clone(),
         action,
@@ -1789,7 +1789,7 @@ fn deliver_mfg_cockpit_report(
         .cross_plane
         .decide_connector_action(&snapshot, action, &mode, now);
     let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
-        state.services.cross_plane.control(),
+        &state.services.cross_plane,
         idempotency_key,
         mode.clone(),
         action,

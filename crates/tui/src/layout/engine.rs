@@ -435,9 +435,6 @@ mod tests {
     }
 
     impl MockComponent {
-        fn new(id: &'static str) -> Self {
-            Self { id }
-        }
         fn boxed(id: &'static str) -> Box<dyn Component> {
             Box::new(Self { id })
         }

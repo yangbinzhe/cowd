@@ -91,9 +91,6 @@ impl<'a> Renderer<'a> {
     fn muted_style(&self) -> Style {
         Style::default().fg(self.theme.muted_color())
     }
-    fn accent_style(&self) -> Style {
-        Style::default().fg(self.theme.accent())
-    }
     fn accent_bold(&self) -> Style {
         Style::default()
             .fg(self.theme.accent())
@@ -102,14 +99,8 @@ impl<'a> Renderer<'a> {
     fn code_style(&self) -> Style {
         Style::default().fg(self.theme.inline_code_color())
     }
-    fn link_style(&self) -> Style {
-        Style::default().fg(self.theme.link_color())
-    }
     fn success_style(&self) -> Style {
         Style::default().fg(self.theme.success_color())
-    }
-    fn code_bg(&self) -> ratatui::style::Color {
-        self.theme.code_bg_color()
     }
 
     /// Flush `current_spans` into `self.lines` as a single Line.

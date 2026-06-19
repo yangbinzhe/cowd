@@ -37,8 +37,7 @@ where it must not be used as an internal Rust boundary name.
 
 ## Forbidden For New Code
 
-- `cowd_app_mfg::`
-- `cowd_memory::`
+- package aliases such as `cowd_app_mfg::`, `cowd_memory::`, or `cowd_storage::`
 - new modules named `cowd_*`
 - new service names prefixed with `Cowd` when the enclosing project context is
   already cowd
@@ -48,7 +47,7 @@ where it must not be used as an internal Rust boundary name.
 Every architecture review should run:
 
 ```bash
-rg -n "cowd_app_mfg|cowd_memory|mod cowd_|pub mod cowd_|use cowd_" crates --glob '*.rs'
+rg -n "cowd_app_mfg|cowd_memory|cowd_storage|mod cowd_|pub mod cowd_|use cowd_" crates --glob '*.rs'
 ```
 
 Matches must either be removed or mapped to this allowlist.
