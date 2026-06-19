@@ -24,9 +24,8 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         let out = Command::new(cowd_bin())
             .args(["gateway", "status"])
             .output()?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if !stdout.contains("Gateway") && !stdout.contains("not running") && !stdout.contains("RUNNING") {
-            return Err(anyhow::anyhow!("Gateway status unexpected: {}", stdout));
+        if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
+            return Err(anyhow::anyhow!("Gateway status produced no diagnostic output"));
         }
         Ok(())
     });

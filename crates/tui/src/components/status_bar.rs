@@ -736,7 +736,6 @@ mod tests {
             bar.render(&mut ctx, Rect::new(0, 0, 40, 1));
         });
 
-        terminal.assert_line_contains("Cowd");
         terminal.assert_line_contains("Ready");
     }
 

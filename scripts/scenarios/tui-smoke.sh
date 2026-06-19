@@ -83,7 +83,7 @@ if ! rg -q "YOLO|continuous|Cowd|COWD" "$CAPTURE"; then
   exit 1
 fi
 
-if ! rg -q "Task[[:space:]]+running" "$CAPTURE"; then
+if ! rg -qi "task[[:space:]]+running|running[[:space:]]+task-" "$CAPTURE"; then
   echo "TUI smoke test did not observe durable task status in the startup UI" >&2
   sed -n '1,160p' "$CAPTURE" >&2
   exit 1

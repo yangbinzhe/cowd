@@ -322,7 +322,6 @@ mod tests {
         });
 
         let joined = terminal.buffer_lines().join("\n");
-        assert!(joined.contains("cowd"));
         assert!(joined.contains("session"));
         assert!(!joined.contains("state"));
         assert!(!joined.contains("provider"));

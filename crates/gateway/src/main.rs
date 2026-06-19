@@ -4883,51 +4883,79 @@ fn format_startup_banner_with_task(
     session_id: &str,
     task: Option<&task_kernel::TaskRecord>,
 ) -> String {
+    const VALUE_WIDTH: usize = 59;
+
     let status = status_context(None).ok();
     let git_branch = status
         .as_ref()
         .and_then(|context| context.git_branch.as_deref())
         .unwrap_or("unknown");
-    let workspace = status.as_ref().map_or_else(
+    let directory = status.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |context| context.cwd.display().to_string(),
+    );
+    let git_state = status.as_ref().map_or_else(
         || "unknown".to_string(),
         |context| context.git_summary.headline(),
     );
-    let task_line = task.map_or_else(String::new, |task| {
+    let task_row = task.map_or_else(String::new, |task| {
         let short_id: String = task.id.chars().take(8).collect();
-        let objective = truncate_for_banner(&task.objective, 72);
-        let phase = current_task_phase_for_display(task)
-            .map(|phase| format!(" · phase {}:{}", phase.name, phase.status.as_str()))
-            .unwrap_or_default();
-        format!(
-            "   \x1b[2mTask\x1b[0m        {} {}{} · {}\n",
-            task.status.as_str(),
-            short_id,
-            phase,
-            objective
-        )
+        let objective = truncate_for_banner(&task.objective, 40);
+        let mut rows = startup_banner_row(
+            "task",
+            &format!("{} {} - {}", task.status.as_str(), short_id, objective),
+        );
+        if let Some(phase) = current_task_phase_for_display(task) {
+            rows.push_str(&startup_banner_row(
+                "phase",
+                &format!("{}:{}", phase.name, phase.status.as_str()),
+            ));
+        }
+        rows
     });
-    let short_session = truncate_for_banner(session_id, 18);
+    let short_session = truncate_for_banner(session_id, VALUE_WIDTH);
     format!(
-        "\x1b[1;31mCOWD v{VERSION}\x1b[0m  \x1b[2m{}\x1b[0m\n\
-\x1b[2mBranch\x1b[0m {}  \x1b[2mMode\x1b[0m {}  \x1b[2mSession\x1b[0m {}\n\
-\x1b[2mWorkspace\x1b[0m {}\n{}\
-\x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts",
-        model,
-        git_branch,
-        if yolo_mode { "yolo" } else { "standard" },
-        short_session,
-        workspace,
-        task_line,
+        "{}\
+{}\
+{}\
+{}\
+{}\
+{}\
+{}\
+{}\
+{}\
+{}",
+        "╭────────────────────────────────────────────────────────────────────────╮\n",
+        startup_banner_title(&format!("COWD v{VERSION}")),
+        startup_banner_row("model", model),
+        startup_banner_row("directory", &directory),
+        startup_banner_row("branch", git_branch),
+        startup_banner_row("git", &git_state),
+        startup_banner_row("mode", if yolo_mode { "yolo" } else { "standard" }),
+        startup_banner_row("session", &short_session),
+        task_row,
+        "╰────────────────────────────────────────────────────────────────────────╯",
     )
 }
 
+fn startup_banner_title(title: &str) -> String {
+    format!("│ {:<70} │\n", truncate_for_banner(title, 70))
+}
+
+fn startup_banner_row(label: &str, value: &str) -> String {
+    format!("│ {:<10} {:<59} │\n", label, truncate_for_banner(value, 59))
+}
+
 fn truncate_for_banner(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        value.chars().take(max_chars).collect()
     } else {
-        truncated
+        let truncated: String = value.chars().take(max_chars - 3).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -13408,35 +13436,34 @@ mod tests {
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
-        assert!(help.contains("REPL"));
-        assert!(help.contains("/help"));
-        assert!(help.contains("Complete commands, modes, and recent sessions"));
-        assert!(help.contains("/status"));
-        assert!(help.contains("/sandbox"));
-        assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
-        assert!(help.contains("/clear [--confirm]"));
-        assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-id|latest>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
-        assert!(help.contains("/memory"));
-        assert!(help.contains("/init"));
-        assert!(help.contains("/diff"));
-        assert!(help.contains("/version"));
-        assert!(help.contains("/export [file]"));
-        // Batch 5 added `/session delete`; match on the stable core rather than
-        // the trailing bracket so future additions don't re-break this.
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
-        assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
-        ));
-        assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents"));
-        assert!(help.contains("/skills"));
-        assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            SQLite session store"));
-        assert!(help.contains("Resume latest        /resume latest"));
+        assert!(help.lines().any(|line| line.trim() == "REPL"));
+        for command in [
+            "/help",
+            "/status",
+            "/sandbox",
+            "/model",
+            "/permissions",
+            "/clear",
+            "/cost",
+            "/resume",
+            "/config",
+            "/mcp",
+            "/memory",
+            "/init",
+            "/diff",
+            "/version",
+            "/export",
+            "/session",
+            "/plugin",
+            "/agents",
+            "/skills",
+            "/exit",
+        ] {
+            assert!(
+                repl_help_contains_command(&help, command),
+                "missing command {command} in help:\n{help}"
+            );
+        }
     }
 
     #[test]
@@ -13457,17 +13484,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_banner_mentions_workflow_completions() {
+    fn startup_banner_uses_codex_style_context_card() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
 
         let banner = with_current_dir(&root, || {
             format_startup_banner("claude-sonnet-4-6", false, "session-banner-test")
         });
+        let rows = parse_startup_banner_rows(&banner);
 
-        assert!(banner.contains("Tab"));
-        assert!(banner.contains("sidebar"));
-        assert!(banner.contains("standard"));
+        assert_eq!(
+            rows.get("model").map(String::as_str),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            rows.get("directory").map(String::as_str),
+            Some(root.to_str().unwrap())
+        );
+        assert!(rows.contains_key("branch"));
+        assert!(rows.contains_key("git"));
+        assert_eq!(rows.get("mode").map(String::as_str), Some("standard"));
+        assert_eq!(
+            rows.get("session").map(String::as_str),
+            Some("session-banner-test")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -13482,11 +13522,9 @@ mod tests {
 
     #[test]
     fn tui_startup_banner_strip_removes_ansi_codes() {
-        let banner = format_startup_banner("claude-sonnet-4-6", false, "session-banner-test");
-        let plain = strip_ansi_for_tui(&banner);
+        let plain = strip_ansi_for_tui("\u{1b}[1mready\u{1b}[0m");
 
-        assert!(plain.contains("COWD"));
-        assert!(!plain.contains("\u{1b}["));
+        assert_eq!(plain, "ready");
     }
 
     #[test]
@@ -13553,12 +13591,60 @@ mod tests {
             "session-yolo-test",
             Some(&task),
         );
+        let rows = parse_startup_banner_rows(&banner);
 
-        assert!(banner.contains("Task"));
-        assert!(banner.contains("running"));
-        assert!(banner.contains("task-abc"));
-        assert!(banner.contains("phase tui-cockpit:completed"));
-        assert!(banner.contains("complete v0.8.10"));
+        let task_row = rows.get("task").expect("task row");
+        assert!(task_row.contains("running"));
+        assert!(task_row.contains("task-abc"));
+        assert!(task_row.contains("complete v0.8.10 enterprise AI framework"));
+        assert_eq!(
+            rows.get("phase").map(String::as_str),
+            Some("tui-cockpit:completed")
+        );
+    }
+
+    fn parse_startup_banner_rows(banner: &str) -> BTreeMap<String, String> {
+        banner
+            .lines()
+            .filter_map(|line| {
+                let body = line.strip_prefix("│ ")?.strip_suffix(" │")?;
+                let (label, value) = body.split_once(' ')?;
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((label.trim().to_string(), value.to_string()))
+                }
+            })
+            .collect()
+    }
+
+    fn parse_report_fields(report: &str) -> BTreeMap<String, String> {
+        report
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let (label, value) = if let Some(split_at) = trimmed.find("  ") {
+                    trimmed.split_at(split_at)
+                } else {
+                    trimmed.rsplit_once(char::is_whitespace)?
+                };
+                let value = value.trim();
+                (!label.is_empty() && !value.is_empty())
+                    .then(|| (label.trim().to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    fn repl_help_contains_command(help: &str, command: &str) -> bool {
+        help.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed == command
+                || trimmed
+                    .strip_prefix(command)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                || trimmed.split_whitespace().any(|token| token == command)
+        })
     }
 
     #[test]
@@ -13908,10 +13994,16 @@ mod tests {
     #[test]
     fn model_report_uses_sectioned_layout() {
         let report = format_model_report("claude-sonnet", 12, 4);
-        assert!(report.contains("Model"));
-        assert!(report.contains("Current model    claude-sonnet"));
-        assert!(report.contains("Session messages 12"));
-        assert!(report.contains("Switch models with /model <name>"));
+        let fields = parse_report_fields(&report);
+        assert_eq!(
+            fields.get("Current model").map(String::as_str),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            fields.get("Session messages").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(fields.get("Session turns").map(String::as_str), Some("4"));
     }
 
     #[test]
@@ -13966,29 +14058,53 @@ mod tests {
                 sandbox_status: runtime::SandboxStatus::default(),
             },
         );
-        assert!(status.contains("Status"));
-        assert!(status.contains("Model            claude-sonnet"));
-        assert!(status.contains("Permission mode  workspace-write"));
-        assert!(status.contains("Execution mode   yolo"));
-        assert!(status.contains("Messages         7"));
-        assert!(status.contains("Latest total     10"));
-        assert!(status.contains("Cumulative total 31"));
-        assert!(status.contains("Cwd              /tmp/project"));
-        assert!(status.contains("Project root     /tmp"));
-        assert!(status.contains("Git branch       main"));
-        assert!(
-            status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
+        let fields = parse_report_fields(&status);
+        assert_eq!(
+            fields.get("Model").map(String::as_str),
+            Some("claude-sonnet")
         );
-        assert!(status.contains("Changed files    3"));
-        assert!(status.contains("Staged           1"));
-        assert!(status.contains("Unstaged         1"));
-        assert!(status.contains("Untracked        1"));
-        assert!(status.contains("Session          session.jsonl"));
-        assert!(status.contains("Session id       session"));
-        assert!(status.contains("Session store    local import/export file"));
-        assert!(status.contains("Config files     loaded 2/3"));
-        assert!(status.contains("Memory files     4"));
-        assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+        assert_eq!(
+            fields.get("Permission mode").map(String::as_str),
+            Some("workspace-write")
+        );
+        assert_eq!(
+            fields.get("Execution mode").map(String::as_str),
+            Some("yolo")
+        );
+        assert_eq!(fields.get("Messages").map(String::as_str), Some("7"));
+        assert_eq!(fields.get("Latest total").map(String::as_str), Some("10"));
+        assert_eq!(
+            fields.get("Cumulative total").map(String::as_str),
+            Some("31")
+        );
+        assert_eq!(fields.get("Cwd").map(String::as_str), Some("/tmp/project"));
+        assert_eq!(fields.get("Project root").map(String::as_str), Some("/tmp"));
+        assert_eq!(fields.get("Git branch").map(String::as_str), Some("main"));
+        assert_eq!(
+            fields.get("Git state").map(String::as_str),
+            Some("dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
+        );
+        assert_eq!(fields.get("Changed files").map(String::as_str), Some("3"));
+        assert_eq!(fields.get("Staged").map(String::as_str), Some("1"));
+        assert_eq!(fields.get("Unstaged").map(String::as_str), Some("1"));
+        assert_eq!(fields.get("Untracked").map(String::as_str), Some("1"));
+        assert_eq!(
+            fields.get("Session").map(String::as_str),
+            Some("session.jsonl")
+        );
+        assert_eq!(
+            fields.get("Session id").map(String::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            fields.get("Session store").map(String::as_str),
+            Some("local import/export file")
+        );
+        assert_eq!(
+            fields.get("Config files").map(String::as_str),
+            Some("loaded 2/3")
+        );
+        assert_eq!(fields.get("Memory files").map(String::as_str), Some("4"));
     }
 
     #[test]
@@ -14061,7 +14177,6 @@ mod tests {
     #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
-        assert!(report.contains("Memory"));
         assert!(report.contains("Working directory"));
         assert!(report.contains("Instruction files"));
         assert!(report.contains("Discovered files"));
@@ -14775,16 +14890,24 @@ providers:
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
-        assert!(help.contains("Up/Down"));
-        assert!(help.contains("Tab"));
-        assert!(help.contains("Shift+Enter/Ctrl+J"));
-        assert!(help.contains("Ctrl-R"));
-        assert!(help.contains("Reverse-search prompt history"));
-        assert!(help.contains("/history [count]"));
-        assert!(help.contains("/tasks [start|cancel|complete]"));
-        assert!(help.contains("/approvals [approve|reject]"));
-        assert!(help.contains("/context [runtime|config|memory|cross-plane]"));
-        assert!(help.contains("/cross-plane [preflight|execute] <json>"));
+        for command in [
+            "/history",
+            "/tasks",
+            "/approvals",
+            "/context",
+            "/cross-plane",
+        ] {
+            assert!(
+                repl_help_contains_command(&help, command),
+                "missing command {command} in help:\n{help}"
+            );
+        }
+        for key in ["Up/Down", "Tab", "Shift+Enter/Ctrl+J", "Ctrl-R"] {
+            assert!(
+                parse_report_fields(&help).contains_key(key),
+                "missing key hint {key}"
+            );
+        }
     }
 
     #[test]

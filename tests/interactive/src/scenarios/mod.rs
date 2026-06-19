@@ -20,7 +20,7 @@ use crate::reporter::TestRunner;
 
 pub fn list() {
     for (name, desc) in [
-        ("tui_startup", "TUI logo + status bar"),
+        ("tui_startup", "TUI startup context"),
         ("tui_chat_stream", "Send message + verify streaming reply"),
         ("tui_scroll_expand", "PgUp/PgDn scroll + expand/collapse"),
         ("tui_search", "/ search highlight"),

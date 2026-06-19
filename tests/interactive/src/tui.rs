@@ -47,6 +47,30 @@ impl TuiSession {
         Err(anyhow!("Timeout waiting for '{expected}'"))
     }
 
+    pub fn wait_until_ready(&self, secs: u64) -> Result<()> {
+        let start = Instant::now();
+        let t = Duration::from_secs(secs);
+        while start.elapsed() < t {
+            let cap = self.capture()?;
+            if capture_is_healthy(&cap) && cap.trim().len() > 80 {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Err(anyhow!("Timeout waiting for rendered TUI"))
+    }
+
+    pub fn assert_healthy_capture(&self, min_len: usize) -> Result<String> {
+        let cap = self.capture()?;
+        if !capture_is_healthy(&cap) {
+            return Err(anyhow!("TUI capture contains startup/runtime failure"));
+        }
+        if cap.trim().len() < min_len {
+            return Err(anyhow!("TUI capture too short ({} chars)", cap.trim().len()));
+        }
+        Ok(cap)
+    }
+
     pub fn screenshot(&self, path: &str) -> Result<()> {
         let content = self.capture()?;
         std::fs::write(path, content)?;
@@ -57,6 +81,15 @@ impl TuiSession {
         Command::new("tmux").args(["kill-session", "-t", &self.session]).status()?;
         Ok(())
     }
+}
+
+fn capture_is_healthy(capture: &str) -> bool {
+    let lower = capture.to_lowercase();
+    !lower.contains("panic")
+        && !lower.contains("backtrace")
+        && !lower.contains("thread '")
+        && !lower.contains("failed to initialize terminal")
+        && !lower.contains("run cowd --help")
 }
 
 impl Drop for TuiSession {

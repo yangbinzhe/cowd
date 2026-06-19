@@ -370,10 +370,9 @@ mod tests {
 
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
-        // Should render nothing (panel hides when empty)
         assert!(
-            !joined.contains("Todo"),
-            "Empty panel should not show 'Todo' title"
+            joined.trim().is_empty(),
+            "empty panel should render no content"
         );
     }
 

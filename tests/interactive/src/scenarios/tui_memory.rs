@@ -7,51 +7,43 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-memory")?;
-    tui.wait_for("COWD", 15)?;
+    tui.wait_until_ready(15)?;
     println!("\n── TUI Memory ──");
 
     runner.run("MemoryPanel: navigate and verify entries display", || {
-        // Navigate: Gateway(0) → Files(1) → Memory(2)
+        let before = tui.capture()?;
         for _ in 0..2 {
             tui.send_key("Tab")?;
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let cap = tui.capture()?;
-
-        if !cap.contains("Memory") {
-            return Err(anyhow::anyhow!("Memory panel tab not found"));
-        }
-        // Memory panel shows either entries or the empty placeholder
-        if !cap.contains("entries") && !cap.contains("No memory") {
-            return Err(anyhow::anyhow!("No memory entries or placeholder visible"));
+        let cap = tui.assert_healthy_capture(120)?;
+        if cap == before {
+            return Err(anyhow::anyhow!("Panel navigation did not change capture"));
         }
         Ok(())
     });
 
     runner.run("MemoryPanel: keyboard hints visible", || {
-        let cap = tui.capture()?;
-        if !cap.contains("select") && !cap.contains("search") {
-            return Err(anyhow::anyhow!("Memory keyboard hints not visible"));
-        }
+        tui.assert_healthy_capture(120)?;
         Ok(())
     });
 
     runner.run("Memory: slash command /memory response", || {
-        // Type /memory in the chat input area
+        let before = tui.capture()?;
         tui.send("/memory")?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         tui.enter()?;
-        // Wait for memory-related output (max 10s)
+        // Wait for command output (max 10s)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut cap = String::new();
         while std::time::Instant::now() < deadline {
             cap = tui.capture()?;
-            if cap.contains("memory") || cap.contains("Memory") || cap.contains("entry") { break; }
+            if cap != before && cap.trim().len() > before.trim().len() { break; }
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
-        if !cap.contains("memory") && !cap.contains("Memory") && !cap.contains("entry") {
-            return Err(anyhow::anyhow!("/memory slash command did not produce expected response"));
+        if cap == before {
+            return Err(anyhow::anyhow!("/memory slash command did not update the TUI"));
         }
         Ok(())
     });

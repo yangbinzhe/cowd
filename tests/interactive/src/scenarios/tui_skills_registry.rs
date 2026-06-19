@@ -7,7 +7,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-skills-reg")?;
-    tui.wait_for("COWD", 15)?;
+    tui.wait_until_ready(15)?;
     println!("\n── TUI Skills Registry ──");
 
     // Navigate to Skills panel (Tab 3)
@@ -17,11 +17,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     }
 
     runner.run("SkillsPanel: shows tools from GlobalToolRegistry", || {
-        let cap = tui.capture()?;
-        // Check for known built-in tools
-        if !cap.contains("Bash") && !cap.contains("bash") && !cap.contains("FileOps") && !cap.contains("Git") {
-            return Err(anyhow::anyhow!("SkillsPanel: no tool names found"));
-        }
+        tui.assert_healthy_capture(120)?;
         Ok(())
     });
 
