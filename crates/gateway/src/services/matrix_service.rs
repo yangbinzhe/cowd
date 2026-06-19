@@ -399,6 +399,15 @@ impl MatrixService {
             .build_evidence_packet(attention_id, problem_statement)
     }
 
+    pub(crate) fn insert_ai_harness_evidence_packet(
+        &self,
+        config_home: impl AsRef<Path>,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<MatrixEvidencePacket, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .insert_ai_harness_evidence_packet(packet)
+    }
+
     pub(crate) fn get_evidence_packet(
         &self,
         config_home: impl AsRef<Path>,

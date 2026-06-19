@@ -105,6 +105,38 @@ impl MatrixEvidencePacket {
         self.refresh_readiness();
     }
 
+    pub fn add_ai_kernel_trace_source(
+        &mut self,
+        trace_ref: &str,
+        strategy_mode: &str,
+        verification_can_finalize: bool,
+        regression_allowed: bool,
+        summary: &str,
+    ) {
+        self.source_refs.push(MatrixEvidenceSourceRef {
+            kind: "ai_kernel_trace".to_string(),
+            reference: trace_ref.to_string(),
+            summary: summary.to_string(),
+        });
+        self.attribution_candidates.push(serde_json::json!({
+            "kind": "ai_kernel_trace",
+            "strategy_mode": strategy_mode,
+            "verification_can_finalize": verification_can_finalize,
+            "regression_allowed": regression_allowed,
+            "source_ref": trace_ref,
+            "summary": summary,
+        }));
+        if !verification_can_finalize || !regression_allowed {
+            self.anomaly_evidence.push(serde_json::json!({
+                "kind": "ai_harness_gate_issue",
+                "verification_can_finalize": verification_can_finalize,
+                "regression_allowed": regression_allowed,
+                "source_ref": trace_ref,
+            }));
+        }
+        self.refresh_readiness();
+    }
+
     fn refresh_readiness(&mut self) {
         self.missing_evidence.retain(|item| {
             !matches!(
@@ -176,6 +208,24 @@ mod tests {
         assert_eq!(packet.source_refs[0].kind, "agent_evidence");
         assert_eq!(packet.attribution_candidates.len(), 1);
         assert!(packet.missing_evidence.is_empty());
+        assert!(packet.confidence > 0.30);
+    }
+
+    #[test]
+    fn evidence_packet_accepts_ai_kernel_trace_source() {
+        let mut packet = MatrixEvidencePacket::new("AI harness execution quality");
+
+        packet.add_ai_kernel_trace_source(
+            "runtime:event:event-1",
+            "plan_execute",
+            false,
+            false,
+            "verification blocked finalization",
+        );
+
+        assert_eq!(packet.source_refs[0].kind, "ai_kernel_trace");
+        assert_eq!(packet.attribution_candidates.len(), 1);
+        assert_eq!(packet.anomaly_evidence.len(), 1);
         assert!(packet.confidence > 0.30);
     }
 }

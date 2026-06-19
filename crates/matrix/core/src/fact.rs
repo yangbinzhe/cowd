@@ -2,6 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const AI_STRATEGY_DECISION_FACT: &str = "ai_strategy_decision";
+pub const AI_VERIFICATION_RESULT_FACT: &str = "ai_verification_result";
+pub const AI_TOOL_TRANSACTION_RESULT_FACT: &str = "ai_tool_transaction_result";
+pub const AI_WORKGRAPH_QUALITY_FACT: &str = "ai_workgraph_quality";
+pub const AI_GROWTH_SIGNAL_FACT: &str = "ai_growth_signal";
+pub const AI_EVAL_RESULT_FACT: &str = "ai_eval_result";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatrixFact {
     pub fact_id: String,

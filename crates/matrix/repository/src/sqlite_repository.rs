@@ -863,6 +863,18 @@ impl MatrixSqliteRepository {
         Ok(packet)
     }
 
+    pub fn insert_ai_harness_evidence_packet(
+        &self,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<MatrixEvidencePacket, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_evidence_packet(&connection, packet)?;
+        Ok(packet.clone())
+    }
+
     pub fn get_evidence_packet(
         &self,
         packet_id: &str,

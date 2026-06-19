@@ -2242,6 +2242,9 @@ where
             .collect::<Vec<_>>()
             .join("");
         let failed_tool_results = count_failed_tool_results(&tool_results);
+        if let Some(envelope) = self.last_context_envelope() {
+            ai_kernel.record_context_envelope(envelope.id);
+        }
         let ai_kernel_trace = ai_kernel.finalize(
             &assistant_text,
             tool_results.len().saturating_sub(failed_tool_results),
@@ -3353,12 +3356,14 @@ where
             },
             "context": {
                 "epoch_id": trace.context_epoch.epoch_id,
+                "envelope_id": trace.context_envelope_id,
                 "token_total": trace.context_epoch.token_total,
                 "selected_count": trace.context_epoch.selected.len(),
                 "omitted_count": trace.context_epoch.omitted.len(),
             },
             "verification": {
                 "can_finalize": trace.verification_report.can_finalize,
+                "finalization_blocked": trace.finalization_blocked,
                 "severity": format!("{:?}", trace.verification_report.severity),
                 "blocking_reasons": trace.verification_report.blocking_reasons,
                 "claim_count": trace.verification_report.claim_count,
@@ -3403,6 +3408,7 @@ where
             },
             "growth": {
                 "record_id": trace.learning_record.id,
+                "event_id": trace.growth_event.id,
                 "policy": trace.learning_record.policy,
                 "has_blocker": trace.learning_record.has_blocker(),
                 "signals": trace.learning_record.signals.iter().map(|signal| serde_json::json!({
@@ -3411,6 +3417,13 @@ where
                     "summary": signal.summary,
                 })).collect::<Vec<_>>(),
                 "next_strategy_hints": trace.learning_record.next_strategy_hints,
+            },
+            "maintenance_candidates": growth_maintenance_candidates(trace),
+            "matrix_evidence_signal": {
+                "source": "ai_kernel_trace",
+                "growth_event_id": trace.growth_event.id,
+                "evidence_refs": trace.growth_event.evidence_refs,
+                "signals": trace.growth_event.matrix_signals,
             },
         });
         let created_at_ms = std::time::SystemTime::now()
@@ -3722,6 +3735,48 @@ fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
                 .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
         })
         .count()
+}
+
+fn growth_maintenance_candidates(
+    trace: &RuntimeAiKernelTrace,
+) -> Vec<memory::MaintenanceCandidate> {
+    trace
+        .growth_event
+        .memory_candidates
+        .iter()
+        .map(|candidate| {
+            let now = chrono::Utc::now();
+            memory::MaintenanceCandidate {
+                id: candidate.id.clone(),
+                kind: match candidate.kind {
+                    ai_growth::GrowthMemoryCandidateKind::Conflict => {
+                        memory::MaintenanceCandidateKind::Conflict
+                    }
+                    ai_growth::GrowthMemoryCandidateKind::Stale => {
+                        memory::MaintenanceCandidateKind::Stale
+                    }
+                    ai_growth::GrowthMemoryCandidateKind::AuthorityPromotion => {
+                        memory::MaintenanceCandidateKind::AuthorityPromotion
+                    }
+                    ai_growth::GrowthMemoryCandidateKind::RelationshipRefresh => {
+                        memory::MaintenanceCandidateKind::RelationshipRefresh
+                    }
+                },
+                status: memory::MaintenanceCandidateStatus::Open,
+                entry_ids: Vec::new(),
+                summary: candidate.summary.clone(),
+                reason: format!(
+                    "ai_growth:{}; confidence_bp={}",
+                    candidate.reason, candidate.confidence_bp
+                ),
+                confidence: candidate.confidence_bp as f32 / 10_000.0,
+                source: Some("ai_growth".to_string()),
+                source_ref: Some(trace.growth_event.id.clone()),
+                created_at: now,
+                updated_at: now,
+            }
+        })
+        .collect()
 }
 
 type ToolHandler = Box<dyn Fn(&str) -> Result<String, ToolError> + Send + Sync>;
@@ -4904,9 +4959,18 @@ mod tests {
                 ai_kernel_trace.payload["verification"]["can_finalize"],
                 true
             );
+            assert_eq!(
+                ai_kernel_trace.payload["verification"]["finalization_blocked"],
+                false
+            );
             assert_eq!(ai_kernel_trace.payload["bench"]["passed"], true);
             assert_eq!(ai_kernel_trace.payload["regression_gate"]["allowed"], true);
             assert_eq!(ai_kernel_trace.payload["growth"]["has_blocker"], false);
+            assert!(ai_kernel_trace.payload["maintenance_candidates"].is_array());
+            assert_eq!(
+                ai_kernel_trace.payload["matrix_evidence_signal"]["source"],
+                "ai_kernel_trace"
+            );
         });
     }
 

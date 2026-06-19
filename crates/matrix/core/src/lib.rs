@@ -31,7 +31,11 @@ pub use data_plane::{
 };
 pub use entity::{normalize_key, MatrixEntity, MatrixEntityInput, MatrixSourceKey};
 pub use evidence::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
-pub use fact::{MatrixFact, MatrixFactInput};
+pub use fact::{
+    MatrixFact, MatrixFactInput, AI_EVAL_RESULT_FACT, AI_GROWTH_SIGNAL_FACT,
+    AI_STRATEGY_DECISION_FACT, AI_TOOL_TRANSACTION_RESULT_FACT, AI_VERIFICATION_RESULT_FACT,
+    AI_WORKGRAPH_QUALITY_FACT,
+};
 pub use metric::{MatrixMetricDefinition, MatrixMetricState, MatrixMetricStatus};
 pub use metric_attention::{
     build_metric_compute_jobs, MatrixMetricAttentionPlan, MatrixMetricAttentionScore,

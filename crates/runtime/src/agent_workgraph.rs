@@ -88,6 +88,66 @@ pub struct AgentWorkGraph {
 
 impl AgentWorkGraph {
     #[must_use]
+    pub fn from_ai_workgraph(
+        session_id: impl Into<String>,
+        graph: &ai_workgraph::WorkGraph,
+    ) -> Self {
+        let now = current_time_ms();
+        let graph_id = graph.id.clone();
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| WorkGraphNode {
+                node_id: node.id.clone(),
+                kind: match node.kind {
+                    ai_workgraph::WorkNodeKind::AgentTask => WorkGraphNodeKind::AgentTask,
+                    ai_workgraph::WorkNodeKind::ToolTask => WorkGraphNodeKind::ToolTask,
+                    ai_workgraph::WorkNodeKind::ReadOnlyFanout => WorkGraphNodeKind::ToolTask,
+                    ai_workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
+                    ai_workgraph::WorkNodeKind::Synthesis => WorkGraphNodeKind::Synthesis,
+                },
+                label: node.label.clone(),
+                objective: node.objective.clone(),
+                agent_id: node.agent_id.clone(),
+                status: format!("{:?}", node.status).to_ascii_lowercase(),
+                refs: vec![WorkGraphRef {
+                    ref_type: "ai_workgraph".to_string(),
+                    id: graph_id.clone(),
+                }],
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .collect::<Vec<_>>();
+        let edges = graph
+            .edges
+            .iter()
+            .map(|edge| WorkGraphEdge {
+                from_node_id: edge.from.clone(),
+                to_node_id: edge.to.clone(),
+                kind: match edge.kind {
+                    ai_workgraph::WorkEdgeKind::DependsOn => WorkGraphEdgeKind::DependsOn,
+                    ai_workgraph::WorkEdgeKind::Verifies => WorkGraphEdgeKind::Verifies,
+                    ai_workgraph::WorkEdgeKind::Reviews => WorkGraphEdgeKind::Reviews,
+                    ai_workgraph::WorkEdgeKind::Produces => WorkGraphEdgeKind::Produces,
+                },
+            })
+            .collect();
+
+        Self {
+            graph_id,
+            session_id: session_id.into(),
+            objective: graph.objective.clone(),
+            nodes,
+            edges,
+            board_id: None,
+            scorecard: None,
+            status: WorkGraphStatus::Planned,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = session_id.into();
         self
@@ -380,6 +440,35 @@ mod tests {
             memory_pulse_count: 0,
             surfaced_conflicts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn projects_ai_workgraph_into_runtime_agent_workgraph() {
+        let mut graph = ai_workgraph::WorkGraph::new("analyze runtime growth");
+        let plan = graph
+            .add_node(ai_workgraph::WorkNode::new(
+                ai_workgraph::WorkNodeKind::AgentTask,
+                "plan",
+                "plan the work",
+            ))
+            .unwrap();
+        let review = graph
+            .add_node(ai_workgraph::WorkNode::new(
+                ai_workgraph::WorkNodeKind::Review,
+                "review",
+                "review evidence",
+            ))
+            .unwrap();
+        graph
+            .add_edge(&plan, &review, ai_workgraph::WorkEdgeKind::DependsOn)
+            .unwrap();
+
+        let projected = AgentWorkGraph::from_ai_workgraph("session-1", &graph);
+
+        assert_eq!(projected.graph_id, graph.id);
+        assert_eq!(projected.nodes.len(), 2);
+        assert_eq!(projected.edges.len(), 1);
+        assert_eq!(projected.nodes[0].refs[0].ref_type, "ai_workgraph");
     }
 
     #[test]

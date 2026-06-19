@@ -41,6 +41,7 @@ pub struct StrategyInput {
     pub workspace_available: bool,
     pub changed_files: usize,
     pub explicit_write: bool,
+    pub experience: Option<StrategyExperienceSummary>,
 }
 
 impl StrategyInput {
@@ -51,6 +52,7 @@ impl StrategyInput {
             workspace_available: true,
             changed_files: 0,
             explicit_write: false,
+            experience: None,
         }
     }
 
@@ -71,6 +73,21 @@ impl StrategyInput {
         self.explicit_write = explicit_write;
         self
     }
+
+    #[must_use]
+    pub fn with_experience(mut self, experience: StrategyExperienceSummary) -> Self {
+        self.experience = Some(experience);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyExperienceSummary {
+    pub sample_count: u32,
+    pub success_rate_bp: u16,
+    pub verification_block_rate_bp: u16,
+    pub context_pressure_rate_bp: u16,
+    pub multi_agent_lift_rate_bp: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,9 +185,22 @@ impl StrategyRouter {
             reasons.push("task explicitly benefits from multiple agents".to_string());
         }
 
-        let mode = select_mode(&understanding, &self.policy, &mut reasons);
+        let mut mode = select_mode(&understanding, &self.policy, &mut reasons);
+        if let Some(experience) = &input.experience {
+            mode = adapt_mode_from_experience(mode, &understanding, experience, &mut reasons);
+        }
         dedupe_decorators(&mut decorators);
-        let confidence = confidence_for(&understanding, mode);
+        let mut confidence = confidence_for(&understanding, mode);
+        if let Some(experience) = &input.experience {
+            confidence =
+                adapt_confidence_from_experience(confidence, mode, experience, &mut reasons);
+            if experience.verification_block_rate_bp >= 3000
+                && !decorators.contains(&StrategyDecorator::WithVerifier)
+            {
+                decorators.push(StrategyDecorator::WithVerifier);
+                reasons.push("experience shows verification gaps for comparable tasks".to_string());
+            }
+        }
         let required_capabilities = required_capabilities_for(&understanding, mode, &decorators);
 
         StrategyDecision {
@@ -183,6 +213,60 @@ impl StrategyRouter {
             policy_version: "strategy-router-v2".to_string(),
         }
     }
+}
+
+fn adapt_mode_from_experience(
+    mode: ExecutionMode,
+    understanding: &TaskUnderstanding,
+    experience: &StrategyExperienceSummary,
+    reasons: &mut Vec<String>,
+) -> ExecutionMode {
+    if experience.sample_count < 3 {
+        return mode;
+    }
+    if mode == ExecutionMode::SupervisorSubagents
+        && experience.multi_agent_lift_rate_bp < 4000
+        && !matches!(understanding.risk, TaskRisk::Critical)
+    {
+        reasons.push("experience shows low multi-agent lift for comparable tasks".to_string());
+        return ExecutionMode::PlanExecute;
+    }
+    if matches!(mode, ExecutionMode::DirectAnswer | ExecutionMode::FastEdit)
+        && experience.verification_block_rate_bp >= 5000
+        && matches!(
+            understanding.complexity,
+            TaskComplexity::Moderate | TaskComplexity::Complex | TaskComplexity::Strategic
+        )
+    {
+        reasons.push(
+            "experience shows frequent verification blocks; upgrading to plan-execute".to_string(),
+        );
+        return ExecutionMode::PlanExecute;
+    }
+    mode
+}
+
+fn adapt_confidence_from_experience(
+    confidence: u8,
+    mode: ExecutionMode,
+    experience: &StrategyExperienceSummary,
+    reasons: &mut Vec<String>,
+) -> u8 {
+    if experience.sample_count < 3 {
+        return confidence;
+    }
+    if experience.success_rate_bp >= 8500 {
+        reasons.push("experience shows high success rate for comparable routing".to_string());
+        return confidence.saturating_add(5).min(95);
+    }
+    if experience.success_rate_bp <= 4500 || experience.context_pressure_rate_bp >= 6000 {
+        reasons.push("experience shows degraded outcomes for comparable routing".to_string());
+        return confidence.saturating_sub(match mode {
+            ExecutionMode::HumanConfirm | ExecutionMode::RiskGate => 0,
+            _ => 8,
+        });
+    }
+    confidence
 }
 
 #[must_use]
@@ -557,5 +641,26 @@ mod tests {
         ));
 
         assert_eq!(decision.mode, ExecutionMode::HumanConfirm);
+    }
+
+    #[test]
+    fn strategy_experience_can_downgrade_low_lift_multi_agent() {
+        let decision = decide_strategy(
+            &StrategyInput::from_prompt("使用多 Agent 协同完成复杂架构分析").with_experience(
+                StrategyExperienceSummary {
+                    sample_count: 5,
+                    success_rate_bp: 5000,
+                    verification_block_rate_bp: 0,
+                    context_pressure_rate_bp: 0,
+                    multi_agent_lift_rate_bp: 2000,
+                },
+            ),
+        );
+
+        assert_eq!(decision.mode, ExecutionMode::PlanExecute);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("low multi-agent lift")));
     }
 }

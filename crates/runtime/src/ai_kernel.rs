@@ -9,7 +9,7 @@ use ai_eval::{
     score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
     RegressionGateVerdict, Trajectory,
 };
-use ai_growth::{GrowthInput, LearningRecord};
+use ai_growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord};
 use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
 use ai_tool_transaction::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
@@ -26,14 +26,17 @@ use crate::context_runtime::ContextProfile;
 pub struct RuntimeAiKernelTrace {
     pub strategy: StrategyDecision,
     pub context_epoch: ContextEpoch,
+    pub context_envelope_id: Option<String>,
     pub prompt_plan: PromptAssemblyPlan,
     pub tool_transaction: Option<ToolTransactionPlan>,
     pub tool_receipt: Option<ToolTransactionReceipt>,
     pub verification_report: VerificationReport,
+    pub finalization_blocked: bool,
     pub trajectory: Trajectory,
     pub bench_result: BenchCaseResult,
     pub regression_gate: RegressionGateVerdict,
     pub learning_record: LearningRecord,
+    pub growth_event: GrowthEvent,
     pub workgraph: Option<WorkGraph>,
     pub workgraph_quality: Option<WorkGraphQualityReport>,
 }
@@ -46,6 +49,7 @@ pub struct RuntimeAiKernel {
     tool_transaction: Option<ToolTransactionPlan>,
     workgraph: Option<WorkGraph>,
     verification: VerificationLedger,
+    context_envelope_id: Option<String>,
 }
 
 impl RuntimeAiKernel {
@@ -68,6 +72,7 @@ impl RuntimeAiKernel {
             tool_transaction: None,
             workgraph,
             verification: VerificationLedger::new(),
+            context_envelope_id: None,
         }
     }
 
@@ -110,6 +115,10 @@ impl RuntimeAiKernel {
         }
     }
 
+    pub fn record_context_envelope(&mut self, envelope_id: impl Into<String>) {
+        self.context_envelope_id = Some(envelope_id.into());
+    }
+
     pub fn finalize(
         mut self,
         assistant_text: &str,
@@ -138,6 +147,7 @@ impl RuntimeAiKernel {
             .as_ref()
             .map(|plan| plan.receipt(completed_tool_results, failed_tool_results));
         let verification_report = self.verification.report();
+        let finalization_blocked = !verification_report.can_finalize;
         let prompt_plan = self.context_epoch.prompt_assembly_plan();
         let mut bench_case = CowdBenchCase::new(
             bench_kind_for_mode(self.strategy.mode),
@@ -182,6 +192,28 @@ impl RuntimeAiKernel {
             verification_can_finalize: verification_report.can_finalize,
             bench_passed: bench_result.passed,
         });
+        let mut evidence_refs = Vec::new();
+        if let Some(plan) = &self.tool_transaction {
+            evidence_refs.push(GrowthEvidenceRef::new(
+                "tool_transaction",
+                plan.id.clone(),
+                "AI kernel tool transaction plan",
+            ));
+        }
+        if let Some(graph) = &self.workgraph {
+            evidence_refs.push(GrowthEvidenceRef::new(
+                "workgraph",
+                graph.id.clone(),
+                "AI kernel workgraph",
+            ));
+        }
+        let growth_event = GrowthEvent::from_input(GrowthEventInput {
+            session_id: self.context_epoch.identity.session_id.clone(),
+            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            strategy_mode: self.strategy.mode,
+            learning_record: learning_record.clone(),
+            evidence_refs,
+        });
         let workgraph_quality = self
             .workgraph
             .as_ref()
@@ -190,14 +222,17 @@ impl RuntimeAiKernel {
         RuntimeAiKernelTrace {
             strategy: self.strategy,
             context_epoch: self.context_epoch,
+            context_envelope_id: self.context_envelope_id,
             prompt_plan,
             tool_transaction: self.tool_transaction,
             tool_receipt,
             verification_report,
+            finalization_blocked,
             trajectory,
             bench_result,
             regression_gate,
             learning_record,
+            growth_event,
             workgraph: self.workgraph,
             workgraph_quality,
         }
@@ -391,9 +426,14 @@ mod tests {
         assert!(!kernel.context_epoch().selected.is_empty());
         let trace = kernel.finalize("done", 0, 0);
         assert!(trace.verification_report.can_finalize);
+        assert!(!trace.finalization_blocked);
         assert!(trace.bench_result.passed);
         assert!(trace.regression_gate.allowed);
         assert!(!trace.learning_record.has_blocker());
+        assert_eq!(
+            trace.growth_event.source_event_kind,
+            "runtime.ai_kernel.trace"
+        );
     }
 
     #[test]
@@ -415,6 +455,19 @@ mod tests {
         assert!(trace.tool_transaction.is_some());
         assert!(trace.tool_receipt.is_some());
         assert!(!trace.learning_record.signals.is_empty());
+        assert!(!trace.growth_event.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn runtime_kernel_marks_empty_final_response_as_blocked() {
+        let kernel =
+            RuntimeAiKernel::begin_turn("session-1", "answer", ContextProfile::MainTurn, &[]);
+
+        let trace = kernel.finalize("", 0, 0);
+
+        assert!(trace.finalization_blocked);
+        assert!(!trace.regression_gate.allowed);
+        assert!(trace.learning_record.has_blocker());
     }
 
     #[test]

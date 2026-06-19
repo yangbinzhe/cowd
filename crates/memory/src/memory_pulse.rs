@@ -34,10 +34,14 @@ pub struct MemoryPulseBatch {
 
 impl MemoryPulseBatch {
     pub fn from_runtime_event(event: &RuntimeEvent) -> Option<Self> {
-        if !matches!(
-            event.scope,
-            RuntimeEventScope::Agent | RuntimeEventScope::Workgraph | RuntimeEventScope::Memory
-        ) {
+        let ai_kernel_task_trace =
+            event.scope == RuntimeEventScope::Task && event.kind == "runtime.ai_kernel.trace";
+        if !ai_kernel_task_trace
+            && !matches!(
+                event.scope,
+                RuntimeEventScope::Agent | RuntimeEventScope::Workgraph | RuntimeEventScope::Memory
+            )
+        {
             return None;
         }
 
@@ -149,8 +153,12 @@ impl MemoryPulseConsumer {
         let dropped = batch.candidates.len().saturating_sub(max);
         batch.candidates.truncate(max);
         for candidate in &mut batch.candidates {
-            candidate.source = Some("memory_pulse".to_string());
-            candidate.source_ref = Some(batch.source_ref.clone());
+            if candidate.source.is_none() {
+                candidate.source = Some("memory_pulse".to_string());
+            }
+            if candidate.source_ref.is_none() {
+                candidate.source_ref = Some(batch.source_ref.clone());
+            }
         }
 
         let transitions = batch
@@ -292,6 +300,52 @@ mod tests {
         assert_eq!(batch.source_ref, "board-1");
         assert_eq!(batch.candidates.len(), 1);
         assert_eq!(batch.candidates[0].id, "from-event");
+    }
+
+    #[test]
+    fn memory_pulse_batch_extracts_candidates_from_ai_kernel_task_trace() {
+        let mut ai_candidate = candidate("from-ai-growth");
+        ai_candidate.source = Some("ai_growth".to_string());
+        let event = RuntimeEvent::new(
+            "session-1",
+            8,
+            RuntimeEventScope::Task,
+            "runtime.ai_kernel.trace",
+            serde_json::json!({
+                "maintenance_candidates": [ai_candidate]
+            }),
+            88,
+        );
+
+        let batch = MemoryPulseBatch::from_runtime_event(&event).unwrap();
+        assert_eq!(batch.source_event_id, event.event_id);
+        assert_eq!(batch.source_ref, event.event_id);
+        assert_eq!(batch.candidates[0].id, "from-ai-growth");
+    }
+
+    #[test]
+    fn memory_pulse_preserves_ai_growth_candidate_source() {
+        let mut ai_candidate = candidate("preserve-ai-source");
+        ai_candidate.source = Some("ai_growth".to_string());
+        let consumer = MemoryPulseConsumer::new(MaintenanceQueue::new());
+        let report = consumer
+            .process_batch(MemoryPulseBatch {
+                source_event_id: "event-ai".to_string(),
+                source_ref: "runtime:event:event-ai".to_string(),
+                candidates: vec![ai_candidate],
+            })
+            .unwrap();
+
+        assert_eq!(report.accepted, 1);
+        let queued = consumer
+            .queue
+            .list(MaintenanceCandidateFilter::default())
+            .unwrap();
+        assert_eq!(queued[0].source.as_deref(), Some("ai_growth"));
+        assert_eq!(
+            queued[0].source_ref.as_deref(),
+            Some("runtime:event:event-ai")
+        );
     }
 
     #[test]
