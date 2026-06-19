@@ -1,0 +1,492 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use app_mfg::{server_manufacturing_skill_pack, MfgSkillManifest};
+use serde::Serialize;
+use skill_service::{SkillInfo, SkillRegistry, SkillRouter};
+
+use super::{SkillActionRequest, SkillServiceError};
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SkillCatalogItem {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) description: Option<String>,
+    pub(super) scope: String,
+    pub(super) source: String,
+    pub(super) domain: Option<String>,
+    pub(super) status: String,
+    pub(super) risk: String,
+    pub(super) tags: Vec<String>,
+    pub(super) tools: Vec<String>,
+    pub(super) required_evidence: Vec<String>,
+    pub(super) capabilities: Vec<String>,
+    pub(super) path: Option<String>,
+    pub(super) shadowed_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillFileEntry {
+    pub(super) path: String,
+    pub(super) name: String,
+    pub(super) kind: &'static str,
+    pub(super) size: Option<u64>,
+    pub(super) primary: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillAction {
+    pub(super) id: &'static str,
+    pub(super) label: &'static str,
+    pub(super) surface: &'static str,
+    pub(super) mutation: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillProjection {
+    pub(super) kind: &'static str,
+    pub(super) surface: String,
+    pub(super) catalog_count: usize,
+    pub(super) capabilities: Vec<&'static str>,
+    pub(super) actions: Vec<SkillAction>,
+    pub(super) facets: SkillProjectionFacets,
+    pub(super) queue: SkillProjectionQueue,
+    pub(super) governance: SkillProjectionGovernance,
+    pub(super) diagnostics: Vec<String>,
+    pub(super) activation: Option<serde_json::Value>,
+    pub(super) items: Vec<SkillCatalogItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillProjectionFacets {
+    pub(super) scopes: Vec<String>,
+    pub(super) domains: Vec<String>,
+    pub(super) tags: Vec<String>,
+    pub(super) risks: Vec<String>,
+    pub(super) statuses: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillProjectionQueue {
+    pub(super) source: &'static str,
+    pub(super) run_list_endpoint: &'static str,
+    pub(super) supports_watch: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillProjectionGovernance {
+    pub(super) evidence_model: &'static str,
+    pub(super) tool_fact_model: &'static str,
+    pub(super) approval_model: &'static str,
+}
+pub(super) fn collect_skill_catalog(
+    workspace_root: &Path,
+) -> Result<Vec<SkillCatalogItem>, SkillServiceError> {
+    let mut items = server_manufacturing_skill_pack()
+        .into_iter()
+        .map(mfg_skill_catalog_item)
+        .collect::<Vec<_>>();
+    let registry = SkillRegistry::discover(workspace_root);
+    for skill in registry
+        .list()
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))?
+    {
+        items.push(local_skill_catalog_item(skill));
+    }
+    items.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(items)
+}
+
+pub(super) fn find_catalog_item(
+    workspace_root: &Path,
+    id: &str,
+) -> Result<SkillCatalogItem, SkillServiceError> {
+    collect_skill_catalog(workspace_root)?
+        .into_iter()
+        .find(|item| item.id == id || item.name.eq_ignore_ascii_case(id))
+        .ok_or_else(|| SkillServiceError::NotFound("skill not found".to_string()))
+}
+
+pub(super) fn find_mfg_skill(skill_id: &str) -> Option<MfgSkillManifest> {
+    server_manufacturing_skill_pack()
+        .into_iter()
+        .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
+}
+
+pub(super) fn required_incident_id(
+    request: &SkillActionRequest,
+) -> Result<String, SkillServiceError> {
+    request
+        .incident_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| SkillServiceError::BadRequest("incident_id is required".to_string()))
+}
+
+fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
+    let risk = mfg_risk(&skill).to_string();
+    let tags = vec![skill.domain.clone(), "mfg".to_string()];
+    let capabilities = skill
+        .output_actions
+        .iter()
+        .chain(skill.input_fact_types.iter())
+        .cloned()
+        .collect();
+    SkillCatalogItem {
+        id: format!("mfg:{}", skill.skill_id),
+        name: skill.skill_id,
+        description: Some(skill.role),
+        scope: "mfg".to_string(),
+        source: "app_mfg.server_manufacturing".to_string(),
+        domain: Some(skill.domain),
+        status: "ready".to_string(),
+        risk,
+        tags,
+        tools: skill.tools,
+        required_evidence: skill.required_evidence,
+        capabilities,
+        path: None,
+        shadowed_by: None,
+    }
+}
+
+fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
+    SkillCatalogItem {
+        id: format!("local:{}", skill.name),
+        name: skill.name,
+        description: skill.description,
+        scope: "local".to_string(),
+        source: format!("{:?}", skill.source),
+        domain: None,
+        status: if skill.shadowed_by.is_some() {
+            "shadowed".to_string()
+        } else {
+            "ready".to_string()
+        },
+        risk: "operator_review".to_string(),
+        tags: skill.tags,
+        tools: Vec::new(),
+        required_evidence: Vec::new(),
+        capabilities: skill.related_skills,
+        path: Some(skill.path.display().to_string()),
+        shadowed_by: skill.shadowed_by.map(|source| format!("{source:?}")),
+    }
+}
+
+pub(super) fn local_skill_root(item: &SkillCatalogItem) -> Result<PathBuf, SkillServiceError> {
+    let Some(path) = item.path.as_ref() else {
+        return Err(SkillServiceError::NotFound(
+            "skill path unavailable".to_string(),
+        ));
+    };
+    let path = PathBuf::from(path);
+    let root = if path.is_file() {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        path
+    };
+    root.canonicalize()
+        .map_err(|error| SkillServiceError::Internal(format!("skill root unavailable: {error}")))
+}
+
+pub(super) fn safe_skill_file_path(
+    root: &Path,
+    requested: &str,
+) -> Result<PathBuf, SkillServiceError> {
+    if requested.trim().is_empty() || requested.starts_with('/') || requested.contains('\\') {
+        return Err(SkillServiceError::BadRequest(
+            "invalid skill file path".to_string(),
+        ));
+    }
+    let candidate = root.join(requested);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| SkillServiceError::NotFound("skill file not found".to_string()))?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err(SkillServiceError::BadRequest(
+            "skill file path escapes skill root".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+pub(super) fn list_skill_files(root: &Path) -> std::io::Result<Vec<SkillFileEntry>> {
+    let mut files = Vec::new();
+    collect_skill_files(root, root, &mut files, 0)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn collect_skill_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<SkillFileEntry>,
+    depth: usize,
+) -> std::io::Result<()> {
+    if depth > 3 || files.len() >= 240 {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == "node_modules" || name == "target" {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            files.push(SkillFileEntry {
+                path: relative.clone(),
+                name,
+                kind: "directory",
+                size: None,
+                primary: false,
+            });
+            collect_skill_files(root, &path, files, depth + 1)?;
+        } else if metadata.is_file() {
+            files.push(SkillFileEntry {
+                primary: relative == "SKILL.md",
+                path: relative,
+                name,
+                kind: "file",
+                size: Some(metadata.len()),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn mfg_virtual_files(item: &SkillCatalogItem) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "skills.files",
+        "schema_version": 1,
+        "skill": item,
+        "root": "virtual://mfg/server-manufacturing",
+        "primary": "SKILL.md",
+        "files": [{
+            "path": "SKILL.md",
+            "name": "SKILL.md",
+            "kind": "file",
+            "size": mfg_virtual_skill_markdown(item).len(),
+            "primary": true
+        }],
+    })
+}
+
+pub(super) fn mfg_virtual_skill_markdown(item: &SkillCatalogItem) -> String {
+    format!(
+        "# {}\n\n{}\n\n- Scope: {}\n- Source: {}\n- Domain: {}\n- Status: {}\n- Risk: {}\n\n## Tools\n{}\n\n## Required Evidence\n{}\n\n## Capabilities\n{}\n",
+        item.name,
+        item.description.as_deref().unwrap_or("MFG manufacturing skill."),
+        item.scope,
+        item.source,
+        item.domain.as_deref().unwrap_or("manufacturing"),
+        item.status,
+        item.risk,
+        markdown_list(&item.tools),
+        markdown_list(&item.required_evidence),
+        markdown_list(&item.capabilities),
+    )
+}
+
+fn markdown_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "- none".to_string();
+    }
+    values
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mfg_risk(skill: &MfgSkillManifest) -> &'static str {
+    if skill
+        .output_actions
+        .iter()
+        .any(|action| action.contains("dispatch") || action.contains("escalation"))
+    {
+        "controlled"
+    } else if skill.tools.iter().any(|tool| tool.contains("cross_plane")) {
+        "governed"
+    } else {
+        "review"
+    }
+}
+
+pub(super) fn filter_scope(
+    items: Vec<SkillCatalogItem>,
+    scope: Option<&str>,
+) -> Vec<SkillCatalogItem> {
+    match scope.unwrap_or("all") {
+        "all" => items,
+        scope => items
+            .into_iter()
+            .filter(|item| item.scope == scope || item.source.contains(scope))
+            .collect(),
+    }
+}
+
+pub(super) fn normalize_surface(surface: Option<&str>) -> String {
+    match surface.unwrap_or("webui").to_ascii_lowercase().as_str() {
+        "tui" => "tui".to_string(),
+        "cli" => "cli".to_string(),
+        _ => "webui".to_string(),
+    }
+}
+
+pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
+    match surface {
+        "cli" => vec![
+            "catalog.read",
+            "skill.view",
+            "skill.import",
+            "diagnostics.read",
+        ],
+        "tui" => vec![
+            "catalog.read",
+            "skill.view",
+            "skill.validate",
+            "skill.plan",
+            "skill.run",
+            "run.watch",
+            "evidence.summary",
+            "governance.queue",
+        ],
+        _ => vec![
+            "catalog.read",
+            "skill.view",
+            "skill.validate",
+            "skill.plan",
+            "skill.run",
+            "run.watch",
+            "evidence.timeline",
+            "evidence.diff",
+            "governance.bulk",
+            "imports.guided",
+            "telemetry.dashboard",
+        ],
+    }
+}
+
+pub(super) fn projection_actions(surface: &str) -> Vec<SkillAction> {
+    let mut actions = vec![
+        SkillAction {
+            id: "view",
+            label: "View",
+            surface: "all",
+            mutation: false,
+        },
+        SkillAction {
+            id: "validate",
+            label: "Validate",
+            surface: "webui,tui",
+            mutation: false,
+        },
+    ];
+    if surface != "cli" {
+        actions.extend([
+            SkillAction {
+                id: "plan",
+                label: "Plan",
+                surface: "webui,tui",
+                mutation: false,
+            },
+            SkillAction {
+                id: "run",
+                label: "Run",
+                surface: "webui,tui",
+                mutation: true,
+            },
+            SkillAction {
+                id: "watch",
+                label: "Watch",
+                surface: "webui,tui",
+                mutation: false,
+            },
+        ]);
+    }
+    if surface == "webui" {
+        actions.push(SkillAction {
+            id: "bulk_govern",
+            label: "Bulk Govern",
+            surface: "webui",
+            mutation: true,
+        });
+    }
+    actions
+}
+
+pub(super) fn projection_facets(items: &[SkillCatalogItem]) -> SkillProjectionFacets {
+    let mut scopes = Vec::new();
+    let mut domains = Vec::new();
+    let mut tags = Vec::new();
+    let mut risks = Vec::new();
+    let mut statuses = Vec::new();
+    for item in items {
+        push_unique(&mut scopes, item.scope.clone());
+        if let Some(domain) = &item.domain {
+            push_unique(&mut domains, domain.clone());
+        }
+        for tag in &item.tags {
+            push_unique(&mut tags, tag.clone());
+        }
+        push_unique(&mut risks, item.risk.clone());
+        push_unique(&mut statuses, item.status.clone());
+    }
+    SkillProjectionFacets {
+        scopes,
+        domains,
+        tags,
+        risks,
+        statuses,
+    }
+}
+
+pub(super) fn projection_diagnostics(items: &[SkillCatalogItem]) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if !items.iter().any(|item| item.scope == "mfg") {
+        diagnostics.push("mfg_skill_pack_unavailable".to_string());
+    }
+    if !items.iter().any(|item| item.scope == "local") {
+        diagnostics.push("local_skill_registry_empty".to_string());
+    }
+    diagnostics
+}
+
+pub(super) fn activation_projection(
+    workspace_root: &Path,
+    query: Option<&str>,
+) -> Result<Option<serde_json::Value>, SkillServiceError> {
+    let Some(query) = query.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let registry = SkillRegistry::discover(workspace_root);
+    let result = SkillRouter::new(registry)
+        .suggest(query)
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+    Ok(Some(serde_json::json!({
+        "kind": "skills.activation",
+        "query": result.query,
+        "selected": result.selected,
+        "candidates": result.candidates,
+    })))
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}

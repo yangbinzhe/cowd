@@ -38,7 +38,6 @@ mod session_kernel;
 mod session_lifecycle_kernel;
 mod skill_projection;
 mod skill_static;
-mod slash_catalog;
 mod suggestions;
 mod task_kernel;
 mod tool_projection;

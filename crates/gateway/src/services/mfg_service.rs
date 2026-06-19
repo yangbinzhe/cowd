@@ -21,6 +21,9 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+mod cross_plane;
+mod delivery;
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MfgCrossPlaneBridgeRequest {
     #[serde(default = "default_mfg_bridge_mode")]
@@ -82,34 +85,6 @@ pub(crate) struct MfgCockpitReportDeliveryOutcome {
 
 fn default_mfg_bridge_mode() -> String {
     "dry_run".to_string()
-}
-
-fn default_cross_plane_capability(execution: &MfgActionExecution) -> &'static str {
-    match execution.action_type.as_str() {
-        "supplier_recovery" | "plan_bom_reconciliation" | "evidence_review" => {
-            "channel.feishu.send_text"
-        }
-        _ => "channel.feishu.send_text",
-    }
-}
-
-fn default_bridge_message(execution: &MfgActionExecution) -> String {
-    format!(
-        "MFG action {} [{}]: {}; incident={}; execution={}",
-        execution.action_type,
-        execution.owner_role,
-        execution.title,
-        execution.incident_id,
-        execution.execution_id
-    )
-}
-
-fn cross_plane_risk(execution: &MfgActionExecution) -> CrossPlaneRisk {
-    if execution.governance.contains("human_review") || execution.mode == "commit" {
-        CrossPlaneRisk::Medium
-    } else {
-        CrossPlaneRisk::Low
-    }
 }
 
 #[derive(Clone)]
@@ -189,186 +164,6 @@ impl MfgService {
             "commit" | "live" | "execute" => "commit".to_string(),
             _ => "dry_run".to_string(),
         }
-    }
-
-    pub(crate) fn cross_plane_action_from_execution(
-        &self,
-        execution: &MfgActionExecution,
-        request: &MfgCrossPlaneBridgeRequest,
-    ) -> CrossPlaneAction {
-        let actor_principal = request
-            .actor_principal
-            .as_deref()
-            .or(execution.operator_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("mfg:operator");
-        let requested_capability = request
-            .requested_capability
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| default_cross_plane_capability(execution));
-        let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
-        action.actor_identity_ref = request.actor_identity_ref.clone();
-        action.source_channel = Some(
-            request
-                .source_channel
-                .clone()
-                .unwrap_or_else(|| "mfg".to_string()),
-        );
-        action.session_id = Some(execution.incident_id.clone());
-        action.provider_account = request.provider_account.clone();
-        action.target_ref = request.target_ref.clone();
-        action.resource_ref = request
-            .resource_ref
-            .clone()
-            .or_else(|| Some(format!("text://{}", default_bridge_message(execution))));
-        action.risk = cross_plane_risk(execution);
-        action.data_classification = DataClassification::Internal;
-        action.identity_trust = IdentityTrust::Unknown;
-        action
-    }
-
-    pub(crate) fn bridge_outcome(
-        &self,
-        mode: &str,
-        decision: &CrossPlanePolicyDecision,
-    ) -> (String, String, Vec<String>, String, String) {
-        if decision.decision == PolicyDecisionKind::Allow {
-            if mode == "dry_run" {
-                return (
-                    "planned".to_string(),
-                    "dry_run".to_string(),
-                    Vec::new(),
-                    "dry_run".to_string(),
-                    "mfg_cross_plane_bridge_dry_run_plan".to_string(),
-                );
-            }
-            return (
-                "planned".to_string(),
-                "human_review_required".to_string(),
-                vec!["mfg:human_review_required".to_string()],
-                "planned".to_string(),
-                "mfg_cross_plane_bridge_queued_for_human_review".to_string(),
-            );
-        }
-        (
-            "blocked".to_string(),
-            "policy_blocked".to_string(),
-            vec![format!("policy:{}", decision.reason)],
-            "blocked".to_string(),
-            "mfg_cross_plane_bridge_policy_blocked".to_string(),
-        )
-    }
-
-    pub(crate) fn record_cross_plane_bridge_receipt(
-        &self,
-        cross_plane: &CrossPlaneService,
-        idempotency_key: Option<String>,
-        mode: String,
-        action: CrossPlaneAction,
-        decision: CrossPlanePolicyDecision,
-        evidence: CrossPlaneDecisionEvidence,
-    ) -> CrossPlaneExecutionReceipt {
-        let (status, dispatch_status, blockers, audit_result, audit_summary) =
-            self.bridge_outcome(&mode, &decision);
-        let (_, receipt) = cross_plane.record_action_execution(CrossPlaneExecutionRecord {
-            idempotency_key,
-            mode,
-            status: match status.as_str() {
-                "planned" => "planned",
-                "blocked" => "blocked",
-                _ => "blocked",
-            }
-            .to_string(),
-            dispatch_status: match dispatch_status.as_str() {
-                "dry_run" => "dry_run",
-                "human_review_required" => "human_review_required",
-                "policy_blocked" => "policy_blocked",
-                _ => "not_dispatched",
-            }
-            .to_string(),
-            action,
-            decision,
-            blockers,
-            dispatch_target: None,
-            dispatch_outcome: None,
-            evidence,
-            audit_result,
-            audit_summary,
-        });
-        receipt
-    }
-
-    pub(crate) fn report_delivery_payload(
-        &self,
-        report: &MfgCockpitReportSnapshot,
-        request: &MfgCockpitReportDeliveryRequest,
-    ) -> app_mfg::MfgCockpitReportDeliveryPayload {
-        app_mfg::MfgCockpitReportDeliveryPayload::from_report(
-            report,
-            app_mfg::MfgCockpitReportDeliveryPayloadRequest {
-                channel: request.channel.clone(),
-                template_id: request.template_id.clone(),
-                target_ref: request
-                    .target_ref
-                    .clone()
-                    .or_else(|| report.delivery_ref.clone()),
-                requested_capability: request.requested_capability.clone(),
-            },
-        )
-    }
-
-    pub(crate) fn report_delivery_action(
-        &self,
-        report: &MfgCockpitReportSnapshot,
-        request: &MfgCockpitReportDeliveryRequest,
-        delivery_payload: &app_mfg::MfgCockpitReportDeliveryPayload,
-    ) -> CrossPlaneAction {
-        let actor_principal = request
-            .actor_principal
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(report.owner_ref.as_str());
-        let requested_capability = request
-            .requested_capability
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(delivery_payload.requested_capability.as_str());
-        let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
-        action.actor_identity_ref = request.actor_identity_ref.clone();
-        action.source_channel = Some(
-            request
-                .source_channel
-                .clone()
-                .unwrap_or_else(|| "mfg.report".to_string()),
-        );
-        action.session_id = Some(report.report_id.clone());
-        action.provider_account = request.provider_account.clone();
-        action.target_ref = request
-            .target_ref
-            .clone()
-            .or_else(|| delivery_payload.target_ref.clone())
-            .or_else(|| report.delivery_ref.clone());
-        action.resource_ref = request
-            .resource_ref
-            .clone()
-            .or_else(|| Some(delivery_payload.resource_ref.clone()));
-        action.risk = CrossPlaneRisk::Low;
-        action.data_classification = DataClassification::Internal;
-        action.identity_trust = IdentityTrust::Unknown;
-        action
-    }
-
-    pub(crate) fn report_delivery_receipt_matches(
-        &self,
-        receipt: &CrossPlaneExecutionReceipt,
-        report: &MfgCockpitReportSnapshot,
-    ) -> bool {
-        receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
     }
 
     pub(crate) fn open_store(
@@ -800,25 +595,6 @@ impl MfgService {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.open_store(config_home)?
             .attach_cockpit_report_delivery(report_id, receipt)
-    }
-
-    pub(crate) fn attach_report_delivery_receipt(
-        &self,
-        config_home: impl AsRef<Path>,
-        report: &MfgCockpitReportSnapshot,
-        receipt: &CrossPlaneExecutionReceipt,
-    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
-        self.attach_cockpit_report_delivery(
-            config_home,
-            &report.report_id,
-            MfgCockpitReportDeliveryReceipt::new(
-                report.report_id.clone(),
-                receipt.id.clone(),
-                receipt.status.clone(),
-                receipt.dispatch_status.clone(),
-                receipt.audit_record_id.clone(),
-            ),
-        )
     }
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {

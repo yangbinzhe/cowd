@@ -148,7 +148,7 @@ check_empty "command-service must remain declarative" \
     crates/command/service/src crates/command/service/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
 
 check_empty "gateway services must not become protocol or storage adapters" \
-  bash -c 'rg -n "crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|std::env|env::|ConfigLoader::default_for" crates/gateway/src/services --glob "*.rs" | rg -v "^crates/gateway/src/services/mod.rs:[0-9]+:.*std::env::temp_dir|^crates/gateway/src/services/system_service.rs:(196|197|199):.*std::env::|^crates/gateway/src/services/skill_service.rs:(858|859|861):.*std::env::|^crates/gateway/src/services/mfg_service.rs:[0-9]+:.*MfgStore::open_storage_handle" || true'
+  bash -c 'rg -n "crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|std::env|env::|ConfigLoader::default_for" crates/gateway/src/services --glob "*.rs" | rg -v "^crates/gateway/src/services/registry.rs:[0-9]+:.*std::env::temp_dir|^crates/gateway/src/services/system_service.rs:(196|197|199):.*std::env::|^crates/gateway/src/services/skill_service.rs:(858|859|861):.*std::env::|^crates/gateway/src/services/mfg_service.rs:[0-9]+:.*MfgStore::open_storage_handle" || true'
 
 check_empty "gateway services must not route through slash command execution" \
   rg -n "slash_catalog|handle_.*slash_command|resolve_skill_invocation|resolve_skill_path" crates/gateway/src/services --glob "*.rs"
