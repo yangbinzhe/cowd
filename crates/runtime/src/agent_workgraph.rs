@@ -6,6 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ai_agent_spec::AgentSpec;
 use ai_growth::GrowthSignal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -59,6 +60,8 @@ pub struct WorkGraphNode {
     pub label: String,
     pub objective: String,
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_spec_id: Option<String>,
     pub status: String,
     #[serde(default)]
     pub refs: Vec<WorkGraphRef>,
@@ -110,6 +113,7 @@ impl AgentWorkGraph {
                 label: node.label.clone(),
                 objective: node.objective.clone(),
                 agent_id: node.agent_id.clone(),
+                agent_spec_id: node.agent_id.as_ref().map(|id| format!("agent-spec-{id}")),
                 status: format!("{:?}", node.status).to_ascii_lowercase(),
                 refs: vec![WorkGraphRef {
                     ref_type: "ai_workgraph".to_string(),
@@ -170,6 +174,7 @@ impl AgentWorkGraph {
                 label: subtask.id.clone(),
                 objective: subtask.description.clone(),
                 agent_id: None,
+                agent_spec_id: Some(AgentSpec::worker().id),
                 status: "planned".to_string(),
                 refs: vec![WorkGraphRef {
                     ref_type: "workgraph".to_string(),
@@ -225,6 +230,39 @@ impl AgentWorkGraph {
             self.upsert_trace_node(trace, now);
         }
         self.ensure_synthesis_node(&packet.board_id, now);
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent_specs(mut self, specs: &[AgentSpec]) -> Self {
+        if specs.is_empty() {
+            return self;
+        }
+        for node in &mut self.nodes {
+            if node.agent_spec_id.is_some() {
+                continue;
+            }
+            let spec = specs
+                .iter()
+                .find(|spec| {
+                    node.agent_id
+                        .as_ref()
+                        .map(|agent_id| {
+                            spec.id == *agent_id
+                                || spec.name.eq_ignore_ascii_case(agent_id)
+                                || spec.id == format!("agent-spec-{agent_id}")
+                        })
+                        .unwrap_or(false)
+                })
+                .or_else(|| specs.first());
+            if let Some(spec) = spec {
+                node.agent_spec_id = Some(spec.id.clone());
+                node.refs.push(WorkGraphRef {
+                    ref_type: "agent_spec".to_string(),
+                    id: spec.id.clone(),
+                });
+            }
+        }
         self
     }
 
@@ -320,6 +358,10 @@ impl AgentWorkGraph {
             label: trace.role.clone(),
             objective: trace.objective.clone(),
             agent_id: trace.agent_run_id.clone(),
+            agent_spec_id: trace
+                .agent_run_id
+                .as_ref()
+                .map(|agent_id| format!("agent-spec-{agent_id}")),
             status: trace.status.clone(),
             refs,
             created_at_ms: trace.created_at_ms,
@@ -338,6 +380,7 @@ impl AgentWorkGraph {
             label: "synthesis".to_string(),
             objective: "merge agent outputs and score collaboration lift".to_string(),
             agent_id: None,
+            agent_spec_id: Some(AgentSpec::reviewer().id),
             status: "completed".to_string(),
             refs: vec![
                 WorkGraphRef {

@@ -13,6 +13,7 @@ pub enum BenchCaseKind {
     VerificationGuard,
     WorkGraphFanout,
     ToolTransaction,
+    BehaviorMinimalScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +109,14 @@ pub struct RegressionGateVerdict {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgenticEvalGateReport {
+    pub verdict: RegressionGateVerdict,
+    pub required_capabilities: Vec<String>,
+    pub covered_capabilities: Vec<String>,
+    pub missing_capabilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RegressionGate {
     pub min_average_score: f32,
@@ -188,6 +197,43 @@ impl CowdBenchSmokeSuite {
     ) -> RegressionGateVerdict {
         gate.evaluate(&self.score(trajectories))
     }
+
+    #[must_use]
+    pub fn evaluate_agentic_gate(
+        &self,
+        trajectories: &[Trajectory],
+        gate: RegressionGate,
+    ) -> AgenticEvalGateReport {
+        let verdict = self.evaluate(trajectories, gate);
+        let required_capabilities = vec![
+            "strategy".to_string(),
+            "context".to_string(),
+            "verification".to_string(),
+            "workgraph".to_string(),
+            "tool_transaction".to_string(),
+            "policy".to_string(),
+            "behavior".to_string(),
+        ];
+        let covered_capabilities = self
+            .cases
+            .iter()
+            .flat_map(|case| case.required_checks.iter().cloned())
+            .filter_map(|check| capability_for_check(&check).map(ToString::to_string))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let missing_capabilities = required_capabilities
+            .iter()
+            .filter(|capability| !covered_capabilities.contains(capability))
+            .cloned()
+            .collect::<Vec<_>>();
+        AgenticEvalGateReport {
+            verdict,
+            required_capabilities,
+            covered_capabilities,
+            missing_capabilities,
+        }
+    }
 }
 
 #[must_use]
@@ -235,6 +281,12 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             ExecutionMode::RiskGate,
             "tool_transaction",
         ),
+        (
+            BenchCaseKind::BehaviorMinimalScope,
+            "avoid unnecessary abstractions while preserving safety",
+            ExecutionMode::FastEdit,
+            "minimal_scope",
+        ),
     ];
     specs
         .into_iter()
@@ -244,6 +296,19 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             case
         })
         .collect()
+}
+
+fn capability_for_check(check: &str) -> Option<&'static str> {
+    match check {
+        "answered" => Some("strategy"),
+        "guardrails" => Some("policy"),
+        "workgraph" | "value_verdict" => Some("workgraph"),
+        "context_epoch" => Some("context"),
+        "verification_report" => Some("verification"),
+        "tool_transaction" => Some("tool_transaction"),
+        "minimal_scope" | "reuse_existing" | "safety_preserved" => Some("behavior"),
+        _ => None,
+    }
 }
 
 #[must_use]
@@ -384,7 +449,7 @@ mod tests {
         let verdict = suite.evaluate(&trajectories, RegressionGate::strict());
 
         assert!(verdict.allowed);
-        assert_eq!(suite.cases.len(), 7);
+        assert_eq!(suite.cases.len(), 8);
     }
 
     #[test]
@@ -394,5 +459,16 @@ mod tests {
 
         assert!(!verdict.allowed);
         assert_eq!(verdict.failed, suite.cases.len());
+    }
+
+    #[test]
+    fn agentic_gate_reports_capability_coverage() {
+        let suite = CowdBenchSmokeSuite::default();
+        let report = suite.evaluate_agentic_gate(&[], RegressionGate::strict());
+
+        assert!(report
+            .covered_capabilities
+            .contains(&"behavior".to_string()));
+        assert!(report.required_capabilities.contains(&"policy".to_string()));
     }
 }
