@@ -65,7 +65,7 @@ impl AgentService {
     }
 
     pub(crate) fn catalog(&self, workspace_root: &Path) -> std::io::Result<Value> {
-        crate::slash_catalog::handle_agents_slash_command_json(Some("list"), workspace_root)
+        crate::slash_catalog::agent_catalog_json(workspace_root)
     }
 
     pub(crate) fn directory(&self, workspace_root: &Path) -> std::io::Result<Value> {
@@ -84,10 +84,7 @@ impl AgentService {
     }
 
     pub(crate) fn discover(&self, workspace_root: &Path, task: &str) -> std::io::Result<Value> {
-        crate::slash_catalog::handle_agents_slash_command_json(
-            Some(&format!("discover {}", task.trim())),
-            workspace_root,
-        )
+        crate::slash_catalog::agent_discovery_json(workspace_root, task.trim())
     }
 
     pub(crate) fn assemble(&self, workspace_root: &Path, task: &str) -> std::io::Result<Value> {

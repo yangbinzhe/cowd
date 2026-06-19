@@ -77,6 +77,9 @@ check_empty "cross-plane audit and receipt construction owner" \
   rg -n "CrossPlaneAuditRecord::new|CrossPlaneExecutionReceipt::new" \
     crates/gateway/src --glob '*.rs' --glob '!**/services/cross_plane_service.rs'
 
+check_empty "agent service must not route through slash handlers" \
+  rg -n "handle_agents_slash_command" crates/gateway/src/services/agent_service.rs
+
 check_empty "command-service must remain declarative" \
   rg -n "runtime::|memory::|matrix::|app_mfg::|plugins::|ConfigLoader|GlobalToolRegistry|Connection::open|SqliteConnectionManager::file|std::fs|fs::|std::env|env::|handle_agents_slash_command|handle_skills_slash_command|resolve_skill_path|resolve_skill_invocation" \
     crates/command/service/src crates/command/service/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'

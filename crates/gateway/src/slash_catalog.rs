@@ -208,44 +208,10 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
-            let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            Ok(render_agents_report_json(cwd, &agents))
-        }
+        None | Some("list") => agent_catalog_json(cwd),
         Some(args) if args.starts_with("discover") => {
             let task_desc = args.strip_prefix("discover").unwrap_or("").trim();
-            let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            let ranked = discover_agents_for_task(&agents, task_desc);
-            let agents_json: Vec<Value> = ranked
-                .iter()
-                .map(|a| {
-                    json!({
-                        "agent_id": a.name,
-                        "role": a.description,
-                        "capabilities": a.match_terms,
-                        "reputation": null,
-                        "status": if a.shadowed_by.is_some() { "shadowed" } else { "active" },
-                        "source": definition_source_json(a.source),
-                    })
-                })
-                .collect();
-            let team = assemble_static_agent_team(&ranked);
-            let team_json = team.map(|t| {
-                json!({
-                    "leader": { "agent_id": t.leader.name, "role": t.leader.description },
-                    "workers": t.workers.iter().map(|w| json!({ "agent_id": w.name, "role": w.description })).collect::<Vec<_>>(),
-                })
-            });
-            Ok(json!({
-                "kind": "agents",
-                "action": "discover",
-                "task": task_desc,
-                "count": ranked.len(),
-                "agents": agents_json,
-                "team": team_json,
-            }))
+            agent_discovery_json(cwd, task_desc)
         }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage_json(None)),
         Some(args) => Ok(render_agents_usage_json(Some(args))),
@@ -466,7 +432,10 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
         .map(|skill| skill.path)
 }
 
-fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
+pub(crate) fn discover_definition_roots(
+    cwd: &Path,
+    leaf: &str,
+) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -1027,6 +996,48 @@ pub(crate) fn render_agents_report_json(cwd: &Path, agents: &[AgentSummary]) -> 
         },
         "agents": agents.iter().map(agent_summary_json).collect::<Vec<_>>(),
     })
+}
+
+pub(crate) fn agent_catalog_json(cwd: &Path) -> std::io::Result<Value> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let agents = load_agents_from_roots(&roots)?;
+    Ok(render_agents_report_json(cwd, &agents))
+}
+
+pub(crate) fn agent_discovery_json(cwd: &Path, task: &str) -> std::io::Result<Value> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let agents = load_agents_from_roots(&roots)?;
+    let ranked = discover_agents_for_task(&agents, task);
+    let agents_json: Vec<Value> = ranked
+        .iter()
+        .map(|agent| {
+            json!({
+                "agent_id": agent.name,
+                "role": agent.description,
+                "capabilities": agent.match_terms,
+                "reputation": null,
+                "status": if agent.shadowed_by.is_some() { "shadowed" } else { "active" },
+                "source": definition_source_json(agent.source),
+            })
+        })
+        .collect();
+    let team_json = assemble_static_agent_team(&ranked).map(|team| {
+        json!({
+            "leader": { "agent_id": team.leader.name, "role": team.leader.description },
+            "workers": team.workers.iter().map(|worker| json!({
+                "agent_id": worker.name,
+                "role": worker.description
+            })).collect::<Vec<_>>(),
+        })
+    });
+    Ok(json!({
+        "kind": "agents",
+        "action": "discover",
+        "task": task,
+        "count": ranked.len(),
+        "agents": agents_json,
+        "team": team_json,
+    }))
 }
 
 fn discover_agents_for_task(agents: &[AgentSummary], task: &str) -> Vec<StaticAgentMatch> {
