@@ -3426,6 +3426,11 @@ where
                 "overengineering_risks": trace.behavior_policy.overengineering_risks,
                 "safety_exceptions": trace.behavior_policy.safety_exceptions,
                 "recommended_scope": format!("{:?}", trace.behavior_policy.recommended_scope),
+                "enforcement": {
+                    "allow_execution": trace.behavior_policy.enforcement.allow_execution,
+                    "requires_scope_downgrade": trace.behavior_policy.enforcement.requires_scope_downgrade,
+                    "requires_human_review": trace.behavior_policy.enforcement.requires_human_review,
+                },
                 "eval_checks": trace.behavior_policy.eval_checks,
             },
             "workgraph": trace.workgraph.as_ref().map(|graph| serde_json::json!({
@@ -3473,6 +3478,14 @@ where
             "matrix_evidence_signal": {
                 "source": "ai_kernel_trace",
                 "growth_event_id": trace.growth_event.id,
+                "packet_contract": {
+                    "problem_statement": "AI harness execution quality",
+                    "trace_ref": format!("runtime:event:{sequence}"),
+                    "strategy_mode": trace.strategy.mode.as_str(),
+                    "verification_can_finalize": trace.verification_report.can_finalize,
+                    "regression_allowed": trace.regression_gate.allowed,
+                    "harness_receipt_id": trace.harness_receipt.id,
+                },
                 "evidence_refs": trace.growth_event.evidence_refs,
                 "signals": trace.growth_event.matrix_signals,
                 "missing_evidence": matrix_missing_evidence(trace),

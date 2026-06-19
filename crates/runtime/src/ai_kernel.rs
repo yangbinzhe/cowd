@@ -15,7 +15,10 @@ use ai_growth::{
     GrowthSignalKind, LearningRecord,
 };
 use ai_harness::{CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt};
-use ai_policy::{tool_transaction_policy_receipts, PolicyReceipt};
+use ai_policy::{
+    agent_spec_policy_receipts, behavior_policy_receipt, tool_transaction_policy_receipts,
+    PolicyReceipt,
+};
 use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
 use ai_tool_transaction::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
@@ -243,11 +246,23 @@ impl RuntimeAiKernel {
             .workgraph
             .as_ref()
             .map(ai_workgraph::WorkGraph::quality_report);
-        let policy_receipts = tool_transaction_policy_receipts(
+        let agent_spec = ai_agent_spec::AgentSpec::for_turn(
+            &self.user_input,
+            self.strategy.mode,
+            self.strategy.understanding.risk,
+        );
+        let mut policy_receipts = agent_spec_policy_receipts(&agent_spec);
+        policy_receipts.extend(tool_transaction_policy_receipts(
             self.tool_transaction.as_ref().map(|plan| plan.id.as_str()),
             tool_requires_checkpoint,
             tool_requires_human_confirm,
-        );
+        ));
+        policy_receipts.push(behavior_policy_receipt(
+            self.behavior_policy.enforcement.allow_execution,
+            self.behavior_policy.enforcement.requires_scope_downgrade,
+            self.behavior_policy.enforcement.requires_human_review,
+            &self.behavior_policy.overengineering_risks,
+        ));
         let mut learning_record = LearningRecord::from_input(GrowthInput {
             selected_mode: self.strategy.mode,
             complexity: self.strategy.understanding.complexity,
@@ -328,7 +343,7 @@ impl RuntimeAiKernel {
         let harness_receipt = harness
             .execute_turn(
                 HarnessTurnInput {
-                    agent_spec: ai_agent_spec::AgentSpec::worker(),
+                    agent_spec: agent_spec.clone(),
                     strategy: self.strategy.clone(),
                     context_epoch: self.context_epoch.clone(),
                     tool_plan: self.tool_transaction.clone(),
@@ -347,7 +362,7 @@ impl RuntimeAiKernel {
             .unwrap_or_else(|error| HarnessTurnReceipt {
                 id: format!("harness-receipt-degraded-{}", uuid::Uuid::new_v4()),
                 harness_id: "cowd-native".to_string(),
-                agent_spec_id: "agent-spec-worker".to_string(),
+                agent_spec_id: agent_spec.id.clone(),
                 strategy_mode: self.strategy.mode.as_str().to_string(),
                 context_epoch_id: self.context_epoch.epoch_id.clone(),
                 tool_transaction_id: self.tool_transaction.as_ref().map(|plan| plan.id.clone()),

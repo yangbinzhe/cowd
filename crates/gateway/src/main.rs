@@ -11014,6 +11014,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn managed_sessions_default_to_sqlite_and_detect_legacy_imports() {
         let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();

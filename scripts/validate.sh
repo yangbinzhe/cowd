@@ -210,6 +210,7 @@ run_serial_global() {
 run_scenario() {
   run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
+  run_step ai_harness bash scripts/ci/ai-harness.sh
   run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
   run_step memory_context bash scripts/scenarios/memory-runtime.sh

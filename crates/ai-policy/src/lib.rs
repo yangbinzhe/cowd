@@ -4,6 +4,7 @@
 //! cross-plane or approval engines; adapters should convert those decisions
 //! into receipts from this crate.
 
+use ai_agent_spec::{AgentPolicyRequirement, AgentSpec};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +99,77 @@ pub fn tool_transaction_policy_receipts(
     receipts
 }
 
+#[must_use]
+pub fn agent_spec_policy_receipts(agent_spec: &AgentSpec) -> Vec<PolicyReceipt> {
+    let mut receipts = Vec::new();
+    for requirement in &agent_spec.policies {
+        let (scope, decision, reason) = match requirement {
+            AgentPolicyRequirement::RequiresApproval => (
+                PolicyScope::Agent,
+                PolicyDecisionKind::Ask,
+                "agent contract requires approval",
+            ),
+            AgentPolicyRequirement::RequiresMatrixEvidence => (
+                PolicyScope::Matrix,
+                PolicyDecisionKind::Allow,
+                "agent contract requires matrix evidence",
+            ),
+            AgentPolicyRequirement::RequiresVerification => (
+                PolicyScope::Harness,
+                PolicyDecisionKind::Allow,
+                "agent contract requires verification",
+            ),
+            AgentPolicyRequirement::RequiresWorktreeIsolation => (
+                PolicyScope::Agent,
+                PolicyDecisionKind::Ask,
+                "agent contract requires worktree isolation",
+            ),
+            AgentPolicyRequirement::RequiresHumanReview => (
+                PolicyScope::Agent,
+                PolicyDecisionKind::Ask,
+                "agent contract requires human review",
+            ),
+        };
+        receipts.push(
+            PolicyReceipt::new(scope, decision, "agent_spec_policy")
+                .with_reason(reason)
+                .with_evidence_ref(format!("agent_spec:{}", agent_spec.id)),
+        );
+    }
+    receipts
+}
+
+#[must_use]
+pub fn behavior_policy_receipt(
+    allow_execution: bool,
+    requires_scope_downgrade: bool,
+    requires_human_review: bool,
+    risks: &[String],
+) -> PolicyReceipt {
+    let decision = if !allow_execution {
+        PolicyDecisionKind::Deny
+    } else if requires_human_review || requires_scope_downgrade {
+        PolicyDecisionKind::Ask
+    } else {
+        PolicyDecisionKind::Allow
+    };
+    let mut receipt = PolicyReceipt::new(PolicyScope::Global, decision, "behavior_policy");
+    if risks.is_empty() {
+        receipt = receipt.with_reason("behavior policy permits current execution scope");
+    } else {
+        for risk in risks {
+            receipt = receipt.with_reason(risk.clone());
+        }
+    }
+    if requires_scope_downgrade {
+        receipt = receipt.with_reason("execution scope should be downgraded before expansion");
+    }
+    if requires_human_review {
+        receipt = receipt.with_reason("behavior policy requires human review");
+    }
+    receipt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +179,13 @@ mod tests {
         let receipts = tool_transaction_policy_receipts(Some("tx-1"), true, true);
         assert_eq!(receipts[0].decision, PolicyDecisionKind::Ask);
         assert!(receipts[0].evidence_refs[0].contains("tx-1"));
+    }
+
+    #[test]
+    fn agent_spec_policy_maps_review_to_ask() {
+        let receipts = agent_spec_policy_receipts(&AgentSpec::reviewer());
+        assert!(receipts
+            .iter()
+            .any(|receipt| receipt.decision == PolicyDecisionKind::Ask));
     }
 }

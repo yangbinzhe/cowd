@@ -44,6 +44,7 @@ dependencies = [
 name = "ai-agent-spec"
 version = "0.9.327"
 dependencies = [
+ "ai-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -116,6 +117,7 @@ dependencies = [
 name = "ai-policy"
 version = "0.9.327"
 dependencies = [
+ "ai-agent-spec",
  "chrono",
  "serde",
  "uuid",

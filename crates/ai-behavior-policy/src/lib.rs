@@ -20,6 +20,7 @@ pub struct BehaviorPolicyDecision {
     pub overengineering_risks: Vec<String>,
     pub safety_exceptions: Vec<String>,
     pub recommended_scope: RecommendedScope,
+    pub enforcement: BehaviorPolicyEnforcement,
     pub eval_checks: Vec<String>,
 }
 
@@ -28,6 +29,13 @@ impl BehaviorPolicyDecision {
     pub fn has_overengineering_risk(&self) -> bool {
         !self.overengineering_risks.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorPolicyEnforcement {
+    pub allow_execution: bool,
+    pub requires_scope_downgrade: bool,
+    pub requires_human_review: bool,
 }
 
 #[must_use]
@@ -81,6 +89,12 @@ pub fn decide_behavior_policy(prompt: &str, strategy: &StrategyDecision) -> Beha
         ExecutionMode::PlanExecute | ExecutionMode::ReActLoop => RecommendedScope::PlannedChange,
         _ => RecommendedScope::WorkGraph,
     };
+    let requires_scope_downgrade = !overengineering_risks.is_empty();
+    let requires_human_review = requires_scope_downgrade
+        && matches!(
+            strategy.understanding.risk,
+            TaskRisk::High | TaskRisk::Critical
+        );
 
     BehaviorPolicyDecision {
         necessity: "perform the smallest change that satisfies the requested capability without removing safety gates".to_string(),
@@ -88,6 +102,11 @@ pub fn decide_behavior_policy(prompt: &str, strategy: &StrategyDecision) -> Beha
         overengineering_risks,
         safety_exceptions,
         recommended_scope,
+        enforcement: BehaviorPolicyEnforcement {
+            allow_execution: true,
+            requires_scope_downgrade,
+            requires_human_review,
+        },
         eval_checks: vec![
             "minimal_scope".to_string(),
             "reuse_existing".to_string(),

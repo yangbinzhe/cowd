@@ -3,6 +3,7 @@
 //! This crate describes what an agent is allowed and expected to do. It does
 //! not execute tools, spawn processes, or own runtime orchestration.
 
+use ai_core::{ExecutionMode, TaskRisk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -138,6 +139,75 @@ impl AgentSpec {
     }
 
     #[must_use]
+    pub fn for_turn(prompt: &str, mode: ExecutionMode, risk: TaskRisk) -> Self {
+        let mut spec = match mode {
+            ExecutionMode::DirectAnswer => Self::cowd_native(
+                "agent-spec-direct-answer",
+                "direct-answer",
+                "Answer directly from the provided context and cite limitations.",
+            ),
+            ExecutionMode::FastEdit => Self::cowd_native(
+                "agent-spec-fast-edit",
+                "fast-edit",
+                "Make a minimal workspace edit with verification evidence.",
+            )
+            .with_tool(AgentToolPermission::WriteWorkspace),
+            ExecutionMode::ExploreThenAnswer
+            | ExecutionMode::PlanExecute
+            | ExecutionMode::ReActLoop
+            | ExecutionMode::ReflexionRetry => Self::cowd_native(
+                "agent-spec-plan-execute",
+                "plan-execute",
+                "Plan, execute, verify, and return evidence-backed output.",
+            )
+            .with_tool(AgentToolPermission::WriteWorkspace)
+            .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
+            .with_matrix_requirement("runtime_ai_kernel_trace"),
+            ExecutionMode::SupervisorSubagents
+            | ExecutionMode::ParallelReadFanout
+            | ExecutionMode::ParallelWorktree
+            | ExecutionMode::DeliberationSearch
+            | ExecutionMode::BackgroundReview => Self::cowd_native(
+                "agent-spec-workgraph",
+                "workgraph",
+                "Coordinate decomposed work with review and synthesis evidence.",
+            )
+            .with_tool(AgentToolPermission::WriteWorkspace)
+            .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
+            .with_policy(AgentPolicyRequirement::RequiresHumanReview)
+            .with_matrix_requirement("workgraph_quality")
+            .with_matrix_requirement("synthesis_evidence"),
+            ExecutionMode::RiskGate | ExecutionMode::HumanConfirm => Self::cowd_native(
+                "agent-spec-risk-gate",
+                "risk-gate",
+                "Gate risky execution through approval and verification receipts.",
+            )
+            .with_tool(AgentToolPermission::WriteWorkspace)
+            .with_policy(AgentPolicyRequirement::RequiresApproval)
+            .with_policy(AgentPolicyRequirement::RequiresHumanReview),
+        };
+        spec.context_profile = mode.as_str().to_string();
+        spec.instructions = format!(
+            "{} Prompt summary: {}",
+            spec.instructions,
+            prompt.trim().chars().take(240).collect::<String>()
+        );
+        spec = spec
+            .with_tool(AgentToolPermission::MemoryCandidateOnly)
+            .with_matrix_requirement("harness_receipt")
+            .with_matrix_requirement("verification_report");
+        if matches!(risk, TaskRisk::High | TaskRisk::Critical) {
+            spec = spec
+                .with_policy(AgentPolicyRequirement::RequiresApproval)
+                .with_policy(AgentPolicyRequirement::RequiresHumanReview);
+        }
+        if matches!(mode, ExecutionMode::ParallelWorktree) {
+            spec = spec.with_policy(AgentPolicyRequirement::RequiresWorktreeIsolation);
+        }
+        spec
+    }
+
+    #[must_use]
     pub fn with_tool(mut self, permission: AgentToolPermission) -> Self {
         if !self.tools.contains(&permission) {
             self.tools.push(permission);
@@ -199,6 +269,21 @@ mod tests {
     #[test]
     fn native_worker_spec_validates() {
         AgentSpec::worker().validate().expect("valid worker spec");
+    }
+
+    #[test]
+    fn plan_execute_spec_declares_matrix_and_memory_contracts() {
+        let spec =
+            AgentSpec::for_turn("重构 runtime", ExecutionMode::PlanExecute, TaskRisk::Medium);
+
+        assert!(spec.tools.contains(&AgentToolPermission::WriteWorkspace));
+        assert!(spec
+            .policies
+            .contains(&AgentPolicyRequirement::RequiresMatrixEvidence));
+        assert!(spec
+            .matrix_requirements
+            .contains(&"harness_receipt".to_string()));
+        spec.validate().expect("derived spec should validate");
     }
 
     #[test]
