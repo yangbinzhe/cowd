@@ -1,16 +1,31 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub struct TuiSession { session: String }
+pub struct TuiSession {
+    session: String,
+    closed: bool,
+}
 
 impl TuiSession {
     pub fn new(name: &str) -> Result<Self> {
-        let _ = Command::new("tmux").args(["kill-session", "-t", name]).output();
+        let session = owned_session_name(name);
         let status = Command::new("tmux")
-            .args(["new-session", "-d", "-s", name, &format!("{}", std::env::var("COWD_BIN").unwrap_or_else(|_| "cowd".to_string()))]).status()?;
-        if !status.success() { return Err(anyhow!("tmux session failed")); }
-        Ok(Self { session: name.to_string() })
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                &std::env::var("COWD_BIN").unwrap_or_else(|_| "cowd".to_string()),
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("tmux session failed"));
+        }
+        Ok(Self {
+            session,
+            closed: false,
+        })
     }
 
     pub fn send(&self, text: &str) -> Result<()> {
@@ -78,10 +93,36 @@ impl TuiSession {
         Ok(())
     }
 
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
         Command::new("tmux").args(["kill-session", "-t", &self.session]).status()?;
+        self.closed = true;
         Ok(())
     }
+}
+
+fn owned_session_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let base = if sanitized.is_empty() {
+        "scenario".to_string()
+    } else {
+        sanitized
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("cowd-it-{base}-{}-{nonce}", std::process::id())
 }
 
 fn capture_is_healthy(capture: &str) -> bool {
@@ -95,6 +136,9 @@ fn capture_is_healthy(capture: &str) -> bool {
 
 impl Drop for TuiSession {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", &self.session])
             .status();
