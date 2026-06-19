@@ -147,6 +147,18 @@ check_empty "command-service must remain declarative" \
   rg -n "runtime::|memory::|matrix::|app_mfg::|plugins::|ConfigLoader|GlobalToolRegistry|Connection::open|SqliteConnectionManager::file|std::fs|fs::|std::env|env::|handle_agents_slash_command|handle_skills_slash_command|resolve_skill_path|resolve_skill_invocation" \
     crates/command/service/src crates/command/service/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
 
+check_empty "gateway services must not become protocol or storage adapters" \
+  bash -c 'rg -n "crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|std::env|env::|ConfigLoader::default_for" crates/gateway/src/services --glob "*.rs" | rg -v "^crates/gateway/src/services/mod.rs:[0-9]+:.*std::env::temp_dir|^crates/gateway/src/services/system_service.rs:(196|197|199):.*std::env::|^crates/gateway/src/services/skill_service.rs:(858|859|861):.*std::env::|^crates/gateway/src/services/mfg_service.rs:[0-9]+:.*MfgStore::open_storage_handle" || true'
+
+check_empty "gateway services must not route through slash command execution" \
+  rg -n "slash_catalog|handle_.*slash_command|resolve_skill_invocation|resolve_skill_path" crates/gateway/src/services --glob "*.rs"
+
+check_empty "gateway service registry must not own context use cases" \
+  rg -n "impl GatewayServices" crates/gateway/src/services/context_service.rs
+
+check_empty "gateway entry must not route skill invocation through slash catalog" \
+  rg -n "slash_catalog::resolve_skill_invocation|slash_catalog::resolve_skill_path" crates/gateway/src/entry --glob "*.rs"
+
 check_empty "gateway main must not own business registries" \
   bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open|current_tool_registry|build_runtime_plugin_state|RuntimePluginState" || true'
 

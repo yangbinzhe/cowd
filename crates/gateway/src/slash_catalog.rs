@@ -411,7 +411,7 @@ fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
     install_skill_into(source, cwd, &registry_root)
 }
 
-pub(crate) fn install_skill_into(
+fn install_skill_into(
     source: &str,
     cwd: &Path,
     registry_root: &Path,
@@ -802,7 +802,7 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
+fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     let mut lines = contents.lines();
     if lines.next().map(str::trim) != Some("---") {
         return (None, None);

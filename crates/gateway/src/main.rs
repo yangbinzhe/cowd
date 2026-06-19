@@ -5,6 +5,7 @@
     dead_code
 )]
 #![deny(deprecated)]
+mod agent_static;
 mod api_routes;
 mod bootstrap;
 mod boundary_policy;
@@ -36,6 +37,7 @@ mod services;
 mod session_kernel;
 mod session_lifecycle_kernel;
 mod skill_projection;
+mod skill_static;
 mod slash_catalog;
 mod suggestions;
 mod task_kernel;

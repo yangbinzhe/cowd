@@ -20,11 +20,16 @@ use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
 mod agent_service;
 mod command_service;
 mod connector_service;
+mod context;
 mod context_service;
 mod cross_plane_service;
+mod error;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
+mod policy;
+mod receipt;
+mod registry;
 mod skill_service;
 mod system_service;
 mod workspace_service;
@@ -39,6 +44,7 @@ pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
     MfgService,
 };
+pub(crate) use receipt::{service_envelope, ServiceEnvelope};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
@@ -46,29 +52,6 @@ pub(crate) use skill_service::{
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
 pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixSqliteRepositoryError;
 pub(crate) type RuntimeContextBoundary = runtime::ContextRuntimeKernel;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ServiceEnvelope {
-    pub(crate) service: &'static str,
-    pub(crate) operation: &'static str,
-    pub(crate) status: &'static str,
-    pub(crate) owner: &'static str,
-    pub(crate) boundary_status: &'static str,
-}
-
-fn service_envelope(
-    service: &'static str,
-    owner: &'static str,
-    operation: &'static str,
-) -> ServiceEnvelope {
-    ServiceEnvelope {
-        service,
-        operation,
-        status: "service_boundary_ready",
-        owner,
-        boundary_status: "0618_final_boundary",
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct ContextService {
@@ -1190,6 +1173,10 @@ impl AuditService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{
+        context::ServiceContext, error::ServiceError, policy::ServicePolicy,
+        receipt::ServiceReceipt, registry::ServiceRegistry,
+    };
 
     #[test]
     fn services_declares_transition_owner() {
@@ -1254,5 +1241,16 @@ mod tests {
             .contracts()
             .iter()
             .any(|contract| contract.operation == "incident"));
+        let _registry: ServiceRegistry = services.clone();
+        let ctx = ServiceContext::transition_only()
+            .with_workspace(std::env::temp_dir())
+            .with_session("session-1");
+        assert_eq!(ctx.session_id.as_deref(), Some("session-1"));
+        let error = ServiceError::InvalidInput("bad".to_string());
+        assert_eq!(error.kind(), "invalid_input");
+        let policy = ServicePolicy::final_boundary("service-test-owner");
+        assert_eq!(policy.boundary_status, "0618_final_boundary");
+        let receipt = ServiceReceipt::completed("service", "operation", Some("trace".to_string()));
+        assert_eq!(receipt.outcome, "completed");
     }
 }

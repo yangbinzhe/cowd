@@ -8,7 +8,9 @@ use runtime::{
     ContextRole, ContextSourceKind, ContextVisibility, ExternalResourceRef,
 };
 
-use super::{ContextService, GatewayServices, RuntimeContextBoundary};
+use super::{
+    ConnectorService, ContextService, MemoryService, RuntimeContextBoundary, SessionService,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ContextServiceError {
@@ -99,16 +101,16 @@ impl ContextService {
     }
 }
 
-impl GatewayServices {
+impl ContextService {
     pub(crate) async fn context_history(
         &self,
+        session: &SessionService,
         session_id: &str,
         from_seq: usize,
         limit: usize,
         include_envelopes: bool,
     ) -> Result<serde_json::Value, ContextServiceError> {
-        let Some((total, stored_events)) = self
-            .session
+        let Some((total, stored_events)) = session
             .stored_events_by_type_page(session_id, "ContextEnvelope", from_seq, limit)
             .await
             .map_err(|error| {
@@ -163,10 +165,10 @@ impl GatewayServices {
 
     pub(crate) async fn context_envelope(
         &self,
+        session: &SessionService,
         envelope_id: &str,
     ) -> Result<serde_json::Value, ContextServiceError> {
-        let Some(event) = self
-            .session
+        let Some(event) = session
             .context_event_by_envelope_id(envelope_id)
             .await
             .map_err(|error| {
@@ -194,12 +196,12 @@ impl GatewayServices {
 
     pub(crate) async fn context_recommendation_stats(
         &self,
+        session: &SessionService,
         session_id: &str,
         from_seq: usize,
         limit: usize,
     ) -> Result<serde_json::Value, ContextServiceError> {
-        let Some((total, stored_events)) = self
-            .session
+        let Some((total, stored_events)) = session
             .stored_events_by_type_page(session_id, "ContextRecommendationAction", from_seq, limit)
             .await
             .map_err(|error| {
@@ -277,9 +279,12 @@ impl GatewayServices {
             "has_more": event_count < total,
         }))
     }
+}
 
+impl ContextService {
     pub(crate) async fn record_context_recommendation_action(
         &self,
+        session: &SessionService,
         session_id: &str,
         envelope_id: String,
         recommendation: String,
@@ -304,7 +309,7 @@ impl GatewayServices {
             "action": action,
             "note": note,
         });
-        self.session
+        session
             .append_timeline_event(session_id, "ContextRecommendationAction", payload.clone())
             .await
             .map_err(|error| {
@@ -322,14 +327,14 @@ impl GatewayServices {
 
     pub(crate) async fn resolve_evidence_ref(
         &self,
-        state: &crate::api_routes::AppState,
+        session: &SessionService,
+        connector: &ConnectorService,
+        workspace_root: &Path,
         reference: &str,
         session_id: Option<&str>,
     ) -> Result<serde_json::Value, ContextServiceError> {
         if let Some(path) = reference.strip_prefix("workspace://changed-file/") {
-            Ok(self
-                .context
-                .workspace_evidence_preview(&state.workspace_root, reference, path))
+            Ok(self.workspace_evidence_preview(workspace_root, reference, path))
         } else if let Some(symbol) = reference.strip_prefix("workspace://symbol/") {
             Ok(serde_json::json!({
                 "ref": reference,
@@ -338,11 +343,15 @@ impl GatewayServices {
                 "symbol": symbol,
             }))
         } else if let Some(session_ref) = reference.strip_prefix("session://") {
-            Ok(self.resolve_session_evidence(reference, session_ref).await)
+            Ok(self
+                .resolve_session_evidence(session, reference, session_ref)
+                .await)
         } else if reference.starts_with("tool://") {
-            Ok(self.resolve_tool_evidence(reference, session_id).await)
+            Ok(self
+                .resolve_tool_evidence(session, reference, session_id)
+                .await)
         } else if reference.starts_with("service://") || reference.starts_with("mcp://") {
-            Ok(self.resolve_resource_evidence(&state.workspace_root, reference))
+            Ok(self.resolve_resource_evidence(connector, workspace_root, reference))
         } else if reference.starts_with("agent://") {
             Ok(serde_json::json!({
                 "ref": reference,
@@ -359,14 +368,11 @@ impl GatewayServices {
 
     fn resolve_resource_evidence(
         &self,
+        connector: &ConnectorService,
         workspace_root: &Path,
         reference: &str,
     ) -> serde_json::Value {
-        if !self
-            .connector
-            .resource_directory_path(workspace_root)
-            .exists()
-        {
+        if !connector.resource_directory_path(workspace_root).exists() {
             return serde_json::json!({
                 "ref": reference,
                 "kind": "resource",
@@ -374,7 +380,7 @@ impl GatewayServices {
                 "reason": "resource directory is not initialized",
             });
         }
-        match self.connector.get_resource(workspace_root, reference) {
+        match connector.get_resource(workspace_root, reference) {
             Ok(Some(resource)) => serde_json::json!({
                 "ref": reference,
                 "kind": "resource",
@@ -403,6 +409,7 @@ impl GatewayServices {
 
     async fn resolve_session_evidence(
         &self,
+        session: &SessionService,
         reference: &str,
         session_ref: &str,
     ) -> serde_json::Value {
@@ -415,7 +422,7 @@ impl GatewayServices {
                 "reason": "missing session id",
             });
         }
-        match self.session.stored_session(session_id).await {
+        match session.stored_session(session_id).await {
             Ok(Some(session)) => serde_json::json!({
                 "ref": reference,
                 "kind": "session",
@@ -447,6 +454,7 @@ impl GatewayServices {
 
     async fn resolve_tool_evidence(
         &self,
+        session: &SessionService,
         reference: &str,
         session_id: Option<&str>,
     ) -> serde_json::Value {
@@ -462,8 +470,7 @@ impl GatewayServices {
             .strip_prefix("tool://")
             .and_then(|tail| tail.split('/').next())
             .unwrap_or_default();
-        let Some((_, events)) = self
-            .session
+        let Some((_, events)) = session
             .stored_events_page(session_id, 0, 500)
             .await
             .ok()
@@ -594,16 +601,20 @@ fn resource_next_actions(resource: &ExternalResourceRef) -> Vec<&'static str> {
     }
 }
 
-impl GatewayServices {
+impl ContextService {
     pub(crate) async fn current_context_projection(
         &self,
-        state: &crate::api_routes::AppState,
+        memory: &MemoryService,
+        connector: &ConnectorService,
+        workspace_root: &Path,
+        active_envelope: Option<ContextEnvelope>,
+        fallback_session_id: Option<String>,
         params: HashMap<String, String>,
     ) -> serde_json::Value {
         let session_id = params
             .get("session_id")
             .cloned()
-            .or_else(|| state.list_active_session_ids().into_iter().next())
+            .or(fallback_session_id)
             .unwrap_or_else(|| "api-context".to_string());
         let query = params.get("q").cloned().unwrap_or_default();
         let profile = params
@@ -611,17 +622,8 @@ impl GatewayServices {
             .and_then(|value| parse_context_profile(value))
             .unwrap_or(ContextProfile::MainTurn);
 
-        if let Some(runtime_entry) = state.active_runtime(&session_id) {
-            if let Ok(runtime) = runtime_entry.try_lock() {
-                if let Some(envelope) = runtime.last_context_envelope() {
-                    return context_projection_json("runtime", envelope, &params);
-                }
-            } else {
-                tracing::debug!(
-                    %session_id,
-                    "runtime context envelope skipped because active runtime is busy"
-                );
-            }
+        if let Some(envelope) = active_envelope {
+            return context_projection_json("runtime", envelope, &params);
         }
 
         let mut identity = ContextIdentity::main(session_id.clone());
@@ -630,8 +632,7 @@ impl GatewayServices {
         let mut omitted_items = Vec::new();
         let mut degraded = Vec::new();
 
-        match self
-            .memory
+        match memory
             .context_packet(session_id.clone(), "api", query.clone(), 12, 2_000)
             .await
         {
@@ -669,7 +670,7 @@ impl GatewayServices {
             Err(_) => degraded.push(ContextSourceKind::Memory),
         }
 
-        dynamic_items.extend(self.resource_context_items(&state.workspace_root, &query));
+        dynamic_items.extend(self.resource_context_items(connector, workspace_root, &query));
 
         let mut envelope = RuntimeContextBoundary::build_envelope(ContextEnvelopeRequest {
             profile,
@@ -685,18 +686,19 @@ impl GatewayServices {
         context_projection_json("synthetic", envelope, &params)
     }
 
-    fn resource_context_items(&self, workspace_root: &Path, query: &str) -> Vec<ContextItem> {
-        if !self
-            .connector
-            .resource_directory_path(workspace_root)
-            .exists()
-        {
+    fn resource_context_items(
+        &self,
+        connector: &ConnectorService,
+        workspace_root: &Path,
+        query: &str,
+    ) -> Vec<ContextItem> {
+        if !connector.resource_directory_path(workspace_root).exists() {
             return Vec::new();
         }
         let resources = if query.trim().is_empty() {
-            self.connector.recent_resources(workspace_root, 5)
+            connector.recent_resources(workspace_root, 5)
         } else {
-            self.connector.search_resources(workspace_root, query, 5)
+            connector.search_resources(workspace_root, query, 5)
         }
         .unwrap_or_default();
 

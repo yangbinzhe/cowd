@@ -65,7 +65,7 @@ impl AgentService {
     }
 
     pub(crate) fn catalog(&self, workspace_root: &Path) -> std::io::Result<Value> {
-        crate::slash_catalog::agent_catalog_json(workspace_root)
+        crate::agent_static::agent_catalog_json(workspace_root)
     }
 
     pub(crate) fn directory(&self, workspace_root: &Path) -> std::io::Result<Value> {
@@ -84,7 +84,7 @@ impl AgentService {
     }
 
     pub(crate) fn discover(&self, workspace_root: &Path, task: &str) -> std::io::Result<Value> {
-        crate::slash_catalog::agent_discovery_json(workspace_root, task.trim())
+        crate::agent_static::agent_discovery_json(workspace_root, task.trim())
     }
 
     pub(crate) fn command_json(
@@ -671,10 +671,7 @@ impl GatewayServices {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn list_agent_graphs(
-        &self,
-        _state: &crate::api_routes::AppState,
-    ) -> serde_json::Value {
+    pub(crate) fn list_agent_graphs(&self) -> serde_json::Value {
         let runs = self.task.list_agent_graphs().unwrap_or_default();
         serde_json::json!({
             "kind": "agent_run_graphs",
@@ -682,17 +679,12 @@ impl GatewayServices {
         })
     }
 
-    pub(crate) fn agent_graph(
-        &self,
-        _state: &crate::api_routes::AppState,
-        task_id: &str,
-    ) -> Option<AgentRunGraph> {
+    pub(crate) fn agent_graph(&self, task_id: &str) -> Option<AgentRunGraph> {
         self.task.agent_graph(task_id).ok().flatten()
     }
 
     pub(crate) async fn upsert_agent_graph(
         &self,
-        _state: &crate::api_routes::AppState,
         task_id: &str,
         objective: Option<String>,
         nodes: Vec<serde_json::Value>,

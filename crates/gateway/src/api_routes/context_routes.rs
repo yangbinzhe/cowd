@@ -66,10 +66,37 @@ async fn context_current_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    let requested_session_id = params
+        .get("session_id")
+        .cloned()
+        .or_else(|| state.list_active_session_ids().into_iter().next());
+    let active_envelope = requested_session_id.as_deref().and_then(|session_id| {
+        match state.active_runtime(session_id) {
+            Some(runtime_entry) => match runtime_entry.try_lock() {
+                Ok(runtime) => runtime.last_context_envelope(),
+                Err(_) => {
+                    tracing::debug!(
+                        %session_id,
+                        "runtime context envelope skipped because active runtime is busy"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    });
     Json(
         state
             .services
-            .current_context_projection(&state, params)
+            .context
+            .current_context_projection(
+                &state.services.memory,
+                &state.services.connector,
+                &state.workspace_root,
+                active_envelope,
+                requested_session_id,
+                params,
+            )
             .await,
     )
 }
@@ -82,24 +109,44 @@ async fn get_session_context_history(
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).min(200);
     let include_envelopes = params.include_envelopes.unwrap_or(true);
-    state
+    let value = state
         .services
-        .context_history(&id, from_seq, limit, include_envelopes)
+        .context
+        .context_history(
+            &state.services.session,
+            &id,
+            from_seq,
+            limit,
+            include_envelopes,
+        )
         .await
-        .map(Json)
-        .map_err(context_service_error)
+        .map_err(context_service_error)?;
+    tracing::info!(
+        session_id = id.as_str(),
+        include_envelopes = include_envelopes,
+        total = value["total"].as_u64().unwrap_or(0),
+        from_seq = from_seq,
+        limit = limit,
+        "context history loaded"
+    );
+    Ok(Json(value))
 }
 
 async fn get_context_envelope_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(envelope_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
+    let value = state
         .services
-        .context_envelope(&envelope_id)
+        .context
+        .context_envelope(&state.services.session, &envelope_id)
         .await
-        .map(Json)
-        .map_err(context_service_error)
+        .map_err(context_service_error)?;
+    tracing::info!(
+        envelope_id = envelope_id.as_str(),
+        "context envelope loaded"
+    );
+    Ok(Json(value))
 }
 
 async fn get_context_recommendation_stats(
@@ -111,7 +158,8 @@ async fn get_context_recommendation_stats(
     let limit = params.limit.unwrap_or(200).min(500);
     state
         .services
-        .context_recommendation_stats(&id, from_seq, limit)
+        .context
+        .context_recommendation_stats(&state.services.session, &id, from_seq, limit)
         .await
         .map(Json)
         .map_err(context_service_error)
@@ -140,7 +188,14 @@ async fn resolve_evidence_ref_handler(
 
     state
         .services
-        .resolve_evidence_ref(&state, reference, session_id.as_deref())
+        .context
+        .resolve_evidence_ref(
+            &state.services.session,
+            &state.services.connector,
+            &state.workspace_root,
+            reference,
+            session_id.as_deref(),
+        )
         .await
         .map(Json)
         .map_err(context_service_error)
@@ -153,7 +208,9 @@ async fn record_context_recommendation_action(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
+        .context
         .record_context_recommendation_action(
+            &state.services.session,
             &id,
             body.envelope_id,
             body.recommendation,

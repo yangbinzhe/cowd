@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::services::GatewayServices;
 use command_service::SkillSlashDispatch;
 
 pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -12,7 +13,8 @@ pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option
     if !looks_like_skill_name {
         return None;
     }
-    match crate::slash_catalog::resolve_skill_invocation(cwd, Some(trimmed)) {
+    let skill_service = GatewayServices::transition_only().skill;
+    match skill_service.resolve_invocation(cwd, Some(trimmed)) {
         Ok(SkillSlashDispatch::Invoke(prompt)) => Some(prompt),
         _ => None,
     }

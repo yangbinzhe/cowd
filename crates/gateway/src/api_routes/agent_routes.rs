@@ -124,7 +124,7 @@ async fn agent_reputation_handler(
 }
 
 async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.list_agent_graphs(&state))
+    Json(state.services.list_agent_graphs())
 }
 
 async fn agent_team_profiles_list_handler(
@@ -237,7 +237,7 @@ async fn task_agent_graph_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
-        .agent_graph(&state, &id)
+        .agent_graph(&id)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent graph not found"))?;
     Ok(Json(graph))
 }
@@ -249,7 +249,7 @@ async fn upsert_task_agent_graph_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
-        .upsert_agent_graph(&state, &id, body.objective, body.nodes)
+        .upsert_agent_graph(&id, body.objective, body.nodes)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(graph))
