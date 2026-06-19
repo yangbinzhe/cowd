@@ -12,14 +12,40 @@ WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
+FAILED=0
 
 cleanup() {
+  if [[ "$FAILED" == "1" && "${COWD_GATEWAY_WEBUI_KEEP_TMP:-}" == "1" ]]; then
+    echo "preserving gateway webui contract temp dir: $TMP_DIR" >&2
+    return
+  fi
   if command -v tmux >/dev/null 2>&1; then
     tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+on_error() {
+  local status=$?
+  FAILED=1
+  echo "gateway webui contract scenario failed with status $status" >&2
+  echo "----- temp dir -----" >&2
+  echo "$TMP_DIR" >&2
+  echo "----- gateway log -----" >&2
+  sed -n '1,260p' "$LOG" >&2 || true
+  echo "----- healthz -----" >&2
+  curl -sS "$BASE_URL/healthz" >&2 || true
+  echo >&2
+  echo "----- readyz -----" >&2
+  curl -sS "$BASE_URL/readyz" >&2 || true
+  echo >&2
+  echo "----- webui manifest -----" >&2
+  curl -sS "$BASE_URL/api/webui/manifest" >&2 || true
+  echo >&2
+  exit "$status"
+}
+trap on_error ERR
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for gateway webui contract scenario" >&2
@@ -65,7 +91,7 @@ for _ in {1..80}; do
   sleep 0.25
 done
 
-curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
+curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"gateway-runtime-host"'
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"kind":"cowd.webui.manifest"'
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'

@@ -14,13 +14,8 @@ MSG
   exit 0
 fi
 
-if [[ -z "${COWD_AI_HARNESS_LIVE_COMMAND:-}" ]]; then
-  cat >&2 <<'MSG'
-COWD_AI_HARNESS_LIVE=1 was set, but COWD_AI_HARNESS_LIVE_COMMAND is empty.
-
-Provide a bounded command, for example a single deep scenario runner with explicit token limits.
-MSG
-  exit 2
+if [[ -n "${COWD_AI_HARNESS_LIVE_COMMAND:-}" ]]; then
+  bash -lc "$COWD_AI_HARNESS_LIVE_COMMAND"
+else
+  scripts/ci/ai-harness-live-provider.sh
 fi
-
-bash -lc "$COWD_AI_HARNESS_LIVE_COMMAND"
