@@ -14,6 +14,9 @@ pub enum BenchCaseKind {
     WorkGraphFanout,
     ToolTransaction,
     BehaviorMinimalScope,
+    MemoryGrowthLoop,
+    MatrixEvidenceSignal,
+    HarnessReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,6 +594,9 @@ impl CowdBenchSmokeSuite {
             "tool_transaction".to_string(),
             "policy".to_string(),
             "behavior".to_string(),
+            "memory".to_string(),
+            "matrix".to_string(),
+            "harness".to_string(),
         ];
         let covered_capabilities = self
             .cases
@@ -665,6 +671,24 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             ExecutionMode::FastEdit,
             "minimal_scope",
         ),
+        (
+            BenchCaseKind::MemoryGrowthLoop,
+            "turn runtime learning into reviewable memory candidates",
+            ExecutionMode::PlanExecute,
+            "memory_candidate",
+        ),
+        (
+            BenchCaseKind::MatrixEvidenceSignal,
+            "emit matrix-compatible evidence and quality signals",
+            ExecutionMode::PlanExecute,
+            "matrix_signal",
+        ),
+        (
+            BenchCaseKind::HarnessReceipt,
+            "produce a harness receipt for the completed AI turn",
+            ExecutionMode::PlanExecute,
+            "harness_receipt",
+        ),
     ];
     specs
         .into_iter()
@@ -685,6 +709,9 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
         "verification_report" => Some("verification"),
         "tool_transaction" => Some("tool_transaction"),
         "minimal_scope" | "reuse_existing" | "safety_preserved" => Some("behavior"),
+        "memory_candidate" => Some("memory"),
+        "matrix_signal" => Some("matrix"),
+        "harness_receipt" => Some("harness"),
         _ => None,
     }
 }
@@ -827,7 +854,7 @@ mod tests {
         let verdict = suite.evaluate(&trajectories, RegressionGate::strict());
 
         assert!(verdict.allowed);
-        assert_eq!(suite.cases.len(), 8);
+        assert_eq!(suite.cases.len(), 11);
     }
 
     #[test]
