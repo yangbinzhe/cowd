@@ -2753,14 +2753,13 @@ fn run_resume_command(
         }
         SlashCommand::Agents { args } => {
             let cwd = env::current_dir()?;
+            let message = handle_agents_slash_command(args.as_deref(), &cwd)?;
+            let json = handle_agents_slash_command_json(args.as_deref(), &cwd)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
-                message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
-                json: Some(serde_json::json!({
-                    "kind": "agents",
-                    "text": handle_agents_slash_command(args.as_deref(), &cwd)?,
-                })),
+                message: Some(message),
+                json: Some(json),
             })
         }
         SlashCommand::Skills { args } => {
@@ -14339,6 +14338,33 @@ UU conflicted.rs",
         let message = outcome.message.expect("diff message should exist");
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn resume_agents_command_returns_structured_catalog_json() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let session_path = root.join("session.json");
+        let session = Session::new();
+        let outcome = with_current_dir(&root, || {
+            run_resume_command(
+                &session_path,
+                &session,
+                &SlashCommand::Agents { args: None },
+            )
+            .expect("resume agents should work")
+        });
+        let json = outcome.json.expect("agents json should exist");
+        assert_eq!(json["kind"], "agents");
+        assert_eq!(json["action"], "list");
+        assert!(json
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .is_some());
+        assert!(json.get("text").is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
