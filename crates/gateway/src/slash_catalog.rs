@@ -128,96 +128,6 @@ pub(crate) enum SkillInstallSource {
     MarkdownFile { path: PathBuf },
 }
 
-pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
-    if let Some(args) = normalize_optional_args(args) {
-        if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
-                [] => render_agents_usage(None),
-                _ => render_agents_usage(Some(&help_path.join(" "))),
-            });
-        }
-    }
-
-    match normalize_optional_args(args) {
-        None | Some("list") => {
-            let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            Ok(render_agents_report(&agents))
-        }
-        Some(args) if args.starts_with("discover") => {
-            let task_desc = args.strip_prefix("discover").unwrap_or("").trim();
-            if task_desc.is_empty() {
-                return Ok("Usage: /agents discover <task description>\n\nProvide a task description to discover a matching agent team.".to_string());
-            }
-            let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            let ranked = discover_agents_for_task(&agents, task_desc);
-            if ranked.is_empty() {
-                return Ok(format!(
-                    "No agents matched the task: \"{task_desc}\"\n\nRegister agents with relevant capabilities first."
-                ));
-            }
-            let mut report = format!(
-                "Discovered {} agent(s) for \"{task_desc}\"\n\n",
-                ranked.len()
-            );
-            for (i, agent) in ranked.iter().enumerate() {
-                report.push_str(&format!(
-                    "  {}. {} ({}) — [{}]\n",
-                    i + 1,
-                    agent.name,
-                    agent.source.label(),
-                    agent.match_terms.join(", "),
-                ));
-            }
-            if let Some(team) = assemble_static_agent_team(&ranked) {
-                report.push_str(&format!(
-                    "\nAuto-assembled team:\n  Leader: {} ({})\n",
-                    team.leader.name,
-                    team.leader.source.label()
-                ));
-                if !team.workers.is_empty() {
-                    report.push_str("  Workers:\n");
-                    for w in &team.workers {
-                        report.push_str(&format!(
-                            "    - {} ({}) [{}]\n",
-                            w.name,
-                            w.source.label(),
-                            w.match_terms.join(", ")
-                        ));
-                    }
-                } else {
-                    report.push_str("  Workers: none\n");
-                }
-            }
-            Ok(report)
-        }
-        Some(args) if is_help_arg(args) => Ok(render_agents_usage(None)),
-        Some(args) => Ok(render_agents_usage(Some(args))),
-    }
-}
-
-pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::io::Result<Value> {
-    if let Some(args) = normalize_optional_args(args) {
-        if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
-                [] => render_agents_usage_json(None),
-                _ => render_agents_usage_json(Some(&help_path.join(" "))),
-            });
-        }
-    }
-
-    match normalize_optional_args(args) {
-        None | Some("list") => agent_catalog_json(cwd),
-        Some(args) if args.starts_with("discover") => {
-            let task_desc = args.strip_prefix("discover").unwrap_or("").trim();
-            agent_discovery_json(cwd, task_desc)
-        }
-        Some(args) if is_help_arg(args) => Ok(render_agents_usage_json(None)),
-        Some(args) => Ok(render_agents_usage_json(Some(args))),
-    }
-}
-
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
@@ -937,48 +847,6 @@ fn unquote_frontmatter_value(value: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn render_agents_report(agents: &[AgentSummary]) -> String {
-    if agents.is_empty() {
-        return "No agents found.".to_string();
-    }
-
-    let total_active = agents
-        .iter()
-        .filter(|agent| agent.shadowed_by.is_none())
-        .count();
-    let mut lines = vec![
-        "Agents".to_string(),
-        format!("  {total_active} active agents"),
-        String::new(),
-    ];
-
-    for scope in [
-        DefinitionScope::Project,
-        DefinitionScope::UserConfigHome,
-        DefinitionScope::UserHome,
-    ] {
-        let group = agents
-            .iter()
-            .filter(|agent| agent.source.report_scope() == scope)
-            .collect::<Vec<_>>();
-        if group.is_empty() {
-            continue;
-        }
-
-        lines.push(format!("{}:", scope.label()));
-        for agent in group {
-            let detail = agent_detail(agent);
-            match agent.shadowed_by {
-                Some(winner) => lines.push(format!("  (shadowed by {}) {detail}", winner.label())),
-                None => lines.push(format!("  {detail}")),
-            }
-        }
-        lines.push(String::new());
-    }
-
-    lines.join("\n").trim_end().to_string()
-}
-
 pub(crate) fn render_agents_report_json(cwd: &Path, agents: &[AgentSummary]) -> Value {
     let active = agents
         .iter()
@@ -1102,20 +970,6 @@ fn normalized_terms(value: &str) -> Vec<String> {
         .filter(|term| term.len() >= 3)
         .map(str::to_ascii_lowercase)
         .collect()
-}
-
-fn agent_detail(agent: &AgentSummary) -> String {
-    let mut parts = vec![agent.name.clone()];
-    if let Some(description) = &agent.description {
-        parts.push(description.clone());
-    }
-    if let Some(model) = &agent.model {
-        parts.push(model.clone());
-    }
-    if let Some(reasoning) = &agent.reasoning_effort {
-        parts.push(reasoning.clone());
-    }
-    parts.join(" · ")
 }
 
 pub(crate) fn render_skills_report(skills: &[SkillSummary]) -> String {
@@ -1392,32 +1246,6 @@ fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
     let parts = args.split_whitespace().collect::<Vec<_>>();
     let help_index = parts.iter().position(|part| is_help_arg(part))?;
     Some(parts[..help_index].to_vec())
-}
-
-fn render_agents_usage(unexpected: Option<&str>) -> String {
-    let mut lines = vec![
-        "Agents".to_string(),
-        "  Usage            /agents [list|discover <task>|help]".to_string(),
-        "  Direct CLI       cowd agents".to_string(),
-        "  Sources          .cowd/agents, ~/.cowd/agents, $CC_CONFIG_HOME/agents".to_string(),
-    ];
-    if let Some(args) = unexpected {
-        lines.push(format!("  Unexpected       {args}"));
-    }
-    lines.join("\n")
-}
-
-fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
-    json!({
-        "kind": "agents",
-        "action": "help",
-        "usage": {
-            "slash_command": "/agents [list|discover <task>|help]",
-            "direct_cli": "cowd agents [list|discover <task>|help]",
-            "sources": [".cowd/agents", "~/.cowd/agents", "$CC_CONFIG_HOME/agents"],
-        },
-        "unexpected": unexpected,
-    })
 }
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
