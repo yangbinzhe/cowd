@@ -5725,6 +5725,28 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6069,9 +6091,13 @@ mod tests {
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
 
+        let _env_guard = env_lock().lock().expect("env lock");
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
+        let config_home = worktree.join("config-home");
+        fs::create_dir_all(&config_home).expect("create config home");
+        let _config_home_guard = EnvVarGuard::set_path("COWD_CONFIG_HOME", &config_home);
         let cwd = worktree.to_str().expect("utf-8").to_string();
         let state_path = runtime::cowd_dirs::worker_state_path();
 

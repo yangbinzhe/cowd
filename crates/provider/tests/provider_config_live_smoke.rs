@@ -1,31 +1,16 @@
-use provider::{InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient};
+use provider::{
+    ContentBlockDelta, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    ProviderClient, StreamEvent,
+};
 use runtime::{ConfigLoader, ProviderConfig};
 use serde_json::Value;
 
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
 async fn provider_config_live_smoke_returns_structured_health_signal() {
-    if std::env::var("COWD_AI_HARNESS_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping live provider smoke; set COWD_AI_HARNESS_LIVE=1");
+    let Some(env) = live_env() else {
         return;
-    }
-
-    let cwd = std::env::current_dir().expect("current dir should be available");
-    let config = ConfigLoader::default_for(cwd)
-        .load()
-        .expect("runtime config should load");
-    let requested_model = std::env::var("COWD_AI_HARNESS_LIVE_MODEL")
-        .ok()
-        .or_else(|| config.model().map(str::to_string))
-        .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or config model");
-    let provider = config
-        .providers()
-        .resolve_full(&requested_model)
-        .cloned()
-        .or_else(|| fallback_provider_from_env(&requested_model))
-        .unwrap_or_else(|| panic!("no provider configured for live model {requested_model:?}"));
-
-    let client = ProviderClient::from_config(&provider).expect("provider client should build");
+    };
     let probes = [
         LiveProbe {
             name: "structured_provider",
@@ -56,7 +41,7 @@ async fn provider_config_live_smoke_returns_structured_health_signal() {
     let mut total_tokens = 0;
     let mut response_ids = Vec::new();
     for probe in probes {
-        let response = send_live_probe(&client, &requested_model, &probe)
+        let response = send_live_probe(&env.client, &env.model, &probe)
             .await
             .unwrap_or_else(|error| {
                 panic!("live provider probe {} should succeed: {error}", probe.name)
@@ -85,12 +70,175 @@ async fn provider_config_live_smoke_returns_structured_health_signal() {
 
     eprintln!(
         "live_provider model={} provider={} probes={} response_ids={} total_tokens={}",
-        requested_model,
-        provider.name,
+        env.model,
+        env.provider_name,
         response_ids.len(),
         response_ids.join(","),
         total_tokens
     );
+}
+
+#[tokio::test]
+#[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
+async fn provider_live_stream_contract_is_ordered() {
+    let Some(env) = live_env() else {
+        return;
+    };
+    let mut stream = env
+        .client
+        .stream_message(&MessageRequest {
+            model: env.model.clone(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text(
+                "Return exactly this JSON object and nothing else: {\"status\":\"ok\",\"stream\":\"ordered\"}",
+            )],
+            system: Some("Return strict JSON only; no markdown.".to_string()),
+            stream: true,
+            temperature: Some(0.0),
+            ..Default::default()
+        })
+        .await
+        .expect("live stream should start");
+
+    let mut saw_start = false;
+    let mut saw_delta = false;
+    let mut saw_stop = false;
+    let mut text = String::new();
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .expect("live stream should yield valid events")
+    {
+        match event {
+            StreamEvent::MessageStart(_) => {
+                assert!(!saw_start, "stream should emit a single message_start");
+                assert!(!saw_stop, "message_start must precede message_stop");
+                saw_start = true;
+            }
+            StreamEvent::ContentBlockDelta(delta) => {
+                assert!(saw_start, "content delta must follow message_start");
+                if let ContentBlockDelta::TextDelta { text: delta_text } = delta.delta {
+                    saw_delta |= !delta_text.trim().is_empty();
+                    text.push_str(&delta_text);
+                }
+            }
+            StreamEvent::MessageStop(_) => {
+                assert!(saw_start, "message_stop must follow message_start");
+                saw_stop = true;
+            }
+            StreamEvent::MessageDelta(_)
+            | StreamEvent::ContentBlockStart(_)
+            | StreamEvent::ContentBlockStop(_) => {}
+        }
+    }
+
+    assert!(saw_start, "stream should include message_start");
+    assert!(saw_delta, "stream should include nonempty text delta");
+    assert!(saw_stop, "stream should include message_stop");
+    let parsed = parse_json_object(&text)
+        .unwrap_or_else(|| panic!("stream text should contain JSON object, got: {text:?}"));
+    assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        parsed.get("stream").and_then(Value::as_str),
+        Some("ordered")
+    );
+    eprintln!(
+        "live_stream model={} provider={} ordered=true text_chars={}",
+        env.model,
+        env.provider_name,
+        text.len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
+async fn provider_live_structured_output_is_stable() {
+    let Some(env) = live_env() else {
+        return;
+    };
+    let probe = LiveProbe {
+        name: "structured_drift",
+        max_tokens: 96,
+        prompt:
+            "Return exactly this JSON object and nothing else: {\"status\":\"ok\",\"drift\":\"stable\"}",
+        expected_key: "drift",
+        expected_value: "stable",
+    };
+
+    let mut total_tokens = 0;
+    for idx in 1..=3 {
+        let response = send_live_probe(&env.client, &env.model, &probe)
+            .await
+            .unwrap_or_else(|error| panic!("structured drift probe {idx} failed: {error}"));
+        let text = response_text(&response);
+        let parsed = parse_json_object(&text)
+            .unwrap_or_else(|| panic!("structured drift probe {idx} produced non-json: {text:?}"));
+        assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(parsed.get("drift").and_then(Value::as_str), Some("stable"));
+        total_tokens += response.total_tokens();
+    }
+    eprintln!(
+        "live_structured_drift model={} provider={} probes=3 total_tokens={}",
+        env.model, env.provider_name, total_tokens
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
+async fn provider_live_routing_respects_simple_complex_and_risk() {
+    let Some(env) = live_env() else {
+        return;
+    };
+    let probes = [
+        LiveProbe {
+            name: "route_direct",
+            max_tokens: 96,
+            prompt: "A user asks what 2+2 is. Return only JSON: {\"status\":\"ok\",\"route\":\"direct\"}",
+            expected_key: "route",
+            expected_value: "direct",
+        },
+        LiveProbe {
+            name: "route_plan",
+            max_tokens: 128,
+            prompt: "A user asks to refactor a multi-crate runtime. Return only JSON: {\"status\":\"ok\",\"route\":\"plan\"}",
+            expected_key: "route",
+            expected_value: "plan",
+        },
+        LiveProbe {
+            name: "route_blocked",
+            max_tokens: 128,
+            prompt: "A user asks to delete production data without confirmation. Return only JSON: {\"status\":\"ok\",\"route\":\"blocked\"}",
+            expected_key: "route",
+            expected_value: "blocked",
+        },
+    ];
+
+    let mut total_tokens = 0;
+    for probe in probes {
+        let response = send_live_probe(&env.client, &env.model, &probe)
+            .await
+            .unwrap_or_else(|error| panic!("routing probe {} failed: {error}", probe.name));
+        let text = response_text(&response);
+        let parsed = parse_json_object(&text)
+            .unwrap_or_else(|| panic!("routing probe {} produced non-json: {text:?}", probe.name));
+        assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            parsed.get(probe.expected_key).and_then(Value::as_str),
+            Some(probe.expected_value)
+        );
+        total_tokens += response.total_tokens();
+    }
+    eprintln!(
+        "live_routing model={} provider={} probes=3 total_tokens={}",
+        env.model, env.provider_name, total_tokens
+    );
+}
+
+#[derive(Debug, Clone)]
+struct LiveEnv {
+    model: String,
+    provider_name: String,
+    client: ProviderClient,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +259,35 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
         models: vec![model.to_string()],
         name: "env-openai-compatible".to_string(),
         protocol: Some("openai-compat".to_string()),
+    })
+}
+
+fn live_env() -> Option<LiveEnv> {
+    if std::env::var("COWD_AI_HARNESS_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("skipping live provider test; set COWD_AI_HARNESS_LIVE=1");
+        return None;
+    }
+
+    let cwd = std::env::current_dir().expect("current dir should be available");
+    let config = ConfigLoader::default_for(cwd)
+        .load()
+        .expect("runtime config should load");
+    let model = std::env::var("COWD_AI_HARNESS_LIVE_MODEL")
+        .ok()
+        .or_else(|| config.model().map(str::to_string))
+        .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or config model");
+    let provider = config
+        .providers()
+        .resolve_full(&model)
+        .cloned()
+        .or_else(|| fallback_provider_from_env(&model))
+        .unwrap_or_else(|| panic!("no provider configured for live model {model:?}"));
+    let provider_name = provider.name.clone();
+    let client = ProviderClient::from_config(&provider).expect("provider client should build");
+    Some(LiveEnv {
+        model,
+        provider_name,
+        client,
     })
 }
 
