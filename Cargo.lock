@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agent-spec"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ai-behavior-policy"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "ai-strategy",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "ai-context"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "ai-core"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "serde",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "ai-eval"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "ai-growth"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "ai-harness"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-agent-spec",
  "ai-context",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ai-policy"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-agent-spec",
  "chrono",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "ai-strategy"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "ai-task"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "ai-strategy",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "ai-tool-transaction"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "ai-verification"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "ai-workgraph"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-core",
  "serde",
@@ -201,7 +201,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
  "serde_json",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "gateway",
  "memory",
@@ -713,27 +713,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tui",
 ]
 
 [[package]]
-name = "clipboard-win"
-version = "5.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+name = "cli-ui"
+version = "0.9.329"
 dependencies = [
- "error-code",
+ "crossterm",
+ "pulldown-cmark",
+ "syntect",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
 name = "command-contract"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "command-service"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "command-contract",
@@ -1029,12 +1031,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "endian-type"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1049,12 +1045,6 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "error-code"
-version = "3.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "event-listener"
@@ -1100,17 +1090,6 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
-
-[[package]]
-name = "fd-lock"
-version = "4.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
-dependencies = [
- "cfg-if",
- "rustix 1.1.4",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "filetime"
@@ -1302,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "ai-task",
  "app-mfg",
@@ -1310,9 +1289,9 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "cli-ui",
  "command-contract",
  "command-service",
- "crossterm",
  "futures",
  "libc",
  "matrix-core",
@@ -1321,13 +1300,10 @@ dependencies = [
  "memory",
  "plugins",
  "provider",
- "pulldown-cmark",
  "qrcode",
- "ratatui",
  "reqwest",
  "runtime",
  "rusqlite",
- "rustyline",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1336,7 +1312,6 @@ dependencies = [
  "sha2",
  "skill-service",
  "storage",
- "syntect",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -1347,9 +1322,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "tui",
- "tui-textarea",
- "unicode-width 0.2.0",
  "uuid",
 ]
 
@@ -1502,15 +1474,6 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
-name = "home"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "http"
@@ -2230,7 +2193,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "serde",
@@ -2241,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -2257,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
  "serde_json",
@@ -2272,7 +2235,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2407,27 +2370,6 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
-
-[[package]]
-name = "nibble_vec"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
-name = "nix"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "cfg_aliases",
- "libc",
-]
 
 [[package]]
 name = "nom"
@@ -2696,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
  "serde_json",
@@ -2803,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "reqwest",
  "runtime",
@@ -2960,16 +2902,6 @@ dependencies = [
  "r2d2",
  "rusqlite",
  "uuid",
-]
-
-[[package]]
-name = "radix_trie"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c069c179fcdc6a2fe24d8d18305cf085fdbd4f922c041943e203685d6a1c58fd"
-dependencies = [
- "endian-type",
- "nibble_vec",
 ]
 
 [[package]]
@@ -3183,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "aes",
  "ai-agent-spec",
@@ -3333,28 +3265,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rustyline"
-version = "15.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee1e066dc922e513bda599c6ccb5f3bb2b0ea5870a579448f2622993f0a9a2f"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "clipboard-win",
- "fd-lock",
- "home",
- "libc",
- "log",
- "memchr",
- "nix",
- "radix_trie",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "utf8parse",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "ryu"
@@ -3549,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
  "serde_json",
@@ -3651,7 +3561,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill-service"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "regex",
  "serde",
@@ -3712,7 +3622,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3865,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "serde",
  "serde_json",
@@ -4138,7 +4048,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4394,7 +4304,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.328"
+version = "0.9.329"
 dependencies = [
  "chrono",
  "crossterm",
@@ -4545,12 +4455,6 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
-
-[[package]]
-name = "utf8parse"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"

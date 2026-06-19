@@ -18,6 +18,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions/search", get(search_messages_handler))
         .route("/api/sessions/:id/ensure", post(ensure_session_handler))
         .route(
+            "/api/sessions/:id/cancel",
+            post(cancel_session_turn_handler),
+        )
+        .route(
             "/api/sessions/:id",
             get(get_session)
                 .patch(update_session_handler)
@@ -136,6 +140,14 @@ struct UpdateSessionRequest {
     title: Option<String>,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CancelSessionTurnRequest {
+    #[serde(default)]
+    actor_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn session_title_from_metadata(metadata_json: Option<&str>) -> Option<String> {
@@ -481,6 +493,87 @@ async fn get_session(
             }),
         ))
     }
+}
+
+async fn cancel_session_turn_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<CancelSessionTurnRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session id is required".to_string(),
+            }),
+        ));
+    }
+
+    if state.services.session.active_runtime(&id).is_none()
+        && state
+            .services
+            .session
+            .stored_session(&id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to load session: {error}"),
+                    }),
+                )
+            })?
+            .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {id} not found"),
+            }),
+        ));
+    }
+
+    let actor_id = body
+        .actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("user_requested");
+    let event = serde_json::json!({
+        "type": "TurnCancelRequested",
+        "session_id": id,
+        "actor_id": actor_id,
+        "reason": reason,
+        "status": "accepted",
+    });
+    state.event_bus().broadcast(&id, &event.to_string()).await;
+    state
+        .services
+        .session
+        .append_timeline_event(&id, "TurnCancelRequested", event.clone())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to persist cancel request: {error}"),
+                }),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": id,
+        "status": "cancel_requested",
+        "actor_id": actor_id,
+        "reason": reason,
+    })))
 }
 
 async fn delete_session(

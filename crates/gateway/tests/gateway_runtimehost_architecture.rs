@@ -12,6 +12,15 @@ fn production_part(source: &str) -> &str {
     source.split("#[cfg(test)]").next().unwrap_or(source)
 }
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source
+        .find(start)
+        .expect("source start marker should exist");
+    let remainder = &source[start_index..];
+    let end_index = remainder.find(end).expect("source end marker should exist");
+    &remainder[..end_index]
+}
+
 fn manifest_dependencies(source: &str) -> &str {
     source.split("[dev-dependencies]").next().unwrap_or(source)
 }
@@ -122,7 +131,7 @@ fn compat_harness_is_not_a_workspace_dependency() {
 #[test]
 fn entry_boundary_crates_exist_as_migration_targets() {
     let root = repo_root();
-    for crate_name in ["cli", "gateway", "tui"] {
+    for crate_name in ["cli", "cli-ui", "gateway", "tui"] {
         let manifest = root.join(format!("crates/{crate_name}/Cargo.toml"));
         assert!(
             manifest.is_file(),
@@ -133,13 +142,68 @@ fn entry_boundary_crates_exist_as_migration_targets() {
 
     let cli_manifest = read_repo("crates/cli/Cargo.toml");
     let cli_dependencies = manifest_dependencies(&cli_manifest);
+    let cli_main = read_repo("crates/cli/src/main.rs");
     assert!(cli_manifest.contains("name = \"cli\""));
+    assert!(
+        cli_dependencies.contains("gateway = { path = \"../gateway\" }"),
+        "cli must depend on gateway only for backend management commands"
+    );
+    assert!(
+        cli_dependencies.contains("tui = { path = \"../tui\" }"),
+        "cli must depend on tui directly for the terminal UI launcher"
+    );
+    assert!(
+        cli_main.contains("tui::terminal_entry()"),
+        "cli launcher must route no-arg or explicit tui usage directly to the TUI entry"
+    );
+    assert!(
+        cli_main.contains("gateway::backend_entry()"),
+        "cli launcher must route gateway management commands to the backend entry"
+    );
+    assert!(
+        cli_main.contains("gateway::main_entry()"),
+        "cli must preserve gateway's non-interactive command parser for static commands"
+    );
     assert!(!cli_dependencies.contains("runtime"));
     assert!(!cli_dependencies.contains("ratatui"));
     assert!(!cli_dependencies.contains("axum"));
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
+    let gateway_dependencies = manifest_dependencies(&gateway_manifest);
     assert!(gateway_manifest.contains("name = \"gateway\""));
+    assert!(
+        gateway_dependencies.contains("cli-ui = { path = \"../cli-ui\" }"),
+        "gateway may use terminal rendering only through the cli-ui surface adapter"
+    );
+    assert!(
+        !gateway_manifest.contains("terminal-ui"),
+        "gateway must not expose a terminal UI feature"
+    );
+    for dependency in [
+        "crossterm",
+        "pulldown-cmark",
+        "ratatui",
+        "rustyline",
+        "syntect",
+        "tui",
+        "tui-textarea",
+        "unicode-width",
+    ] {
+        assert!(
+            !gateway_dependencies.contains(&format!("{dependency} = ")),
+            "gateway must not depend directly on terminal rendering crate {dependency}"
+        );
+    }
+
+    let cli_ui_manifest = read_repo("crates/cli-ui/Cargo.toml");
+    let cli_ui_dependencies = manifest_dependencies(&cli_ui_manifest);
+    assert!(cli_ui_manifest.contains("name = \"cli-ui\""));
+    for dependency in ["crossterm", "pulldown-cmark", "syntect", "unicode-width"] {
+        assert!(
+            cli_ui_dependencies.contains(&format!("{dependency} = ")),
+            "cli-ui must own terminal rendering dependency {dependency}"
+        );
+    }
 
     let tui_manifest = read_repo("crates/tui/Cargo.toml");
     let tui_dependencies = manifest_dependencies(&tui_manifest);
@@ -160,6 +224,47 @@ fn entry_boundary_crates_exist_as_migration_targets() {
             "tui manifest must not depend directly on {forbidden}"
         );
     }
+}
+
+#[test]
+fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback() {
+    let full_source = read_repo("crates/tui/src/runner.rs");
+    let source = source_between(
+        &full_source,
+        "pub fn run_gateway_tui(config: GatewayTuiConfig)",
+        "fn attach_gateway_session",
+    );
+    for forbidden in [
+        "local TUI runtime fallback",
+        "local TUI runtime active",
+        "local runtime remains active",
+        "Gateway API unavailable for this message",
+        "capture_stdout(|| cli.handle_repl_command",
+        "cli.handle_repl_command",
+        "run_turn_async",
+        "Gateway turn cancellation API is not wired yet",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "TUI must not silently fall back to a second local runtime path: {forbidden}"
+        );
+    }
+    assert!(
+        source.contains("Gateway API is required for TUI"),
+        "TUI startup must fail explicitly when Gateway cannot be reached"
+    );
+    assert!(
+        source.contains("dispatch_gateway_message("),
+        "TUI chat submit must use Gateway HTTP message API"
+    );
+    assert!(
+        source.contains("dispatch_gateway_command("),
+        "TUI slash command submit must use Gateway HTTP command API"
+    );
+    assert!(
+        source.contains("dispatch_gateway_cancel("),
+        "TUI cancel must use Gateway HTTP control API"
+    );
 }
 
 #[test]

@@ -1,0 +1,15 @@
+[package]
+name = "cli-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossterm = { version = "0.28", features = ["event-stream"] }
+pulldown-cmark = "0.13"
+syntect = "5"
+unicode-width = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"

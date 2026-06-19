@@ -3817,6 +3817,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cancel_records_gateway_control_event() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "cancel-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{session_id}/cancel"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor_id": "tui:test",
+                            "reason": "test_cancel",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["status"], "cancel_requested");
+        assert_eq!(json["actor_id"], "tui:test");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["events"][0]["type"], "TurnCancelRequested");
+        assert_eq!(json["events"][0]["payload"]["actor_id"], "tui:test");
+        assert_eq!(json["events"][0]["payload"]["reason"], "test_cancel");
+    }
+
+    #[tokio::test]
     async fn runtime_timeline_projection_is_paged() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "runtime-timeline-session";

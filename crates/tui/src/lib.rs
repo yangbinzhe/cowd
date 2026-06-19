@@ -17,6 +17,7 @@ pub mod osc52;
 pub mod profiler;
 pub mod protocol;
 pub mod render;
+pub mod runner;
 pub mod runtime_control_store;
 pub mod scroll_state;
 pub mod skin;
@@ -32,3 +33,4 @@ pub use boundary_policy::{TuiBackendAccess, TuiBoundaryPolicy};
 #[allow(unused_imports)]
 pub use events::{cowd_event_channel, CowdEventReceiver};
 pub use protocol::{CowdEvent, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary};
+pub use runner::{run_gateway_tui, terminal_entry, GatewayTuiConfig};

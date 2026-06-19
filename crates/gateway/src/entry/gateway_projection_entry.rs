@@ -213,15 +213,241 @@ fn gateway_projection_auth_token() -> Option<String> {
         .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
 }
 
-fn running_gateway_client(
-) -> Result<tui::gateway_client::GatewayApiClient, Box<dyn std::error::Error>> {
-    let Some(client) = tui::gateway_client::GatewayApiClient::from_running_gateway(
-        gateway_projection_auth_token(),
-    )?
+#[derive(Debug, Clone)]
+struct GatewayProjectionClient {
+    base_url: String,
+    auth_token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl GatewayProjectionClient {
+    fn from_running_gateway(
+        auth_token: Option<String>,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let base_url = std::env::var("COWD_GATEWAY_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string());
+        let base_url = normalize_gateway_base_url(base_url)?;
+        if !gateway_listener_reachable(&base_url) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            base_url,
+            auth_token,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?,
+        }))
+    }
+
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let request = self.client.get(format!("{}{}", self.base_url, path));
+        let request = self.authorize(request);
+        let response = request.send().await?;
+        Self::parse_response(response).await
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let request = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(&body);
+        let request = self.authorize(request);
+        let response = request.send().await?;
+        Self::parse_response(response).await
+    }
+
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth_token.as_deref() {
+            Some(token) if !token.trim().is_empty() => request.bearer_auth(token.trim()),
+            _ => request,
+        }
+    }
+
+    async fn parse_response(
+        response: reqwest::Response,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(format!("Gateway API returned {status}: {text}").into());
+        }
+        Ok(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "body": text })))
+    }
+
+    async fn task_status(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/tasks").await
+    }
+
+    async fn start_task(
+        &self,
+        objective: &str,
+        yolo_mode: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json(
+            "/api/tasks/start",
+            serde_json::json!({ "objective": objective, "yolo_mode": yolo_mode }),
+        )
+        .await
+    }
+
+    async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json(
+            &format!("/api/tasks/{}/cancel", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    async fn complete_task(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json(
+            &format!("/api/tasks/{}/complete", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    async fn pending_approvals(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/approval/pending").await
+    }
+
+    async fn respond_approval(
+        &self,
+        id: &str,
+        approved: bool,
+        persistence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json(
+            "/api/approval/respond",
+            serde_json::json!({
+                "id": id,
+                "approved": approved,
+                "persistence": persistence,
+                "reason": reason,
+            }),
+        )
+        .await
+    }
+
+    async fn current_context(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        match session_id {
+            Some(id) => {
+                self.get_json(&format!(
+                    "/api/context/current?session_id={}",
+                    url_encode(id)
+                ))
+                .await
+            }
+            None => self.get_json("/api/context/current").await,
+        }
+    }
+
+    async fn runtime_control_plane(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/runtime/control-plane").await
+    }
+
+    async fn runtime_effective_config(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/runtime/config/effective").await
+    }
+
+    async fn memory_status(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/memory/status").await
+    }
+
+    async fn cross_plane_summary(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.get_json("/api/cross-plane/summary").await
+    }
+
+    async fn preflight_cross_plane_action(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json("/api/cross-plane/action/preflight", request)
+            .await
+    }
+
+    async fn execute_cross_plane_action(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.post_json("/api/cross-plane/action/execute", request)
+            .await
+    }
+}
+
+fn running_gateway_client() -> Result<GatewayProjectionClient, Box<dyn std::error::Error>> {
+    let Some(client) =
+        GatewayProjectionClient::from_running_gateway(gateway_projection_auth_token())?
     else {
         return Err("Gateway API is not running; start gateway first".into());
     };
     Ok(client)
+}
+
+fn normalize_gateway_base_url(mut base_url: String) -> Result<String, Box<dyn std::error::Error>> {
+    base_url = base_url.trim().trim_end_matches('/').to_string();
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(format!(
+            "Gateway API base URL must start with http:// or https://: {base_url}"
+        )
+        .into());
+    }
+    Ok(base_url)
+}
+
+fn gateway_listener_reachable(base_url: &str) -> bool {
+    let Some(rest) = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let mut parts = authority.rsplitn(2, ':');
+    let port = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(80);
+    let host = parts.next().unwrap_or(authority);
+    std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .ok()
+        .and_then(|mut addrs| {
+            addrs
+                .any(|addr| {
+                    std::net::TcpStream::connect_timeout(
+                        &addr,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .is_ok()
+                })
+                .then_some(())
+        })
+        .is_some()
+}
+
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn print_gateway_task_status(value: &serde_json::Value) {

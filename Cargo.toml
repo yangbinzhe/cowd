@@ -16,6 +16,7 @@ members = [
     "crates/app-mfg",
     "crates/approval",
     "crates/cli",
+    "crates/cli-ui",
     "crates/command/contract",
     "crates/command/service",
     "crates/gateway",
@@ -36,7 +37,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.328"
+version = "0.9.329"
 edition = "2021"
 license = "MIT"
 publish = false

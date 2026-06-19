@@ -122,6 +122,21 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn command_execute(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/commands/execute",
+            serde_json::json!({
+                "command": command,
+                "args": args,
+            }),
+        )
+        .await
+    }
+
     pub async fn runtime_snapshot(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/snapshot").await
     }
@@ -150,6 +165,22 @@ impl GatewayApiClient {
         self.post_json(
             &format!("/api/sessions/{}/messages", url_encode(session_id)),
             serde_json::json!({ "content": content }),
+        )
+        .await
+    }
+
+    pub async fn cancel_session_turn(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/sessions/{}/cancel", url_encode(session_id)),
+            serde_json::json!({
+                "actor_id": actor_id,
+                "reason": reason,
+            }),
         )
         .await
     }
@@ -868,6 +899,9 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .unwrap_or("Gateway turn error")
                 .to_string(),
         }),
+        "TurnCancelRequested" | "turn_cancel_requested" => Some(CowdEvent::Warning {
+            message: "Gateway cancel request accepted".to_string(),
+        }),
         _ => None,
     }
 }
@@ -1013,9 +1047,11 @@ mod tests {
             "tool_checkpoint_restore",
             "tool_intent_plan",
             "tool_context_fanout_plan",
+            "command_execute",
+            "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 59);
+        assert_eq!(migrated.len(), 61);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
