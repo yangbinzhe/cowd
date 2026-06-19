@@ -1,7 +1,10 @@
 //! Lightweight intent and dependency planning for tool execution.
 
+use ai_strategy::{decide_strategy, StrategyInput, TaskDomain};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use ai_strategy::{StrategyDecision, TaskUnderstanding};
 
 use crate::tool_dispatch::ToolRequest;
 
@@ -27,66 +30,69 @@ pub struct IntentPlan {
 
 #[must_use]
 pub fn classify_intent(prompt: &str) -> IntentPlan {
-    let normalized = prompt.to_ascii_lowercase();
-    let (intent, recommended_tools, reason) =
-        if contains_any(&normalized, &["review", "审查", "审计"]) {
-            (
-                TaskIntent::Review,
-                vec!["workspace_snapshot", "grep_many", "read_many"],
-                "review tasks need workspace status, changed files, and targeted reads",
-            )
-        } else if contains_any(&normalized, &["bug", "fix", "修复", "报错", "失败"]) {
-            (
-                TaskIntent::Bugfix,
-                vec!["grep_many", "read_many", "tool_batch_readonly"],
-                "bugfix tasks need symbol search, callers, and failing test context",
-            )
-        } else if contains_any(
-            &normalized,
-            &["frontend", "ui", "页面", "样式", "tui", "webui"],
-        ) {
-            (
-                TaskIntent::Frontend,
-                vec!["workspace_snapshot", "glob_many", "read_many"],
-                "frontend tasks need component, style, and route context",
-            )
-        } else if contains_any(&normalized, &["release", "发布", "tag", "验收"]) {
-            (
-                TaskIntent::Release,
-                vec!["workspace_snapshot", "tool_batch_readonly"],
-                "release tasks need status, tests, build, and release-gate context",
-            )
-        } else if contains_any(&normalized, &["test", "测试", "e2e", "验证"]) {
-            (
-                TaskIntent::Test,
-                vec!["workspace_snapshot", "grep_many"],
-                "test tasks need test targets and validation commands",
-            )
-        } else if contains_any(&normalized, &["docs", "文档", "方案"]) {
-            (
-                TaskIntent::Docs,
-                vec!["glob_many", "read_many"],
-                "docs tasks need related document discovery and batch reads",
-            )
-        } else if contains_any(&normalized, &["backend", "runtime", "server", "后端"]) {
-            (
-                TaskIntent::Backend,
-                vec!["workspace_snapshot", "grep_many", "read_many"],
-                "backend tasks need runtime/module search and source context",
-            )
-        } else {
-            (
-                TaskIntent::Explore,
-                vec!["workspace_snapshot", "grep_many", "read_many"],
-                "exploration starts with workspace snapshot and fanout search/read",
-            )
-        };
+    let decision = classify_strategy(prompt);
+    let intent = intent_from_domain(decision.understanding.domain);
+    let recommended_tools = recommended_tools_for(intent);
+    let reason = reason_for(intent, &decision);
 
     IntentPlan {
         intent,
-        recommended_tools: recommended_tools.into_iter().map(str::to_string).collect(),
-        reason: reason.to_string(),
+        recommended_tools,
+        reason,
     }
+}
+
+#[must_use]
+pub fn classify_strategy(prompt: &str) -> StrategyDecision {
+    decide_strategy(&StrategyInput::from_prompt(prompt))
+}
+
+fn intent_from_domain(domain: TaskDomain) -> TaskIntent {
+    match domain {
+        TaskDomain::Review => TaskIntent::Review,
+        TaskDomain::Bugfix => TaskIntent::Bugfix,
+        TaskDomain::Frontend => TaskIntent::Frontend,
+        TaskDomain::Backend | TaskDomain::Architecture => TaskIntent::Backend,
+        TaskDomain::Docs | TaskDomain::Research => TaskIntent::Docs,
+        TaskDomain::Release => TaskIntent::Release,
+        TaskDomain::Test => TaskIntent::Test,
+        TaskDomain::Explore => TaskIntent::Explore,
+    }
+}
+
+fn recommended_tools_for(intent: TaskIntent) -> Vec<String> {
+    let tools = match intent {
+        TaskIntent::Review => vec!["workspace_snapshot", "grep_many", "read_many"],
+        TaskIntent::Bugfix => vec!["grep_many", "read_many", "tool_batch_readonly"],
+        TaskIntent::Frontend => vec!["workspace_snapshot", "glob_many", "read_many"],
+        TaskIntent::Backend => vec!["workspace_snapshot", "grep_many", "read_many"],
+        TaskIntent::Docs => vec!["glob_many", "read_many"],
+        TaskIntent::Release => vec!["workspace_snapshot", "tool_batch_readonly"],
+        TaskIntent::Test => vec!["workspace_snapshot", "grep_many"],
+        TaskIntent::Explore => vec!["workspace_snapshot", "grep_many", "read_many"],
+    };
+    tools.into_iter().map(str::to_string).collect()
+}
+
+fn reason_for(intent: TaskIntent, decision: &StrategyDecision) -> String {
+    let base = match intent {
+        TaskIntent::Review => {
+            "review tasks need workspace status, changed files, and targeted reads"
+        }
+        TaskIntent::Bugfix => "bugfix tasks need symbol search, callers, and failing test context",
+        TaskIntent::Frontend => "frontend tasks need component, style, and route context",
+        TaskIntent::Backend => "backend tasks need runtime/module search and source context",
+        TaskIntent::Docs => "documentation tasks need related document discovery and batch reads",
+        TaskIntent::Release => "release tasks need status, tests, build, and release-gate context",
+        TaskIntent::Test => "test tasks need test targets and validation commands",
+        TaskIntent::Explore => "exploration starts with workspace snapshot and fanout search/read",
+    };
+    format!(
+        "{base}; strategy_mode={}; complexity={:?}; risk={:?}",
+        decision.mode.as_str(),
+        decision.understanding.complexity,
+        decision.understanding.risk
+    )
 }
 
 #[must_use]
@@ -165,13 +171,10 @@ fn path_related(previous: Option<&str>, current: &str) -> bool {
         || current.starts_with(&format!("{previous}/"))
 }
 
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_core::ExecutionMode;
 
     fn request(id: &str, name: &str, input: &str) -> ToolRequest {
         ToolRequest {
@@ -189,6 +192,14 @@ mod tests {
             TaskIntent::Review
         );
         assert_eq!(classify_intent("修复这个失败").intent, TaskIntent::Bugfix);
+    }
+
+    #[test]
+    fn exposes_strategy_decision_for_runtime_callers() {
+        let decision = classify_strategy("全面规划 runtime gateway service 的架构演进");
+
+        assert_eq!(decision.mode, ExecutionMode::PlanExecute);
+        assert!(decision.confidence >= 70);
     }
 
     #[test]

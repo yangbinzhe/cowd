@@ -9965,6 +9965,7 @@ mod tests {
             updated_at_ms: 1,
             audit: Vec::new(),
             agent_graph: None,
+            strategy: None,
         };
 
         let banner = format_startup_banner_with_task(
@@ -10069,6 +10070,7 @@ mod tests {
             updated_at_ms: 2,
             audit: Vec::new(),
             agent_graph: None,
+            strategy: None,
         };
 
         let summary = current_task_summary_from_record(&task);

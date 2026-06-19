@@ -37,6 +37,7 @@ use tracing;
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
+use crate::ai_kernel::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -238,7 +239,7 @@ impl Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 /// Summary of one completed runtime turn, including tool results and usage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
@@ -246,6 +247,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub ai_kernel_trace: RuntimeAiKernelTrace,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -1380,6 +1382,12 @@ where
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
+        let mut ai_kernel = RuntimeAiKernel::begin_turn(
+            self.session().session_id.clone(),
+            user_input.clone(),
+            self.context_profile(),
+            &self.system_prompt,
+        );
 
         if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -1787,6 +1795,7 @@ where
                         depends_on: Vec::new(),
                     })
                     .collect();
+                ai_kernel.record_tool_requests(&pending_tool_uses);
                 let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
@@ -2223,6 +2232,22 @@ where
             }
         }
 
+        let assistant_text = assistant_messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                crate::session::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let failed_tool_results = count_failed_tool_results(&tool_results);
+        let ai_kernel_trace = ai_kernel.finalize(
+            &assistant_text,
+            tool_results.len().saturating_sub(failed_tool_results),
+            failed_tool_results,
+        );
+        self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
@@ -2230,20 +2255,11 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            ai_kernel_trace,
         };
         self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
         if let Some(ref cowd) = self.cowd_bus {
-            let assistant_text = summary
-                .assistant_messages
-                .iter()
-                .flat_map(|m| m.blocks.iter())
-                .filter_map(|b| match b {
-                    crate::session::ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             cowd.emit(crate::cowd_event::CowdEvent::TurnComplete {
                 assistant_text,
                 iterations: summary.iterations as u32,
@@ -3319,6 +3335,75 @@ where
         self.append_tool_runtime_events(sequence, "tool.schedule.created", vec![event]);
     }
 
+    fn record_ai_kernel_trace_event(&self, trace: &RuntimeAiKernelTrace, sequence: usize) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "strategy": {
+                "mode": trace.strategy.mode.as_str(),
+                "confidence": trace.strategy.confidence,
+                "complexity": format!("{:?}", trace.strategy.understanding.complexity),
+                "risk": format!("{:?}", trace.strategy.understanding.risk),
+                "decorators": trace.strategy.decorators.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
+            },
+            "context": {
+                "epoch_id": trace.context_epoch.epoch_id,
+                "token_total": trace.context_epoch.token_total,
+                "selected_count": trace.context_epoch.selected.len(),
+                "omitted_count": trace.context_epoch.omitted.len(),
+            },
+            "verification": {
+                "can_finalize": trace.verification_report.can_finalize,
+                "claim_count": trace.verification_report.claim_count,
+                "evidence_count": trace.verification_report.evidence_count,
+                "unsupported_required_count": trace.verification_report.unsupported_required_claims.len(),
+                "not_run_count": trace.verification_report.not_run_claims.len(),
+            },
+            "tool_transaction": trace.tool_transaction.as_ref().map(|plan| serde_json::json!({
+                "id": plan.id,
+                "batch_count": plan.batches.len(),
+                "requires_checkpoint": plan.requires_checkpoint,
+                "requires_human_confirm": plan.requires_human_confirm,
+                "warning_count": plan.warnings.len(),
+            })),
+            "workgraph": trace.workgraph.as_ref().map(|graph| serde_json::json!({
+                "id": graph.id,
+                "node_count": graph.nodes.len(),
+                "edge_count": graph.edges.len(),
+            })),
+            "bench": {
+                "passed": trace.bench_result.passed,
+                "score": trace.bench_result.score,
+                "case_id": trace.bench_result.case_id,
+            }
+        });
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let mut event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Task,
+            "runtime.ai_kernel.trace",
+            payload,
+            created_at_ms,
+        );
+        event.status = Some(if trace.verification_report.can_finalize {
+            "completed".to_string()
+        } else {
+            "degraded".to_string()
+        });
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(%error, session_id, sequence, "AI kernel runtime trace append failed");
+            }
+        });
+    }
+
     fn append_tool_runtime_events(
         &self,
         turn_index: usize,
@@ -3591,6 +3676,18 @@ fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
     } else {
         (String::new(), String::new())
     }
+}
+
+fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
+        })
+        .count()
 }
 
 type ToolHandler = Box<dyn Fn(&str) -> Result<String, ToolError> + Send + Sync>;
@@ -3957,6 +4054,14 @@ mod tests {
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
         assert_eq!(summary.auto_compaction, None);
+        assert_eq!(
+            summary.ai_kernel_trace.strategy.mode,
+            ai_core::ExecutionMode::DirectAnswer
+        );
+        assert!(summary.ai_kernel_trace.verification_report.can_finalize);
+        assert!(summary.ai_kernel_trace.tool_transaction.is_some());
+        assert!(summary.ai_kernel_trace.tool_receipt.is_some());
+        assert!(summary.ai_kernel_trace.bench_result.passed);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -4671,7 +4776,12 @@ mod tests {
                 .expect("turn should succeed");
 
             for _ in 0..20 {
-                if store.get_events(&session_id, 0).await.unwrap().len() >= 3 {
+                let events = store.get_events(&session_id, 0).await.unwrap();
+                if events.iter().any(|event| {
+                    memory::RuntimeEvent::from_session_event(event)
+                        .map(|runtime_event| runtime_event.kind == "runtime.ai_kernel.trace")
+                        .unwrap_or(false)
+                }) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -4734,14 +4844,27 @@ mod tests {
 
             let policy = events
                 .iter()
-                .find(|event| event.event_type == memory::RUNTIME_EVENT_TYPE)
-                .and_then(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .find(|event| event.kind == "runtime.policy.decided")
                 .expect("runtime policy event");
             assert_eq!(policy.scope, memory::RuntimeEventScope::Policy);
             assert_eq!(policy.kind, "runtime.policy.decided");
             assert_eq!(policy.payload["complexity"]["level"], "Simple");
             assert_eq!(policy.payload["agent_mode"], "Off");
             assert_eq!(policy.payload["requires_review"], false);
+
+            let ai_kernel_trace = events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .find(|event| event.kind == "runtime.ai_kernel.trace")
+                .expect("AI kernel trace event");
+            assert_eq!(ai_kernel_trace.scope, memory::RuntimeEventScope::Task);
+            assert_eq!(ai_kernel_trace.payload["strategy"]["mode"], "direct_answer");
+            assert_eq!(
+                ai_kernel_trace.payload["verification"]["can_finalize"],
+                true
+            );
+            assert_eq!(ai_kernel_trace.payload["bench"]["passed"], true);
         });
     }
 

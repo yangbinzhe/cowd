@@ -1,0 +1,13 @@
+[package]
+name = "ai-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ai-core = { path = "../ai-core" }
+serde.workspace = true
+
+[lints]
+workspace = true

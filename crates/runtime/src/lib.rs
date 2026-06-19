@@ -64,6 +64,7 @@ pub mod agent_discussion;
 pub mod agent_kernel;
 pub mod agent_protocol;
 pub mod agent_workgraph;
+pub mod ai_kernel;
 pub mod approval_gate;
 pub mod checkpoint;
 pub mod connector;
@@ -128,6 +129,7 @@ pub use agent_workgraph::{
     AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
     WorkGraphRef, WorkGraphStatus,
 };
+pub use ai_kernel::{RuntimeAiKernel, RuntimeAiKernelTrace};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

@@ -41,6 +41,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-context"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "ai-core"
+version = "0.9.326"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "ai-eval"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "ai-strategy"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+]
+
+[[package]]
+name = "ai-task"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "ai-strategy",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "storage",
+ "uuid",
+]
+
+[[package]]
+name = "ai-tool-transaction"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "ai-verification"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "ai-workgraph"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "aliasable"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1172,6 +1250,7 @@ dependencies = [
 name = "gateway"
 version = "0.9.326"
 dependencies = [
+ "ai-task",
  "app-mfg",
  "approval",
  "async-trait",
@@ -3053,6 +3132,13 @@ name = "runtime"
 version = "0.9.326"
 dependencies = [
  "aes",
+ "ai-context",
+ "ai-core",
+ "ai-eval",
+ "ai-strategy",
+ "ai-tool-transaction",
+ "ai-verification",
+ "ai-workgraph",
  "approval",
  "async-trait",
  "base64 0.22.1",

@@ -11,6 +11,7 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
+ai-task = { path = "../ai-task" }
 provider = { path = "../provider" }
 storage = { path = "../storage" }
 approval = { path = "../approval" }

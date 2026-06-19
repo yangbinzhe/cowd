@@ -1,5 +1,13 @@
 [workspace]
 members = [
+    "crates/ai-core",
+    "crates/ai-context",
+    "crates/ai-eval",
+    "crates/ai-strategy",
+    "crates/ai-task",
+    "crates/ai-tool-transaction",
+    "crates/ai-verification",
+    "crates/ai-workgraph",
     "crates/app-mfg",
     "crates/approval",
     "crates/cli",
