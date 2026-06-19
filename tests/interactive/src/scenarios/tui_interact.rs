@@ -8,7 +8,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-interact")?;
-    tui.wait_for("COWD", 15)?;
+    tui.wait_until_ready(15)?;
     println!("\n── TUI Interact ──");
 
     runner.run("Which-Key overlay via Space", || {

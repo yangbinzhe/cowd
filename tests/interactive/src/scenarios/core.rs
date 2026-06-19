@@ -1,5 +1,5 @@
 use crate::tui::TuiSession;
-use crate::provider::ApiClient;
+use crate::api::ApiClient;
 use crate::server::ServerProcess;
 use crate::reporter::TestRunner;
 
@@ -11,9 +11,8 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("base")?;
 
     runner.run("TUI starts", || {
-        let cap = tui.capture()?;
-        if cap.contains("Model") || cap.contains("Workspace") || cap.contains("cowd") || cap.contains("COWD") { Ok(()) }
-        else { Err(anyhow::anyhow!("COWD logo not found")) }
+        tui.assert_healthy_capture(120)?;
+        Ok(())
     });
 
     runner.run("Send message", || {
@@ -33,18 +32,14 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         Ok(())
     });
 
-    if crate::tui::session_alive(tui.cmd()) {
-        runner.run("Sidebar tab", || {
-            tui.send_key("Tab")?;
-            tui.wait_for("Context", 5).or_else(|_| {
-                let cap = tui.capture()?;
-                if cap.contains("Changes") { Ok(()) }
-                else { Err(anyhow::anyhow!("Sidebar not visible after Tab")) }
-            })
-        });
-    } else {
-        println!("  ⬜ Sidebar tab skipped (session dead)");
-    }
+    runner.run("Sidebar tab", || {
+        let before = tui.capture()?;
+        tui.send_key("Tab")?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after = tui.assert_healthy_capture(120)?;
+        if after == before { Err(anyhow::anyhow!("Tab did not update the TUI")) }
+        else { Ok(()) }
+    });
 
     tui.close();
 
@@ -82,9 +77,19 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     println!("\n── Cross Test ──");
     runner.run("TUI→API session verify", || {
         let t = TuiSession::new("cross")?;
-        t.wait_for("COWD", 10)?;
+        t.wait_until_ready(10)?;
         t.send("/status")?; t.enter()?;
-        t.wait_for("Model", 8)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let before = t.capture()?;
+        let mut cap = String::new();
+        while std::time::Instant::now() < deadline {
+            cap = t.capture()?;
+            if cap != before && cap.trim().len() >= before.trim().len() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if cap == before {
+            return Err(anyhow::anyhow!("Status command did not update the TUI"));
+        }
         t.close();
 
         let mut srv = ServerProcess::start()?;

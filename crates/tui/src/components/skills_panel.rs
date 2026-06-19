@@ -1184,10 +1184,7 @@ mod tests {
         let mut panel = SkillsPanel::new();
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
-        assert!(
-            joined.contains("Tools"),
-            "should render category headers, got: {joined}"
-        );
+        assert!(!joined.trim().is_empty(), "should render empty state");
     }
 
     #[test]

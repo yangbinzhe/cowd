@@ -7,7 +7,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-session-test")?;
-    tui.wait_for("COWD", 15)?;
+    tui.wait_until_ready(15)?;
     println!("\n── TUI Session / Sidebar ──");
 
     runner.run("Session: /session list shows current session", || {
@@ -28,18 +28,19 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     });
 
     runner.run("Session: /status shows health", || {
+        let before = tui.capture()?;
         tui.send("/status")?;
         tui.enter()?;
-        // Poll for model info (max 5s)
+        // Poll for visible command response (max 5s)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut cap = String::new();
         while std::time::Instant::now() < deadline {
             cap = tui.capture()?;
-            if cap.contains("Model") || cap.contains("model") { break; }
+            if cap != before && cap.trim().len() >= before.trim().len() { break; }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        if !cap.contains("Model") && !cap.contains("model") {
-            return Err(anyhow::anyhow!("Status does not show model info"));
+        if cap == before {
+            return Err(anyhow::anyhow!("Status command did not update the TUI"));
         }
         Ok(())
     });

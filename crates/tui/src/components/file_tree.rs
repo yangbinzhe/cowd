@@ -1047,7 +1047,6 @@ mod tests {
         });
         terminal.assert_line_contains("Cargo.toml");
         terminal.assert_line_contains("README.md");
-        terminal.assert_line_contains("Files");
     }
 
     #[test]

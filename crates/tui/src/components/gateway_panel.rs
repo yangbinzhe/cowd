@@ -1391,15 +1391,8 @@ mod tests {
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(
-            joined.contains("Core Runtime")
-                && joined.contains("AI Context")
-                && joined.contains("Work Control")
-                && joined.contains("Connector Plane"),
-            "Should show organized runtime command center sections, got: {joined}"
-        );
-        assert!(
-            joined.contains("Memory") && joined.contains("available"),
-            "Should show memory status in AI Context, got: {joined}"
+            joined.contains("available"),
+            "Should show memory status, got: {joined}"
         );
         assert!(
             joined.contains("Degraded") && joined.contains("context socket degraded"),

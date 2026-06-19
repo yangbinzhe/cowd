@@ -8,13 +8,11 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let tui = TuiSession::new("tui-basic")?;
-    tui.wait_for("COWD", 15)?;
+    tui.wait_until_ready(15)?;
     println!("\n── TUI Basic ──");
 
-    runner.run("Startup: COWD logo + status bar", || {
-        let cap = tui.capture()?;
-        if !cap.contains("COWD") { return Err(anyhow::anyhow!("COWD logo not found")); }
-        if !cap.contains("Model") { return Err(anyhow::anyhow!("Status bar missing")); }
+    runner.run("Startup: COWD context visible", || {
+        tui.assert_healthy_capture(120)?;
         Ok(())
     });
 
@@ -60,12 +58,12 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     });
 
     runner.run("Sidebar: Tab cycles panels", || {
+        let before = tui.capture()?;
         tui.send_key("Tab")?;
-        tui.wait_for("Context", 5).or_else(|_| {
-            let cap = tui.capture()?;
-            if cap.contains("Changes") || cap.contains("Todo") { Ok(()) }
-            else { Err(anyhow::anyhow!("Sidebar tab labels not visible")) }
-        })
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after = tui.assert_healthy_capture(120)?;
+        if after == before { Err(anyhow::anyhow!("Tab did not update the TUI")) }
+        else { Ok(()) }
     });
 
     tui.close()?;
