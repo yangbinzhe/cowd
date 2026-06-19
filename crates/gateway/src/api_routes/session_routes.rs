@@ -10,7 +10,7 @@ use axum::{
 use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{new_api_session_record, AppState, ErrorResponse};
+use super::{abort_active_turn, new_api_session_record, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -545,12 +545,15 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
+    let aborted_run_id = abort_active_turn(&id);
     let event = serde_json::json!({
         "type": "TurnCancelRequested",
         "session_id": id,
         "actor_id": actor_id,
         "reason": reason,
         "status": "accepted",
+        "aborted": aborted_run_id.is_some(),
+        "run_id": aborted_run_id,
     });
     state.event_bus().broadcast(&id, &event.to_string()).await;
     state
@@ -573,6 +576,8 @@ async fn cancel_session_turn_handler(
         "status": "cancel_requested",
         "actor_id": actor_id,
         "reason": reason,
+        "aborted": event["aborted"],
+        "run_id": event["run_id"],
     })))
 }
 

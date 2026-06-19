@@ -2875,6 +2875,22 @@ impl BuiltRuntime {
         self
     }
 
+    pub(crate) fn install_turn_control(
+        &mut self,
+        cancellation_token: runtime::CancellationToken,
+        hook_abort_signal: runtime::HookAbortSignal,
+    ) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing turn control");
+        self.runtime = Some(
+            runtime
+                .with_cancellation_token(cancellation_token)
+                .with_hook_abort_signal(hook_abort_signal),
+        );
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;

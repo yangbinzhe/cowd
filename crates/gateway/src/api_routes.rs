@@ -2,8 +2,9 @@
 // Core gateway routes shared between TUI and HTTP API.
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -90,6 +91,67 @@ pub struct AppState {
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
+
+#[derive(Clone)]
+struct ActiveTurnControl {
+    run_id: String,
+    cancellation_token: runtime::CancellationToken,
+    hook_abort_signal: runtime::HookAbortSignal,
+}
+
+impl ActiveTurnControl {
+    fn abort(&self) {
+        self.cancellation_token.cancel();
+        self.hook_abort_signal.abort();
+    }
+}
+
+static ACTIVE_TURN_CONTROLS: OnceLock<Mutex<HashMap<String, ActiveTurnControl>>> = OnceLock::new();
+
+fn active_turn_controls() -> &'static Mutex<HashMap<String, ActiveTurnControl>> {
+    ACTIVE_TURN_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_active_turn_control(
+    session_id: String,
+    run_id: String,
+    cancellation_token: runtime::CancellationToken,
+    hook_abort_signal: runtime::HookAbortSignal,
+) {
+    let control = ActiveTurnControl {
+        run_id,
+        cancellation_token,
+        hook_abort_signal,
+    };
+    active_turn_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id, control);
+}
+
+pub(crate) fn clear_active_turn_control(session_id: &str, run_id: &str) {
+    let mut controls = active_turn_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if controls
+        .get(session_id)
+        .is_some_and(|control| control.run_id == run_id)
+    {
+        controls.remove(session_id);
+    }
+}
+
+pub(crate) fn abort_active_turn(session_id: &str) -> Option<String> {
+    let control = active_turn_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned();
+    control.map(|control| {
+        control.abort();
+        control.run_id
+    })
+}
 
 impl AppState {
     pub(crate) fn has_unified_store(&self) -> bool {
@@ -3854,6 +3916,8 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["status"], "cancel_requested");
         assert_eq!(json["actor_id"], "tui:test");
+        assert_eq!(json["aborted"], false);
+        assert_eq!(json["run_id"], serde_json::Value::Null);
 
         let response = app
             .oneshot(
@@ -3870,6 +3934,33 @@ mod tests {
         assert_eq!(json["events"][0]["type"], "TurnCancelRequested");
         assert_eq!(json["events"][0]["payload"]["actor_id"], "tui:test");
         assert_eq!(json["events"][0]["payload"]["reason"], "test_cancel");
+        assert_eq!(json["events"][0]["payload"]["aborted"], false);
+        assert_eq!(
+            json["events"][0]["payload"]["run_id"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn active_turn_registry_aborts_runtime_control_signals() {
+        let session_id = format!("cancel-active-{}", uuid::Uuid::new_v4());
+        let run_id = "run-active-cancel".to_string();
+        let cancellation_token = runtime::CancellationToken::new();
+        let hook_abort_signal = runtime::HookAbortSignal::new();
+
+        register_active_turn_control(
+            session_id.clone(),
+            run_id.clone(),
+            cancellation_token.clone(),
+            hook_abort_signal.clone(),
+        );
+
+        assert_eq!(abort_active_turn(&session_id), Some(run_id.clone()));
+        assert!(cancellation_token.is_cancelled());
+        assert!(hook_abort_signal.is_aborted());
+
+        clear_active_turn_control(&session_id, &run_id);
+        assert_eq!(abort_active_turn(&session_id), None);
     }
 
     #[tokio::test]

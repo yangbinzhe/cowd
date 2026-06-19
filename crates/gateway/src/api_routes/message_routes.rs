@@ -25,7 +25,7 @@ use crate::event_bus::SessionEventBus;
 use crate::services::SessionService;
 use crate::task_kernel::TaskRecord;
 
-use super::{AppState, ErrorResponse};
+use super::{clear_active_turn_control, register_active_turn_control, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -381,6 +381,18 @@ async fn send_message(
 
     let content = body.content;
     let rt_entry = runtime_entry.clone();
+    let cancellation_token = runtime::CancellationToken::new();
+    let hook_abort_signal = runtime::HookAbortSignal::new();
+    {
+        let mut runtime_guard = runtime_entry.lock().await;
+        runtime_guard.install_turn_control(cancellation_token.clone(), hook_abort_signal.clone());
+    }
+    register_active_turn_control(
+        session_id.clone(),
+        run_id.clone(),
+        cancellation_token,
+        hook_abort_signal,
+    );
     let turn_result = tokio::task::spawn_blocking(move || {
         let handle = tokio::runtime::Handle::current();
         handle.block_on(async move {
@@ -394,6 +406,7 @@ async fn send_message(
         })
     })
     .await;
+    clear_active_turn_control(&session_id, &run_id);
 
     match turn_result {
         Ok(Ok(Ok(summary))) => {

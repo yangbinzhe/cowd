@@ -167,8 +167,9 @@ pub use connector::{
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
-    AssistantEvent, AutoCompactionEvent, ConversationRuntime, MemoryCallback, PromptCacheEvent,
-    RuntimeError, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
+    AssistantEvent, AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
+    PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor,
+    TurnSummary,
 };
 pub use cowd_event::{
     CowdEvent, CowdEventBus, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary,
