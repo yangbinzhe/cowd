@@ -80,6 +80,9 @@ check_empty "cross-plane audit and receipt construction owner" \
 check_empty "agent service must not route through slash handlers" \
   rg -n "handle_agents_slash_command" crates/gateway/src/services/agent_service.rs
 
+check_empty "gateway main must use agent service owner" \
+  rg -n "handle_agents_slash_command" crates/gateway/src/main.rs
+
 check_empty "interactive tests must not pre-kill named tmux sessions" \
   rg -n 'kill-session.*("-t", name|-t[[:space:]]+\$?name)' tests/interactive/src --glob '*.rs'
 

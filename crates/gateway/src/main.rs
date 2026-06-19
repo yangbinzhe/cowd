@@ -90,9 +90,9 @@ use runtime::{
 use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpState};
 use serde::Deserialize;
 use serde_json::json;
+use services::GatewayServices;
 use slash_catalog::{
-    handle_agents_slash_command, handle_agents_slash_command_json, handle_skills_slash_command,
-    handle_skills_slash_command_json, resolve_skill_invocation,
+    handle_skills_slash_command, handle_skills_slash_command_json, resolve_skill_invocation,
 };
 
 use futures::StreamExt;
@@ -2753,8 +2753,9 @@ fn run_resume_command(
         }
         SlashCommand::Agents { args } => {
             let cwd = env::current_dir()?;
-            let message = handle_agents_slash_command(args.as_deref(), &cwd)?;
-            let json = handle_agents_slash_command_json(args.as_deref(), &cwd)?;
+            let agent_service = GatewayServices::transition_only().agent;
+            let message = agent_service.command_text(&cwd, args.as_deref())?;
+            let json = agent_service.command_json(&cwd, args.as_deref())?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
@@ -5897,11 +5898,12 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
+        let agent_service = GatewayServices::transition_only().agent;
         match output_format {
-            CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
+            CliOutputFormat::Text => println!("{}", agent_service.command_text(&cwd, args)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?
+                serde_json::to_string_pretty(&agent_service.command_json(&cwd, args)?)?
             ),
         }
         Ok(())
