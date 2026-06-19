@@ -3344,6 +3344,9 @@ where
             "strategy": {
                 "mode": trace.strategy.mode.as_str(),
                 "confidence": trace.strategy.confidence,
+                "policy_version": trace.strategy.policy_version,
+                "reasons": trace.strategy.reasons,
+                "required_capabilities": trace.strategy.required_capabilities.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>(),
                 "complexity": format!("{:?}", trace.strategy.understanding.complexity),
                 "risk": format!("{:?}", trace.strategy.understanding.risk),
                 "decorators": trace.strategy.decorators.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
@@ -3356,6 +3359,8 @@ where
             },
             "verification": {
                 "can_finalize": trace.verification_report.can_finalize,
+                "severity": format!("{:?}", trace.verification_report.severity),
+                "blocking_reasons": trace.verification_report.blocking_reasons,
                 "claim_count": trace.verification_report.claim_count,
                 "evidence_count": trace.verification_report.evidence_count,
                 "unsupported_required_count": trace.verification_report.unsupported_required_claims.len(),
@@ -3373,11 +3378,40 @@ where
                 "node_count": graph.nodes.len(),
                 "edge_count": graph.edges.len(),
             })),
+            "workgraph_quality": trace.workgraph_quality.as_ref().map(|quality| serde_json::json!({
+                "node_count": quality.node_count,
+                "edge_count": quality.edge_count,
+                "ready_count": quality.ready_count,
+                "blocked_count": quality.blocked_count,
+                "failed_count": quality.failed_count,
+                "has_review_node": quality.has_review_node,
+                "has_synthesis_node": quality.has_synthesis_node,
+                "is_dag": quality.is_dag,
+                "warnings": quality.warnings,
+            })),
             "bench": {
                 "passed": trace.bench_result.passed,
                 "score": trace.bench_result.score,
                 "case_id": trace.bench_result.case_id,
-            }
+                "reasons": trace.bench_result.reasons,
+            },
+            "regression_gate": {
+                "allowed": trace.regression_gate.allowed,
+                "average_score": trace.regression_gate.average_score,
+                "failed": trace.regression_gate.failed,
+                "reasons": trace.regression_gate.reasons,
+            },
+            "growth": {
+                "record_id": trace.learning_record.id,
+                "policy": trace.learning_record.policy,
+                "has_blocker": trace.learning_record.has_blocker(),
+                "signals": trace.learning_record.signals.iter().map(|signal| serde_json::json!({
+                    "kind": format!("{:?}", signal.kind),
+                    "severity": format!("{:?}", signal.severity),
+                    "summary": signal.summary,
+                })).collect::<Vec<_>>(),
+                "next_strategy_hints": trace.learning_record.next_strategy_hints,
+            },
         });
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4062,6 +4096,8 @@ mod tests {
         assert!(summary.ai_kernel_trace.tool_transaction.is_some());
         assert!(summary.ai_kernel_trace.tool_receipt.is_some());
         assert!(summary.ai_kernel_trace.bench_result.passed);
+        assert!(summary.ai_kernel_trace.regression_gate.allowed);
+        assert!(!summary.ai_kernel_trace.learning_record.has_blocker());
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -4861,10 +4897,16 @@ mod tests {
             assert_eq!(ai_kernel_trace.scope, memory::RuntimeEventScope::Task);
             assert_eq!(ai_kernel_trace.payload["strategy"]["mode"], "direct_answer");
             assert_eq!(
+                ai_kernel_trace.payload["strategy"]["policy_version"],
+                "strategy-router-v2"
+            );
+            assert_eq!(
                 ai_kernel_trace.payload["verification"]["can_finalize"],
                 true
             );
             assert_eq!(ai_kernel_trace.payload["bench"]["passed"], true);
+            assert_eq!(ai_kernel_trace.payload["regression_gate"]["allowed"], true);
+            assert_eq!(ai_kernel_trace.payload["growth"]["has_blocker"], false);
         });
     }
 

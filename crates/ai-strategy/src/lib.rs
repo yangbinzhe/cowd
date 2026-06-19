@@ -4,7 +4,7 @@
 //! selection. It does not execute tools, assemble prompts, or mutate task
 //! state; later layers consume its `StrategyDecision`.
 
-use ai_core::{ExecutionMode, StrategyDecorator, TaskComplexity, TaskRisk};
+use ai_core::{ExecutionMode, KernelCapability, StrategyDecorator, TaskComplexity, TaskRisk};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +80,8 @@ pub struct StrategyDecision {
     pub decorators: Vec<StrategyDecorator>,
     pub confidence: u8,
     pub reasons: Vec<String>,
+    pub required_capabilities: Vec<KernelCapability>,
+    pub policy_version: String,
 }
 
 impl StrategyDecision {
@@ -169,6 +171,7 @@ impl StrategyRouter {
         let mode = select_mode(&understanding, &self.policy, &mut reasons);
         dedupe_decorators(&mut decorators);
         let confidence = confidence_for(&understanding, mode);
+        let required_capabilities = required_capabilities_for(&understanding, mode, &decorators);
 
         StrategyDecision {
             understanding,
@@ -176,6 +179,8 @@ impl StrategyRouter {
             decorators,
             confidence,
             reasons,
+            required_capabilities,
+            policy_version: "strategy-router-v2".to_string(),
         }
     }
 }
@@ -270,6 +275,42 @@ fn select_mode(
         return ExecutionMode::DirectAnswer;
     }
     ExecutionMode::ReActLoop
+}
+
+fn required_capabilities_for(
+    understanding: &TaskUnderstanding,
+    mode: ExecutionMode,
+    decorators: &[StrategyDecorator],
+) -> Vec<KernelCapability> {
+    let mut capabilities = vec![
+        KernelCapability::StrategyRouting,
+        KernelCapability::ContextEpoch,
+    ];
+    if understanding.requires_write || decorators.contains(&StrategyDecorator::WithGuardrails) {
+        capabilities.push(KernelCapability::ToolTransaction);
+    }
+    if matches!(
+        mode,
+        ExecutionMode::PlanExecute
+            | ExecutionMode::SupervisorSubagents
+            | ExecutionMode::ParallelReadFanout
+            | ExecutionMode::ParallelWorktree
+    ) {
+        capabilities.push(KernelCapability::WorkGraph);
+    }
+    if decorators.contains(&StrategyDecorator::WithVerifier)
+        || matches!(
+            understanding.complexity,
+            TaskComplexity::Complex | TaskComplexity::Strategic
+        )
+    {
+        capabilities.push(KernelCapability::VerificationLedger);
+    }
+    capabilities.push(KernelCapability::Evaluation);
+    capabilities.push(KernelCapability::GrowthLoop);
+    capabilities.sort_by_key(|capability| format!("{capability:?}"));
+    capabilities.dedup();
+    capabilities
 }
 
 fn classify_domain(normalized: &str) -> TaskDomain {
@@ -480,6 +521,13 @@ mod tests {
         assert_eq!(decision.mode, ExecutionMode::PlanExecute);
         assert_eq!(decision.understanding.complexity, TaskComplexity::Strategic);
         assert!(decision.uses_decorator(StrategyDecorator::WithVerifier));
+        assert_eq!(decision.policy_version, "strategy-router-v2");
+        assert!(decision
+            .required_capabilities
+            .contains(&KernelCapability::WorkGraph));
+        assert!(decision
+            .required_capabilities
+            .contains(&KernelCapability::VerificationLedger));
     }
 
     #[test]

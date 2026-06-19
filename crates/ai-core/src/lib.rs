@@ -214,6 +214,7 @@ pub enum KernelCapability {
     ToolTransaction,
     VerificationLedger,
     Evaluation,
+    GrowthLoop,
 }
 
 #[cfg(test)]

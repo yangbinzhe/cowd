@@ -36,6 +36,14 @@ pub enum VerificationStatus {
     NotRun,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationSeverity {
+    Clear,
+    Advisory,
+    Blocking,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub id: String,
@@ -101,6 +109,8 @@ pub struct VerificationReport {
     pub unsupported_required_claims: Vec<Claim>,
     pub not_run_claims: Vec<Claim>,
     pub can_finalize: bool,
+    pub severity: VerificationSeverity,
+    pub blocking_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,12 +191,29 @@ impl VerificationLedger {
             .filter(|claim| matches!(claim.status, VerificationStatus::NotRun))
             .cloned()
             .collect::<Vec<_>>();
+        let mut blocking_reasons = unsupported_required_claims
+            .iter()
+            .map(|claim| format!("required claim lacks support: {}", claim.statement))
+            .collect::<Vec<_>>();
+        if self.claims.is_empty() {
+            blocking_reasons.push("verification ledger has no claims".to_string());
+        }
+        let can_finalize = unsupported_required_claims.is_empty();
+        let severity = if !can_finalize {
+            VerificationSeverity::Blocking
+        } else if !not_run_claims.is_empty() || self.evidence.is_empty() {
+            VerificationSeverity::Advisory
+        } else {
+            VerificationSeverity::Clear
+        };
         VerificationReport {
             claim_count: self.claims.len(),
             evidence_count: self.evidence.len(),
-            can_finalize: unsupported_required_claims.is_empty(),
+            can_finalize,
             unsupported_required_claims,
             not_run_claims,
+            severity,
+            blocking_reasons,
         }
     }
 

@@ -3,6 +3,7 @@ members = [
     "crates/ai-core",
     "crates/ai-context",
     "crates/ai-eval",
+    "crates/ai-growth",
     "crates/ai-strategy",
     "crates/ai-task",
     "crates/ai-tool-transaction",

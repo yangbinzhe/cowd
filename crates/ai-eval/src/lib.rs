@@ -98,6 +98,16 @@ pub struct BenchReport {
     pub results: Vec<BenchCaseResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionGateVerdict {
+    pub allowed: bool,
+    pub min_average_score: f32,
+    pub require_all_pass: bool,
+    pub average_score: f32,
+    pub failed: usize,
+    pub reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RegressionGate {
     pub min_average_score: f32,
@@ -118,6 +128,28 @@ impl RegressionGate {
     pub fn allows(self, report: &BenchReport) -> bool {
         report.average_score >= self.min_average_score
             && (!self.require_all_pass || report.failed == 0)
+    }
+
+    #[must_use]
+    pub fn evaluate(self, report: &BenchReport) -> RegressionGateVerdict {
+        let mut reasons = Vec::new();
+        if report.average_score < self.min_average_score {
+            reasons.push(format!(
+                "average score {} below minimum {}",
+                report.average_score, self.min_average_score
+            ));
+        }
+        if self.require_all_pass && report.failed > 0 {
+            reasons.push(format!("{} benchmark cases failed", report.failed));
+        }
+        RegressionGateVerdict {
+            allowed: reasons.is_empty(),
+            min_average_score: self.min_average_score,
+            require_all_pass: self.require_all_pass,
+            average_score: report.average_score,
+            failed: report.failed,
+            reasons,
+        }
     }
 }
 

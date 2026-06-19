@@ -71,6 +71,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-growth"
+version = "0.9.326"
+dependencies = [
+ "ai-core",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "ai-strategy"
 version = "0.9.326"
 dependencies = [
@@ -3135,6 +3144,7 @@ dependencies = [
  "ai-context",
  "ai-core",
  "ai-eval",
+ "ai-growth",
  "ai-strategy",
  "ai-tool-transaction",
  "ai-verification",

@@ -5,7 +5,11 @@ use ai_context::{
     ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
 use ai_core::{ExecutionMode, StrategyDecorator};
-use ai_eval::{score_case, BenchCaseKind, BenchCaseResult, CowdBenchCase, Trajectory};
+use ai_eval::{
+    score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
+    RegressionGateVerdict, Trajectory,
+};
+use ai_growth::{GrowthInput, LearningRecord};
 use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
 use ai_tool_transaction::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
@@ -13,7 +17,7 @@ use ai_tool_transaction::{
 use ai_verification::{
     Claim, ClaimKind, Evidence, EvidenceKind, VerificationLedger, VerificationReport,
 };
-use ai_workgraph::{WorkGraph, WorkNode, WorkNodeKind};
+use ai_workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::ContextProfile;
@@ -28,7 +32,10 @@ pub struct RuntimeAiKernelTrace {
     pub verification_report: VerificationReport,
     pub trajectory: Trajectory,
     pub bench_result: BenchCaseResult,
+    pub regression_gate: RegressionGateVerdict,
+    pub learning_record: LearningRecord,
     pub workgraph: Option<WorkGraph>,
+    pub workgraph_quality: Option<WorkGraphQualityReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,9 +147,45 @@ impl RuntimeAiKernel {
         bench_case
             .required_checks
             .push("verification_report".to_string());
-        let trajectory =
-            Trajectory::new(bench_case.id.clone(), self.strategy.mode).pass("verification_report");
+        let trajectory = if verification_report.can_finalize {
+            Trajectory::new(bench_case.id.clone(), self.strategy.mode).pass("verification_report")
+        } else {
+            Trajectory::new(bench_case.id.clone(), self.strategy.mode).fail("verification_report")
+        };
         let bench_result = score_case(&bench_case, &trajectory);
+        let bench_report = score_report(
+            std::slice::from_ref(&bench_case),
+            std::slice::from_ref(&trajectory),
+        );
+        let regression_gate = RegressionGate {
+            min_average_score: 0.8,
+            require_all_pass: true,
+        }
+        .evaluate(&bench_report);
+        let tool_requires_checkpoint = self
+            .tool_transaction
+            .as_ref()
+            .map(|plan| plan.requires_checkpoint)
+            .unwrap_or(false);
+        let tool_requires_human_confirm = self
+            .tool_transaction
+            .as_ref()
+            .map(|plan| plan.requires_human_confirm)
+            .unwrap_or(false);
+        let learning_record = LearningRecord::from_input(GrowthInput {
+            selected_mode: self.strategy.mode,
+            complexity: self.strategy.understanding.complexity,
+            risk: self.strategy.understanding.risk,
+            context_omitted: self.context_epoch.omitted.len(),
+            tool_requires_checkpoint,
+            tool_requires_human_confirm,
+            verification_can_finalize: verification_report.can_finalize,
+            bench_passed: bench_result.passed,
+        });
+        let workgraph_quality = self
+            .workgraph
+            .as_ref()
+            .map(ai_workgraph::WorkGraph::quality_report);
 
         RuntimeAiKernelTrace {
             strategy: self.strategy,
@@ -153,7 +196,10 @@ impl RuntimeAiKernel {
             verification_report,
             trajectory,
             bench_result,
+            regression_gate,
+            learning_record,
             workgraph: self.workgraph,
+            workgraph_quality,
         }
     }
 }
@@ -247,7 +293,15 @@ fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Opt
             "verify the final response against evidence",
         ))
         .ok()?;
-    let _ = graph.add_edge(plan, verify, ai_workgraph::WorkEdgeKind::DependsOn);
+    let synthesize = graph
+        .add_node(WorkNode::new(
+            WorkNodeKind::Synthesis,
+            "synthesize",
+            "synthesize verified evidence into the final response",
+        ))
+        .ok()?;
+    let _ = graph.add_edge(&plan, &verify, ai_workgraph::WorkEdgeKind::DependsOn);
+    let _ = graph.add_edge(&verify, &synthesize, ai_workgraph::WorkEdgeKind::DependsOn);
     Some(graph)
 }
 
@@ -338,6 +392,8 @@ mod tests {
         let trace = kernel.finalize("done", 0, 0);
         assert!(trace.verification_report.can_finalize);
         assert!(trace.bench_result.passed);
+        assert!(trace.regression_gate.allowed);
+        assert!(!trace.learning_record.has_blocker());
     }
 
     #[test]
@@ -358,5 +414,23 @@ mod tests {
 
         assert!(trace.tool_transaction.is_some());
         assert!(trace.tool_receipt.is_some());
+        assert!(!trace.learning_record.signals.is_empty());
+    }
+
+    #[test]
+    fn runtime_kernel_reports_workgraph_quality_for_complex_turn() {
+        let kernel = RuntimeAiKernel::begin_turn(
+            "session-1",
+            "全面规划 runtime gateway service crate 的复杂架构演进",
+            ContextProfile::MainTurn,
+            &[],
+        );
+
+        let trace = kernel.finalize("planned", 0, 0);
+        let quality = trace.workgraph_quality.expect("workgraph quality report");
+
+        assert!(quality.is_dag);
+        assert!(quality.has_review_node);
+        assert!(quality.has_synthesis_node);
     }
 }

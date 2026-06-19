@@ -9,6 +9,7 @@ publish.workspace = true
 ai-core = { path = "../ai-core" }
 ai-context = { path = "../ai-context" }
 ai-eval = { path = "../ai-eval" }
+ai-growth = { path = "../ai-growth" }
 ai-strategy = { path = "../ai-strategy" }
 ai-tool-transaction = { path = "../ai-tool-transaction" }
 ai-verification = { path = "../ai-verification" }

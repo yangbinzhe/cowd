@@ -94,6 +94,19 @@ pub struct WorkGraph {
     pub edges: Vec<WorkEdge>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkGraphQualityReport {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub ready_count: usize,
+    pub blocked_count: usize,
+    pub failed_count: usize,
+    pub has_review_node: bool,
+    pub has_synthesis_node: bool,
+    pub is_dag: bool,
+    pub warnings: Vec<String>,
+}
+
 impl WorkGraph {
     #[must_use]
     pub fn new(objective: impl Into<String>) -> Self {
@@ -232,6 +245,51 @@ impl WorkGraph {
             Err(AiKernelError::Conflict(
                 "workgraph dependency cycle detected".to_string(),
             ))
+        }
+    }
+
+    #[must_use]
+    pub fn quality_report(&self) -> WorkGraphQualityReport {
+        let is_dag = self.topological_batches().is_ok();
+        let ready_count = self.ready_nodes().len();
+        let blocked_count = self
+            .nodes
+            .iter()
+            .filter(|node| node.status == WorkNodeStatus::Blocked)
+            .count();
+        let failed_count = self
+            .nodes
+            .iter()
+            .filter(|node| node.status == WorkNodeStatus::Failed)
+            .count();
+        let has_review_node = self
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkNodeKind::Review);
+        let has_synthesis_node = self
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkNodeKind::Synthesis);
+        let mut warnings = Vec::new();
+        if self.nodes.is_empty() {
+            warnings.push("workgraph has no nodes".to_string());
+        }
+        if !has_review_node {
+            warnings.push("workgraph has no review node".to_string());
+        }
+        if !is_dag {
+            warnings.push("workgraph is not a DAG".to_string());
+        }
+        WorkGraphQualityReport {
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+            ready_count,
+            blocked_count,
+            failed_count,
+            has_review_node,
+            has_synthesis_node,
+            is_dag,
+            warnings,
         }
     }
 
