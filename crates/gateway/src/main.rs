@@ -91,9 +91,7 @@ use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpSt
 use serde::Deserialize;
 use serde_json::json;
 use services::GatewayServices;
-use slash_catalog::{
-    handle_skills_slash_command, handle_skills_slash_command_json, resolve_skill_invocation,
-};
+use slash_catalog::resolve_skill_invocation;
 
 use futures::StreamExt;
 use tui::state::TuiState;
@@ -2770,11 +2768,12 @@ fn run_resume_command(
                 );
             }
             let cwd = env::current_dir()?;
+            let skill_service = GatewayServices::transition_only().skill;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
-                message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
-                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
+                message: Some(skill_service.command_text(&cwd, args.as_deref())?),
+                json: Some(skill_service.command_json(&cwd, args.as_deref())?),
             })
         }
         SlashCommand::Doctor => {
@@ -5929,11 +5928,12 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
+        let skill_service = GatewayServices::transition_only().skill;
         match output_format {
-            CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
+            CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+                serde_json::to_string_pretty(&skill_service.command_json(&cwd, args)?)?
             ),
         }
         Ok(())

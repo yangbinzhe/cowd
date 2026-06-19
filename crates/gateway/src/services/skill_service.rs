@@ -144,6 +144,22 @@ impl SkillService {
         vec![self.catalog_envelope(), self.envelope("projection")]
     }
 
+    pub(crate) fn command_text(
+        &self,
+        workspace_root: &Path,
+        args: Option<&str>,
+    ) -> std::io::Result<String> {
+        crate::slash_catalog::handle_skills_slash_command(args, workspace_root)
+    }
+
+    pub(crate) fn command_json(
+        &self,
+        workspace_root: &Path,
+        args: Option<&str>,
+    ) -> std::io::Result<serde_json::Value> {
+        crate::slash_catalog::handle_skills_slash_command_json(args, workspace_root)
+    }
+
     pub(crate) fn catalog(
         &self,
         workspace_root: &Path,

@@ -83,6 +83,9 @@ check_empty "agent service must not route through slash handlers" \
 check_empty "gateway main must use agent service owner" \
   rg -n "handle_agents_slash_command" crates/gateway/src/main.rs
 
+check_empty "gateway main must use skill service owner" \
+  rg -n "handle_skills_slash_command" crates/gateway/src/main.rs
+
 check_empty "interactive tests must not pre-kill named tmux sessions" \
   rg -n 'kill-session.*("-t", name|-t[[:space:]]+\$?name)' tests/interactive/src --glob '*.rs'
 
