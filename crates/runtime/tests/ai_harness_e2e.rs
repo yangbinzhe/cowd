@@ -1,6 +1,7 @@
 use std::pin::Pin;
 
 use ai_core::{ExecutionMode, TaskComplexity, TaskRisk};
+use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite};
 use ai_growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
@@ -18,6 +19,7 @@ use runtime::{
 
 #[derive(Debug)]
 struct HarnessObservation {
+    scenario_id: String,
     strategy_mode: ExecutionMode,
     finalization_blocked: bool,
     regression_allowed: bool,
@@ -31,13 +33,18 @@ struct HarnessObservation {
 }
 
 impl HarnessObservation {
-    fn from_trace(trace: &RuntimeAiKernelTrace, assistant_text: impl Into<String>) -> Self {
+    fn from_trace(
+        scenario_id: impl Into<String>,
+        trace: &RuntimeAiKernelTrace,
+        assistant_text: impl Into<String>,
+    ) -> Self {
         let workgraph_quality_ok = trace
             .workgraph_quality
             .as_ref()
             .map(|quality| quality.is_dag && quality.has_review_node && quality.has_synthesis_node)
             .unwrap_or(false);
         Self {
+            scenario_id: scenario_id.into(),
             strategy_mode: trace.strategy.mode,
             finalization_blocked: trace.finalization_blocked,
             regression_allowed: trace.regression_gate.allowed,
@@ -56,8 +63,9 @@ impl HarnessObservation {
         }
     }
 
-    fn from_summary(summary: &TurnSummary) -> Self {
+    fn from_summary(scenario_id: impl Into<String>, summary: &TurnSummary) -> Self {
         Self::from_trace(
+            scenario_id,
             &summary.ai_kernel_trace,
             summary
                 .assistant_messages
@@ -72,15 +80,55 @@ impl HarnessObservation {
         )
     }
 
-    fn has_growth_signal(&self, kind: &str) -> bool {
-        self.growth_signal_kinds
-            .iter()
-            .any(|item| item == kind || item.eq_ignore_ascii_case(kind))
+    fn into_scenario_observation(self) -> ScenarioObservation {
+        ScenarioObservation {
+            scenario_id: self.scenario_id,
+            strategy_mode: self.strategy_mode,
+            finalization_blocked: self.finalization_blocked,
+            regression_allowed: self.regression_allowed,
+            has_workgraph: self.has_workgraph,
+            workgraph_quality_ok: self.workgraph_quality_ok,
+            growth_has_blocker: self.growth_has_blocker,
+            growth_signal_kinds: self.growth_signal_kinds,
+            memory_candidate_count: self.memory_candidate_count,
+            matrix_signal_count: self.matrix_signal_count,
+            assistant_text: self.assistant_text,
+        }
     }
 }
 
 #[test]
 fn simple_question_stays_direct_and_clean() {
+    let spec = ScenarioSpec::new("simple_question", "explain this function")
+        .expect_mode(ExecutionMode::DirectAnswer)
+        .require(ScenarioCheck::bool(
+            "verification.finalization_blocked",
+            ScenarioCheckKind::FinalizationBlocked,
+            false,
+            "ai-verification/runtime-conversation",
+            "simple successful answers must finalize without the gate",
+        ))
+        .require(ScenarioCheck::bool(
+            "workgraph.present",
+            ScenarioCheckKind::WorkgraphPresent,
+            false,
+            "ai-strategy/runtime-ai-kernel",
+            "simple direct answers should not allocate workgraph",
+        ))
+        .require(ScenarioCheck::bool(
+            "growth.blocker",
+            ScenarioCheckKind::GrowthBlocker,
+            false,
+            "ai-growth",
+            "clean simple traces should not produce blocker signals",
+        ))
+        .require(ScenarioCheck::min_count(
+            "matrix.signal_count",
+            ScenarioCheckKind::MatrixSignalCount,
+            1,
+            "ai-growth",
+            "runtime trace should expose matrix-compatible growth signals",
+        ));
     let kernel = RuntimeAiKernel::begin_turn(
         "harness-simple",
         "explain this function",
@@ -89,21 +137,42 @@ fn simple_question_stays_direct_and_clean() {
     );
 
     let trace = kernel.finalize("done", 0, 0);
-    let observation = HarnessObservation::from_trace(&trace, "done");
+    let observation = HarnessObservation::from_trace("simple_question", &trace, "done")
+        .into_scenario_observation();
+    let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
 
-    assert_eq!(observation.strategy_mode, ExecutionMode::DirectAnswer);
-    assert!(!observation.finalization_blocked);
-    assert!(observation.regression_allowed);
-    assert!(!observation.has_workgraph);
-    assert!(!observation.growth_has_blocker);
-    assert_eq!(observation.memory_candidate_count, 0);
-    assert!(observation.matrix_signal_count > 0);
-    assert!(observation.has_growth_signal("StrategyFit"));
-    assert!(observation.has_growth_signal("MatrixQualityGate"));
+    assert!(report.verdicts[0].passed, "{:?}", report.verdicts[0]);
+    assert_eq!(trace.growth_event.memory_candidates.len(), 0);
 }
 
 #[test]
 fn complex_task_builds_plan_execute_workgraph() {
+    let spec = ScenarioSpec::new(
+        "complex_workgraph",
+        "全面规划 runtime gateway service crate 的复杂架构演进",
+    )
+    .expect_mode(ExecutionMode::PlanExecute)
+    .require(ScenarioCheck::bool(
+        "workgraph.present",
+        ScenarioCheckKind::WorkgraphPresent,
+        true,
+        "ai-strategy/runtime-ai-kernel",
+        "complex tasks must allocate a workgraph",
+    ))
+    .require(ScenarioCheck::bool(
+        "workgraph.quality",
+        ScenarioCheckKind::WorkgraphQualityOk,
+        true,
+        "ai-workgraph",
+        "complex workgraph must be DAG with review and synthesis nodes",
+    ))
+    .require(ScenarioCheck::bool(
+        "regression.allowed",
+        ScenarioCheckKind::RegressionAllowed,
+        true,
+        "ai-eval",
+        "successful complex trace must pass regression gate",
+    ));
     let kernel = RuntimeAiKernel::begin_turn(
         "harness-complex",
         "全面规划 runtime gateway service crate 的复杂架构演进",
@@ -112,18 +181,51 @@ fn complex_task_builds_plan_execute_workgraph() {
     );
 
     let trace = kernel.finalize("planned", 0, 0);
-    let observation = HarnessObservation::from_trace(&trace, "planned");
+    let observation = HarnessObservation::from_trace("complex_workgraph", &trace, "planned")
+        .into_scenario_observation();
+    let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
 
-    assert_eq!(observation.strategy_mode, ExecutionMode::PlanExecute);
-    assert!(!observation.finalization_blocked);
-    assert!(observation.regression_allowed);
-    assert!(observation.has_workgraph);
-    assert!(observation.workgraph_quality_ok);
-    assert!(!observation.growth_has_blocker);
+    assert!(report.verdicts[0].passed, "{:?}", report.verdicts[0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_answer_is_blocked_by_finalization_gate() {
+    let spec = ScenarioSpec::new("empty_answer_gate", "answer this")
+        .expect_mode(ExecutionMode::DirectAnswer)
+        .require(ScenarioCheck::bool(
+            "verification.finalization_blocked",
+            ScenarioCheckKind::FinalizationBlocked,
+            true,
+            "ai-verification/runtime-conversation",
+            "empty answers must be blocked by finalization gate",
+        ))
+        .require(ScenarioCheck::bool(
+            "regression.allowed",
+            ScenarioCheckKind::RegressionAllowed,
+            false,
+            "ai-eval",
+            "blocked finalization must fail regression gate",
+        ))
+        .require(ScenarioCheck::bool(
+            "growth.blocker",
+            ScenarioCheckKind::GrowthBlocker,
+            true,
+            "ai-growth",
+            "blocked finalization must become a growth blocker",
+        ))
+        .require(ScenarioCheck::min_count(
+            "memory.candidate_count",
+            ScenarioCheckKind::MemoryCandidateCount,
+            1,
+            "ai-growth/memory-pulse",
+            "blocked finalization should create a reviewable memory candidate",
+        ))
+        .require(ScenarioCheck::text_contains(
+            "assistant.gate_message",
+            "I cannot finalize this as a completed answer yet",
+            "runtime-conversation",
+            "append limitation message when verification blocks finalization",
+        ));
     let mut runtime = ConversationRuntime::new(
         Session::new(),
         EmptyApi,
@@ -137,16 +239,11 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         .run_turn_async("answer this", &SharedPrompter::none())
         .await
         .expect("turn should complete with a gate message");
-    let observation = HarnessObservation::from_summary(&summary);
+    let observation =
+        HarnessObservation::from_summary("empty_answer_gate", &summary).into_scenario_observation();
+    let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
 
-    assert_eq!(observation.strategy_mode, ExecutionMode::DirectAnswer);
-    assert!(observation.finalization_blocked);
-    assert!(!observation.regression_allowed);
-    assert!(observation.growth_has_blocker);
-    assert!(observation.memory_candidate_count > 0);
-    assert!(observation
-        .assistant_text
-        .contains("I cannot finalize this as a completed answer yet"));
+    assert!(report.verdicts[0].passed, "{:?}", report.verdicts[0]);
 }
 
 #[test]
@@ -183,6 +280,28 @@ fn low_value_multi_agent_experience_downgrades_next_route() {
 
 #[test]
 fn matrix_quality_failure_becomes_growth_signal() {
+    let spec = ScenarioSpec::new("matrix_quality_failure", "quality gate failure")
+        .expect_mode(ExecutionMode::PlanExecute)
+        .require(ScenarioCheck::growth_signal(
+            "growth.matrix_quality_gate",
+            "MatrixQualityGate",
+            "ai-growth",
+            "matrix quality gate failures must map into growth signals",
+        ))
+        .require(ScenarioCheck::min_count(
+            "memory.candidate_count",
+            ScenarioCheckKind::MemoryCandidateCount,
+            1,
+            "ai-growth/memory-pulse",
+            "matrix quality failures should produce reviewable memory candidates",
+        ))
+        .require(ScenarioCheck::min_count(
+            "matrix.signal_count",
+            ScenarioCheckKind::MatrixSignalCount,
+            1,
+            "ai-growth/matrix",
+            "matrix quality failures should produce matrix-compatible growth signals",
+        ));
     let packet = MatrixEvidencePacket::new("AI harness evidence is incomplete");
     let gate = MatrixQualityGateDecision::for_evidence_packet(&packet);
     assert_eq!(gate.decision, "fail");
@@ -217,8 +336,29 @@ fn matrix_quality_failure_becomes_growth_signal() {
         .signals
         .iter()
         .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate));
-    assert!(!event.memory_candidates.is_empty());
-    assert!(!event.matrix_signals.is_empty());
+    let observation = ScenarioObservation {
+        scenario_id: "matrix_quality_failure".to_string(),
+        strategy_mode: event.strategy_mode,
+        finalization_blocked: false,
+        regression_allowed: false,
+        has_workgraph: false,
+        workgraph_quality_ok: false,
+        growth_has_blocker: event
+            .signals
+            .iter()
+            .any(|signal| signal.severity == GrowthSeverity::Blocker),
+        growth_signal_kinds: event
+            .signals
+            .iter()
+            .map(|signal| format!("{:?}", signal.kind))
+            .collect(),
+        memory_candidate_count: event.memory_candidates.len(),
+        matrix_signal_count: event.matrix_signals.len(),
+        assistant_text: String::new(),
+    };
+    let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
+
+    assert!(report.verdicts[0].passed, "{:?}", report.verdicts[0]);
     assert!(event.confidence_bp >= 9000);
 }
 

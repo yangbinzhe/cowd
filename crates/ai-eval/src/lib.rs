@@ -166,6 +166,370 @@ pub struct CowdBenchSmokeSuite {
     pub cases: Vec<CowdBenchCase>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioSpec {
+    pub id: String,
+    pub prompt: String,
+    pub expected_mode: Option<ExecutionMode>,
+    pub required_checks: Vec<ScenarioCheck>,
+}
+
+impl ScenarioSpec {
+    #[must_use]
+    pub fn new(id: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            prompt: prompt.into(),
+            expected_mode: None,
+            required_checks: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn expect_mode(mut self, mode: ExecutionMode) -> Self {
+        self.expected_mode = Some(mode);
+        self
+    }
+
+    #[must_use]
+    pub fn require(mut self, check: ScenarioCheck) -> Self {
+        self.required_checks.push(check);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioCheckKind {
+    StrategyMode,
+    FinalizationBlocked,
+    RegressionAllowed,
+    WorkgraphPresent,
+    WorkgraphQualityOk,
+    GrowthBlocker,
+    GrowthSignal,
+    MemoryCandidateCount,
+    MatrixSignalCount,
+    AssistantTextContains,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioCheck {
+    pub id: String,
+    pub kind: ScenarioCheckKind,
+    pub expected_bool: Option<bool>,
+    pub expected_min_count: Option<usize>,
+    pub expected_text: Option<String>,
+    pub owner: String,
+    pub repair_hint: String,
+}
+
+impl ScenarioCheck {
+    #[must_use]
+    pub fn bool(
+        id: impl Into<String>,
+        kind: ScenarioCheckKind,
+        expected: bool,
+        owner: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            expected_bool: Some(expected),
+            expected_min_count: None,
+            expected_text: None,
+            owner: owner.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn min_count(
+        id: impl Into<String>,
+        kind: ScenarioCheckKind,
+        expected_min_count: usize,
+        owner: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            expected_bool: None,
+            expected_min_count: Some(expected_min_count),
+            expected_text: None,
+            owner: owner.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn text_contains(
+        id: impl Into<String>,
+        expected_text: impl Into<String>,
+        owner: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: ScenarioCheckKind::AssistantTextContains,
+            expected_bool: None,
+            expected_min_count: None,
+            expected_text: Some(expected_text.into()),
+            owner: owner.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn growth_signal(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        owner: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: ScenarioCheckKind::GrowthSignal,
+            expected_bool: None,
+            expected_min_count: None,
+            expected_text: Some(kind.into()),
+            owner: owner.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioObservation {
+    pub scenario_id: String,
+    pub strategy_mode: ExecutionMode,
+    pub finalization_blocked: bool,
+    pub regression_allowed: bool,
+    pub has_workgraph: bool,
+    pub workgraph_quality_ok: bool,
+    pub growth_has_blocker: bool,
+    pub growth_signal_kinds: Vec<String>,
+    pub memory_candidate_count: usize,
+    pub matrix_signal_count: usize,
+    pub assistant_text: String,
+}
+
+impl ScenarioObservation {
+    #[must_use]
+    pub fn has_growth_signal(&self, kind: &str) -> bool {
+        self.growth_signal_kinds
+            .iter()
+            .any(|item| item == kind || item.eq_ignore_ascii_case(kind))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailedScenarioCheck {
+    pub check_id: String,
+    pub owner: String,
+    pub expected: String,
+    pub actual: String,
+    pub repair_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioVerdict {
+    pub scenario_id: String,
+    pub passed: bool,
+    pub score: f32,
+    pub failed_checks: Vec<FailedScenarioCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioSuiteReport {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub average_score: f32,
+    pub verdicts: Vec<ScenarioVerdict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioSuite {
+    pub specs: Vec<ScenarioSpec>,
+}
+
+impl ScenarioSuite {
+    #[must_use]
+    pub fn new(specs: Vec<ScenarioSpec>) -> Self {
+        Self { specs }
+    }
+
+    #[must_use]
+    pub fn evaluate(&self, observations: &[ScenarioObservation]) -> ScenarioSuiteReport {
+        let verdicts = self
+            .specs
+            .iter()
+            .map(|spec| {
+                observations
+                    .iter()
+                    .find(|observation| observation.scenario_id == spec.id)
+                    .map_or_else(
+                        || missing_observation_verdict(spec),
+                        |observation| evaluate_scenario(spec, observation),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let total = verdicts.len();
+        let passed = verdicts.iter().filter(|verdict| verdict.passed).count();
+        let failed = total.saturating_sub(passed);
+        let average_score = if total == 0 {
+            0.0
+        } else {
+            verdicts.iter().map(|verdict| verdict.score).sum::<f32>() / total as f32
+        };
+        ScenarioSuiteReport {
+            total,
+            passed,
+            failed,
+            average_score,
+            verdicts,
+        }
+    }
+}
+
+#[must_use]
+pub fn evaluate_scenario(
+    spec: &ScenarioSpec,
+    observation: &ScenarioObservation,
+) -> ScenarioVerdict {
+    let mut failed_checks = Vec::new();
+    if let Some(expected_mode) = spec.expected_mode {
+        if observation.strategy_mode != expected_mode {
+            failed_checks.push(FailedScenarioCheck {
+                check_id: "strategy.mode".to_string(),
+                owner: "ai-strategy".to_string(),
+                expected: expected_mode.as_str().to_string(),
+                actual: observation.strategy_mode.as_str().to_string(),
+                repair_hint: "inspect strategy classifier and experience adapter".to_string(),
+            });
+        }
+    }
+    for check in &spec.required_checks {
+        if let Some(failure) = evaluate_check(check, observation) {
+            failed_checks.push(failure);
+        }
+    }
+    let total_checks = spec.required_checks.len() + usize::from(spec.expected_mode.is_some());
+    let passed_checks = total_checks.saturating_sub(failed_checks.len());
+    let score = if total_checks == 0 {
+        1.0
+    } else {
+        passed_checks as f32 / total_checks as f32
+    };
+    ScenarioVerdict {
+        scenario_id: spec.id.clone(),
+        passed: failed_checks.is_empty(),
+        score,
+        failed_checks,
+    }
+}
+
+fn evaluate_check(
+    check: &ScenarioCheck,
+    observation: &ScenarioObservation,
+) -> Option<FailedScenarioCheck> {
+    match check.kind {
+        ScenarioCheckKind::StrategyMode => None,
+        ScenarioCheckKind::FinalizationBlocked => {
+            compare_bool(check, observation.finalization_blocked)
+        }
+        ScenarioCheckKind::RegressionAllowed => compare_bool(check, observation.regression_allowed),
+        ScenarioCheckKind::WorkgraphPresent => compare_bool(check, observation.has_workgraph),
+        ScenarioCheckKind::WorkgraphQualityOk => {
+            compare_bool(check, observation.workgraph_quality_ok)
+        }
+        ScenarioCheckKind::GrowthBlocker => compare_bool(check, observation.growth_has_blocker),
+        ScenarioCheckKind::GrowthSignal => check.expected_text.as_ref().and_then(|kind| {
+            if observation.has_growth_signal(kind) {
+                None
+            } else {
+                Some(failed_check(
+                    check,
+                    format!("growth signal {kind}"),
+                    format!("{:?}", observation.growth_signal_kinds),
+                ))
+            }
+        }),
+        ScenarioCheckKind::MemoryCandidateCount => {
+            compare_min_count(check, observation.memory_candidate_count)
+        }
+        ScenarioCheckKind::MatrixSignalCount => {
+            compare_min_count(check, observation.matrix_signal_count)
+        }
+        ScenarioCheckKind::AssistantTextContains => check.expected_text.as_ref().and_then(|text| {
+            if observation.assistant_text.contains(text) {
+                None
+            } else {
+                Some(failed_check(
+                    check,
+                    format!("assistant text contains {text}"),
+                    observation.assistant_text.clone(),
+                ))
+            }
+        }),
+    }
+}
+
+fn compare_bool(check: &ScenarioCheck, actual: bool) -> Option<FailedScenarioCheck> {
+    check.expected_bool.and_then(|expected| {
+        if expected == actual {
+            None
+        } else {
+            Some(failed_check(
+                check,
+                expected.to_string(),
+                actual.to_string(),
+            ))
+        }
+    })
+}
+
+fn compare_min_count(check: &ScenarioCheck, actual: usize) -> Option<FailedScenarioCheck> {
+    check.expected_min_count.and_then(|expected| {
+        if actual >= expected {
+            None
+        } else {
+            Some(failed_check(
+                check,
+                format!(">= {expected}"),
+                actual.to_string(),
+            ))
+        }
+    })
+}
+
+fn failed_check(check: &ScenarioCheck, expected: String, actual: String) -> FailedScenarioCheck {
+    FailedScenarioCheck {
+        check_id: check.id.clone(),
+        owner: check.owner.clone(),
+        expected,
+        actual,
+        repair_hint: check.repair_hint.clone(),
+    }
+}
+
+fn missing_observation_verdict(spec: &ScenarioSpec) -> ScenarioVerdict {
+    ScenarioVerdict {
+        scenario_id: spec.id.clone(),
+        passed: false,
+        score: 0.0,
+        failed_checks: vec![FailedScenarioCheck {
+            check_id: "scenario.observation".to_string(),
+            owner: "ai-eval".to_string(),
+            expected: "observation present".to_string(),
+            actual: "missing".to_string(),
+            repair_hint: "ensure scenario runner emits HarnessObservation".to_string(),
+        }],
+    }
+}
+
 impl Default for CowdBenchSmokeSuite {
     fn default() -> Self {
         Self {
@@ -394,5 +758,73 @@ mod tests {
 
         assert!(!verdict.allowed);
         assert_eq!(verdict.failed, suite.cases.len());
+    }
+
+    #[test]
+    fn scenario_suite_reports_owner_and_repair_hint() {
+        let spec = ScenarioSpec::new("empty_answer", "answer this")
+            .expect_mode(ExecutionMode::DirectAnswer)
+            .require(ScenarioCheck::bool(
+                "verification.finalization_blocked",
+                ScenarioCheckKind::FinalizationBlocked,
+                true,
+                "ai-verification/runtime-conversation",
+                "ensure finalization gate appends limitation message",
+            ));
+        let observation = ScenarioObservation {
+            scenario_id: "empty_answer".to_string(),
+            strategy_mode: ExecutionMode::DirectAnswer,
+            finalization_blocked: false,
+            regression_allowed: true,
+            has_workgraph: false,
+            workgraph_quality_ok: false,
+            growth_has_blocker: false,
+            growth_signal_kinds: Vec::new(),
+            memory_candidate_count: 0,
+            matrix_signal_count: 0,
+            assistant_text: String::new(),
+        };
+
+        let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            report.verdicts[0].failed_checks[0].owner,
+            "ai-verification/runtime-conversation"
+        );
+        assert!(report.verdicts[0].failed_checks[0]
+            .repair_hint
+            .contains("finalization gate"));
+    }
+
+    #[test]
+    fn scenario_suite_accepts_growth_signal_checks() {
+        let spec = ScenarioSpec::new("matrix_quality", "quality gate")
+            .expect_mode(ExecutionMode::PlanExecute)
+            .require(ScenarioCheck::growth_signal(
+                "growth.matrix_quality_gate",
+                "MatrixQualityGate",
+                "ai-growth",
+                "map matrix quality gate into growth signal",
+            ));
+        let observation = ScenarioObservation {
+            scenario_id: "matrix_quality".to_string(),
+            strategy_mode: ExecutionMode::PlanExecute,
+            finalization_blocked: false,
+            regression_allowed: false,
+            has_workgraph: false,
+            workgraph_quality_ok: false,
+            growth_has_blocker: true,
+            growth_signal_kinds: vec!["MatrixQualityGate".to_string()],
+            memory_candidate_count: 1,
+            matrix_signal_count: 1,
+            assistant_text: String::new(),
+        };
+
+        let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
+
+        assert_eq!(report.failed, 0);
+        assert!(report.verdicts[0].passed);
     }
 }
