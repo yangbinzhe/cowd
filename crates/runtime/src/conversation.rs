@@ -25,6 +25,7 @@ impl CancellationToken {
     }
 }
 
+use ai_strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput};
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
@@ -1382,11 +1383,13 @@ where
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
-        let mut ai_kernel = RuntimeAiKernel::begin_turn(
+        let strategy_input = self.strategy_input_for_turn(&user_input);
+        let mut ai_kernel = RuntimeAiKernel::begin_turn_with_strategy_input(
             self.session().session_id.clone(),
             user_input.clone(),
             self.context_profile(),
             &self.system_prompt,
+            strategy_input,
         );
 
         if self.session.read().await.compaction.is_some() {
@@ -2267,6 +2270,7 @@ where
             assistant_messages.push(gate_message);
         }
         self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
+        self.record_strategy_experience(&ai_kernel_trace);
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
@@ -3387,6 +3391,7 @@ where
                 "evidence_count": trace.verification_report.evidence_count,
                 "unsupported_required_count": trace.verification_report.unsupported_required_claims.len(),
                 "not_run_count": trace.verification_report.not_run_claims.len(),
+                "matrix_missing_evidence": matrix_missing_evidence(trace),
             },
             "tool_transaction": trace.tool_transaction.as_ref().map(|plan| serde_json::json!({
                 "id": plan.id,
@@ -3395,6 +3400,34 @@ where
                 "requires_human_confirm": plan.requires_human_confirm,
                 "warning_count": plan.warnings.len(),
             })),
+            "harness": {
+                "receipt_id": trace.harness_receipt.id,
+                "harness_id": trace.harness_receipt.harness_id,
+                "agent_spec_id": trace.harness_receipt.agent_spec_id,
+                "strategy_mode": trace.harness_receipt.strategy_mode,
+                "context_epoch_id": trace.harness_receipt.context_epoch_id,
+                "tool_transaction_id": trace.harness_receipt.tool_transaction_id,
+                "verification_can_finalize": trace.harness_receipt.verification_can_finalize,
+                "policy_receipts": trace.harness_receipt.policy_receipts,
+                "output_summary": trace.harness_receipt.output_summary,
+            },
+            "policy_receipts": trace.policy_receipts.iter().map(|receipt| serde_json::json!({
+                "id": receipt.id,
+                "scope": format!("{:?}", receipt.scope),
+                "decision": format!("{:?}", receipt.decision),
+                "reasons": receipt.reasons,
+                "evidence_refs": receipt.evidence_refs,
+                "source_policy": receipt.source_policy,
+                "created_at": receipt.created_at,
+            })).collect::<Vec<_>>(),
+            "behavior_policy": {
+                "necessity": trace.behavior_policy.necessity,
+                "reuse_opportunities": trace.behavior_policy.reuse_opportunities,
+                "overengineering_risks": trace.behavior_policy.overengineering_risks,
+                "safety_exceptions": trace.behavior_policy.safety_exceptions,
+                "recommended_scope": format!("{:?}", trace.behavior_policy.recommended_scope),
+                "eval_checks": trace.behavior_policy.eval_checks,
+            },
             "workgraph": trace.workgraph.as_ref().map(|graph| serde_json::json!({
                 "id": graph.id,
                 "node_count": graph.nodes.len(),
@@ -3435,12 +3468,14 @@ where
                 })).collect::<Vec<_>>(),
                 "next_strategy_hints": trace.learning_record.next_strategy_hints,
             },
+            "strategy_experience": strategy_experience_projection(trace),
             "maintenance_candidates": growth_maintenance_candidates(trace),
             "matrix_evidence_signal": {
                 "source": "ai_kernel_trace",
                 "growth_event_id": trace.growth_event.id,
                 "evidence_refs": trace.growth_event.evidence_refs,
                 "signals": trace.growth_event.matrix_signals,
+                "missing_evidence": matrix_missing_evidence(trace),
             },
         });
         let created_at_ms = std::time::SystemTime::now()
@@ -3466,6 +3501,20 @@ where
                 tracing::warn!(%error, session_id, sequence, "AI kernel runtime trace append failed");
             }
         });
+    }
+
+    fn strategy_input_for_turn(&self, user_input: &str) -> StrategyInput {
+        let store = StrategyExperienceStore::load_or_default(strategy_experience_path());
+        store.enrich_input(StrategyInput::from_prompt(user_input.to_string()))
+    }
+
+    fn record_strategy_experience(&self, trace: &RuntimeAiKernelTrace) {
+        let path = strategy_experience_path();
+        let mut store = StrategyExperienceStore::load_or_default(path.clone());
+        store.record(strategy_experience_record(trace));
+        if let Err(error) = store.save(path) {
+            tracing::warn!(%error, "failed to persist AI strategy experience");
+        }
     }
 
     fn append_tool_runtime_events(
@@ -3761,6 +3810,88 @@ fn finalization_gate_message(trace: &RuntimeAiKernelTrace) -> String {
         trace.verification_report.blocking_reasons.join("; ")
     };
     format!("I cannot finalize this as a completed answer yet. Blocking verification: {reasons}")
+}
+
+fn strategy_experience_path() -> std::path::PathBuf {
+    crate::cowd_dirs::config_home_dir()
+        .join("ai")
+        .join("strategy-experience.json")
+}
+
+fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienceRecord {
+    let context_pressure = !trace.context_epoch.omitted.is_empty()
+        || trace
+            .context_alignment
+            .as_ref()
+            .map(|alignment| !alignment.aligned)
+            .unwrap_or(false);
+    let multi_agent_positive_lift = trace
+        .workgraph_quality
+        .as_ref()
+        .map(|quality| {
+            quality.is_dag
+                && quality.has_review_node
+                && quality.has_synthesis_node
+                && quality.failed_count == 0
+        })
+        .unwrap_or(false);
+    let succeeded = trace.verification_report.can_finalize
+        && trace.bench_result.passed
+        && trace.regression_gate.allowed;
+    StrategyExperienceRecord::from_decision(
+        &trace.strategy,
+        succeeded,
+        trace.finalization_blocked,
+        context_pressure,
+        multi_agent_positive_lift,
+        now_ms(),
+    )
+}
+
+fn strategy_experience_projection(trace: &RuntimeAiKernelTrace) -> serde_json::Value {
+    let record = strategy_experience_record(trace);
+    serde_json::json!({
+        "domain": format!("{:?}", record.domain),
+        "complexity": format!("{:?}", record.complexity),
+        "risk": format!("{:?}", record.risk),
+        "selected_mode": record.selected_mode.as_str(),
+        "succeeded": record.succeeded,
+        "verification_blocked": record.verification_blocked,
+        "context_pressure": record.context_pressure,
+        "multi_agent_positive_lift": record.multi_agent_positive_lift,
+        "store_ref": strategy_experience_path().display().to_string(),
+    })
+}
+
+fn matrix_missing_evidence(trace: &RuntimeAiKernelTrace) -> Vec<String> {
+    let mut missing = trace
+        .verification_report
+        .unsupported_required_claims
+        .iter()
+        .map(|claim| format!("unsupported_required_claim: {}", claim.statement))
+        .collect::<Vec<_>>();
+    missing.extend(
+        trace
+            .verification_report
+            .not_run_claims
+            .iter()
+            .map(|claim| format!("not_run_claim: {}", claim.statement)),
+    );
+    if trace
+        .context_alignment
+        .as_ref()
+        .map(|alignment| !alignment.aligned)
+        .unwrap_or(false)
+    {
+        missing.push("context_epoch_envelope_alignment".to_string());
+    }
+    if !trace.context_epoch.omitted.is_empty() {
+        missing.push(format!(
+            "context_omitted_items:{}",
+            trace.context_epoch.omitted.len()
+        ));
+    }
+    missing
 }
 
 fn growth_maintenance_candidates(

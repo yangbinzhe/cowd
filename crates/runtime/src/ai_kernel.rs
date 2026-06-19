@@ -1,5 +1,6 @@
 //! Runtime integration facade for the Cowd AI work kernel crates.
 
+use ai_behavior_policy::{decide_behavior_policy, BehaviorPolicyDecision};
 use ai_context::{
     ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
@@ -13,6 +14,8 @@ use ai_growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
 };
+use ai_harness::{CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt};
+use ai_policy::{tool_transaction_policy_receipts, PolicyReceipt};
 use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
 use ai_tool_transaction::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
@@ -43,6 +46,9 @@ pub struct RuntimeAiKernelTrace {
     pub growth_event: GrowthEvent,
     pub workgraph: Option<WorkGraph>,
     pub workgraph_quality: Option<WorkGraphQualityReport>,
+    pub harness_receipt: HarnessTurnReceipt,
+    pub policy_receipts: Vec<PolicyReceipt>,
+    pub behavior_policy: BehaviorPolicyDecision,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +59,7 @@ pub struct RuntimeAiKernel {
     tool_transaction: Option<ToolTransactionPlan>,
     workgraph: Option<WorkGraph>,
     verification: VerificationLedger,
+    behavior_policy: BehaviorPolicyDecision,
     context_envelope_id: Option<String>,
     context_envelope_counts: Option<(usize, usize)>,
 }
@@ -64,9 +71,27 @@ impl RuntimeAiKernel {
         profile: ContextProfile,
         system_prompt: &[String],
     ) -> Self {
+        let user_input = user_input.into();
+        Self::begin_turn_with_strategy_input(
+            session_id,
+            user_input.clone(),
+            profile,
+            system_prompt,
+            StrategyInput::from_prompt(user_input),
+        )
+    }
+
+    pub fn begin_turn_with_strategy_input(
+        session_id: impl Into<String>,
+        user_input: impl Into<String>,
+        profile: ContextProfile,
+        system_prompt: &[String],
+        strategy_input: StrategyInput,
+    ) -> Self {
         let session_id = session_id.into();
         let user_input = user_input.into();
-        let strategy = decide_strategy(&StrategyInput::from_prompt(user_input.clone()));
+        let strategy = decide_strategy(&strategy_input);
+        let behavior_policy = decide_behavior_policy(&user_input, &strategy);
         let context_epoch =
             build_context_epoch(&session_id, &user_input, profile, system_prompt, &strategy);
         let workgraph = build_initial_workgraph(&user_input, &strategy);
@@ -77,6 +102,7 @@ impl RuntimeAiKernel {
             tool_transaction: None,
             workgraph,
             verification: VerificationLedger::new(),
+            behavior_policy,
             context_envelope_id: None,
             context_envelope_counts: None,
         }
@@ -180,8 +206,16 @@ impl RuntimeAiKernel {
         bench_case
             .required_checks
             .push("verification_report".to_string());
+        bench_case
+            .required_checks
+            .extend(self.behavior_policy.eval_checks.clone());
         let trajectory = if verification_report.can_finalize {
-            Trajectory::new(bench_case.id.clone(), self.strategy.mode).pass("verification_report")
+            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.mode)
+                .pass("verification_report");
+            for check in &self.behavior_policy.eval_checks {
+                trajectory = trajectory.pass(check.clone());
+            }
+            trajectory
         } else {
             Trajectory::new(bench_case.id.clone(), self.strategy.mode).fail("verification_report")
         };
@@ -209,6 +243,11 @@ impl RuntimeAiKernel {
             .workgraph
             .as_ref()
             .map(ai_workgraph::WorkGraph::quality_report);
+        let policy_receipts = tool_transaction_policy_receipts(
+            self.tool_transaction.as_ref().map(|plan| plan.id.as_str()),
+            tool_requires_checkpoint,
+            tool_requires_human_confirm,
+        );
         let mut learning_record = LearningRecord::from_input(GrowthInput {
             selected_mode: self.strategy.mode,
             complexity: self.strategy.understanding.complexity,
@@ -253,6 +292,16 @@ impl RuntimeAiKernel {
                     .push("repair workgraph before synthesizing complex tasks".to_string());
             }
         }
+        if self.behavior_policy.has_overengineering_risk() {
+            learning_record.signals.push(GrowthSignal::new(
+                GrowthSignalKind::StrategyFit,
+                GrowthSeverity::Improve,
+                self.behavior_policy.overengineering_risks.join("; "),
+            ));
+            learning_record
+                .next_strategy_hints
+                .push("prefer minimal scope and reuse existing platform capabilities".to_string());
+        }
         let mut evidence_refs = Vec::new();
         if let Some(plan) = &self.tool_transaction {
             evidence_refs.push(GrowthEvidenceRef::new(
@@ -275,6 +324,37 @@ impl RuntimeAiKernel {
             learning_record: learning_record.clone(),
             evidence_refs,
         });
+        let harness = CowdNativeHarness;
+        let harness_receipt = harness
+            .execute_turn(
+                HarnessTurnInput {
+                    agent_spec: ai_agent_spec::AgentSpec::worker(),
+                    strategy: self.strategy.clone(),
+                    context_epoch: self.context_epoch.clone(),
+                    tool_plan: self.tool_transaction.clone(),
+                    policy_context: policy_receipts
+                        .iter()
+                        .map(|receipt| receipt.id.clone())
+                        .collect(),
+                },
+                &verification_report,
+                if assistant_text.trim().is_empty() {
+                    "empty assistant output"
+                } else {
+                    "assistant output produced"
+                },
+            )
+            .unwrap_or_else(|error| HarnessTurnReceipt {
+                id: format!("harness-receipt-degraded-{}", uuid::Uuid::new_v4()),
+                harness_id: "cowd-native".to_string(),
+                agent_spec_id: "agent-spec-worker".to_string(),
+                strategy_mode: self.strategy.mode.as_str().to_string(),
+                context_epoch_id: self.context_epoch.epoch_id.clone(),
+                tool_transaction_id: self.tool_transaction.as_ref().map(|plan| plan.id.clone()),
+                verification_can_finalize: verification_report.can_finalize,
+                policy_receipts: Vec::new(),
+                output_summary: format!("harness receipt degraded: {error}"),
+            });
         RuntimeAiKernelTrace {
             strategy: self.strategy,
             context_epoch: self.context_epoch,
@@ -292,6 +372,9 @@ impl RuntimeAiKernel {
             growth_event,
             workgraph: self.workgraph,
             workgraph_quality,
+            harness_receipt,
+            policy_receipts,
+            behavior_policy: self.behavior_policy,
         }
     }
 }
