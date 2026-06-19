@@ -44,6 +44,7 @@ impl ApiClient {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
+    #[allow(dead_code)]
     pub fn get_json(&self, path: &str) -> Result<serde_json::Value> {
         let body = self.get(path)?;
         Ok(serde_json::from_str(&body)?)
@@ -51,6 +52,7 @@ impl ApiClient {
 
     /// Poll a GET endpoint until the response satisfies `predicate` or `timeout` expires.
     /// Polls every 200ms. Returns Ok when the predicate returns true.
+    #[allow(dead_code)]
     pub fn poll_until<F>(&self, path: &str, predicate: F, timeout: Duration) -> Result<()>
     where
         F: Fn(&str) -> bool,

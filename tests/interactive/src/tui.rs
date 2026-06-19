@@ -28,6 +28,7 @@ impl TuiSession {
     pub fn send_alt(&self, key: &str) -> Result<()> {
         Command::new("tmux").args(["send-keys", "-t", &self.session, &format!("M-{key}")]).status()?;
         Ok(()) }
+    #[allow(dead_code)]
     pub fn send_shift_enter(&self) -> Result<()> {
         Command::new("tmux").args(["send-keys", "-t", &self.session, "S-Enter"]).status()?;
         Ok(()) }
