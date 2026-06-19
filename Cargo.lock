@@ -86,6 +86,7 @@ version = "0.9.326"
 dependencies = [
  "ai-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

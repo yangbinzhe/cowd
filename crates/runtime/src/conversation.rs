@@ -2243,13 +2243,29 @@ where
             .join("");
         let failed_tool_results = count_failed_tool_results(&tool_results);
         if let Some(envelope) = self.last_context_envelope() {
-            ai_kernel.record_context_envelope(envelope.id);
+            ai_kernel.record_context_envelope(
+                envelope.id,
+                envelope.selected.len(),
+                envelope.omitted.len(),
+            );
         }
         let ai_kernel_trace = ai_kernel.finalize(
             &assistant_text,
             tool_results.len().saturating_sub(failed_tool_results),
             failed_tool_results,
         );
+        if ai_kernel_trace.finalization_blocked {
+            let gate_message = ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: finalization_gate_message(&ai_kernel_trace),
+            }]);
+            self.session
+                .write()
+                .await
+                .push_message(gate_message.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            self.dual_write_message(&gate_message, self.session().messages.len().wrapping_sub(1));
+            assistant_messages.push(gate_message);
+        }
         self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
         let summary = TurnSummary {
             assistant_messages,
@@ -3360,6 +3376,7 @@ where
                 "token_total": trace.context_epoch.token_total,
                 "selected_count": trace.context_epoch.selected.len(),
                 "omitted_count": trace.context_epoch.omitted.len(),
+                "alignment": trace.context_alignment,
             },
             "verification": {
                 "can_finalize": trace.verification_report.can_finalize,
@@ -3735,6 +3752,15 @@ fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
                 .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
         })
         .count()
+}
+
+fn finalization_gate_message(trace: &RuntimeAiKernelTrace) -> String {
+    let reasons = if trace.verification_report.blocking_reasons.is_empty() {
+        "verification ledger blocked finalization".to_string()
+    } else {
+        trace.verification_report.blocking_reasons.join("; ")
+    };
+    format!("I cannot finalize this as a completed answer yet. Blocking verification: {reasons}")
 }
 
 fn growth_maintenance_candidates(
@@ -4998,6 +5024,35 @@ mod tests {
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finalization_gate_replaces_empty_success_with_limitation_message() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let summary = runtime
+            .run_turn_async("answer this", &SharedPrompter::none())
+            .await
+            .expect("turn should complete with gate message");
+
+        assert!(summary.ai_kernel_trace.finalization_blocked);
+        assert!(summary.ai_kernel_trace.learning_record.has_blocker());
+        assert!(summary
+            .assistant_messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .any(|block| matches!(
+                block,
+                ContentBlock::Text { text }
+                    if text.contains("I cannot finalize this as a completed answer yet")
+            )));
     }
 
     struct StubCollaboration;

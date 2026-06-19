@@ -1,15 +1,18 @@
 //! Runtime integration facade for the Cowd AI work kernel crates.
 
 use ai_context::{
-    ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder, ContextIdentity,
-    ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
+    ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
+    ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
 use ai_core::{ExecutionMode, StrategyDecorator};
 use ai_eval::{
     score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
     RegressionGateVerdict, Trajectory,
 };
-use ai_growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord};
+use ai_growth::{
+    GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
+    GrowthSignalKind, LearningRecord,
+};
 use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
 use ai_tool_transaction::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
@@ -27,6 +30,7 @@ pub struct RuntimeAiKernelTrace {
     pub strategy: StrategyDecision,
     pub context_epoch: ContextEpoch,
     pub context_envelope_id: Option<String>,
+    pub context_alignment: Option<ContextAlignmentReport>,
     pub prompt_plan: PromptAssemblyPlan,
     pub tool_transaction: Option<ToolTransactionPlan>,
     pub tool_receipt: Option<ToolTransactionReceipt>,
@@ -50,6 +54,7 @@ pub struct RuntimeAiKernel {
     workgraph: Option<WorkGraph>,
     verification: VerificationLedger,
     context_envelope_id: Option<String>,
+    context_envelope_counts: Option<(usize, usize)>,
 }
 
 impl RuntimeAiKernel {
@@ -73,6 +78,7 @@ impl RuntimeAiKernel {
             workgraph,
             verification: VerificationLedger::new(),
             context_envelope_id: None,
+            context_envelope_counts: None,
         }
     }
 
@@ -115,8 +121,14 @@ impl RuntimeAiKernel {
         }
     }
 
-    pub fn record_context_envelope(&mut self, envelope_id: impl Into<String>) {
+    pub fn record_context_envelope(
+        &mut self,
+        envelope_id: impl Into<String>,
+        selected_count: usize,
+        omitted_count: usize,
+    ) {
         self.context_envelope_id = Some(envelope_id.into());
+        self.context_envelope_counts = Some((selected_count, omitted_count));
     }
 
     pub fn finalize(
@@ -149,6 +161,17 @@ impl RuntimeAiKernel {
         let verification_report = self.verification.report();
         let finalization_blocked = !verification_report.can_finalize;
         let prompt_plan = self.context_epoch.prompt_assembly_plan();
+        let context_alignment = self
+            .context_envelope_id
+            .as_ref()
+            .zip(self.context_envelope_counts)
+            .map(|(envelope_id, (selected_count, omitted_count))| {
+                self.context_epoch.alignment_report(
+                    envelope_id.clone(),
+                    selected_count,
+                    omitted_count,
+                )
+            });
         let mut bench_case = CowdBenchCase::new(
             bench_kind_for_mode(self.strategy.mode),
             self.user_input.clone(),
@@ -182,7 +205,11 @@ impl RuntimeAiKernel {
             .as_ref()
             .map(|plan| plan.requires_human_confirm)
             .unwrap_or(false);
-        let learning_record = LearningRecord::from_input(GrowthInput {
+        let workgraph_quality = self
+            .workgraph
+            .as_ref()
+            .map(ai_workgraph::WorkGraph::quality_report);
+        let mut learning_record = LearningRecord::from_input(GrowthInput {
             selected_mode: self.strategy.mode,
             complexity: self.strategy.understanding.complexity,
             risk: self.strategy.understanding.risk,
@@ -192,6 +219,40 @@ impl RuntimeAiKernel {
             verification_can_finalize: verification_report.can_finalize,
             bench_passed: bench_result.passed,
         });
+        learning_record
+            .signals
+            .push(GrowthSignal::from_matrix_quality_gate(
+                regression_gate.allowed,
+                (regression_gate.average_score.clamp(0.0, 1.0) * 10_000.0).round() as u16,
+                &regression_gate.reasons,
+            ));
+        if let Some(alignment) = &context_alignment {
+            if !alignment.aligned {
+                learning_record.signals.push(GrowthSignal::new(
+                    GrowthSignalKind::ContextPressure,
+                    GrowthSeverity::Improve,
+                    format!(
+                        "context epoch and envelope diverged selected_delta={} omitted_delta={}",
+                        alignment.selected_delta, alignment.omitted_delta
+                    ),
+                ));
+                learning_record.next_strategy_hints.push(
+                    "reconcile memory context packet projection with ai-context epoch".to_string(),
+                );
+            }
+        }
+        if let Some(quality) = &workgraph_quality {
+            if !quality.is_dag || !quality.has_review_node || !quality.has_synthesis_node {
+                learning_record.signals.push(GrowthSignal::new(
+                    GrowthSignalKind::MultiAgentValue,
+                    GrowthSeverity::Improve,
+                    "workgraph quality report missed dag/review/synthesis requirements",
+                ));
+                learning_record
+                    .next_strategy_hints
+                    .push("repair workgraph before synthesizing complex tasks".to_string());
+            }
+        }
         let mut evidence_refs = Vec::new();
         if let Some(plan) = &self.tool_transaction {
             evidence_refs.push(GrowthEvidenceRef::new(
@@ -214,15 +275,11 @@ impl RuntimeAiKernel {
             learning_record: learning_record.clone(),
             evidence_refs,
         });
-        let workgraph_quality = self
-            .workgraph
-            .as_ref()
-            .map(ai_workgraph::WorkGraph::quality_report);
-
         RuntimeAiKernelTrace {
             strategy: self.strategy,
             context_epoch: self.context_epoch,
             context_envelope_id: self.context_envelope_id,
+            context_alignment,
             prompt_plan,
             tool_transaction: self.tool_transaction,
             tool_receipt,

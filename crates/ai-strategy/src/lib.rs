@@ -6,6 +6,7 @@
 
 use ai_core::{ExecutionMode, KernelCapability, StrategyDecorator, TaskComplexity, TaskRisk};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +89,141 @@ pub struct StrategyExperienceSummary {
     pub verification_block_rate_bp: u16,
     pub context_pressure_rate_bp: u16,
     pub multi_agent_lift_rate_bp: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyExperienceRecord {
+    pub domain: TaskDomain,
+    pub complexity: TaskComplexity,
+    pub risk: TaskRisk,
+    pub selected_mode: ExecutionMode,
+    pub succeeded: bool,
+    pub verification_blocked: bool,
+    pub context_pressure: bool,
+    pub multi_agent_positive_lift: bool,
+    pub created_at_ms: u64,
+}
+
+impl StrategyExperienceRecord {
+    #[must_use]
+    pub fn from_decision(
+        decision: &StrategyDecision,
+        succeeded: bool,
+        verification_blocked: bool,
+        context_pressure: bool,
+        multi_agent_positive_lift: bool,
+        created_at_ms: u64,
+    ) -> Self {
+        Self {
+            domain: decision.understanding.domain,
+            complexity: decision.understanding.complexity,
+            risk: decision.understanding.risk,
+            selected_mode: decision.mode,
+            succeeded,
+            verification_blocked,
+            context_pressure,
+            multi_agent_positive_lift,
+            created_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyExperienceStore {
+    pub records: Vec<StrategyExperienceRecord>,
+}
+
+impl StrategyExperienceStore {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let bytes = std::fs::read(path)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(path, bytes)
+    }
+
+    pub fn load_or_default(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        Self::load(path).unwrap_or_default()
+    }
+
+    pub fn record(&mut self, record: StrategyExperienceRecord) {
+        self.records.push(record);
+    }
+
+    #[must_use]
+    pub fn summary_for(
+        &self,
+        understanding: &TaskUnderstanding,
+    ) -> Option<StrategyExperienceSummary> {
+        let comparable = self
+            .records
+            .iter()
+            .filter(|record| {
+                record.domain == understanding.domain
+                    && record.complexity == understanding.complexity
+                    && record.risk == understanding.risk
+            })
+            .collect::<Vec<_>>();
+        if comparable.is_empty() {
+            return None;
+        }
+        let sample_count = comparable.len() as u32;
+        Some(StrategyExperienceSummary {
+            sample_count,
+            success_rate_bp: rate_bp(
+                comparable.iter().filter(|record| record.succeeded).count(),
+                comparable.len(),
+            ),
+            verification_block_rate_bp: rate_bp(
+                comparable
+                    .iter()
+                    .filter(|record| record.verification_blocked)
+                    .count(),
+                comparable.len(),
+            ),
+            context_pressure_rate_bp: rate_bp(
+                comparable
+                    .iter()
+                    .filter(|record| record.context_pressure)
+                    .count(),
+                comparable.len(),
+            ),
+            multi_agent_lift_rate_bp: rate_bp(
+                comparable
+                    .iter()
+                    .filter(|record| record.multi_agent_positive_lift)
+                    .count(),
+                comparable.len(),
+            ),
+        })
+    }
+
+    #[must_use]
+    pub fn enrich_input(&self, mut input: StrategyInput) -> StrategyInput {
+        let understanding = understand(&input);
+        input.experience = self.summary_for(&understanding);
+        input
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +644,13 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn rate_bp(count: usize, total: usize) -> u16 {
+    if total == 0 {
+        return 0;
+    }
+    ((count as u32 * 10_000) / total as u32).min(10_000) as u16
+}
+
 const REVIEW_TERMS: &[&str] = &["review", "审查", "审计", "检查", "code review"];
 const BUGFIX_TERMS: &[&str] = &["bug", "fix", "修复", "报错", "失败", "failure", "panic"];
 const FRONTEND_TERMS: &[&str] = &["frontend", "ui", "页面", "样式", "tui", "webui", "react"];
@@ -662,5 +805,53 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("low multi-agent lift")));
+    }
+
+    #[test]
+    fn strategy_experience_store_summarizes_comparable_records() {
+        let input = StrategyInput::from_prompt("使用多 Agent 协同完成复杂架构分析");
+        let understanding = understand(&input);
+        let mut store = StrategyExperienceStore::new();
+        for index in 0..4 {
+            store.record(StrategyExperienceRecord {
+                domain: understanding.domain,
+                complexity: understanding.complexity,
+                risk: understanding.risk,
+                selected_mode: ExecutionMode::SupervisorSubagents,
+                succeeded: index < 3,
+                verification_blocked: index == 3,
+                context_pressure: index >= 2,
+                multi_agent_positive_lift: index == 0,
+                created_at_ms: index,
+            });
+        }
+
+        let summary = store.summary_for(&understanding).expect("summary");
+
+        assert_eq!(summary.sample_count, 4);
+        assert_eq!(summary.success_rate_bp, 7500);
+        assert_eq!(summary.verification_block_rate_bp, 2500);
+        assert_eq!(summary.context_pressure_rate_bp, 5000);
+        assert_eq!(summary.multi_agent_lift_rate_bp, 2500);
+    }
+
+    #[test]
+    fn strategy_experience_store_persists_json() {
+        let decision = decide_strategy(&StrategyInput::from_prompt("修复这个单文件小问题"));
+        let mut store = StrategyExperienceStore::new();
+        store.record(StrategyExperienceRecord::from_decision(
+            &decision, true, false, false, true, 1,
+        ));
+        let path = std::env::temp_dir().join(format!(
+            "cowd-strategy-experience-{}.json",
+            std::process::id()
+        ));
+
+        store.save(&path).unwrap();
+        let loaded = StrategyExperienceStore::load(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].selected_mode, decision.mode);
     }
 }

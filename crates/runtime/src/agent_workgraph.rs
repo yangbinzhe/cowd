@@ -6,6 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ai_growth::GrowthSignal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -260,6 +261,7 @@ impl AgentWorkGraph {
                 "board_id": packet.board_id,
                 "scorecard": packet.scorecard,
                 "value_verdict": packet.scorecard.value_verdict(),
+                "growth_signals": collaboration_growth_signals(&packet.scorecard),
                 "maintenance_candidates": packet.maintenance_candidates,
             }),
             current_time_ms(),
@@ -416,6 +418,16 @@ fn trace_refs(trace: &AgentTaskTrace, graph_id: &str) -> Vec<WorkGraphRef> {
         });
     }
     refs
+}
+
+fn collaboration_growth_signals(scorecard: &CollaborationScorecard) -> Vec<GrowthSignal> {
+    let verdict = scorecard.value_verdict();
+    vec![GrowthSignal::from_multi_agent_value(
+        verdict.positive_lift,
+        verdict.continue_multi_agent,
+        verdict.value_score,
+        &verdict.reasons,
+    )]
 }
 
 fn current_time_ms() -> u64 {
@@ -680,6 +692,10 @@ mod tests {
         assert_eq!(
             event.payload["maintenance_candidates"][0]["id"],
             "candidate-1"
+        );
+        assert_eq!(
+            event.payload["growth_signals"][0]["kind"],
+            "multi_agent_value"
         );
         assert!(event
             .refs

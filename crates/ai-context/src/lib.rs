@@ -152,6 +152,19 @@ pub struct ContextEpoch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextAlignmentReport {
+    pub epoch_id: String,
+    pub envelope_id: String,
+    pub epoch_selected_count: usize,
+    pub envelope_selected_count: usize,
+    pub epoch_omitted_count: usize,
+    pub envelope_omitted_count: usize,
+    pub selected_delta: isize,
+    pub omitted_delta: isize,
+    pub aligned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptAssemblyPlan {
     pub epoch_id: String,
     pub sections: Vec<PromptSection>,
@@ -242,6 +255,28 @@ impl ContextEpoch {
             sections,
             token_total: self.token_total,
             omissions: self.omitted.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn alignment_report(
+        &self,
+        envelope_id: impl Into<String>,
+        envelope_selected_count: usize,
+        envelope_omitted_count: usize,
+    ) -> ContextAlignmentReport {
+        let selected_delta = self.selected.len() as isize - envelope_selected_count as isize;
+        let omitted_delta = self.omitted.len() as isize - envelope_omitted_count as isize;
+        ContextAlignmentReport {
+            epoch_id: self.epoch_id.clone(),
+            envelope_id: envelope_id.into(),
+            epoch_selected_count: self.selected.len(),
+            envelope_selected_count,
+            epoch_omitted_count: self.omitted.len(),
+            envelope_omitted_count,
+            selected_delta,
+            omitted_delta,
+            aligned: selected_delta == 0 && omitted_delta == 0,
         }
     }
 }
@@ -342,5 +377,26 @@ mod tests {
         assert_eq!(plan.epoch_id, epoch.epoch_id);
         assert_eq!(plan.sections.len(), epoch.selected.len());
         assert_eq!(plan.omissions.len(), epoch.omitted.len());
+    }
+
+    #[test]
+    fn alignment_report_compares_epoch_with_envelope_counts() {
+        let epoch = ContextEpochBuilder::new(ContextIdentity::main("s1"), ContextBudget::new(5))
+            .add_item(item(ContextSourceKind::StableHead, "system", 1.0))
+            .add_item(item(
+                ContextSourceKind::Memory,
+                "too much memory content",
+                1.0,
+            ))
+            .build()
+            .unwrap();
+
+        let aligned =
+            epoch.alignment_report("envelope-1", epoch.selected.len(), epoch.omitted.len());
+        let drifted = epoch.alignment_report("envelope-2", 10, 0);
+
+        assert!(aligned.aligned);
+        assert!(!drifted.aligned);
+        assert_eq!(drifted.envelope_id, "envelope-2");
     }
 }

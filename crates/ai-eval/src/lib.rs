@@ -125,6 +125,14 @@ impl Default for RegressionGate {
 
 impl RegressionGate {
     #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            min_average_score: 0.9,
+            require_all_pass: true,
+        }
+    }
+
+    #[must_use]
     pub fn allows(self, report: &BenchReport) -> bool {
         report.average_score >= self.min_average_score
             && (!self.require_all_pass || report.failed == 0)
@@ -151,6 +159,91 @@ impl RegressionGate {
             reasons,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CowdBenchSmokeSuite {
+    pub cases: Vec<CowdBenchCase>,
+}
+
+impl Default for CowdBenchSmokeSuite {
+    fn default() -> Self {
+        Self {
+            cases: cowdbench_smoke_cases(),
+        }
+    }
+}
+
+impl CowdBenchSmokeSuite {
+    #[must_use]
+    pub fn score(&self, trajectories: &[Trajectory]) -> BenchReport {
+        score_report(&self.cases, trajectories)
+    }
+
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        trajectories: &[Trajectory],
+        gate: RegressionGate,
+    ) -> RegressionGateVerdict {
+        gate.evaluate(&self.score(trajectories))
+    }
+}
+
+#[must_use]
+pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
+    let specs = [
+        (
+            BenchCaseKind::SimpleAnswer,
+            "explain this function",
+            ExecutionMode::DirectAnswer,
+            "answered",
+        ),
+        (
+            BenchCaseKind::FastEdit,
+            "fix one small file",
+            ExecutionMode::FastEdit,
+            "guardrails",
+        ),
+        (
+            BenchCaseKind::ArchitecturePlan,
+            "plan a multi-crate architecture change",
+            ExecutionMode::PlanExecute,
+            "workgraph",
+        ),
+        (
+            BenchCaseKind::ContextAssembly,
+            "assemble relevant memory and workspace context",
+            ExecutionMode::ReActLoop,
+            "context_epoch",
+        ),
+        (
+            BenchCaseKind::VerificationGuard,
+            "verify claims before final answer",
+            ExecutionMode::PlanExecute,
+            "verification_report",
+        ),
+        (
+            BenchCaseKind::WorkGraphFanout,
+            "parallel multi-agent implementation",
+            ExecutionMode::SupervisorSubagents,
+            "value_verdict",
+        ),
+        (
+            BenchCaseKind::ToolTransaction,
+            "write files safely with rollback discipline",
+            ExecutionMode::RiskGate,
+            "tool_transaction",
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(kind, prompt, expected_mode, required_check)| {
+            let mut case = CowdBenchCase::new(kind, prompt, expected_mode);
+            case.required_checks.push(required_check.to_string());
+            case
+        })
+        .collect()
 }
 
 #[must_use]
@@ -272,5 +365,34 @@ mod tests {
         let report = score_report(&[case], &[]);
 
         assert!(!RegressionGate::default().allows(&report));
+    }
+
+    #[test]
+    fn smoke_suite_passes_when_all_required_checks_are_present() {
+        let suite = CowdBenchSmokeSuite::default();
+        let trajectories = suite
+            .cases
+            .iter()
+            .map(|case| {
+                case.required_checks.iter().fold(
+                    Trajectory::new(case.id.clone(), case.expected_mode),
+                    |trajectory, check| trajectory.pass(check.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let verdict = suite.evaluate(&trajectories, RegressionGate::strict());
+
+        assert!(verdict.allowed);
+        assert_eq!(suite.cases.len(), 7);
+    }
+
+    #[test]
+    fn smoke_suite_strict_gate_blocks_missing_path() {
+        let suite = CowdBenchSmokeSuite::default();
+        let verdict = suite.evaluate(&[], RegressionGate::strict());
+
+        assert!(!verdict.allowed);
+        assert_eq!(verdict.failed, suite.cases.len());
     }
 }

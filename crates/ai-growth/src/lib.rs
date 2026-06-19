@@ -14,6 +14,8 @@ pub enum GrowthSignalKind {
     ToolRisk,
     VerificationGap,
     EvaluationRegression,
+    MatrixQualityGate,
+    MultiAgentValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,55 @@ impl GrowthSignal {
             severity,
             summary: summary.into(),
         }
+    }
+
+    #[must_use]
+    pub fn from_matrix_quality_gate(allowed: bool, score_bp: u16, reasons: &[String]) -> Self {
+        let severity = if allowed {
+            GrowthSeverity::Info
+        } else if score_bp < 5000 {
+            GrowthSeverity::Blocker
+        } else {
+            GrowthSeverity::Improve
+        };
+        let detail = if reasons.is_empty() {
+            "quality gate accepted evidence packet".to_string()
+        } else {
+            reasons.join("; ")
+        };
+        Self::new(
+            GrowthSignalKind::MatrixQualityGate,
+            severity,
+            format!("matrix quality gate score={score_bp} allowed={allowed}: {detail}"),
+        )
+    }
+
+    #[must_use]
+    pub fn from_multi_agent_value(
+        positive_lift: bool,
+        continue_multi_agent: bool,
+        value_score: u16,
+        reasons: &[String],
+    ) -> Self {
+        let severity = if positive_lift {
+            GrowthSeverity::Info
+        } else if continue_multi_agent {
+            GrowthSeverity::Watch
+        } else {
+            GrowthSeverity::Improve
+        };
+        let detail = if reasons.is_empty() {
+            "multi-agent value assessed".to_string()
+        } else {
+            reasons.join("; ")
+        };
+        Self::new(
+            GrowthSignalKind::MultiAgentValue,
+            severity,
+            format!(
+                "multi-agent value score={value_score} positive_lift={positive_lift} continue={continue_multi_agent}: {detail}"
+            ),
+        )
     }
 }
 
@@ -285,6 +336,14 @@ fn growth_memory_candidate(signal: &GrowthSignal) -> Option<GrowthMemoryCandidat
         GrowthSignalKind::ToolRisk => GrowthMemoryCandidateKind::AuthorityPromotion,
         GrowthSignalKind::VerificationGap => GrowthMemoryCandidateKind::Conflict,
         GrowthSignalKind::EvaluationRegression => GrowthMemoryCandidateKind::Stale,
+        GrowthSignalKind::MatrixQualityGate if signal.severity == GrowthSeverity::Info => {
+            return None;
+        }
+        GrowthSignalKind::MatrixQualityGate => GrowthMemoryCandidateKind::AuthorityPromotion,
+        GrowthSignalKind::MultiAgentValue if signal.severity == GrowthSeverity::Info => {
+            return None;
+        }
+        GrowthSignalKind::MultiAgentValue => GrowthMemoryCandidateKind::RelationshipRefresh,
     };
     Some(GrowthMemoryCandidate {
         id: format!("growth-candidate-{}", uuid::Uuid::new_v4()),
@@ -373,5 +432,32 @@ mod tests {
         assert!(!event.memory_candidates.is_empty());
         assert!(!event.matrix_signals.is_empty());
         assert!(event.confidence_bp >= 9000);
+    }
+
+    #[test]
+    fn matrix_quality_gate_signal_can_block_growth() {
+        let signal = GrowthSignal::from_matrix_quality_gate(
+            false,
+            4200,
+            &["missing high-authority source".to_string()],
+        );
+
+        assert_eq!(signal.kind, GrowthSignalKind::MatrixQualityGate);
+        assert_eq!(signal.severity, GrowthSeverity::Blocker);
+        assert!(signal.summary.contains("missing high-authority source"));
+    }
+
+    #[test]
+    fn multi_agent_value_signal_marks_low_lift_as_improvement() {
+        let signal = GrowthSignal::from_multi_agent_value(
+            false,
+            false,
+            35,
+            &["no_synthesis_lift".to_string()],
+        );
+
+        assert_eq!(signal.kind, GrowthSignalKind::MultiAgentValue);
+        assert_eq!(signal.severity, GrowthSeverity::Improve);
+        assert!(signal.summary.contains("no_synthesis_lift"));
     }
 }
