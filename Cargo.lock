@@ -3166,6 +3166,7 @@ dependencies = [
  "libc",
  "lru",
  "mail-parser",
+ "matrix-core",
  "memory",
  "native-tls",
  "plugins",
