@@ -201,7 +201,6 @@ impl ScenarioSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioCheckKind {
-    StrategyMode,
     FinalizationBlocked,
     RegressionAllowed,
     WorkgraphPresent,
@@ -436,7 +435,6 @@ fn evaluate_check(
     observation: &ScenarioObservation,
 ) -> Option<FailedScenarioCheck> {
     match check.kind {
-        ScenarioCheckKind::StrategyMode => None,
         ScenarioCheckKind::FinalizationBlocked => {
             compare_bool(check, observation.finalization_blocked)
         }
@@ -446,63 +444,75 @@ fn evaluate_check(
             compare_bool(check, observation.workgraph_quality_ok)
         }
         ScenarioCheckKind::GrowthBlocker => compare_bool(check, observation.growth_has_blocker),
-        ScenarioCheckKind::GrowthSignal => check.expected_text.as_ref().and_then(|kind| {
-            if observation.has_growth_signal(kind) {
-                None
-            } else {
-                Some(failed_check(
-                    check,
-                    format!("growth signal {kind}"),
-                    format!("{:?}", observation.growth_signal_kinds),
-                ))
+        ScenarioCheckKind::GrowthSignal => match check.expected_text.as_ref() {
+            Some(kind) => {
+                if observation.has_growth_signal(kind) {
+                    None
+                } else {
+                    Some(failed_check(
+                        check,
+                        format!("growth signal {kind}"),
+                        format!("{:?}", observation.growth_signal_kinds),
+                    ))
+                }
             }
-        }),
+            None => Some(missing_expectation(check, "expected_text")),
+        },
         ScenarioCheckKind::MemoryCandidateCount => {
             compare_min_count(check, observation.memory_candidate_count)
         }
         ScenarioCheckKind::MatrixSignalCount => {
             compare_min_count(check, observation.matrix_signal_count)
         }
-        ScenarioCheckKind::AssistantTextContains => check.expected_text.as_ref().and_then(|text| {
-            if observation.assistant_text.contains(text) {
-                None
-            } else {
-                Some(failed_check(
-                    check,
-                    format!("assistant text contains {text}"),
-                    observation.assistant_text.clone(),
-                ))
+        ScenarioCheckKind::AssistantTextContains => match check.expected_text.as_ref() {
+            Some(text) => {
+                if observation.assistant_text.contains(text) {
+                    None
+                } else {
+                    Some(failed_check(
+                        check,
+                        format!("assistant text contains {text}"),
+                        observation.assistant_text.clone(),
+                    ))
+                }
             }
-        }),
+            None => Some(missing_expectation(check, "expected_text")),
+        },
     }
 }
 
 fn compare_bool(check: &ScenarioCheck, actual: bool) -> Option<FailedScenarioCheck> {
-    check.expected_bool.and_then(|expected| {
-        if expected == actual {
-            None
-        } else {
-            Some(failed_check(
-                check,
-                expected.to_string(),
-                actual.to_string(),
-            ))
+    match check.expected_bool {
+        Some(expected) => {
+            if expected == actual {
+                None
+            } else {
+                Some(failed_check(
+                    check,
+                    expected.to_string(),
+                    actual.to_string(),
+                ))
+            }
         }
-    })
+        None => Some(missing_expectation(check, "expected_bool")),
+    }
 }
 
 fn compare_min_count(check: &ScenarioCheck, actual: usize) -> Option<FailedScenarioCheck> {
-    check.expected_min_count.and_then(|expected| {
-        if actual >= expected {
-            None
-        } else {
-            Some(failed_check(
-                check,
-                format!(">= {expected}"),
-                actual.to_string(),
-            ))
+    match check.expected_min_count {
+        Some(expected) => {
+            if actual >= expected {
+                None
+            } else {
+                Some(failed_check(
+                    check,
+                    format!(">= {expected}"),
+                    actual.to_string(),
+                ))
+            }
         }
-    })
+        None => Some(missing_expectation(check, "expected_min_count")),
+    }
 }
 
 fn failed_check(check: &ScenarioCheck, expected: String, actual: String) -> FailedScenarioCheck {
@@ -513,6 +523,10 @@ fn failed_check(check: &ScenarioCheck, expected: String, actual: String) -> Fail
         actual,
         repair_hint: check.repair_hint.clone(),
     }
+}
+
+fn missing_expectation(check: &ScenarioCheck, field: &str) -> FailedScenarioCheck {
+    failed_check(check, format!("{field} configured"), "missing".to_string())
 }
 
 fn missing_observation_verdict(spec: &ScenarioSpec) -> ScenarioVerdict {

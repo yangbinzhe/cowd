@@ -23,4 +23,4 @@ MSG
   exit 2
 fi
 
-eval "$COWD_AI_HARNESS_LIVE_COMMAND"
+bash -lc "$COWD_AI_HARNESS_LIVE_COMMAND"
