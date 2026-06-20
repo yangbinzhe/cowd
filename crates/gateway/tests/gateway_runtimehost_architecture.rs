@@ -250,6 +250,45 @@ fn external_boundary_crates_do_not_depend_on_runtime_or_gateway() {
 }
 
 #[test]
+fn prompt_cache_is_owned_by_model_protocol_boundary() {
+    let model_protocol_manifest = read_repo("crates/model-protocol/Cargo.toml");
+    let model_protocol_source = read_repo("crates/model-protocol/src/lib.rs");
+    assert!(model_protocol_manifest.contains("name = \"model-protocol\""));
+    assert!(
+        model_protocol_source.contains("pub mod prompt_cache"),
+        "model-protocol must own prompt cache protocol semantics"
+    );
+
+    let runtime_source = read_repo("crates/runtime/src/prompt_cache.rs");
+    assert!(
+        runtime_source.trim() == "pub use model_protocol::prompt_cache::*;",
+        "runtime prompt_cache must stay a compatibility re-export"
+    );
+
+    let provider_manifest = read_repo("crates/provider/Cargo.toml");
+    let provider_source = [
+        read_repo("crates/provider/src/lib.rs"),
+        read_repo("crates/provider/src/client.rs"),
+        read_repo("crates/provider/src/cached_client.rs"),
+        read_repo("crates/provider/src/providers/anthropic.rs"),
+    ]
+    .join("\n");
+    assert!(
+        manifest_dependencies(&provider_manifest)
+            .contains("model-protocol = { path = \"../model-protocol\" }"),
+        "provider must depend on model-protocol for prompt cache contracts"
+    );
+    assert!(
+        provider_source.contains("model_protocol::prompt_cache"),
+        "provider must import prompt cache contracts from model-protocol"
+    );
+    assert!(
+        !provider_source.contains("runtime::prompt_cache"),
+        "provider must not import prompt cache contracts from runtime"
+    );
+}
+
+#[test]
 fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
     let manifest = read_repo("crates/runtime/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);

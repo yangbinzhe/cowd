@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod prompt_cache;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: String,

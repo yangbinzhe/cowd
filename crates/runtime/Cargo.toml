@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 ai-kernel = { path = "../ai-kernel" }
 ai-eval = { path = "../ai-eval" }
+model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
 storage = { path = "../storage" }
 approval = { path = "../approval" }

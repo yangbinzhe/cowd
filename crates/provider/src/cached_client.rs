@@ -14,13 +14,13 @@ use sha2::{Digest, Sha256};
 
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
-use runtime::prompt_cache::{
+use model_protocol::prompt_cache::{
     hash_serializable, CacheUsage, PromptCache, PromptCacheRecord, RequestFingerprintHashes,
 };
 
 /// Wraps a [`ProviderClient`](crate::ProviderClient) with deterministic
 /// prompt-completion caching backed by
-/// [`PromptCache`](runtime::prompt_cache::PromptCache).
+/// [`PromptCache`](model_protocol::prompt_cache::PromptCache).
 #[derive(Debug, Clone)]
 pub struct CachedProviderClient {
     /// The underlying provider client.
@@ -71,7 +71,7 @@ impl CachedProviderClient {
     }
 
     #[must_use]
-    pub fn prompt_cache_stats(&self) -> runtime::prompt_cache::PromptCacheStats {
+    pub fn prompt_cache_stats(&self) -> model_protocol::prompt_cache::PromptCacheStats {
         self.cache.stats()
     }
 

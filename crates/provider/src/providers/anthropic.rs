@@ -14,7 +14,7 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
-use runtime::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
+use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture};
 use crate::sse::SseParser;
@@ -310,13 +310,13 @@ impl AnthropicClient {
 
         if let Some(prompt_cache) = &self.prompt_cache {
             let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&request);
-            let fingerprints = runtime::prompt_cache::RequestFingerprintHashes {
-                model: runtime::prompt_cache::hash_serializable(&request.model),
-                system: runtime::prompt_cache::hash_serializable(&request.system),
-                tools: runtime::prompt_cache::hash_serializable(&request.tools),
-                messages: runtime::prompt_cache::hash_serializable(&request.messages),
+            let fingerprints = model_protocol::prompt_cache::RequestFingerprintHashes {
+                model: model_protocol::prompt_cache::hash_serializable(&request.model),
+                system: model_protocol::prompt_cache::hash_serializable(&request.system),
+                tools: model_protocol::prompt_cache::hash_serializable(&request.tools),
+                messages: model_protocol::prompt_cache::hash_serializable(&request.messages),
             };
-            let cache_usage = runtime::prompt_cache::CacheUsage {
+            let cache_usage = model_protocol::prompt_cache::CacheUsage {
                 input_tokens: response.usage.input_tokens,
                 cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
                 cache_read_input_tokens: response.usage.cache_read_input_tokens,
@@ -876,15 +876,21 @@ impl MessageStream {
                             crate::cached_client::CachedProviderClient::compute_cache_key(
                                 &self.request,
                             );
-                        let fingerprints = runtime::prompt_cache::RequestFingerprintHashes {
-                            model: runtime::prompt_cache::hash_serializable(&self.request.model),
-                            system: runtime::prompt_cache::hash_serializable(&self.request.system),
-                            tools: runtime::prompt_cache::hash_serializable(&self.request.tools),
-                            messages: runtime::prompt_cache::hash_serializable(
+                        let fingerprints = model_protocol::prompt_cache::RequestFingerprintHashes {
+                            model: model_protocol::prompt_cache::hash_serializable(
+                                &self.request.model,
+                            ),
+                            system: model_protocol::prompt_cache::hash_serializable(
+                                &self.request.system,
+                            ),
+                            tools: model_protocol::prompt_cache::hash_serializable(
+                                &self.request.tools,
+                            ),
+                            messages: model_protocol::prompt_cache::hash_serializable(
                                 &self.request.messages,
                             ),
                         };
-                        let cache_usage = runtime::prompt_cache::CacheUsage {
+                        let cache_usage = model_protocol::prompt_cache::CacheUsage {
                             input_tokens: usage.input_tokens,
                             cache_creation_input_tokens: usage.cache_creation_input_tokens,
                             cache_read_input_tokens: usage.cache_read_input_tokens,
