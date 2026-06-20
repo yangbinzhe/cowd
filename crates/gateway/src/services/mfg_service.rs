@@ -103,7 +103,7 @@ impl MfgService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mfg",
-            owner: "0.9.292 Gateway RuntimeHost",
+            owner: "0.9.337 GatewayServices",
         }
     }
 
@@ -113,7 +113,7 @@ impl MfgService {
             operation,
             status: "service_boundary_ready",
             owner: self.owner,
-            boundary_status: "0618_final_boundary",
+            boundary_status: "0620_final_boundary",
         }
     }
 

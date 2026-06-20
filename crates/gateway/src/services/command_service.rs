@@ -50,7 +50,7 @@ impl CommandService {
                 operation,
                 status: "service_boundary_ready",
                 owner: "0.9.294 Commands unified registry",
-                boundary_status: "0618_final_boundary",
+                boundary_status: "0620_final_boundary",
             })
             .collect()
     }
@@ -145,7 +145,7 @@ impl CommandService {
                         "degraded",
                         serde_json::json!({
                             "ok": true,
-                            "runtime_host": "transition-only",
+                            "runtime_host": "gateway-baseline",
                             "active_sessions": 0,
                             "warning": "runtime service is unavailable in this gateway state",
                         }),

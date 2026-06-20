@@ -39,6 +39,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/runtime/snapshot", get(get_runtime_snapshot))
         .route("/api/runtime/control-plane", get(get_runtime_control_plane))
         .route(
+            "/api/runtime/turns",
+            get(get_runtime_turns).post(submit_runtime_turn),
+        )
+        .route("/api/runtime/turns/:id", get(get_runtime_turn))
+        .route("/api/runtime/turns/:id/cancel", post(cancel_runtime_turn))
+        .route(
             "/api/runtime/sessions/:id/attach",
             post(attach_runtime_session),
         )
@@ -105,11 +111,71 @@ struct RuntimeSessionDetachRequest {
 }
 
 #[derive(Deserialize)]
+struct RuntimeTurnSubmitRequest {
+    prompt: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RuntimeSessionReplayParams {
     #[serde(default)]
     from_sequence: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+async fn submit_runtime_turn(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<RuntimeTurnSubmitRequest>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => {
+            Json(runtime.submit_turn_value(body.session_id, body.task_id, body.prompt))
+        }
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn get_runtime_turns(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.turns_value()),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn get_runtime_turn(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.turn_value(&id)),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
+}
+
+async fn cancel_runtime_turn(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match state.services.runtime.as_ref() {
+        Some(runtime) => Json(runtime.cancel_turn_value(&id)),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "runtime service unavailable",
+        })),
+    }
 }
 
 pub(super) async fn get_runtime_status(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {

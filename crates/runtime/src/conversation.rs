@@ -59,8 +59,9 @@ use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::tool_ledger::{tool_event_idempotency_key, TurnToolLedger};
-use crate::usage::{TokenUsage, UsageTracker};
+use crate::usage::UsageTracker;
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
+use model_protocol::usage::TokenUsage;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
@@ -178,7 +179,7 @@ pub trait ToolCallback: Send + Sync {
     fn on_tool_complete(&self, id: &str, name: &str, result_summary: &str, exit_code: Option<i32>);
     /// Called when token usage data is available (typically after each stream completes).
     /// Default implementation is a no-op so existing implementors don't break.
-    fn on_usage(&self, _usage: &crate::usage::TokenUsage) {}
+    fn on_usage(&self, _usage: &TokenUsage) {}
 }
 
 /// Memory lifecycle callback for real-time TUI visualization.
@@ -4097,10 +4098,10 @@ mod tests {
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
-    use crate::usage::TokenUsage;
     use crate::SubAgentConfig;
     use crate::ToolError;
     use futures::stream::Stream;
+    use model_protocol::usage::TokenUsage;
     use std::fs;
     use std::future::Future;
     use std::path::PathBuf;

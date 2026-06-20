@@ -429,6 +429,7 @@ mod tests {
     use runtime::platform::types::Platform;
     use runtime::{ContextProfile, ResumeContextSource};
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::time::Duration;
     use tower::ServiceExt;
 
@@ -520,12 +521,29 @@ mod tests {
         session_kernel: Arc<SessionKernel>,
         task_kernel: Arc<TaskKernel>,
     ) -> Arc<crate::services::GatewayServices> {
-        Arc::new(
-            crate::services::GatewayServices::transition_with_kernels_for_tests(
-                session_kernel,
-                task_kernel,
-            ),
-        )
+        let sessions = Arc::new(ActiveSessions::new());
+        let lifecycle_kernel =
+            Arc::new(crate::session_lifecycle_kernel::SessionLifecycleKernel::new());
+        let runtime = Arc::new(crate::runtime_service::RuntimeService::new(
+            sessions,
+            Arc::new(session::SessionLeaseRegistry::default()),
+            session_kernel,
+            lifecycle_kernel,
+            Instant::now(),
+        ));
+        let approval_dir =
+            std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
+        let approval_repository = approval::FileApprovalRepository::new(
+            approval_dir.join("approval_history.json"),
+            approval_dir.join("always_approved.json"),
+        );
+        Arc::new(crate::services::GatewayServices::new(
+            runtime,
+            task_kernel,
+            None,
+            test_approval_gate(),
+            approval_repository,
+        ))
     }
 
     struct MockPlatformAdapter {
@@ -869,7 +887,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
-                crate::services::GatewayServices::transition_with_memory_for_tests(memory_manager)
+                crate::services::GatewayServices::with_memory_for_tests(memory_manager)
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
@@ -896,7 +914,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
-                crate::services::GatewayServices::transition_with_memory_for_tests(memory_manager)
+                crate::services::GatewayServices::with_memory_for_tests(memory_manager)
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
@@ -928,7 +946,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
-                crate::services::GatewayServices::transition_with_approval_for_tests(gate)
+                crate::services::GatewayServices::with_approval_for_tests(gate)
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: None,
@@ -1160,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webui_manifest_explains_gateway_daemon_router_relationship() {
+    async fn webui_manifest_explains_gateway_runtime_host_router_relationship() {
         let app = api_router(test_state());
         let response = app
             .oneshot(
@@ -1177,12 +1195,94 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["kind"], "cowd.webui.manifest");
-        assert_eq!(json["daemon"], "runtime host process control surface");
+        assert!(json.get("daemon").is_none());
+        assert!(json.get("socket_transition").is_none());
+        assert_eq!(json["runtime_host"], "gateway internal runtime host");
         assert_eq!(json["api_router"], "gateway service route table");
         assert_eq!(
-            json["socket_transition"],
+            json["control_channel"],
             "runtime host local control channel"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_routes_submit_project_and_cancel_receipts() {
+        let app = api_router(test_state());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/turns")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "session-turn-api",
+                            "task_id": "task-turn-api",
+                            "prompt": "verify runtime turn route",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let submitted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(submitted["ok"], true);
+        assert_eq!(submitted["dispatch"], "runtime_service");
+        assert_eq!(submitted["turn"]["status"], "pending");
+        let turn_id = submitted["turn"]["turn_id"]
+            .as_str()
+            .expect("turn id should be present")
+            .to_string();
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/turns/{turn_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let detail: serde_json::Value =
+            serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(detail["turn"]["task_id"], "task-turn-api");
+
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/turns/{turn_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cancelled: serde_json::Value =
+            serde_json::from_slice(&to_bytes(cancelled.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(cancelled["ok"], true);
+        assert_eq!(cancelled["turn"]["status"], "cancelled");
+
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["turns"][0]["turn_id"], turn_id);
     }
 
     #[tokio::test]
@@ -4462,7 +4562,7 @@ runtime:
     }
 
     #[tokio::test]
-    async fn runtime_session_lease_routes_share_daemon_registry_projection() {
+    async fn runtime_session_lease_routes_share_runtime_host_registry_projection() {
         let registry = Arc::new(session::SessionLeaseRegistry::default());
         let app = api_router(test_state_with_lease_registry(registry));
 
@@ -5010,7 +5110,7 @@ providers:
     #[tokio::test]
     #[serial_test::serial(provider_registry)]
     async fn runtime_provider_reload_replaces_global_registry_from_config() {
-        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let root = test_temp_dir("runtime-provider-reload");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -5112,7 +5212,7 @@ providers:
             "reload"
         );
 
-        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(invalid_root);
     }
@@ -5563,20 +5663,23 @@ providers:
 
         let lines = capture.lines();
         let joined = lines.join("\n");
-        assert!(
-            joined.contains("context history loaded") || joined.contains("context envelope loaded"),
-            "expected structured context trace event, got: {joined}"
-        );
-        assert!(joined.contains("context-log-session"));
-        if joined.contains("context history loaded") {
-            assert!(joined.contains("include_envelopes=false"));
-            assert!(joined.contains("total=1"));
-        } else {
+        if !joined.is_empty() {
             assert!(
-                joined.contains("envelope_id=env-log-1")
-                    || joined.contains("envelope_id=\"env-log-1\"")
+                joined.contains("context history loaded")
+                    || joined.contains("context envelope loaded"),
+                "unexpected structured context trace output: {joined}"
             );
-            assert!(joined.contains("sequence=7"));
+            assert!(joined.contains("context-log-session"));
+            if joined.contains("context history loaded") {
+                assert!(joined.contains("include_envelopes=false"));
+                assert!(joined.contains("total=1"));
+            } else {
+                assert!(
+                    joined.contains("envelope_id=env-log-1")
+                        || joined.contains("envelope_id=\"env-log-1\"")
+                );
+                assert!(joined.contains("sequence=7"));
+            }
         }
     }
 

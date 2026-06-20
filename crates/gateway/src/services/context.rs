@@ -11,7 +11,7 @@ pub(crate) struct ServiceContext {
 }
 
 impl ServiceContext {
-    pub(crate) fn transition_only() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 

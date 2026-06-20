@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ai_strategy::StrategyDecision;
+use ai_kernel::strategy::StrategyDecision;
 use rusqlite::params;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use storage::{SqliteConnectionFactory, StorageHandle};

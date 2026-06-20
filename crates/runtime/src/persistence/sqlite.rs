@@ -17,7 +17,7 @@ use memory::sqlite_persistence::{
 
 use crate::persistence::{CleanupConfig, PersistenceProtocol, Result, StoreStats};
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, SessionRecord};
-use crate::usage::TokenUsage;
+use model_protocol::usage::TokenUsage;
 
 // ---------------------------------------------------------------------------
 // SqlitePersistence (newtype wrapper)

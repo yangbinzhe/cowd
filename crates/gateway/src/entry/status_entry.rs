@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::{CliOutputFormat, DEFAULT_DATE};
-use runtime::{resolve_sandbox_status, ConfigLoader, PermissionMode, ProjectContext, TokenUsage};
+use model_protocol::usage::TokenUsage;
+use runtime::{resolve_sandbox_status, ConfigLoader, PermissionMode, ProjectContext};
 use serde_json::json;
 
 #[allow(clippy::struct_field_names)]

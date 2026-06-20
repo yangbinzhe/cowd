@@ -1,8 +1,9 @@
+use model_protocol::provider_config::ProviderConfig;
 use provider::{
     ContentBlockDelta, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     ProviderClient, StreamEvent,
 };
-use runtime::{ConfigLoader, ProviderConfig};
+use runtime::ConfigLoader;
 use serde_json::Value;
 
 #[tokio::test]

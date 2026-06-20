@@ -12,7 +12,6 @@ mod boundary_policy;
 mod checks;
 mod cli;
 mod compat_manifest;
-mod daemon;
 mod doctor;
 mod entry;
 mod event_bus;
@@ -60,6 +59,8 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 
+use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+use model_protocol::usage::TokenUsage;
 use provider::{
     detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
@@ -81,7 +82,7 @@ use runtime::{
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ResolvedPermissionMode, ResumeContextPacket,
-    ResumeContextSource, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ResumeContextSource, RuntimeError, Session, ToolError, ToolExecutor, UsageTracker,
 };
 use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpState};
 use serde::Deserialize;
@@ -241,10 +242,6 @@ fn spawn_gateway_process(exe: &Path) -> Result<Child, Box<dyn std::error::Error>
     command
         .spawn()
         .map_err(|e| format!("failed to start gateway process: {e}").into())
-}
-
-fn gateway_daemon_autostart_disabled() -> bool {
-    cfg!(test) || std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok()
 }
 
 fn wait_for_gateway_start(
@@ -473,7 +470,7 @@ fn print_skills_command(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let skill_service = GatewayServices::transition_only().skill;
+    let skill_service = GatewayServices::baseline().skill;
     match output_format {
         CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
         CliOutputFormat::Json => println!(
@@ -708,7 +705,7 @@ fn run_gateway_action(
             let auth_token: Option<String> =
                 api_server_platform.and_then(gateway_auth_token_from_platform);
             // Ensure the unified session store is initialised before the
-            // daemon starts so that the OnceLock is populated.
+            // runtime host starts so that the OnceLock is populated.
             let _ = get_unified_store();
 
             let runtime_host_config = runtime_host::RuntimeHostConfig {
@@ -2388,7 +2385,7 @@ fn run_resume_command(
         }
         SlashCommand::Agents { args } => {
             let cwd = env::current_dir()?;
-            let agent_service = GatewayServices::transition_only().agent;
+            let agent_service = GatewayServices::baseline().agent;
             let message = agent_service.command_text(&cwd, args.as_deref())?;
             let json = agent_service.command_json(&cwd, args.as_deref())?;
             Ok(ResumeCommandOutcome {
@@ -2405,7 +2402,7 @@ fn run_resume_command(
                 );
             }
             let cwd = env::current_dir()?;
-            let skill_service = GatewayServices::transition_only().skill;
+            let skill_service = GatewayServices::baseline().skill;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
@@ -3913,7 +3910,7 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let agent_service = GatewayServices::transition_only().agent;
+        let agent_service = GatewayServices::baseline().agent;
         match output_format {
             CliOutputFormat::Text => println!("{}", agent_service.command_text(&cwd, args)?),
             CliOutputFormat::Json => println!(
@@ -3944,7 +3941,7 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let skill_service = GatewayServices::transition_only().skill;
+        let skill_service = GatewayServices::baseline().skill;
         match output_format {
             CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
             CliOutputFormat::Json => println!(
@@ -4620,7 +4617,7 @@ fn fallback_init_providers_from_user_config() {
 
         providers.insert(
             name.clone(),
-            runtime::ProviderConfig {
+            ProviderConfig {
                 name: name.clone(),
                 base_url,
                 api_key,
@@ -4630,7 +4627,7 @@ fn fallback_init_providers_from_user_config() {
         );
     }
 
-    runtime::init_global_providers(runtime::ProvidersConfig { providers });
+    runtime::init_global_providers(ProvidersConfig { providers });
     tracing::warn!(
         path = %user_cfg.display(),
         "[init] fallback: loaded {} providers from Cowd config home",
@@ -4736,7 +4733,7 @@ fn run_prompt(
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                     "total_tokens": summary.usage.total_tokens(),
                 },
-                "estimated_cost": runtime::format_usd(cost),
+                "estimated_cost": model_protocol::usage::format_usd(cost),
                 "compact": compact,
             });
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -7034,15 +7031,17 @@ mod tests {
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
+    use model_protocol::oauth::{save_oauth_credentials, OAuthConfig, OAuthTokenSet};
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+    use model_protocol::usage::TokenUsage;
     use plugins::{
         PluginManager as Pm, PluginManagerConfig as Pmc, PluginTool, PluginToolDefinition,
         PluginToolPermission,
     };
     use provider::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ContextProfile, ConversationMessage, GatewayPlatformConfig, JsonValue, MessageRole,
-        OAuthConfig, PermissionMode, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ContextProfile, ConversationMessage,
+        GatewayPlatformConfig, JsonValue, MessageRole, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -7649,7 +7648,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
 
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(0),
@@ -7743,7 +7742,7 @@ mod tests {
 
     #[test]
     fn builtin_aliases_fallback_main_and_fast() {
-        let resolver = runtime::ModelResolver::default();
+        let resolver = model_protocol::model_registry::ModelResolver::default();
         assert_eq!(resolver.resolve("main"), "claude-sonnet-4-6");
         assert_eq!(resolver.resolve("fast"), "claude-haiku-4-5-20251213");
         // Unknown aliases pass through
@@ -9050,7 +9049,7 @@ mod tests {
 
     #[test]
     fn cost_report_uses_sectioned_layout() {
-        let report = format_cost_report(runtime::TokenUsage {
+        let report = format_cost_report(TokenUsage {
             input_tokens: 20,
             output_tokens: 8,
             cache_creation_input_tokens: 3,
@@ -9140,13 +9139,13 @@ mod tests {
             StatusUsage {
                 message_count: 7,
                 turns: 3,
-                latest: runtime::TokenUsage {
+                latest: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 4,
                     cache_creation_input_tokens: 1,
                     cache_read_input_tokens: 0,
                 },
-                cumulative: runtime::TokenUsage {
+                cumulative: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 8,
                     cache_creation_input_tokens: 2,
@@ -9756,7 +9755,7 @@ UU conflicted.rs",
         let config_home = temp_workspace("session-resolution-config");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         std::fs::create_dir_all(&config_home).expect("config home should create");
-        let previous = std::env::current_dir().expect("cwd");
+        let restore_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         std::env::set_current_dir(&workspace).expect("switch cwd");
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
 
@@ -9787,7 +9786,7 @@ UU conflicted.rs",
             .expect("session lookup should succeed")
             .is_some());
 
-        std::env::set_current_dir(previous).expect("restore cwd");
+        std::env::set_current_dir(&restore_dir).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
         std::fs::remove_dir_all(config_home).expect("config home should clean up");
         if let Some(v) = config_home_original {
@@ -9827,10 +9826,10 @@ providers:
 "#,
         )
         .expect("test provider config should write");
-        runtime::init_global_providers(runtime::ProvidersConfig {
+        runtime::init_global_providers(ProvidersConfig {
             providers: std::collections::HashMap::from([(
                 "test-anthropic".to_string(),
-                runtime::ProviderConfig {
+                ProviderConfig {
                     name: "test-anthropic".to_string(),
                     base_url: "http://127.0.0.1:9".to_string(),
                     api_key: "test-dummy-key-for-tui-switch".to_string(),

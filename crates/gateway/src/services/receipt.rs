@@ -19,7 +19,7 @@ pub(crate) fn service_envelope(
         operation,
         status: "service_boundary_ready",
         owner,
-        boundary_status: "0618_final_boundary",
+        boundary_status: "0620_final_boundary",
     }
 }
 

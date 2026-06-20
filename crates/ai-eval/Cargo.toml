@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-ai-core = { path = "../ai-core" }
+ai-kernel = { path = "../ai-kernel" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

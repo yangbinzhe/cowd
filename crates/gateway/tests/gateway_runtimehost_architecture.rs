@@ -26,13 +26,17 @@ fn manifest_dependencies(source: &str) -> &str {
 }
 
 #[test]
-fn daemon_module_is_only_a_runtime_host_transition_shim() {
-    let source = read_repo("crates/gateway/src/daemon/mod.rs");
-    assert!(source.contains("status: 0618_final_boundary"));
-    assert!(source.contains("pub(crate) use crate::runtime_host::*;"));
-    assert!(!source.contains("fn "));
-    assert!(!source.contains("struct "));
-    assert!(!source.contains("enum "));
+fn daemon_module_is_removed_after_runtime_host_consolidation() {
+    let root = repo_root();
+    assert!(
+        !root.join("crates/gateway/src/daemon/mod.rs").exists(),
+        "gateway must not retain a daemon compatibility re-export module"
+    );
+    let main_source = read_repo("crates/gateway/src/main.rs");
+    assert!(
+        !production_part(&main_source).contains("mod daemon;"),
+        "gateway main must not register daemon as a module"
+    );
 }
 
 #[test]
@@ -52,7 +56,7 @@ fn runtime_host_owns_gateway_runtime_implementation() {
 }
 
 #[test]
-fn production_code_does_not_depend_on_daemon_module_except_transition_shim() {
+fn production_code_does_not_depend_on_daemon_module() {
     let files = [
         "crates/gateway/src/main.rs",
         "crates/gateway/src/api_routes.rs",
@@ -138,6 +142,34 @@ fn ai_kernel_is_pure_semantic_crate() {
     );
     let manifest = read_repo("crates/ai-kernel/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);
+    let absorbed_crates = [
+        "ai-core",
+        "ai-agent-spec",
+        "ai-behavior-policy",
+        "ai-context",
+        "ai-growth",
+        "ai-harness",
+        "ai-policy",
+        "ai-strategy",
+        "ai-tool-transaction",
+        "ai-verification",
+        "ai-workgraph",
+    ];
+    let workspace_manifest = read_repo("Cargo.toml");
+    for absorbed in absorbed_crates {
+        assert!(
+            !root.join(format!("crates/{absorbed}/Cargo.toml")).exists(),
+            "absorbed AI semantic crate {absorbed} must not remain as a top-level crate"
+        );
+        assert!(
+            !workspace_manifest.contains(&format!("\"crates/{absorbed}\"")),
+            "workspace must not keep absorbed AI semantic crate {absorbed}"
+        );
+        assert!(
+            !dependencies.contains(absorbed),
+            "ai-kernel must own {absorbed} semantics internally, not depend on it"
+        );
+    }
     for forbidden in [
         "rusqlite",
         "reqwest",
@@ -259,10 +291,11 @@ fn prompt_cache_is_owned_by_model_protocol_boundary() {
         "model-protocol must own prompt cache protocol semantics"
     );
 
-    let runtime_source = read_repo("crates/runtime/src/prompt_cache.rs");
     assert!(
-        runtime_source.trim() == "pub use model_protocol::prompt_cache::*;",
-        "runtime prompt_cache must stay a compatibility re-export"
+        !repo_root()
+            .join("crates/runtime/src/prompt_cache.rs")
+            .exists(),
+        "runtime must not retain a prompt_cache compatibility module"
     );
 
     let provider_manifest = read_repo("crates/provider/Cargo.toml");
@@ -311,12 +344,6 @@ fn usage_contracts_are_owned_by_model_protocol_boundary() {
 
     let runtime_usage = read_repo("crates/runtime/src/usage.rs");
     assert!(
-        runtime_usage.contains(
-            "pub use model_protocol::usage::{format_usd, ModelPricing, TokenUsage, UsageCostEstimate};"
-        ),
-        "runtime must re-export model-protocol usage contracts for compatibility"
-    );
-    assert!(
         runtime_usage.contains("pub struct UsageTracker"),
         "runtime keeps session-derived usage tracking"
     );
@@ -354,11 +381,11 @@ fn model_registry_is_owned_by_model_protocol_boundary() {
         );
     }
 
-    let runtime_registry = read_repo("crates/runtime/src/model_registry.rs");
-    assert_eq!(
-        runtime_registry.trim(),
-        "pub use model_protocol::model_registry::*;",
-        "runtime model_registry must stay a compatibility re-export"
+    assert!(
+        !repo_root()
+            .join("crates/runtime/src/model_registry.rs")
+            .exists(),
+        "runtime must not retain a model_registry compatibility module"
     );
 
     let runtime_usage = read_repo("crates/runtime/src/usage.rs");
@@ -421,17 +448,9 @@ fn provider_config_and_oauth_contracts_are_owned_by_model_protocol_boundary() {
         );
     }
 
-    let runtime_config = read_repo("crates/runtime/src/config.rs");
     assert!(
-        runtime_config.contains(
-            "pub use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};"
-        ) && runtime_config.contains("pub use model_protocol::oauth::OAuthConfig;"),
-        "runtime config must re-export model-protocol provider/OAuth contracts"
-    );
-    assert_eq!(
-        read_repo("crates/runtime/src/oauth.rs").trim(),
-        "pub use model_protocol::oauth::*;",
-        "runtime OAuth module must stay a compatibility re-export"
+        !repo_root().join("crates/runtime/src/oauth.rs").exists(),
+        "runtime must not retain an OAuth compatibility module"
     );
 
     let provider_manifest = read_repo("crates/provider/Cargo.toml");
@@ -653,11 +672,11 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
 
 #[test]
 fn api_route_direct_dependencies_are_closed() {
-    let allowlist = read_repo("crates/gateway/src/api_routes/service_transition_allowlist.txt");
+    let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 
     assert!(
         allowlist.contains("status: closed_by=0.9.303"),
-        "service transition allowlist must be closed, not extended"
+        "service boundary policy must remain closed, not extended"
     );
     assert!(!allowlist.contains("file="));
     let direct_dependency_key = ["direct", "_dependency="].concat();

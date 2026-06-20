@@ -4,7 +4,8 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use runtime::{load_oauth_credentials, ConfigLoader};
+use model_protocol::oauth::load_oauth_credentials;
+use runtime::ConfigLoader;
 
 use crate::{
     doctor::{DiagnosticCheck, DiagnosticLevel},

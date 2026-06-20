@@ -1,6 +1,6 @@
 //! CowdBench evaluation contracts and lightweight scoring.
 
-use ai_core::ExecutionMode;
+use ai_kernel::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

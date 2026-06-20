@@ -28,11 +28,11 @@ impl GatewayServices {
             task: TaskService::with_kernel(task_kernel),
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
-            ..Self::transition_only()
+            ..Self::baseline()
         }
     }
 
-    pub(crate) fn transition_only() -> Self {
+    pub(crate) fn baseline() -> Self {
         Self {
             runtime: None,
             command: CommandService::new(None),
@@ -51,15 +51,13 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.292 Gateway RuntimeHost",
-            boundary_status: "0618_final_boundary",
+            owner: "0.9.337 GatewayServices",
+            boundary_status: "0620_final_boundary",
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn transition_with_approval_for_tests(
-        approval_gate: Arc<SmartApprovalGate>,
-    ) -> Self {
+    pub(crate) fn with_approval_for_tests(approval_gate: Arc<SmartApprovalGate>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "cowd-approval-service-test-{}",
             uuid::Uuid::new_v4()
@@ -70,39 +68,35 @@ impl GatewayServices {
         );
         Self {
             approval: ApprovalService::with_gate_and_repository(approval_gate, repository),
-            ..Self::transition_only()
+            ..Self::baseline()
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn transition_with_memory_for_tests(
-        memory_manager: Arc<GatewayMemoryManager>,
-    ) -> Self {
+    pub(crate) fn with_memory_for_tests(memory_manager: Arc<GatewayMemoryManager>) -> Self {
         Self {
             memory: MemoryService::with_manager(Some(memory_manager)),
-            ..Self::transition_only()
+            ..Self::baseline()
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn transition_with_session_kernel_for_tests(
-        session_kernel: Arc<SessionKernel>,
-    ) -> Self {
+    pub(crate) fn with_session_kernel_for_tests(session_kernel: Arc<SessionKernel>) -> Self {
         Self {
             session: SessionService::with_kernel(session_kernel),
-            ..Self::transition_only()
+            ..Self::baseline()
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn transition_with_kernels_for_tests(
+    pub(crate) fn with_kernels_for_tests(
         session_kernel: Arc<SessionKernel>,
         task_kernel: Arc<TaskKernel>,
     ) -> Self {
         Self {
             session: SessionService::with_kernel(session_kernel),
             task: TaskService::with_kernel(task_kernel),
-            ..Self::transition_only()
+            ..Self::baseline()
         }
     }
 

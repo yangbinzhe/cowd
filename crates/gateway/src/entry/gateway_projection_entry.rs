@@ -460,7 +460,7 @@ fn print_gateway_task_status(value: &serde_json::Value) {
         return;
     };
     if tasks.is_empty() {
-        println!("No active daemon tasks.");
+        println!("No active gateway tasks.");
         return;
     }
     for task in tasks {

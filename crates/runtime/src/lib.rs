@@ -44,7 +44,6 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
-mod oauth;
 pub mod permission_enforcer;
 pub mod permissions;
 pub mod platform;
@@ -75,7 +74,6 @@ pub mod execution_scheduler;
 pub mod intent_planner;
 pub mod joint_problem_solving;
 pub mod mirror;
-pub mod model_registry;
 pub mod mutation_plan;
 pub mod pairing;
 pub mod profile;
@@ -147,10 +145,9 @@ pub use config::{
     DomainProfile, GateAutoFixConfig, GatewayConfig, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    OAuthConfig, PlatformConfig as GatewayPlatformConfig, ProviderConfig, ProvidersConfig,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
+    PlatformConfig as GatewayPlatformConfig, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -233,20 +230,9 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
-pub use model_registry::{
-    global_registry, CircularAliasError, ModelInfo, ModelRegistry, ModelRegistryError,
-    ModelResolver, Pricing,
-};
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
     MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
-};
-pub use oauth::{
-    clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
-    generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
-    parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
-    OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
-    PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
@@ -313,9 +299,7 @@ pub use tool_orchestrator::{
     tool_execution_profile, ToolCachePolicy, ToolExecutionProfile, ToolSafetyCategory,
 };
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
-pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
-};
+pub use usage::{pricing_for_model, UsageTracker};
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
@@ -327,8 +311,6 @@ pub use worker_boot::{
 };
 
 pub mod cached_prompt;
-pub mod prompt_cache;
-
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{
     AgentContextLease, AgentContextView, AgentReturnPacket, AgentReturnRequirement,
@@ -341,11 +323,6 @@ pub use context_runtime::{
     ContextSegmentKind, ContextSegmentSnapshot, ContextSnapshot, ContextSnapshotDiff,
     ContextSourceKind, ContextVisibility, ResumeContextPacket, ResumeContextSource,
     StableHeadComparison, ToolTracePacket, ToolTraceStatus, WorkspacePacket,
-};
-pub use prompt_cache::{
-    hash_serializable, now_unix_secs, request_hash_hex_from_fnv, sanitize_path_segment,
-    stable_hash_bytes, CacheBreakEvent, CacheUsage, PromptCache, PromptCacheConfig,
-    PromptCachePaths, PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes,
 };
 pub use runtime_control::{
     AgentControlPolicy, AgentMode, ComplexityLevel, ComplexitySignal, ComplexityThresholds,

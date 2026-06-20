@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::gateway::ActiveSessions;
@@ -8,6 +10,7 @@ use crate::runtime_boundary::{
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
+use ai_kernel::turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus};
 use session::SessionLeaseRegistry;
 
 #[derive(Clone)]
@@ -17,6 +20,7 @@ pub(crate) struct RuntimeService {
     session_kernel: Arc<SessionKernel>,
     lifecycle_kernel: Arc<SessionLifecycleKernel>,
     started_at: Instant,
+    turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
 }
 
 impl RuntimeService {
@@ -34,6 +38,7 @@ impl RuntimeService {
             session_kernel,
             lifecycle_kernel,
             started_at,
+            turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -67,6 +72,7 @@ impl RuntimeService {
     pub(crate) async fn snapshot_value(&self) -> serde_json::Value {
         let snapshot = self.snapshot().await;
         let leases = self.lease_registry.list().await;
+        let turns = self.turns_snapshot();
         serde_json::json!({
             "ok": true,
             "kind": "gateway_runtime_snapshot",
@@ -80,11 +86,109 @@ impl RuntimeService {
                 "items": leases,
             },
             "lifecycle": self.lifecycle_kernel.snapshots().await,
+            "turns": turns,
             "transport": {
                 "control": "gateway_http",
                 "projection": "http_optional",
             },
         })
+    }
+
+    pub(crate) fn submit_turn_value(
+        &self,
+        session_id: Option<String>,
+        task_id: Option<String>,
+        prompt: String,
+    ) -> serde_json::Value {
+        if prompt.trim().is_empty() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "prompt is required",
+            });
+        }
+
+        let mut input = TurnInput::new(prompt);
+        input.session_id = session_id;
+        input.task_id = task_id;
+        let mut receipt = TurnReceipt::from_input(&input, TurnStatus::Pending);
+        receipt
+            .events
+            .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Pending));
+        let turn_id = input.turn_id.to_string();
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(turn_id.clone(), receipt.clone());
+
+        serde_json::json!({
+            "ok": true,
+            "dispatch": "runtime_service",
+            "accepted": true,
+            "turn": receipt,
+        })
+    }
+
+    pub(crate) fn turn_value(&self, turn_id: &str) -> serde_json::Value {
+        let turns = self
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match turns.get(turn_id) {
+            Some(turn) => serde_json::json!({
+                "ok": true,
+                "turn": turn,
+            }),
+            None => serde_json::json!({
+                "ok": false,
+                "error": "turn not found",
+            }),
+        }
+    }
+
+    pub(crate) fn turns_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "turns": self.turns_snapshot(),
+        })
+    }
+
+    pub(crate) fn cancel_turn_value(&self, turn_id: &str) -> serde_json::Value {
+        let mut turns = self
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(turn) = turns.get_mut(turn_id) else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "turn not found",
+            });
+        };
+
+        turn.status = TurnStatus::Cancelled;
+        turn.events.push(TurnEvent::new(
+            TurnId::from_string(turn_id.to_string()),
+            TurnStatus::Cancelled,
+        ));
+        let aborted_run_id = turn
+            .session_id
+            .as_deref()
+            .and_then(crate::api_routes::abort_active_turn);
+
+        serde_json::json!({
+            "ok": true,
+            "cancelled": true,
+            "aborted_run_id": aborted_run_id,
+            "turn": turn,
+        })
+    }
+
+    fn turns_snapshot(&self) -> Vec<TurnReceipt> {
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub(crate) async fn snapshot(&self) -> RuntimeBoundarySnapshot {

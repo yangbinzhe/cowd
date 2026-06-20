@@ -1,5 +1,6 @@
 use std::{collections::HashMap, env};
 
+use model_protocol::model_registry::ModelResolver;
 use runtime::{ConfigLoader, PermissionMode, ResolvedPermissionMode};
 
 use crate::{cli, DEFAULT_MODEL};
@@ -7,7 +8,7 @@ use crate::{cli, DEFAULT_MODEL};
 pub(crate) fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
     let config_aliases = config_aliases_for_current_dir();
-    let resolver = runtime::ModelResolver::new(config_aliases);
+    let resolver = ModelResolver::new(config_aliases);
     resolver.resolve(trimmed)
 }
 

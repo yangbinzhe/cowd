@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use model_protocol::usage::TokenUsage;
 
 use crate::json::{JsonError, JsonValue};
-use crate::usage::TokenUsage;
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
@@ -1404,7 +1404,7 @@ mod tests {
         MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
-    use crate::usage::TokenUsage;
+    use model_protocol::usage::TokenUsage;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

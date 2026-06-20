@@ -1,6 +1,6 @@
 use crate::session::Session;
 
-pub use model_protocol::usage::{format_usd, ModelPricing, TokenUsage, UsageCostEstimate};
+use model_protocol::usage::{ModelPricing, TokenUsage};
 
 /// Returns pricing metadata for a known model alias or family.
 ///
@@ -64,8 +64,10 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use model_protocol::usage::{format_usd, TokenUsage};
+
+    use super::{pricing_for_model, UsageTracker};
 
     #[test]
     fn tracks_true_cumulative_usage() {

@@ -13,7 +13,7 @@ pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option
     if !looks_like_skill_name {
         return None;
     }
-    let skill_service = GatewayServices::transition_only().skill;
+    let skill_service = GatewayServices::baseline().skill;
     match skill_service.resolve_invocation(cwd, Some(trimmed)) {
         Ok(SkillSlashDispatch::Invoke(prompt)) => Some(prompt),
         _ => None,

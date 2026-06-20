@@ -394,10 +394,10 @@ mod tests {
     };
 
     #[test]
-    fn services_declares_transition_owner() {
-        let services = GatewayServices::transition_only();
-        assert_eq!(services.owner, "0.9.292 Gateway RuntimeHost");
-        assert_eq!(services.boundary_status, "0618_final_boundary");
+    fn services_declares_gateway_boundary_owner() {
+        let services = GatewayServices::baseline();
+        assert_eq!(services.owner, "0.9.337 GatewayServices");
+        assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
             services.service_labels(),
@@ -457,14 +457,14 @@ mod tests {
             .iter()
             .any(|contract| contract.operation == "incident"));
         let _registry: ServiceRegistry = services.clone();
-        let ctx = ServiceContext::transition_only()
+        let ctx = ServiceContext::new()
             .with_workspace(std::path::PathBuf::from("/tmp/cowd-service-context-test"))
             .with_session("session-1");
         assert_eq!(ctx.session_id.as_deref(), Some("session-1"));
         let error = ServiceError::InvalidInput("bad".to_string());
         assert_eq!(error.kind(), "invalid_input");
         let policy = ServicePolicy::final_boundary("service-test-owner");
-        assert_eq!(policy.boundary_status, "0618_final_boundary");
+        assert_eq!(policy.boundary_status, "0620_final_boundary");
         let receipt = ServiceReceipt::completed("service", "operation", Some("trace".to_string()));
         assert_eq!(receipt.outcome, "completed");
     }

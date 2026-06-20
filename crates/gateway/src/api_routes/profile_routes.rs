@@ -90,7 +90,7 @@ async fn switch_profile_handler(
         "active_profile": state.profile_manager.active_id(),
         "runtime_profile": state.profile_id,
         "restart_required": state.profile_manager.active_id() != state.profile_id,
-        "message": "profile switch persisted; restart the daemon to move memory/session roots",
+        "message": "profile switch persisted; restart the gateway to move memory/session roots",
     })))
 }
 

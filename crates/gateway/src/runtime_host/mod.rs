@@ -391,7 +391,7 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
         platform_count = diagnostics.platform_count,
         enabled_platform_count = diagnostics.enabled_platform_count,
         message_mirror_configured = diagnostics.message_mirror_configured,
-        "daemon startup diagnostics"
+        "runtime host startup diagnostics"
     );
 }
 
@@ -910,7 +910,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     // 4. Platform adapters via PlatformRuntime
 
-    // Initialise the message mirror with default rules from daemon config
+    // Initialise the message mirror with default rules from runtime host config
     if let Some(mirror) = config.message_mirror {
         platform_runtime.set_mirror(mirror).await;
     } else {
@@ -1034,14 +1034,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .map_err(|e| format!("HTTP server error: {e}"))?;
 
     // ── Cleanup after shutdown ──
-    tracing::info!("cleaning up daemon resources...");
+    tracing::info!("cleaning up runtime host resources...");
 
     // Shutdown platform adapters
     let _ = platform_runtime.shutdown().await;
     tracing::info!("platform runtime shut down");
 
     // PID file is cleaned up by PidFileGuard drop
-    tracing::info!("daemon shutdown complete");
+    tracing::info!("runtime host shutdown complete");
     Ok(())
 }
 
