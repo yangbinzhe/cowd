@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/ai-kernel",
     "crates/ai-core",
     "crates/ai-agent-spec",
     "crates/ai-behavior-policy",
@@ -16,16 +17,19 @@ members = [
     "crates/app-mfg",
     "crates/approval",
     "crates/cli",
-    "crates/cli-ui",
     "crates/command/contract",
     "crates/command/service",
+    "crates/fact-kernel",
     "crates/gateway",
     "crates/matrix/core",
     "crates/matrix/repository",
     "crates/mcp",
     "crates/memory",
+    "crates/model-protocol",
     "crates/plugins",
     "crates/provider",
+    "crates/channel",
+    "crates/connector",
     "crates/runtime",
     "crates/session",
     "crates/skill/service",
@@ -37,7 +41,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.329"
+version = "0.9.330"
 edition = "2021"
 license = "MIT"
 publish = false

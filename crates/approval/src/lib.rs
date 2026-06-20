@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use storage::StorageLayout;
 use thiserror::Error;
 
+pub mod cache;
+pub mod contract;
+
+pub use cache::{ApprovalCacheDecision, ApprovalCacheKey};
+pub use contract::{ApprovalDecision, ApprovalPersistence, ApprovalReceipt, ApprovalRequest};
+
 #[derive(Debug, Error)]
 pub enum ApprovalRepositoryError {
     #[error("io error: {0}")]

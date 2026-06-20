@@ -22,7 +22,6 @@ command-contract = { path = "../command/contract" }
 command-service = { path = "../command/service" }
 skill-service = { path = "../skill/service" }
 app-mfg = { path = "../app-mfg" }
-cli-ui = { path = "../cli-ui" }
 futures = "0.3"
 libc = "0.2"
 qrcode = "0.14"

@@ -1,0 +1,16 @@
+//! Unified fact semantics for Cowd memory, matrix, and growth.
+//!
+//! This crate contains contracts only.  It must not depend on Memory stores,
+//! Matrix repositories, Gateway services, Runtime executors, or external SDKs.
+
+pub mod bridge;
+pub mod core;
+pub mod growth;
+pub mod health;
+pub mod hypothesis;
+pub mod matrix;
+pub mod memory;
+
+pub use core::{
+    Confidence, EvidenceId, EvidencePacket, FactId, FactRecord, FactSource, Provenance, SourceKind,
+};

@@ -46,6 +46,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
+#[cfg(test)]
 use std::os::unix::io::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -55,7 +56,9 @@ use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
 
 use provider::{
     detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
@@ -64,7 +67,6 @@ use provider::{
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
-use cli_ui::{MarkdownStreamState, Spinner, TerminalRenderer};
 #[cfg(test)]
 use command_service::resume_supported_slash_commands;
 use command_service::{
@@ -86,10 +88,12 @@ use serde::Deserialize;
 use serde_json::json;
 use services::GatewayServices;
 
+#[cfg(test)]
+pub(crate) use entry::env_entry::resolve_repl_model;
 pub(crate) use entry::env_entry::{
     default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
-    resolve_repl_model,
 };
+#[cfg(test)]
 pub(crate) use entry::gateway_projection_entry::{
     handle_gateway_approvals_command, handle_gateway_context_command,
     handle_gateway_cross_plane_command, handle_gateway_tasks_command,
@@ -105,11 +109,14 @@ use entry::init_entry::{init_claude_md, init_json_value, run_init};
 use entry::install_entry::run_install;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::print_help_to;
+#[cfg(test)]
 pub(crate) use entry::local_command_entry::{
     format_bughunter_report, format_issue_report, format_pr_report, format_ultraplan_report,
-    print_help, print_help_topic, render_last_tool_debug_report, render_teleport_report,
+    render_last_tool_debug_report, render_teleport_report,
 };
+pub(crate) use entry::local_command_entry::{print_help, print_help_topic};
 use entry::mcp_entry::{handle_mcp_slash_command, handle_mcp_slash_command_json};
+#[cfg(test)]
 use entry::plugin_entry::{execute_plugin_command, print_plugin_command};
 pub(crate) use entry::session_archive_entry::{
     render_export_text, resolve_export_path, run_export,
@@ -118,16 +125,17 @@ pub(crate) use entry::session_archive_entry::{
 pub(crate) use entry::session_archive_entry::{
     render_session_markdown, short_tool_id, summarize_tool_payload_for_markdown,
 };
-pub(crate) use entry::session_store_entry::{
-    confirm_session_deletion, create_managed_session_handle, delete_managed_session,
-    get_unified_store, list_managed_sessions, load_or_create_live_session, load_session_reference,
-    new_cli_session, render_session_list, resolve_session_reference, run_import_session,
-    session_db_path, sync_cli_session_to_unified_store, write_session_clear_backup, SessionHandle,
-};
 #[cfg(test)]
 pub(crate) use entry::session_store_entry::{
+    confirm_session_deletion, create_managed_session_handle, delete_managed_session,
     discover_local_session_import_candidates, hydrate_session_from_unified_store,
-    import_local_session_file, jsonl_sessions_dir,
+    import_local_session_file, jsonl_sessions_dir, load_or_create_live_session,
+    resolve_session_reference, SessionHandle,
+};
+pub(crate) use entry::session_store_entry::{
+    get_unified_store, list_managed_sessions, load_session_reference, new_cli_session,
+    render_session_list, run_import_session, session_db_path, sync_cli_session_to_unified_store,
+    write_session_clear_backup,
 };
 #[cfg(test)]
 pub(crate) use entry::skill_entry::try_resolve_bare_skill_prompt;
@@ -138,18 +146,20 @@ use entry::static_entry::{
 #[cfg(test)]
 pub(crate) use entry::status_entry::parse_git_status_metadata_for;
 pub(crate) use entry::status_entry::{
-    format_sandbox_report, format_status_report, parse_git_status_branch,
-    parse_git_status_metadata, parse_git_workspace_summary, print_sandbox_status_snapshot,
-    print_status_snapshot, resolve_git_branch_for, sandbox_json_value, status_context,
-    status_context_for_session, status_json_value, GitWorkspaceSummary, StatusContext, StatusUsage,
-};
-use entry::workspace_entry::{
-    print_setup, render_config_json, render_config_report, render_diff_json_for,
-    render_diff_report, render_diff_report_for, render_memory_json, render_memory_report,
-    render_setup_json, render_setup_report,
+    format_sandbox_report, format_status_report, parse_git_status_metadata,
+    parse_git_workspace_summary, print_sandbox_status_snapshot, print_status_snapshot,
+    sandbox_json_value, status_context, status_context_for_session, status_json_value,
+    GitWorkspaceSummary, StatusContext, StatusUsage,
 };
 #[cfg(test)]
-pub(crate) use entry::workspace_entry::{SetupItem, SetupSnapshot};
+pub(crate) use entry::status_entry::{parse_git_status_branch, resolve_git_branch_for};
+use entry::workspace_entry::{
+    print_setup, render_config_json, render_config_report, render_diff_json_for,
+    render_diff_report_for, render_memory_json, render_memory_report, render_setup_json,
+    render_setup_report,
+};
+#[cfg(test)]
+pub(crate) use entry::workspace_entry::{render_diff_report, SetupItem, SetupSnapshot};
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -403,8 +413,8 @@ fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     }
 }
 
-pub fn main_entry() {
-    exit_on_error(run())
+pub fn static_entry() {
+    exit_on_error(run_static_entry())
 }
 
 pub fn backend_entry() {
@@ -458,6 +468,22 @@ fn run_backend_entry() -> Result<(), Box<dyn std::error::Error>> {
     run_gateway_action(&action, output_format)
 }
 
+fn print_skills_command(
+    args: Option<&str>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let skill_service = GatewayServices::transition_only().skill;
+    match output_format {
+        CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&skill_service.command_json(&cwd, args)?)?
+        ),
+    }
+    Ok(())
+}
+
 /// Merge a piped stdin payload into a prompt argument.
 ///
 /// When `stdin_content` is `None` or empty after trimming, the prompt is
@@ -478,7 +504,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
     logging::init_logging(VERSION);
 
     // Set up SIGCHLD handler to auto-reap gateway child processes
@@ -506,23 +532,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manifests_dir,
         } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
-        CliAction::Agents {
-            args,
-            output_format,
-        } => LiveCli::print_agents(args.as_deref(), output_format)?,
-        CliAction::Mcp {
-            args,
-            output_format,
-        } => LiveCli::print_mcp(args.as_deref(), output_format)?,
+        CliAction::Agents { .. } => {
+            return Err("`cowd agents` is no longer part of the Gateway production entry".into())
+        }
+        CliAction::Mcp { .. } => {
+            return Err("`cowd mcp` is no longer part of the Gateway production entry".into())
+        }
         CliAction::Skills {
             args,
             output_format,
-        } => LiveCli::print_skills(args.as_deref(), output_format)?,
-        CliAction::Plugins {
-            action,
-            target,
-            output_format,
-        } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
+        } => print_skills_command(args.as_deref(), output_format)?,
+        CliAction::Plugins { .. } => {
+            return Err("`cowd plugins` is no longer part of the Gateway production entry".into())
+        }
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -562,63 +584,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             path,
             output_format,
         } => run_import_session(&path, output_format)?,
-        CliAction::Repl {
-            model,
-            session_id,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            yolo_mode,
-        } => {
-            // Auto-start Gateway RuntimeHost if not already ready
-            let gateway_autostart_disabled = gateway_daemon_autostart_disabled();
-            let gateway_running = server::get_server_status().ok().flatten().is_some();
-            if !gateway_running && !gateway_autostart_disabled {
-                tracing::info!("runtime host not ready, auto-starting...");
-                setup_sigchld_handler();
-                if let Ok(exe) = std::env::current_exe() {
-                    match std::process::Command::new(&exe)
-                        .arg("gateway")
-                        .arg("run")
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        Ok(child) => {
-                            let pid = adopt_gateway_child(child);
-                            tracing::info!(pid, "runtime host auto-started for REPL");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to auto-start runtime host");
-                        }
-                    }
-                    // Wait for Gateway status to appear (max 5 seconds).
-                    for _ in 0..50 {
-                        if server::get_server_status().ok().flatten().is_some() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-            } else if gateway_autostart_disabled {
-                tracing::debug!(
-                    "runtime host auto-start disabled by COWD_DISABLE_DAEMON_AUTOSTART"
-                );
-            }
-            tracing::debug!("starting TUI REPL");
-            run_repl(
-                model,
-                session_id,
-                allowed_tools,
-                permission_mode,
-                base_commit,
-                reasoning_effort,
-                allow_broad_cwd,
-                yolo_mode,
-            )?;
+        CliAction::Repl { .. } => {
+            return Err(
+                "interactive TUI is owned by the cowd CLI; run `cowd` or `cowd tui` instead".into(),
+            );
         }
         CliAction::Gateway {
             action,
@@ -2693,6 +2662,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[cfg(test)]
 fn run_repl(
     _model: String,
     _session_id: Option<String>,
@@ -2709,12 +2679,14 @@ fn run_repl(
     )
 }
 
+#[cfg(test)]
 struct SessionSwitchReport {
     session_id: String,
     session_path: PathBuf,
     message_count: usize,
 }
 
+#[cfg(test)]
 fn activate_live_cli_session(
     cli: &mut LiveCli,
     handle: SessionHandle,
@@ -2765,6 +2737,7 @@ fn activate_live_cli_session(
     })
 }
 
+#[cfg(test)]
 fn switch_live_cli_session(
     cli: &mut LiveCli,
     target: &str,
@@ -2776,6 +2749,7 @@ fn switch_live_cli_session(
 /// Process all pending CowdEvents from the channel without blocking.
 /// This is called at the top of the TUI render loop to keep the display
 /// in sync with the background turn runner.
+#[cfg(test)]
 fn capture_stdout<F, R>(f: F) -> Result<(R, String), Box<dyn std::error::Error>>
 where
     F: FnOnce() -> Result<R, Box<dyn std::error::Error>>,
@@ -2808,6 +2782,7 @@ where
     Ok((result?, buf))
 }
 
+#[cfg(test)]
 pub(crate) struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -3174,6 +3149,7 @@ fn current_task_phase_for_display(
         .or_else(|| task.phases.last())
 }
 
+#[cfg(test)]
 impl LiveCli {
     fn new(
         model: String,
@@ -3295,13 +3271,6 @@ impl LiveCli {
             resume_context,
             false,
         );
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
@@ -3312,12 +3281,6 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -3329,11 +3292,6 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
                 Err(Box::new(error))
             }
         }
@@ -4702,6 +4660,7 @@ fn init_runtime_providers_for_cwd(cwd: &Path) {
     }
 }
 
+#[cfg(test)]
 fn run_prompt(
     text: &str,
     model: String,
@@ -5367,16 +5326,19 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct CliPermissionPrompter {
     current_mode: PermissionMode,
 }
 
+#[cfg(test)]
 impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
         Self { current_mode }
     }
 }
 
+#[cfg(test)]
 impl runtime::PermissionPrompter for CliPermissionPrompter {
     fn decide(
         &mut self,
@@ -5655,8 +5617,6 @@ impl AnthropicRuntimeClient {
         } else {
             &mut sink
         };
-        let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         let mut block_has_thinking_summary = false;
@@ -5712,11 +5672,9 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            }
+                            write!(out, "{text}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
                             events.push(AssistantEvent::TextDelta(text.clone()));
                             if let Some(ref cb) = self.stream_callback {
                                 let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
@@ -5745,11 +5703,6 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    }
                     if let Some((id, name, input)) = pending_tool.take() {
                         // Display tool call now that input is fully accumulated
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
@@ -5763,11 +5716,6 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    }
                     events.push(AssistantEvent::MessageStop);
                 }
             }
@@ -5833,8 +5781,6 @@ async fn consume_stream_standalone(
     let mut stdout = io::stdout();
     let mut sink = io::sink();
     let out: &mut dyn Write = if emit_output { &mut stdout } else { &mut sink };
-    let renderer = TerminalRenderer::new();
-    let mut markdown_stream = MarkdownStreamState::default();
     let mut events = Vec::new();
     let mut pending_tool: Option<(String, String, String)> = None;
     let mut block_has_thinking_summary = false;
@@ -5890,11 +5836,9 @@ async fn consume_stream_standalone(
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
-                        if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                            write!(out, "{rendered}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        }
+                        write!(out, "{text}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
                         events.push(AssistantEvent::TextDelta(text.clone()));
                         if let Some(ref cb) = stream_callback {
                             let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
@@ -5923,11 +5867,6 @@ async fn consume_stream_standalone(
             },
             ApiStreamEvent::ContentBlockStop(_) => {
                 block_has_thinking_summary = false;
-                if let Some(rendered) = markdown_stream.flush(&renderer) {
-                    write!(out, "{rendered}")
-                        .and_then(|()| out.flush())
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                }
                 if let Some((id, name, input)) = pending_tool.take() {
                     writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                         .and_then(|()| out.flush())
@@ -5940,11 +5879,6 @@ async fn consume_stream_standalone(
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
-                if let Some(rendered) = markdown_stream.flush(&renderer) {
-                    write!(out, "{rendered}")
-                        .and_then(|()| out.flush())
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                }
                 events.push(AssistantEvent::MessageStop);
             }
         }
@@ -6789,8 +6723,7 @@ fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
+                write!(out, "{text}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
@@ -6877,7 +6810,6 @@ fn prompt_cache_record_to_runtime_event(
 }
 
 pub(crate) struct CliToolExecutor {
-    renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GatewayToolRegistry,
@@ -6892,7 +6824,6 @@ impl CliToolExecutor {
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
-            renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
             tool_registry,
@@ -6987,18 +6918,14 @@ impl ToolExecutor for CliToolExecutor {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    print!("{markdown}");
                 }
                 Ok(output)
             }
             Err(error) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    print!("{markdown}");
                 }
                 Err(error)
             }
@@ -10411,7 +10338,10 @@ providers:
 
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("Heading"));
-        assert!(rendered.contains('\u{1b}'));
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "gateway response conversion must stay plain-text; terminal rendering belongs to CLI/TUI"
+        );
     }
 
     #[test]

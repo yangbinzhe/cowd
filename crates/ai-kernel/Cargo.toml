@@ -1,0 +1,26 @@
+[package]
+name = "ai-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ai-agent-spec = { path = "../ai-agent-spec" }
+ai-behavior-policy = { path = "../ai-behavior-policy" }
+ai-context = { path = "../ai-context" }
+ai-core = { path = "../ai-core" }
+ai-growth = { path = "../ai-growth" }
+ai-harness = { path = "../ai-harness" }
+ai-policy = { path = "../ai-policy" }
+ai-strategy = { path = "../ai-strategy" }
+ai-tool-transaction = { path = "../ai-tool-transaction" }
+ai-verification = { path = "../ai-verification" }
+ai-workgraph = { path = "../ai-workgraph" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

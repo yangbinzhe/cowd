@@ -30,7 +30,7 @@ impl GatewayTuiConfig {
         let model = arg_value(&args, &["--model", "-m"])
             .or_else(|| std::env::var("COWD_MODEL").ok())
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-        let session_id = arg_value(&args, &["--session", "--session-id", "-s"])
+        let session_id = arg_value(&args, &["--resume", "--session", "--session-id", "-s"])
             .unwrap_or_else(|| format!("tui-{}", uuid::Uuid::new_v4()));
         let yolo_mode = args.iter().any(|arg| {
             matches!(

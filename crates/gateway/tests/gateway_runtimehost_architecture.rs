@@ -129,9 +129,130 @@ fn compat_harness_is_not_a_workspace_dependency() {
 }
 
 #[test]
+fn ai_kernel_is_pure_semantic_crate() {
+    let root = repo_root();
+    let manifest_path = root.join("crates/ai-kernel/Cargo.toml");
+    assert!(
+        manifest_path.is_file(),
+        "ai-kernel must exist as the unified AI harness semantic crate"
+    );
+    let manifest = read_repo("crates/ai-kernel/Cargo.toml");
+    let dependencies = manifest_dependencies(&manifest);
+    for forbidden in [
+        "rusqlite",
+        "reqwest",
+        "gateway",
+        "runtime",
+        "storage",
+        "provider",
+        "memory",
+        "matrix-repository",
+        "mcp",
+        "plugins",
+        "tools",
+        "axum",
+    ] {
+        assert!(
+            !dependencies.contains(forbidden),
+            "ai-kernel must not depend on heavy implementation crate {forbidden}"
+        );
+    }
+
+    let source = read_repo("crates/ai-kernel/src/lib.rs");
+    for module in [
+        "pub mod core",
+        "pub mod turn",
+        "pub mod task",
+        "pub mod strategy",
+        "pub mod context",
+        "pub mod agent",
+        "pub mod workgraph",
+        "pub mod tool",
+        "pub mod verification",
+        "pub mod policy",
+        "pub mod growth",
+        "pub mod harness",
+    ] {
+        assert!(source.contains(module), "ai-kernel missing {module}");
+    }
+}
+
+#[test]
+fn fact_kernel_is_pure_semantic_crate() {
+    let root = repo_root();
+    let manifest_path = root.join("crates/fact-kernel/Cargo.toml");
+    assert!(
+        manifest_path.is_file(),
+        "fact-kernel must exist as the unified fact semantic crate"
+    );
+    let manifest = read_repo("crates/fact-kernel/Cargo.toml");
+    let dependencies = manifest_dependencies(&manifest);
+    for forbidden in [
+        "rusqlite",
+        "reqwest",
+        "gateway",
+        "runtime",
+        "storage",
+        "provider",
+        "memory",
+        "matrix-core",
+        "matrix-repository",
+        "mcp",
+        "plugins",
+        "tools",
+        "axum",
+    ] {
+        assert!(
+            !dependencies.contains(forbidden),
+            "fact-kernel must not depend on implementation crate {forbidden}"
+        );
+    }
+
+    let source = read_repo("crates/fact-kernel/src/lib.rs");
+    for module in [
+        "pub mod core",
+        "pub mod memory",
+        "pub mod matrix",
+        "pub mod growth",
+        "pub mod hypothesis",
+        "pub mod bridge",
+        "pub mod health",
+    ] {
+        assert!(source.contains(module), "fact-kernel missing {module}");
+    }
+}
+
+#[test]
+fn external_boundary_crates_do_not_depend_on_runtime_or_gateway() {
+    for crate_name in ["model-protocol", "channel", "connector"] {
+        let manifest_path = format!("crates/{crate_name}/Cargo.toml");
+        let manifest = read_repo(&manifest_path);
+        let dependencies = manifest_dependencies(&manifest);
+        for forbidden in [
+            "gateway",
+            "runtime",
+            "memory",
+            "matrix-repository",
+            "provider",
+            "mcp",
+            "plugins",
+            "tools",
+            "axum",
+            "reqwest",
+            "rusqlite",
+        ] {
+            assert!(
+                !dependencies.contains(forbidden),
+                "{crate_name} must not depend on implementation crate {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
 fn entry_boundary_crates_exist_as_migration_targets() {
     let root = repo_root();
-    for crate_name in ["cli", "cli-ui", "gateway", "tui"] {
+    for crate_name in ["cli", "gateway", "tui"] {
         let manifest = root.join(format!("crates/{crate_name}/Cargo.toml"));
         assert!(
             manifest.is_file(),
@@ -157,23 +278,41 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "cli launcher must route no-arg or explicit tui usage directly to the TUI entry"
     );
     assert!(
+        cli_main.contains("fn should_open_tui(") && cli_main.contains("\"--resume\""),
+        "cli launcher must route resume/session startup flags directly to the TUI entry"
+    );
+    assert!(
         cli_main.contains("gateway::backend_entry()"),
         "cli launcher must route gateway management commands to the backend entry"
     );
     assert!(
-        cli_main.contains("gateway::main_entry()"),
-        "cli must preserve gateway's non-interactive command parser for static commands"
+        cli_main.contains("gateway::static_entry()"),
+        "cli launcher must route explicit static commands to the static command entry"
+    );
+    assert!(
+        !cli_main.contains("gateway::main_entry()"),
+        "cli must not fall back into gateway's historical full CLI parser"
     );
     assert!(!cli_dependencies.contains("runtime"));
     assert!(!cli_dependencies.contains("ratatui"));
     assert!(!cli_dependencies.contains("axum"));
+    for dependency in ["crossterm", "pulldown-cmark", "syntect", "unicode-width"] {
+        assert!(
+            !cli_dependencies.contains(&format!("{dependency} = ")),
+            "cli must stay plain-text and must not own terminal rendering dependency {dependency}"
+        );
+    }
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     let gateway_dependencies = manifest_dependencies(&gateway_manifest);
     assert!(gateway_manifest.contains("name = \"gateway\""));
     assert!(
-        gateway_dependencies.contains("cli-ui = { path = \"../cli-ui\" }"),
-        "gateway may use terminal rendering only through the cli-ui surface adapter"
+        !root.join("crates/cli-ui/Cargo.toml").exists(),
+        "terminal rendering is a cli module, not a standalone workspace crate"
+    );
+    assert!(
+        !gateway_dependencies.contains("cli-ui") && !gateway_dependencies.contains("cli_ui"),
+        "gateway must not depend on the historical cli-ui terminal adapter"
     );
     assert!(
         !gateway_manifest.contains("terminal-ui"),
@@ -195,19 +334,21 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         );
     }
 
-    let cli_ui_manifest = read_repo("crates/cli-ui/Cargo.toml");
-    let cli_ui_dependencies = manifest_dependencies(&cli_ui_manifest);
-    assert!(cli_ui_manifest.contains("name = \"cli-ui\""));
-    for dependency in ["crossterm", "pulldown-cmark", "syntect", "unicode-width"] {
-        assert!(
-            cli_ui_dependencies.contains(&format!("{dependency} = ")),
-            "cli-ui must own terminal rendering dependency {dependency}"
-        );
-    }
-
     let tui_manifest = read_repo("crates/tui/Cargo.toml");
     let tui_dependencies = manifest_dependencies(&tui_manifest);
     assert!(tui_manifest.contains("name = \"tui\""));
+    for dependency in [
+        "crossterm",
+        "pulldown-cmark",
+        "ratatui",
+        "syntect",
+        "unicode-width",
+    ] {
+        assert!(
+            tui_dependencies.contains(&format!("{dependency} = ")),
+            "tui owns terminal rendering dependency {dependency}"
+        );
+    }
     for forbidden in [
         "runtime",
         "matrix-core",
