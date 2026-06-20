@@ -1,4 +1,5 @@
-use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
+use model_protocol::usage::{TokenUsage, UsageCostEstimate};
+use runtime::pricing_for_model;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -278,7 +279,7 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use runtime::format_usd;
+    use model_protocol::usage::format_usd;
 
     use super::{InputContentBlock, InputMessage, MessageRequest, MessageResponse, Usage};
 

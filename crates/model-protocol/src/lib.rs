@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod prompt_cache;
+pub mod usage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMessage {

@@ -289,6 +289,50 @@ fn prompt_cache_is_owned_by_model_protocol_boundary() {
 }
 
 #[test]
+fn usage_contracts_are_owned_by_model_protocol_boundary() {
+    let model_protocol_source = read_repo("crates/model-protocol/src/lib.rs");
+    let usage_source = read_repo("crates/model-protocol/src/usage.rs");
+    assert!(
+        model_protocol_source.contains("pub mod usage"),
+        "model-protocol must expose usage protocol contracts"
+    );
+    for contract in [
+        "pub struct ModelPricing",
+        "pub struct TokenUsage",
+        "pub struct UsageCostEstimate",
+        "pub fn format_usd",
+        "pub fn heuristic_pricing_for_model",
+    ] {
+        assert!(
+            usage_source.contains(contract),
+            "model-protocol usage contract missing {contract}"
+        );
+    }
+
+    let runtime_usage = read_repo("crates/runtime/src/usage.rs");
+    assert!(
+        runtime_usage.contains(
+            "pub use model_protocol::usage::{format_usd, ModelPricing, TokenUsage, UsageCostEstimate};"
+        ),
+        "runtime must re-export model-protocol usage contracts for compatibility"
+    );
+    assert!(
+        runtime_usage.contains("pub struct UsageTracker"),
+        "runtime keeps session-derived usage tracking"
+    );
+    assert!(
+        runtime_usage.contains("crate::model_registry::global_registry()"),
+        "runtime keeps dynamic registry-aware pricing lookup"
+    );
+
+    let provider_types = read_repo("crates/provider/src/types.rs");
+    assert!(
+        provider_types.contains("use model_protocol::usage::{TokenUsage, UsageCostEstimate};"),
+        "provider protocol response types must use model-protocol usage contracts"
+    );
+}
+
+#[test]
 fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
     let manifest = read_repo("crates/runtime/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);
