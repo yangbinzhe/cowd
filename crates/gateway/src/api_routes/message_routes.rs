@@ -222,6 +222,7 @@ async fn send_message(
     let run_id = uuid::Uuid::new_v4().to_string();
     let run_started_at_ms = current_time_ms();
     let active_task = state.services.task.current().unwrap_or_default();
+    let active_task_id = active_task.as_ref().map(|task| task.id.clone());
     let run_profile = if active_task.as_ref().is_some_and(|task| task.yolo_mode) {
         ContextProfile::YoloGoal
     } else {
@@ -396,12 +397,14 @@ async fn send_message(
         hook_abort_signal,
     );
     let turn_result = runtime_service
-        .run_turn_with_timeout(&session_id, content, TURN_TIMEOUT)
+        .run_turn_with_timeout(&session_id, active_task_id, content, TURN_TIMEOUT)
         .await;
     clear_active_turn_control(&session_id, &run_id);
 
     match turn_result {
-        Ok(summary) => {
+        Ok(execution) => {
+            let summary = execution.summary;
+            let turn_id = execution.receipt.turn_id.to_string();
             let final_text = summary
                 .assistant_messages
                 .last()
@@ -455,6 +458,8 @@ async fn send_message(
 
             let response = serde_json::json!({
                 "session_id": &session_id,
+                "turn_id": &turn_id,
+                "turn": execution.receipt,
                 "status": "complete",
                 "response": final_text,
                 "iterations": summary.iterations,
@@ -463,6 +468,7 @@ async fn send_message(
             let sse_data = serde_json::json!({
                 "type": "TurnComplete",
                 "session_id": &session_id,
+                "turn_id": &turn_id,
                 "response": final_text,
                 "iterations": summary.iterations,
             });

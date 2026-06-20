@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
+
 use crate::gateway::ActiveSessions;
 use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
@@ -32,6 +34,12 @@ impl RuntimeTurnExecutionError {
             Self::Timeout { seconds } => format!("turn timed out after {seconds}s"),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeTurnExecution {
+    pub(crate) summary: runtime::TurnSummary,
+    pub(crate) receipt: TurnReceipt,
 }
 
 #[derive(Clone)]
@@ -259,12 +267,16 @@ impl RuntimeService {
     pub(crate) async fn run_turn_with_timeout(
         &self,
         session_id: &str,
+        task_id: Option<String>,
         content: String,
         turn_timeout: Duration,
-    ) -> Result<runtime::TurnSummary, RuntimeTurnExecutionError> {
+    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
+        let receipt =
+            self.start_running_turn(Some(session_id.to_string()), task_id, content.clone());
+        let turn_id = receipt.turn_id.clone();
         let turn_result = tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -281,12 +293,74 @@ impl RuntimeService {
         .map_err(|error| RuntimeTurnExecutionError::Join(format!("task join error: {error}")))?;
 
         match turn_result {
-            Ok(Ok(summary)) => Ok(summary),
-            Ok(Err(error)) => Err(RuntimeTurnExecutionError::Runtime(error.to_string())),
-            Err(_) => Err(RuntimeTurnExecutionError::Timeout {
-                seconds: turn_timeout.as_secs(),
-            }),
+            Ok(Ok(summary)) => {
+                let receipt = self.finish_turn(&turn_id, TurnStatus::Completed, None);
+                Ok(RuntimeTurnExecution { summary, receipt })
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
+                Err(RuntimeTurnExecutionError::Runtime(message))
+            }
+            Err(_) => {
+                let message = format!("turn timed out after {}s", turn_timeout.as_secs());
+                self.finish_turn(&turn_id, TurnStatus::Failed, Some(message));
+                Err(RuntimeTurnExecutionError::Timeout {
+                    seconds: turn_timeout.as_secs(),
+                })
+            }
         }
+    }
+
+    fn start_running_turn(
+        &self,
+        session_id: Option<String>,
+        task_id: Option<String>,
+        prompt: String,
+    ) -> TurnReceipt {
+        let mut input = TurnInput::new(prompt);
+        input.session_id = session_id;
+        input.task_id = task_id;
+        let mut receipt = TurnReceipt::from_input(&input, TurnStatus::Running);
+        receipt
+            .events
+            .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Running));
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(input.turn_id.to_string(), receipt.clone());
+        receipt
+    }
+
+    fn finish_turn(
+        &self,
+        turn_id: &TurnId,
+        status: TurnStatus,
+        message: Option<String>,
+    ) -> TurnReceipt {
+        let mut turns = self
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let turn = turns
+            .entry(turn_id.to_string())
+            .or_insert_with(|| TurnReceipt {
+                turn_id: turn_id.clone(),
+                status: status.clone(),
+                session_id: None,
+                task_id: None,
+                events: Vec::new(),
+                completed_at: None,
+            });
+
+        if turn.status != TurnStatus::Cancelled {
+            turn.status = status.clone();
+        }
+        let mut event = TurnEvent::new(turn_id.clone(), status);
+        event.message = message;
+        turn.events.push(event);
+        turn.completed_at = Some(Utc::now());
+        turn.clone()
     }
 
     pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
@@ -597,5 +671,36 @@ mod tests {
         let detached = service.detach_session_value("session-1", "tui-1").await;
         assert_eq!(detached["ok"], true);
         assert_eq!(detached["snapshot"]["state"], "detached");
+    }
+
+    #[test]
+    fn runtime_service_records_executing_turn_lifecycle() {
+        let service = RuntimeService::new(
+            Arc::new(ActiveSessions::default()),
+            Arc::new(SessionLeaseRegistry::default()),
+            Arc::new(SessionKernel::new(
+                Arc::new(ActiveSessions::default()),
+                None,
+                crate::event_bus::SessionEventBus::new(),
+            )),
+            Arc::new(SessionLifecycleKernel::new()),
+            Instant::now(),
+        );
+
+        let running = service.start_running_turn(
+            Some("session-turn".to_string()),
+            Some("task-turn".to_string()),
+            "execute real turn".to_string(),
+        );
+        assert_eq!(running.status, TurnStatus::Running);
+        assert_eq!(running.session_id.as_deref(), Some("session-turn"));
+        assert_eq!(running.task_id.as_deref(), Some("task-turn"));
+
+        let completed = service.finish_turn(&running.turn_id, TurnStatus::Completed, None);
+        assert_eq!(completed.status, TurnStatus::Completed);
+        assert!(completed.completed_at.is_some());
+        assert_eq!(completed.events.len(), 2);
+        assert_eq!(completed.events[0].status, TurnStatus::Running);
+        assert_eq!(completed.events[1].status, TurnStatus::Completed);
     }
 }

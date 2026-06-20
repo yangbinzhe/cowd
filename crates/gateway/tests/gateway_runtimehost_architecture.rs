@@ -630,9 +630,22 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     .to_string();
     assert!(
         message_routes.contains(".active_messages_page(")
+            && message_routes.contains("\"turn_id\"")
+            && message_routes.contains("\"turn\"")
             && !message_routes.contains("state.active_runtime(")
             && !message_routes.contains("run_turn_async("),
-        "message routes must delegate active runtime reads and turn execution to services"
+        "message routes must delegate active runtime reads and turn execution receipt projection to services"
+    );
+    let runtime_service =
+        production_part(&read_repo("crates/gateway/src/runtime_service.rs")).to_string();
+    assert!(
+        runtime_service.contains("pub(crate) struct RuntimeTurnExecution")
+            && runtime_service.contains("fn start_running_turn")
+            && runtime_service.contains("fn finish_turn")
+            && runtime_service.contains("TurnStatus::Running")
+            && runtime_service.contains("TurnStatus::Completed")
+            && runtime_service.contains("TurnStatus::Failed"),
+        "RuntimeService must own real turn receipt lifecycle for running/completed/failed execution"
     );
     let session_service =
         production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();
