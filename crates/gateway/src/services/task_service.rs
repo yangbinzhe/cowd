@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use memory::store::session::SessionRecord;
 use runtime::AgentRunGraph;
 
-use super::ServiceEnvelope;
+use super::{ServiceEnvelope, SessionService};
 use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
 
 #[derive(Clone)]
@@ -132,4 +133,81 @@ impl TaskService {
     ) -> Result<TaskRecord, String> {
         self.kernel()?.upsert_agent_graph(task_id, graph)
     }
+
+    pub(crate) async fn append_runtime_event(
+        &self,
+        session_service: &SessionService,
+        task: &TaskRecord,
+        kind: &'static str,
+    ) -> Result<(), String> {
+        ensure_task_session_record(session_service, task)
+            .await
+            .map_err(|error| format!("failed to prepare task runtime session: {error}"))?;
+        let latest_audit = task.audit.last();
+        let payload = serde_json::json!({
+            "task": task,
+            "task_id": task.id,
+            "objective": task.objective,
+            "status": task.status.as_str(),
+            "current_phase": task.current_phase,
+            "failure_count": task.failure_count,
+            "latest_audit": latest_audit,
+        });
+        session_service
+            .append_runtime_event(&task.id, memory::RuntimeEventScope::Task, kind, payload)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("failed to append task runtime event: {error}"))
+    }
+}
+
+async fn ensure_task_session_record(
+    session_service: &SessionService,
+    task: &TaskRecord,
+) -> Result<(), String> {
+    let Some(store) = session_service.unified_store() else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let metadata_json = serde_json::json!({
+        "kind": "task",
+        "task_id": task.id,
+        "objective": task.objective,
+        "yolo_mode": task.yolo_mode,
+        "current_phase": task.current_phase,
+    })
+    .to_string();
+    let mut record = SessionRecord {
+        session_id: task.id.clone(),
+        platform: "task".to_string(),
+        chat_id: task.id.clone(),
+        user_id: None,
+        model: None,
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: task.audit.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(metadata_json),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: task.status.as_str().to_string(),
+    };
+    if let Some(existing) = store
+        .get_session(&task.id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        record.created_at = existing.created_at;
+        store
+            .update_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        store
+            .create_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }

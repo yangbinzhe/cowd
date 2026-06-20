@@ -37,6 +37,11 @@ impl EvidenceId {
     pub fn new() -> Self {
         Self(format!("evidence-{}", Uuid::new_v4()))
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Default for EvidenceId {

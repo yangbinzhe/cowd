@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -11,6 +11,7 @@ use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use serde::{Deserialize, Serialize};
 
 use super::{abort_active_turn, new_api_session_record, AppState, ErrorResponse};
+use crate::services::SessionUpdateRequest;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -130,16 +131,6 @@ struct SearchMessagesResponse {
     query: String,
     results: Vec<SearchMessagesItem>,
     total: usize,
-}
-
-#[derive(Deserialize)]
-struct UpdateSessionRequest {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -867,202 +858,83 @@ async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.services.session.active_runtime(&id).ok_or_else(|| {
-        (
+    match state.services.session.compact_active_session(&id).await {
+        Ok(Some(result)) => {
+            tracing::info!(
+                session_id = %id,
+                removed = result.removed_message_count,
+                "API session compacted"
+            );
+            Ok(Json(result))
+        }
+        Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("session {id} not found"),
             }),
-        )
-    })?;
-
-    let mut runtime_guard = runtime_entry.lock().await;
-    let result = runtime_guard.compact(runtime::CompactionConfig::default());
-    if result.removed_message_count > 0 {
-        *runtime_guard.session_mut() = result.compacted_session.clone();
-    }
-    let session_snapshot = runtime_guard.session().clone();
-    drop(runtime_guard);
-
-    state.services.session
-        .sync_runtime_session_snapshot(&id, &session_snapshot)
-        .await
-        .map_err(|error| {
+        )),
+        Err(error) => {
             tracing::error!(session_id = %id, error = %error, "failed to sync compacted session to unified store");
-            (
+            Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: format!("failed to sync compacted session: {error}"),
                 }),
-            )
-        })?;
-
-    tracing::info!(%id, removed = result.removed_message_count, "API session compacted");
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "compacted": result.removed_message_count > 0,
-        "removed_message_count": result.removed_message_count,
-        "summary": result.formatted_summary,
-    })))
+            ))
+        }
+    }
 }
 
 async fn get_session_stats_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.services.session.active_runtime(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
-    })?;
-
-    let runtime_guard = runtime_entry.lock().await;
-    let session = runtime_guard.session();
-    let messages = &session.messages;
-
-    let user_count = messages
-        .iter()
-        .filter(|message| message.role == runtime::MessageRole::User)
-        .count();
-    let assistant_count = messages
-        .iter()
-        .filter(|message| message.role == runtime::MessageRole::Assistant)
-        .count();
-    let tool_count = messages
-        .iter()
-        .filter(|message| message.role == runtime::MessageRole::Tool)
-        .count();
-
-    let total_input_tokens: u32 = messages
-        .iter()
-        .filter_map(|message| message.usage.as_ref())
-        .map(|usage| usage.input_tokens)
-        .sum();
-    let total_output_tokens: u32 = messages
-        .iter()
-        .filter_map(|message| message.usage.as_ref())
-        .map(|usage| usage.output_tokens)
-        .sum();
-
-    let mut tool_usage: HashMap<String, usize> = HashMap::new();
-    for message in messages {
-        if message.role == runtime::MessageRole::Assistant {
-            for block in &message.blocks {
-                if let runtime::ContentBlock::ToolUse { name, .. } = block {
-                    *tool_usage.entry(name.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    let duration_ms = session.updated_at_ms.saturating_sub(session.created_at_ms);
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "message_count": messages.len(),
-        "message_counts": {
-            "user": user_count,
-            "assistant": assistant_count,
-            "tool": tool_count,
-        },
-        "tokens": {
-            "input": total_input_tokens,
-            "output": total_output_tokens,
-            "total": total_input_tokens + total_output_tokens,
-        },
-        "tool_usage": tool_usage,
-        "duration_ms": duration_ms,
-    })))
+    state
+        .services
+        .session
+        .active_session_stats(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("session {id} not found"),
+                }),
+            )
+        })
 }
 
 async fn update_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpdateSessionRequest>,
+    Json(body): Json<SessionUpdateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut found = false;
+    let found = state
+        .services
+        .session
+        .update_session(&id, body)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to update session: {error}"),
+                }),
+            )
+        })?;
 
-    if let Some(runtime_entry) = state.services.session.active_runtime(&id) {
-        found = true;
-        let mut runtime_guard = runtime_entry.lock().await;
-        let mut session = runtime_guard.session_mut_async().await;
-        if let Some(ref model) = body.model {
-            session.model = Some(model.clone());
-        }
-    }
-
-    if state.services.session.has_unified_store() {
-        match state.services.session.stored_session(&id).await {
-            Ok(Some(mut record)) => {
-                found = true;
-                if let Some(ref model) = body.model {
-                    record.model = Some(model.clone());
-                }
-                if let Some(ref title) = body.title {
-                    let mut meta: serde_json::Value = record
-                        .metadata_json
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str(value).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    meta["title"] = serde_json::Value::String(title.clone());
-                    record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
-                }
-                if let Some(ref metadata) = body.metadata {
-                    let mut meta: serde_json::Value = record
-                        .metadata_json
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str(value).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    if let Some(obj) = meta.as_object_mut() {
-                        if let Some(new_obj) = metadata.as_object() {
-                            for (key, value) in new_obj {
-                                obj.insert(key.clone(), value.clone());
-                            }
-                        }
-                    }
-                    record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
-                }
-                state
-                    .services
-                    .session
-                    .update_stored_session(&record)
-                    .await
-                    .map_err(|error| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("failed to update session: {error}"),
-                            }),
-                        )
-                    })?;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to load session: {error}"),
-                    }),
-                ));
-            }
-        }
-    }
-
-    if !found {
-        return Err((
+    if found {
+        Ok(Json(serde_json::json!({
+            "session_id": id,
+            "updated": true,
+        })))
+    } else {
+        Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("session {id} not found"),
             }),
-        ));
+        ))
     }
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "updated": true,
-    })))
 }

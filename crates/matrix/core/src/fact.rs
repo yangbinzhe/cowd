@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use fact_kernel::{
     hypothesis::HypothesisBoundary, matrix::MatrixFact as KernelMatrixFact, Confidence, FactId,
-    FactSource, SourceKind,
+    FactKernelService, FactRecord, FactSource, FactStore, Provenance, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,6 +155,30 @@ impl MatrixFact {
                 .map(str::to_string),
         })
     }
+
+    pub fn write_to_fact_kernel<S>(&self, service: &mut FactKernelService<S>) -> FactRecord
+    where
+        S: FactStore,
+    {
+        service.upsert_fact(self.to_fact_record())
+    }
+
+    #[must_use]
+    pub fn to_fact_record(&self) -> FactRecord {
+        let kernel = self.to_fact_kernel_matrix_fact();
+        let statement = format!("{} {} {}", kernel.entity, kernel.predicate, kernel.value);
+        let mut record = FactRecord::new(format!("matrix.{}", kernel.predicate), statement);
+        record.id = kernel.id;
+        record.confidence = kernel.confidence;
+        record.provenance = vec![Provenance {
+            source: kernel.source,
+            observed_at: self.event_time,
+            trace_id: Some(self.snapshot_id.clone()),
+        }];
+        record.created_at = self.event_time;
+        record.updated_at = self.event_time;
+        record
+    }
 }
 
 fn confidence_basis_points(confidence: f32) -> u16 {
@@ -255,5 +279,32 @@ mod fact_kernel_bridge_tests {
         assert_eq!(restored.entity_refs, original.entity_refs);
         assert_eq!(restored.metric_key, original.metric_key);
         assert_eq!(restored.confidence, original.confidence);
+    }
+
+    #[test]
+    fn matrix_fact_writes_to_fact_kernel_service_for_recall() {
+        let fact = MatrixFact::from_input(MatrixFactInput {
+            fact_id: Some("fact-3".to_string()),
+            snapshot_id: Some("snapshot-3".to_string()),
+            fact_type: AI_WORKGRAPH_QUALITY_FACT.to_string(),
+            entity_refs: vec!["harness:runtime".to_string()],
+            metric_key: Some("quality_score".to_string()),
+            dimensions: serde_json::json!({"area": "runtime"}),
+            measures: serde_json::json!({"score": 0.88}),
+            event_time: Some(Utc::now()),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("eval://run-3".to_string()),
+            confidence: Some(0.88),
+            raw_hash: Some("sha256:fact3".to_string()),
+        });
+        let mut service = FactKernelService::new();
+
+        let record = fact.write_to_fact_kernel(&mut service);
+        let hits = service.recall(&fact_kernel::memory::RecallQuery::new("runtime quality"));
+
+        assert_eq!(record.id.as_str(), "fact-3");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fact.id, record.id);
     }
 }

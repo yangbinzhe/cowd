@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use fact_kernel::{
     hypothesis::HypothesisBoundary, memory::MemoryCandidate as FactMemoryCandidate, Confidence,
-    FactId, FactRecord, FactSource, Provenance, SourceKind,
+    FactId, FactKernelService, FactRecord, FactSource, FactStore, Provenance, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -173,6 +173,13 @@ impl MemoryEntry {
         record.created_at = self.created_at;
         record.updated_at = self.updated_at;
         record
+    }
+
+    pub fn write_to_fact_kernel<S>(&self, service: &mut FactKernelService<S>) -> FactRecord
+    where
+        S: FactStore,
+    {
+        service.upsert_fact(self.to_fact_record())
     }
 }
 
@@ -706,5 +713,21 @@ mod fact_kernel_bridge_tests {
         assert_eq!(record.fact_type, "memory.decision");
         assert_eq!(record.statement, entry.content);
         assert_eq!(record.provenance[0].trace_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn memory_entry_writes_to_fact_kernel_service_for_recall() {
+        let entry = sample_entry();
+        let mut service = FactKernelService::new();
+
+        let record = entry.write_to_fact_kernel(&mut service);
+        let hits = service.recall(&fact_kernel::memory::RecallQuery::new(
+            "orchestrate services",
+        ));
+
+        assert_eq!(record.id.as_str(), format!("memory:{}", entry.id));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fact.id, record.id);
+        assert!(service.evaluate_health().is_empty());
     }
 }

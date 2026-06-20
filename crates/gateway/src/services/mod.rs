@@ -37,7 +37,7 @@ pub(crate) use mfg_service::{
     MfgService,
 };
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use session_service::SessionService;
+pub(crate) use session_service::{SessionService, SessionUpdateRequest};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.340 GatewayServices");
+        assert_eq!(services.owner, "0.9.341 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

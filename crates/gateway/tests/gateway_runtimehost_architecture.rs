@@ -281,6 +281,9 @@ fn fact_kernel_is_pure_semantic_crate() {
         "pub mod hypothesis",
         "pub mod bridge",
         "pub mod health",
+        "pub mod store",
+        "pub mod indexer",
+        "pub mod service",
     ] {
         assert!(source.contains(module), "fact-kernel missing {module}");
     }
@@ -524,7 +527,9 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
     for required in [
         "to_fact_memory_candidate",
         "to_fact_record",
+        "write_to_fact_kernel",
         "FactMemoryCandidate",
+        "FactKernelService",
         "HypothesisBoundary::observed()",
     ] {
         assert!(
@@ -543,7 +548,10 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
     for required in [
         "to_fact_kernel_matrix_fact",
         "from_fact_kernel_matrix_fact",
+        "to_fact_record",
+        "write_to_fact_kernel",
         "KernelMatrixFact",
+        "FactKernelService",
         "HypothesisBoundary::observed()",
     ] {
         assert!(
@@ -573,6 +581,40 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             "runtime approval policy bridge missing {required}"
         );
     }
+
+    let gateway_approval = production_part(&read_repo(
+        "crates/gateway/src/services/approval_service.rs",
+    ))
+    .to_string();
+    assert!(
+        gateway_approval.contains("pub(crate) async fn risk_receipt")
+            && gateway_approval.contains("gate.policy_receipt"),
+        "gateway approval service must expose runtime risk receipt without route-level gate coupling"
+    );
+    let gateway_approval_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/approval_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        gateway_approval_routes.contains("/api/approval/risk-receipt")
+            && gateway_approval_routes.contains("risk_receipt_handler"),
+        "approval API must expose risk receipt projection for auditable pre-approval checks"
+    );
+
+    let task_service =
+        production_part(&read_repo("crates/gateway/src/services/task_service.rs")).to_string();
+    assert!(
+        task_service.contains("pub(crate) async fn append_runtime_event")
+            && task_service.contains("ensure_task_session_record"),
+        "task service must own task lifecycle runtime-event projection"
+    );
+    let task_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/task_routes.rs")).to_string();
+    assert!(
+        !task_routes.contains("async fn append_task_runtime_event")
+            && task_routes.contains(".append_runtime_event(&state.services.session"),
+        "task routes must delegate lifecycle projection to TaskService"
+    );
 
     let ai_policy = production_part(&read_repo("crates/ai-kernel/src/policy/mod.rs")).to_string();
     assert!(

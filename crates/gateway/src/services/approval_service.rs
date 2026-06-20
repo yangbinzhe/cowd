@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ai_kernel::policy::RiskGateReceipt;
 use approval::{ApprovalRepository, FileApprovalRepository};
 use runtime::{
     approval_gate::SmartApprovalGate,
@@ -131,5 +132,17 @@ impl ApprovalService {
             "tool": "bash",
             "action": request.command,
         }))
+    }
+
+    pub(crate) async fn risk_receipt(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<RiskGateReceipt, String> {
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or_else(|| "approval gate not configured".to_string())?;
+        Ok(gate.policy_receipt(tool_name, input).await)
     }
 }

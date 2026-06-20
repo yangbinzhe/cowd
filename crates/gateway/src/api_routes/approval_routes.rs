@@ -16,6 +16,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/approval/pending", get(approval_pending_handler))
         .route("/api/approval/respond", post(approval_respond_handler))
+        .route("/api/approval/risk-receipt", post(risk_receipt_handler))
         .route(
             "/api/approval/config",
             get(approval_config_handler).put(update_approval_config_handler),
@@ -32,6 +33,12 @@ struct ApprovalRespondRequest {
     persistence: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RiskReceiptRequest {
+    tool_name: String,
+    input: serde_json::Value,
 }
 
 async fn approval_pending_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -89,4 +96,21 @@ async fn approval_respond_handler(
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn risk_receipt_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<RiskReceiptRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let input = match body.input {
+        serde_json::Value::String(value) => value,
+        value => serde_json::to_string(&value).unwrap_or_default(),
+    };
+    state
+        .services
+        .approval
+        .risk_receipt(&body.tool_name, &input)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))
 }
