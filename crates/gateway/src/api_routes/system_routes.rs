@@ -593,63 +593,7 @@ async fn config_providers_handler(
         .system
         .runtime_config(&state.workspace_root, &state.config_home)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let providers = runtime_config.providers();
-    let configured_model = runtime_config.model().map(str::to_string);
-    let configured_model_provider = configured_model
-        .as_deref()
-        .and_then(|model| providers.resolve_full(model))
-        .map(|provider| provider.name.clone());
-    let mut provider_rows = providers
-        .providers
-        .values()
-        .map(|provider| {
-            serde_json::json!({
-                "name": provider.name,
-                "base_url": provider.base_url,
-                "protocol": provider.protocol,
-                "models": provider.models,
-                "model_count": provider.models.len(),
-                "credential_present": !provider.api_key.trim().is_empty(),
-            })
-        })
-        .collect::<Vec<_>>();
-    provider_rows.sort_by(|left, right| {
-        left["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(right["name"].as_str().unwrap_or(""))
-    });
-    let selected_model = configured_model.clone();
-    let models = provider_rows
-        .iter()
-        .flat_map(|provider| {
-            let provider_name = provider["name"].as_str().unwrap_or("").to_string();
-            let selected_model = selected_model.clone();
-            provider["models"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(move |model| {
-                    model.as_str().map(|id| {
-                        serde_json::json!({
-                            "id": id,
-                            "name": id,
-                            "provider": provider_name,
-                            "selected": selected_model.as_deref() == Some(id),
-                        })
-                    })
-                })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(Json(serde_json::json!({
-        "providers": provider_rows,
-        "models": models,
-        "provider_count": providers.providers.len(),
-        "provider_model_count": models.len(),
-        "configured_model": configured_model,
-        "configured_model_provider": configured_model_provider,
-        "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
-    })))
+    Ok(Json(
+        state.services.provider.config_projection(&runtime_config),
+    ))
 }

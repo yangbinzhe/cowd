@@ -8568,6 +8568,7 @@ providers:
                 message_routes::runtime_run_completed_payload(
                     session_id,
                     "run-1",
+                    None,
                     ContextProfile::MainTurn,
                     "completed",
                     Some(2),
@@ -8678,6 +8679,7 @@ providers:
                 event_json: message_routes::runtime_run_completed_payload(
                     session_id,
                     "run-linked",
+                    None,
                     ContextProfile::MainTurn,
                     "completed",
                     Some(1),
@@ -8793,6 +8795,7 @@ providers:
                 event_json: message_routes::runtime_run_completed_payload(
                     session_id,
                     "run-runtime-timeline",
+                    None,
                     ContextProfile::MainTurn,
                     "completed",
                     Some(1),
@@ -8902,6 +8905,7 @@ providers:
                     event_json: message_routes::runtime_run_completed_payload(
                         session_id,
                         &run_id,
+                        None,
                         ContextProfile::MainTurn,
                         "completed",
                         Some(1),

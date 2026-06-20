@@ -597,8 +597,20 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     .to_string();
     assert!(
         gateway_approval_routes.contains("/api/approval/risk-receipt")
-            && gateway_approval_routes.contains("risk_receipt_handler"),
-        "approval API must expose risk receipt projection for auditable pre-approval checks"
+            && gateway_approval_routes.contains("risk_receipt_handler")
+            && gateway_approval_routes.contains("state.services.audit.risk_gate_projection")
+            && gateway_approval_routes.contains("state.services.growth.risk_gate_event"),
+        "approval API must expose risk receipt projection through audit and growth services"
+    );
+    let gateway_services =
+        production_part(&read_repo("crates/gateway/src/services/mod.rs")).to_string();
+    assert!(
+        gateway_services.contains("pub(crate) struct ProviderService")
+            && gateway_services.contains("pub(crate) struct GrowthService")
+            && gateway_services.contains("config_projection")
+            && gateway_services.contains("risk_gate_event")
+            && gateway_services.contains("risk_gate_projection"),
+        "GatewayServices must include concrete provider, growth, and audit projections"
     );
 
     let task_service =
@@ -642,10 +654,18 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         runtime_service.contains("pub(crate) struct RuntimeTurnExecution")
             && runtime_service.contains("fn start_running_turn")
             && runtime_service.contains("fn finish_turn")
+            && runtime_service.contains("TaskTurnBinding")
+            && runtime_service.contains("fn record_turn_binding")
             && runtime_service.contains("TurnStatus::Running")
             && runtime_service.contains("TurnStatus::Completed")
             && runtime_service.contains("TurnStatus::Failed"),
-        "RuntimeService must own real turn receipt lifecycle for running/completed/failed execution"
+        "RuntimeService must own real turn receipt lifecycle and task-turn binding projection"
+    );
+    let system_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/system_routes.rs")).to_string();
+    assert!(
+        system_routes.contains("state.services.provider.config_projection(&runtime_config)"),
+        "provider config route must delegate projection to ProviderService"
     );
     let session_service =
         production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();

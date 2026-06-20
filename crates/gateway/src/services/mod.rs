@@ -1,5 +1,11 @@
 use std::sync::Arc;
 
+use ai_kernel::{
+    core::{ExecutionMode, TaskComplexity, TaskRisk},
+    growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
+    policy::{PolicyDecisionKind, RiskGateReceipt},
+};
+
 use crate::runtime_service::RuntimeService;
 use memory::CognitiveContextManager;
 
@@ -155,6 +161,170 @@ impl AuditService {
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         service_envelope(self.label, self.owner, operation)
     }
+
+    pub(crate) fn risk_gate_projection(&self, receipt: &RiskGateReceipt) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.envelope("risk_gate_projection"),
+            "source": "approval.risk_receipt",
+            "issued_at": receipt.issued_at,
+            "decision": receipt.decision,
+            "approval_required": receipt.approval_required,
+            "risk": receipt.risk,
+            "scope": receipt.scope,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl ProviderService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "provider",
+            owner: "0.9.347 Provider service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+
+    pub(crate) fn config_projection(
+        &self,
+        runtime_config: &runtime::RuntimeConfig,
+    ) -> serde_json::Value {
+        let providers = runtime_config.providers();
+        let configured_model = runtime_config.model().map(str::to_string);
+        let configured_model_provider = configured_model
+            .as_deref()
+            .and_then(|model| providers.resolve_full(model))
+            .map(|provider| provider.name.clone());
+        let mut provider_rows = providers
+            .providers
+            .values()
+            .map(|provider| {
+                serde_json::json!({
+                    "name": provider.name,
+                    "base_url": provider.base_url,
+                    "protocol": provider.protocol,
+                    "models": provider.models,
+                    "model_count": provider.models.len(),
+                    "credential_present": !provider.api_key.trim().is_empty(),
+                })
+            })
+            .collect::<Vec<_>>();
+        provider_rows.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["name"].as_str().unwrap_or(""))
+        });
+        let selected_model = configured_model.clone();
+        let models = provider_rows
+            .iter()
+            .flat_map(|provider| {
+                let provider_name = provider["name"].as_str().unwrap_or("").to_string();
+                let selected_model = selected_model.clone();
+                provider["models"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(move |model| {
+                        model.as_str().map(|id| {
+                            serde_json::json!({
+                                "id": id,
+                                "name": id,
+                                "provider": provider_name,
+                                "selected": selected_model.as_deref() == Some(id),
+                            })
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "envelope": self.envelope("config_projection"),
+            "providers": provider_rows,
+            "models": models,
+            "provider_count": providers.providers.len(),
+            "provider_model_count": models.len(),
+            "configured_model": configured_model,
+            "configured_model_provider": configured_model_provider,
+            "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GrowthService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+impl GrowthService {
+    pub(crate) fn new() -> Self {
+        Self {
+            label: "growth",
+            owner: "0.9.347 Growth service boundary",
+        }
+    }
+
+    pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
+        service_envelope(self.label, self.owner, operation)
+    }
+
+    pub(crate) fn risk_gate_event(
+        &self,
+        session_id: impl Into<String>,
+        receipt: &RiskGateReceipt,
+    ) -> serde_json::Value {
+        let record = LearningRecord::from_input(GrowthInput {
+            selected_mode: if receipt.approval_required {
+                ExecutionMode::HumanConfirm
+            } else {
+                ExecutionMode::RiskGate
+            },
+            complexity: TaskComplexity::Moderate,
+            risk: if receipt.approval_required {
+                TaskRisk::High
+            } else {
+                TaskRisk::Medium
+            },
+            context_omitted: 0,
+            tool_requires_checkpoint: !matches!(receipt.decision, PolicyDecisionKind::Allow),
+            tool_requires_human_confirm: receipt.approval_required,
+            verification_can_finalize: !receipt.approval_required,
+            bench_passed: true,
+        });
+        let event = GrowthEvent::from_input(GrowthEventInput {
+            session_id: session_id.into(),
+            source_event_kind: "approval.risk_receipt".to_string(),
+            strategy_mode: if receipt.approval_required {
+                ExecutionMode::HumanConfirm
+            } else {
+                ExecutionMode::RiskGate
+            },
+            learning_record: record,
+            evidence_refs: vec![GrowthEvidenceRef::new(
+                "risk_gate_receipt",
+                format!("risk:{}", receipt.issued_at.timestamp_millis()),
+                format!(
+                    "decision={:?} approval_required={}",
+                    receipt.decision, receipt.approval_required
+                ),
+            )],
+        });
+
+        serde_json::json!({
+            "envelope": self.envelope("risk_gate_event"),
+            "event": event,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -229,6 +399,8 @@ pub(crate) struct GatewayServices {
     pub(crate) tool: ToolService,
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
+    pub(crate) provider: ProviderService,
+    pub(crate) growth: GrowthService,
     pub(crate) workspace: WorkspaceService,
     pub(crate) skill: SkillService,
     pub(crate) agent: AgentService,
@@ -383,8 +555,52 @@ impl AuditService {
         self.envelope("audit_projection")
     }
 
+    pub(crate) fn risk_gate_projection_contract(&self) -> ServiceEnvelope {
+        self.envelope("risk_gate_projection")
+    }
+
     fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.approval_projection(), self.audit_projection()]
+        vec![
+            self.approval_projection(),
+            self.audit_projection(),
+            self.risk_gate_projection_contract(),
+        ]
+    }
+}
+
+impl ProviderService {
+    pub(crate) fn config_projection_contract(&self) -> ServiceEnvelope {
+        self.envelope("config_projection")
+    }
+
+    pub(crate) fn model_routing(&self) -> ServiceEnvelope {
+        self.envelope("model_routing")
+    }
+
+    fn contracts(&self) -> Vec<ServiceEnvelope> {
+        vec![self.config_projection_contract(), self.model_routing()]
+    }
+}
+
+impl GrowthService {
+    pub(crate) fn risk_gate_event_contract(&self) -> ServiceEnvelope {
+        self.envelope("risk_gate_event")
+    }
+
+    pub(crate) fn memory_candidates(&self) -> ServiceEnvelope {
+        self.envelope("memory_candidates")
+    }
+
+    pub(crate) fn matrix_signals(&self) -> ServiceEnvelope {
+        self.envelope("matrix_signals")
+    }
+
+    fn contracts(&self) -> Vec<ServiceEnvelope> {
+        vec![
+            self.risk_gate_event_contract(),
+            self.memory_candidates(),
+            self.matrix_signals(),
+        ]
     }
 }
 
@@ -399,14 +615,15 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.346 GatewayServices");
+        assert_eq!(services.owner, "0.9.347 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
             services.service_labels(),
             vec![
                 "runtime",
-                "command",
+                "channel",
+                "slash",
                 "session",
                 "task",
                 "approval",
@@ -416,6 +633,9 @@ mod tests {
                 "tool",
                 "system",
                 "audit",
+                "provider",
+                "growth",
+                "workspace",
                 "skill",
                 "agent",
                 "matrix",
@@ -442,6 +662,23 @@ mod tests {
             services.audit.approval_projection().operation,
             "approval_projection"
         );
+        assert_eq!(
+            services.audit.risk_gate_projection_contract().operation,
+            "risk_gate_projection"
+        );
+        assert_eq!(
+            services.provider.config_projection_contract().operation,
+            "config_projection"
+        );
+        assert_eq!(
+            services.growth.risk_gate_event_contract().operation,
+            "risk_gate_event"
+        );
+        assert!(services
+            .workspace
+            .contracts()
+            .iter()
+            .any(|contract| contract.operation == "overview"));
         let skill_contracts = services.skill.contracts();
         assert!(skill_contracts
             .iter()

@@ -51,12 +51,14 @@ impl GatewayServices {
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
+            provider: ProviderService::new(),
+            growth: GrowthService::new(),
             workspace: WorkspaceService::new(),
             skill: SkillService::new(),
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.346 GatewayServices",
+            owner: "0.9.347 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -125,6 +127,9 @@ impl GatewayServices {
             self.tool.label,
             self.system.label,
             self.audit.label,
+            self.provider.label,
+            self.growth.label,
+            self.workspace.label,
             self.skill.label,
             self.agent.label,
             self.matrix.label,
@@ -144,6 +149,9 @@ impl GatewayServices {
         contracts.extend(self.tool.contracts());
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
+        contracts.extend(self.provider.contracts());
+        contracts.extend(self.growth.contracts());
+        contracts.extend(self.workspace.contracts());
         contracts.extend(self.skill.contracts());
         contracts.extend(self.agent.contracts());
         contracts.extend(self.matrix.contracts());
@@ -161,10 +169,10 @@ impl GatewayServices {
 
         [
             ("session", "chat"),
-            ("command", "registry"),
-            ("command", "projection"),
-            ("command", "resolve"),
-            ("command", "execute"),
+            ("slash", "catalog"),
+            ("slash", "projection"),
+            ("slash", "resolve"),
+            ("slash", "dispatch"),
             ("session", "create"),
             ("session", "list"),
             ("session", "replay"),
@@ -190,6 +198,13 @@ impl GatewayServices {
             ("system", "runtime_summary"),
             ("audit", "approval_projection"),
             ("audit", "audit_projection"),
+            ("audit", "risk_gate_projection"),
+            ("provider", "config_projection"),
+            ("provider", "model_routing"),
+            ("growth", "risk_gate_event"),
+            ("growth", "memory_candidates"),
+            ("growth", "matrix_signals"),
+            ("workspace", "overview"),
             ("skill", "catalog"),
             ("skill", "projection"),
             ("agent", "list"),

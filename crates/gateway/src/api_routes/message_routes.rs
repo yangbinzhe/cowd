@@ -156,6 +156,7 @@ pub(super) fn runtime_run_started_payload(
 pub(super) fn runtime_run_completed_payload(
     session_id: &str,
     run_id: &str,
+    turn_id: Option<&str>,
     profile: ContextProfile,
     status: &str,
     iterations: Option<usize>,
@@ -164,10 +165,13 @@ pub(super) fn runtime_run_completed_payload(
     started_at_ms: u64,
     completed_at_ms: u64,
 ) -> serde_json::Value {
-    let refs = context_envelope_id
+    let mut refs = context_envelope_id
         .as_ref()
         .map(|id| vec![serde_json::json!({"type": "context_envelope", "id": id})])
         .unwrap_or_default();
+    if let Some(turn_id) = turn_id {
+        refs.push(serde_json::json!({"type": "turn", "id": turn_id}));
+    }
     serde_json::json!({
         "type": "RuntimeRun",
         "phase": "completed",
@@ -175,6 +179,7 @@ pub(super) fn runtime_run_completed_payload(
         "parent_run_id": null,
         "kind": "main_turn",
         "session_id": session_id,
+        "turn_id": turn_id,
         "profile": profile,
         "status": status,
         "summary": error
@@ -482,6 +487,7 @@ async fn send_message(
                 runtime_run_completed_payload(
                     &session_id,
                     &run_id,
+                    Some(&turn_id),
                     run_profile,
                     "completed",
                     Some(summary.iterations),
@@ -529,6 +535,7 @@ async fn send_message(
                 runtime_run_completed_payload(
                     &session_id,
                     &run_id,
+                    None,
                     run_profile,
                     if status == StatusCode::REQUEST_TIMEOUT {
                         "timeout"

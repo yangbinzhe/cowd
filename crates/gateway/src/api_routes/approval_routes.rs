@@ -39,6 +39,8 @@ struct ApprovalRespondRequest {
 struct RiskReceiptRequest {
     tool_name: String,
     input: serde_json::Value,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 async fn approval_pending_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -106,11 +108,22 @@ async fn risk_receipt_handler(
         serde_json::Value::String(value) => value,
         value => serde_json::to_string(&value).unwrap_or_default(),
     };
-    state
+    let receipt = state
         .services
         .approval
         .risk_receipt(&body.tool_name, &input)
         .await
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))
+        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let audit = state.services.audit.risk_gate_projection(&receipt);
+    let growth = state.services.growth.risk_gate_event(
+        body.session_id
+            .unwrap_or_else(|| "approval-risk-receipt".to_string()),
+        &receipt,
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "receipt": receipt,
+        "audit": audit,
+        "growth": growth,
+    })))
 }

@@ -12,7 +12,10 @@ use crate::runtime_boundary::{
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
-use ai_kernel::turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus};
+use ai_kernel::{
+    task::{TaskId, TaskTurnBinding},
+    turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus},
+};
 use runtime::agent_collaboration::CollaborationContextResult;
 use session::SessionLeaseRegistry;
 use tokio::time::timeout;
@@ -50,6 +53,7 @@ pub(crate) struct RuntimeService {
     lifecycle_kernel: Arc<SessionLifecycleKernel>,
     started_at: Instant,
     turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
+    turn_bindings: Arc<Mutex<BTreeMap<String, TaskTurnBinding>>>,
 }
 
 impl RuntimeService {
@@ -68,6 +72,7 @@ impl RuntimeService {
             lifecycle_kernel,
             started_at,
             turns: Arc::new(Mutex::new(BTreeMap::new())),
+            turn_bindings: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -102,6 +107,7 @@ impl RuntimeService {
         let snapshot = self.snapshot().await;
         let leases = self.lease_registry.list().await;
         let turns = self.turns_snapshot();
+        let turn_bindings = self.turn_bindings_snapshot();
         serde_json::json!({
             "ok": true,
             "kind": "gateway_runtime_snapshot",
@@ -116,6 +122,7 @@ impl RuntimeService {
             },
             "lifecycle": self.lifecycle_kernel.snapshots().await,
             "turns": turns,
+            "turn_bindings": turn_bindings,
             "transport": {
                 "control": "gateway_http",
                 "projection": "http_optional",
@@ -143,6 +150,7 @@ impl RuntimeService {
         receipt
             .events
             .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Pending));
+        self.record_turn_binding(&input);
         let turn_id = input.turn_id.to_string();
         self.turns
             .lock()
@@ -178,6 +186,7 @@ impl RuntimeService {
         serde_json::json!({
             "ok": true,
             "turns": self.turns_snapshot(),
+            "turn_bindings": self.turn_bindings_snapshot(),
         })
     }
 
@@ -213,6 +222,15 @@ impl RuntimeService {
 
     fn turns_snapshot(&self) -> Vec<TurnReceipt> {
         self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn turn_bindings_snapshot(&self) -> Vec<TaskTurnBinding> {
+        self.turn_bindings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
@@ -325,11 +343,29 @@ impl RuntimeService {
         receipt
             .events
             .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Running));
+        self.record_turn_binding(&input);
         self.turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(input.turn_id.to_string(), receipt.clone());
         receipt
+    }
+
+    fn record_turn_binding(&self, input: &TurnInput) {
+        let Some(task_id) = input
+            .task_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let mut binding =
+            TaskTurnBinding::new(TaskId::from_string(task_id.clone()), input.turn_id.clone());
+        binding.session_id = input.session_id.clone();
+        self.turn_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(input.turn_id.to_string(), binding);
     }
 
     fn finish_turn(
@@ -702,5 +738,13 @@ mod tests {
         assert_eq!(completed.events.len(), 2);
         assert_eq!(completed.events[0].status, TurnStatus::Running);
         assert_eq!(completed.events[1].status, TurnStatus::Completed);
+
+        let snapshot = service.turns_value();
+        assert_eq!(snapshot["turn_bindings"][0]["task_id"], "task-turn");
+        assert_eq!(
+            snapshot["turn_bindings"][0]["turn_id"],
+            running.turn_id.to_string()
+        );
+        assert_eq!(snapshot["turn_bindings"][0]["session_id"], "session-turn");
     }
 }
