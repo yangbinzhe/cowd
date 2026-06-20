@@ -1,7 +1,7 @@
-const DEFAULT_INPUT_COST_PER_MILLION: f64 = 3.0;
-const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 15.0;
-const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 3.75;
-const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 0.30;
+const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
+const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
+const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 18.75;
+const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 1.5;
 
 /// Per-million-token pricing used for cost estimation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,8 +71,13 @@ pub fn heuristic_pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 1.5,
         });
     }
-    if normalized.contains("sonnet") {
-        return Some(ModelPricing::default_sonnet_tier());
+    if normalized.contains("sonnet-4") {
+        return Some(ModelPricing {
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 15.0,
+            cache_creation_cost_per_million: 3.75,
+            cache_read_cost_per_million: 0.30,
+        });
     }
     None
 }
@@ -175,8 +180,8 @@ mod tests {
         };
 
         let cost = usage.estimate_cost_usd();
-        assert_eq!(format_usd(cost.input_cost_usd), "$3.0000");
-        assert_eq!(format_usd(cost.output_cost_usd), "$7.5000");
+        assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
+        assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
         let model_pricing =
             heuristic_pricing_for_model("claude-sonnet-4-6").expect("known model pricing");
         let model_cost = usage.estimate_cost_usd_with_pricing(model_pricing);

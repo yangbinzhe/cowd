@@ -9,25 +9,7 @@ pub use model_protocol::usage::{format_usd, ModelPricing, TokenUsage, UsageCostE
 /// unavailable or the model is not found.
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
-    // First, try the global model registry.
-    if let Some(pricing) = crate::model_registry::global_registry()
-        .pricing_for(model)
-        .map(|p| p.to_model_pricing())
-    {
-        return Some(pricing);
-    }
-
-    // Fallback: heuristic matching for Claude family (legacy).
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("haiku") {
-        return Some(model_protocol::usage::heuristic_pricing_for_model(
-            &normalized,
-        )?);
-    }
-    if normalized.contains("opus") || normalized.contains("sonnet") {
-        return model_protocol::usage::heuristic_pricing_for_model(&normalized);
-    }
-    None
+    model_protocol::model_registry::pricing_for_model(model)
 }
 
 /// Aggregates token usage across a running session.
@@ -119,8 +101,8 @@ mod tests {
         };
 
         let cost = usage.estimate_cost_usd();
-        assert_eq!(format_usd(cost.input_cost_usd), "$3.0000");
-        assert_eq!(format_usd(cost.output_cost_usd), "$7.5000");
+        assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
+        assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
         let model_pricing =
             pricing_for_model("claude-sonnet-4-6").expect("known model pricing should resolve");
         let model_cost = usage.estimate_cost_usd_with_pricing(model_pricing);

@@ -1,5 +1,5 @@
+use model_protocol::model_registry::pricing_for_model;
 use model_protocol::usage::{TokenUsage, UsageCostEstimate};
-use runtime::pricing_for_model;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

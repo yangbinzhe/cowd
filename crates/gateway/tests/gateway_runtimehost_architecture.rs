@@ -321,14 +321,65 @@ fn usage_contracts_are_owned_by_model_protocol_boundary() {
         "runtime keeps session-derived usage tracking"
     );
     assert!(
-        runtime_usage.contains("crate::model_registry::global_registry()"),
-        "runtime keeps dynamic registry-aware pricing lookup"
+        runtime_usage.contains("model_protocol::model_registry::pricing_for_model(model)"),
+        "runtime pricing lookup must delegate to model-protocol registry"
     );
 
     let provider_types = read_repo("crates/provider/src/types.rs");
     assert!(
         provider_types.contains("use model_protocol::usage::{TokenUsage, UsageCostEstimate};"),
         "provider protocol response types must use model-protocol usage contracts"
+    );
+}
+
+#[test]
+fn model_registry_is_owned_by_model_protocol_boundary() {
+    let model_protocol_source = read_repo("crates/model-protocol/src/lib.rs");
+    let model_registry = read_repo("crates/model-protocol/src/model_registry.rs");
+    assert!(
+        model_protocol_source.contains("pub mod model_registry"),
+        "model-protocol must expose model registry protocol metadata"
+    );
+    for contract in [
+        "pub struct ModelRegistry",
+        "pub struct ModelInfo",
+        "pub struct Pricing",
+        "pub struct ModelResolver",
+        "pub fn global_registry",
+        "pub fn pricing_for_model",
+    ] {
+        assert!(
+            model_registry.contains(contract),
+            "model-protocol model registry missing {contract}"
+        );
+    }
+
+    let runtime_registry = read_repo("crates/runtime/src/model_registry.rs");
+    assert_eq!(
+        runtime_registry.trim(),
+        "pub use model_protocol::model_registry::*;",
+        "runtime model_registry must stay a compatibility re-export"
+    );
+
+    let runtime_usage = read_repo("crates/runtime/src/usage.rs");
+    assert!(
+        runtime_usage.contains("model_protocol::model_registry::pricing_for_model(model)"),
+        "runtime pricing lookup must delegate to model-protocol model registry"
+    );
+
+    let provider_sources = [
+        read_repo("crates/provider/src/types.rs"),
+        read_repo("crates/provider/src/providers/mod.rs"),
+    ]
+    .join("\n");
+    assert!(
+        provider_sources.contains("model_protocol::model_registry"),
+        "provider must read model metadata through model-protocol"
+    );
+    assert!(
+        !provider_sources.contains("runtime::model_registry")
+            && !provider_sources.contains("runtime::pricing_for_model"),
+        "provider must not use runtime for model metadata or pricing"
     );
 }
 

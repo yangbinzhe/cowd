@@ -166,7 +166,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    let registry = runtime::model_registry::global_registry();
+    let registry = model_protocol::model_registry::global_registry();
     registry.max_output_tokens_for(model)
 }
 
@@ -180,7 +180,7 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    let registry = runtime::model_registry::global_registry();
+    let registry = model_protocol::model_registry::global_registry();
     let info = registry.get(model)?;
     Some(ModelTokenLimit {
         max_output_tokens: info.max_output_tokens,
