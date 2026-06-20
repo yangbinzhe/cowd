@@ -1,4 +1,6 @@
-use crate::specs::{SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS};
+use crate::specs::{
+    SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
+};
 impl SlashCommand {
     pub fn parse(input: &str) -> Result<Option<Self>, SlashCommandParseError> {
         validate_slash_command_input(input)
@@ -948,4 +950,26 @@ pub fn render_slash_command_help() -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[must_use]
+pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
+    match normalize_optional_args(args) {
+        None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        Some(args) if args == "install" || args.starts_with("install ") => {
+            SkillSlashDispatch::Local
+        }
+        Some("view") => SkillSlashDispatch::Local,
+        Some(args) if args.starts_with("view ") => SkillSlashDispatch::Local,
+        Some("create" | "edit" | "delete" | "generate") => SkillSlashDispatch::Local,
+        Some(args)
+            if args.starts_with("create ")
+                || args.starts_with("edit ")
+                || args.starts_with("delete ")
+                || args.starts_with("generate ") =>
+        {
+            SkillSlashDispatch::Local
+        }
+        Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
+    }
 }

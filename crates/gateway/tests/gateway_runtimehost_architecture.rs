@@ -932,6 +932,18 @@ fn entry_boundary_crates_exist_as_migration_targets() {
             "tui manifest must not depend directly on {forbidden}"
         );
     }
+
+    assert!(
+        !root.join("crates/command/service/src/parser.rs").exists(),
+        "command-service must not duplicate the slash parser owned by command-contract"
+    );
+    let command_service_source = read_repo("crates/command/service/src/lib.rs");
+    assert!(
+        command_service_source.contains("pub use command_contract::{")
+            && command_service_source.contains("classify_skills_slash_command")
+            && !command_service_source.contains("pub mod parser"),
+        "command-service must re-export command-contract parser APIs instead of owning parser logic"
+    );
 }
 
 #[test]
