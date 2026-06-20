@@ -5,6 +5,10 @@
 //! compression-related types.
 
 use chrono::{DateTime, Utc};
+use fact_kernel::{
+    hypothesis::HypothesisBoundary, memory::MemoryCandidate as FactMemoryCandidate, Confidence,
+    FactId, FactRecord, FactSource, Provenance, SourceKind,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -118,6 +122,74 @@ pub struct MemoryEntry {
     pub source_agent: Option<String>,
     /// Agent visibility level for cross-agent sharing.
     pub visibility: AgentVisibility,
+}
+
+impl MemoryEntry {
+    #[must_use]
+    pub fn fact_source(&self) -> FactSource {
+        FactSource {
+            kind: match self.source {
+                MemorySource::UserExplicit => SourceKind::User,
+                MemorySource::AutoExtracted
+                | MemorySource::Compression
+                | MemorySource::Prefetch => SourceKind::Memory,
+                MemorySource::Import => SourceKind::Connector,
+            },
+            id: self.id.to_string(),
+            label: Some(self.title.clone()),
+        }
+    }
+
+    #[must_use]
+    pub fn fact_confidence(&self) -> Confidence {
+        Confidence::from_basis_points(confidence_basis_points(self.confidence))
+    }
+
+    #[must_use]
+    pub fn to_fact_memory_candidate(&self) -> FactMemoryCandidate {
+        FactMemoryCandidate {
+            summary: self.content.clone(),
+            source: self.fact_source(),
+            evidence: Vec::new(),
+            confidence: self.fact_confidence(),
+            boundary: HypothesisBoundary::observed(),
+            tags: self.tags.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_fact_record(&self) -> FactRecord {
+        let mut record = FactRecord::new(
+            memory_category_fact_type(self.category),
+            self.content.clone(),
+        );
+        record.id = FactId::from_string(format!("memory:{}", self.id));
+        record.confidence = self.fact_confidence();
+        record.provenance = vec![Provenance {
+            source: self.fact_source(),
+            observed_at: self.created_at,
+            trace_id: self.session_id.clone(),
+        }];
+        record.created_at = self.created_at;
+        record.updated_at = self.updated_at;
+        record
+    }
+}
+
+fn confidence_basis_points(confidence: f32) -> u16 {
+    (confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16
+}
+
+fn memory_category_fact_type(category: MemoryCategory) -> &'static str {
+    match category {
+        MemoryCategory::UserPreference => "memory.user_preference",
+        MemoryCategory::ProjectConvention => "memory.project_convention",
+        MemoryCategory::Decision => "memory.decision",
+        MemoryCategory::Reference => "memory.reference",
+        MemoryCategory::Shared => "memory.shared",
+        MemoryCategory::CompressedSummary => "memory.compressed_summary",
+        MemoryCategory::ProjectKnowledge => "memory.project_knowledge",
+    }
 }
 
 // --- Memory metadata (frontmatter) ---
@@ -582,4 +654,57 @@ pub struct SearchMemoriesResult {
 
 fn default_search_mode() -> String {
     "keyword".to_string()
+}
+
+#[cfg(test)]
+mod fact_kernel_bridge_tests {
+    use super::*;
+
+    fn sample_entry() -> MemoryEntry {
+        let now = Utc::now();
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Decision,
+            priority: Priority::High,
+            source: MemorySource::AutoExtracted,
+            title: "Gateway boundary".to_string(),
+            content: "Gateway should orchestrate HTTP services only.".to_string(),
+            embedding: None,
+            tags: vec!["architecture".to_string()],
+            relations: Vec::new(),
+            confidence: 0.82,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope: MemoryScope::Project("cowd".to_string()),
+            session_id: Some("session-1".to_string()),
+            source_agent: Some("runtime".to_string()),
+            visibility: AgentVisibility::Private,
+        }
+    }
+
+    #[test]
+    fn memory_entry_projects_to_fact_candidate() {
+        let entry = sample_entry();
+        let candidate = entry.to_fact_memory_candidate();
+
+        assert_eq!(candidate.summary, entry.content);
+        assert_eq!(candidate.source.kind, SourceKind::Memory);
+        assert_eq!(candidate.confidence.basis_points(), 8_200);
+        assert_eq!(candidate.tags, vec!["architecture"]);
+    }
+
+    #[test]
+    fn memory_entry_projects_to_fact_record_with_provenance() {
+        let entry = sample_entry();
+        let record = entry.to_fact_record();
+
+        assert_eq!(record.id.as_str(), format!("memory:{}", entry.id));
+        assert_eq!(record.fact_type, "memory.decision");
+        assert_eq!(record.statement, entry.content);
+        assert_eq!(record.provenance[0].trace_id.as_deref(), Some("session-1"));
+    }
 }

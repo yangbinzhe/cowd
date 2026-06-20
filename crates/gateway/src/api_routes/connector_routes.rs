@@ -6,16 +6,16 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use connector::{
+    default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection,
+    ConnectorHealth, ConnectorHealthStatus, ConnectorRegistrySnapshot, ExternalResourceRef,
+    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, ProviderAccount, ServiceConnector,
+    ServiceToolRequest, ServiceToolResult,
+};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
 use memory::MemoryScope;
-use runtime::{
-    CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
-    ConnectorRegistrySnapshot, ExternalResourceRef, FeishuReadOnlyServiceConnector,
-    MockDocsServiceConnector, ProviderAccount, ServiceConnector, ServiceToolRequest,
-    ServiceToolResult,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::services::GatewayMemoryManager;
@@ -92,7 +92,7 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
     let mut capabilities = base_connector_capabilities().to_vec();
     for platform in platforms {
         for operation in platform.capabilities {
-            let capability = manifest_from_platform_capability(&platform.platform_type, operation);
+            let capability = manifest_from_platform_capability(&platform.platform_type, &operation);
             if !capabilities
                 .iter()
                 .any(|item| item.capability_id == capability.capability_id)
@@ -130,7 +130,7 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
 fn base_connector_capabilities() -> &'static [CapabilityManifest] {
     static BASE_CONNECTOR_CAPABILITIES: OnceLock<Vec<CapabilityManifest>> = OnceLock::new();
     BASE_CONNECTOR_CAPABILITIES.get_or_init(|| {
-        let mut capabilities = runtime::default_capabilities();
+        let mut capabilities = default_capabilities();
         capabilities.extend(MockDocsServiceConnector::new().capabilities());
         capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
         capabilities.dedup_by(|left, right| left.capability_id == right.capability_id);

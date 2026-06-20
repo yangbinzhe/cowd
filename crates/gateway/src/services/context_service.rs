@@ -1,11 +1,12 @@
 use std::{collections::HashMap, path::Path};
 
+use connector::ExternalResourceRef;
 use matrix_core::MatrixEvidencePacket;
 use memory::store::session::SessionEvent;
 use runtime::{
     AgentContextLease, AgentReturnRequirement, ContextAuthority, ContextEnvelope,
     ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission, ContextProfile,
-    ContextRole, ContextSourceKind, ContextVisibility, ExternalResourceRef,
+    ContextRole, ContextSourceKind, ContextVisibility,
 };
 
 use super::{

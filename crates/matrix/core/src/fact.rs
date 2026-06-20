@@ -1,4 +1,8 @@
 use chrono::{DateTime, Utc};
+use fact_kernel::{
+    hypothesis::HypothesisBoundary, matrix::MatrixFact as KernelMatrixFact, Confidence, FactId,
+    FactSource, SourceKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -71,6 +75,90 @@ impl MatrixFact {
             raw_hash,
         }
     }
+
+    #[must_use]
+    pub fn to_fact_kernel_matrix_fact(&self) -> KernelMatrixFact {
+        KernelMatrixFact {
+            id: FactId::from_string(self.fact_id.clone()),
+            entity: self
+                .entity_refs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.snapshot_id.clone()),
+            predicate: self.fact_type.clone(),
+            value: serde_json::json!({
+                "metric_key": self.metric_key,
+                "dimensions": self.dimensions,
+                "measures": self.measures,
+                "event_time": self.event_time,
+                "valid_from": self.valid_from,
+                "valid_to": self.valid_to,
+                "raw_hash": self.raw_hash,
+            }),
+            source: FactSource {
+                kind: SourceKind::Matrix,
+                id: self
+                    .source_ref
+                    .clone()
+                    .unwrap_or_else(|| self.snapshot_id.clone()),
+                label: self.metric_key.clone(),
+            },
+            evidence: Vec::new(),
+            confidence: Confidence::from_basis_points(confidence_basis_points(self.confidence)),
+            boundary: HypothesisBoundary::observed(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_fact_kernel_matrix_fact(
+        fact: KernelMatrixFact,
+        snapshot_id: impl Into<String>,
+    ) -> Self {
+        let dimensions = fact
+            .value
+            .get("dimensions")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let measures = fact
+            .value
+            .get("measures")
+            .cloned()
+            .unwrap_or_else(|| fact.value.clone());
+        let event_time = fact
+            .value
+            .get("event_time")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(Utc::now);
+        Self::from_input(MatrixFactInput {
+            fact_id: Some(fact.id.as_str().to_string()),
+            snapshot_id: Some(snapshot_id.into()),
+            fact_type: fact.predicate,
+            entity_refs: vec![fact.entity],
+            metric_key: fact.source.label,
+            dimensions,
+            measures,
+            event_time: Some(event_time),
+            valid_from: fact
+                .value
+                .get("valid_from")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            valid_to: fact
+                .value
+                .get("valid_to")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            source_ref: Some(fact.source.id),
+            confidence: Some(f32::from(fact.confidence.basis_points()) / 10_000.0),
+            raw_hash: fact
+                .value
+                .get("raw_hash")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+}
+
+fn confidence_basis_points(confidence: f32) -> u16 {
+    (confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,4 +195,65 @@ fn stable_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
+}
+
+#[cfg(test)]
+mod fact_kernel_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn matrix_fact_projects_to_fact_kernel_fact() {
+        let fact = MatrixFact::from_input(MatrixFactInput {
+            fact_id: Some("fact-1".to_string()),
+            snapshot_id: Some("snapshot-1".to_string()),
+            fact_type: AI_GROWTH_SIGNAL_FACT.to_string(),
+            entity_refs: vec!["agent:coder".to_string()],
+            metric_key: Some("success_rate".to_string()),
+            dimensions: serde_json::json!({"task": "refactor"}),
+            measures: serde_json::json!({"score": 0.91}),
+            event_time: Some(Utc::now()),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("eval://run-1".to_string()),
+            confidence: Some(0.91),
+            raw_hash: Some("sha256:test".to_string()),
+        });
+
+        let kernel_fact = fact.to_fact_kernel_matrix_fact();
+
+        assert_eq!(kernel_fact.id.as_str(), "fact-1");
+        assert_eq!(kernel_fact.entity, "agent:coder");
+        assert_eq!(kernel_fact.predicate, AI_GROWTH_SIGNAL_FACT);
+        assert_eq!(kernel_fact.confidence.basis_points(), 9_100);
+        assert_eq!(kernel_fact.source.id, "eval://run-1");
+    }
+
+    #[test]
+    fn matrix_fact_round_trips_from_fact_kernel_fact() {
+        let original = MatrixFact::from_input(MatrixFactInput {
+            fact_id: Some("fact-2".to_string()),
+            snapshot_id: Some("snapshot-2".to_string()),
+            fact_type: AI_EVAL_RESULT_FACT.to_string(),
+            entity_refs: vec!["harness:gateway".to_string()],
+            metric_key: Some("architecture_health".to_string()),
+            dimensions: serde_json::json!({"area": "gateway"}),
+            measures: serde_json::json!({"score": 1.0}),
+            event_time: Some(Utc::now()),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("test://architecture".to_string()),
+            confidence: Some(1.0),
+            raw_hash: Some("sha256:roundtrip".to_string()),
+        });
+
+        let restored =
+            MatrixFact::from_fact_kernel_matrix_fact(original.to_fact_kernel_matrix_fact(), "s3");
+
+        assert_eq!(restored.fact_id, original.fact_id);
+        assert_eq!(restored.snapshot_id, "s3");
+        assert_eq!(restored.fact_type, original.fact_type);
+        assert_eq!(restored.entity_refs, original.entity_refs);
+        assert_eq!(restored.metric_key, original.metric_key);
+        assert_eq!(restored.confidence, original.confidence);
+    }
 }

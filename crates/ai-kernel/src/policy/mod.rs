@@ -13,6 +13,7 @@ pub enum PermissionResource {
     Provider,
     Connector,
     Channel,
+    Tool,
     Memory,
     Matrix,
     Session,

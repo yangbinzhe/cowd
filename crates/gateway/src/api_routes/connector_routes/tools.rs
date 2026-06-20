@@ -212,7 +212,7 @@ pub(super) async fn feishu_readonly_execute_handler(
     let connector = FeishuReadOnlyServiceConnector::new();
     let snapshot = connector_snapshot(&state);
     let health = connector.probe(&snapshot.accounts);
-    let account_ready = matches!(health.status, runtime::ConnectorHealthStatus::Ready);
+    let account_ready = matches!(health.status, ConnectorHealthStatus::Ready);
     let mode = request.mode.as_deref().unwrap_or("dry_run");
     let idempotency_key = request
         .idempotency_key

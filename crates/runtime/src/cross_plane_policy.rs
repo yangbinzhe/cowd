@@ -5,6 +5,7 @@
 //! returns a stable decision that UI, audit, and runtime routing can consume.
 
 use chrono::{DateTime, Utc};
+use connector::{CrossPlaneRisk, DataClassification};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,24 +23,6 @@ pub enum IdentityTrust {
     Claimed,
     Observed,
     Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CrossPlaneRisk {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DataClassification {
-    Public,
-    Internal,
-    Confidential,
-    Secret,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

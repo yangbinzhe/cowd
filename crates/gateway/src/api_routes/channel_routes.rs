@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use channel::{channel_required_fields, ChannelContract};
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -53,7 +54,7 @@ pub(super) struct PlatformReadiness {
     pub(super) missing_required: Vec<String>,
     #[serde(default)]
     pub(super) scopes: Vec<String>,
-    pub(super) capabilities: Vec<&'static str>,
+    pub(super) capabilities: Vec<String>,
     pub(super) diagnostics: Vec<String>,
 }
 
@@ -134,7 +135,12 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
         .get("enabled")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    let required = required_fields(&platform_type);
+    let contract = ChannelContract::for_channel(&platform_type);
+    let required = contract
+        .required_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let missing_required = required
         .iter()
         .filter(|field| !has_non_empty(value, field))
@@ -169,12 +175,13 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
         credential_present,
         missing_required,
         scopes: platform_scopes_from_value(value),
-        capabilities: platform_capabilities(&platform_type),
+        capabilities: contract.operation_names(),
         diagnostics,
     })
 }
 
 fn disabled_platform(platform_type: &str) -> PlatformReadiness {
+    let contract = ChannelContract::for_channel(platform_type);
     PlatformReadiness {
         name: platform_type.to_string(),
         platform_type: platform_type.to_string(),
@@ -182,12 +189,13 @@ fn disabled_platform(platform_type: &str) -> PlatformReadiness {
         status: "disabled",
         configured: false,
         credential_present: false,
-        missing_required: required_fields(platform_type)
+        missing_required: contract
+            .required_fields
             .iter()
-            .map(|field| (*field).to_string())
+            .map(|field| field.to_string())
             .collect(),
         scopes: Vec::new(),
-        capabilities: platform_capabilities(platform_type),
+        capabilities: contract.operation_names(),
         diagnostics: vec!["platform is not configured".to_string()],
     }
 }
@@ -213,23 +221,7 @@ fn platform_scopes_from_value(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn required_fields(platform_type: &str) -> Vec<&'static str> {
-    match platform_type {
-        "feishu" => vec!["app_id", "app_secret"],
-        "wecom" => vec!["corp_id", "corp_secret", "agent_id"],
-        "wechat-ilink" | "wechat_ilink" | "wechat" => Vec::new(),
-        "email" => vec!["smtp_server", "username", "password"],
-        _ => Vec::new(),
-    }
-}
-
-fn platform_capabilities(platform_type: &str) -> Vec<&'static str> {
-    match platform_type {
-        "feishu" => vec!["send_text", "send_image", "send_file", "doc_ops"],
-        "wecom" => vec!["send_text", "callback"],
-        "wechat-ilink" | "wechat_ilink" | "wechat" => vec!["qr_login", "send_text"],
-        "email" => vec!["send_email"],
-        _ => Vec::new(),
-    }
+    channel_required_fields(platform_type)
 }
 
 fn credential_field(field: &str) -> bool {

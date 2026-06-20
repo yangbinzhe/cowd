@@ -13,10 +13,16 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, RwLock};
 
+use ai_kernel::policy::{
+    PermissionOperation, PermissionResource, PermissionScope,
+    PolicyDecisionKind as KernelPolicyDecisionKind, RiskAssessment, RiskGateReceipt,
+    RiskLevel as KernelRiskLevel,
+};
+
 use crate::config::ApprovalConfig;
 use crate::permission_enforcer::{
     ApprovalPersistence, ApprovalRequest, ApprovalVerdict, AutoPassReason,
-    DestructivePatternDetector, SmartApprovalVerdict,
+    DestructivePatternDetector, RiskLevel as RuntimeRiskLevel, SmartApprovalVerdict,
 };
 use crate::platform::adapter::PlatformAdapter;
 use crate::platform::feishu::{ApprovalCard, FeishuAdapter};
@@ -309,6 +315,62 @@ impl SmartApprovalGate {
         }
     }
 
+    /// Return a kernel-level risk receipt without blocking for user approval.
+    pub async fn policy_receipt(&self, tool_name: &str, input: &str) -> RiskGateReceipt {
+        let scope = approval_permission_scope(tool_name, input);
+        if READ_ONLY_TOOLS.contains(&tool_name) {
+            return risk_gate_receipt(
+                scope,
+                KernelRiskLevel::Low,
+                KernelPolicyDecisionKind::Allow,
+                false,
+                "read-only tool auto-pass",
+            );
+        }
+        if !Self::is_bash_tool(tool_name) {
+            return risk_gate_receipt(
+                scope,
+                KernelRiskLevel::Low,
+                KernelPolicyDecisionKind::Allow,
+                false,
+                "non-shell tool delegates to its permission boundary",
+            );
+        }
+
+        let command = Self::extract_command(input);
+        let config = self.config.read().await;
+        let verdict = self.detector.detect_with_config(&command, &config);
+        drop(config);
+
+        match verdict {
+            SmartApprovalVerdict::AutoPass { reason } => risk_gate_receipt(
+                scope,
+                KernelRiskLevel::Low,
+                KernelPolicyDecisionKind::Allow,
+                false,
+                format!("approval gate auto-pass: {reason:?}"),
+            ),
+            SmartApprovalVerdict::NeedsApproval(request) => {
+                let risk = runtime_risk_to_kernel(request.risk_level);
+                let decision = if risk == KernelRiskLevel::Critical {
+                    KernelPolicyDecisionKind::Escalate
+                } else {
+                    KernelPolicyDecisionKind::Ask
+                };
+                risk_gate_receipt(
+                    scope,
+                    risk,
+                    decision,
+                    true,
+                    format!(
+                        "approval required for patterns: {}",
+                        request.matched_patterns.join(", ")
+                    ),
+                )
+            }
+        }
+    }
+
     /// Submit an approval request and wait for the user's response.
     ///
     /// This creates a oneshot channel, registers the request in the pending
@@ -579,6 +641,56 @@ impl SmartApprovalGate {
     }
 }
 
+fn approval_permission_scope(tool_name: &str, input: &str) -> PermissionScope {
+    let mut scope = if SmartApprovalGate::is_bash_tool(tool_name) {
+        PermissionScope::new(PermissionResource::Shell, PermissionOperation::Execute)
+    } else if READ_ONLY_TOOLS.contains(&tool_name)
+        && (tool_name.contains("file")
+            || tool_name.contains("grep")
+            || tool_name.contains("glob")
+            || tool_name.contains("directory"))
+    {
+        PermissionScope::new(PermissionResource::File, PermissionOperation::Read)
+    } else if READ_ONLY_TOOLS.contains(&tool_name) && tool_name.contains("web") {
+        PermissionScope::new(PermissionResource::Network, PermissionOperation::Read)
+    } else if tool_name.contains("file") {
+        PermissionScope::new(PermissionResource::File, PermissionOperation::Write)
+    } else {
+        PermissionScope::new(PermissionResource::Tool, PermissionOperation::Call)
+    };
+    scope.target = Some(SmartApprovalGate::extract_command(input));
+    scope
+}
+
+fn runtime_risk_to_kernel(risk: RuntimeRiskLevel) -> KernelRiskLevel {
+    match risk {
+        RuntimeRiskLevel::Low => KernelRiskLevel::Low,
+        RuntimeRiskLevel::Medium => KernelRiskLevel::Medium,
+        RuntimeRiskLevel::High => KernelRiskLevel::High,
+        RuntimeRiskLevel::Critical => KernelRiskLevel::Critical,
+    }
+}
+
+fn risk_gate_receipt(
+    scope: PermissionScope,
+    risk: KernelRiskLevel,
+    decision: KernelPolicyDecisionKind,
+    approval_required: bool,
+    reason: impl Into<String>,
+) -> RiskGateReceipt {
+    RiskGateReceipt {
+        scope,
+        risk: RiskAssessment {
+            level: risk,
+            reasons: vec![reason.into()],
+            assessed_at: chrono::Utc::now(),
+        },
+        decision,
+        approval_required,
+        issued_at: chrono::Utc::now(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +725,38 @@ mod tests {
                 reason: AutoPassReason::ReadOnlyCommand
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_policy_receipt_allows_without_approval() {
+        let gate = make_gate(ApprovalConfig::default());
+        let receipt = gate
+            .policy_receipt("read_file", r#"{"path": "/tmp/plan.md"}"#)
+            .await;
+
+        assert_eq!(receipt.decision, KernelPolicyDecisionKind::Allow);
+        assert_eq!(receipt.risk.level, KernelRiskLevel::Low);
+        assert!(!receipt.approval_required);
+        assert_eq!(receipt.scope.resource, PermissionResource::File);
+    }
+
+    #[tokio::test]
+    async fn destructive_shell_policy_receipt_requires_approval() {
+        let gate = make_gate(ApprovalConfig {
+            auto_pass_low_risk: false,
+            solo_mode: false,
+            ..ApprovalConfig::default()
+        });
+        let receipt = gate
+            .policy_receipt("bash", r#"{"command": "rm -rf target"}"#)
+            .await;
+
+        assert!(matches!(
+            receipt.decision,
+            KernelPolicyDecisionKind::Ask | KernelPolicyDecisionKind::Escalate
+        ));
+        assert!(receipt.approval_required);
+        assert_eq!(receipt.scope.resource, PermissionResource::Shell);
     }
 
     #[tokio::test]

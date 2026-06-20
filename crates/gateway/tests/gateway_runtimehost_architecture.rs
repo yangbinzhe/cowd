@@ -260,25 +260,197 @@ fn external_boundary_crates_do_not_depend_on_runtime_or_gateway() {
         let manifest_path = format!("crates/{crate_name}/Cargo.toml");
         let manifest = read_repo(&manifest_path);
         let dependencies = manifest_dependencies(&manifest);
-        for forbidden in [
-            "gateway",
-            "runtime",
-            "memory",
-            "matrix-repository",
-            "provider",
-            "mcp",
-            "plugins",
-            "tools",
-            "axum",
-            "reqwest",
-            "rusqlite",
-        ] {
+        let forbidden_dependencies: &[&str] = if crate_name == "connector" {
+            &[
+                "gateway",
+                "runtime",
+                "memory",
+                "matrix-repository",
+                "provider",
+                "mcp",
+                "plugins",
+                "tools",
+                "axum",
+                "reqwest",
+            ]
+        } else {
+            &[
+                "gateway",
+                "runtime",
+                "memory",
+                "matrix-repository",
+                "provider",
+                "mcp",
+                "plugins",
+                "tools",
+                "axum",
+                "reqwest",
+                "rusqlite",
+            ]
+        };
+        for forbidden in forbidden_dependencies {
             assert!(
                 !dependencies.contains(forbidden),
                 "{crate_name} must not depend on implementation crate {forbidden}"
             );
         }
     }
+}
+
+#[test]
+fn connector_is_independent_external_resource_boundary() {
+    let root = repo_root();
+    assert!(
+        !root.join("crates/runtime/src/connector.rs").exists(),
+        "runtime must not retain connector implementation after connector crate extraction"
+    );
+    let connector_manifest = read_repo("crates/connector/Cargo.toml");
+    let connector_dependencies = manifest_dependencies(&connector_manifest);
+    assert!(
+        connector_dependencies.contains("storage = { path = \"../storage\" }")
+            && connector_dependencies.contains("rusqlite"),
+        "connector must own its resource directory persistence boundary"
+    );
+
+    let runtime_lib = production_part(&read_repo("crates/runtime/src/lib.rs")).to_string();
+    assert!(
+        !runtime_lib.contains("pub mod connector") && !runtime_lib.contains("pub use connector::{"),
+        "runtime must not republish connector as a compatibility module"
+    );
+
+    let runtime_cross_plane =
+        production_part(&read_repo("crates/runtime/src/cross_plane_policy.rs")).to_string();
+    assert!(
+        runtime_cross_plane.contains("use connector::{CrossPlaneRisk, DataClassification};"),
+        "runtime policy must consume connector-owned risk/data contracts"
+    );
+
+    let gateway_connector_route = production_part(&read_repo(
+        "crates/gateway/src/api_routes/connector_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        gateway_connector_route.contains("use connector::{"),
+        "gateway connector routes must import connector contracts directly"
+    );
+    for forbidden in [
+        "runtime::default_capabilities",
+        "runtime::Connector",
+        "runtime::ExternalResourceRef",
+        "runtime::ProviderAccount",
+        "runtime::ServiceConnector",
+        "runtime::SqliteResourceDirectory",
+    ] {
+        assert!(
+            !gateway_connector_route.contains(forbidden),
+            "gateway connector route must not use old runtime connector path {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn channel_contracts_drive_gateway_platform_readiness() {
+    let channel_source = production_part(&read_repo("crates/channel/src/lib.rs")).to_string();
+    for required in [
+        "pub struct ChannelContract",
+        "pub fn channel_required_fields",
+        "pub fn channel_operations",
+        "pub fn normalize_channel",
+    ] {
+        assert!(
+            channel_source.contains(required),
+            "channel contract missing {required}"
+        );
+    }
+
+    let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
+    assert!(
+        manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
+        "gateway must depend on channel for platform/channel contracts"
+    );
+    let channel_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/channel_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        channel_routes.contains("use channel::{channel_required_fields, ChannelContract};"),
+        "gateway channel routes must consume channel contract"
+    );
+    assert!(
+        !channel_routes.contains("fn platform_capabilities"),
+        "gateway must not own a duplicate platform capability table"
+    );
+}
+
+#[test]
+fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
+    let memory_manifest = read_repo("crates/memory/Cargo.toml");
+    assert!(
+        manifest_dependencies(&memory_manifest)
+            .contains("fact-kernel = { path = \"../fact-kernel\" }"),
+        "memory must depend on fact-kernel for non-structured fact semantics"
+    );
+    let memory_types = production_part(&read_repo("crates/memory/src/types.rs")).to_string();
+    for required in [
+        "to_fact_memory_candidate",
+        "to_fact_record",
+        "FactMemoryCandidate",
+        "HypothesisBoundary::observed()",
+    ] {
+        assert!(
+            memory_types.contains(required),
+            "memory fact bridge missing {required}"
+        );
+    }
+
+    let matrix_manifest = read_repo("crates/matrix/core/Cargo.toml");
+    assert!(
+        manifest_dependencies(&matrix_manifest)
+            .contains("fact-kernel = { path = \"../../fact-kernel\" }"),
+        "matrix-core must depend on fact-kernel for structured fact semantics"
+    );
+    let matrix_fact = production_part(&read_repo("crates/matrix/core/src/fact.rs")).to_string();
+    for required in [
+        "to_fact_kernel_matrix_fact",
+        "from_fact_kernel_matrix_fact",
+        "KernelMatrixFact",
+        "HypothesisBoundary::observed()",
+    ] {
+        assert!(
+            matrix_fact.contains(required),
+            "matrix fact bridge missing {required}"
+        );
+    }
+}
+
+#[test]
+fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
+    let runtime_approval =
+        production_part(&read_repo("crates/runtime/src/approval_gate.rs")).to_string();
+    assert!(
+        runtime_approval.contains("use ai_kernel::policy::{"),
+        "runtime approval gate must consume ai-kernel policy contracts"
+    );
+    for required in [
+        "pub async fn policy_receipt",
+        "RiskGateReceipt",
+        "PermissionScope",
+        "KernelPolicyDecisionKind::Ask",
+        "KernelPolicyDecisionKind::Escalate",
+    ] {
+        assert!(
+            runtime_approval.contains(required),
+            "runtime approval policy bridge missing {required}"
+        );
+    }
+
+    let ai_policy = production_part(&read_repo("crates/ai-kernel/src/policy/mod.rs")).to_string();
+    assert!(
+        ai_policy.contains("pub enum PermissionResource")
+            && ai_policy.contains("Tool")
+            && ai_policy.contains("pub struct RiskGateReceipt"),
+        "ai-kernel policy must expose generic tool risk-gate contracts"
+    );
 }
 
 #[test]

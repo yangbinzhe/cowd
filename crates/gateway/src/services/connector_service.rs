@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use connector::{ExternalResourceRef, SqliteResourceDirectory};
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
-    CrossPlanePolicyDecision, ExternalResourceRef, PolicyDecisionKind, SqliteResourceDirectory,
+    CrossPlanePolicyDecision, PolicyDecisionKind,
 };
 
 use super::{ConnectorService, CrossPlaneExecutionRecord, CrossPlaneService, ServiceEnvelope};

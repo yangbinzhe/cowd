@@ -10,14 +10,14 @@ use app_mfg::{
     MfgMetricRecomputeResult, MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError,
     MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
 };
+use connector::{CrossPlaneRisk, DataClassification};
 use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
-    CrossPlanePolicyDecision, CrossPlaneRisk, DataClassification, IdentityTrust,
-    PolicyDecisionKind,
+    CrossPlanePolicyDecision, IdentityTrust, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,7 +103,7 @@ impl MfgService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mfg",
-            owner: "0.9.337 GatewayServices",
+            owner: "0.9.338 GatewayServices",
         }
     }
 

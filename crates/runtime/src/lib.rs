@@ -66,7 +66,6 @@ pub mod agent_workgraph;
 pub mod ai_kernel;
 pub mod approval_gate;
 pub mod checkpoint;
-pub mod connector;
 pub mod context_fanout;
 pub mod cowd_event;
 pub mod cross_plane_policy;
@@ -153,14 +152,6 @@ pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
 };
-pub use connector::{
-    default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadGuard,
-    ConnectorBulkheadRejection, ConnectorHealth, ConnectorHealthStatus, ConnectorPlane,
-    ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
-    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, ProviderAccount, ResourceDirectory,
-    ServiceConnector, ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
-    SqliteResourceDirectory,
-};
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
@@ -176,8 +167,8 @@ pub use cross_plane_policy::{
     CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
     CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
-    CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity, CrossPlaneRisk,
-    CrossPlaneSummary, DataClassification, GrantType, IdentityTrust, PolicyDecisionKind,
+    CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity,
+    CrossPlaneSummary, GrantType, IdentityTrust, PolicyDecisionKind,
 };
 pub use doc_ingestion::{
     ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,
