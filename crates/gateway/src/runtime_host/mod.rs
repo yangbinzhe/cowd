@@ -23,13 +23,15 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+use channel_adapters::mirror::MessageMirror;
+use channel_adapters::platform::config::PlatformRuntimeConfig;
+use channel_adapters::platform::{
+    InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime,
+};
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
-use runtime::mirror::MessageMirror;
-use runtime::platform::config::PlatformRuntimeConfig;
-use runtime::platform::{InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime};
 use runtime::{ContentBlock, ConversationMessage, McpServerManager, RuntimeConfig};
 use tools::GlobalToolRegistry;
 
@@ -936,7 +938,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                         }
                     }
                 }
-                match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
+                match channel_adapters::platform::feishu::create_feishu_adapter(&settings_json) {
                     Ok(adapter) => {
                         let app_id = pc
                             .settings
@@ -959,7 +961,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                         .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
                         .unwrap_or_default()
                 );
-                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
+                match channel_adapters::platform::wechat_ilink::create_wechat_ilink_adapter(
+                    &settings_json,
+                ) {
                     Ok(adapter) => {
                         tracing::info!("wechat_ilink adapter created successfully");
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
@@ -970,7 +974,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 }
             }
             "email" | "mail" => {
-                match runtime::platform::email::create_email_adapter(&settings_json) {
+                match channel_adapters::platform::email::create_email_adapter(&settings_json) {
                     Ok(adapter) => {
                         tracing::info!("email adapter created");
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
@@ -980,18 +984,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     Err(e) => tracing::error!("failed to create email adapter: {e}"),
                 }
             }
-            "wecom" => match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
-                Ok(adapter) => {
-                    if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                        tracing::error!("failed to register wecom adapter: {e}");
-                    } else {
-                        tracing::info!("wecom adapter created and registered");
+            "wecom" => {
+                match channel_adapters::platform::wecom::create_wecom_adapter(&settings_json) {
+                    Ok(adapter) => {
+                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                            tracing::error!("failed to register wecom adapter: {e}");
+                        } else {
+                            tracing::info!("wecom adapter created and registered");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("wecom adapter init failed: {e}");
                     }
                 }
-                Err(e) => {
-                    tracing::error!("wecom adapter init failed: {e}");
-                }
-            },
+            }
             other => {
                 tracing::warn!("unknown platform type: {other}");
             }
@@ -1205,8 +1211,8 @@ mod tests {
     #[test]
     fn platform_session_id_is_stable_and_safe() {
         let message = InboundMessage {
-            platform: runtime::platform::Platform::WeChat,
-            session_key: runtime::platform::SessionKey::new(
+            platform: channel_adapters::platform::Platform::WeChat,
+            session_key: channel_adapters::platform::SessionKey::new(
                 "wechat_ilink",
                 "o9cq8003hLBXjG9UUzafDuDSS1hM@im.wechat",
             ),
@@ -1214,7 +1220,7 @@ mod tests {
             sender_name: None,
             timestamp: chrono::Utc::now(),
             metadata: serde_json::json!({}),
-            message_type: runtime::platform::MessageType::Text,
+            message_type: channel_adapters::platform::MessageType::Text,
             message_id: Some("msg-1".to_string()),
             reply_to_message_id: None,
             media_urls: vec![],

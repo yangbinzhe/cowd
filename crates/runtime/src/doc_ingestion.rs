@@ -2,9 +2,34 @@
 //!
 //! Provides tools for classifying and ingesting documents into the memory system.
 
-use crate::platform::feishu::doc::DocumentContent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentContent {
+    pub title: String,
+    pub body: String,
+    pub source: Option<String>,
+    pub author: Option<String>,
+    pub created_at: Option<String>,
+    pub modified_at: Option<String>,
+    pub language: Option<String>,
+}
+
+impl DocumentContent {
+    #[must_use]
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            source: None,
+            author: None,
+            created_at: None,
+            modified_at: None,
+            language: None,
+        }
+    }
+}
 
 /// Document category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -201,13 +226,7 @@ impl DocumentClassifier {
             let pattern_matches = rule
                 .patterns
                 .iter()
-                .filter(|p| {
-                    content
-                        .metadata
-                        .title
-                        .to_lowercase()
-                        .contains(&p.to_lowercase())
-                })
+                .filter(|p| content.title.to_lowercase().contains(&p.to_lowercase()))
                 .count();
 
             if keyword_matches > 0 || pattern_matches > 0 {
@@ -222,7 +241,7 @@ impl DocumentClassifier {
         }
 
         // Title-based scoring
-        let title_lower = content.metadata.title.to_lowercase();
+        let title_lower = content.title.to_lowercase();
         if title_lower.contains("api") || title_lower.contains("reference") {
             *scores.entry(DocumentCategory::ApiReference).or_insert(0.0) += 0.4;
             reasoning.push("Title suggests API Reference".to_string());
@@ -268,16 +287,19 @@ impl DocumentClassifier {
         let suggested_layer = best_category.layer_priority();
 
         let metadata = DocumentMetadata {
-            title: content.metadata.title.clone(),
+            title: content.title.clone(),
             category: best_category,
             confidence,
             keywords,
             tags,
-            source: None,
-            author: None,
-            created_at: Some(content.metadata.created_at.to_rfc3339()),
-            modified_at: Some(content.metadata.updated_at.to_rfc3339()),
-            language: "zh-CN".to_string(), // Default, should detect from content
+            source: content.source.clone(),
+            author: content.author.clone(),
+            created_at: content.created_at.clone(),
+            modified_at: content.modified_at.clone(),
+            language: content
+                .language
+                .clone()
+                .unwrap_or_else(|| "zh-CN".to_string()),
         };
 
         reasoning.push(format!(
@@ -294,25 +316,7 @@ impl DocumentClassifier {
 
     /// Extract plain text from document content.
     fn extract_text(&self, content: &DocumentContent) -> String {
-        use crate::platform::feishu::doc::DocumentElement;
-
-        let mut text = String::new();
-        for element in &content.elements {
-            match element {
-                DocumentElement::Paragraph { elements, .. }
-                | DocumentElement::Heading { elements, .. }
-                | DocumentElement::CodeBlock { elements, .. }
-                | DocumentElement::Quote { elements, .. } => {
-                    for e in elements {
-                        text.push_str(&e.text);
-                        text.push(' ');
-                    }
-                    text.push('\n');
-                }
-                _ => {}
-            }
-        }
-        text
+        content.body.clone()
     }
 
     /// Extract keywords from text.
@@ -607,32 +611,8 @@ impl Default for DocumentIngestor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::feishu::doc::{
-        DocumentElement, DocumentMetadata as FeishuDocMeta, TextElement,
-    };
-    use chrono::Utc;
-
     fn create_test_doc(title: &str, text: &str) -> DocumentContent {
-        DocumentContent {
-            metadata: FeishuDocMeta {
-                token: "test_token".to_string(),
-                doc_type: crate::platform::feishu::doc::DocumentType::Doc,
-                title: title.to_string(),
-                owner_open_id: "test_user".to_string(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                is_folder: false,
-                parent_token: None,
-            },
-            elements: vec![DocumentElement::Paragraph {
-                elements: vec![TextElement {
-                    text: text.to_string(),
-                    style: None,
-                }],
-                style: None,
-            }],
-            raw_blocks: vec![],
-        }
+        DocumentContent::new(title, text)
     }
 
     #[test]

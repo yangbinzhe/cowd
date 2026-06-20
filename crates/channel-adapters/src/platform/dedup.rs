@@ -35,7 +35,7 @@ fn now_secs() -> i64 {
 /// # Example
 ///
 /// ```ignore
-/// use runtime::platform::dedup::DedupStore;
+/// use channel_adapters::platform::dedup::DedupStore;
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let store = DedupStore::new(10, 3600);

@@ -24,9 +24,6 @@ use crate::permission_enforcer::{
     ApprovalPersistence, ApprovalRequest, ApprovalVerdict, AutoPassReason,
     DestructivePatternDetector, RiskLevel as RuntimeRiskLevel, SmartApprovalVerdict,
 };
-use crate::platform::adapter::PlatformAdapter;
-use crate::platform::feishu::{ApprovalCard, FeishuAdapter};
-
 /// Result of evaluating a command through the approval gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApprovalGateResult {
@@ -168,8 +165,6 @@ pub struct SmartApprovalGate {
     /// Persistent approval history store.
     history: Arc<ApprovalHistoryStore>,
     session_approved: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    feishu_adapter: Option<Arc<FeishuAdapter>>,
-    card_approval_map: Arc<RwLock<HashMap<u64, (String, String, String)>>>,
 }
 
 /// Tools that are inherently read-only and never need approval.
@@ -196,8 +191,6 @@ impl SmartApprovalGate {
             sse_sender: None,
             history: Arc::new(ApprovalHistoryStore::new(history_path)),
             session_approved: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            feishu_adapter: None,
-            card_approval_map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -206,21 +199,6 @@ impl SmartApprovalGate {
     pub fn with_sse_sender(mut self, sender: Arc<dyn ApprovalSseSender>) -> Self {
         self.sse_sender = Some(sender);
         self
-    }
-
-    /// Attach a Feishu adapter for sending interactive approval cards.
-    #[must_use]
-    pub fn with_feishu_adapter(mut self, adapter: Arc<FeishuAdapter>) -> Self {
-        self.feishu_adapter = Some(adapter);
-        self
-    }
-
-    pub fn feishu_adapter(&self) -> Option<&Arc<FeishuAdapter>> {
-        self.feishu_adapter.as_ref()
-    }
-
-    pub fn card_approval_map(&self) -> &Arc<RwLock<HashMap<u64, (String, String, String)>>> {
-        &self.card_approval_map
     }
 
     /// Get a reference to the approval config (for API endpoints).
@@ -477,103 +455,6 @@ impl SmartApprovalGate {
         }
         // Fall back to raw input
         input.to_string()
-    }
-
-    /// Send an interactive approval card via the Feishu adapter.
-    ///
-    /// Returns the Feishu message ID and the card's approval ID on success.
-    /// The caller should store the `card_approval_id` for later resolution
-    /// via [`resolve_approval_by_card`].
-    pub async fn send_approval_card(
-        &self,
-        chat_id: &str,
-        request_id: &str,
-    ) -> Option<(u64, String)> {
-        let adapter = self.feishu_adapter.as_ref()?;
-        let pending = self.pending.read().await;
-        let (request, _tx) = pending.get(request_id)?;
-        let command = request.command.clone();
-        let risk = format!("{:?}", request.risk_level);
-        drop(pending);
-
-        let approval_id = adapter.next_approval_id();
-        let card = ApprovalCard::new(approval_id, &command)
-            .with_description(&format!("Risk level: {}", risk));
-        let card_json = card.build();
-
-        match adapter.send_card(chat_id, &card_json).await {
-            Ok(message_id) => {
-                let mid: String = message_id.clone();
-                self.card_approval_map.write().await.insert(
-                    approval_id,
-                    (request_id.to_string(), mid, chat_id.to_string()),
-                );
-                tracing::info!(
-                    approval_id,
-                    request_id,
-                    %message_id,
-                    "Approval card sent via Feishu"
-                );
-                Some((approval_id, message_id))
-            }
-            Err(e) => {
-                tracing::error!(%e, "Failed to send approval card via Feishu");
-                None
-            }
-        }
-    }
-
-    /// Resolve a pending approval triggered by a Feishu card button callback.
-    ///
-    /// Maps `hermes_action` to an [`ApprovalVerdict`], resolves the pending request,
-    /// updates the card to its resolved state, and returns the resolution result.
-    pub async fn resolve_approval_by_card(
-        &self,
-        card_approval_id: u64,
-        hermes_action: &str,
-        operator_name: &str,
-    ) -> Option<ApprovalVerdict> {
-        let (request_id, message_id, _chat_id) = {
-            let map = self.card_approval_map.read().await;
-            map.get(&card_approval_id)?.clone()
-        };
-
-        let verdict = match hermes_action {
-            "approve_once" | "approve_session" | "approve_always" | "approved" => {
-                ApprovalVerdict::Approved
-            }
-            "deny" | "denied" | "reject" | "rejected" => ApprovalVerdict::Denied {
-                reason: format!("Denied by {} via Feishu", operator_name),
-            },
-            _ => ApprovalVerdict::Denied {
-                reason: format!("Unknown action '{}' from {}", hermes_action, operator_name),
-            },
-        };
-
-        let persistence = match hermes_action {
-            "approve_session" => ApprovalPersistence::Session,
-            "approve_always" => ApprovalPersistence::Always,
-            _ => ApprovalPersistence::Once,
-        };
-
-        self.resolve_approval(&request_id, verdict.clone(), persistence)
-            .await;
-
-        if let Some(adapter) = &self.feishu_adapter {
-            if let Err(e) = adapter
-                .update_approval_card(&message_id, hermes_action, operator_name)
-                .await
-            {
-                tracing::warn!(%e, "Failed to update approval card to resolved state");
-            }
-        }
-
-        self.card_approval_map
-            .write()
-            .await
-            .remove(&card_approval_id);
-
-        Some(verdict)
     }
 
     /// Resolve a pending approval request (called by the API endpoint handler).

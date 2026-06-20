@@ -6,11 +6,7 @@ use memory::{
     RuntimeRef, UnifiedSessionStore,
 };
 use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
-use runtime::doc_ingestion::{DocumentCategory, DocumentIngestor};
-use runtime::platform::feishu::doc::{
-    DocumentContent, DocumentElement, DocumentMetadata as FeishuDocumentMetadata, DocumentType,
-    ListItem, TableCell, TableRow, TextElement,
-};
+use runtime::doc_ingestion::{DocumentCategory, DocumentContent, DocumentIngestor};
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -65,129 +61,26 @@ fn memory_entry(
 }
 
 fn complex_manufacturing_document() -> DocumentContent {
-    let text = |value: &str| TextElement {
-        text: value.to_string(),
-        style: None,
-    };
     DocumentContent {
-        metadata: FeishuDocumentMetadata {
-            token: "doc-full-capability-eval".to_string(),
-            doc_type: DocumentType::Doc,
-            title: "Architecture Manufacturing Memory Evaluation".to_string(),
-            owner_open_id: "user-full-capability-eval".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            is_folder: false,
-            parent_token: None,
-        },
-        elements: vec![
-            DocumentElement::Heading {
-                level: 1,
-                elements: vec![text("Architecture: Manufacturing memory and structured evidence evaluation")],
-                style: None,
-            },
-            DocumentElement::Paragraph {
-                elements: vec![text(
-                    "The GPU shortage eval requires material_shortage_risk, supplier_recovery, \
-                     order_delivery_risk, and quality gate pass after incident analysis.",
-                )],
-                style: None,
-            },
-            DocumentElement::BulletList {
-                items: vec![ListItem {
-                    elements: vec![text(
-                        "Planner, executor, and reviewer agents must share evidence through L4 memory.",
-                    )],
-                    children: vec![ListItem {
-                        elements: vec![text(
-                            "Reviewer must see document evidence and structured runtime evidence.",
-                        )],
-                        children: Vec::new(),
-                    }],
-                }],
-            },
-            DocumentElement::Table {
-                rows: vec![
-                    TableRow {
-                        is_header: true,
-                        cells: vec![
-                            TableCell {
-                                content: vec![DocumentElement::Paragraph {
-                                    elements: vec![text("Metric")],
-                                    style: None,
-                                }],
-                            },
-                            TableCell {
-                                content: vec![DocumentElement::Paragraph {
-                                    elements: vec![text("Expected action")],
-                                    style: None,
-                                }],
-                            },
-                        ],
-                    },
-                    TableRow {
-                        is_header: false,
-                        cells: vec![
-                            TableCell {
-                                content: vec![DocumentElement::Paragraph {
-                                    elements: vec![text("material_shortage_risk")],
-                                    style: None,
-                                }],
-                            },
-                            TableCell {
-                                content: vec![DocumentElement::Paragraph {
-                                    elements: vec![text("supplier_recovery")],
-                                    style: None,
-                                }],
-                            },
-                        ],
-                    },
-                ],
-            },
-        ],
-        raw_blocks: vec![serde_json::json!({
-            "source": "mock.complex_doc",
-            "contains_table": true,
-            "contains_nested_list": true
-        })],
+        title: "Architecture Manufacturing Memory Evaluation".to_string(),
+        body: [
+            "Architecture: Manufacturing memory and structured evidence evaluation",
+            "The GPU shortage eval requires material_shortage_risk, supplier_recovery, order_delivery_risk, and quality gate pass after incident analysis.",
+            "Planner, executor, and reviewer agents must share evidence through L4 memory.",
+            "Reviewer must see document evidence and structured runtime evidence.",
+            "Metric: material_shortage_risk. Expected action: supplier_recovery.",
+        ]
+        .join("\n"),
+        source: Some("mock.complex_doc".to_string()),
+        author: Some("user-full-capability-eval".to_string()),
+        created_at: Some(Utc::now().to_rfc3339()),
+        modified_at: Some(Utc::now().to_rfc3339()),
+        language: Some("en-US".to_string()),
     }
 }
 
 fn document_text_for_memory(document: &DocumentContent) -> String {
-    fn collect_element(element: &DocumentElement, out: &mut Vec<String>) {
-        match element {
-            DocumentElement::Paragraph { elements, .. }
-            | DocumentElement::Heading { elements, .. }
-            | DocumentElement::CodeBlock { elements, .. }
-            | DocumentElement::Quote { elements } => {
-                out.extend(elements.iter().map(|item| item.text.clone()));
-            }
-            DocumentElement::BulletList { items } | DocumentElement::NumberedList { items } => {
-                for item in items {
-                    out.extend(item.elements.iter().map(|text| text.text.clone()));
-                    for child in &item.children {
-                        out.extend(child.elements.iter().map(|text| text.text.clone()));
-                    }
-                }
-            }
-            DocumentElement::Table { rows } => {
-                for row in rows {
-                    for cell in &row.cells {
-                        for nested in &cell.content {
-                            collect_element(nested, out);
-                        }
-                    }
-                }
-            }
-            DocumentElement::Image { .. } | DocumentElement::Divider => {}
-        }
-    }
-
-    let mut parts = Vec::new();
-    for element in &document.elements {
-        collect_element(element, &mut parts);
-    }
-    parts.join("\n")
+    document.body.clone()
 }
 
 fn session_record(session_id: &str) -> SessionRecord {

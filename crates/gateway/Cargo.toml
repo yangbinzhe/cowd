@@ -21,6 +21,7 @@ axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 channel = { path = "../channel" }
+channel-adapters = { path = "../channel-adapters" }
 command-contract = { path = "../command/contract" }
 command-service = { path = "../command/service" }
 connector = { path = "../connector" }

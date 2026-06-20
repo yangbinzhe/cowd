@@ -3,8 +3,6 @@
 //! Provides secure device pairing via 8-character codes with rate limiting,
 //! attempt counting, and lockout. Inspired by hermes pairing.py (OWASP + NIST SP 800-63-4).
 
-use crate::platform::adapter::Platform;
-use crate::platform::types::SessionKey;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -37,10 +35,10 @@ const LOCKOUT_SECS: i64 = 3600;
 pub struct PendingCode {
     /// The 8-character pairing code.
     pub code: String,
-    /// The platform requesting pairing.
-    pub platform: String,
-    /// The session key of the requester.
-    pub session_key: String,
+    /// The channel requesting pairing.
+    pub channel: String,
+    /// The requester session reference.
+    pub session_ref: String,
     /// When the code was created.
     pub created_at: DateTime<Utc>,
     /// Number of failed verification attempts.
@@ -107,10 +105,12 @@ impl PairingManager {
     /// - The rate limit has not expired (1 code per 10 minutes)
     pub async fn generate_code(
         &self,
-        platform: &Platform,
-        session_key: &SessionKey,
+        channel: &str,
+        session_ref: &str,
     ) -> Result<String, PairingError> {
-        let key_str = session_key.as_str();
+        let channel = normalize_channel_ref(channel)?;
+        let session_ref = normalize_session_ref(session_ref)?;
+        let key_str = format!("{channel}:{session_ref}");
 
         // Check lockout
         {
@@ -148,8 +148,8 @@ impl PairingManager {
 
         let pending = PendingCode {
             code: code.clone(),
-            platform: platform.name().to_string(),
-            session_key: key_str.to_string(),
+            channel: channel.clone(),
+            session_ref: session_ref.clone(),
             created_at: Utc::now(),
             attempts: 0,
         };
@@ -173,7 +173,7 @@ impl PairingManager {
 
         tracing::info!(
             code = %code,
-            platform = %platform.name(),
+            channel = %channel,
             session = %key_str,
             "pairing code generated"
         );
@@ -183,9 +183,9 @@ impl PairingManager {
 
     /// Verify a pairing code.
     ///
-    /// Returns the platform and session key on success.
+    /// Returns the channel and session reference on success.
     /// On failure, increments the attempt counter and may lock out after 5 failures.
-    pub async fn verify_code(&self, code: &str) -> Result<(Platform, SessionKey), PairingError> {
+    pub async fn verify_code(&self, code: &str) -> Result<(String, String), PairingError> {
         // Take ownership of the entry to avoid borrow conflicts
         let mut codes = self.pending_codes.write().await;
         let mut pending = codes.remove(code).ok_or(PairingError::InvalidCode)?;
@@ -200,8 +200,9 @@ impl PairingManager {
         // Increment attempts
         pending.attempts += 1;
         let attempts = pending.attempts;
-        let platform_str = pending.platform.clone();
-        let session_str = pending.session_key.clone();
+        let channel = pending.channel.clone();
+        let session_ref = pending.session_ref.clone();
+        let session_key = format!("{channel}:{session_ref}");
 
         drop(codes);
         self.remove_persisted_code(code).ok();
@@ -210,7 +211,7 @@ impl PairingManager {
         if attempts > MAX_FAILURES {
             // Lock out this session
             self.lockouts.write().await.insert(
-                session_str,
+                session_key,
                 LockoutEntry {
                     locked_at: Utc::now(),
                     failure_count: attempts,
@@ -223,18 +224,15 @@ impl PairingManager {
         }
 
         // Code is valid - clear any lockout on success
-        self.lockouts.write().await.remove(&session_str);
-
-        let platform = Platform::parse(&platform_str);
-        let session_key: SessionKey = session_str.as_str().into();
+        self.lockouts.write().await.remove(&session_key);
 
         tracing::info!(
             code = %code,
-            platform = %platform.name(),
+            channel = %channel,
             "pairing code verified successfully"
         );
 
-        Ok((platform, session_key))
+        Ok((channel, session_ref))
     }
 
     /// Clean up expired codes.
@@ -306,6 +304,25 @@ impl PairingManager {
     }
 }
 
+fn normalize_channel_ref(channel: &str) -> Result<String, PairingError> {
+    let value = channel.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err(PairingError::InvalidChannel);
+    }
+    Ok(match value.as_str() {
+        "wechat_ilink" | "wechat" => "wechat-ilink".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn normalize_session_ref(session_ref: &str) -> Result<String, PairingError> {
+    let value = session_ref.trim();
+    if value.is_empty() {
+        return Err(PairingError::InvalidSessionRef);
+    }
+    Ok(value.to_string())
+}
+
 /// Pairing error types.
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
@@ -323,6 +340,12 @@ pub enum PairingError {
 
     #[error("storage error: {0}")]
     StorageError(String),
+
+    #[error("invalid channel")]
+    InvalidChannel,
+
+    #[error("invalid session reference")]
+    InvalidSessionRef,
 }
 
 impl From<std::io::Error> for PairingError {
@@ -364,15 +387,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let session_key = SessionKey::new("feishu", "user123");
-        let code = manager
-            .generate_code(&Platform::Feishu, &session_key)
-            .await
-            .unwrap();
+        let code = manager.generate_code("feishu", "user123").await.unwrap();
 
-        let (platform, verified_key) = manager.verify_code(&code).await.unwrap();
-        assert_eq!(platform, Platform::Feishu);
-        assert_eq!(verified_key.user_id, "user123");
+        let (channel, verified_ref) = manager.verify_code(&code).await.unwrap();
+        assert_eq!(channel, "feishu");
+        assert_eq!(verified_ref, "user123");
     }
 
     #[tokio::test]
@@ -389,11 +408,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let session_key = SessionKey::new("feishu", "user456");
-        let code = manager
-            .generate_code(&Platform::Feishu, &session_key)
-            .await
-            .unwrap();
+        let code = manager.generate_code("feishu", "user456").await.unwrap();
 
         // First verification succeeds
         let _ = manager.verify_code(&code).await.unwrap();
@@ -408,14 +423,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let session_key = SessionKey::new("feishu", "user789");
-        let _ = manager
-            .generate_code(&Platform::Feishu, &session_key)
-            .await
-            .unwrap();
+        let _ = manager.generate_code("feishu", "user789").await.unwrap();
 
         // Second generation should be rate limited
-        let result = manager.generate_code(&Platform::Feishu, &session_key).await;
+        let result = manager.generate_code("feishu", "user789").await;
         assert!(result.is_err());
         if let Err(PairingError::RateLimited { remaining_secs }) = result {
             assert!(remaining_secs > 0);

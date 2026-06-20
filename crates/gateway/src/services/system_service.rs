@@ -6,8 +6,8 @@ use std::{
 
 use provider::ToolDefinition;
 use runtime::{
-    classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
-    RuntimeConfig, ToolSafetyCategory,
+    classify_intent, plan_context_fanout, tool_cache::tool_cache_stats, tool_execution_profile,
+    ConfigLoader, JsonValue, RuntimeConfig, ToolSafetyCategory,
 };
 use serde::Serialize;
 use tools::GlobalToolRegistry;
@@ -97,6 +97,34 @@ impl SystemService {
             next_actions: next_actions_for_tool(tool_name, &data),
             data,
         })
+    }
+
+    pub(crate) fn tool_cache_receipt(&self) -> ToolOperationReceipt {
+        let data = serde_json::to_value(tool_cache_stats()).unwrap_or_else(|_| {
+            serde_json::json!({
+                "hits": 0,
+                "misses": 0,
+                "invalidations": 0,
+                "entries": 0,
+                "epoch": 0,
+                "scopeEpochs": 0
+            })
+        });
+        ToolOperationReceipt {
+            request_id: format!("tool-op-{}", chrono::Utc::now().timestamp_millis()),
+            tool_name: "tool_cache_stats".to_string(),
+            mode: "stats".to_string(),
+            risk: "low".to_string(),
+            status: "ok".to_string(),
+            changed_refs: Vec::new(),
+            audit_ref: format!(
+                "tool://tool_cache_stats/{}",
+                chrono::Utc::now().timestamp_millis()
+            ),
+            data,
+            warnings: Vec::new(),
+            next_actions: Vec::new(),
+        }
     }
 
     pub(crate) fn intent_plan(

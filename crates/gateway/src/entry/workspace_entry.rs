@@ -294,7 +294,7 @@ fn setup_feishu_item(config: &runtime::RuntimeConfig) -> SetupItem {
 }
 
 fn setup_wechat_item() -> SetupItem {
-    match runtime::platform::wechat_ilink::list_wechat_qr_accounts(None) {
+    match channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None) {
         Ok(accounts) if !accounts.is_empty() => SetupItem {
             id: "wechat",
             label: "WeChat",

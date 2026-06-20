@@ -320,19 +320,7 @@ async fn tool_execute_handler(
 async fn tool_cache_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = state
-        .services
-        .system
-        .execute_tool_receipt(
-            &state.tool_registry,
-            &state.workspace_root,
-            "tool_cache_stats",
-            serde_json::json!({}),
-            "stats",
-            "low",
-        )
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    Ok(Json(receipt))
+    Ok(Json(state.services.system.tool_cache_receipt()))
 }
 
 async fn tool_batch_readonly_handler(

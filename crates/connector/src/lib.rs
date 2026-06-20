@@ -1064,86 +1064,6 @@ impl ServiceConnector for MockDocsServiceConnector {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct FeishuReadOnlyServiceConnector;
-
-impl FeishuReadOnlyServiceConnector {
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn resource_type_for_tool(tool_id: &str) -> &'static str {
-        if tool_id.contains(".drive.") {
-            "drive"
-        } else if tool_id.contains(".wiki.") {
-            "wiki"
-        } else {
-            "docx"
-        }
-    }
-}
-
-impl ServiceConnector for FeishuReadOnlyServiceConnector {
-    fn metadata(&self) -> ServiceConnectorMetadata {
-        ServiceConnectorMetadata {
-            id: "feishu.readonly".to_string(),
-            provider: "feishu".to_string(),
-            family: "service.feishu".to_string(),
-            display_name: "Feishu Read-only".to_string(),
-            read_only: true,
-        }
-    }
-
-    fn capabilities(&self) -> Vec<CapabilityManifest> {
-        [
-            "docx.read",
-            "drive.metadata",
-            "drive.download_readonly",
-            "wiki.node_readonly",
-        ]
-        .into_iter()
-        .map(|operation| CapabilityManifest::service_readonly("feishu", operation))
-        .collect()
-    }
-
-    fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult {
-        let ServiceToolRequest {
-            tool_id,
-            resource_id,
-            title,
-            input,
-        } = request;
-        let resource_type = Self::resource_type_for_tool(&tool_id);
-        let mut resource = ExternalResourceRef::new("feishu", resource_type, &resource_id, &title);
-        resource.permissions_summary = Some(
-            "Feishu read-only connector; body fetch requires configured app scope".to_string(),
-        );
-        resource.source = input
-            .get("source")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| Some(format!("feishu://{resource_type}/{resource_id}")));
-        let retrieval_capability = tool_id.clone();
-        ServiceToolResult {
-            status: "ok".to_string(),
-            tool_id,
-            resource: Some(resource.clone()),
-            output: serde_json::json!({
-                "summary": format!("Feishu {resource_type} resource resolved as {}", resource.reference),
-                "read_only": true,
-                "body_included": false,
-                "body_policy": "metadata_only",
-                "retrieval_capability": retrieval_capability,
-                "next_actions": [
-                    "resolve_evidence_for_metadata",
-                    "use_authorized_feishu_read_capability_for_body"
-                ],
-            }),
-        }
-    }
-}
-
 #[must_use]
 pub fn default_capabilities() -> Vec<CapabilityManifest> {
     let mut capabilities = vec![
@@ -1166,16 +1086,6 @@ pub fn default_capabilities() -> Vec<CapabilityManifest> {
         .into_iter()
         .map(|(provider, operation)| CapabilityManifest::channel(provider, operation)),
     );
-    capabilities.extend(
-        [
-            "docx.read",
-            "drive.metadata",
-            "drive.download_readonly",
-            "wiki.node_readonly",
-        ]
-        .into_iter()
-        .map(|operation| CapabilityManifest::service_readonly("feishu", operation)),
-    );
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     capabilities
 }
@@ -1190,11 +1100,6 @@ fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
 
 fn readonly_required_scopes(provider: &str, operation: &str) -> Vec<String> {
     match (provider, operation) {
-        ("feishu", "docx.read") => vec!["docx:read".to_string()],
-        ("feishu", "drive.metadata" | "drive.download_readonly") => {
-            vec!["drive:read".to_string()]
-        }
-        ("feishu", "wiki.node_readonly") => vec!["wiki:read".to_string()],
         _ => Vec::new(),
     }
 }
@@ -1226,11 +1131,11 @@ mod tests {
 
     #[test]
     fn provider_account_reports_missing_scopes() {
-        let mut account = ProviderAccount::new("feishu", "feishu-main", "app_secret");
-        account.scopes = vec!["docx:read".to_string()];
-        let required = vec!["docx:read".to_string(), "drive:read".to_string()];
+        let mut account = ProviderAccount::new("mock.docs", "mock-docs-main", "api_key");
+        account.scopes = vec!["document:read".to_string()];
+        let required = vec!["document:read".to_string(), "document:write".to_string()];
 
-        assert_eq!(account.missing_scopes(&required), vec!["drive:read"]);
+        assert_eq!(account.missing_scopes(&required), vec!["document:write"]);
     }
 
     #[test]
@@ -1373,46 +1278,6 @@ mod tests {
         );
         bulkhead.record_success("feishu");
         assert!(bulkhead.try_acquire("feishu").is_ok());
-    }
-
-    #[test]
-    fn feishu_readonly_connector_declares_low_risk_read_capabilities() {
-        let connector = FeishuReadOnlyServiceConnector::new();
-        let capabilities = connector.capabilities();
-
-        assert!(capabilities.iter().any(|capability| {
-            capability.capability_id == "service.feishu.docx.read"
-                && capability.supports_commit
-                && !capability.requires_approval
-                && capability.risk == CrossPlaneRisk::Low
-                && capability.required_scopes == vec!["docx:read".to_string()]
-        }));
-        assert!(matches!(
-            connector.probe(&[]).status,
-            ConnectorHealthStatus::Degraded
-        ));
-    }
-
-    #[test]
-    fn feishu_readonly_connector_returns_canonical_resource_ref_without_body() {
-        let result = FeishuReadOnlyServiceConnector::new().execute_tool(ServiceToolRequest {
-            tool_id: "service.feishu.docx.read".to_string(),
-            resource_id: "doccn123".to_string(),
-            title: "Feishu Plan".to_string(),
-            input: serde_json::json!({}),
-        });
-
-        assert_eq!(result.status, "ok");
-        assert_eq!(
-            result.resource.unwrap().reference,
-            "service://feishu/docx/doccn123"
-        );
-        assert_eq!(result.output["body_included"], false);
-        assert_eq!(result.output["body_policy"], "metadata_only");
-        assert_eq!(
-            result.output["retrieval_capability"],
-            "service.feishu.docx.read"
-        );
     }
 
     #[test]

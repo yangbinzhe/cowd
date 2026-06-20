@@ -30,23 +30,10 @@ serde_yaml.workspace = true
 telemetry = { path = "../telemetry" }
 fs2 = "0.4"
 walkdir = "2"
-# Email support
 uuid = { version = "1", features = ["v4"] }
-native-tls = "0.2"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"] }
-imap = "3.0.0-alpha.15"
-imap-proto = "0.16"
-mail-parser = "0.9"
-# WeCom crypto support
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
-sha1 = "0.10"
 rand = "0.8"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-prost = "0.13"
-lru = "0.12"
 libc = "0.2.186"
 
 [dev-dependencies]

@@ -70,8 +70,8 @@ pub struct CardActionDef {
 ///
 /// ```ignore
 /// // Note: this module is `pub use`-re-exported from
-/// // `runtime::platform::feishu`, so callers outside the crate use
-/// // `runtime::platform::feishu::build_post_payload(...)`.
+/// // `channel_adapters::platform::feishu`, so callers outside the crate use
+/// // `channel_adapters::platform::feishu::build_post_payload(...)`.
 /// let payload = build_post_payload("Hello **world**");
 /// assert!(payload.contains(r#""tag":"md""#));
 /// assert!(payload.contains("Hello **world**"));

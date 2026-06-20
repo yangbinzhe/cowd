@@ -354,7 +354,7 @@ fn channel_contracts_drive_gateway_platform_readiness() {
     for required in [
         "pub struct ChannelContract",
         "pub fn channel_required_fields",
-        "pub fn channel_operations",
+        "pub fn channel_transport_capabilities",
         "pub fn normalize_channel",
     ] {
         assert!(
@@ -368,6 +368,11 @@ fn channel_contracts_drive_gateway_platform_readiness() {
         manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
         "gateway must depend on channel for platform/channel contracts"
     );
+    assert!(
+        manifest_dependencies(&gateway_manifest)
+            .contains("channel-adapters = { path = \"../channel-adapters\" }"),
+        "gateway must depend on channel-adapters for platform SDK hosting"
+    );
     let channel_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/channel_routes.rs",
     ))
@@ -379,6 +384,61 @@ fn channel_contracts_drive_gateway_platform_readiness() {
     assert!(
         !channel_routes.contains("fn platform_capabilities"),
         "gateway must not own a duplicate platform capability table"
+    );
+    assert!(
+        !channel_source.contains("doc_ops"),
+        "channel contract must not expose Feishu document operations as built-in channel capability"
+    );
+
+    for source_path in [
+        "crates/gateway/src/main.rs",
+        "crates/gateway/src/api_routes.rs",
+        "crates/gateway/src/runtime_host/mod.rs",
+        "crates/gateway/src/api_routes/channel_routes.rs",
+        "crates/gateway/src/api_routes/cross_plane_routes.rs",
+        "crates/gateway/src/entry/workspace_entry.rs",
+    ] {
+        let source = production_part(&read_repo(source_path)).to_string();
+        assert!(
+            !source.contains("runtime::platform"),
+            "{source_path} must not use runtime::platform as the channel host"
+        );
+    }
+
+    let channel_adapters_source =
+        production_part(&read_repo("crates/channel-adapters/src/lib.rs")).to_string();
+    assert!(
+        channel_adapters_source.contains("pub mod platform"),
+        "channel-adapters must expose the gateway-owned platform adapter host"
+    );
+    assert!(
+        repo_root()
+            .join("crates/channel-adapters/src/platform")
+            .exists(),
+        "platform adapter sources must live under channel-adapters"
+    );
+    assert!(
+        !repo_root().join("crates/runtime/src/platform").exists(),
+        "runtime must not physically own platform adapter sources"
+    );
+    let runtime_manifest = read_repo("crates/runtime/Cargo.toml");
+    for forbidden in [
+        "channel-adapters",
+        "lettre",
+        "imap",
+        "tokio-tungstenite",
+        "prost",
+        "native-tls",
+    ] {
+        assert!(
+            !manifest_dependencies(&runtime_manifest).contains(forbidden),
+            "runtime must not depend on platform adapter dependency {forbidden}"
+        );
+    }
+    let runtime_lib = production_part(&read_repo("crates/runtime/src/lib.rs")).to_string();
+    assert!(
+        !runtime_lib.contains("pub mod platform") && !runtime_lib.contains("pub mod mirror"),
+        "runtime must not re-export channel adapter platform or mirror modules"
     );
 }
 

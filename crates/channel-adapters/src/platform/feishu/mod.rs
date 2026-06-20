@@ -103,8 +103,6 @@ pub mod approval;
 pub mod auth;
 pub mod batch;
 pub mod card_handler;
-pub mod comment;
-pub mod doc;
 pub mod markdown;
 pub mod media;
 pub mod normalize;
@@ -124,14 +122,6 @@ pub use approval::{
 };
 pub use auth::*;
 pub use batch::*;
-pub use comment::{
-    CommentFilter, CommentHandler, CommentStatus, CreateCommentRequest, FeishuComment,
-    ReplyCommentRequest, UpdateCommentRequest,
-};
-pub use doc::{
-    DocumentClient, DocumentContent, DocumentElement, DocumentMetadata, DocumentType,
-    SearchDocumentsRequest, SearchDocumentsResponse, SearchResult,
-};
 pub use markdown::*;
 pub use media::*;
 pub use normalize::*;
@@ -167,7 +157,7 @@ pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<Fei
         config = config.with_base_url(base_url);
     }
 
-    // Set the global API base URL for sub-modules (media, reactions, doc, comment)
+    // Set the global API base URL for messaging, media, reactions, and card presentation modules.
     set_api_base_url(&config.api_base_url);
 
     let mut adapter = FeishuAdapter::new(config);
@@ -249,17 +239,5 @@ mod tests {
         let engine = RulesEngine::new();
         let rules = engine.list_rules().await;
         assert!(!rules.is_empty());
-    }
-
-    #[test]
-    fn test_document_type_serialization() {
-        let json = serde_json::to_string(&DocumentType::Doc).unwrap();
-        assert_eq!(json, "\"doc\"");
-    }
-
-    #[test]
-    fn test_comment_status_serialization() {
-        let json = serde_json::to_string(&CommentStatus::Open).unwrap();
-        assert_eq!(json, "\"open\"");
     }
 }

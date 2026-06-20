@@ -4,6 +4,62 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelKind {
+    InteractiveSurface,
+    ExternalIntegration,
+    AutomationEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChannelId(String);
+
+impl ChannelId {
+    #[must_use]
+    pub fn new(channel: impl AsRef<str>) -> Self {
+        Self(normalize_channel(channel.as_ref()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChannelSurface {
+    pub id: ChannelId,
+    pub kind: ChannelKind,
+    pub supports_ingress: bool,
+    pub supports_delivery: bool,
+    pub supports_subscription: bool,
+}
+
+impl ChannelSurface {
+    #[must_use]
+    pub fn interactive(id: impl AsRef<str>) -> Self {
+        Self {
+            id: ChannelId::new(id),
+            kind: ChannelKind::InteractiveSurface,
+            supports_ingress: true,
+            supports_delivery: true,
+            supports_subscription: true,
+        }
+    }
+
+    #[must_use]
+    pub fn integration(id: impl AsRef<str>) -> Self {
+        Self {
+            id: ChannelId::new(id),
+            kind: ChannelKind::ExternalIntegration,
+            supports_ingress: true,
+            supports_delivery: true,
+            supports_subscription: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelMessageId(String);
 
 impl ChannelMessageId {
@@ -39,11 +95,86 @@ pub struct OutboundChannelMessage {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEnvelope<T> {
+    pub channel: String,
+    pub actor: Option<String>,
+    pub thread: Option<String>,
+    pub run_id: Option<String>,
+    pub payload: T,
+    pub metadata: Value,
+}
+
+impl<T> ChannelEnvelope<T> {
+    #[must_use]
+    pub fn new(channel: impl AsRef<str>, payload: T) -> Self {
+        Self {
+            channel: normalize_channel(channel.as_ref()),
+            actor: None,
+            thread: None,
+            run_id: None,
+            payload,
+            metadata: Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryPolicy {
+    OriginOnly,
+    Subscribers,
+    ExplicitTargets,
+    OriginAndSubscribers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryTarget {
+    pub channel: String,
+    pub recipient: String,
+    pub thread: Option<String>,
+}
+
+impl DeliveryTarget {
+    #[must_use]
+    pub fn new(channel: impl AsRef<str>, recipient: impl Into<String>) -> Self {
+        Self {
+            channel: normalize_channel(channel.as_ref()),
+            recipient: recipient.into(),
+            thread: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionPolicy {
+    pub allow_cross_surface_watch: bool,
+    pub allow_external_channel_watch: bool,
+}
+
+impl Default for SubscriptionPolicy {
+    fn default() -> Self {
+        Self {
+            allow_cross_surface_watch: true,
+            allow_external_channel_watch: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VisibilityPolicy {
+    PrivateOrigin,
+    SameActor,
+    SameWorkspace,
+    ExplicitSubscribers,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelCapability {
     pub id: String,
     pub channel: String,
-    pub operation: String,
+    pub capability: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,9 +192,9 @@ impl ChannelContract {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let capabilities = channel_operations(&channel)
+        let capabilities = channel_transport_capabilities(&channel)
             .into_iter()
-            .map(|operation| ChannelCapability::new(&channel, operation))
+            .map(|capability| ChannelCapability::new(&channel, capability))
             .collect();
         Self {
             channel,
@@ -73,23 +204,23 @@ impl ChannelContract {
     }
 
     #[must_use]
-    pub fn operation_names(&self) -> Vec<String> {
+    pub fn capability_names(&self) -> Vec<String> {
         self.capabilities
             .iter()
-            .map(|capability| capability.operation.clone())
+            .map(|capability| capability.capability.clone())
             .collect()
     }
 }
 
 impl ChannelCapability {
     #[must_use]
-    pub fn new(channel: impl AsRef<str>, operation: impl AsRef<str>) -> Self {
+    pub fn new(channel: impl AsRef<str>, capability: impl AsRef<str>) -> Self {
         let channel = normalize_channel(channel.as_ref());
-        let operation = operation.as_ref().to_string();
+        let capability = capability.as_ref().to_string();
         Self {
-            id: format!("channel.{channel}.{operation}"),
+            id: format!("channel.{channel}.{capability}"),
             channel,
-            operation,
+            capability,
         }
     }
 }
@@ -114,12 +245,9 @@ pub fn channel_required_fields(channel: &str) -> Vec<&'static str> {
 }
 
 #[must_use]
-pub fn channel_operations(channel: &str) -> Vec<&'static str> {
+pub fn channel_transport_capabilities(channel: &str) -> Vec<&'static str> {
     match normalize_channel(channel).as_str() {
-        "feishu" => vec!["send_text", "send_image", "send_file", "doc_ops"],
-        "wecom" => vec!["send_text", "callback"],
-        "wechat-ilink" => vec!["qr_login", "send_text"],
-        "email" => vec!["send_email"],
+        "feishu" | "wecom" | "wechat-ilink" | "email" => vec!["ingress", "delivery"],
         _ => Vec::new(),
     }
 }
@@ -135,9 +263,28 @@ mod tests {
         assert_eq!(contract.channel, "wechat-ilink");
         assert!(contract.required_fields.is_empty());
         assert_eq!(
-            contract.operation_names(),
-            vec!["qr_login".to_string(), "send_text".to_string()]
+            contract.capability_names(),
+            vec!["ingress".to_string(), "delivery".to_string()]
         );
-        assert_eq!(contract.capabilities[0].id, "channel.wechat-ilink.qr_login");
+        assert_eq!(contract.capabilities[0].id, "channel.wechat-ilink.ingress");
+    }
+
+    #[test]
+    fn channel_surface_models_ui_and_external_channels() {
+        let tui = ChannelSurface::interactive("tui");
+        assert_eq!(tui.id.as_str(), "tui");
+        assert_eq!(tui.kind, ChannelKind::InteractiveSurface);
+        assert!(tui.supports_subscription);
+
+        let feishu = ChannelSurface::integration("feishu");
+        assert_eq!(feishu.kind, ChannelKind::ExternalIntegration);
+        assert!(!feishu.supports_subscription);
+    }
+
+    #[test]
+    fn delivery_target_normalizes_channel_names() {
+        let target = DeliveryTarget::new("wechat_ilink", "user-1");
+        assert_eq!(target.channel, "wechat-ilink");
+        assert_eq!(target.recipient, "user-1");
     }
 }

@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.338 GatewayServices");
+        assert_eq!(services.owner, "0.9.339 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

@@ -1517,7 +1517,6 @@ fn cross_plane_operation_from_capability(capability: &str) -> Option<String> {
 fn normalize_cross_plane_operation(operation: &str) -> &str {
     match operation.trim() {
         "send_file" | "send_document" => "send_file",
-        "doc_ops" | "docx" | "docs" => "doc_ops",
         other => other,
     }
 }
@@ -1525,7 +1524,7 @@ fn normalize_cross_plane_operation(operation: &str) -> &str {
 fn is_known_cross_plane_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "send_text" | "send_image" | "send_file" | "doc_ops" | "callback" | "qr_login"
+        "send_text" | "send_image" | "send_file" | "callback" | "qr_login"
     )
 }
 
@@ -1542,7 +1541,7 @@ mod tests {
     #[test]
     fn unknown_actor_is_denied_by_default() {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
-        let action = CrossPlaneAction::new("wechat:unknown", "service.feishu.docx.export");
+        let action = CrossPlaneAction::new("wechat:unknown", "service.mock.docs.export");
 
         let decision = engine.decide(&action, now());
 
@@ -1565,21 +1564,21 @@ mod tests {
 
     #[test]
     fn connector_context_missing_scope_denies_before_grant() {
-        let grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.docx.read");
+        let grant = CrossPlaneGrant::persistent("user:yi", "service.mock.docs.read");
         let engine =
             CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(vec![grant]);
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.read");
+        let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.read");
         action.identity_trust = IdentityTrust::Verified;
         let context = ConnectorActionContext {
-            provider: "feishu".to_string(),
+            provider: "mock.docs".to_string(),
             plane: "service".to_string(),
-            capability_id: "service.feishu.docx.read".to_string(),
-            provider_account: Some("feishu-main".to_string()),
+            capability_id: "service.mock.docs.read".to_string(),
+            provider_account: Some("mock-docs-main".to_string()),
             account_status: Some("ready".to_string()),
             account_reason: None,
-            resource_ref: Some("service://feishu/docx/doc-1".to_string()),
-            required_scopes: vec!["docx:read".to_string()],
-            missing_scopes: vec!["docx:read".to_string()],
+            resource_ref: Some("service://mock.docs/document/doc-1".to_string()),
+            required_scopes: vec!["document:read".to_string()],
+            missing_scopes: vec!["document:read".to_string()],
             supports_commit: true,
             requires_approval: false,
             risk: CrossPlaneRisk::Low,
@@ -1590,7 +1589,10 @@ mod tests {
         let decision = engine.decide_with_connector_context(&action, Some(&context), now());
 
         assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-        assert_eq!(decision.reason, "connector_missing_account_scope:docx:read");
+        assert_eq!(
+            decision.reason,
+            "connector_missing_account_scope:document:read"
+        );
         assert!(decision.matched_grant.is_none());
     }
 
@@ -1600,10 +1602,10 @@ mod tests {
         let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
         action.identity_trust = IdentityTrust::Verified;
         let context = ConnectorActionContext {
-            provider: "feishu".to_string(),
+            provider: "mock.docs".to_string(),
             plane: "channel".to_string(),
             capability_id: "channel.feishu.send_text".to_string(),
-            provider_account: Some("feishu-main".to_string()),
+            provider_account: Some("mock-docs-main".to_string()),
             account_status: Some("disabled".to_string()),
             account_reason: Some("platform is disabled".to_string()),
             resource_ref: Some("text://hello".to_string()),
@@ -1830,17 +1832,17 @@ mod tests {
     #[test]
     fn control_plane_audits_connector_evidence_fields() {
         let control = CrossPlaneControlPlane::new();
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.read");
+        let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.read");
         action.identity_trust = IdentityTrust::Verified;
         let context = ConnectorActionContext {
-            provider: "feishu".to_string(),
+            provider: "mock.docs".to_string(),
             plane: "service".to_string(),
-            capability_id: "service.feishu.docx.read".to_string(),
-            provider_account: Some("feishu-main".to_string()),
+            capability_id: "service.mock.docs.read".to_string(),
+            provider_account: Some("mock-docs-main".to_string()),
             account_status: Some("ready".to_string()),
             account_reason: None,
-            resource_ref: Some("service://feishu/docx/doc-1".to_string()),
-            required_scopes: vec!["docx:read".to_string()],
+            resource_ref: Some("service://mock.docs/document/doc-1".to_string()),
+            required_scopes: vec!["document:read".to_string()],
             missing_scopes: Vec::new(),
             supports_commit: true,
             requires_approval: false,
@@ -1858,16 +1860,19 @@ mod tests {
                 .connector_context
                 .as_ref()
                 .map(|context| context.capability_id.as_str()),
-            Some("service.feishu.docx.read")
+            Some("service.mock.docs.read")
         );
         let audit = control.list_audit(10, 0);
         let connector = audit[0].evidence.connector_context.as_ref().unwrap();
-        assert_eq!(connector.provider_account.as_deref(), Some("feishu-main"));
+        assert_eq!(
+            connector.provider_account.as_deref(),
+            Some("mock-docs-main")
+        );
         assert_eq!(
             connector.resource_ref.as_deref(),
-            Some("service://feishu/docx/doc-1")
+            Some("service://mock.docs/document/doc-1")
         );
-        assert_eq!(connector.required_scopes, vec!["docx:read".to_string()]);
+        assert_eq!(connector.required_scopes, vec!["document:read".to_string()]);
         assert!(connector.missing_scopes.is_empty());
     }
 
@@ -2007,7 +2012,7 @@ mod tests {
 
     #[test]
     fn expired_grant_does_not_allow_action() {
-        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.docx.export");
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.mock.docs.export");
         grant.expires_at = Some(
             DateTime::parse_from_rfc3339("2026-06-06T00:00:00Z")
                 .unwrap()
@@ -2016,7 +2021,7 @@ mod tests {
 
         let engine =
             CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(vec![grant]);
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.export");
+        let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.export");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::High;
 
@@ -2061,9 +2066,9 @@ mod tests {
         ));
         control.upsert_grant(CrossPlaneGrant::persistent(
             "user:yi",
-            "service.feishu.docx.read",
+            "service.mock.docs.read",
         ));
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.read");
+        let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.read");
         action.identity_trust = IdentityTrust::Verified;
         let _ = control.decide_and_audit(action, now());
 

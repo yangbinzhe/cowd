@@ -8,9 +8,8 @@ use axum::{
 };
 use connector::{
     default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection,
-    ConnectorHealth, ConnectorHealthStatus, ConnectorRegistrySnapshot, ExternalResourceRef,
-    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, ProviderAccount, ServiceConnector,
-    ServiceToolRequest, ServiceToolResult,
+    ConnectorHealth, ConnectorRegistrySnapshot, ExternalResourceRef, MockDocsServiceConnector,
+    ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
 };
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
@@ -58,14 +57,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/connectors/services/mock.docs/execute",
             axum::routing::post(mock_docs_execute_handler),
-        )
-        .route(
-            "/api/connectors/services/feishu.readonly/tools",
-            get(feishu_readonly_tools_handler),
-        )
-        .route(
-            "/api/connectors/services/feishu.readonly/execute",
-            axum::routing::post(feishu_readonly_execute_handler),
         )
 }
 
@@ -186,11 +177,7 @@ fn account_from_platform(platform: &channel_routes::PlatformReadiness) -> Provid
 }
 
 fn manifest_from_platform_capability(platform_type: &str, operation: &str) -> CapabilityManifest {
-    if platform_type == "feishu" && operation == "doc_ops" {
-        CapabilityManifest::service(platform_type, operation)
-    } else {
-        CapabilityManifest::channel(platform_type, operation)
-    }
+    CapabilityManifest::channel(platform_type, operation)
 }
 
 fn auth_mode_for_platform(platform_type: &str) -> &'static str {

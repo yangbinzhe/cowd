@@ -16,8 +16,8 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
+use channel_adapters::platform::PlatformRuntime;
 use runtime::approval_gate::SmartApprovalGate;
-use runtime::platform::PlatformRuntime;
 #[cfg(test)]
 use runtime::ApprovalConfig;
 #[cfg(test)]
@@ -420,13 +420,13 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use memory::config::{BudgetConfig, StoreConfig};
-    use runtime::permission_enforcer::DestructivePatternDetector;
-    use runtime::platform::adapter::{
+    use channel_adapters::platform::adapter::{
         InboundMessage, OutboundMessage, PlatformAdapter, PlatformError, SendResult,
     };
-    use runtime::platform::config::PlatformRuntimeConfig;
-    use runtime::platform::types::Platform;
+    use channel_adapters::platform::config::PlatformRuntimeConfig;
+    use channel_adapters::platform::types::Platform;
+    use memory::config::{BudgetConfig, StoreConfig};
+    use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::{ContextProfile, ResumeContextSource};
     use std::sync::Arc;
     use std::time::Instant;
@@ -6137,11 +6137,10 @@ providers:
             .iter()
             .any(|item| item["capability_id"] == "service.mock.docs.read"
                 && item["plane"] == "service"));
-        assert!(list
-            .iter()
-            .any(|item| item["capability_id"] == "service.feishu.doc_ops"
-                && item["plane"] == "service"
-                && item["supports_commit"] == false));
+        assert!(!list.iter().any(|item| item["capability_id"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("doc_ops")));
     }
 
     #[tokio::test]
@@ -6181,7 +6180,7 @@ providers:
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "channel.feishu.send_file"));
+            .any(|item| item == "channel.feishu.delivery"));
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -6696,234 +6695,6 @@ providers:
     }
 
     #[tokio::test]
-    async fn feishu_readonly_service_blocks_without_ready_account() {
-        let workspace = unique_test_workspace("feishu-readonly-blocked");
-        let app = api_router(test_state_with_config_runtime_and_workspace(
-            serde_json::json!({}),
-            None,
-            workspace,
-        ));
-        let tools = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/connectors/services/feishu.readonly/tools")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(tools.status(), StatusCode::OK);
-        let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["service"]["id"], "feishu.readonly");
-        assert_eq!(json["health"]["status"], "degraded");
-        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
-            tool["capability_id"] == "service.feishu.docx.read"
-                && tool["supports_commit"] == true
-                && tool["requires_approval"] == false
-        }));
-
-        let request = serde_json::json!({
-            "actor_principal": "user:feishu-readonly-blocked",
-            "tool_id": "service.feishu.docx.read",
-            "resource_id": "doccn-blocked",
-            "title": "Blocked Feishu Doc",
-            "mode": "commit",
-            "idempotency_key": format!("feishu-blocked-{}", uuid::Uuid::new_v4())
-        });
-        let execute = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/connectors/services/feishu.readonly/execute")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(request.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(execute.status(), StatusCode::OK);
-        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result"]["status"], "blocked");
-        assert_eq!(json["receipt"]["status"], "blocked");
-        assert!(json["receipt"]["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap_or_default()
-                .contains("no ready provider account")));
-        assert_eq!(json["resource_persisted"], false);
-    }
-
-    #[tokio::test]
-    async fn feishu_readonly_service_executes_with_ready_account_and_persists_resource() {
-        let workspace = unique_test_workspace("feishu-readonly-ready");
-        let app = api_router(test_state_with_config_runtime_and_workspace(
-            serde_json::json!({
-                "gateway": {
-                    "platforms": [{
-                        "name": "feishu-main",
-                        "platformType": "feishu",
-                        "enabled": true,
-                        "app_id": "cli_xxx",
-                        "app_secret": "secret_xxx",
-                        "scopes": ["docx:read"]
-                    }]
-                }
-            }),
-            None,
-            workspace,
-        ));
-        let suffix = uuid::Uuid::new_v4().to_string();
-        let actor_principal = format!("user:feishu-readonly-ready-{suffix}");
-        let actor_identity_ref =
-            format!("channel://feishu/user/ready?email=ready-{suffix}@example.com");
-        let identity = serde_json::json!({
-            "id": format!("idb-feishu-readonly-ready-{suffix}"),
-            "principal_id": actor_principal,
-            "identity_ref": actor_identity_ref,
-            "trust": "verified",
-            "source": "test",
-            "created_at": "2026-06-08T00:00:00Z",
-            "expires_at": null
-        });
-        let identity_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/cross-plane/identities")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(identity.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(identity_response.status(), StatusCode::OK);
-
-        let request = serde_json::json!({
-            "actor_principal": actor_principal,
-            "actor_identity_ref": actor_identity_ref,
-            "source_channel": "channel://feishu/chat/ready",
-            "session_id": "feishu-readonly-ready-session",
-            "tool_id": "service.feishu.docx.read",
-            "resource_id": "doccn-ready",
-            "title": "Ready Feishu Doc",
-            "mode": "commit",
-            "idempotency_key": format!("feishu-ready-{}", uuid::Uuid::new_v4())
-        });
-        let execute = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/connectors/services/feishu.readonly/execute")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(request.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(execute.status(), StatusCode::OK);
-        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["health"]["status"], "ready");
-        assert_eq!(json["result"]["status"], "ok");
-        assert_eq!(
-            json["result"]["resource"]["reference"],
-            "service://feishu/docx/doccn-ready"
-        );
-        assert_eq!(json["result"]["output"]["body_included"], false);
-        assert_eq!(json["result"]["output"]["body_policy"], "metadata_only");
-        assert_eq!(
-            json["result"]["output"]["retrieval_capability"],
-            "service.feishu.docx.read"
-        );
-        assert_eq!(json["resource_persisted"], true);
-        assert!(!json.to_string().contains("secret_xxx"));
-
-        let audit = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/cross-plane/audit")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(audit.status(), StatusCode::OK);
-        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
-        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
-        let connector_evidence = audit_json["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|record| record["action"]["requested_capability"] == "service.feishu.docx.read")
-            .and_then(|record| record["evidence"]["connector_context"].as_object())
-            .expect("feishu connector action should audit connector evidence");
-        assert_eq!(
-            connector_evidence["provider_account"].as_str(),
-            Some("feishu-main")
-        );
-        assert_eq!(
-            connector_evidence["resource_ref"].as_str(),
-            Some("service://feishu/docx/doccn-ready")
-        );
-        assert_eq!(
-            connector_evidence["required_scopes"],
-            serde_json::json!(["docx:read"])
-        );
-
-        let resources = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/connectors/resources?q=Ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resources.status(), StatusCode::OK);
-        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
-        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(resources_json["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|resource| resource["reference"] == "service://feishu/docx/doccn-ready"));
-
-        let evidence = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Ffeishu%2Fdocx%2Fdoccn-ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(evidence.status(), StatusCode::OK);
-        let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
-        let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(evidence_json["body"], serde_json::Value::Null);
-        assert_eq!(evidence_json["body_policy"], "metadata_only");
-        assert_eq!(
-            evidence_json["retrieval_capability"],
-            "service.feishu.docx.read"
-        );
-        assert!(evidence_json["next_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item == "fetch_body_through_connector_before_context_injection"));
-    }
-
-    #[tokio::test]
     async fn cross_plane_policy_simulation_does_not_consume_single_use_grant() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
@@ -6964,7 +6735,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7250,7 +7021,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7344,7 +7115,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7455,7 +7226,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7577,7 +7348,7 @@ providers:
                 "source_channel": "channel://wechat/chat/test",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": null,
                 "resource_ref": null,
                 "risk": "high",
@@ -7696,7 +7467,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7790,11 +7561,9 @@ providers:
                 && item["live_supported"] == true
                 && item["adapter_bound"] == false
         }));
-        assert!(capabilities.iter().any(|item| {
-            item["platform"] == "wecom"
-                && item["operation"] == "callback"
-                && item["live_supported"] == false
-        }));
+        assert!(!capabilities
+            .iter()
+            .any(|item| item["platform"] == "wecom" && item["operation"] == "callback"));
     }
 
     #[tokio::test]
@@ -7873,7 +7642,7 @@ providers:
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": null,
             "resource_ref": null,
             "risk": "high",
@@ -7985,7 +7754,7 @@ providers:
             "source_channel": "channel://wechat/chat/source",
             "session_id": "test-session",
             "requested_capability": capability,
-            "provider_account": "feishu-main",
+            "provider_account": "mock-docs-main",
             "target_ref": "channel://feishu/user/open-id-1/thread/chat-id-1",
             "resource_ref": "text://hello from cross plane",
             "risk": "high",
@@ -8081,7 +7850,7 @@ providers:
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": "channel://feishu/chat/demo-chat",
                 "resource_ref": "text://receipt payload",
                 "risk": "high",
@@ -8189,7 +7958,7 @@ providers:
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": "channel://feishu/chat/live-chat",
                 "resource_ref": "text://live payload",
                 "risk": "high",
@@ -8299,7 +8068,7 @@ providers:
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": "channel://feishu/chat/live-chat",
                 "resource_ref": "image://https://example.test/panel.png",
                 "risk": "high",
@@ -8403,7 +8172,7 @@ providers:
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": "channel://feishu/chat/live-chat",
                 "resource_ref": "file://reports/panel.txt",
                 "risk": "high",
@@ -8510,7 +8279,7 @@ providers:
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
                 "requested_capability": capability,
-                "provider_account": "feishu-main",
+                "provider_account": "mock-docs-main",
                 "target_ref": "channel://feishu/chat/live-chat",
                 "resource_ref": format!("file://{}", outside.display()),
                 "risk": "high",

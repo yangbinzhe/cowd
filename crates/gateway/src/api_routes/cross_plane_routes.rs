@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use runtime::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
+use channel_adapters::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision,
@@ -616,21 +616,14 @@ fn adapter_capabilities_for_platform(
     let adapter_bound = platform_binding_keys(platform)
         .iter()
         .any(|key| bound_adapters.contains(key));
-    platform
-        .capabilities
-        .iter()
-        .map(|capability| {
-            let operation = normalize_operation(capability);
-            CrossPlaneAdapterCapability {
-                platform: platform.platform_type.clone(),
-                capability: format!("channel.{}.{}", platform.platform_type, operation),
-                operation: operation.to_string(),
-                live_supported: platform_supports_live_operation(
-                    &platform.platform_type,
-                    operation,
-                ),
-                adapter_bound,
-            }
+    platform_live_dispatch_operations(&platform.platform_type)
+        .into_iter()
+        .map(|operation| CrossPlaneAdapterCapability {
+            platform: platform.platform_type.clone(),
+            capability: format!("channel.{}.{}", platform.platform_type, operation),
+            operation: operation.to_string(),
+            live_supported: true,
+            adapter_bound,
         })
         .collect()
 }
@@ -855,30 +848,26 @@ fn operation_from_capability(capability: &str) -> Option<String> {
 fn normalize_operation(operation: &str) -> &str {
     match operation.trim() {
         "send_file" | "send_document" => "send_file",
-        "doc_ops" | "docx" | "docs" => "doc_ops",
         other => other,
     }
 }
 
 fn platform_supports_live_operation(platform: &str, operation: &str) -> bool {
-    matches!(
-        (platform, operation),
-        ("feishu", "send_text")
-            | ("feishu", "send_image")
-            | ("feishu", "send_file")
-            | ("wechat-ilink", "send_text")
-            | ("wechat_ilink", "send_text")
-            | ("wechat", "send_text")
-            | ("wechat-ilink", "send_image")
-            | ("wechat_ilink", "send_image")
-            | ("wechat", "send_image")
-            | ("wecom", "send_text")
-    )
+    platform_live_dispatch_operations(platform).contains(&operation)
+}
+
+fn platform_live_dispatch_operations(platform: &str) -> Vec<&'static str> {
+    match platform {
+        "feishu" => vec!["send_text", "send_image", "send_file"],
+        "wechat-ilink" | "wechat_ilink" | "wechat" => vec!["send_text", "send_image"],
+        "wecom" => vec!["send_text"],
+        _ => Vec::new(),
+    }
 }
 
 fn is_known_cross_plane_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "send_text" | "send_image" | "send_file" | "doc_ops" | "callback" | "qr_login"
+        "send_text" | "send_image" | "send_file" | "callback" | "qr_login"
     )
 }

@@ -348,9 +348,11 @@ fn build_memory_config(
     Some(mc)
 }
 
-/// Convert `runtime::GatewayConfig` → `Vec<runtime::platform::PlatformConfig>`.
+/// Convert `runtime::GatewayConfig` → `Vec<channel_adapters::platform::PlatformConfig>`.
 /// Filters out `api_server` (handled by serve itself) and disabled platforms.
-fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform::PlatformConfig> {
+fn build_platform_configs(
+    gw: &runtime::GatewayConfig,
+) -> Vec<channel_adapters::platform::PlatformConfig> {
     if !gw.enabled {
         return Vec::new();
     }
@@ -359,7 +361,7 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
-            let mut pc = runtime::platform::PlatformConfig::new(&p.platform_type);
+            let mut pc = channel_adapters::platform::PlatformConfig::new(&p.platform_type);
             pc.enabled = p.enabled;
             for (k, v) in &p.extra {
                 pc = pc.with_setting(k, json_value_to_serde(v));
@@ -372,14 +374,16 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
         .iter()
         .any(|p| matches!(p.platform_type.as_str(), "wechat_ilink" | "wechat"));
     if !has_wechat {
-        if let Ok(accounts) = runtime::platform::wechat_ilink::list_wechat_qr_accounts(None) {
+        if let Ok(accounts) =
+            channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None)
+        {
             if let Some(account) = accounts.first() {
                 tracing::info!(
                     "wechat_ilink: auto-detected QR account {} (saved at {})",
                     account.account_id,
                     account.saved_at
                 );
-                let mut pc = runtime::platform::PlatformConfig::new("wechat_ilink");
+                let mut pc = channel_adapters::platform::PlatformConfig::new("wechat_ilink");
                 pc = pc
                     .with_setting("credential_source", "qr_account")
                     .with_setting("account_id", account.account_id.clone());
@@ -392,7 +396,7 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
 }
 
 /// Convert `runtime::JsonValue` → `serde_json::Value` for use with
-/// `runtime::platform::PlatformConfig::with_setting()`.
+/// `channel_adapters::platform::PlatformConfig::with_setting()`.
 fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     match v {
         runtime::JsonValue::Null => serde_json::Value::Null,
@@ -788,9 +792,7 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
     println!("Use personal WeChat to scan and confirm in the mobile app.");
 
     let qr = rt
-        .block_on(runtime::platform::wechat_ilink::request_wechat_qr_login(
-            "3",
-        ))
+        .block_on(channel_adapters::platform::wechat_ilink::request_wechat_qr_login("3"))
         .map_err(|e| format!("failed to create WeChat QR code: {e}"))?;
 
     println!();
@@ -816,10 +818,12 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(480);
     while std::time::Instant::now() < deadline {
         let status = rt
-            .block_on(runtime::platform::wechat_ilink::poll_wechat_qr_login(
-                &qr.qrcode,
-                Some(&base_url),
-            ))
+            .block_on(
+                channel_adapters::platform::wechat_ilink::poll_wechat_qr_login(
+                    &qr.qrcode,
+                    Some(&base_url),
+                ),
+            )
             .map_err(|e| format!("failed to poll WeChat QR status: {e}"))?;
 
         match status.status.as_str() {
@@ -840,9 +844,11 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
                 let credentials = status
                     .credentials
                     .ok_or("WeChat confirmed without credentials")?;
-                let path =
-                    runtime::platform::wechat_ilink::save_wechat_qr_account(&credentials, None)
-                        .map_err(|e| format!("failed to save WeChat account: {e}"))?;
+                let path = channel_adapters::platform::wechat_ilink::save_wechat_qr_account(
+                    &credentials,
+                    None,
+                )
+                .map_err(|e| format!("failed to save WeChat account: {e}"))?;
                 println!();
                 println!("WeChat connected.");
                 println!("Account          {}", credentials.account_id);

@@ -175,7 +175,7 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
         credential_present,
         missing_required,
         scopes: platform_scopes_from_value(value),
-        capabilities: contract.operation_names(),
+        capabilities: contract.capability_names(),
         diagnostics,
     })
 }
@@ -195,7 +195,7 @@ fn disabled_platform(platform_type: &str) -> PlatformReadiness {
             .map(|field| field.to_string())
             .collect(),
         scopes: Vec::new(),
-        capabilities: contract.operation_names(),
+        capabilities: contract.capability_names(),
         diagnostics: vec!["platform is not configured".to_string()],
     }
 }
@@ -259,7 +259,7 @@ async fn wechat_ilink_accounts_handler(
     } else {
         Vec::new()
     };
-    let accounts = runtime::platform::wechat_ilink::list_wechat_qr_accounts(None)
+    let accounts = channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None)
         .unwrap_or_default()
         .into_iter()
         .map(|account| {
@@ -284,7 +284,7 @@ async fn wechat_ilink_accounts_handler(
 async fn wechat_ilink_qr_start_handler(
     Json(body): Json<WechatQrStartRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let qr = runtime::platform::wechat_ilink::request_wechat_qr_login(&body.bot_type)
+    let qr = channel_adapters::platform::wechat_ilink::request_wechat_qr_login(&body.bot_type)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
     Ok(Json(serde_json::json!({
@@ -301,7 +301,7 @@ async fn wechat_ilink_qr_start_handler(
 async fn wechat_ilink_qr_poll_handler(
     Json(body): Json<WechatQrPollRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let status = runtime::platform::wechat_ilink::poll_wechat_qr_login(
+    let status = channel_adapters::platform::wechat_ilink::poll_wechat_qr_login(
         &body.qrcode,
         body.base_url.as_deref(),
     )
@@ -309,7 +309,7 @@ async fn wechat_ilink_qr_poll_handler(
     .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
 
     let account = if let Some(credentials) = status.credentials.as_ref() {
-        runtime::platform::wechat_ilink::save_wechat_qr_account(credentials, None)
+        channel_adapters::platform::wechat_ilink::save_wechat_qr_account(credentials, None)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         Some(serde_json::json!({
             "account_id": credentials.account_id,
