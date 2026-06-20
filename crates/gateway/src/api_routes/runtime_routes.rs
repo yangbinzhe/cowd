@@ -45,22 +45,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/runtime/turns/:id", get(get_runtime_turn))
         .route("/api/runtime/turns/:id/cancel", post(cancel_runtime_turn))
         .route(
-            "/api/runtime/sessions/:id/attach",
-            post(attach_runtime_session),
-        )
-        .route(
-            "/api/runtime/sessions/:id/detach",
-            post(detach_runtime_session),
-        )
-        .route(
-            "/api/runtime/sessions/:id/lifecycle",
-            get(get_runtime_session_lifecycle),
-        )
-        .route(
-            "/api/runtime/sessions/:id/replay",
-            get(replay_runtime_session),
-        )
-        .route(
             "/api/runtime/session-leases",
             get(get_runtime_session_leases),
         )
@@ -98,33 +82,12 @@ struct RuntimeSessionLeaseReleaseRequest {
 }
 
 #[derive(Deserialize)]
-struct RuntimeSessionAttachRequest {
-    actor_id: String,
-    surface: String,
-    #[serde(default)]
-    role: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RuntimeSessionDetachRequest {
-    actor_id: String,
-}
-
-#[derive(Deserialize)]
 struct RuntimeTurnSubmitRequest {
     prompt: String,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RuntimeSessionReplayParams {
-    #[serde(default)]
-    from_sequence: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
 }
 
 async fn submit_runtime_turn(
@@ -193,73 +156,6 @@ pub(super) async fn get_runtime_snapshot(
 ) -> Json<Value> {
     match state.services.runtime.as_ref() {
         Some(runtime) => Json(runtime.snapshot_value().await),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
-}
-
-async fn attach_runtime_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<RuntimeSessionAttachRequest>,
-) -> Json<Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(
-            runtime
-                .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
-                .await,
-        ),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
-}
-
-async fn detach_runtime_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<RuntimeSessionDetachRequest>,
-) -> Json<Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(runtime.detach_session_value(&id, &body.actor_id).await),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
-}
-
-async fn get_runtime_session_lifecycle(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Json<Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(runtime.lifecycle_snapshot_value(Some(&id)).await),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
-}
-
-async fn replay_runtime_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<RuntimeSessionReplayParams>,
-) -> Json<Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(
-            runtime
-                .replay_session_value(
-                    &id,
-                    params.from_sequence.unwrap_or(0),
-                    params.limit.unwrap_or(100),
-                )
-                .await,
-        ),
         None => Json(serde_json::json!({
             "ok": false,
             "error": "runtime service unavailable",

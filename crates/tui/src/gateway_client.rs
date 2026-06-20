@@ -234,7 +234,7 @@ impl GatewayApiClient {
         role: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/runtime/sessions/{}/attach", url_encode(session_id)),
+            &format!("/api/sessions/{}/attach", url_encode(session_id)),
             serde_json::json!({
                 "actor_id": actor_id,
                 "surface": surface,
@@ -250,7 +250,7 @@ impl GatewayApiClient {
         actor_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/runtime/sessions/{}/detach", url_encode(session_id)),
+            &format!("/api/sessions/{}/detach", url_encode(session_id)),
             serde_json::json!({ "actor_id": actor_id }),
         )
         .await
@@ -263,7 +263,7 @@ impl GatewayApiClient {
         match session_id {
             Some(session_id) => {
                 self.get_json(&format!(
-                    "/api/runtime/sessions/{}/lifecycle",
+                    "/api/sessions/{}/lifecycle",
                     url_encode(session_id)
                 ))
                 .await
@@ -279,7 +279,7 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!(
-            "/api/runtime/sessions/{}/replay?from_sequence={from_sequence}&limit={limit}",
+            "/api/sessions/{}/replay?from_sequence={from_sequence}&limit={limit}",
             url_encode(session_id)
         ))
         .await

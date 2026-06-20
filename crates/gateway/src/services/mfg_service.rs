@@ -103,7 +103,7 @@ impl MfgService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mfg",
-            owner: "0.9.344 GatewayServices",
+            owner: "0.9.345 GatewayServices",
         }
     }
 

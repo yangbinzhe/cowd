@@ -665,6 +665,22 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && session_routes.contains("session_exists"),
         "session routes must use SessionService semantic helpers instead of runtime registry internals"
     );
+    let runtime_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/runtime_routes.rs",
+    ))
+    .to_string();
+    let tui_gateway_client_source = read_repo("crates/tui/src/gateway_client.rs");
+    let tui_gateway_client = production_part(&tui_gateway_client_source);
+    assert!(
+        !runtime_routes.contains("/api/runtime/sessions/")
+            && session_routes.contains("/api/sessions/:id/attach")
+            && session_routes.contains("/api/sessions/:id/detach")
+            && session_routes.contains("/api/sessions/:id/lifecycle")
+            && session_routes.contains("/api/sessions/:id/replay")
+            && !tui_gateway_client.contains("/api/runtime/sessions/")
+            && tui_gateway_client.contains("/api/sessions/{}/attach"),
+        "session lifecycle API must live under /api/sessions/*, not /api/runtime/sessions/*"
+    );
 
     let ai_policy = production_part(&read_repo("crates/ai-kernel/src/policy/mod.rs")).to_string();
     assert!(
