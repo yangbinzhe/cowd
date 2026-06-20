@@ -11,6 +11,7 @@ pub mod hypothesis;
 pub mod matrix;
 pub mod memory;
 
+pub use bridge::{decide_candidate_promotion, BridgeDecision};
 pub use core::{
     Confidence, EvidenceId, EvidencePacket, FactId, FactRecord, FactSource, Provenance, SourceKind,
 };

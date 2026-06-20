@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use channel_adapters::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
+use channel_adapters::platform::{OutboundDispatch, OutboundPayloadKind};
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision,
@@ -629,10 +629,7 @@ fn adapter_capabilities_for_platform(
 }
 
 async fn bound_adapter_snapshot(state: &AppState) -> HashSet<String> {
-    let Some(runtime) = &state.platform_runtime else {
-        return HashSet::new();
-    };
-    runtime.list_bound_adapters().await.into_iter().collect()
+    state.services.channel.bound_adapter_set().await
 }
 
 fn platform_binding_keys(platform: &channel_routes::PlatformReadiness) -> Vec<String> {
@@ -672,10 +669,9 @@ async fn dispatch_ready_target(
         .outbound_message
         .as_ref()
         .ok_or_else(|| ("dispatch:outbound_message_missing".to_string(), None))?;
-    let runtime = state
-        .platform_runtime
-        .as_ref()
-        .ok_or_else(|| ("dispatch:runtime_unavailable".to_string(), None))?;
+    if !state.services.channel.is_runtime_available() {
+        return Err(("dispatch:runtime_unavailable".to_string(), None));
+    }
     let operation = target.operation.as_deref().unwrap_or("send_text");
     let kind = match outbound.payload_kind.as_str() {
         "text" => OutboundPayloadKind::Text,
@@ -708,11 +704,15 @@ async fn dispatch_ready_target(
             },
         )?;
 
-    match runtime
+    match state
+        .services
+        .channel
         .dispatch_payload(
             platform,
             OutboundDispatch {
-                session_key: SessionKey::from(outbound.session_key.as_str()),
+                session_key: crate::services::ChannelService::session_key(
+                    outbound.session_key.as_str(),
+                ),
                 kind,
                 payload_ref,
                 caption: outbound.caption.clone(),

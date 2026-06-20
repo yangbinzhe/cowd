@@ -3,7 +3,6 @@ use provider::{
     ContentBlockDelta, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     ProviderClient, StreamEvent,
 };
-use runtime::ConfigLoader;
 use serde_json::Value;
 
 #[tokio::test]
@@ -269,19 +268,11 @@ fn live_env() -> Option<LiveEnv> {
         return None;
     }
 
-    let cwd = std::env::current_dir().expect("current dir should be available");
-    let config = ConfigLoader::default_for(cwd)
-        .load()
-        .expect("runtime config should load");
     let model = std::env::var("COWD_AI_HARNESS_LIVE_MODEL")
         .ok()
-        .or_else(|| config.model().map(str::to_string))
-        .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or config model");
-    let provider = config
-        .providers()
-        .resolve_full(&model)
-        .cloned()
-        .or_else(|| fallback_provider_from_env(&model))
+        .or_else(|| std::env::var("OPENAI_MODEL").ok())
+        .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or OPENAI_MODEL");
+    let provider = fallback_provider_from_env(&model)
         .unwrap_or_else(|| panic!("no provider configured for live model {model:?}"));
     let provider_name = provider.name.clone();
     let client = ProviderClient::from_config(&provider).expect("provider client should build");

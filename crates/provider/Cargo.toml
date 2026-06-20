@@ -15,8 +15,5 @@ telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 
-[dev-dependencies]
-runtime = { path = "../runtime" }
-
 [lints]
 workspace = true

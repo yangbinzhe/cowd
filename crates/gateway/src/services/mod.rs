@@ -5,6 +5,7 @@ use memory::CognitiveContextManager;
 
 mod agent_service;
 mod approval_service;
+mod channel_service;
 mod command_service;
 mod connector_service;
 mod context;
@@ -25,6 +26,7 @@ mod workspace_service;
 
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
+pub(crate) use channel_service::ChannelService;
 pub(crate) use command_service::CommandService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
@@ -215,6 +217,7 @@ impl AgentService {
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
+    pub(crate) channel: ChannelService,
     pub(crate) command: CommandService,
     pub(crate) session: SessionService,
     pub(crate) task: TaskService,
@@ -396,7 +399,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.339 GatewayServices");
+        assert_eq!(services.owner, "0.9.340 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

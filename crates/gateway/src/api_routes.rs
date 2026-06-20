@@ -16,6 +16,7 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
+#[cfg(test)]
 use channel_adapters::platform::PlatformRuntime;
 use runtime::approval_gate::SmartApprovalGate;
 #[cfg(test)]
@@ -77,7 +78,6 @@ mod workspace_routes;
 pub struct AppState {
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
-    pub platform_runtime: Option<Arc<PlatformRuntime>>,
     pub event_bus: Arc<SessionEventBus>,
     pub static_webui: crate::gateway_static::StaticWebUiSource,
     pub approval_gate: Option<Arc<SmartApprovalGate>>,
@@ -520,6 +520,7 @@ mod tests {
     fn test_services(
         session_kernel: Arc<SessionKernel>,
         task_kernel: Arc<TaskKernel>,
+        platform_runtime: Option<Arc<PlatformRuntime>>,
     ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessions::new());
         let lifecycle_kernel =
@@ -540,6 +541,7 @@ mod tests {
         Arc::new(crate::services::GatewayServices::new(
             runtime,
             task_kernel,
+            platform_runtime,
             None,
             test_approval_gate(),
             approval_repository,
@@ -714,7 +716,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -723,7 +724,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         })
     }
@@ -743,7 +744,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -752,7 +752,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: Some(registry),
         })
     }
@@ -781,7 +781,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: Some(config),
-            platform_runtime,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -790,7 +789,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, platform_runtime),
             session_lease_registry: None,
         })
     }
@@ -811,7 +810,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -820,7 +818,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         })
     }
@@ -839,7 +837,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -848,7 +845,7 @@ mod tests {
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         })
     }
@@ -877,7 +874,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -904,7 +900,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -936,7 +931,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: Some(gate.clone()),
@@ -962,7 +956,6 @@ mod tests {
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -971,7 +964,7 @@ mod tests {
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         })
     }
@@ -6140,7 +6133,7 @@ providers:
         assert!(!list.iter().any(|item| item["capability_id"]
             .as_str()
             .unwrap_or_default()
-            .contains("doc_ops")));
+            .contains("feishu_document_operation")));
     }
 
     #[tokio::test]
@@ -9921,7 +9914,6 @@ providers:
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -9930,7 +9922,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9957,7 +9949,6 @@ providers:
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -9966,7 +9957,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -9993,7 +9984,6 @@ providers:
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -10002,7 +9992,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         });
         let app = api_router(state);
@@ -10038,7 +10028,6 @@ providers:
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            platform_runtime: None,
             event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
@@ -10047,7 +10036,7 @@ providers:
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel),
+            services: test_services(session_kernel, task_kernel, None),
             session_lease_registry: None,
         });
         let app = api_router(state);

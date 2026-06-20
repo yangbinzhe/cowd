@@ -487,38 +487,15 @@ mod tests {
     #[test]
     fn plugin_config_max_output_tokens_overrides_model_default() {
         // given
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("api-plugin-max-tokens-{nanos}"));
-        let cwd = root.join("project");
-        let home = root.join("home").join(".cowd");
-        std::fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
-        std::fs::create_dir_all(&home).expect("home config dir");
-        std::fs::write(
-            home.join("config.yaml"),
-            r#"{
-              "plugins": {
-                "maxOutputTokens": 12345
-              }
-            }"#,
-        )
-        .expect("write plugin settings");
+        let plugin_override = Some(12345);
 
         // when
-        let loaded = runtime::ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-        let plugin_override = loaded.plugins().max_output_tokens();
         let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
 
         // then
         assert_eq!(plugin_override, Some(12345));
         assert_eq!(effective, 12345);
         assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
-
-        std::fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

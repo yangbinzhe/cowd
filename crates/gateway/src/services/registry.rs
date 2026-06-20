@@ -15,6 +15,7 @@ impl GatewayServices {
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
+        channel_runtime: Option<Arc<channel_adapters::platform::PlatformRuntime>>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
@@ -23,6 +24,9 @@ impl GatewayServices {
         let session_kernel = runtime.session_kernel();
         Self {
             runtime: Some(runtime),
+            channel: channel_runtime
+                .map(ChannelService::with_runtime)
+                .unwrap_or_else(ChannelService::new),
             command: CommandService::new(Some(command_host_runtime)),
             session: SessionService::with_kernel(session_kernel),
             task: TaskService::with_kernel(task_kernel),
@@ -35,6 +39,7 @@ impl GatewayServices {
     pub(crate) fn baseline() -> Self {
         Self {
             runtime: None,
+            channel: ChannelService::new(),
             command: CommandService::new(None),
             session: SessionService::new(),
             task: TaskService::new(),
@@ -51,7 +56,7 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.339 GatewayServices",
+            owner: "0.9.340 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -109,6 +114,7 @@ impl GatewayServices {
     pub(crate) fn service_labels(&self) -> Vec<&'static str> {
         vec![
             "runtime",
+            self.channel.label(),
             self.command.label(),
             self.session.label,
             self.task.label,

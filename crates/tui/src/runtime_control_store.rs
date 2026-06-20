@@ -1011,17 +1011,17 @@ mod tests {
         }));
         snapshot.ingest_connector_accounts(&serde_json::json!({
             "accounts": [{
-                "provider": "feishu",
-                "account_id": "feishu-main",
-                "auth_mode": "app_secret",
-                "enabled_bindings": ["service.feishu.docx.read"],
-                "health": {"status": "degraded", "reason": "missing app_secret"}
+                "provider": "mock",
+                "account_id": "mock-docs",
+                "auth_mode": "none",
+                "enabled_bindings": ["service.mock.docs.read"],
+                "health": {"status": "ready"}
             }]
         }));
         snapshot.ingest_connector_capabilities(&serde_json::json!({
             "capabilities": [{
-                "capability_id": "service.feishu.docx.read",
-                "provider": "feishu",
+                "capability_id": "service.mock.docs.read",
+                "provider": "mock",
                 "plane": "service",
                 "risk": "low",
                 "supports_commit": true,
@@ -1031,10 +1031,10 @@ mod tests {
         snapshot.ingest_connector_resources(&serde_json::json!({
             "degraded_reason": "resource directory unavailable",
             "resources": [{
-                "reference": "service://feishu/docx/doccn-ready",
-                "provider": "feishu",
-                "resource_type": "docx",
-                "title": "Ready Feishu Doc",
+                "reference": "service://mock/docs/ready",
+                "provider": "mock",
+                "resource_type": "document",
+                "title": "Ready Mock Document",
                 "indexed_state": "indexed"
             }]
         }));
@@ -1056,15 +1056,12 @@ mod tests {
         assert_eq!(snapshot.cross_plane_grants_active, Some(4));
         assert_eq!(snapshot.cross_plane_actions_24h, Some(7));
         assert_eq!(snapshot.connector_accounts.len(), 1);
-        assert_eq!(snapshot.connector_accounts[0].status, "degraded");
-        assert_eq!(
-            snapshot.connector_accounts[0].reason.as_deref(),
-            Some("missing app_secret")
-        );
+        assert_eq!(snapshot.connector_accounts[0].status, "ready");
+        assert_eq!(snapshot.connector_accounts[0].reason.as_deref(), None);
         assert_eq!(snapshot.connector_capabilities.len(), 1);
         assert!(snapshot.connector_capabilities[0].supports_commit);
         assert_eq!(snapshot.connector_resources.len(), 1);
-        assert_eq!(snapshot.connector_resources[0].title, "Ready Feishu Doc");
+        assert_eq!(snapshot.connector_resources[0].title, "Ready Mock Document");
         assert_eq!(
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"

@@ -26,6 +26,38 @@ fn manifest_dependencies(source: &str) -> &str {
 }
 
 #[test]
+fn removed_builtin_channel_document_operations_do_not_reappear() {
+    let forbidden_terms = [
+        "service.feishu.docx",
+        "feishu.readonly",
+        "docx:read",
+        "doc_ops",
+    ];
+    let checked_files = [
+        "crates/channel/src/lib.rs",
+        "crates/channel-adapters/src/lib.rs",
+        "crates/channel-adapters/src/platform/mod.rs",
+        "crates/connector/src/lib.rs",
+        "crates/gateway/src/api_routes.rs",
+        "crates/gateway/src/runtime_host/mod.rs",
+        "crates/runtime/src/lib.rs",
+        "crates/tui/src/runtime_control_store.rs",
+        "crates/tui/src/components/command_palette.rs",
+        "crates/tui/src/components/gateway_panel.rs",
+    ];
+
+    for file in checked_files {
+        let source = read_repo(file);
+        for forbidden in forbidden_terms {
+            assert!(
+                !source.contains(forbidden),
+                "{file} must not retain built-in channel document operation residue `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn daemon_module_is_removed_after_runtime_host_consolidation() {
     let root = repo_root();
     assert!(
@@ -386,8 +418,29 @@ fn channel_contracts_drive_gateway_platform_readiness() {
         "gateway must not own a duplicate platform capability table"
     );
     assert!(
-        !channel_source.contains("doc_ops"),
+        !channel_source.contains("feishu_document_operation"),
         "channel contract must not expose Feishu document operations as built-in channel capability"
+    );
+
+    let gateway_services_source = read_repo("crates/gateway/src/services/mod.rs");
+    let gateway_services = production_part(&gateway_services_source);
+    let channel_service_source = read_repo("crates/gateway/src/services/channel_service.rs");
+    let channel_service = production_part(&channel_service_source);
+    let api_state_source = read_repo("crates/gateway/src/api_routes.rs");
+    let api_state = production_part(&api_state_source);
+    assert!(
+        gateway_services.contains("pub(crate) channel: ChannelService"),
+        "GatewayServices must expose the channel service boundary"
+    );
+    assert!(
+        channel_service.contains("pub(crate) struct ChannelService")
+            && channel_service.contains("runtime: Option<Arc<PlatformRuntime>>")
+            && channel_service.contains("dispatch_payload("),
+        "ChannelService must own gateway-side platform runtime access"
+    );
+    assert!(
+        !api_state.contains("pub platform_runtime:"),
+        "AppState must not expose PlatformRuntime directly to gateway routes"
     );
 
     for source_path in [
@@ -402,6 +455,23 @@ fn channel_contracts_drive_gateway_platform_readiness() {
         assert!(
             !source.contains("runtime::platform"),
             "{source_path} must not use runtime::platform as the channel host"
+        );
+    }
+
+    for source_path in [
+        "crates/gateway/src/api_routes/channel_routes.rs",
+        "crates/gateway/src/api_routes/cross_plane_routes.rs",
+        "crates/gateway/src/api_routes/mfg_routes.rs",
+        "crates/gateway/src/gateway_health.rs",
+    ] {
+        let source = production_part(&read_repo(source_path)).to_string();
+        assert!(
+            source.contains("services.channel"),
+            "{source_path} must access channel runtime through GatewayServices.channel"
+        );
+        assert!(
+            !source.contains("state.platform_runtime"),
+            "{source_path} must not bypass ChannelService with AppState.platform_runtime"
         );
     }
 
@@ -787,7 +857,10 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         !cli_main.contains("gateway::main_entry()"),
         "cli must not fall back into gateway's historical full CLI parser"
     );
-    assert!(!cli_dependencies.contains("runtime"));
+    assert!(
+        !cli_manifest.contains("runtime = ") && !cli_manifest.contains("memory = "),
+        "cli must not depend on runtime or memory, including dev-dependencies"
+    );
     assert!(!cli_dependencies.contains("ratatui"));
     assert!(!cli_dependencies.contains("axum"));
     for dependency in ["crossterm", "pulldown-cmark", "syntect", "unicode-width"] {

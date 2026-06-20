@@ -60,7 +60,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         service_layer: state.services.has_minimum_service_contract(),
         unified_store: state.has_unified_store(),
         memory_manager: state.services.memory.manager().is_some(),
-        platform_runtime: state.platform_runtime.is_some(),
+        platform_runtime: state.services.channel.is_runtime_available(),
         event_bus: true,
         session_kernel: true,
     };

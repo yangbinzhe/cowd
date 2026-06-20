@@ -249,16 +249,12 @@ fn qr_svg(scan_data: &str) -> Option<String> {
 async fn wechat_ilink_accounts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let runtime_bound = if let Some(runtime) = &state.platform_runtime {
-        runtime.has_bound_adapter("wechat_ilink").await
-    } else {
-        false
-    };
-    let bound_adapters = if let Some(runtime) = &state.platform_runtime {
-        runtime.list_bound_adapters().await
-    } else {
-        Vec::new()
-    };
+    let runtime_bound = state
+        .services
+        .channel
+        .has_bound_adapter("wechat_ilink")
+        .await;
+    let bound_adapters = state.services.channel.list_bound_adapters().await;
     let accounts = channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None)
         .unwrap_or_default()
         .into_iter()

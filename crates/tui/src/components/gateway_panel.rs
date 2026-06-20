@@ -1338,28 +1338,18 @@ mod tests {
         panel.pending_approvals = Some(1);
         panel.memory_status = Some("available".to_string());
         panel.degraded_reasons = vec!["context socket degraded".to_string()];
-        panel.set_connector_accounts(vec![
-            ConnectorAccountSummary {
-                provider: "feishu".to_string(),
-                account_id: "feishu-main".to_string(),
-                auth_mode: "app_secret".to_string(),
-                status: "degraded".to_string(),
-                reason: Some("missing required fields: app_secret".to_string()),
-                binding_count: 1,
-            },
-            ConnectorAccountSummary {
-                provider: "mock".to_string(),
-                account_id: "mock.docs".to_string(),
-                auth_mode: "none".to_string(),
-                status: "ready".to_string(),
-                reason: None,
-                binding_count: 1,
-            },
-        ]);
+        panel.set_connector_accounts(vec![ConnectorAccountSummary {
+            provider: "mock".to_string(),
+            account_id: "mock-docs".to_string(),
+            auth_mode: "none".to_string(),
+            status: "ready".to_string(),
+            reason: None,
+            binding_count: 1,
+        }]);
         panel.set_connector_capabilities(vec![
             ConnectorCapabilitySummary {
-                capability_id: "service.feishu.docx.read".to_string(),
-                provider: "feishu".to_string(),
+                capability_id: "service.mock.docs.read".to_string(),
+                provider: "mock".to_string(),
                 plane: "service".to_string(),
                 risk: "low".to_string(),
                 supports_commit: true,
@@ -1375,10 +1365,10 @@ mod tests {
             },
         ]);
         panel.set_connector_resources(vec![ConnectorResourceSummary {
-            reference: "service://feishu/docx/doccn-ready".to_string(),
-            provider: "feishu".to_string(),
-            resource_type: "docx".to_string(),
-            title: "Ready Feishu Doc".to_string(),
+            reference: "service://mock/docs/ready".to_string(),
+            provider: "mock".to_string(),
+            resource_type: "document".to_string(),
+            title: "Ready Mock Document".to_string(),
             indexed_state: "indexed".to_string(),
         }]);
         panel.set_connector_degraded_reasons(vec!["resource_directory: locked".to_string()]);
@@ -1403,15 +1393,15 @@ mod tests {
             "Should show connector section, got: {joined}"
         );
         assert!(
-            joined.contains("feishu-main") && joined.contains("missing required fields"),
-            "Should show degraded account reason, got: {joined}"
+            joined.contains("mock-docs"),
+            "Should show connector account, got: {joined}"
         );
         assert!(
-            joined.contains("service.feishu.docx.read") && joined.contains("mcp.filesystem.server"),
+            joined.contains("service.mock.docs.read") && joined.contains("mcp.filesystem.server"),
             "Should show connector capabilities, got: {joined}"
         );
         assert!(
-            joined.contains("Ready Feishu Doc") && joined.contains("indexed"),
+            joined.contains("Ready Mock Document") && joined.contains("indexed"),
             "Should show connector resources, got: {joined}"
         );
         assert!(

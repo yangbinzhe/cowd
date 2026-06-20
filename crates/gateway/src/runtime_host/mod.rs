@@ -837,6 +837,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             started_at,
         )),
         task_kernel.clone(),
+        Some(platform_runtime.clone()),
         cognitive.clone(),
         approval_gate.clone(),
         approval_repository,
@@ -845,7 +846,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
-        platform_runtime: Some(platform_runtime.clone()),
         event_bus: event_bus.clone(),
         static_webui: static_webui.clone(),
         approval_gate: Some(approval_gate),

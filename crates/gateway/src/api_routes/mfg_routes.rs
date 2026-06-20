@@ -349,7 +349,7 @@ async fn mfg_production_governance_handler(
         auth_token_configured: state.auth_token.is_some(),
         approval_gate_configured: state.services.approval.is_configured(),
         session_store_ready: state.services.session.has_unified_store(),
-        platform_runtime_ready: state.platform_runtime.is_some(),
+        platform_runtime_ready: state.services.channel.is_runtime_available(),
         audit_export_surface: true,
         cross_plane_audit_surface: true,
         runbook_present: state

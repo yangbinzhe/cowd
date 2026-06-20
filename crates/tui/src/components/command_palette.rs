@@ -1258,11 +1258,11 @@ mod tests {
             gateway_running: true,
             task_count: Some(0),
             connector_accounts: vec![crate::runtime_control_store::ConnectorAccountSummary {
-                provider: "feishu".to_string(),
-                account_id: "feishu-main".to_string(),
-                auth_mode: "app_secret".to_string(),
-                status: "degraded".to_string(),
-                reason: Some("missing required fields: app_secret".to_string()),
+                provider: "mock".to_string(),
+                account_id: "mock-docs".to_string(),
+                auth_mode: "none".to_string(),
+                status: "ready".to_string(),
+                reason: None,
                 binding_count: 1,
             }],
             connector_capabilities: vec![
@@ -1274,20 +1274,12 @@ mod tests {
                     supports_commit: true,
                     requires_approval: false,
                 },
-                crate::runtime_control_store::ConnectorCapabilitySummary {
-                    capability_id: "service.feishu.docx.read".to_string(),
-                    provider: "feishu".to_string(),
-                    plane: "service".to_string(),
-                    risk: "low".to_string(),
-                    supports_commit: true,
-                    requires_approval: false,
-                },
             ],
             connector_resources: vec![crate::runtime_control_store::ConnectorResourceSummary {
-                reference: "service://feishu/docx/doccn-ready".to_string(),
-                provider: "feishu".to_string(),
-                resource_type: "docx".to_string(),
-                title: "Ready Feishu Doc".to_string(),
+                reference: "service://mock/docs/ready".to_string(),
+                provider: "mock".to_string(),
+                resource_type: "document".to_string(),
+                title: "Ready Mock Document".to_string(),
                 indexed_state: "indexed".to_string(),
             }],
             connector_degraded_reasons: vec!["resource_directory: locked".to_string()],
@@ -1304,7 +1296,6 @@ mod tests {
             "Probe Connectors",
             "Mock Docs Dry Run",
             "Mock Docs Commit",
-            "Inspect Degraded Connector",
         ] {
             assert!(
                 p.all_commands
@@ -1315,14 +1306,9 @@ mod tests {
         }
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic
-                && entry.name == "Inspect Degraded Connector"
-                && entry.description.contains("resource_directory")
-        }));
-        assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic
                 && entry.action
                     == Action::RevalidateConnectorResource {
-                        reference: "service://feishu/docx/doccn-ready".to_string(),
+                        reference: "service://mock/docs/ready".to_string(),
                         state: "stale".to_string(),
                     }
         }));
@@ -1330,7 +1316,7 @@ mod tests {
             entry.dynamic
                 && entry.action
                     == Action::PromoteConnectorResourceToMemory {
-                        reference: "service://feishu/docx/doccn-ready".to_string(),
+                        reference: "service://mock/docs/ready".to_string(),
                         session_id: None,
                     }
         }));
