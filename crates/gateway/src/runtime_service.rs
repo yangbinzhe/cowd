@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::gateway::ActiveSessions;
 use crate::runtime_boundary::{
@@ -11,7 +11,28 @@ use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse}
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
 use ai_kernel::turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus};
+use runtime::agent_collaboration::CollaborationContextResult;
 use session::SessionLeaseRegistry;
+use tokio::time::timeout;
+
+#[derive(Debug)]
+pub(crate) enum RuntimeTurnExecutionError {
+    NotFound(String),
+    Timeout { seconds: u64 },
+    Runtime(String),
+    Join(String),
+}
+
+impl RuntimeTurnExecutionError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::NotFound(message) | Self::Runtime(message) | Self::Join(message) => {
+                message.clone()
+            }
+            Self::Timeout { seconds } => format!("turn timed out after {seconds}s"),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
@@ -189,6 +210,107 @@ impl RuntimeService {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn has_active_session(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some()
+    }
+
+    pub(crate) async fn cowd_event_receiver(
+        &self,
+        session_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<runtime::CowdEvent>> {
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.cowd_bus().map(|bus| bus.subscribe())
+    }
+
+    pub(crate) async fn configure_turn_context(
+        &self,
+        session_id: &str,
+        profile: runtime::ContextProfile,
+        resume_context: Option<runtime::ResumeContextPacket>,
+    ) -> Result<(), RuntimeTurnExecutionError> {
+        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
+            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
+        })?;
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.set_context_profile(profile);
+        if let Some(packet) = resume_context {
+            runtime_guard.inject_resume_context(packet);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn install_turn_control(
+        &self,
+        session_id: &str,
+        cancellation_token: runtime::CancellationToken,
+        hook_abort_signal: runtime::HookAbortSignal,
+    ) -> Result<(), RuntimeTurnExecutionError> {
+        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
+            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
+        })?;
+        let mut runtime_guard = runtime_entry.lock().await;
+        runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
+        Ok(())
+    }
+
+    pub(crate) async fn run_turn_with_timeout(
+        &self,
+        session_id: &str,
+        content: String,
+        turn_timeout: Duration,
+    ) -> Result<runtime::TurnSummary, RuntimeTurnExecutionError> {
+        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
+            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
+        })?;
+        let turn_result = tokio::task::spawn_blocking(move || {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async move {
+                let mut runtime_guard = runtime_entry.lock().await;
+                timeout(
+                    turn_timeout,
+                    runtime_guard
+                        .run_turn_async(&content, &runtime::permissions::SharedPrompter::none()),
+                )
+                .await
+            })
+        })
+        .await
+        .map_err(|error| RuntimeTurnExecutionError::Join(format!("task join error: {error}")))?;
+
+        match turn_result {
+            Ok(Ok(summary)) => Ok(summary),
+            Ok(Err(error)) => Err(RuntimeTurnExecutionError::Runtime(error.to_string())),
+            Err(_) => Err(RuntimeTurnExecutionError::Timeout {
+                seconds: turn_timeout.as_secs(),
+            }),
+        }
+    }
+
+    pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        Some(runtime_guard.session().clone())
+    }
+
+    pub(crate) async fn last_context_envelope(
+        &self,
+        session_id: &str,
+    ) -> Option<runtime::ContextEnvelope> {
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.last_context_envelope()
+    }
+
+    pub(crate) async fn take_collaboration_result(
+        &self,
+        session_id: &str,
+    ) -> Option<CollaborationContextResult> {
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.take_collaboration_result()
     }
 
     pub(crate) async fn snapshot(&self) -> RuntimeBoundarySnapshot {

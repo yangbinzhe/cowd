@@ -61,6 +61,18 @@ pub(crate) struct SessionTokenCounts {
     pub(crate) total: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ActiveMessagesPage {
+    pub(crate) session_id: String,
+    pub(crate) messages: Vec<serde_json::Value>,
+    pub(crate) total: usize,
+    pub(crate) offset: usize,
+    pub(crate) from_seq: Option<usize>,
+    pub(crate) next_seq: Option<usize>,
+    pub(crate) limit: usize,
+    pub(crate) has_more: bool,
+}
+
 impl SessionService {
     pub(crate) fn new() -> Self {
         Self {
@@ -113,6 +125,19 @@ impl SessionService {
             .map_or_else(Vec::new, |kernel| kernel.list_active_session_ids())
     }
 
+    pub(crate) fn has_active_runtime(&self, session_id: &str) -> bool {
+        self.active_runtime(session_id).is_some()
+    }
+
+    pub(crate) async fn session_exists(&self, session_id: &str) -> Result<bool, MemoryError> {
+        if self.has_active_runtime(session_id) {
+            return Ok(true);
+        }
+        self.stored_session(session_id)
+            .await
+            .map(|record| record.is_some())
+    }
+
     pub(crate) fn active_runtime(
         &self,
         session_id: &str,
@@ -137,6 +162,10 @@ impl SessionService {
     ) -> Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>> {
         self.kernel()
             .and_then(|kernel| kernel.remove_active_runtime(session_id))
+    }
+
+    pub(crate) fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
+        self.remove_active_runtime(session_id).is_some()
     }
 
     pub(crate) async fn list_stored_sessions_page(
@@ -468,6 +497,109 @@ impl SessionService {
             },
             tool_usage,
             duration_ms: session.updated_at_ms.saturating_sub(session.created_at_ms),
+        })
+    }
+
+    pub(crate) fn last_context_envelope_nonblocking(
+        &self,
+        session_id: &str,
+    ) -> Option<runtime::ContextEnvelope> {
+        let runtime_entry = self.active_runtime(session_id)?;
+        let envelope = match runtime_entry.try_lock() {
+            Ok(runtime) => runtime.last_context_envelope(),
+            Err(_) => {
+                tracing::debug!(
+                    %session_id,
+                    "runtime context envelope skipped because active runtime is busy"
+                );
+                None
+            }
+        };
+        envelope
+    }
+
+    pub(crate) async fn active_messages_page(
+        &self,
+        session_id: &str,
+        offset: usize,
+        from_seq: Option<usize>,
+        limit: usize,
+    ) -> Option<ActiveMessagesPage> {
+        let runtime_entry = self.active_runtime(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        let session = runtime_guard.session();
+
+        let all_messages: Vec<serde_json::Value> = session
+            .messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role {
+                    runtime::MessageRole::System => "system",
+                    runtime::MessageRole::User => "user",
+                    runtime::MessageRole::Assistant => "assistant",
+                    runtime::MessageRole::Tool => "tool",
+                };
+                let blocks: Vec<serde_json::Value> = msg
+                    .blocks
+                    .iter()
+                    .map(|block| match block {
+                        runtime::ContentBlock::Text { text } => {
+                            serde_json::json!({"type": "text", "text": text})
+                        }
+                        runtime::ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
+                            let mut value =
+                                serde_json::json!({"type": "thinking", "thinking": thinking});
+                            if let Some(signature) = signature {
+                                value["signature"] =
+                                    serde_json::Value::String(signature.clone());
+                            }
+                            value
+                        }
+                        runtime::ContentBlock::ToolUse { id, name, input } => {
+                            serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                        }
+                        runtime::ContentBlock::ToolResult {
+                            tool_use_id,
+                            tool_name,
+                            output,
+                            is_error,
+                        } => {
+                            serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error})
+                        }
+                    })
+                    .collect();
+
+                let mut value = serde_json::json!({"role": role, "blocks": blocks});
+                if let Some(usage) = &msg.usage {
+                    value["usage"] = serde_json::json!({
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    });
+                }
+                value
+            })
+            .collect();
+        let total = all_messages.len();
+        let start = from_seq.unwrap_or(offset);
+        let messages: Vec<serde_json::Value> =
+            all_messages.into_iter().skip(start).take(limit).collect();
+        let next_seq = (!messages.is_empty()).then_some(start + messages.len());
+        let has_more = next_seq.map(|seq| seq < total).unwrap_or(start < total);
+
+        Some(ActiveMessagesPage {
+            session_id: session_id.to_string(),
+            messages,
+            total,
+            offset,
+            from_seq,
+            next_seq,
+            limit,
+            has_more,
         })
     }
 

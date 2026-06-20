@@ -71,19 +71,10 @@ async fn context_current_handler(
         .cloned()
         .or_else(|| state.list_active_session_ids().into_iter().next());
     let active_envelope = requested_session_id.as_deref().and_then(|session_id| {
-        match state.active_runtime(session_id) {
-            Some(runtime_entry) => match runtime_entry.try_lock() {
-                Ok(runtime) => runtime.last_context_envelope(),
-                Err(_) => {
-                    tracing::debug!(
-                        %session_id,
-                        "runtime context envelope skipped because active runtime is busy"
-                    );
-                    None
-                }
-            },
-            None => None,
-        }
+        state
+            .services
+            .session
+            .last_context_envelope_nonblocking(session_id)
     });
     Json(
         state

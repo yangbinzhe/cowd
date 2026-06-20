@@ -615,6 +615,43 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && task_routes.contains(".append_runtime_event(&state.services.session"),
         "task routes must delegate lifecycle projection to TaskService"
     );
+    let context_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/context_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        !context_routes.contains("active_runtime(")
+            && context_routes.contains("last_context_envelope_nonblocking"),
+        "context routes must delegate active runtime context projection to SessionService"
+    );
+    let message_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/message_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        message_routes.contains(".active_messages_page(")
+            && !message_routes.contains("state.active_runtime(")
+            && !message_routes.contains("run_turn_async("),
+        "message routes must delegate active runtime reads and turn execution to services"
+    );
+    let session_service =
+        production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();
+    assert!(
+        session_service.contains("pub(crate) fn last_context_envelope_nonblocking")
+            && session_service.contains("pub(crate) async fn active_messages_page"),
+        "session service must own active runtime read projections"
+    );
+    let session_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/session_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        !session_routes.contains(".active_runtime(")
+            && !session_routes.contains(".remove_active_runtime(")
+            && session_routes.contains("has_active_runtime")
+            && session_routes.contains("session_exists"),
+        "session routes must use SessionService semantic helpers instead of runtime registry internals"
+    );
 
     let ai_policy = production_part(&read_repo("crates/ai-kernel/src/policy/mod.rs")).to_string();
     assert!(

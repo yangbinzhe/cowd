@@ -368,7 +368,7 @@ async fn ensure_session_handler(
     }
 
     let mut created = false;
-    if state.services.session.active_runtime(&id).is_none() {
+    if !state.services.session.has_active_runtime(&id) {
         let session = runtime::Session::new();
         let model = body
             .model
@@ -474,7 +474,7 @@ async fn get_session(
         }
     }
 
-    if state.services.session.active_runtime(&id).is_some() {
+    if state.services.session.has_active_runtime(&id) {
         Ok(Json(active_session_info(id)))
     } else {
         Err((
@@ -500,21 +500,19 @@ async fn cancel_session_turn_handler(
         ));
     }
 
-    if state.services.session.active_runtime(&id).is_none()
-        && state
-            .services
-            .session
-            .stored_session(&id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to load session: {error}"),
-                    }),
-                )
-            })?
-            .is_none()
+    if !state
+        .services
+        .session
+        .session_exists(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session: {error}"),
+                }),
+            )
+        })?
     {
         return Err((
             StatusCode::NOT_FOUND,
@@ -576,7 +574,7 @@ async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state.services.session.remove_active_runtime(&id).is_some();
+    let removed_active = state.services.session.remove_active_runtime_if_present(&id);
     let removed_stored = state
         .services
         .session
