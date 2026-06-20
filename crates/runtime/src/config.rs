@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::json::JsonValue;
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
+pub use model_protocol::oauth::OAuthConfig;
+pub use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 
 // ── Config Error Types ─────────────────────────────────────────────────
 
@@ -131,19 +133,6 @@ pub struct McpOAuthConfig {
     pub auth_server_metadata_url: Option<String>,
     #[serde(default)]
     pub xaa: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OAuthConfig {
-    pub client_id: String,
-    pub authorize_url: String,
-    pub token_url: String,
-    #[serde(default)]
-    pub callback_port: Option<u16>,
-    #[serde(default)]
-    pub manual_redirect_url: Option<String>,
-    #[serde(default)]
-    pub scopes: Vec<String>,
 }
 
 // ── Runtime Config Types ───────────────────────────────────────────────
@@ -650,77 +639,6 @@ impl Default for RuntimeControlConfig {
             scenario: DomainProfile::Coding,
             policy: RuntimeControlPolicy::default(),
         }
-    }
-}
-
-/// Configuration for a single named provider (OpenAI-compatible endpoint).
-///
-/// Each provider has its own `base_url` and `api_key`, and declares the list
-/// of model IDs it serves. When a model is requested, [`ProvidersConfig::resolve`]
-/// searches this list to locate the matching provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderConfig {
-    /// Base URL for the provider's OpenAI-compatible API (e.g. `https://api.stepfun.com/v1`).
-    pub base_url: String,
-    /// API key (Bearer token) for authenticating with this provider.
-    pub api_key: String,
-    /// List of model IDs served by this provider.
-    pub models: Vec<String>,
-    /// Short name identifying this provider entry (e.g. `"stepfun"`, `"bailian"`).
-    pub name: String,
-    /// Optional protocol override: `"anthropic"` or `"openai-compat"` (default).
-    pub protocol: Option<String>,
-}
-
-/// Named collection of provider configurations.
-///
-/// Providers are keyed by a short name (e.g. `"stepfun"`, `"bailian"`).
-/// Use [`ProvidersConfig::resolve`] to look up the `(base_url, api_key)` pair
-/// for a given model name.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProvidersConfig {
-    pub providers: HashMap<String, ProviderConfig>,
-}
-
-impl ProvidersConfig {
-    /// Returns `true` if no providers are configured.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
-    }
-
-    /// Resolves a model name to its provider's `(base_url, api_key)` pair.
-    ///
-    /// Iterates over all configured providers and returns the credentials for
-    /// the first provider whose `models` list contains `model_name`.
-    ///
-    /// Returns `None` if no provider claims the model; callers should then
-    /// fall back to the `OPENAI_BASE_URL` / `OPENAI_API_KEY` environment variables.
-    #[must_use]
-    pub fn resolve(&self, model_name: &str) -> Option<(&str, &str)> {
-        for provider in self.providers.values() {
-            if provider.models.iter().any(|m| m == model_name) {
-                return Some((&provider.base_url, &provider.api_key));
-            }
-        }
-        None
-    }
-
-    /// Resolves a model name to the full [`ProviderConfig`].
-    ///
-    /// Returns the first provider whose `models` list contains `model_name`,
-    /// or `None` if no provider claims the model.
-    #[must_use]
-    pub fn resolve_full(&self, model: &str) -> Option<&ProviderConfig> {
-        self.providers
-            .values()
-            .find(|p| p.models.iter().any(|m| m == model))
-    }
-
-    /// Returns the named provider if it exists.
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<&ProviderConfig> {
-        self.providers.get(name)
     }
 }
 

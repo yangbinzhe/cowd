@@ -4,6 +4,7 @@ use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConf
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
+use model_protocol::provider_config::ProviderConfig;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ impl ProviderClient {
     }
 
     /// 从配置文件 ProviderConfig 直接构造，不读任何环境变量。
-    pub fn from_config(provider: &runtime::ProviderConfig) -> Result<Self, ApiError> {
+    pub fn from_config(provider: &ProviderConfig) -> Result<Self, ApiError> {
         match provider.protocol.as_deref().unwrap_or("openai-compat") {
             "anthropic" => {
                 let auth = AuthSource::ApiKey(provider.api_key.clone());

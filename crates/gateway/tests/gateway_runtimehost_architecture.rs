@@ -384,6 +384,87 @@ fn model_registry_is_owned_by_model_protocol_boundary() {
 }
 
 #[test]
+fn provider_config_and_oauth_contracts_are_owned_by_model_protocol_boundary() {
+    let model_protocol_source = read_repo("crates/model-protocol/src/lib.rs");
+    assert!(
+        model_protocol_source.contains("pub mod provider_config")
+            && model_protocol_source.contains("pub mod oauth"),
+        "model-protocol must expose provider config and OAuth contracts"
+    );
+
+    let provider_config = read_repo("crates/model-protocol/src/provider_config.rs");
+    for contract in [
+        "pub struct ProviderConfig",
+        "pub struct ProvidersConfig",
+        "pub fn resolve(",
+        "pub fn resolve_full(",
+    ] {
+        assert!(
+            provider_config.contains(contract),
+            "provider config contract missing {contract}"
+        );
+    }
+
+    let oauth = read_repo("crates/model-protocol/src/oauth.rs");
+    for contract in [
+        "pub struct OAuthConfig",
+        "pub struct OAuthTokenSet",
+        "pub struct OAuthRefreshRequest",
+        "pub struct OAuthTokenExchangeRequest",
+        "pub fn load_oauth_credentials",
+        "pub fn save_oauth_credentials",
+        "pub fn clear_oauth_credentials",
+    ] {
+        assert!(
+            oauth.contains(contract),
+            "OAuth contract missing {contract}"
+        );
+    }
+
+    let runtime_config = read_repo("crates/runtime/src/config.rs");
+    assert!(
+        runtime_config.contains(
+            "pub use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};"
+        ) && runtime_config.contains("pub use model_protocol::oauth::OAuthConfig;"),
+        "runtime config must re-export model-protocol provider/OAuth contracts"
+    );
+    assert_eq!(
+        read_repo("crates/runtime/src/oauth.rs").trim(),
+        "pub use model_protocol::oauth::*;",
+        "runtime OAuth module must stay a compatibility re-export"
+    );
+
+    let provider_manifest = read_repo("crates/provider/Cargo.toml");
+    let provider_dependencies = manifest_dependencies(&provider_manifest);
+    assert!(
+        provider_dependencies.contains("model-protocol = { path = \"../model-protocol\" }"),
+        "provider must depend on model-protocol contracts"
+    );
+    assert!(
+        !provider_dependencies.contains("runtime = { path = \"../runtime\" }"),
+        "provider production dependencies must not include runtime"
+    );
+
+    let provider_sources = [
+        read_repo("crates/provider/src/client.rs"),
+        read_repo("crates/provider/src/providers/anthropic.rs"),
+    ]
+    .join("\n");
+    assert!(
+        provider_sources.contains("model_protocol::provider_config::ProviderConfig")
+            && provider_sources.contains("model_protocol::oauth"),
+        "provider source must use model-protocol provider/OAuth contracts"
+    );
+    assert!(
+        !provider_sources.contains("runtime::ProviderConfig")
+            && !provider_sources.contains("runtime::OAuth")
+            && !provider_sources.contains("runtime::load_oauth_credentials")
+            && !provider_sources.contains("runtime::save_oauth_credentials"),
+        "provider source must not use runtime provider/OAuth contracts"
+    );
+}
+
+#[test]
 fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
     let manifest = read_repo("crates/runtime/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);
