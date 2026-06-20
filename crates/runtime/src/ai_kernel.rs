@@ -1,32 +1,32 @@
 //! Runtime integration facade for the Cowd AI work kernel crates.
 
-use ai_behavior_policy::{decide_behavior_policy, BehaviorPolicyDecision};
-use ai_context::{
-    ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
-    ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
-};
-use ai_core::{ExecutionMode, StrategyDecorator};
 use ai_eval::{
     score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
     RegressionGateVerdict, Trajectory,
 };
-use ai_growth::{
+use ai_kernel::behavior::{decide_behavior_policy, BehaviorPolicyDecision};
+use ai_kernel::context::{
+    ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
+    ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
+};
+use ai_kernel::core::{ExecutionMode, StrategyDecorator};
+use ai_kernel::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
 };
-use ai_harness::{CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt};
-use ai_policy::{
+use ai_kernel::harness::{CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt};
+use ai_kernel::policy::{
     agent_spec_policy_receipts, behavior_policy_receipt, tool_transaction_policy_receipts,
     PolicyReceipt,
 };
-use ai_strategy::{decide_strategy, StrategyDecision, StrategyInput};
-use ai_tool_transaction::{
+use ai_kernel::strategy::{decide_strategy, StrategyDecision, StrategyInput};
+use ai_kernel::tool::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
 };
-use ai_verification::{
+use ai_kernel::verification::{
     Claim, ClaimKind, Evidence, EvidenceKind, VerificationLedger, VerificationReport,
 };
-use ai_workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
+use ai_kernel::workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::ContextProfile;
@@ -245,8 +245,8 @@ impl RuntimeAiKernel {
         let workgraph_quality = self
             .workgraph
             .as_ref()
-            .map(ai_workgraph::WorkGraph::quality_report);
-        let agent_spec = ai_agent_spec::AgentSpec::for_turn(
+            .map(ai_kernel::workgraph::WorkGraph::quality_report);
+        let agent_spec = ai_kernel::agent::AgentSpec::for_turn(
             &self.user_input,
             self.strategy.mode,
             self.strategy.understanding.risk,
@@ -490,8 +490,16 @@ fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Opt
             "synthesize verified evidence into the final response",
         ))
         .ok()?;
-    let _ = graph.add_edge(&plan, &verify, ai_workgraph::WorkEdgeKind::DependsOn);
-    let _ = graph.add_edge(&verify, &synthesize, ai_workgraph::WorkEdgeKind::DependsOn);
+    let _ = graph.add_edge(
+        &plan,
+        &verify,
+        ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+    );
+    let _ = graph.add_edge(
+        &verify,
+        &synthesize,
+        ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+    );
     Some(graph)
 }
 

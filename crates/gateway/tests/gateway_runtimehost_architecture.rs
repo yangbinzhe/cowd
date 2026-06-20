@@ -250,6 +250,34 @@ fn external_boundary_crates_do_not_depend_on_runtime_or_gateway() {
 }
 
 #[test]
+fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
+    let manifest = read_repo("crates/runtime/Cargo.toml");
+    let dependencies = manifest_dependencies(&manifest);
+    assert!(
+        dependencies.contains("ai-kernel = { path = \"../ai-kernel\" }"),
+        "runtime must depend on ai-kernel as the unified harness semantic entrypoint"
+    );
+    for forbidden in [
+        "ai-core",
+        "ai-agent-spec",
+        "ai-behavior-policy",
+        "ai-context",
+        "ai-growth",
+        "ai-harness",
+        "ai-policy",
+        "ai-strategy",
+        "ai-tool-transaction",
+        "ai-verification",
+        "ai-workgraph",
+    ] {
+        assert!(
+            !dependencies.contains(forbidden),
+            "runtime must not directly depend on legacy AI semantic crate {forbidden}; use ai-kernel"
+        );
+    }
+}
+
+#[test]
 fn entry_boundary_crates_exist_as_migration_targets() {
     let root = repo_root();
     for crate_name in ["cli", "gateway", "tui"] {

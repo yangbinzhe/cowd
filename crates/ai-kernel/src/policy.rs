@@ -69,7 +69,7 @@ pub enum RiskLevel {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskAssessment {
     pub level: RiskLevel,
     pub reasons: Vec<String>,
@@ -97,7 +97,7 @@ pub enum PolicyDecisionKind {
     Escalate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDecision {
     pub kind: PolicyDecisionKind,
     pub scope: PermissionScope,
@@ -115,14 +115,14 @@ pub enum ApprovalPersistence {
     Always,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicyReceipt {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDecisionReceipt {
     pub decision: PolicyDecision,
     pub trace_id: Option<String>,
     pub issued_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskGateReceipt {
     pub scope: PermissionScope,
     pub risk: RiskAssessment,

@@ -6,18 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-ai-core = { path = "../ai-core" }
-ai-agent-spec = { path = "../ai-agent-spec" }
-ai-behavior-policy = { path = "../ai-behavior-policy" }
-ai-context = { path = "../ai-context" }
+ai-kernel = { path = "../ai-kernel" }
 ai-eval = { path = "../ai-eval" }
-ai-growth = { path = "../ai-growth" }
-ai-harness = { path = "../ai-harness" }
-ai-policy = { path = "../ai-policy" }
-ai-strategy = { path = "../ai-strategy" }
-ai-tool-transaction = { path = "../ai-tool-transaction" }
-ai-verification = { path = "../ai-verification" }
-ai-workgraph = { path = "../ai-workgraph" }
 memory = { path = "../memory" }
 storage = { path = "../storage" }
 approval = { path = "../approval" }

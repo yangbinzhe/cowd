@@ -1,6 +1,6 @@
-use ai_core::ExecutionMode;
 use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
-use ai_strategy::{
+use ai_kernel::core::ExecutionMode;
+use ai_kernel::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
 use runtime::{
@@ -274,7 +274,7 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
             domain: understanding.domain,
             complexity: understanding.complexity,
             risk: understanding.risk,
-            selected_mode: ai_core::ExecutionMode::SupervisorSubagents,
+            selected_mode: ai_kernel::core::ExecutionMode::SupervisorSubagents,
             succeeded: idx == 0,
             verification_blocked: false,
             context_pressure: false,
@@ -284,7 +284,7 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
     }
 
     let adapted = decide_strategy(&store.enrich_input(StrategyInput::from_prompt(prompt)));
-    assert_eq!(adapted.mode, ai_core::ExecutionMode::PlanExecute);
+    assert_eq!(adapted.mode, ai_kernel::core::ExecutionMode::PlanExecute);
     assert!(adapted
         .reasons
         .iter()

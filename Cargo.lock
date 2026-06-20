@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agent-spec"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ai-behavior-policy"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "ai-strategy",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "ai-context"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "ai-core"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "serde",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "ai-eval"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "ai-growth"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "ai-harness"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-agent-spec",
  "ai-context",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ai-kernel"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-agent-spec",
  "ai-behavior-policy",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "ai-policy"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-agent-spec",
  "chrono",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "ai-strategy"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ai-task"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "ai-strategy",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "ai-tool-transaction"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "ai-verification"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "ai-workgraph"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-core",
  "serde",
@@ -222,7 +222,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "serde",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "gateway",
  "memory",
@@ -749,14 +749,14 @@ dependencies = [
 
 [[package]]
 name = "command-contract"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "command-service"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "command-contract",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "serde",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "ai-task",
  "app-mfg",
@@ -2231,7 +2231,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "serde",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -2273,7 +2273,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "reqwest",
  "runtime",
@@ -3161,21 +3161,11 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "aes",
- "ai-agent-spec",
- "ai-behavior-policy",
- "ai-context",
- "ai-core",
  "ai-eval",
- "ai-growth",
- "ai-harness",
- "ai-policy",
- "ai-strategy",
- "ai-tool-transaction",
- "ai-verification",
- "ai-workgraph",
+ "ai-kernel",
  "approval",
  "async-trait",
  "base64 0.22.1",
@@ -3505,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -3607,7 +3597,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill-service"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "regex",
  "serde",
@@ -3668,7 +3658,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3821,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "serde",
  "serde_json",
@@ -4094,7 +4084,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4350,7 +4340,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.330"
+version = "0.9.331"
 dependencies = [
  "chrono",
  "crossterm",

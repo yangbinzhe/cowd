@@ -25,7 +25,7 @@ impl CancellationToken {
     }
 }
 
-use ai_strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput};
+use ai_kernel::strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput};
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
@@ -3919,16 +3919,16 @@ fn growth_maintenance_candidates(
             memory::MaintenanceCandidate {
                 id: candidate.id.clone(),
                 kind: match candidate.kind {
-                    ai_growth::GrowthMemoryCandidateKind::Conflict => {
+                    ai_kernel::growth::GrowthMemoryCandidateKind::Conflict => {
                         memory::MaintenanceCandidateKind::Conflict
                     }
-                    ai_growth::GrowthMemoryCandidateKind::Stale => {
+                    ai_kernel::growth::GrowthMemoryCandidateKind::Stale => {
                         memory::MaintenanceCandidateKind::Stale
                     }
-                    ai_growth::GrowthMemoryCandidateKind::AuthorityPromotion => {
+                    ai_kernel::growth::GrowthMemoryCandidateKind::AuthorityPromotion => {
                         memory::MaintenanceCandidateKind::AuthorityPromotion
                     }
-                    ai_growth::GrowthMemoryCandidateKind::RelationshipRefresh => {
+                    ai_kernel::growth::GrowthMemoryCandidateKind::RelationshipRefresh => {
                         memory::MaintenanceCandidateKind::RelationshipRefresh
                     }
                 },
@@ -4315,7 +4315,7 @@ mod tests {
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(
             summary.ai_kernel_trace.strategy.mode,
-            ai_core::ExecutionMode::DirectAnswer
+            ai_kernel::core::ExecutionMode::DirectAnswer
         );
         assert!(summary.ai_kernel_trace.verification_report.can_finalize);
         assert!(summary.ai_kernel_trace.tool_transaction.is_some());

@@ -1,12 +1,12 @@
 use std::pin::Pin;
 
-use ai_core::{ExecutionMode, TaskComplexity, TaskRisk};
 use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite};
-use ai_growth::{
+use ai_kernel::core::{ExecutionMode, TaskComplexity, TaskRisk};
+use ai_kernel::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
 };
-use ai_strategy::{
+use ai_kernel::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
 use futures::Stream;
@@ -364,7 +364,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
 
 #[test]
 fn underspecified_complex_trace_exposes_improvement_signal() {
-    let record = LearningRecord::from_input(ai_growth::GrowthInput {
+    let record = LearningRecord::from_input(ai_kernel::growth::GrowthInput {
         selected_mode: ExecutionMode::DirectAnswer,
         complexity: TaskComplexity::Complex,
         risk: TaskRisk::Medium,

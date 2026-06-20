@@ -6,8 +6,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ai_agent_spec::AgentSpec;
-use ai_growth::GrowthSignal;
+use ai_kernel::agent::AgentSpec;
+use ai_kernel::growth::GrowthSignal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -94,7 +94,7 @@ impl AgentWorkGraph {
     #[must_use]
     pub fn from_ai_workgraph(
         session_id: impl Into<String>,
-        graph: &ai_workgraph::WorkGraph,
+        graph: &ai_kernel::workgraph::WorkGraph,
     ) -> Self {
         let now = current_time_ms();
         let graph_id = graph.id.clone();
@@ -103,11 +103,13 @@ impl AgentWorkGraph {
             .iter()
             .map(|node| {
                 let kind = match node.kind {
-                    ai_workgraph::WorkNodeKind::AgentTask => WorkGraphNodeKind::AgentTask,
-                    ai_workgraph::WorkNodeKind::ToolTask => WorkGraphNodeKind::ToolTask,
-                    ai_workgraph::WorkNodeKind::ReadOnlyFanout => WorkGraphNodeKind::ToolTask,
-                    ai_workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
-                    ai_workgraph::WorkNodeKind::Synthesis => WorkGraphNodeKind::Synthesis,
+                    ai_kernel::workgraph::WorkNodeKind::AgentTask => WorkGraphNodeKind::AgentTask,
+                    ai_kernel::workgraph::WorkNodeKind::ToolTask => WorkGraphNodeKind::ToolTask,
+                    ai_kernel::workgraph::WorkNodeKind::ReadOnlyFanout => {
+                        WorkGraphNodeKind::ToolTask
+                    }
+                    ai_kernel::workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
+                    ai_kernel::workgraph::WorkNodeKind::Synthesis => WorkGraphNodeKind::Synthesis,
                 };
                 WorkGraphNode {
                     node_id: node.id.clone(),
@@ -133,10 +135,10 @@ impl AgentWorkGraph {
                 from_node_id: edge.from.clone(),
                 to_node_id: edge.to.clone(),
                 kind: match edge.kind {
-                    ai_workgraph::WorkEdgeKind::DependsOn => WorkGraphEdgeKind::DependsOn,
-                    ai_workgraph::WorkEdgeKind::Verifies => WorkGraphEdgeKind::Verifies,
-                    ai_workgraph::WorkEdgeKind::Reviews => WorkGraphEdgeKind::Reviews,
-                    ai_workgraph::WorkEdgeKind::Produces => WorkGraphEdgeKind::Produces,
+                    ai_kernel::workgraph::WorkEdgeKind::DependsOn => WorkGraphEdgeKind::DependsOn,
+                    ai_kernel::workgraph::WorkEdgeKind::Verifies => WorkGraphEdgeKind::Verifies,
+                    ai_kernel::workgraph::WorkEdgeKind::Reviews => WorkGraphEdgeKind::Reviews,
+                    ai_kernel::workgraph::WorkEdgeKind::Produces => WorkGraphEdgeKind::Produces,
                 },
             })
             .collect();
@@ -511,23 +513,27 @@ mod tests {
 
     #[test]
     fn projects_ai_workgraph_into_runtime_agent_workgraph() {
-        let mut graph = ai_workgraph::WorkGraph::new("analyze runtime growth");
+        let mut graph = ai_kernel::workgraph::WorkGraph::new("analyze runtime growth");
         let plan = graph
-            .add_node(ai_workgraph::WorkNode::new(
-                ai_workgraph::WorkNodeKind::AgentTask,
+            .add_node(ai_kernel::workgraph::WorkNode::new(
+                ai_kernel::workgraph::WorkNodeKind::AgentTask,
                 "plan",
                 "plan the work",
             ))
             .unwrap();
         let review = graph
-            .add_node(ai_workgraph::WorkNode::new(
-                ai_workgraph::WorkNodeKind::Review,
+            .add_node(ai_kernel::workgraph::WorkNode::new(
+                ai_kernel::workgraph::WorkNodeKind::Review,
                 "review",
                 "review evidence",
             ))
             .unwrap();
         graph
-            .add_edge(&plan, &review, ai_workgraph::WorkEdgeKind::DependsOn)
+            .add_edge(
+                &plan,
+                &review,
+                ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+            )
             .unwrap();
 
         let projected = AgentWorkGraph::from_ai_workgraph("session-1", &graph);
