@@ -98,21 +98,21 @@ impl GatewayApiClient {
         self.get_json("/api/runtime/status").await
     }
 
-    pub async fn command_projection(
+    pub async fn slash_projection(
         &self,
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/commands?surface={}", url_encode(surface)))
+        self.get_json(&format!("/api/slash?surface={}", url_encode(surface)))
             .await
     }
 
-    pub async fn command_resolve(
+    pub async fn slash_resolve(
         &self,
         input: &str,
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/commands/resolve",
+            "/api/slash/resolve",
             serde_json::json!({
                 "input": input,
                 "surface": surface,
@@ -122,13 +122,13 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn command_execute(
+    pub async fn slash_dispatch(
         &self,
         command: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/commands/execute",
+            "/api/slash/dispatch",
             serde_json::json!({
                 "command": command,
                 "args": args,
@@ -1047,7 +1047,7 @@ mod tests {
             "tool_checkpoint_restore",
             "tool_intent_plan",
             "tool_context_fanout_plan",
-            "command_execute",
+            "slash_dispatch",
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];

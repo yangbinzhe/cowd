@@ -1,13 +1,12 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use axum::{
-    extract::{Path as AxumPath, Query, State as AxumState},
+    extract::{Path as AxumPath, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use command_contract::CommandSurface;
 use serde::Deserialize;
 
 use super::{api_error, AppState, ErrorResponse};
@@ -52,39 +51,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/config/providers", get(config_providers_handler))
         .route("/api/usage", get(usage_handler))
-        .route("/api/commands", get(commands_handler))
-        .route("/api/commands/history", get(commands_history_handler))
-        .route("/api/commands/resolve", post(commands_resolve_handler))
-        .route("/api/commands/execute", post(commands_execute_handler))
-        .route("/api/commands/:id", get(command_detail_handler))
 }
 
 #[derive(Deserialize)]
 struct UpdateConfigRequest {
     #[serde(default)]
     model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ExecuteCommandRequest {
-    command: String,
-    #[serde(default)]
-    args: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct CommandsQuery {
-    #[serde(default)]
-    surface: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ResolveCommandRequest {
-    input: String,
-    #[serde(default)]
-    surface: Option<String>,
-    #[serde(default)]
-    context: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -679,80 +651,5 @@ async fn config_providers_handler(
         "configured_model": configured_model,
         "configured_model_provider": configured_model_provider,
         "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
-    })))
-}
-
-async fn commands_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(query): Query<CommandsQuery>,
-) -> Json<serde_json::Value> {
-    let surface = CommandSurface::parse(query.surface.as_deref());
-    let projection = state.services.command.projection(surface);
-    Json(serde_json::json!({
-        "surface": projection.surface,
-        "commands": projection.commands,
-    }))
-}
-
-async fn command_detail_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let command = state
-        .services
-        .command
-        .detail(&id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown command `{id}`")))?;
-    Ok(Json(serde_json::json!({ "command": command })))
-}
-
-async fn commands_history_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let entries = state.services.system.command_history(&state.config_home);
-    Json(serde_json::json!({ "history": entries, "total": entries.len() }))
-}
-
-async fn commands_execute_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<ExecuteCommandRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let receipt = state
-        .services
-        .command
-        .execute(
-            &body.command,
-            body.args.unwrap_or_else(|| serde_json::json!({})),
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    if !receipt.ok {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            serde_json::to_string(&receipt).unwrap_or_else(|_| receipt.status.clone()),
-        ));
-    }
-    let receipt = serde_json::to_value(receipt)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    state
-        .services
-        .system
-        .append_command_history(&state.config_home, &receipt);
-    Ok(Json(receipt))
-}
-
-async fn commands_resolve_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<ResolveCommandRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let surface = CommandSurface::parse(body.surface.as_deref());
-    let resolution = state
-        .services
-        .command
-        .resolve(&body.input, surface, body.context)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "resolution": resolution,
     })))
 }

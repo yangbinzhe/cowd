@@ -2706,7 +2706,7 @@ impl TuiState {
 
     fn refresh_command_projection_from_gateway(&mut self) {
         if let Ok(payload) =
-            run_gateway_api_blocking(|client| async move { client.command_projection("tui").await })
+            run_gateway_api_blocking(|client| async move { client.slash_projection("tui").await })
         {
             self.command_palette.sync_command_projection(&payload);
             self.prompt

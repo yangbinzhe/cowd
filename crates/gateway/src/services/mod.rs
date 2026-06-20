@@ -6,7 +6,6 @@ use memory::CognitiveContextManager;
 mod agent_service;
 mod approval_service;
 mod channel_service;
-mod command_service;
 mod connector_service;
 mod context;
 mod context_service;
@@ -20,6 +19,7 @@ mod receipt;
 mod registry;
 mod session_service;
 mod skill_service;
+mod slash_controller;
 mod system_service;
 mod task_service;
 mod workspace_service;
@@ -27,7 +27,6 @@ mod workspace_service;
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use channel_service::ChannelService;
-pub(crate) use command_service::CommandService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use matrix_service::MatrixService;
@@ -41,6 +40,7 @@ pub(crate) use session_service::{SessionService, SessionUpdateRequest};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
+pub(crate) use slash_controller::SlashController;
 pub(crate) use task_service::TaskService;
 
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
@@ -218,7 +218,7 @@ impl AgentService {
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) channel: ChannelService,
-    pub(crate) command: CommandService,
+    pub(crate) slash: SlashController,
     pub(crate) session: SessionService,
     pub(crate) task: TaskService,
     pub(crate) approval: ApprovalService,
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.343 GatewayServices");
+        assert_eq!(services.owner, "0.9.344 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

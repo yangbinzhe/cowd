@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use command_contract::{
+use slash_contract::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
@@ -10,22 +10,22 @@ use crate::runtime_service::RuntimeService;
 use super::ServiceEnvelope;
 
 #[derive(Clone)]
-pub(crate) struct CommandService {
+pub(crate) struct SlashController {
     runtime: Option<Arc<RuntimeService>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct CommandResolution {
+pub(crate) struct SlashResolution {
     pub(crate) input: String,
     pub(crate) surface: CommandSurface,
-    pub(crate) command: CommandDefinition,
+    pub(crate) slash: CommandDefinition,
     pub(crate) action_request: serde_json::Value,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct CommandExecutionReceipt {
+pub(crate) struct SlashDispatchReceipt {
     pub(crate) ok: bool,
-    pub(crate) command: String,
+    pub(crate) slash: String,
     pub(crate) id: String,
     pub(crate) action: CommandActionTarget,
     pub(crate) status: String,
@@ -33,23 +33,23 @@ pub(crate) struct CommandExecutionReceipt {
     pub(crate) executed_at_ms: i64,
 }
 
-impl CommandService {
+impl SlashController {
     pub(crate) fn new(runtime: Option<Arc<RuntimeService>>) -> Self {
         Self { runtime }
     }
 
     pub(crate) fn label(&self) -> &'static str {
-        "command"
+        "slash"
     }
 
     pub(crate) fn contracts(&self) -> Vec<ServiceEnvelope> {
-        ["registry", "projection", "detail", "resolve", "execute"]
+        ["catalog", "projection", "detail", "resolve", "dispatch"]
             .into_iter()
             .map(|operation| ServiceEnvelope {
                 service: self.label(),
                 operation,
                 status: "service_boundary_ready",
-                owner: "0.9.294 Commands unified registry",
+                owner: "0.9.344 Slash controller boundary",
                 boundary_status: "0620_final_boundary",
             })
             .collect()
@@ -81,7 +81,7 @@ impl CommandService {
         input: &str,
         surface: CommandSurface,
         context: serde_json::Value,
-    ) -> Result<CommandResolution, String> {
+    ) -> Result<SlashResolution, String> {
         let normalized = normalize_command_name(input);
         let registry = self.registry();
         let definition = registry
@@ -101,28 +101,28 @@ impl CommandService {
             "action": definition.action,
             "context": context,
         });
-        Ok(CommandResolution {
+        Ok(SlashResolution {
             input: input.to_string(),
             surface,
-            command: definition,
+            slash: definition,
             action_request,
         })
     }
 
-    pub(crate) async fn execute(
+    pub(crate) async fn dispatch(
         &self,
         command: &str,
         args: serde_json::Value,
-    ) -> Result<CommandExecutionReceipt, String> {
+    ) -> Result<SlashDispatchReceipt, String> {
         let definition = self
             .registry()
             .find(command)
             .cloned()
             .ok_or_else(|| format!("unknown command `{command}`"))?;
         let (ok, status, data) = self.execute_target(&definition.action, args).await;
-        Ok(CommandExecutionReceipt {
+        Ok(SlashDispatchReceipt {
             ok,
-            command: definition.name,
+            slash: definition.name,
             id: definition.id,
             action: definition.action,
             status: status.to_string(),

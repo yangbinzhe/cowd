@@ -27,7 +27,7 @@ impl GatewayServices {
             channel: channel_runtime
                 .map(ChannelService::with_runtime)
                 .unwrap_or_else(ChannelService::new),
-            command: CommandService::new(Some(command_host_runtime)),
+            slash: SlashController::new(Some(command_host_runtime)),
             session: SessionService::with_kernel(session_kernel),
             task: TaskService::with_kernel(task_kernel),
             memory: MemoryService::with_manager(memory_manager),
@@ -40,7 +40,7 @@ impl GatewayServices {
         Self {
             runtime: None,
             channel: ChannelService::new(),
-            command: CommandService::new(None),
+            slash: SlashController::new(None),
             session: SessionService::new(),
             task: TaskService::new(),
             approval: ApprovalService::new(),
@@ -56,7 +56,7 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.343 GatewayServices",
+            owner: "0.9.344 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -115,7 +115,7 @@ impl GatewayServices {
         vec![
             "runtime",
             self.channel.label(),
-            self.command.label(),
+            self.slash.label(),
             self.session.label,
             self.task.label,
             self.approval.label,
@@ -134,7 +134,7 @@ impl GatewayServices {
 
     pub(crate) fn service_contracts(&self) -> Vec<ServiceEnvelope> {
         let mut contracts = Vec::new();
-        contracts.extend(self.command.contracts());
+        contracts.extend(self.slash.contracts());
         contracts.extend(self.session.contracts());
         contracts.extend(self.task.contracts());
         contracts.extend(self.approval.contracts());

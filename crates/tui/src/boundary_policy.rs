@@ -30,8 +30,8 @@ impl TuiBoundaryPolicy {
                 "storage",
                 "tools",
                 "memory",
-                "command-contract",
-                "command-service",
+                "slash-contract",
+                "slash-catalog",
                 "rusqlite",
             ]
             .into_iter()

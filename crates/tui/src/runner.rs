@@ -152,7 +152,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         break;
                                     }
                                     if text.starts_with('/') {
-                                        dispatch_gateway_command(
+                                        dispatch_gateway_slash(
                                             &gateway_client,
                                             &tui_tx,
                                             &mut state,
@@ -416,7 +416,7 @@ fn send_session_list(
     });
 }
 
-fn dispatch_gateway_command(
+fn dispatch_gateway_slash(
     gateway_client: &GatewayApiClient,
     tx: &crate::events::CowdEventSender,
     state: &mut TuiState,
@@ -431,7 +431,7 @@ fn dispatch_gateway_command(
     let command = cmd_name.trim_start_matches('/').to_string();
     let command_input = text.to_string();
     let command_session_id = session_id.to_string();
-    let command_client = gateway_client.clone();
+    let slash_client = gateway_client.clone();
     let command_tx = tx.clone();
     shared_rt().spawn(async move {
         let args = serde_json::json!({
@@ -439,7 +439,7 @@ fn dispatch_gateway_command(
             "session_id": command_session_id,
             "surface": "tui",
         });
-        match command_client.command_execute(&command, args).await {
+        match slash_client.slash_dispatch(&command, args).await {
             Ok(receipt) => {
                 let status = receipt
                     .get("status")
@@ -451,17 +451,17 @@ fn dispatch_gateway_command(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("gateway");
                 let _ = command_tx.send(CowdEvent::Warning {
-                    message: format!("Gateway command /{command} {status} via {dispatch}"),
+                    message: format!("Gateway slash /{command} {status} via {dispatch}"),
                 });
             }
             Err(err) => {
                 let _ = command_tx.send(CowdEvent::TurnError {
-                    error: format!("Gateway command /{command} failed: {err}"),
+                    error: format!("Gateway slash /{command} failed: {err}"),
                 });
             }
         }
     });
-    state.add_slash_output(&cmd_name, "Command dispatched to Gateway");
+    state.add_slash_output(&cmd_name, "Slash dispatched to Gateway");
     state.open_surface_for_slash_result(&cmd_name);
 }
 

@@ -68,12 +68,6 @@ use provider::{
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
-#[cfg(test)]
-use command_service::resume_supported_slash_commands;
-use command_service::{
-    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
-    SkillSlashDispatch, SlashCommand,
-};
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use plugins::PluginRegistry;
 use runtime::ContextProfile;
@@ -88,6 +82,12 @@ use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpSt
 use serde::Deserialize;
 use serde_json::json;
 use services::GatewayServices;
+#[cfg(test)]
+use slash_catalog::resume_supported_slash_commands;
+use slash_catalog::{
+    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
+    SkillSlashDispatch, SlashCommand,
+};
 
 #[cfg(test)]
 pub(crate) use entry::env_entry::resolve_repl_model;
@@ -8566,7 +8566,7 @@ mod tests {
 
     #[test]
     fn shared_help_uses_resume_annotation_copy() {
-        let help = command_service::render_slash_command_help();
+        let help = slash_catalog::render_slash_command_help();
         assert!(help.contains("Slash commands"));
         assert!(
             help.contains("[resumed TUI]     available after `cowd --resume <session-id|latest>`")

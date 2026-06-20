@@ -69,6 +69,7 @@ mod public_routes;
 mod runtime_routes;
 mod session_routes;
 mod skill_routes;
+mod slash_routes;
 mod system_routes;
 mod task_routes;
 mod workspace_routes;
@@ -237,6 +238,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(runtime_routes::router())
         .merge(session_routes::router())
         .merge(skill_routes::router())
+        .merge(slash_routes::router())
         .merge(system_routes::router())
         .merge(task_routes::router())
         .merge(workspace_routes::router())
@@ -4983,8 +4985,8 @@ providers:
     }
 
     #[tokio::test]
-    async fn commands_registry_execute_and_history_are_available() {
-        let root = test_temp_dir("system-commands");
+    async fn slash_catalog_dispatch_and_history_are_available() {
+        let root = test_temp_dir("slash-catalog");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -4995,7 +4997,7 @@ providers:
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/commands?surface=webui")
+                    .uri("/api/slash?surface=webui")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5014,7 +5016,7 @@ providers:
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/commands/slash.status")
+                    .uri("/api/slash/slash.status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5023,14 +5025,14 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["command"]["id"], "slash.status");
+        assert_eq!(json["slash"]["id"], "slash.status");
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/commands/resolve")
+                    .uri("/api/slash/resolve")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"input":"/status","surface":"webui"}"#))
                     .unwrap(),
@@ -5040,14 +5042,14 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["resolution"]["command"]["name"], "/status");
+        assert_eq!(json["resolution"]["slash"]["name"], "/status");
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/commands/execute")
+                    .uri("/api/slash/dispatch")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"command":"/status","args":{"session_id":"s1"}}"#,
@@ -5060,7 +5062,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
-        assert_eq!(json["command"], "/status");
+        assert_eq!(json["slash"], "/status");
         assert!(matches!(
             json["status"].as_str(),
             Some("complete" | "degraded")
@@ -5071,7 +5073,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/commands/execute")
+                    .uri("/api/slash/dispatch")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"command":"/compact","args":{}}"#))
                     .unwrap(),
@@ -5088,7 +5090,7 @@ providers:
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/commands/history")
+                    .uri("/api/slash/history")
                     .body(Body::empty())
                     .unwrap(),
             )

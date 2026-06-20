@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, fs, path::Path};
 use app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill, skill_agent_node_id,
 };
-use command_service::SkillSlashDispatch;
 use serde::Deserialize;
 use skill_service::{SkillManager, SkillViewInput};
+use slash_catalog::SkillSlashDispatch;
 
 use super::{ServiceEnvelope, SkillService};
 

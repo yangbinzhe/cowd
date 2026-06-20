@@ -1013,8 +1013,8 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "matrix-core",
         "matrix-repository",
         "memory",
-        "command-contract",
-        "command-service",
+        "slash-contract",
+        "slash-catalog",
         "storage",
         "tools",
         "rusqlite",
@@ -1027,14 +1027,37 @@ fn entry_boundary_crates_exist_as_migration_targets() {
 
     assert!(
         !root.join("crates/command/service/src/parser.rs").exists(),
-        "command-service must not duplicate the slash parser owned by command-contract"
+        "slash-catalog must not duplicate the slash parser owned by slash-contract"
     );
-    let command_service_source = read_repo("crates/command/service/src/lib.rs");
+    let lockfile = read_repo("Cargo.lock");
     assert!(
-        command_service_source.contains("pub use command_contract::{")
-            && command_service_source.contains("classify_skills_slash_command")
-            && !command_service_source.contains("pub mod parser"),
-        "command-service must re-export command-contract parser APIs instead of owning parser logic"
+        lockfile.contains("name = \"slash-contract\"")
+            && lockfile.contains("name = \"slash-catalog\"")
+            && !lockfile.contains("name = \"command-contract\"")
+            && !lockfile.contains("name = \"command-service\""),
+        "slash crates must use final package names, not legacy command package names"
+    );
+    let slash_catalog_source = read_repo("crates/command/service/src/lib.rs");
+    assert!(
+        slash_catalog_source.contains("pub use slash_contract::{")
+            && slash_catalog_source.contains("classify_skills_slash_command")
+            && !slash_catalog_source.contains("pub mod parser"),
+        "slash-catalog must re-export slash-contract parser APIs instead of owning parser logic"
+    );
+    let system_routes = read_repo("crates/gateway/src/api_routes/system_routes.rs");
+    let slash_routes = read_repo("crates/gateway/src/api_routes/slash_routes.rs");
+    assert!(
+        !system_routes.contains("/api/commands")
+            && !system_routes.contains("/api/slash")
+            && slash_routes.contains("/api/slash")
+            && slash_routes.contains("slash_dispatch_handler"),
+        "slash API must be owned by slash_routes, not system_routes or legacy /api/commands"
+    );
+    let gateway_services = read_repo("crates/gateway/src/services/mod.rs");
+    assert!(
+        gateway_services.contains("pub(crate) slash: SlashController")
+            && !gateway_services.contains("pub(crate) command:"),
+        "GatewayServices must expose slash controller, not a command execution service"
     );
 }
 
@@ -1070,8 +1093,8 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
         "TUI chat submit must use Gateway HTTP message API"
     );
     assert!(
-        source.contains("dispatch_gateway_command("),
-        "TUI slash command submit must use Gateway HTTP command API"
+        source.contains("dispatch_gateway_slash("),
+        "TUI slash command submit must use Gateway HTTP slash API"
     );
     assert!(
         source.contains("dispatch_gateway_cancel("),

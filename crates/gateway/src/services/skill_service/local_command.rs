@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use command_service::SkillSlashDispatch;
 use skill_service::{SkillRegistry, SkillRegistryRootKind, SkillViewOutput};
+use slash_catalog::SkillSlashDispatch;
 
 #[derive(Debug, Clone)]
 pub(super) struct LocalSkillSummary {
