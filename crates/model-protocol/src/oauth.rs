@@ -494,10 +494,7 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
+        crate::test_env_lock()
     }
 
     fn temp_config_home() -> std::path::PathBuf {
