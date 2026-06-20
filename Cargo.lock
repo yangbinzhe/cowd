@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-eval"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "ai-kernel",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ai-kernel"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "serde",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "ai-task"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "ai-kernel",
  "rusqlite",
@@ -102,7 +102,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
  "serde_json",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "serde",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "channel-adapters"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "aes",
  "async-trait",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "gateway",
  "serde",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "serde",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "ai-kernel",
  "ai-task",
@@ -2132,7 +2132,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
  "serde_json",
@@ -2175,7 +2175,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "lru",
  "serde",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
  "serde_json",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "ai-eval",
  "ai-kernel",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
  "serde_json",
@@ -3494,7 +3494,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill-service"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "regex",
  "serde",
@@ -3511,7 +3511,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slash-catalog"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "regex",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "slash-contract"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
 ]
@@ -3574,7 +3574,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "serde",
  "serde_json",
@@ -4000,7 +4000,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4256,7 +4256,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.345"
+version = "0.9.346"
 dependencies = [
  "chrono",
  "crossterm",

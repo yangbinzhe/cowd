@@ -1042,7 +1042,7 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     }
 
     assert!(
-        !root.join("crates/command/service/src/parser.rs").exists(),
+        !root.join("crates/slash/catalog/src/parser.rs").exists(),
         "slash-catalog must not duplicate the slash parser owned by slash-contract"
     );
     let lockfile = read_repo("Cargo.lock");
@@ -1053,7 +1053,7 @@ fn entry_boundary_crates_exist_as_migration_targets() {
             && !lockfile.contains("name = \"command-service\""),
         "slash crates must use final package names, not legacy command package names"
     );
-    let slash_catalog_source = read_repo("crates/command/service/src/lib.rs");
+    let slash_catalog_source = read_repo("crates/slash/catalog/src/lib.rs");
     assert!(
         slash_catalog_source.contains("pub use slash_contract::{")
             && slash_catalog_source.contains("classify_skills_slash_command")

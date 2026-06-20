@@ -22,8 +22,8 @@ memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 channel = { path = "../channel" }
 channel-adapters = { path = "../channel-adapters" }
-slash-contract = { path = "../command/contract" }
-slash-catalog = { path = "../command/service" }
+slash-contract = { path = "../slash/contract" }
+slash-catalog = { path = "../slash/catalog" }
 connector = { path = "../connector" }
 skill-service = { path = "../skill/service" }
 app-mfg = { path = "../app-mfg" }
