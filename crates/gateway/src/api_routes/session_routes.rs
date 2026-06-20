@@ -147,17 +147,13 @@ async fn attach_session_handler(
     Path(id): Path<String>,
     Json(body): Json<SessionAttachRequest>,
 ) -> Json<serde_json::Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(
-            runtime
-                .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
-                .await,
-        ),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
+    Json(
+        state
+            .services
+            .session
+            .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
+            .await,
+    )
 }
 
 async fn detach_session_handler(
@@ -165,26 +161,26 @@ async fn detach_session_handler(
     Path(id): Path<String>,
     Json(body): Json<SessionDetachRequest>,
 ) -> Json<serde_json::Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(runtime.detach_session_value(&id, &body.actor_id).await),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
+    Json(
+        state
+            .services
+            .session
+            .detach_session_value(&id, &body.actor_id)
+            .await,
+    )
 }
 
 async fn session_lifecycle_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(runtime.lifecycle_snapshot_value(Some(&id)).await),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
+    Json(
+        state
+            .services
+            .session
+            .lifecycle_snapshot_value(Some(&id))
+            .await,
+    )
 }
 
 async fn replay_session_handler(
@@ -192,21 +188,17 @@ async fn replay_session_handler(
     Path(id): Path<String>,
     Query(params): Query<SessionReplayParams>,
 ) -> Json<serde_json::Value> {
-    match state.services.runtime.as_ref() {
-        Some(runtime) => Json(
-            runtime
-                .replay_session_value(
-                    &id,
-                    params.from_sequence.unwrap_or(0),
-                    params.limit.unwrap_or(100),
-                )
-                .await,
-        ),
-        None => Json(serde_json::json!({
-            "ok": false,
-            "error": "runtime service unavailable",
-        })),
-    }
+    Json(
+        state
+            .services
+            .session
+            .replay_session_value(
+                &id,
+                params.from_sequence.unwrap_or(0),
+                params.limit.unwrap_or(100),
+            )
+            .await,
+    )
 }
 
 #[derive(Serialize)]

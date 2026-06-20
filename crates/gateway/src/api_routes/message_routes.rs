@@ -22,6 +22,7 @@ use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
+use crate::runtime_service::{RuntimeService, RuntimeTurnExecution, RuntimeTurnExecutionError};
 use crate::services::SessionService;
 use crate::task_kernel::TaskRecord;
 
@@ -194,6 +195,169 @@ pub(super) fn runtime_run_completed_payload(
         "duration_ms": completed_at_ms.saturating_sub(started_at_ms),
         "refs": refs,
     })
+}
+
+struct RuntimeTurnSink<'a> {
+    state: &'a AppState,
+    runtime_service: &'a RuntimeService,
+    event_bus: &'a SessionEventBus,
+}
+
+impl<'a> RuntimeTurnSink<'a> {
+    async fn complete(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        profile: ContextProfile,
+        execution: RuntimeTurnExecution,
+        started_at_ms: u64,
+    ) -> serde_json::Value {
+        let summary = execution.summary;
+        let turn_id = execution.receipt.turn_id.to_string();
+        let final_text = summary
+            .assistant_messages
+            .last()
+            .map(|msg| {
+                msg.blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+
+        let session_snapshot = self.runtime_service.session_snapshot(session_id).await;
+        let context_envelope_id = self
+            .runtime_service
+            .last_context_envelope(session_id)
+            .await
+            .map(|envelope| envelope.id);
+        let collaboration_result = self
+            .runtime_service
+            .take_collaboration_result(session_id)
+            .await;
+        if let Some(session_snapshot) = session_snapshot {
+            if let Err(e) = self
+                .state
+                .services
+                .session
+                .sync_runtime_session_snapshot(session_id, &session_snapshot)
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
+            }
+        }
+        if let Some(collaboration_result) = collaboration_result {
+            let memory_manager = self.state.services.memory.manager();
+            if let Err(e) = self
+                .state
+                .services
+                .session
+                .persist_workgraph_review(
+                    &collaboration_result.work_graph,
+                    &collaboration_result.review_packet,
+                    memory_manager.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    %session_id,
+                    error = %e,
+                    "failed to persist collaboration closed-loop runtime event"
+                );
+            }
+        }
+
+        let sse_data = serde_json::json!({
+            "type": "TurnComplete",
+            "session_id": session_id,
+            "turn_id": &turn_id,
+            "response": final_text,
+            "iterations": summary.iterations,
+        });
+        self.event_bus
+            .broadcast(session_id, &sse_data.to_string())
+            .await;
+        append_session_timeline_event(
+            &self.state.services.session,
+            session_id,
+            "RuntimeRun",
+            runtime_run_completed_payload(
+                session_id,
+                run_id,
+                Some(&turn_id),
+                profile,
+                "completed",
+                Some(summary.iterations),
+                context_envelope_id,
+                None,
+                started_at_ms,
+                current_time_ms(),
+            ),
+        )
+        .await;
+
+        serde_json::json!({
+            "session_id": session_id,
+            "turn_id": &turn_id,
+            "turn": execution.receipt,
+            "status": "complete",
+            "response": final_text,
+            "iterations": summary.iterations,
+        })
+    }
+
+    async fn fail(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        profile: ContextProfile,
+        status: StatusCode,
+        error: &RuntimeTurnExecutionError,
+        started_at_ms: u64,
+    ) -> String {
+        let error_msg = error.message();
+        let context_envelope_id = self
+            .runtime_service
+            .last_context_envelope(session_id)
+            .await
+            .map(|envelope| envelope.id);
+
+        let sse_data = serde_json::json!({
+            "type": "TurnError",
+            "session_id": session_id,
+            "error": error_msg,
+        });
+        self.event_bus
+            .broadcast(session_id, &sse_data.to_string())
+            .await;
+        append_session_timeline_event(
+            &self.state.services.session,
+            session_id,
+            "RuntimeRun",
+            runtime_run_completed_payload(
+                session_id,
+                run_id,
+                None,
+                profile,
+                if status == StatusCode::REQUEST_TIMEOUT {
+                    "timeout"
+                } else {
+                    "failed"
+                },
+                None,
+                context_envelope_id,
+                Some(error_msg.clone()),
+                started_at_ms,
+                current_time_ms(),
+            ),
+        )
+        .await;
+        error_msg
+    }
 }
 
 async fn send_message(
@@ -405,100 +569,23 @@ async fn send_message(
         .run_turn_with_timeout(&session_id, active_task_id, content, TURN_TIMEOUT)
         .await;
     clear_active_turn_control(&session_id, &run_id);
+    let turn_sink = RuntimeTurnSink {
+        state: &state,
+        runtime_service: &runtime_service,
+        event_bus: &event_bus,
+    };
 
     match turn_result {
         Ok(execution) => {
-            let summary = execution.summary;
-            let turn_id = execution.receipt.turn_id.to_string();
-            let final_text = summary
-                .assistant_messages
-                .last()
-                .map(|msg| {
-                    msg.blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-
-            let session_snapshot = runtime_service.session_snapshot(&session_id).await;
-            let context_envelope_id = runtime_service
-                .last_context_envelope(&session_id)
-                .await
-                .map(|envelope| envelope.id);
-            let collaboration_result = runtime_service.take_collaboration_result(&session_id).await;
-            if let Some(session_snapshot) = session_snapshot {
-                if let Err(e) = state
-                    .services
-                    .session
-                    .sync_runtime_session_snapshot(&session_id, &session_snapshot)
-                    .await
-                {
-                    tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
-                }
-            }
-            if let Some(collaboration_result) = collaboration_result {
-                let memory_manager = state.services.memory.manager();
-                if let Err(e) = state
-                    .services
-                    .session
-                    .persist_workgraph_review(
-                        &collaboration_result.work_graph,
-                        &collaboration_result.review_packet,
-                        memory_manager.as_ref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        %session_id,
-                        error = %e,
-                        "failed to persist collaboration closed-loop runtime event"
-                    );
-                }
-            }
-
-            let response = serde_json::json!({
-                "session_id": &session_id,
-                "turn_id": &turn_id,
-                "turn": execution.receipt,
-                "status": "complete",
-                "response": final_text,
-                "iterations": summary.iterations,
-            });
-
-            let sse_data = serde_json::json!({
-                "type": "TurnComplete",
-                "session_id": &session_id,
-                "turn_id": &turn_id,
-                "response": final_text,
-                "iterations": summary.iterations,
-            });
-            event_bus
-                .broadcast(&session_id, &sse_data.to_string())
-                .await;
-            append_session_timeline_event(
-                &state.services.session,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
+            let response = turn_sink
+                .complete(
                     &session_id,
                     &run_id,
-                    Some(&turn_id),
                     run_profile,
-                    "completed",
-                    Some(summary.iterations),
-                    context_envelope_id,
-                    None,
+                    execution,
                     run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
-
+                )
+                .await;
             Ok(Json(response))
         }
         Err(error) => {
@@ -514,42 +601,16 @@ async fn send_message(
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             };
-            let error_msg = error.message();
-            let context_envelope_id = runtime_service
-                .last_context_envelope(&session_id)
-                .await
-                .map(|envelope| envelope.id);
-
-            let sse_data = serde_json::json!({
-                "type": "TurnError",
-                "session_id": &session_id,
-                "error": error_msg,
-            });
-            event_bus
-                .broadcast(&session_id, &sse_data.to_string())
-                .await;
-            append_session_timeline_event(
-                &state.services.session,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
+            let error_msg = turn_sink
+                .fail(
                     &session_id,
                     &run_id,
-                    None,
                     run_profile,
-                    if status == StatusCode::REQUEST_TIMEOUT {
-                        "timeout"
-                    } else {
-                        "failed"
-                    },
-                    None,
-                    context_envelope_id,
-                    Some(error_msg.clone()),
+                    status,
+                    &error,
                     run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
+                )
+                .await;
 
             Err((status, Json(ErrorResponse { error: error_msg })))
         }

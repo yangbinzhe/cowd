@@ -8,15 +8,18 @@ use memory::{
 };
 use runtime::{AgentWorkGraph, CollaborationReviewPacket};
 use serde::{Deserialize, Serialize};
+use session::SessionLifecycleKernel;
 
 use super::ServiceEnvelope;
 use crate::session_kernel::SessionKernel;
+use crate::session_lifecycle_kernel::SessionActor;
 
 #[derive(Clone)]
 pub(crate) struct SessionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     kernel: Option<Arc<SessionKernel>>,
+    lifecycle_kernel: Option<Arc<SessionLifecycleKernel>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,12 +82,24 @@ impl SessionService {
             label: "session",
             owner: "0.9.296 Session service boundary",
             kernel: None,
+            lifecycle_kernel: None,
         }
     }
 
     pub(crate) fn with_kernel(kernel: Arc<SessionKernel>) -> Self {
         Self {
             kernel: Some(kernel),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn with_runtime_boundaries(
+        kernel: Arc<SessionKernel>,
+        lifecycle_kernel: Arc<SessionLifecycleKernel>,
+    ) -> Self {
+        Self {
+            kernel: Some(kernel),
+            lifecycle_kernel: Some(lifecycle_kernel),
             ..Self::new()
         }
     }
@@ -105,6 +120,10 @@ impl SessionService {
 
     fn kernel(&self) -> Option<&Arc<SessionKernel>> {
         self.kernel.as_ref()
+    }
+
+    fn lifecycle_kernel(&self) -> Option<&Arc<SessionLifecycleKernel>> {
+        self.lifecycle_kernel.as_ref()
     }
 
     pub(crate) fn unified_store(&self) -> Option<Arc<UnifiedSessionStore>> {
@@ -166,6 +185,148 @@ impl SessionService {
 
     pub(crate) fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
         self.remove_active_runtime(session_id).is_some()
+    }
+
+    pub(crate) async fn attach_session_value(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        surface: &str,
+        role: Option<&str>,
+    ) -> serde_json::Value {
+        let Some(lifecycle_kernel) = self.lifecycle_kernel() else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "session lifecycle service unavailable",
+            });
+        };
+        let mut actor = SessionActor::new(actor_id, surface);
+        actor.role = role.map(ToOwned::to_owned);
+        match lifecycle_kernel.attach(session_id, actor).await {
+            Ok(event) => {
+                let snapshot = lifecycle_kernel.snapshot(session_id).await;
+                serde_json::json!({
+                    "ok": true,
+                    "event": event,
+                    "snapshot": snapshot,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": error,
+            }),
+        }
+    }
+
+    pub(crate) async fn detach_session_value(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> serde_json::Value {
+        let Some(lifecycle_kernel) = self.lifecycle_kernel() else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "session lifecycle service unavailable",
+            });
+        };
+        match lifecycle_kernel.detach(session_id, actor_id).await {
+            Ok(event) => {
+                let snapshot = lifecycle_kernel.snapshot(session_id).await;
+                serde_json::json!({
+                    "ok": true,
+                    "event": event,
+                    "snapshot": snapshot,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": error,
+            }),
+        }
+    }
+
+    pub(crate) async fn lifecycle_snapshot_value(
+        &self,
+        session_id: Option<&str>,
+    ) -> serde_json::Value {
+        let Some(lifecycle_kernel) = self.lifecycle_kernel() else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "session lifecycle service unavailable",
+            });
+        };
+        match session_id {
+            Some(session_id) => serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "snapshot": lifecycle_kernel.snapshot(session_id).await,
+            }),
+            None => serde_json::json!({
+                "ok": true,
+                "sessions": lifecycle_kernel.snapshots().await,
+            }),
+        }
+    }
+
+    pub(crate) async fn replay_session_value(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> serde_json::Value {
+        if session_id.trim().is_empty() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "session_id is required",
+            });
+        }
+        let capped_limit = limit.clamp(1, 500);
+        match self
+            .stored_events_page(session_id, from_sequence, capped_limit)
+            .await
+        {
+            Ok(Some((total, events))) => {
+                let next_sequence = events
+                    .last()
+                    .map(|event| event.sequence + 1)
+                    .unwrap_or(from_sequence);
+                let projected_events: Vec<_> = events
+                    .into_iter()
+                    .map(|event| {
+                        serde_json::json!({
+                            "session_id": event.session_id,
+                            "event_type": event.event_type,
+                            "event_json": event.event_json,
+                            "sequence": event.sequence,
+                            "created_at_ms": event.created_at_ms,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "session_id": session_id,
+                    "from_sequence": from_sequence,
+                    "limit": capped_limit,
+                    "total": total,
+                    "next_sequence": next_sequence,
+                    "events": projected_events,
+                })
+            }
+            Ok(None) => serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "from_sequence": from_sequence,
+                "limit": capped_limit,
+                "total": 0,
+                "next_sequence": from_sequence,
+                "events": [],
+                "degraded": "unified session store unavailable",
+            }),
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": error.to_string(),
+            }),
+        }
     }
 
     pub(crate) async fn list_stored_sessions_page(
@@ -652,5 +813,40 @@ impl SessionService {
         }
 
         Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::ActiveSessions;
+    use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+
+    #[tokio::test]
+    async fn session_service_owns_attach_detach_lifecycle_projection() {
+        let sessions = Arc::new(ActiveSessions::default());
+        let service = SessionService::with_runtime_boundaries(
+            Arc::new(SessionKernel::new(
+                sessions,
+                None,
+                crate::event_bus::SessionEventBus::new(),
+            )),
+            Arc::new(SessionLifecycleKernel::new()),
+        );
+
+        let attached = service
+            .attach_session_value("session-1", "tui-1", "tui", Some("reader"))
+            .await;
+        assert_eq!(attached["ok"], true);
+        assert_eq!(attached["event"]["sequence"], 0);
+        assert_eq!(attached["snapshot"]["state"], "attached");
+
+        let lifecycle = service.lifecycle_snapshot_value(Some("session-1")).await;
+        assert_eq!(lifecycle["ok"], true);
+        assert_eq!(lifecycle["snapshot"]["state"], "attached");
+
+        let detached = service.detach_session_value("session-1", "tui-1").await;
+        assert_eq!(detached["ok"], true);
+        assert_eq!(detached["snapshot"]["state"], "detached");
     }
 }

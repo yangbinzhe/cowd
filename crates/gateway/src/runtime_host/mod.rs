@@ -465,7 +465,12 @@ async fn handle_platform_inbound_message(
     message: InboundMessage,
 ) -> Result<(), String> {
     let session_id = platform_session_id(&message);
-    let runtime_entry = ensure_platform_session_runtime(&app_state, &session_id).await?;
+    ensure_platform_session_runtime(&app_state, &session_id).await?;
+    let runtime_service = app_state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable for platform inbound".to_string())?;
 
     tracing::info!(
         platform = %message.session_key.platform,
@@ -475,13 +480,17 @@ async fn handle_platform_inbound_message(
         "platform inbound message received"
     );
 
-    let summary = {
-        let mut runtime = runtime_entry.lock().await;
-        runtime
-            .run_turn_async(&message.text, &runtime::permissions::SharedPrompter::none())
-            .await
-            .map_err(|error| format!("runtime turn failed: {error}"))?
-    };
+    let execution = runtime_service
+        .run_turn_with_timeout(
+            &session_id,
+            None,
+            message.text.clone(),
+            Duration::from_secs(300),
+        )
+        .await
+        .map_err(|error| format!("runtime turn failed: {}", error.message()))?;
+    let summary = execution.summary;
+    let turn_id = execution.receipt.turn_id.to_string();
     let reply = assistant_reply_text(&summary.assistant_messages)
         .unwrap_or_else(|| "我已收到，但这次没有生成可发送的文本回复。".to_string());
 
@@ -492,6 +501,7 @@ async fn handle_platform_inbound_message(
         metadata: serde_json::json!({
             "source": "cowd.platform_inbound_loop",
             "session_id": session_id,
+            "turn_id": turn_id,
             "inbound_message_id": message.message_id,
         }),
     };
@@ -500,12 +510,10 @@ async fn handle_platform_inbound_message(
         .await
         .map_err(|error| format!("send response failed: {error}"))?;
 
-    if let (Some(store), Some(runtime_entry)) = (
+    if let (Some(store), Some(session)) = (
         app_state.services.session.unified_store(),
-        app_state.services.session.active_runtime(&session_id),
+        runtime_service.session_snapshot(&session_id).await,
     ) {
-        let runtime = runtime_entry.lock().await;
-        let session = runtime.session();
         if let Err(error) = crate::api_routes::sync_runtime_session_metadata_to_store(
             store.as_ref(),
             &session_id,

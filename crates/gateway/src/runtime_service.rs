@@ -11,7 +11,7 @@ use crate::runtime_boundary::{
 };
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
-use crate::session_lifecycle_kernel::{SessionActor, SessionLifecycleKernel};
+use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use ai_kernel::{
     task::{TaskId, TaskTurnBinding},
     turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus},
@@ -91,6 +91,11 @@ impl RuntimeService {
     #[must_use]
     pub(crate) fn session_kernel(&self) -> Arc<SessionKernel> {
         self.session_kernel.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn lifecycle_kernel(&self) -> Arc<SessionLifecycleKernel> {
+        self.lifecycle_kernel.clone()
     }
 
     #[must_use]
@@ -460,131 +465,6 @@ impl RuntimeService {
         self.lease_registry.release(session_id, owner).await
     }
 
-    pub(crate) async fn attach_session_value(
-        &self,
-        session_id: &str,
-        actor_id: &str,
-        surface: &str,
-        role: Option<&str>,
-    ) -> serde_json::Value {
-        let mut actor = SessionActor::new(actor_id, surface);
-        actor.role = role.map(ToOwned::to_owned);
-        match self.lifecycle_kernel.attach(session_id, actor).await {
-            Ok(event) => {
-                let snapshot = self.lifecycle_kernel.snapshot(session_id).await;
-                serde_json::json!({
-                    "ok": true,
-                    "event": event,
-                    "snapshot": snapshot,
-                })
-            }
-            Err(error) => serde_json::json!({
-                "ok": false,
-                "error": error,
-            }),
-        }
-    }
-
-    pub(crate) async fn detach_session_value(
-        &self,
-        session_id: &str,
-        actor_id: &str,
-    ) -> serde_json::Value {
-        match self.lifecycle_kernel.detach(session_id, actor_id).await {
-            Ok(event) => {
-                let snapshot = self.lifecycle_kernel.snapshot(session_id).await;
-                serde_json::json!({
-                    "ok": true,
-                    "event": event,
-                    "snapshot": snapshot,
-                })
-            }
-            Err(error) => serde_json::json!({
-                "ok": false,
-                "error": error,
-            }),
-        }
-    }
-
-    pub(crate) async fn lifecycle_snapshot_value(
-        &self,
-        session_id: Option<&str>,
-    ) -> serde_json::Value {
-        match session_id {
-            Some(session_id) => serde_json::json!({
-                "ok": true,
-                "session_id": session_id,
-                "snapshot": self.lifecycle_kernel.snapshot(session_id).await,
-            }),
-            None => serde_json::json!({
-                "ok": true,
-                "sessions": self.lifecycle_kernel.snapshots().await,
-            }),
-        }
-    }
-
-    pub(crate) async fn replay_session_value(
-        &self,
-        session_id: &str,
-        from_sequence: usize,
-        limit: usize,
-    ) -> serde_json::Value {
-        if session_id.trim().is_empty() {
-            return serde_json::json!({
-                "ok": false,
-                "error": "session_id is required",
-            });
-        }
-        let capped_limit = limit.clamp(1, 500);
-        match self
-            .session_kernel
-            .stored_events_page(session_id, from_sequence, capped_limit)
-            .await
-        {
-            Ok(Some((total, events))) => {
-                let next_sequence = events
-                    .last()
-                    .map(|event| event.sequence + 1)
-                    .unwrap_or(from_sequence);
-                let projected_events: Vec<_> = events
-                    .into_iter()
-                    .map(|event| {
-                        serde_json::json!({
-                            "session_id": event.session_id,
-                            "event_type": event.event_type,
-                            "event_json": event.event_json,
-                            "sequence": event.sequence,
-                            "created_at_ms": event.created_at_ms,
-                        })
-                    })
-                    .collect();
-                serde_json::json!({
-                    "ok": true,
-                    "session_id": session_id,
-                    "from_sequence": from_sequence,
-                    "limit": capped_limit,
-                    "total": total,
-                    "next_sequence": next_sequence,
-                    "events": projected_events,
-                })
-            }
-            Ok(None) => serde_json::json!({
-                "ok": true,
-                "session_id": session_id,
-                "from_sequence": from_sequence,
-                "limit": capped_limit,
-                "total": 0,
-                "next_sequence": from_sequence,
-                "events": [],
-                "degraded": "unified session store unavailable",
-            }),
-            Err(error) => serde_json::json!({
-                "ok": false,
-                "error": error.to_string(),
-            }),
-        }
-    }
-
     #[must_use]
     pub(crate) fn unsupported_protocol_value(request: &RuntimeRequest) -> serde_json::Value {
         let response = RuntimeResponse::unsupported_protocol(request);
@@ -680,33 +560,6 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("unsupported runtime protocol version"));
-    }
-
-    #[tokio::test]
-    async fn runtime_service_attach_detach_projects_lifecycle_snapshot() {
-        let sessions = Arc::new(ActiveSessions::default());
-        let service = RuntimeService::new(
-            sessions.clone(),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                sessions,
-                None,
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
-
-        let attached = service
-            .attach_session_value("session-1", "tui-1", "tui", Some("reader"))
-            .await;
-        assert_eq!(attached["ok"], true);
-        assert_eq!(attached["event"]["sequence"], 0);
-        assert_eq!(attached["snapshot"]["state"], "attached");
-
-        let detached = service.detach_session_value("session-1", "tui-1").await;
-        assert_eq!(detached["ok"], true);
-        assert_eq!(detached["snapshot"]["state"], "detached");
     }
 
     #[test]

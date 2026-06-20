@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ai_kernel::{
     core::{ExecutionMode, TaskComplexity, TaskRisk},
@@ -112,6 +112,38 @@ pub(crate) struct ToolService {
     pub(crate) owner: &'static str,
 }
 
+impl CrossPlaneService {
+    pub(crate) fn summary(&self) -> ServiceEnvelope {
+        self.envelope("summary")
+    }
+
+    pub(crate) fn grants(&self) -> ServiceEnvelope {
+        self.envelope("grants")
+    }
+
+    pub(crate) fn identities(&self) -> ServiceEnvelope {
+        self.envelope("identities")
+    }
+
+    pub(crate) fn audit(&self) -> ServiceEnvelope {
+        self.envelope("audit")
+    }
+
+    pub(crate) fn execute(&self) -> ServiceEnvelope {
+        self.envelope("execute")
+    }
+
+    fn contracts(&self) -> Vec<ServiceEnvelope> {
+        vec![
+            self.summary(),
+            self.grants(),
+            self.identities(),
+            self.audit(),
+            self.execute(),
+        ]
+    }
+}
+
 impl ToolService {
     pub(crate) fn new() -> Self {
         Self {
@@ -185,7 +217,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.347 Provider service boundary",
+            owner: "0.9.348 Provider service boundary",
         }
     }
 
@@ -264,13 +296,15 @@ impl ProviderService {
 pub(crate) struct GrowthService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    events: Arc<Mutex<Vec<GrowthEvent>>>,
 }
 
 impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.347 Growth service boundary",
+            owner: "0.9.348 Growth service boundary",
+            events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -319,11 +353,26 @@ impl GrowthService {
                 ),
             )],
         });
+        self.record_event(event.clone());
 
         serde_json::json!({
             "envelope": self.envelope("risk_gate_event"),
             "event": event,
         })
+    }
+
+    pub(crate) fn record_event(&self, event: GrowthEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    pub(crate) fn event_log(&self) -> Vec<GrowthEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -595,11 +644,16 @@ impl GrowthService {
         self.envelope("matrix_signals")
     }
 
+    pub(crate) fn event_log_contract(&self) -> ServiceEnvelope {
+        self.envelope("event_log")
+    }
+
     fn contracts(&self) -> Vec<ServiceEnvelope> {
         vec![
             self.risk_gate_event_contract(),
             self.memory_candidates(),
             self.matrix_signals(),
+            self.event_log_contract(),
         ]
     }
 }
@@ -615,7 +669,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.347 GatewayServices");
+        assert_eq!(services.owner, "0.9.348 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
@@ -630,6 +684,7 @@ mod tests {
                 "memory",
                 "context",
                 "connector",
+                "cross_plane",
                 "tool",
                 "system",
                 "audit",
@@ -653,6 +708,7 @@ mod tests {
             services.connector.resource_promote_memory().operation,
             "resource_promote_memory"
         );
+        assert_eq!(services.cross_plane.summary().operation, "summary");
         assert_eq!(services.tool.approve().operation, "approve");
         assert_eq!(
             services.system.storage_summary().operation,
@@ -674,6 +730,7 @@ mod tests {
             services.growth.risk_gate_event_contract().operation,
             "risk_gate_event"
         );
+        assert_eq!(services.growth.event_log_contract().operation, "event_log");
         assert!(services
             .workspace
             .contracts()

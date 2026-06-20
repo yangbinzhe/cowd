@@ -22,13 +22,14 @@ impl GatewayServices {
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
         let session_kernel = runtime.session_kernel();
+        let lifecycle_kernel = runtime.lifecycle_kernel();
         Self {
             runtime: Some(runtime),
             channel: channel_runtime
                 .map(ChannelService::with_runtime)
                 .unwrap_or_else(ChannelService::new),
             slash: SlashController::new(Some(command_host_runtime)),
-            session: SessionService::with_kernel(session_kernel),
+            session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
             task: TaskService::with_kernel(task_kernel),
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
@@ -58,7 +59,7 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.347 GatewayServices",
+            owner: "0.9.348 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -124,6 +125,7 @@ impl GatewayServices {
             self.memory.label,
             self.context.label,
             self.connector.label,
+            self.cross_plane.label,
             self.tool.label,
             self.system.label,
             self.audit.label,
@@ -146,6 +148,7 @@ impl GatewayServices {
         contracts.extend(self.memory.contracts());
         contracts.extend(self.context.contracts());
         contracts.extend(self.connector.contracts());
+        contracts.extend(self.cross_plane.contracts());
         contracts.extend(self.tool.contracts());
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
@@ -190,6 +193,11 @@ impl GatewayServices {
             ("connector", "resource_list"),
             ("connector", "resource_revalidate"),
             ("connector", "resource_promote_memory"),
+            ("cross_plane", "summary"),
+            ("cross_plane", "grants"),
+            ("cross_plane", "identities"),
+            ("cross_plane", "audit"),
+            ("cross_plane", "execute"),
             ("tool", "approve"),
             ("tool", "deny"),
             ("system", "health"),
@@ -204,6 +212,7 @@ impl GatewayServices {
             ("growth", "risk_gate_event"),
             ("growth", "memory_candidates"),
             ("growth", "matrix_signals"),
+            ("growth", "event_log"),
             ("workspace", "overview"),
             ("skill", "catalog"),
             ("skill", "projection"),

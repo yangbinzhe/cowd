@@ -661,6 +661,12 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && runtime_service.contains("TurnStatus::Failed"),
         "RuntimeService must own real turn receipt lifecycle and task-turn binding projection"
     );
+    assert!(
+        !runtime_service.contains("attach_session_value")
+            && !runtime_service.contains("detach_session_value")
+            && !runtime_service.contains("replay_session_value"),
+        "RuntimeService must not own session lifecycle APIs"
+    );
     let system_routes =
         production_part(&read_repo("crates/gateway/src/api_routes/system_routes.rs")).to_string();
     assert!(
@@ -681,6 +687,9 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     assert!(
         !session_routes.contains(".active_runtime(")
             && !session_routes.contains(".remove_active_runtime(")
+            && !session_routes.contains("state.services.runtime.as_ref()")
+            && session_routes.contains(".attach_session_value(")
+            && session_routes.contains(".replay_session_value(")
             && session_routes.contains("has_active_runtime")
             && session_routes.contains("session_exists"),
         "session routes must use SessionService semantic helpers instead of runtime registry internals"
@@ -1135,6 +1144,44 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
     assert!(
         source.contains("dispatch_gateway_cancel("),
         "TUI cancel must use Gateway HTTP control API"
+    );
+}
+
+#[test]
+fn channel_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
+    let runtime_manifest = read_repo("crates/runtime/Cargo.toml");
+    let runtime_dependencies = manifest_dependencies(&runtime_manifest);
+    assert!(
+        !runtime_dependencies.contains("channel = ")
+            && !runtime_dependencies.contains("channel-adapters = "),
+        "runtime must not depend on channel crates; channel is a Gateway ingress/egress boundary"
+    );
+
+    let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
+    let gateway_dependencies = manifest_dependencies(&gateway_manifest);
+    assert!(
+        gateway_dependencies.contains("channel = { path = \"../channel\" }")
+            && gateway_dependencies
+                .contains("channel-adapters = { path = \"../channel-adapters\" }"),
+        "gateway must own channel and channel-adapter integration"
+    );
+
+    let runtime_host =
+        production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
+    assert!(
+        !runtime_host.contains(".run_turn_async(")
+            && runtime_host.contains(".run_turn_with_timeout(")
+            && runtime_host.contains("runtime_service = app_state")
+            && runtime_host.contains("runtime service unavailable for platform inbound"),
+        "platform inbound handling must execute turns through Gateway RuntimeService"
+    );
+
+    let gateway_services = read_repo("crates/gateway/src/services/registry.rs");
+    assert!(
+        gateway_services.contains("self.cross_plane.label")
+            && gateway_services.contains("self.cross_plane.contracts()")
+            && gateway_services.contains("(\"cross_plane\", \"summary\")"),
+        "CrossPlaneService must be part of GatewayServices labels, contracts, and health gates"
     );
 }
 
