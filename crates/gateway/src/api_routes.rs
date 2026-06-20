@@ -58,6 +58,7 @@ pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
+mod growth_routes;
 mod matrix_outcomes;
 mod matrix_routes;
 pub(crate) mod memory_routes;
@@ -230,6 +231,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(context_routes::router())
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
+        .merge(growth_routes::router())
         .merge(matrix_routes::router())
         .merge(mfg_routes::router())
         .merge(memory_routes::router())

@@ -612,6 +612,18 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && gateway_services.contains("risk_gate_projection"),
         "GatewayServices must include concrete provider, growth, and audit projections"
     );
+    let api_routes = read_repo("crates/gateway/src/api_routes.rs");
+    let growth_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/growth_routes.rs")).to_string();
+    assert!(
+        api_routes.contains("mod growth_routes")
+            && api_routes.contains(".merge(growth_routes::router())")
+            && growth_routes.contains("/api/growth/events")
+            && growth_routes.contains("/api/growth/status")
+            && growth_routes.contains("state.services.growth.event_log()")
+            && growth_routes.contains("event_log_contract"),
+        "GrowthService must expose an observable gateway route, not only an internal projection"
+    );
 
     let task_service =
         production_part(&read_repo("crates/gateway/src/services/task_service.rs")).to_string();
@@ -1186,6 +1198,24 @@ fn channel_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
 }
 
 #[test]
+fn production_gateway_entry_does_not_run_ai_turns_directly() {
+    let main_source = read_repo("crates/gateway/src/main.rs");
+    let production_main = production_part(&main_source);
+    assert!(
+        !production_main.contains("run_turn_async("),
+        "production gateway entry must not directly execute AI turns; use RuntimeService or Gateway HTTP surfaces"
+    );
+
+    let runtime_service_source = read_repo("crates/gateway/src/runtime_service.rs");
+    let runtime_service = production_part(&runtime_service_source);
+    assert!(
+        runtime_service.contains("run_turn_with_timeout")
+            && runtime_service.contains(".run_turn_async("),
+        "RuntimeService is the gateway-owned boundary allowed to call the runtime turn engine"
+    );
+}
+
+#[test]
 fn api_route_direct_dependencies_are_closed() {
     let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 
@@ -1208,6 +1238,7 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/context_routes.rs",
         "api_routes/core_routes.rs",
         "api_routes/cross_plane_routes.rs",
+        "api_routes/growth_routes.rs",
         "api_routes/matrix_routes.rs",
         "api_routes/mfg_routes.rs",
         "api_routes/matrix_outcomes.rs",
