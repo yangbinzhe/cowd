@@ -599,8 +599,10 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         gateway_approval_routes.contains("/api/approval/risk-receipt")
             && gateway_approval_routes.contains("risk_receipt_handler")
             && gateway_approval_routes.contains("state.services.audit.risk_gate_projection")
-            && gateway_approval_routes.contains("state.services.growth.risk_gate_event"),
-        "approval API must expose risk receipt projection through audit and growth services"
+            && gateway_approval_routes.contains(".ingest_risk_gate_receipt(")
+            && gateway_approval_routes.contains("&state.services.memory")
+            && gateway_approval_routes.contains("&state.services.matrix"),
+        "approval API must expose risk receipt projection through audit and durable growth promotion services"
     );
     let gateway_services =
         production_part(&read_repo("crates/gateway/src/services/mod.rs")).to_string();
@@ -620,9 +622,21 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && api_routes.contains(".merge(growth_routes::router())")
             && growth_routes.contains("/api/growth/events")
             && growth_routes.contains("/api/growth/status")
-            && growth_routes.contains("state.services.growth.event_log()")
+            && growth_routes.contains("durable_event_log")
+            && growth_routes.contains("durable_promotion_log")
             && growth_routes.contains("event_log_contract"),
         "GrowthService must expose an observable gateway route, not only an internal projection"
+    );
+    let growth_service =
+        production_part(&read_repo("crates/gateway/src/services/growth_service.rs")).to_string();
+    assert!(
+        growth_service.contains("growth.sqlite")
+            && growth_service.contains("growth_events")
+            && growth_service.contains("growth_promotions")
+            && growth_service.contains("promote_event_to_memory")
+            && growth_service.contains("promote_event_to_matrix")
+            && growth_service.contains("promote_event_to_fact_kernel"),
+        "GrowthService must own durable event storage and memory/matrix/fact promotion pipeline"
     );
 
     let task_service =
@@ -1212,6 +1226,31 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
         runtime_service.contains("run_turn_with_timeout")
             && runtime_service.contains(".run_turn_async("),
         "RuntimeService is the gateway-owned boundary allowed to call the runtime turn engine"
+    );
+}
+
+#[test]
+fn runtime_source_self_audit_is_exposed_through_gateway_api() {
+    let runtime_lib = read_repo("crates/runtime/src/lib.rs");
+    let runtime_audit = read_repo("crates/runtime/src/source_self_audit.rs");
+    let runtime_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/runtime_routes.rs",
+    ))
+    .to_string();
+
+    assert!(
+        runtime_lib.contains("pub mod source_self_audit")
+            && runtime_lib.contains("RuntimeSourceSelfAudit")
+            && runtime_audit.contains("runtime.no_channel_dependency")
+            && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
+            && runtime_audit.contains("ai_eval.repair_hints"),
+        "runtime must expose source-aware self audit checks with repair hints"
+    );
+    assert!(
+        runtime_routes.contains("/api/runtime/source-audit")
+            && runtime_routes.contains("/api/runtime/source-repair-plan")
+            && runtime_routes.contains("RuntimeSourceSelfAudit::audit_repo"),
+        "Gateway must expose runtime source audit and repair plan APIs"
     );
 }
 

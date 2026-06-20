@@ -37,6 +37,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/runtime/status", get(get_runtime_status))
         .route("/api/runtime/snapshot", get(get_runtime_snapshot))
+        .route("/api/runtime/source-audit", get(get_runtime_source_audit))
+        .route(
+            "/api/runtime/source-repair-plan",
+            get(get_runtime_source_repair_plan),
+        )
         .route("/api/runtime/control-plane", get(get_runtime_control_plane))
         .route(
             "/api/runtime/turns",
@@ -56,6 +61,23 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/session-leases/release",
             post(release_runtime_session_lease),
         )
+}
+
+async fn get_runtime_source_audit(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
+    let report = runtime::RuntimeSourceSelfAudit::audit_repo(&state.workspace_root);
+    Json(serde_json::json!({
+        "kind": "runtime.source_audit",
+        "report": report,
+    }))
+}
+
+async fn get_runtime_source_repair_plan(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
+    let report = runtime::RuntimeSourceSelfAudit::audit_repo(&state.workspace_root);
+    Json(serde_json::json!({
+        "kind": "runtime.source_repair_plan",
+        "ok": report.ok,
+        "repair_plan": report.repair_plan,
+    }))
 }
 
 #[derive(Deserialize)]

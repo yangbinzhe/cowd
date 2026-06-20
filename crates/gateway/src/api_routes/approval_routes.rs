@@ -115,11 +115,18 @@ async fn risk_receipt_handler(
         .await
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let audit = state.services.audit.risk_gate_projection(&receipt);
-    let growth = state.services.growth.risk_gate_event(
-        body.session_id
-            .unwrap_or_else(|| "approval-risk-receipt".to_string()),
-        &receipt,
-    );
+    let growth = state
+        .services
+        .growth
+        .ingest_risk_gate_receipt(
+            &state.config_home,
+            &state.services.memory,
+            &state.services.matrix,
+            body.session_id
+                .unwrap_or_else(|| "approval-risk-receipt".to_string()),
+            &receipt,
+        )
+        .await;
     Ok(Json(serde_json::json!({
         "ok": true,
         "receipt": receipt,

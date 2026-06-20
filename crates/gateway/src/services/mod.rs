@@ -17,6 +17,7 @@ mod context;
 mod context_service;
 mod cross_plane_service;
 mod error;
+mod growth_service;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
@@ -217,7 +218,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.349 Provider service boundary",
+            owner: "0.9.350 Provider service boundary",
         }
     }
 
@@ -297,14 +298,16 @@ pub(crate) struct GrowthService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     events: Arc<Mutex<Vec<GrowthEvent>>>,
+    fact_kernel: Arc<Mutex<fact_kernel::FactKernelService>>,
 }
 
 impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.349 Growth service boundary",
+            owner: "0.9.350 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
+            fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
     }
 
@@ -669,7 +672,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.349 GatewayServices");
+        assert_eq!(services.owner, "0.9.350 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
@@ -764,5 +767,84 @@ mod tests {
         assert_eq!(policy.boundary_status, "0620_final_boundary");
         let receipt = ServiceReceipt::completed("service", "operation", Some("trace".to_string()));
         assert_eq!(receipt.outcome, "completed");
+    }
+
+    #[tokio::test]
+    async fn growth_service_persists_and_projects_events_to_fact_and_matrix() {
+        let services = GatewayServices::baseline();
+        let config_home = std::env::temp_dir().join(format!(
+            "cowd-growth-pipeline-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let record = LearningRecord::from_input(GrowthInput {
+            selected_mode: ExecutionMode::PlanExecute,
+            complexity: TaskComplexity::Complex,
+            risk: TaskRisk::Medium,
+            context_omitted: 0,
+            tool_requires_checkpoint: false,
+            tool_requires_human_confirm: false,
+            verification_can_finalize: false,
+            bench_passed: false,
+        });
+        let event = GrowthEvent::from_input(GrowthEventInput {
+            session_id: "growth-session-1".to_string(),
+            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            strategy_mode: ExecutionMode::PlanExecute,
+            learning_record: record,
+            evidence_refs: vec![GrowthEvidenceRef::new(
+                "runtime_trace",
+                "trace-1",
+                "blocked verification",
+            )],
+        });
+
+        let receipt = services
+            .growth
+            .ingest_growth_event(
+                &config_home,
+                &services.memory,
+                &services.matrix,
+                event.clone(),
+            )
+            .await;
+
+        assert!(receipt.durable, "{receipt:#?}");
+        assert!(receipt.errors.is_empty(), "{receipt:#?}");
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "fact.memory" && item.status == "promote"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "fact.matrix" && item.status == "promote"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "matrix.fact" && item.status == "promoted"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "held"));
+        assert_eq!(
+            services
+                .growth
+                .durable_event_log(&config_home)
+                .expect("durable events")
+                .len(),
+            1
+        );
+        assert!(!services
+            .growth
+            .durable_promotion_log(&config_home)
+            .expect("durable promotions")
+            .is_empty());
+        assert!(!services
+            .matrix
+            .list_facts(&config_home, 10)
+            .expect("matrix facts")
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(config_home);
     }
 }

@@ -11,24 +11,44 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 }
 
 async fn growth_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let events = state.services.growth.event_log();
+    let events = state
+        .services
+        .growth
+        .durable_event_log(&state.config_home)
+        .unwrap_or_else(|_| state.services.growth.event_log());
+    let promotions = state
+        .services
+        .growth
+        .durable_promotion_log(&state.config_home)
+        .unwrap_or_default();
     Json(serde_json::json!({
         "kind": "growth.status",
         "ok": true,
         "envelope": state.services.growth.event_log_contract(),
         "event_count": events.len(),
+        "promotion_count": promotions.len(),
         "sources": growth_sources(&events),
     }))
 }
 
 async fn growth_events_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let events = state.services.growth.event_log();
+    let events = state
+        .services
+        .growth
+        .durable_event_log(&state.config_home)
+        .unwrap_or_else(|_| state.services.growth.event_log());
+    let promotions = state
+        .services
+        .growth
+        .durable_promotion_log(&state.config_home)
+        .unwrap_or_default();
     Json(serde_json::json!({
         "kind": "growth.events",
         "ok": true,
         "envelope": state.services.growth.event_log_contract(),
         "total": events.len(),
         "events": events,
+        "promotions": promotions,
     }))
 }
 

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ai-kernel = { path = "../ai-kernel" }
+fact-kernel = { path = "../fact-kernel" }
 ai-task = { path = "../ai-task" }
 model-protocol = { path = "../model-protocol" }
 provider = { path = "../provider" }

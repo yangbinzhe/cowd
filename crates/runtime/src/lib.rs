@@ -82,6 +82,7 @@ pub mod session_lifecycle;
 pub mod skill_activation;
 pub mod skill_dependency;
 pub mod skill_memory;
+pub mod source_self_audit;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
@@ -265,6 +266,9 @@ pub use session::{
 };
 pub use skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
 pub use skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
+pub use source_self_audit::{
+    RuntimeSourceSelfAudit, SourceRepairAction, SourceSelfAuditCheck, SourceSelfAuditReport,
+};
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
