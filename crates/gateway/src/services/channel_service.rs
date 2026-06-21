@@ -15,7 +15,7 @@ impl ChannelService {
     pub(crate) fn new() -> Self {
         Self {
             label: "channel",
-            owner: "0.9.350 Channel service boundary",
+            owner: "0.9.351 Channel service boundary",
             runtime: None,
         }
     }

@@ -16,7 +16,7 @@ impl MemoryService {
     pub(crate) fn new() -> Self {
         Self {
             label: "memory",
-            owner: "0.9.350 GatewayServices",
+            owner: "0.9.351 GatewayServices",
             manager: None,
         }
     }
@@ -138,6 +138,30 @@ impl MemoryService {
         let memory_ctx = MemoryTurnContext::new(session_id, source);
         kernel
             .remember(&memory_ctx, entry)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn list_all_entries(&self) -> Result<Vec<MemoryEntry>, String> {
+        let mgr = self
+            .manager()
+            .ok_or_else(|| "memory not configured".to_string())?;
+        mgr.list_all_entries()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn update_entry(
+        &self,
+        id: &str,
+        content: Option<String>,
+        tags: Option<Vec<String>>,
+        priority: Option<memory::types::Priority>,
+    ) -> Result<(), String> {
+        let mgr = self
+            .manager()
+            .ok_or_else(|| "memory not configured".to_string())?;
+        mgr.update_entry(id, content, tags, priority)
             .await
             .map_err(|error| error.to_string())
     }

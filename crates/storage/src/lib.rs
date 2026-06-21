@@ -106,6 +106,7 @@ impl StorageLayout {
             ("tasks".to_string(), root.join("tasks.sqlite")),
             ("audit".to_string(), root.join("audit.sqlite")),
             ("approval".to_string(), root.join("approval.sqlite")),
+            ("growth".to_string(), root.join("growth.sqlite")),
         ]);
         let files_root = root.join("files");
         let files = BTreeMap::from([
@@ -244,6 +245,7 @@ fn owner_for_domain(domain: &str) -> &'static str {
         "tasks" => "task",
         "audit" | "audit_log" => "audit",
         "approval" | "approval_history" | "always_approved" => "approval",
+        "growth" => "growth",
         _ => "storage",
     }
 }
@@ -496,6 +498,7 @@ mod tests {
             "tasks",
             "audit",
             "approval",
+            "growth",
             "approval_history",
             "always_approved",
             "audit_log",

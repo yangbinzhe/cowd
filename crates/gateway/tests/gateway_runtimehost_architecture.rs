@@ -629,14 +629,17 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     );
     let growth_service =
         production_part(&read_repo("crates/gateway/src/services/growth_service.rs")).to_string();
+    let storage_source = production_part(&read_repo("crates/storage/src/lib.rs")).to_string();
     assert!(
-        growth_service.contains("growth.sqlite")
+        storage_source.contains("(\"growth\".to_string(), root.join(\"growth.sqlite\"))")
+            && growth_service.contains("StorageRegistry::default_for_config_home")
+            && growth_service.contains(".sqlite_handle(\"growth\")")
             && growth_service.contains("growth_events")
             && growth_service.contains("growth_promotions")
             && growth_service.contains("promote_event_to_memory")
             && growth_service.contains("promote_event_to_matrix")
             && growth_service.contains("promote_event_to_fact_kernel"),
-        "GrowthService must own durable event storage and memory/matrix/fact promotion pipeline"
+        "GrowthService must use registered storage and own memory/matrix/fact promotion pipeline"
     );
 
     let task_service =
