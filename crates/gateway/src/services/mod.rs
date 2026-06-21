@@ -36,6 +36,7 @@ pub(crate) use approval_service::ApprovalService;
 pub(crate) use channel_service::ChannelService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
+pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{

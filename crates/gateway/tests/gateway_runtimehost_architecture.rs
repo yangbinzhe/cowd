@@ -634,12 +634,28 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         storage_source.contains("(\"growth\".to_string(), root.join(\"growth.sqlite\"))")
             && growth_service.contains("StorageRegistry::default_for_config_home")
             && growth_service.contains(".sqlite_handle(\"growth\")")
+            && growth_service.contains("MigrationRunner::run_sqlite_domain")
+            && growth_service.contains("growth_storage_migrations")
             && growth_service.contains("growth_events")
             && growth_service.contains("growth_promotions")
             && growth_service.contains("promote_event_to_memory")
             && growth_service.contains("promote_event_to_matrix")
             && growth_service.contains("promote_event_to_fact_kernel"),
         "GrowthService must use registered storage and own memory/matrix/fact promotion pipeline"
+    );
+    assert!(
+        growth_service.contains("growth_memory_slot_key")
+            && growth_service.contains("growth_memory_assertion_fingerprint")
+            && growth_service.contains("deterministic_memory_contradiction"),
+        "Growth memory governance must use slot plus assertion keys instead of a single coarse semantic key"
+    );
+    let gateway_health =
+        production_part(&read_repo("crates/gateway/src/gateway_health.rs")).to_string();
+    assert!(
+        gateway_health.contains("growth_storage_migrations")
+            && gateway_health.contains("inspect_growth_migrations")
+            && gateway_health.contains("MigrationRunner::inspect_sqlite_domain"),
+        "Gateway health must expose real Growth schema migration status, not only storage registry layout"
     );
 
     let task_service =

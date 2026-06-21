@@ -1069,6 +1069,13 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["id"] == "storage.matrix.layout"));
+        assert!(json["storage"]["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "growth.v1.init"
+                && item["domain"] == "growth"
+                && item["status"] == "pending"));
         assert!(json["storage"]["locks"]
             .as_array()
             .unwrap()
@@ -1110,6 +1117,60 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["id"] == "storage.tasks.layout"));
+        assert!(json["storage"]["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "growth.v1.init"
+                && item["description"] == "initialize growth durable event and promotion schema"));
+    }
+
+    #[tokio::test]
+    async fn gateway_storage_health_reports_applied_growth_migration() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cowd-gateway-growth-health-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_home = tmp.join("config");
+        let registry = storage::StorageRegistry::default_for_config_home(&config_home);
+        let handle = registry.sqlite_handle("growth").unwrap();
+        std::fs::create_dir_all(handle.path.parent().unwrap()).unwrap();
+        let conn = storage::SqliteConnectionFactory::default()
+            .open_handle(handle)
+            .unwrap();
+        storage::MigrationRunner::run_sqlite_domain(
+            &conn,
+            handle,
+            &crate::services::growth_storage_migrations(),
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home,
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["storage"]["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "growth.v1.init"
+                && item["domain"] == "growth"
+                && item["status"] == "applied"
+                && item["version"] == 1));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]

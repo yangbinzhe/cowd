@@ -17,7 +17,7 @@ use memory::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use storage::{SqliteConnectionFactory, StorageRegistry};
+use storage::{MigrationRunner, SqliteConnectionFactory, StorageMigrationSpec, StorageRegistry};
 
 use super::{GrowthService, MatrixService, MemoryService};
 
@@ -441,27 +441,51 @@ fn open_growth_store(config_home: &Path) -> Result<Connection, String> {
     let conn = SqliteConnectionFactory::default()
         .open_handle(handle)
         .map_err(|error| error.to_string())?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS growth_events (
-            event_id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            source_event_kind TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS growth_promotions (
-            id TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL,
-            target TEXT NOT NULL,
-            status TEXT NOT NULL,
-            target_id TEXT,
-            summary TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );",
-    )
-    .map_err(|error| error.to_string())?;
+    let migration_reports =
+        MigrationRunner::run_sqlite_domain(&conn, handle, &growth_storage_migrations())
+            .map_err(|error| error.to_string())?;
+    if let Some(failed) = migration_reports
+        .iter()
+        .find(|report| report.status == "failed")
+    {
+        return Err(format!(
+            "growth storage migration {} failed: {}",
+            failed.id,
+            failed
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
     Ok(conn)
+}
+
+pub(crate) fn growth_storage_migrations() -> Vec<StorageMigrationSpec> {
+    vec![StorageMigrationSpec {
+        id: "growth.v1.init",
+        domain: "growth",
+        version: 1,
+        description: "initialize growth durable event and promotion schema",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS growth_events (
+                event_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                source_event_kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+            "CREATE TABLE IF NOT EXISTS growth_promotions (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                target_id TEXT,
+                summary TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        ],
+    }]
 }
 
 fn growth_fact_source(event: &GrowthEvent) -> FactSource {
@@ -508,19 +532,24 @@ async fn memory_promotion_decision(
     };
 
     let scope_key = memory_scope_key(&entry.scope);
-    let semantic_key = growth_memory_semantic_key(event, candidate);
-    let candidate_text = normalize_memory_text(&candidate.summary);
+    let slot_key = growth_memory_slot_key(event, candidate, &entry.scope);
+    let assertion_key = growth_memory_assertion_fingerprint(event, candidate);
+    let candidate_text =
+        normalize_memory_text(&format!("{} {}", candidate.summary, candidate.reason));
 
     for existing in existing_entries.iter().filter(|existing| {
         existing.source_agent.as_deref() == Some("growth-service")
             && memory_scope_key(&existing.scope) == scope_key
     }) {
         let existing_text = normalize_memory_text(&existing.content);
-        let same_text =
-            existing_text.contains(&candidate_text) || candidate_text.contains(&existing_text);
-        let same_semantic_key = existing.tags.iter().any(|tag| tag == &semantic_key);
+        let same_assertion = existing.tags.iter().any(|tag| tag == &assertion_key)
+            || legacy_same_text(&existing_text, &candidate_text);
+        let same_slot = existing.tags.iter().any(|tag| tag == &slot_key)
+            || legacy_slot_key(existing)
+                .as_ref()
+                .is_some_and(|legacy| legacy == &growth_memory_legacy_key(event, candidate));
 
-        if same_text {
+        if same_assertion {
             if existing.staleness >= STALE_REFRESH_THRESHOLD {
                 return MemoryPromotionDecision::Refresh {
                     existing_id: existing.id.to_string(),
@@ -531,11 +560,11 @@ async fn memory_promotion_decision(
             };
         }
 
-        if same_semantic_key {
+        if same_slot && deterministic_memory_contradiction(&existing_text, &candidate_text) {
             return MemoryPromotionDecision::Conflict {
                 existing_id: existing.id.to_string(),
                 reason: format!(
-                    "growth memory semantic key `{semantic_key}` already has a different assertion"
+                    "growth memory slot `{slot_key}` already has a contradictory assertion"
                 ),
             };
         }
@@ -555,12 +584,76 @@ fn merge_growth_tags(mut tags: Vec<String>) -> Vec<String> {
     tags
 }
 
-fn growth_memory_semantic_key(event: &GrowthEvent, candidate: &GrowthMemoryCandidate) -> String {
+fn growth_memory_governance_tags(
+    event: &GrowthEvent,
+    candidate: &GrowthMemoryCandidate,
+    scope: &MemoryScope,
+) -> Vec<String> {
+    vec![
+        "growth".to_string(),
+        growth_memory_slot_key(event, candidate, scope),
+        growth_memory_assertion_fingerprint(event, candidate),
+        event.source_event_kind.clone(),
+        format!("{:?}", candidate.kind).to_ascii_lowercase(),
+    ]
+}
+
+fn growth_memory_slot_key(
+    event: &GrowthEvent,
+    candidate: &GrowthMemoryCandidate,
+    scope: &MemoryScope,
+) -> String {
+    format!(
+        "growth-slot:{}:{}:{}:{}",
+        event.source_event_kind,
+        format!("{:?}", candidate.kind).to_ascii_lowercase(),
+        format!("{:?}", event.strategy_mode).to_ascii_lowercase(),
+        memory_scope_key(scope)
+    )
+}
+
+fn growth_memory_assertion_fingerprint(
+    event: &GrowthEvent,
+    candidate: &GrowthMemoryCandidate,
+) -> String {
+    let evidence = event
+        .evidence_refs
+        .iter()
+        .map(|reference| {
+            format!(
+                "{}:{}:{}",
+                normalize_memory_text(&reference.kind),
+                normalize_memory_text(&reference.reference),
+                normalize_memory_text(&reference.summary)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let basis = format!(
+        "{}|{}|{}|{}|{}",
+        normalize_memory_text(&candidate.summary),
+        normalize_memory_text(&candidate.reason),
+        normalize_memory_text(&event.source_event_kind),
+        format!("{:?}", candidate.kind).to_ascii_lowercase(),
+        evidence
+    );
+    format!("growth-assertion:{:016x}", stable_hash64(&basis))
+}
+
+fn growth_memory_legacy_key(event: &GrowthEvent, candidate: &GrowthMemoryCandidate) -> String {
     format!(
         "growth-key:{}:{}",
         event.source_event_kind,
         format!("{:?}", candidate.kind).to_ascii_lowercase()
     )
+}
+
+fn legacy_slot_key(entry: &MemoryEntry) -> Option<String> {
+    entry
+        .tags
+        .iter()
+        .find(|tag| tag.starts_with("growth-key:"))
+        .cloned()
 }
 
 fn memory_scope_key(scope: &MemoryScope) -> String {
@@ -570,6 +663,34 @@ fn memory_scope_key(scope: &MemoryScope) -> String {
         MemoryScope::Session(value) => format!("session:{value}"),
         MemoryScope::Agent(value) => format!("agent:{value}"),
     }
+}
+
+fn legacy_same_text(existing_text: &str, candidate_text: &str) -> bool {
+    existing_text.contains(candidate_text) || candidate_text.contains(existing_text)
+}
+
+fn deterministic_memory_contradiction(left: &str, right: &str) -> bool {
+    const PAIRS: [(&str, &str); 6] = [
+        ("should", "should not"),
+        ("required", "not required"),
+        ("allow", "deny"),
+        ("enabled", "disabled"),
+        ("auto", "manual"),
+        ("approval required", "approval not required"),
+    ];
+    PAIRS.iter().any(|(positive, negative)| {
+        (left.contains(positive) && right.contains(negative))
+            || (left.contains(negative) && right.contains(positive))
+    })
+}
+
+fn stable_hash64(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn normalize_memory_text(value: &str) -> String {
@@ -593,12 +714,11 @@ fn kernel_memory_candidate(
         evidence: vec![evidence_id.clone()],
         confidence: Confidence::from_basis_points(candidate.confidence_bp),
         boundary: HypothesisBoundary::observed(),
-        tags: vec![
-            "growth".to_string(),
-            growth_memory_semantic_key(event, candidate),
-            event.source_event_kind.clone(),
-            format!("{:?}", candidate.kind).to_ascii_lowercase(),
-        ],
+        tags: growth_memory_governance_tags(
+            event,
+            candidate,
+            &MemoryScope::Session(event.session_id.clone()),
+        ),
     }
 }
 
@@ -628,6 +748,7 @@ fn memory_entry_from_candidate(
     candidate: &GrowthMemoryCandidate,
 ) -> MemoryEntry {
     let now = Utc::now();
+    let scope = MemoryScope::Session(event.session_id.clone());
     MemoryEntry {
         id: uuid::Uuid::new_v4(),
         layer: MemoryLayer::L3,
@@ -644,11 +765,7 @@ fn memory_entry_from_candidate(
             candidate.summary, candidate.reason, event.source_event_kind, event.id
         ),
         embedding: None,
-        tags: vec![
-            "growth".to_string(),
-            event.source_event_kind.clone(),
-            format!("{:?}", candidate.kind).to_ascii_lowercase(),
-        ],
+        tags: growth_memory_governance_tags(event, candidate, &scope),
         relations: Vec::new(),
         confidence: f32::from(candidate.confidence_bp) / 10_000.0,
         access_count: 0,
@@ -656,7 +773,7 @@ fn memory_entry_from_candidate(
         created_at: now,
         updated_at: now,
         last_accessed_at: None,
-        scope: MemoryScope::Session(event.session_id.clone()),
+        scope,
         session_id: Some(event.session_id.clone()),
         source_agent: Some("growth-service".to_string()),
         visibility: AgentVisibility::Shared,
@@ -774,25 +891,27 @@ mod tests {
             )
             .expect("table count");
         assert_eq!(table_count, 2);
+        let migration_id: String = conn
+            .query_row(
+                "SELECT id FROM schema_migrations WHERE id = 'growth.v1.init'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("growth migration should be recorded");
+        assert_eq!(migration_id, "growth.v1.init");
         let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
     async fn memory_promotion_governance_suppresses_duplicate_growth_candidates() {
-        let config_home = std::env::temp_dir().join(format!(
-            "cowd-growth-memory-governance-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(config_home.join("storage")).expect("storage dir");
-        let manager = CognitiveContextManager::new(test_memory_config(
-            &config_home.join("storage").join("memory.sqlite"),
-        ))
-        .await
-        .expect("memory manager");
-        let memory = MemoryService::with_manager(Some(Arc::new(manager)));
-        let matrix = MatrixService::new();
-        let growth = GrowthService::new();
-        let event = sample_growth_event("growth-governance-session");
+        let (config_home, _manager, memory, matrix, growth) =
+            growth_memory_test_services("duplicate").await;
+        let event = single_candidate_event(
+            "growth-governance-session",
+            "approval required for risky tool execution",
+            "approval required because risk gate blocked automatic execution",
+            9_000,
+        );
 
         let first = growth
             .ingest_growth_event(&config_home, &memory, &matrix, event.clone())
@@ -801,13 +920,7 @@ mod tests {
             .promotions
             .iter()
             .any(|item| item.target == "memory.entry" && item.status == "promoted"));
-        let initial_growth_entries = memory
-            .list_all_entries()
-            .await
-            .expect("initial memory entries")
-            .iter()
-            .filter(|entry| entry.source_agent.as_deref() == Some("growth-service"))
-            .count();
+        let initial_growth_entries = growth_memory_entry_count(&memory).await;
         assert!(initial_growth_entries > 0);
 
         let second = growth
@@ -817,12 +930,218 @@ mod tests {
             .promotions
             .iter()
             .any(|item| item.target == "memory.entry" && item.status == "duplicate"));
-        let entries = memory.list_all_entries().await.expect("memory entries");
-        let growth_entries = entries
+        assert_eq!(
+            growth_memory_entry_count(&memory).await,
+            initial_growth_entries
+        );
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn memory_promotion_governance_holds_low_confidence_candidates() {
+        let (config_home, _manager, memory, matrix, growth) =
+            growth_memory_test_services("low-confidence").await;
+        let event = single_candidate_event(
+            "growth-low-confidence-session",
+            "weak signal should not enter long term memory",
+            "insufficient evidence",
+            6_999,
+        );
+
+        let receipt = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, event)
+            .await;
+        assert!(receipt.promotions.iter().any(|item| {
+            item.target == "memory.entry"
+                && item.status == "held"
+                && item.summary.contains("below threshold")
+        }));
+        assert_eq!(growth_memory_entry_count(&memory).await, 0);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn memory_promotion_governance_holds_conflicting_growth_assertions() {
+        let (config_home, _manager, memory, matrix, growth) =
+            growth_memory_test_services("conflict").await;
+        let first_event = single_candidate_event(
+            "growth-conflict-session",
+            "approval required for risky tool execution",
+            "approval required before high risk mutation",
+            9_000,
+        );
+        let second_event = single_candidate_event(
+            "growth-conflict-session",
+            "approval not required for risky tool execution",
+            "approval not required before high risk mutation",
+            9_000,
+        );
+
+        let first = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, first_event)
+            .await;
+        assert!(first
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "promoted"));
+        let initial_growth_entries = growth_memory_entry_count(&memory).await;
+
+        let second = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, second_event)
+            .await;
+        assert!(second
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "conflict_held"));
+        assert_eq!(
+            growth_memory_entry_count(&memory).await,
+            initial_growth_entries
+        );
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn memory_promotion_governance_allows_same_slot_non_conflicting_assertions() {
+        let (config_home, _manager, memory, matrix, growth) =
+            growth_memory_test_services("same-slot").await;
+        let first_event = single_candidate_event(
+            "growth-same-slot-session",
+            "architecture guard should run before gateway boundary changes",
+            "gateway boundary changes need architecture evidence",
+            9_000,
+        );
+        let second_event = single_candidate_event(
+            "growth-same-slot-session",
+            "targeted growth tests should run after memory governance changes",
+            "memory governance changes need targeted evidence",
+            9_000,
+        );
+
+        let first = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, first_event)
+            .await;
+        let second = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, second_event)
+            .await;
+        assert!(first
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "promoted"));
+        assert!(second
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "promoted"));
+        assert_eq!(growth_memory_entry_count(&memory).await, 2);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn memory_promotion_governance_refreshes_stale_duplicates() {
+        let (config_home, manager, memory, matrix, growth) =
+            growth_memory_test_services("refresh").await;
+        let event = single_candidate_event(
+            "growth-refresh-session",
+            "stale duplicate should refresh instead of duplicating",
+            "same assertion has become stale",
+            9_000,
+        );
+
+        let first = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, event.clone())
+            .await;
+        assert!(first
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "promoted"));
+        let mut entries = memory.list_all_entries().await.expect("memory entries");
+        let mut entry = entries
+            .iter_mut()
+            .find(|entry| entry.source_agent.as_deref() == Some("growth-service"))
+            .expect("growth memory entry")
+            .clone();
+        entry.staleness = 0.90;
+        manager
+            .orchestrator()
+            .update(&entry)
+            .await
+            .expect("stale entry update");
+        let initial_growth_entries = growth_memory_entry_count(&memory).await;
+
+        let second = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, event)
+            .await;
+        assert!(second
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "refreshed"));
+        assert_eq!(
+            growth_memory_entry_count(&memory).await,
+            initial_growth_entries
+        );
+        let refreshed = memory
+            .list_all_entries()
+            .await
+            .expect("refreshed memory entries")
+            .into_iter()
+            .find(|entry| entry.source_agent.as_deref() == Some("growth-service"))
+            .expect("refreshed growth memory entry");
+        assert!(refreshed.tags.iter().any(|tag| tag == "growth-refreshed"));
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    async fn growth_memory_test_services(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        Arc<CognitiveContextManager>,
+        MemoryService,
+        MatrixService,
+        GrowthService,
+    ) {
+        let config_home = std::env::temp_dir().join(format!(
+            "cowd-growth-memory-governance-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(config_home.join("storage")).expect("storage dir");
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(
+                &config_home.join("storage").join("memory.sqlite"),
+            ))
+            .await
+            .expect("memory manager"),
+        );
+        let memory = MemoryService::with_manager(Some(Arc::clone(&manager)));
+        let matrix = MatrixService::new();
+        let growth = GrowthService::new();
+        (config_home, manager, memory, matrix, growth)
+    }
+
+    fn single_candidate_event(
+        session_id: &str,
+        summary: &str,
+        reason: &str,
+        confidence_bp: u16,
+    ) -> GrowthEvent {
+        let mut event = sample_growth_event(session_id);
+        let mut candidate = event
+            .memory_candidates
+            .first()
+            .expect("sample event should create a memory candidate")
+            .clone();
+        candidate.summary = summary.to_string();
+        candidate.reason = reason.to_string();
+        candidate.confidence_bp = confidence_bp;
+        event.memory_candidates = vec![candidate];
+        event
+    }
+
+    async fn growth_memory_entry_count(memory: &MemoryService) -> usize {
+        memory
+            .list_all_entries()
+            .await
+            .expect("memory entries")
             .iter()
             .filter(|entry| entry.source_agent.as_deref() == Some("growth-service"))
-            .count();
-        assert_eq!(growth_entries, initial_growth_entries);
-        let _ = std::fs::remove_dir_all(config_home);
+            .count()
     }
 }

@@ -5,6 +5,7 @@ use storage::{
 
 use crate::api_routes::AppState;
 use crate::gateway_static::StaticWebUiSource;
+use crate::services::growth_storage_migrations;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayProcessSnapshot {
@@ -66,9 +67,11 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
     };
     let storage_registry = StorageRegistry::default_for_config_home(&state.config_home);
     let pragma = SqlitePragmaConfig::default();
+    let mut migrations = MigrationRunner::from_registry(&storage_registry).status();
+    migrations.extend(inspect_growth_migrations(&storage_registry));
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),
-        migrations: MigrationRunner::from_registry(&storage_registry).status(),
+        migrations,
         locks: storage_registry
             .handles
             .iter()
@@ -95,6 +98,58 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         static_webui,
         runtime,
         storage,
+    }
+}
+
+fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::StorageMigration> {
+    let Ok(handle) = registry.sqlite_handle("growth") else {
+        return Vec::new();
+    };
+    let specs = growth_storage_migrations();
+    if !handle.path.exists() {
+        return specs
+            .into_iter()
+            .map(|spec| storage::StorageMigration {
+                id: spec.id.to_string(),
+                domain: spec.domain.to_string(),
+                version: spec.version,
+                status: "pending".to_string(),
+                target: handle.path.clone(),
+                description: spec.description.to_string(),
+                error: None,
+            })
+            .collect();
+    }
+    match storage::SqliteConnectionFactory::default().open_handle(handle) {
+        Ok(connection) => {
+            match MigrationRunner::inspect_sqlite_domain(&connection, handle, &specs) {
+                Ok(reports) => reports,
+                Err(error) => specs
+                    .into_iter()
+                    .map(|spec| storage::StorageMigration {
+                        id: spec.id.to_string(),
+                        domain: spec.domain.to_string(),
+                        version: spec.version,
+                        status: "failed".to_string(),
+                        target: handle.path.clone(),
+                        description: spec.description.to_string(),
+                        error: Some(error.to_string()),
+                    })
+                    .collect(),
+            }
+        }
+        Err(error) => specs
+            .into_iter()
+            .map(|spec| storage::StorageMigration {
+                id: spec.id.to_string(),
+                domain: spec.domain.to_string(),
+                version: spec.version,
+                status: "failed".to_string(),
+                target: handle.path.clone(),
+                description: spec.description.to_string(),
+                error: Some(error.to_string()),
+            })
+            .collect(),
     }
 }
 

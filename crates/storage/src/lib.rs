@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 pub use sqlite::SqliteStorage;
 pub use sqlite::{SqliteConnectionFactory, SqlitePragmaConfig};
@@ -338,8 +339,11 @@ impl MigrationRunner {
                 .map(|handle| StorageMigration {
                     id: format!("storage.{}.layout", handle.domain),
                     domain: handle.domain.clone(),
+                    version: 0,
                     status: "registered".to_string(),
                     target: handle.path.clone(),
+                    description: handle.migration.clone(),
+                    error: None,
                 })
                 .collect(),
         }
@@ -348,14 +352,187 @@ impl MigrationRunner {
     pub fn status(&self) -> Vec<StorageMigration> {
         self.migrations.clone()
     }
+
+    pub fn run_sqlite_domain(
+        connection: &rusqlite::Connection,
+        handle: &StorageHandle,
+        specs: &[StorageMigrationSpec],
+    ) -> Result<Vec<StorageMigration>, StorageError> {
+        if handle.backend != StorageBackendKind::Sqlite {
+            return Err(StorageError::Other(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        ensure_schema_migrations_table(connection)?;
+        let mut reports = Vec::new();
+        for spec in specs {
+            if spec.domain != handle.domain {
+                return Err(StorageError::Other(format!(
+                    "migration `{}` targets `{}` but handle domain is `{}`",
+                    spec.id, spec.domain, handle.domain
+                )));
+            }
+            reports.push(run_migration_spec(connection, handle, spec)?);
+        }
+        Ok(reports)
+    }
+
+    pub fn inspect_sqlite_domain(
+        connection: &rusqlite::Connection,
+        handle: &StorageHandle,
+        specs: &[StorageMigrationSpec],
+    ) -> Result<Vec<StorageMigration>, StorageError> {
+        if handle.backend != StorageBackendKind::Sqlite {
+            return Err(StorageError::Other(format!(
+                "storage handle `{}` is not sqlite-backed",
+                handle.domain
+            )));
+        }
+        let schema_table_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        let mut reports = Vec::new();
+        for spec in specs {
+            if spec.domain != handle.domain {
+                return Err(StorageError::Other(format!(
+                    "migration `{}` targets `{}` but handle domain is `{}`",
+                    spec.id, spec.domain, handle.domain
+                )));
+            }
+            let applied = if schema_table_exists {
+                connection
+                    .query_row(
+                        "SELECT 1 FROM schema_migrations WHERE id = ?1",
+                        rusqlite::params![spec.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_some()
+            } else {
+                false
+            };
+            reports.push(StorageMigration {
+                id: spec.id.to_string(),
+                domain: spec.domain.to_string(),
+                version: spec.version,
+                status: if applied {
+                    "applied".to_string()
+                } else {
+                    "pending".to_string()
+                },
+                target: handle.path.clone(),
+                description: spec.description.to_string(),
+                error: None,
+            });
+        }
+        Ok(reports)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageMigration {
     pub id: String,
     pub domain: String,
+    pub version: i64,
     pub status: String,
     pub target: PathBuf,
+    pub description: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMigrationSpec {
+    pub id: &'static str,
+    pub domain: &'static str,
+    pub version: i64,
+    pub description: &'static str,
+    pub statements: &'static [&'static str],
+}
+
+fn ensure_schema_migrations_table(connection: &rusqlite::Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+fn run_migration_spec(
+    connection: &rusqlite::Connection,
+    handle: &StorageHandle,
+    spec: &StorageMigrationSpec,
+) -> Result<StorageMigration, StorageError> {
+    let already_applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE id = ?1",
+            rusqlite::params![spec.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if already_applied {
+        return Ok(StorageMigration {
+            id: spec.id.to_string(),
+            domain: spec.domain.to_string(),
+            version: spec.version,
+            status: "already_applied".to_string(),
+            target: handle.path.clone(),
+            description: spec.description.to_string(),
+            error: None,
+        });
+    }
+
+    for statement in spec.statements {
+        if let Err(error) = connection.execute_batch(statement) {
+            return Ok(StorageMigration {
+                id: spec.id.to_string(),
+                domain: spec.domain.to_string(),
+                version: spec.version,
+                status: "failed".to_string(),
+                target: handle.path.clone(),
+                description: spec.description.to_string(),
+                error: Some(error.to_string()),
+            });
+        }
+    }
+    connection.execute(
+        "INSERT INTO schema_migrations(id, domain, version, description, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            spec.id,
+            spec.domain,
+            spec.version,
+            spec.description,
+            applied_at_now()
+        ],
+    )?;
+    Ok(StorageMigration {
+        id: spec.id.to_string(),
+        domain: spec.domain.to_string(),
+        version: spec.version,
+        status: "applied".to_string(),
+        target: handle.path.clone(),
+        description: spec.description.to_string(),
+        error: None,
+    })
+}
+
+fn applied_at_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +694,105 @@ mod tests {
             .status()
             .iter()
             .any(|migration| migration.id == "storage.matrix.layout"));
+    }
+
+    #[test]
+    fn migration_runner_applies_and_records_sqlite_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle =
+            StorageHandle::sqlite("growth", dir.path().join("growth.sqlite"), "growth", "test");
+        let connection = SqliteConnectionFactory::default()
+            .open_handle(&handle)
+            .unwrap();
+        let specs = [StorageMigrationSpec {
+            id: "growth.v1.init",
+            domain: "growth",
+            version: 1,
+            description: "init growth schema",
+            statements: &["CREATE TABLE growth_events(event_id TEXT PRIMARY KEY);"],
+        }];
+        let reports = MigrationRunner::run_sqlite_domain(&connection, &handle, &specs).unwrap();
+        assert_eq!(reports[0].status, "applied");
+        let applied: String = connection
+            .query_row(
+                "SELECT id FROM schema_migrations WHERE id = 'growth.v1.init'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, "growth.v1.init");
+    }
+
+    #[test]
+    fn migration_runner_skips_already_applied_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle =
+            StorageHandle::sqlite("growth", dir.path().join("growth.sqlite"), "growth", "test");
+        let connection = SqliteConnectionFactory::default()
+            .open_handle(&handle)
+            .unwrap();
+        let specs = [StorageMigrationSpec {
+            id: "growth.v1.init",
+            domain: "growth",
+            version: 1,
+            description: "init growth schema",
+            statements: &["CREATE TABLE growth_events(event_id TEXT PRIMARY KEY);"],
+        }];
+        let first = MigrationRunner::run_sqlite_domain(&connection, &handle, &specs).unwrap();
+        let second = MigrationRunner::run_sqlite_domain(&connection, &handle, &specs).unwrap();
+        assert_eq!(first[0].status, "applied");
+        assert_eq!(second[0].status, "already_applied");
+    }
+
+    #[test]
+    fn migration_runner_reports_failed_migration_without_recording_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle =
+            StorageHandle::sqlite("growth", dir.path().join("growth.sqlite"), "growth", "test");
+        let connection = SqliteConnectionFactory::default()
+            .open_handle(&handle)
+            .unwrap();
+        let specs = [StorageMigrationSpec {
+            id: "growth.v1.bad",
+            domain: "growth",
+            version: 1,
+            description: "bad growth schema",
+            statements: &["CREATE TABLE broken ("],
+        }];
+        let reports = MigrationRunner::run_sqlite_domain(&connection, &handle, &specs).unwrap();
+        assert_eq!(reports[0].status, "failed");
+        assert!(reports[0].error.is_some());
+        let recorded = connection
+            .query_row(
+                "SELECT id FROM schema_migrations WHERE id = 'growth.v1.bad'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(recorded.is_none());
+    }
+
+    #[test]
+    fn migration_runner_inspects_pending_and_applied_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle =
+            StorageHandle::sqlite("growth", dir.path().join("growth.sqlite"), "growth", "test");
+        let connection = SqliteConnectionFactory::default()
+            .open_handle(&handle)
+            .unwrap();
+        let specs = [StorageMigrationSpec {
+            id: "growth.v1.init",
+            domain: "growth",
+            version: 1,
+            description: "init growth schema",
+            statements: &["CREATE TABLE growth_events(event_id TEXT PRIMARY KEY);"],
+        }];
+        let pending = MigrationRunner::inspect_sqlite_domain(&connection, &handle, &specs).unwrap();
+        assert_eq!(pending[0].status, "pending");
+        MigrationRunner::run_sqlite_domain(&connection, &handle, &specs).unwrap();
+        let applied = MigrationRunner::inspect_sqlite_domain(&connection, &handle, &specs).unwrap();
+        assert_eq!(applied[0].status, "applied");
     }
 
     #[test]
