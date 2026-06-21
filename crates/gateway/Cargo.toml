@@ -17,12 +17,12 @@ ai-task = { path = "../ai-task" }
 model-protocol = { path = "../model-protocol" }
 provider = { path = "../provider" }
 storage = { path = "../storage" }
+surface = { path = "../surface" }
 approval = { path = "../approval" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 channel = { path = "../channel" }
-channel-adapters = { path = "../channel-adapters" }
 slash-contract = { path = "../slash/contract" }
 slash-catalog = { path = "../slash/catalog" }
 connector = { path = "../connector" }
@@ -30,7 +30,6 @@ skill-service = { path = "../skill/service" }
 app-mfg = { path = "../app-mfg" }
 futures = "0.3"
 libc = "0.2"
-qrcode = "0.14"
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest.workspace = true
 runtime = { path = "../runtime" }

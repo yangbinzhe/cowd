@@ -15,7 +15,7 @@ impl GatewayServices {
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
-        channel_runtime: Option<Arc<channel_adapters::platform::PlatformRuntime>>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
@@ -25,9 +25,7 @@ impl GatewayServices {
         let lifecycle_kernel = runtime.lifecycle_kernel();
         Self {
             runtime: Some(runtime),
-            channel: channel_runtime
-                .map(ChannelService::with_runtime)
-                .unwrap_or_else(ChannelService::new),
+            surface: SurfaceService::with_host(surface_host),
             slash: SlashController::new(Some(command_host_runtime)),
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
             task: TaskService::with_kernel(task_kernel),
@@ -40,7 +38,7 @@ impl GatewayServices {
     pub(crate) fn baseline() -> Self {
         Self {
             runtime: None,
-            channel: ChannelService::new(),
+            surface: SurfaceService::new(),
             slash: SlashController::new(None),
             session: SessionService::new(),
             task: TaskService::new(),
@@ -59,7 +57,7 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.351 GatewayServices",
+            owner: "0.9.352 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -117,7 +115,7 @@ impl GatewayServices {
     pub(crate) fn service_labels(&self) -> Vec<&'static str> {
         vec![
             "runtime",
-            self.channel.label(),
+            self.surface.label(),
             self.slash.label(),
             self.session.label,
             self.task.label,

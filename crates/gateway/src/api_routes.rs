@@ -16,8 +16,6 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
-#[cfg(test)]
-use channel_adapters::platform::PlatformRuntime;
 use runtime::approval_gate::SmartApprovalGate;
 #[cfg(test)]
 use runtime::ApprovalConfig;
@@ -71,6 +69,7 @@ mod runtime_routes;
 mod session_routes;
 mod skill_routes;
 mod slash_routes;
+mod surface_routes;
 mod system_routes;
 mod task_routes;
 mod workspace_routes;
@@ -241,6 +240,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(session_routes::router())
         .merge(skill_routes::router())
         .merge(slash_routes::router())
+        .merge(surface_routes::router())
         .merge(system_routes::router())
         .merge(task_routes::router())
         .merge(workspace_routes::router())
@@ -424,11 +424,6 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use channel_adapters::platform::adapter::{
-        InboundMessage, OutboundMessage, PlatformAdapter, PlatformError, SendResult,
-    };
-    use channel_adapters::platform::config::PlatformRuntimeConfig;
-    use channel_adapters::platform::types::Platform;
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::{ContextProfile, ResumeContextSource};
@@ -524,7 +519,7 @@ mod tests {
     fn test_services(
         session_kernel: Arc<SessionKernel>,
         task_kernel: Arc<TaskKernel>,
-        platform_runtime: Option<Arc<PlatformRuntime>>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessions::new());
         let lifecycle_kernel =
@@ -545,170 +540,11 @@ mod tests {
         Arc::new(crate::services::GatewayServices::new(
             runtime,
             task_kernel,
-            platform_runtime,
+            surface_host.unwrap_or_else(|| Arc::new(crate::surface_host::SurfaceHost::default())),
             None,
             test_approval_gate(),
             approval_repository,
         ))
-    }
-
-    struct MockPlatformAdapter {
-        name: String,
-        connected: bool,
-        sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
-        media_sent: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl MockPlatformAdapter {
-        fn new(name: &str) -> Self {
-            Self {
-                name: name.to_string(),
-                connected: false,
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-            }
-        }
-
-        fn new_with_sent(name: &str, sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>) -> Self {
-            Self {
-                name: name.to_string(),
-                connected: false,
-                sent,
-                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-            }
-        }
-
-        fn new_with_media(name: &str, media_sent: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
-            Self {
-                name: name.to_string(),
-                connected: false,
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                media_sent,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl PlatformAdapter for MockPlatformAdapter {
-        fn platform(&self) -> Platform {
-            Platform::Custom(self.name.clone())
-        }
-
-        fn platform_name(&self) -> &str {
-            &self.name
-        }
-
-        async fn connect(&mut self) -> Result<(), PlatformError> {
-            self.connected = true;
-            Ok(())
-        }
-
-        async fn disconnect(&mut self) -> Result<(), PlatformError> {
-            self.connected = false;
-            Ok(())
-        }
-
-        fn is_connected(&self) -> bool {
-            self.connected
-        }
-
-        async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError> {
-            Ok(None)
-        }
-
-        async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError> {
-            self.sent.lock().unwrap().push(msg.clone());
-            Ok(SendResult::success(Some(format!(
-                "mock-{}",
-                msg.session_key.user_id
-            ))))
-        }
-
-        async fn send_image(
-            &self,
-            chat_id: &str,
-            image_url: &str,
-            caption: Option<&str>,
-        ) -> Result<(), PlatformError> {
-            self.media_sent.lock().unwrap().push(format!(
-                "image-url:{chat_id}:{image_url}:{}",
-                caption.unwrap_or("")
-            ));
-            Ok(())
-        }
-
-        async fn send_image_file(
-            &self,
-            chat_id: &str,
-            image_path: &str,
-            caption: Option<&str>,
-        ) -> Result<(), PlatformError> {
-            self.media_sent.lock().unwrap().push(format!(
-                "image-file:{chat_id}:{image_path}:{}",
-                caption.unwrap_or("")
-            ));
-            Ok(())
-        }
-
-        async fn send_document(
-            &self,
-            chat_id: &str,
-            file_path: &str,
-            file_name: Option<&str>,
-            caption: Option<&str>,
-        ) -> Result<(), PlatformError> {
-            self.media_sent.lock().unwrap().push(format!(
-                "file:{chat_id}:{file_path}:{}:{}",
-                file_name.unwrap_or(""),
-                caption.unwrap_or("")
-            ));
-            Ok(())
-        }
-    }
-
-    async fn test_platform_runtime_with_bound_adapter(name: &str) -> Arc<PlatformRuntime> {
-        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
-        runtime
-            .register_adapter(Box::new(MockPlatformAdapter::new(name)))
-            .await
-            .unwrap();
-        runtime.start().await.unwrap();
-        runtime
-    }
-
-    async fn test_platform_runtime_with_sent_adapter(
-        name: &str,
-    ) -> (
-        Arc<PlatformRuntime>,
-        Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
-    ) {
-        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        runtime
-            .register_adapter(Box::new(MockPlatformAdapter::new_with_sent(
-                name,
-                sent.clone(),
-            )))
-            .await
-            .unwrap();
-        runtime.start().await.unwrap();
-        (runtime, sent)
-    }
-
-    async fn test_platform_runtime_with_media_adapter(
-        name: &str,
-    ) -> (Arc<PlatformRuntime>, Arc<std::sync::Mutex<Vec<String>>>) {
-        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
-        let media_sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        runtime
-            .register_adapter(Box::new(MockPlatformAdapter::new_with_media(
-                name,
-                media_sent.clone(),
-            )))
-            .await
-            .unwrap();
-        runtime.start().await.unwrap();
-        (runtime, media_sent)
     }
 
     fn test_state() -> Arc<AppState> {
@@ -763,18 +599,18 @@ mod tests {
 
     fn test_state_with_config_and_runtime(
         config: serde_json::Value,
-        platform_runtime: Option<Arc<PlatformRuntime>>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<AppState> {
         test_state_with_config_runtime_and_workspace(
             config,
-            platform_runtime,
+            surface_host,
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
     }
 
     fn test_state_with_config_runtime_and_workspace(
         config: serde_json::Value,
-        platform_runtime: Option<Arc<PlatformRuntime>>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
@@ -793,7 +629,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, platform_runtime),
+            services: test_services(session_kernel, task_kernel, surface_host),
             session_lease_registry: None,
         })
     }
@@ -7625,8 +7461,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn cross_plane_adapter_registry_and_preflight_use_bound_runtime_snapshot() {
-        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+    async fn cross_plane_preflight_builds_surface_dispatch_target_plan() {
         let app = api_router(test_state_with_config_and_runtime(
             serde_json::json!({
                 "gateway": {
@@ -7638,142 +7473,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
-        ));
-        let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:bound-runtime-{suffix}");
-        let capability = format!("channel.feishu.send_text.{suffix}");
-        let grant = serde_json::json!({
-            "id": format!("grant-bound-runtime-{suffix}"),
-            "principal_id": principal,
-            "capability": capability,
-            "account_id": null,
-            "target_ref": null,
-            "resource_ref": null,
-            "source_channel": null,
-            "grant_type": "persistent",
-            "expires_at": null,
-            "remaining_uses": null,
-            "created_by": "test",
-            "approval_id": null
-        });
-
-        let grant_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/cross-plane/grants")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(grant.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(grant_response.status(), StatusCode::OK);
-
-        let adapters = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/cross-plane/action/adapters")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let adapters_body = to_bytes(adapters.into_body(), usize::MAX).await.unwrap();
-        let adapters_json: serde_json::Value = serde_json::from_slice(&adapters_body).unwrap();
-        assert!(adapters_json["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| {
-                item["platform"] == "feishu"
-                    && item["operation"] == "send_text"
-                    && item["adapter_bound"] == true
-            }));
-
-        let action = serde_json::json!({
-            "actor_principal": principal,
-            "actor_identity_ref": null,
-            "source_channel": "channel://wechat/chat/test",
-            "session_id": "test-session",
-            "requested_capability": capability,
-            "provider_account": "mock-docs-main",
-            "target_ref": null,
-            "resource_ref": null,
-            "risk": "high",
-            "data_classification": "internal",
-            "identity_trust": "verified"
-        });
-        let preflight = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/cross-plane/action/preflight")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(action.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
-        let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
-        assert_eq!(preflight_json["adapter_capability"]["adapter_bound"], true);
-        assert_eq!(preflight_json["dispatch_target"]["ready"], false);
-        assert!(preflight_json["dispatch_target"]["blockers"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("dispatch:target_ref_missing")));
-
-        let execute = serde_json::json!({
-            "mode": "commit",
-            "idempotency_key": format!("idem-bound-runtime-{suffix}"),
-            "action": action
-        });
-        let executed = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/cross-plane/action/execute")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(execute.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
-        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
-        assert_eq!(
-            executed_json["dispatch_status"],
-            "dispatch_target_not_ready"
-        );
-        assert_eq!(executed_json["adapter_capability"]["adapter_bound"], true);
-        assert!(executed_json["blockers"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("dispatch:target_ref_missing")));
-
-        platform_runtime.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cross_plane_preflight_builds_dispatch_target_plan() {
-        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
-        let app = api_router(test_state_with_config_and_runtime(
-            serde_json::json!({
-                "gateway": {
-                    "platforms": [{
-                        "platformType": "feishu",
-                        "enabled": true,
-                        "app_id": "app-id",
-                        "app_secret": "app-secret"
-                    }]
-                }
-            }),
-            Some(platform_runtime.clone()),
+            None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:dispatch-target-{suffix}");
@@ -7848,13 +7548,10 @@ providers:
             json["dispatch_target"]["outbound_message"]["metadata"]["requested_capability"],
             capability
         );
-
-        platform_runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn cross_plane_execute_persists_dispatch_target_snapshot() {
-        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+    async fn cross_plane_execute_persists_surface_dispatch_target_snapshot() {
         let app = api_router(test_state_with_config_and_runtime(
             serde_json::json!({
                 "gateway": {
@@ -7866,7 +7563,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
+            None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:dispatch-receipt-{suffix}");
@@ -7956,13 +7653,10 @@ providers:
             .unwrap()
             .iter()
             .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat"));
-
-        platform_runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn cross_plane_execute_commit_dispatches_ready_text_target() {
-        let (platform_runtime, sent) = test_platform_runtime_with_sent_adapter("feishu").await;
+    async fn cross_plane_execute_commit_reports_surface_unavailable_without_sidecar() {
         let app = api_router(test_state_with_config_and_runtime(
             serde_json::json!({
                 "gateway": {
@@ -7974,7 +7668,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
+            None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:dispatch-live-{suffix}");
@@ -8039,40 +7733,21 @@ providers:
         let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
-        assert_eq!(executed_json["status"], "dispatched");
-        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(executed_json["status"], "blocked");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(executed_json["dispatched"], true);
-        assert_eq!(
-            executed_json["execution_receipt"]["dispatch_status"],
-            "sent"
-        );
-        assert_eq!(
-            executed_json["execution_receipt"]["dispatch_target"]["session_key"],
-            "feishu:live-chat"
-        );
-        assert_eq!(executed_json["dispatch_outcome"]["status"], "sent");
-        assert_eq!(
-            executed_json["dispatch_outcome"]["provider_message_id"],
-            "mock-live-chat"
-        );
-        assert_eq!(
-            executed_json["execution_receipt"]["dispatch_outcome"]["session_key"],
-            "feishu:live-chat"
-        );
-
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].session_key.as_str(), "feishu:live-chat");
-        assert_eq!(sent[0].text, "live payload");
-        drop(sent);
-
-        platform_runtime.shutdown().await.unwrap();
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap_or_default()
+                .contains("surface_unavailable")));
     }
 
     #[tokio::test]
-    async fn cross_plane_execute_commit_dispatches_ready_image_target() {
-        let (platform_runtime, media_sent) =
-            test_platform_runtime_with_media_adapter("feishu").await;
+    async fn cross_plane_execute_commit_resolves_image_target_but_requires_surface_sidecar() {
         let app = api_router(test_state_with_config_and_runtime(
             serde_json::json!({
                 "gateway": {
@@ -8084,7 +7759,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
+            None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:dispatch-image-{suffix}");
@@ -8149,33 +7824,23 @@ providers:
         let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
-        assert_eq!(executed_json["status"], "dispatched");
-        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(executed_json["status"], "blocked");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
             "image"
         );
-        assert_eq!(executed_json["dispatch_outcome"]["operation"], "send_image");
-        let media_sent = media_sent.lock().unwrap();
-        assert_eq!(
-            media_sent.as_slice(),
-            ["image-url:live-chat:https://example.test/panel.png:"]
-        );
-        drop(media_sent);
-
-        platform_runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn cross_plane_execute_commit_dispatches_workspace_file_target() {
+    async fn cross_plane_execute_commit_resolves_workspace_file_target_but_requires_surface_sidecar(
+    ) {
         let root = test_temp_dir("cross-plane-file-dispatch");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(workspace.join("reports")).unwrap();
         let report_path = workspace.join("reports").join("panel.txt");
         std::fs::write(&report_path, "dispatchable report").unwrap();
-        let (platform_runtime, media_sent) =
-            test_platform_runtime_with_media_adapter("feishu").await;
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({
                 "gateway": {
@@ -8187,7 +7852,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
+            None,
             workspace.clone(),
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
@@ -8253,24 +7918,19 @@ providers:
         let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
-        assert_eq!(executed_json["status"], "dispatched");
-        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(executed_json["status"], "blocked");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
             "file"
         );
-        let media_sent = media_sent.lock().unwrap();
         assert_eq!(
-            media_sent.as_slice(),
-            [format!(
-                "file:live-chat:{}:panel.txt:",
-                report_path.canonicalize().unwrap().display()
-            )]
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
+                ["payload_ref"],
+            report_path.canonicalize().unwrap().display().to_string()
         );
-        drop(media_sent);
 
-        platform_runtime.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8281,8 +7941,6 @@ providers:
         let outside = root.join("outside.txt");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(&outside, "must not send").unwrap();
-        let (platform_runtime, media_sent) =
-            test_platform_runtime_with_media_adapter("feishu").await;
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({
                 "gateway": {
@@ -8294,7 +7952,7 @@ providers:
                     }]
                 }
             }),
-            Some(platform_runtime.clone()),
+            None,
             workspace,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
@@ -8370,9 +8028,6 @@ providers:
                 .as_str()
                 .unwrap_or_default()
                 .contains("workspace_payload_outside_root")));
-        assert!(media_sent.lock().unwrap().is_empty());
-
-        platform_runtime.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 

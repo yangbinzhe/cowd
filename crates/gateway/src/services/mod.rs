@@ -11,7 +11,6 @@ use memory::CognitiveContextManager;
 
 mod agent_service;
 mod approval_service;
-mod channel_service;
 mod connector_service;
 mod context;
 mod context_service;
@@ -27,13 +26,13 @@ mod registry;
 mod session_service;
 mod skill_service;
 mod slash_controller;
+mod surface_service;
 mod system_service;
 mod task_service;
 mod workspace_service;
 
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
-pub(crate) use channel_service::ChannelService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use growth_service::growth_storage_migrations;
@@ -49,6 +48,7 @@ pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
 pub(crate) use slash_controller::SlashController;
+pub(crate) use surface_service::SurfaceService;
 pub(crate) use task_service::TaskService;
 
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
@@ -219,7 +219,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.351 Provider service boundary",
+            owner: "0.9.352 Provider service boundary",
         }
     }
 
@@ -306,7 +306,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.351 Growth service boundary",
+            owner: "0.9.352 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -440,7 +440,7 @@ impl AgentService {
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
-    pub(crate) channel: ChannelService,
+    pub(crate) surface: SurfaceService,
     pub(crate) slash: SlashController,
     pub(crate) session: SessionService,
     pub(crate) task: TaskService,
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.351 GatewayServices");
+        assert_eq!(services.owner, "0.9.352 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

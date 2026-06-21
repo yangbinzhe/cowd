@@ -1,7 +1,7 @@
 // ── Gateway RuntimeHost ────────────────────────────────────
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
-//   - Platform adapters (feishu, wechat_ilink, email)
+//   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
 use std::collections::BTreeMap;
@@ -23,16 +23,12 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
-use channel_adapters::mirror::MessageMirror;
-use channel_adapters::platform::config::PlatformRuntimeConfig;
-use channel_adapters::platform::{
-    InboundMessage, OutboundMessage, PlatformConfig, PlatformRuntime,
-};
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
-use runtime::{ContentBlock, ConversationMessage, McpServerManager, RuntimeConfig};
+use runtime::{McpServerManager, RuntimeConfig};
+use surface::SurfaceManifest;
 use tools::GlobalToolRegistry;
 
 use runtime::session_lifecycle::{
@@ -295,19 +291,18 @@ fn spawn_session_cleanup_task(
 pub struct RuntimeHostConfig {
     pub http_addr: String,
     pub memory_config: Option<MemoryConfig>,
-    pub platform_configs: Vec<PlatformConfig>,
+    pub surface_configs: Vec<SurfaceManifest>,
     pub runtime_config: Option<serde_json::Value>,
     pub webui_dir: Option<PathBuf>,
     pub cors_origins: Vec<String>,
     pub auth_token: Option<String>,
-    pub message_mirror: Option<Arc<MessageMirror>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct PlatformStartupDiagnostic {
-    platform_type: String,
-    enabled: bool,
-    setting_keys: Vec<String>,
+struct SurfaceStartupDiagnostic {
+    surface_id: String,
+    kind: String,
+    capability_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -324,10 +319,8 @@ struct StartupDiagnostics {
     runtime_config_loaded: bool,
     auth_required: bool,
     cors_origin_count: usize,
-    platform_count: usize,
-    enabled_platform_count: usize,
-    platforms: Vec<PlatformStartupDiagnostic>,
-    message_mirror_configured: bool,
+    surface_count: usize,
+    surfaces: Vec<SurfaceStartupDiagnostic>,
 }
 
 fn build_startup_diagnostics(
@@ -338,20 +331,15 @@ fn build_startup_diagnostics(
     memory_available: bool,
     unified_store_available: bool,
 ) -> StartupDiagnostics {
-    let platforms: Vec<PlatformStartupDiagnostic> = config
-        .platform_configs
+    let surfaces: Vec<SurfaceStartupDiagnostic> = config
+        .surface_configs
         .iter()
-        .map(|platform| {
-            let mut setting_keys = platform.settings.keys().cloned().collect::<Vec<_>>();
-            setting_keys.sort();
-            PlatformStartupDiagnostic {
-                platform_type: platform.platform_type.clone(),
-                enabled: platform.enabled,
-                setting_keys,
-            }
+        .map(|surface| SurfaceStartupDiagnostic {
+            surface_id: surface.id.clone(),
+            kind: format!("{:?}", surface.kind),
+            capability_count: surface.capabilities.len(),
         })
         .collect();
-    let enabled_platform_count = platforms.iter().filter(|platform| platform.enabled).count();
 
     StartupDiagnostics {
         http_addr: config.http_addr.clone(),
@@ -369,10 +357,8 @@ fn build_startup_diagnostics(
         runtime_config_loaded: config.runtime_config.is_some(),
         auth_required: config.auth_token.is_some(),
         cors_origin_count: config.cors_origins.len(),
-        platform_count: platforms.len(),
-        enabled_platform_count,
-        platforms,
-        message_mirror_configured: config.message_mirror.is_some(),
+        surface_count: surfaces.len(),
+        surfaces,
     }
 }
 
@@ -390,9 +376,7 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
         runtime_config_loaded = diagnostics.runtime_config_loaded,
         auth_required = diagnostics.auth_required,
         cors_origin_count = diagnostics.cors_origin_count,
-        platform_count = diagnostics.platform_count,
-        enabled_platform_count = diagnostics.enabled_platform_count,
-        message_mirror_configured = diagnostics.message_mirror_configured,
+        surface_count = diagnostics.surface_count,
         "runtime host startup diagnostics"
     );
 }
@@ -422,240 +406,6 @@ async fn webui_not_configured_handler() -> impl IntoResponse {
             "message": "WebUI static assets are optional; configure gateway.webui_dir with a directory containing index.html to enable browser UI.",
         })),
     )
-}
-
-fn spawn_platform_inbound_loop(
-    platform_runtime: Arc<PlatformRuntime>,
-    app_state: Arc<api_routes::AppState>,
-) {
-    tokio::task::spawn_blocking(move || {
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(async move {
-            tracing::info!("platform inbound loop started");
-            loop {
-                match platform_runtime.next_message().await {
-                    Ok(Some(message)) => {
-                        if let Err(error) = handle_platform_inbound_message(
-                            platform_runtime.clone(),
-                            app_state.clone(),
-                            message,
-                        )
-                        .await
-                        {
-                            tracing::warn!(error = %error, "platform inbound message handling failed");
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::warn!("platform inbound message channel closed");
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "platform inbound receive failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
-    });
-}
-
-async fn handle_platform_inbound_message(
-    platform_runtime: Arc<PlatformRuntime>,
-    app_state: Arc<api_routes::AppState>,
-    message: InboundMessage,
-) -> Result<(), String> {
-    let session_id = platform_session_id(&message);
-    ensure_platform_session_runtime(&app_state, &session_id).await?;
-    let runtime_service = app_state
-        .services
-        .runtime
-        .as_ref()
-        .ok_or_else(|| "runtime service unavailable for platform inbound".to_string())?;
-
-    tracing::info!(
-        platform = %message.session_key.platform,
-        user = %message.session_key.user_id,
-        session_id = %session_id,
-        text_len = message.text.len(),
-        "platform inbound message received"
-    );
-
-    let execution = runtime_service
-        .run_turn_with_timeout(
-            &session_id,
-            None,
-            message.text.clone(),
-            Duration::from_secs(300),
-        )
-        .await
-        .map_err(|error| format!("runtime turn failed: {}", error.message()))?;
-    let summary = execution.summary;
-    let turn_id = execution.receipt.turn_id.to_string();
-    let reply = assistant_reply_text(&summary.assistant_messages)
-        .unwrap_or_else(|| "我已收到，但这次没有生成可发送的文本回复。".to_string());
-
-    let outbound = OutboundMessage {
-        session_key: message.session_key.clone(),
-        text: reply,
-        reply_to: message.message_id.clone(),
-        metadata: serde_json::json!({
-            "source": "cowd.platform_inbound_loop",
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "inbound_message_id": message.message_id,
-        }),
-    };
-    platform_runtime
-        .send_response(&message.session_key.platform, outbound)
-        .await
-        .map_err(|error| format!("send response failed: {error}"))?;
-
-    if let (Some(store), Some(session)) = (
-        app_state.services.session.unified_store(),
-        runtime_service.session_snapshot(&session_id).await,
-    ) {
-        if let Err(error) = crate::api_routes::sync_runtime_session_metadata_to_store(
-            store.as_ref(),
-            &session_id,
-            &session,
-        )
-        .await
-        {
-            tracing::warn!(%session_id, error = %error, "failed to sync platform session metadata");
-        }
-    }
-
-    Ok(())
-}
-
-async fn ensure_platform_session_runtime(
-    app_state: &api_routes::AppState,
-    session_id: &str,
-) -> Result<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>, String> {
-    if let Some(entry) = app_state.services.session.active_runtime(session_id) {
-        return Ok(entry);
-    }
-
-    let model = default_platform_session_model(app_state);
-    let session = runtime::Session::new();
-    let runtime = if let Some(store) = app_state.services.session.unified_store() {
-        crate::build_runtime_with_session_store(
-            store.clone(),
-            session,
-            session_id,
-            model.clone(),
-            vec![],
-            true,
-            false,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::build_runtime(
-            session,
-            session_id,
-            model.clone(),
-            vec![],
-            true,
-            false,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    }
-    .map_err(|error| format!("failed to build platform session runtime: {error}"))?;
-
-    app_state
-        .services
-        .session
-        .register_runtime(session_id.to_string(), runtime)
-        .map_err(|error| format!("failed to register platform session runtime: {error}"))?;
-
-    if app_state.services.session.unified_store().is_some() {
-        let mut record = crate::api_routes::new_api_session_record(session_id, Some(model));
-        record.platform = "platform".to_string();
-        record.chat_id = session_id.to_string();
-        record.metadata_json = Some(
-            serde_json::json!({
-                "title": format!("WeChat {}", session_id.chars().rev().take(8).collect::<String>().chars().rev().collect::<String>()),
-                "source": "platform_inbound",
-            })
-            .to_string(),
-        );
-        if let Err(error) = app_state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-        {
-            tracing::warn!(%session_id, error = %error, "failed to persist platform session");
-        }
-    }
-
-    app_state
-        .services
-        .session
-        .active_runtime(session_id)
-        .ok_or_else(|| "registered platform runtime missing".to_string())
-}
-
-fn default_platform_session_model(app_state: &api_routes::AppState) -> String {
-    app_state
-        .config
-        .as_ref()
-        .and_then(|config| config.get("model"))
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
-}
-
-fn platform_session_id(message: &InboundMessage) -> String {
-    let thread = message
-        .session_key
-        .thread_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(&message.session_key.user_id);
-    format!(
-        "channel-{}-{}",
-        safe_session_component(&message.session_key.platform),
-        safe_session_component(thread)
-    )
-}
-
-fn safe_session_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "unknown".to_string()
-    } else {
-        trimmed.chars().take(96).collect()
-    }
-}
-
-fn assistant_reply_text(messages: &[ConversationMessage]) -> Option<String> {
-    let text = messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn build_cors_layer(explicit_origins: Vec<HeaderValue>) -> CorsLayer {
@@ -835,7 +585,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     emit_startup_diagnostics(&startup_diagnostics);
 
-    let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+    let surface_host = Arc::new(crate::surface_host::SurfaceHost::default_for(&approval_dir));
+    let surface_discovery = surface_host.discover();
+    tracing::info!(
+        discovered = surface_discovery.discovered,
+        failures = surface_discovery.failures.len(),
+        roots = ?surface_discovery.roots,
+        "surface host discovery completed"
+    );
     let services = Arc::new(crate::services::GatewayServices::new(
         Arc::new(RuntimeService::new(
             sessions.clone(),
@@ -845,7 +602,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             started_at,
         )),
         task_kernel.clone(),
-        Some(platform_runtime.clone()),
+        surface_host.clone(),
         cognitive.clone(),
         approval_gate.clone(),
         approval_repository,
@@ -918,105 +675,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         tracing::warn!("failed to write addr file: {e}");
     }
 
-    // 4. Platform adapters via PlatformRuntime
-
-    // Initialise the message mirror with default rules from runtime host config
-    if let Some(mirror) = config.message_mirror {
-        platform_runtime.set_mirror(mirror).await;
-    } else {
-        let default_mirror = Arc::new(MessageMirror::new());
-        platform_runtime.set_mirror(default_mirror).await;
-    }
-
-    for pc in &config.platform_configs {
-        if !pc.enabled {
-            continue;
-        }
-        let mut settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
-        match pc.platform_type.as_str() {
-            "feishu" | "lark" => {
-                // Auto-inject base_url for Lark (international) — defaults to open.larksuite.com
-                if pc.platform_type == "lark" {
-                    if let Some(obj) = settings_json.as_object_mut() {
-                        if !obj.contains_key("base_url") {
-                            obj.insert(
-                                "base_url".to_string(),
-                                serde_json::Value::String("https://open.larksuite.com".to_string()),
-                            );
-                        }
-                    }
-                }
-                match channel_adapters::platform::feishu::create_feishu_adapter(&settings_json) {
-                    Ok(adapter) => {
-                        let app_id = pc
-                            .settings
-                            .get("app_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
-                        tracing::info!("feishu adapter created for app_id={app_id}");
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register feishu adapter: {e}");
-                        }
-                    }
-                    Err(e) => tracing::error!("failed to create feishu adapter: {e}"),
-                }
-            }
-            "wechat_ilink" | "wechat" => {
-                tracing::info!(
-                    "wechat_ilink: creating adapter from settings keys=[{}]",
-                    settings_json
-                        .as_object()
-                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
-                        .unwrap_or_default()
-                );
-                match channel_adapters::platform::wechat_ilink::create_wechat_ilink_adapter(
-                    &settings_json,
-                ) {
-                    Ok(adapter) => {
-                        tracing::info!("wechat_ilink adapter created successfully");
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register wechat_ilink adapter: {e}");
-                        }
-                    }
-                    Err(e) => tracing::error!("failed to create wechat_ilink adapter: {e}"),
-                }
-            }
-            "email" | "mail" => {
-                match channel_adapters::platform::email::create_email_adapter(&settings_json) {
-                    Ok(adapter) => {
-                        tracing::info!("email adapter created");
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register email adapter: {e}");
-                        }
-                    }
-                    Err(e) => tracing::error!("failed to create email adapter: {e}"),
-                }
-            }
-            "wecom" => {
-                match channel_adapters::platform::wecom::create_wecom_adapter(&settings_json) {
-                    Ok(adapter) => {
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register wecom adapter: {e}");
-                        } else {
-                            tracing::info!("wecom adapter created and registered");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("wecom adapter init failed: {e}");
-                    }
-                }
-            }
-            other => {
-                tracing::warn!("unknown platform type: {other}");
-            }
-        }
-    }
-
-    // Start the platform runtime (connects all registered adapters and spawns loops)
-    if let Err(e) = platform_runtime.start().await {
-        tracing::error!("failed to start platform runtime: {e}");
-    }
-    spawn_platform_inbound_loop(platform_runtime.clone(), app_state.clone());
+    // 4. Surface sidecars are discovered and represented in SurfaceHost. External
+    // sidecar process launch is driven by surface requests, not by runtime boot.
 
     // 5. HTTP server with graceful shutdown on SIGINT/SIGTERM
     let shutdown_signal = async {
@@ -1050,9 +710,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");
 
-    // Shutdown platform adapters
-    let _ = platform_runtime.shutdown().await;
-    tracing::info!("platform runtime shut down");
+    tracing::info!("surface host shutdown complete");
 
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("runtime host shutdown complete");
@@ -1087,16 +745,15 @@ mod tests {
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
             memory_config: None,
-            platform_configs: vec![],
+            surface_configs: vec![],
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
-            message_mirror: None,
         };
         assert_eq!(config.http_addr, "0.0.0.0:8642");
         assert!(config.memory_config.is_none());
-        assert!(config.platform_configs.is_empty());
+        assert!(config.surface_configs.is_empty());
         assert!(config.auth_token.is_none());
     }
 
@@ -1158,12 +815,11 @@ mod tests {
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9000".into(),
             memory_config: None,
-            platform_configs: vec![],
+            surface_configs: vec![],
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("secret-token".into()),
-            message_mirror: None,
         };
         assert_eq!(config.http_addr, "127.0.0.1:9000");
         assert_eq!(config.auth_token.as_deref(), Some("secret-token"));
@@ -1176,12 +832,11 @@ mod tests {
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
             memory_config: Some(mem_cfg),
-            platform_configs: vec![],
+            surface_configs: vec![],
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
-            message_mirror: None,
         };
         assert!(config.memory_config.is_some());
     }
@@ -1217,69 +872,31 @@ mod tests {
     }
 
     #[test]
-    fn platform_session_id_is_stable_and_safe() {
-        let message = InboundMessage {
-            platform: channel_adapters::platform::Platform::WeChat,
-            session_key: channel_adapters::platform::SessionKey::new(
-                "wechat_ilink",
-                "o9cq8003hLBXjG9UUzafDuDSS1hM@im.wechat",
-            ),
-            text: "hello".to_string(),
-            sender_name: None,
-            timestamp: chrono::Utc::now(),
-            metadata: serde_json::json!({}),
-            message_type: channel_adapters::platform::MessageType::Text,
-            message_id: Some("msg-1".to_string()),
-            reply_to_message_id: None,
-            media_urls: vec![],
-            media_types: vec![],
-        };
-
-        assert_eq!(
-            platform_session_id(&message),
-            "channel-wechat_ilink-o9cq8003hLBXjG9UUzafDuDSS1hM_im_wechat"
-        );
-    }
-
-    #[test]
-    fn assistant_reply_text_merges_text_blocks_only() {
-        let messages = vec![ConversationMessage::assistant(vec![
-            ContentBlock::Thinking {
-                thinking: "hidden".to_string(),
-                signature: None,
-            },
-            ContentBlock::Text {
-                text: "hello".to_string(),
-            },
-            ContentBlock::Text {
-                text: " world".to_string(),
-            },
-        ])];
-
-        assert_eq!(
-            assistant_reply_text(&messages).as_deref(),
-            Some("hello world")
-        );
-    }
-
-    #[test]
     fn startup_diagnostics_expose_capability_state_without_secret_values() {
         let webui_dir = temp_webui_dir("diagnostics");
         fs::write(webui_dir.join("index.html"), "<!doctype html>").expect("write index");
         let workspace = std::env::temp_dir().join("cowd-diagnostics-workspace");
         let config_home = std::env::temp_dir().join("cowd-diagnostics-config");
-        let platform = PlatformConfig::new("feishu")
-            .with_setting("app_id", "cli_test_app")
-            .with_setting("app_secret", "do-not-log-this-secret");
+        let surface = SurfaceManifest {
+            schema: surface::SURFACE_PROTOCOL.to_string(),
+            id: "feishu".to_string(),
+            name: "Feishu Surface".to_string(),
+            version: "0.1.0".to_string(),
+            kind: surface::SurfaceKind::ExternalIntegration,
+            entry: Some("./cowd-surface-feishu".to_string()),
+            transport: surface::SurfaceTransport::StdioJsonl,
+            capabilities: vec!["ingress".to_string(), "delivery".to_string()],
+            config_schema: serde_json::json!({"required": ["app_id", "app_secret"]}),
+            default_enabled: true,
+        };
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9864".into(),
             memory_config: Some(MemoryConfig::default()),
-            platform_configs: vec![platform],
+            surface_configs: vec![surface],
             runtime_config: Some(serde_json::json!({"model": "test-model"})),
             webui_dir: Some(webui_dir.clone()),
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("do-not-log-this-token".into()),
-            message_mirror: None,
         };
 
         let static_webui =
@@ -1295,13 +912,9 @@ mod tests {
         assert!(diagnostics.unified_store_available);
         assert!(diagnostics.runtime_config_loaded);
         assert!(diagnostics.auth_required);
-        assert_eq!(diagnostics.platform_count, 1);
-        assert_eq!(diagnostics.enabled_platform_count, 1);
-        assert_eq!(diagnostics.platforms[0].platform_type, "feishu");
-        assert_eq!(
-            diagnostics.platforms[0].setting_keys,
-            vec!["app_id".to_string(), "app_secret".to_string()]
-        );
+        assert_eq!(diagnostics.surface_count, 1);
+        assert_eq!(diagnostics.surfaces[0].surface_id, "feishu");
+        assert_eq!(diagnostics.surfaces[0].capability_count, 2);
         assert!(!serialized.contains("do-not-log-this-secret"));
         assert!(!serialized.contains("do-not-log-this-token"));
 

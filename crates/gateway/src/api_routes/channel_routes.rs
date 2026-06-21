@@ -10,6 +10,7 @@ use axum::{
 use channel::{channel_required_fields, ChannelContract};
 use serde::Deserialize;
 use serde::Serialize;
+use surface::SurfaceActionRequest;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -237,90 +238,52 @@ fn has_non_empty(value: &serde_json::Value, field: &str) -> bool {
         .unwrap_or_else(|| value.get(field).is_some_and(|value| !value.is_null()))
 }
 
-fn qr_svg(scan_data: &str) -> Option<String> {
-    qrcode::QrCode::new(scan_data.as_bytes()).ok().map(|code| {
-        code.render::<qrcode::render::svg::Color>()
-            .min_dimensions(220, 220)
-            .quiet_zone(true)
-            .build()
-    })
-}
-
 async fn wechat_ilink_accounts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let runtime_bound = state
-        .services
-        .channel
-        .has_bound_adapter("wechat_ilink")
-        .await;
-    let bound_adapters = state.services.channel.list_bound_adapters().await;
-    let accounts = channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|account| {
-            serde_json::json!({
-                "account_id": account.account_id,
-                "base_url": account.base_url,
-                "user_id": account.user_id,
-                "saved_at": account.saved_at,
-            })
-        })
-        .collect::<Vec<_>>();
-    let usable = runtime_bound && !accounts.is_empty();
+    let surface_available = state.services.surface.has_surface("wechat-ilink");
     Json(serde_json::json!({
         "kind": "wechat_ilink_accounts",
-        "runtime_bound": runtime_bound,
-        "usable": usable,
-        "bound_adapters": bound_adapters,
-        "accounts": accounts
+        "surface_available": surface_available,
+        "usable": false,
+        "accounts": [],
+        "diagnostics": ["wechat-ilink account listing is provided by the wechat-ilink surface sidecar"]
     }))
 }
 
 async fn wechat_ilink_qr_start_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<WechatQrStartRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let qr = channel_adapters::platform::wechat_ilink::request_wechat_qr_login(&body.bot_type)
+    let result = state
+        .services
+        .surface
+        .action(SurfaceActionRequest {
+            surface: "wechat-ilink".to_string(),
+            action: "account.login_qr.start".to_string(),
+            payload: serde_json::json!({ "bot_type": body.bot_type }),
+        })
         .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "wechat_ilink_qr",
-        "qrcode": qr.qrcode,
-        "scan_data": qr.scan_data,
-        "qrcode_img_content": qr.qrcode_img_content,
-        "qrcode_svg": qr_svg(&qr.scan_data),
-        "base_url": qr.base_url,
-        "expires_in_seconds": 480
-    })))
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(result))
 }
 
 async fn wechat_ilink_qr_poll_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<WechatQrPollRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let status = channel_adapters::platform::wechat_ilink::poll_wechat_qr_login(
-        &body.qrcode,
-        body.base_url.as_deref(),
-    )
-    .await
-    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-
-    let account = if let Some(credentials) = status.credentials.as_ref() {
-        channel_adapters::platform::wechat_ilink::save_wechat_qr_account(credentials, None)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        Some(serde_json::json!({
-            "account_id": credentials.account_id,
-            "base_url": credentials.base_url,
-            "user_id": credentials.user_id,
-            "saved_at": credentials.saved_at,
-        }))
-    } else {
-        None
-    };
-
-    Ok(Json(serde_json::json!({
-        "kind": "wechat_ilink_qr_status",
-        "status": status.status,
-        "redirect_host": status.redirect_host,
-        "account": account,
-    })))
+    let result = state
+        .services
+        .surface
+        .action(SurfaceActionRequest {
+            surface: "wechat-ilink".to_string(),
+            action: "account.login_qr.poll".to_string(),
+            payload: serde_json::json!({
+                "qrcode": body.qrcode,
+                "base_url": body.base_url,
+            }),
+        })
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(result))
 }

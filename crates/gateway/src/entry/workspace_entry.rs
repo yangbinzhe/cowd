@@ -294,28 +294,14 @@ fn setup_feishu_item(config: &runtime::RuntimeConfig) -> SetupItem {
 }
 
 fn setup_wechat_item() -> SetupItem {
-    match channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None) {
-        Ok(accounts) if !accounts.is_empty() => SetupItem {
-            id: "wechat",
-            label: "WeChat",
-            status: "ready",
-            summary: format!("{} QR-authorized account(s) available", accounts.len()),
-            next: None,
-        },
-        Ok(_) => SetupItem {
-            id: "wechat",
-            label: "WeChat",
-            status: "action",
-            summary: "No personal WeChat QR account authorized".to_string(),
-            next: Some("Configure the WeChat platform in Gateway/WebUI".to_string()),
-        },
-        Err(error) => SetupItem {
-            id: "wechat",
-            label: "WeChat",
-            status: "warn",
-            summary: format!("Could not read WeChat accounts: {error}"),
-            next: Some("Configure the WeChat platform in Gateway/WebUI".to_string()),
-        },
+    SetupItem {
+        id: "wechat",
+        label: "WeChat",
+        status: "action",
+        summary: "Provided by the wechat-ilink Surface sidecar".to_string(),
+        next: Some(
+            "Install cowd-surface-wechat-ilink under the configured surfaces directory".to_string(),
+        ),
     }
 }
 

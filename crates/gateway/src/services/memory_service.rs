@@ -16,7 +16,7 @@ impl MemoryService {
     pub(crate) fn new() -> Self {
         Self {
             label: "memory",
-            owner: "0.9.351 GatewayServices",
+            owner: "0.9.352 GatewayServices",
             manager: None,
         }
     }

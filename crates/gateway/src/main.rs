@@ -36,6 +36,7 @@ mod session_kernel;
 mod session_lifecycle_kernel;
 mod skill_static;
 mod suggestions;
+mod surface_host;
 mod task_kernel;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
@@ -348,55 +349,41 @@ fn build_memory_config(
     Some(mc)
 }
 
-/// Convert `runtime::GatewayConfig` → `Vec<channel_adapters::platform::PlatformConfig>`.
-/// Filters out `api_server` (handled by serve itself) and disabled platforms.
-fn build_platform_configs(
-    gw: &runtime::GatewayConfig,
-) -> Vec<channel_adapters::platform::PlatformConfig> {
+/// Convert `runtime::GatewayConfig` into external Surface descriptors.
+/// Filters out `api_server` because it is the gateway listener itself.
+fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceManifest> {
     if !gw.enabled {
         return Vec::new();
     }
-    let mut configs: Vec<_> = gw
-        .platforms
+    gw.platforms
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
-            let mut pc = channel_adapters::platform::PlatformConfig::new(&p.platform_type);
-            pc.enabled = p.enabled;
-            for (k, v) in &p.extra {
-                pc = pc.with_setting(k, json_value_to_serde(v));
+            let id = surface::normalize_surface_id(&p.platform_type);
+            let required = channel::channel_required_fields(&id)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            surface::SurfaceManifest {
+                schema: surface::SURFACE_PROTOCOL.to_string(),
+                id: id.clone(),
+                name: format!("{id} surface"),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                kind: surface::SurfaceKind::ExternalIntegration,
+                entry: Some(format!("./cowd-surface-{id}")),
+                transport: surface::SurfaceTransport::StdioJsonl,
+                capabilities: channel::channel_transport_capabilities(&id)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                config_schema: serde_json::json!({ "required": required }),
+                default_enabled: p.enabled,
             }
-            pc
         })
-        .collect();
-
-    let has_wechat = configs
-        .iter()
-        .any(|p| matches!(p.platform_type.as_str(), "wechat_ilink" | "wechat"));
-    if !has_wechat {
-        if let Ok(accounts) =
-            channel_adapters::platform::wechat_ilink::list_wechat_qr_accounts(None)
-        {
-            if let Some(account) = accounts.first() {
-                tracing::info!(
-                    "wechat_ilink: auto-detected QR account {} (saved at {})",
-                    account.account_id,
-                    account.saved_at
-                );
-                let mut pc = channel_adapters::platform::PlatformConfig::new("wechat_ilink");
-                pc = pc
-                    .with_setting("credential_source", "qr_account")
-                    .with_setting("account_id", account.account_id.clone());
-                configs.push(pc);
-            }
-        }
-    }
-
-    configs
+        .collect()
 }
 
-/// Convert `runtime::JsonValue` → `serde_json::Value` for use with
-/// `channel_adapters::platform::PlatformConfig::with_setting()`.
+/// Convert `runtime::JsonValue` → `serde_json::Value`.
 fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     match v {
         runtime::JsonValue::Null => serde_json::Value::Null,
@@ -689,7 +676,7 @@ fn run_gateway_action(
                 .map(|n| n as u16)
                 .unwrap_or(8642);
             let memory_config = build_memory_config(runtime_config.memory(), &cwd);
-            let platform_configs = build_platform_configs(runtime_config.gateway());
+            let surface_configs = build_surface_configs(runtime_config.gateway());
             let runtime_config_json = runtime_config.as_json().as_object().map(|obj| {
                 serde_json::Value::Object(
                     obj.iter()
@@ -715,12 +702,11 @@ fn run_gateway_action(
             let runtime_host_config = runtime_host::RuntimeHostConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
                 memory_config,
-                platform_configs,
+                surface_configs,
                 runtime_config: runtime_config_json,
                 webui_dir: runtime_config.gateway().webui_dir.clone(),
                 cors_origins,
                 auth_token,
-                message_mirror: None,
             };
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {
@@ -783,95 +769,7 @@ fn run_gateway_action(
 }
 
 fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to build runtime: {e}"))?;
-
-    println!("WeChat QR login");
-    println!("Use personal WeChat to scan and confirm in the mobile app.");
-
-    let qr = rt
-        .block_on(channel_adapters::platform::wechat_ilink::request_wechat_qr_login("3"))
-        .map_err(|e| format!("failed to create WeChat QR code: {e}"))?;
-
-    println!();
-    println!("Scan data:");
-    println!("{}", qr.scan_data);
-    println!();
-
-    match qrcode::QrCode::new(qr.scan_data.as_bytes()) {
-        Ok(code) => {
-            let rendered = code
-                .render::<qrcode::render::unicode::Dense1x2>()
-                .quiet_zone(true)
-                .build();
-            println!("{rendered}");
-        }
-        Err(e) => {
-            println!("Failed to render terminal QR code: {e}");
-        }
-    }
-
-    println!("Waiting for scan confirmation...");
-    let mut base_url = qr.base_url.clone();
-    let deadline = std::time::Instant::now() + Duration::from_secs(480);
-    while std::time::Instant::now() < deadline {
-        let status = rt
-            .block_on(
-                channel_adapters::platform::wechat_ilink::poll_wechat_qr_login(
-                    &qr.qrcode,
-                    Some(&base_url),
-                ),
-            )
-            .map_err(|e| format!("failed to poll WeChat QR status: {e}"))?;
-
-        match status.status.as_str() {
-            "wait" => {
-                print!(".");
-                let _ = io::stdout().flush();
-            }
-            "scaned" => {
-                println!("\nScanned. Confirm login in WeChat.");
-            }
-            "scaned_but_redirect" => {
-                if let Some(host) = status.redirect_host {
-                    base_url = format!("https://{host}");
-                    println!("\nRedirected to regional iLink host.");
-                }
-            }
-            "confirmed" => {
-                let credentials = status
-                    .credentials
-                    .ok_or("WeChat confirmed without credentials")?;
-                let path = channel_adapters::platform::wechat_ilink::save_wechat_qr_account(
-                    &credentials,
-                    None,
-                )
-                .map_err(|e| format!("failed to save WeChat account: {e}"))?;
-                println!();
-                println!("WeChat connected.");
-                println!("Account          {}", credentials.account_id);
-                if let Some(user_id) = credentials.user_id.as_deref() {
-                    println!("User             {user_id}");
-                }
-                println!("Stored           {}", path.display());
-                println!(
-                    "Gateway          restart with `cowd gateway restart` to activate the channel"
-                );
-                return Ok(());
-            }
-            "expired" => {
-                return Err("WeChat QR code expired; rerun the WeChat platform setup flow".into());
-            }
-            other => {
-                println!("\nStatus           {other}");
-            }
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-
-    Err("WeChat QR login timed out".into())
+    Err("wechat QR login is provided by the `wechat-ilink` Surface sidecar; install and enable `cowd-surface-wechat-ilink`".into())
 }
 
 fn should_bootstrap_for_action(action: &CliAction) -> bool {

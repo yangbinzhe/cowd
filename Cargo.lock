@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-eval"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "ai-kernel",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ai-kernel"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "serde",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "ai-task"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "ai-kernel",
  "rusqlite",
@@ -102,7 +102,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
  "serde_json",
@@ -500,22 +500,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "bytemuck"
-version = "1.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
-name = "byteorder-lite"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
@@ -582,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "serde",
@@ -592,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "channel-adapters"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "aes",
  "async-trait",
@@ -649,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "gateway",
  "serde",
@@ -683,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1000,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "serde",
@@ -1216,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "ai-kernel",
  "ai-task",
@@ -1225,7 +1213,6 @@ dependencies = [
  "async-trait",
  "axum",
  "channel",
- "channel-adapters",
  "chrono",
  "connector",
  "fact-kernel",
@@ -1238,7 +1225,6 @@ dependencies = [
  "model-protocol",
  "plugins",
  "provider",
- "qrcode",
  "reqwest",
  "runtime",
  "rusqlite",
@@ -1252,6 +1238,7 @@ dependencies = [
  "slash-catalog",
  "slash-contract",
  "storage",
+ "surface",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -1758,18 +1745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "image"
-version = "0.25.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
-dependencies = [
- "bytemuck",
- "byteorder-lite",
- "moxcms",
- "num-traits",
-]
-
-[[package]]
 name = "imap"
 version = "3.0.0-alpha.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2133,7 +2108,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -2145,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -2161,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
  "serde_json",
@@ -2176,7 +2151,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2265,23 +2240,13 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "lru",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
-]
-
-[[package]]
-name = "moxcms"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
-dependencies = [
- "num-traits",
- "pxfm",
 ]
 
 [[package]]
@@ -2591,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
  "serde_json",
@@ -2698,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2728,21 +2693,6 @@ name = "pulldown-cmark-escape"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
-
-[[package]]
-name = "pxfm"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
-dependencies = [
- "image",
-]
 
 [[package]]
 name = "quick-xml"
@@ -3068,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "ai-eval",
  "ai-kernel",
@@ -3393,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
  "serde_json",
@@ -3495,7 +3445,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill-service"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "regex",
  "serde",
@@ -3512,7 +3462,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slash-catalog"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "regex",
@@ -3524,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "slash-contract"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
 ]
@@ -3575,7 +3525,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3635,6 +3585,17 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "surface"
+version = "0.9.352"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
 
 [[package]]
 name = "symlink"
@@ -3728,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "serde",
  "serde_json",
@@ -4001,7 +3962,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4257,7 +4218,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.351"
+version = "0.9.352"
 dependencies = [
  "chrono",
  "crossterm",

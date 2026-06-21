@@ -6,13 +6,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use channel_adapters::platform::{OutboundDispatch, OutboundPayloadKind};
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision,
     PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
+use surface::SurfaceSendRequest;
 
 use super::{channel_routes, AppState};
 use crate::services::CrossPlaneExecutionRecord;
@@ -629,7 +629,14 @@ fn adapter_capabilities_for_platform(
 }
 
 async fn bound_adapter_snapshot(state: &AppState) -> HashSet<String> {
-    state.services.channel.bound_adapter_set().await
+    state
+        .services
+        .surface
+        .snapshot()
+        .surfaces
+        .into_iter()
+        .map(|surface| surface.id)
+        .collect()
 }
 
 fn platform_binding_keys(platform: &channel_routes::PlatformReadiness) -> Vec<String> {
@@ -669,14 +676,12 @@ async fn dispatch_ready_target(
         .outbound_message
         .as_ref()
         .ok_or_else(|| ("dispatch:outbound_message_missing".to_string(), None))?;
-    if !state.services.channel.is_runtime_available() {
-        return Err(("dispatch:runtime_unavailable".to_string(), None));
+    if !state.services.surface.is_runtime_available() {
+        return Err(("dispatch:surface_runtime_unavailable".to_string(), None));
     }
     let operation = target.operation.as_deref().unwrap_or("send_text");
-    let kind = match outbound.payload_kind.as_str() {
-        "text" => OutboundPayloadKind::Text,
-        "image" => OutboundPayloadKind::Image,
-        "file" => OutboundPayloadKind::File,
+    let payload_kind = match outbound.payload_kind.as_str() {
+        "text" | "image" | "file" => outbound.payload_kind.as_str(),
         other => {
             return Err((
                 format!("dispatch:payload_kind_unsupported:{other}"),
@@ -690,8 +695,8 @@ async fn dispatch_ready_target(
         }
     };
     let payload_ref =
-        resolve_dispatch_payload_ref(&state.workspace_root, kind, &outbound.payload_ref).map_err(
-            |error| {
+        resolve_dispatch_payload_ref(&state.workspace_root, payload_kind, &outbound.payload_ref)
+            .map_err(|error| {
                 (
                     format!("dispatch:payload_blocked:{error}"),
                     Some(CrossPlaneDispatchOutcome::failed(
@@ -701,38 +706,43 @@ async fn dispatch_ready_target(
                         error,
                     )),
                 )
-            },
-        )?;
+            })?;
 
     match state
         .services
-        .channel
-        .dispatch_payload(
-            platform,
-            OutboundDispatch {
-                session_key: crate::services::ChannelService::session_key(
-                    outbound.session_key.as_str(),
-                ),
-                kind,
-                payload_ref,
-                caption: outbound.caption.clone(),
-                file_name: outbound.file_name.clone(),
-                reply_to: outbound.reply_to.clone(),
-                metadata: outbound.metadata.clone(),
-            },
-        )
+        .surface
+        .send(SurfaceSendRequest {
+            surface: platform.to_string(),
+            recipient: outbound.session_key.clone(),
+            thread: outbound.reply_to.clone(),
+            text: outbound
+                .caption
+                .clone()
+                .unwrap_or_else(|| payload_ref.clone()),
+            metadata: serde_json::json!({
+                "payload_kind": payload_kind,
+                "payload_ref": payload_ref,
+                "file_name": outbound.file_name,
+                "operation": operation,
+                "source": "cross_plane_dispatch",
+                "metadata": outbound.metadata,
+            }),
+        })
         .await
     {
-        Ok(result) if result.success => Ok(CrossPlaneDispatchOutcome::sent(
-            platform,
-            operation,
-            outbound.session_key.clone(),
-            result.message_id,
-        )),
+        Ok(result) if result.status == "sent" || result.status == "ok" => {
+            Ok(CrossPlaneDispatchOutcome::sent(
+                platform,
+                operation,
+                outbound.session_key.clone(),
+                result.message_id,
+            ))
+        }
         Ok(result) => {
-            let error = result
-                .error
-                .unwrap_or_else(|| "adapter reported unsuccessful send".to_string());
+            let error = result.error.map_or_else(
+                || "surface reported unsuccessful send".to_string(),
+                |error| format!("{}: {}", error.code, error.message),
+            );
             Err((
                 format!("dispatch:send_failed:{error}"),
                 Some(CrossPlaneDispatchOutcome::failed(
@@ -760,21 +770,22 @@ async fn dispatch_ready_target(
 
 fn resolve_dispatch_payload_ref(
     workspace_root: &FsPath,
-    kind: OutboundPayloadKind,
+    kind: &str,
     payload_ref: &str,
 ) -> Result<String, String> {
     let payload_ref = payload_ref.trim();
     if payload_ref.is_empty() {
         return Err("payload_ref_missing".to_string());
     }
-    if matches!(kind, OutboundPayloadKind::Text) {
+    if kind == "text" {
         return Ok(payload_ref.to_string());
     }
     if payload_ref.starts_with("http://") || payload_ref.starts_with("https://") {
         return match kind {
-            OutboundPayloadKind::Image => Ok(payload_ref.to_string()),
-            OutboundPayloadKind::File => Err("file_remote_payload_unsupported".to_string()),
-            OutboundPayloadKind::Text => Ok(payload_ref.to_string()),
+            "image" => Ok(payload_ref.to_string()),
+            "file" => Err("file_remote_payload_unsupported".to_string()),
+            "text" => Ok(payload_ref.to_string()),
+            _ => Err("payload_kind_unsupported".to_string()),
         };
     }
 

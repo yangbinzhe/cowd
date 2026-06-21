@@ -335,7 +335,7 @@ struct MfgProductionGovernanceBundle {
     auth_token_configured: bool,
     approval_gate_configured: bool,
     session_store_ready: bool,
-    platform_runtime_ready: bool,
+    surface_runtime_ready: bool,
     audit_export_surface: bool,
     cross_plane_audit_surface: bool,
     runbook_present: bool,
@@ -349,7 +349,7 @@ async fn mfg_production_governance_handler(
         auth_token_configured: state.auth_token.is_some(),
         approval_gate_configured: state.services.approval.is_configured(),
         session_store_ready: state.services.session.has_unified_store(),
-        platform_runtime_ready: state.services.channel.is_runtime_available(),
+        surface_runtime_ready: state.services.surface.is_runtime_available(),
         audit_export_surface: true,
         cross_plane_audit_surface: true,
         runbook_present: state
@@ -364,7 +364,7 @@ async fn mfg_production_governance_handler(
         bundle.auth_token_configured,
         bundle.approval_gate_configured,
         bundle.session_store_ready,
-        bundle.platform_runtime_ready,
+        bundle.surface_runtime_ready,
         bundle.audit_export_surface,
         bundle.cross_plane_audit_surface,
         bundle.runbook_present,
@@ -386,8 +386,8 @@ async fn mfg_production_governance_handler(
     if !bundle.session_store_ready {
         reasons.push("session_store_unavailable");
     }
-    if !bundle.platform_runtime_ready {
-        reasons.push("platform_runtime_unavailable");
+    if !bundle.surface_runtime_ready {
+        reasons.push("surface_runtime_unavailable");
     }
     if !bundle.runbook_present {
         reasons.push("production_runbook_missing");

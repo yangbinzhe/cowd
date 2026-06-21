@@ -20,7 +20,7 @@ pub(crate) struct GatewayRuntimeSnapshot {
     pub(crate) service_layer: bool,
     pub(crate) unified_store: bool,
     pub(crate) memory_manager: bool,
-    pub(crate) platform_runtime: bool,
+    pub(crate) surface_runtime: bool,
     pub(crate) event_bus: bool,
     pub(crate) session_kernel: bool,
 }
@@ -61,7 +61,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         service_layer: state.services.has_minimum_service_contract(),
         unified_store: state.has_unified_store(),
         memory_manager: state.services.memory.manager().is_some(),
-        platform_runtime: state.services.channel.is_runtime_available(),
+        surface_runtime: state.services.surface.is_runtime_available(),
         event_bus: true,
         session_kernel: true,
     };

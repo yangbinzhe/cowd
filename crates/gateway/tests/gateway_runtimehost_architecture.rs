@@ -384,7 +384,7 @@ fn connector_is_independent_external_resource_boundary() {
 }
 
 #[test]
-fn channel_contracts_drive_gateway_platform_readiness() {
+fn channel_contracts_drive_gateway_surface_readiness() {
     let channel_source = production_part(&read_repo("crates/channel/src/lib.rs")).to_string();
     for required in [
         "pub struct ChannelContract",
@@ -404,9 +404,12 @@ fn channel_contracts_drive_gateway_platform_readiness() {
         "gateway must depend on channel for platform/channel contracts"
     );
     assert!(
-        manifest_dependencies(&gateway_manifest)
-            .contains("channel-adapters = { path = \"../channel-adapters\" }"),
-        "gateway must depend on channel-adapters for platform SDK hosting"
+        manifest_dependencies(&gateway_manifest).contains("surface = { path = \"../surface\" }"),
+        "gateway must depend on surface for JSONL sidecar protocol hosting"
+    );
+    assert!(
+        !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
+        "gateway must not depend on channel-adapters; platform SDKs live behind Surface sidecars"
     );
     let channel_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/channel_routes.rs",
@@ -427,19 +430,20 @@ fn channel_contracts_drive_gateway_platform_readiness() {
 
     let gateway_services_source = read_repo("crates/gateway/src/services/mod.rs");
     let gateway_services = production_part(&gateway_services_source);
-    let channel_service_source = read_repo("crates/gateway/src/services/channel_service.rs");
-    let channel_service = production_part(&channel_service_source);
+    let surface_service_source = read_repo("crates/gateway/src/services/surface_service.rs");
+    let surface_service = production_part(&surface_service_source);
     let api_state_source = read_repo("crates/gateway/src/api_routes.rs");
     let api_state = production_part(&api_state_source);
     assert!(
-        gateway_services.contains("pub(crate) channel: ChannelService"),
-        "GatewayServices must expose the channel service boundary"
+        gateway_services.contains("pub(crate) surface: SurfaceService"),
+        "GatewayServices must expose the Surface service boundary"
     );
     assert!(
-        channel_service.contains("pub(crate) struct ChannelService")
-            && channel_service.contains("runtime: Option<Arc<PlatformRuntime>>")
-            && channel_service.contains("dispatch_payload("),
-        "ChannelService must own gateway-side platform runtime access"
+        surface_service.contains("pub(crate) struct SurfaceService")
+            && surface_service.contains("host: Arc<SurfaceHost>")
+            && surface_service.contains("send(")
+            && surface_service.contains("action("),
+        "SurfaceService must own gateway-side SurfaceHost access"
     );
     assert!(
         !api_state.contains("pub platform_runtime:"),
@@ -459,6 +463,10 @@ fn channel_contracts_drive_gateway_platform_readiness() {
             !source.contains("runtime::platform"),
             "{source_path} must not use runtime::platform as the channel host"
         );
+        assert!(
+            !source.contains("channel_adapters"),
+            "{source_path} must not directly use channel-adapters"
+        );
     }
 
     for source_path in [
@@ -469,8 +477,8 @@ fn channel_contracts_drive_gateway_platform_readiness() {
     ] {
         let source = production_part(&read_repo(source_path)).to_string();
         assert!(
-            source.contains("services.channel"),
-            "{source_path} must access channel runtime through GatewayServices.channel"
+            source.contains("services.surface"),
+            "{source_path} must access external ingress/egress through GatewayServices.surface"
         );
         assert!(
             !source.contains("state.platform_runtime"),
@@ -478,17 +486,12 @@ fn channel_contracts_drive_gateway_platform_readiness() {
         );
     }
 
-    let channel_adapters_source =
-        production_part(&read_repo("crates/channel-adapters/src/lib.rs")).to_string();
+    let surface_source = production_part(&read_repo("crates/surface/src/lib.rs")).to_string();
     assert!(
-        channel_adapters_source.contains("pub mod platform"),
-        "channel-adapters must expose the gateway-owned platform adapter host"
-    );
-    assert!(
-        repo_root()
-            .join("crates/channel-adapters/src/platform")
-            .exists(),
-        "platform adapter sources must live under channel-adapters"
+        surface_source.contains("pub enum SurfaceFrame")
+            && surface_source.contains("pub struct SurfaceManifest")
+            && surface_source.contains("StdioJsonl"),
+        "surface crate must expose the JSONL sidecar protocol contract"
     );
     assert!(
         !repo_root().join("crates/runtime/src/platform").exists(),
@@ -1193,7 +1196,7 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
 }
 
 #[test]
-fn channel_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
+fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     let runtime_manifest = read_repo("crates/runtime/Cargo.toml");
     let runtime_dependencies = manifest_dependencies(&runtime_manifest);
     assert!(
@@ -1206,19 +1209,29 @@ fn channel_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     let gateway_dependencies = manifest_dependencies(&gateway_manifest);
     assert!(
         gateway_dependencies.contains("channel = { path = \"../channel\" }")
-            && gateway_dependencies
-                .contains("channel-adapters = { path = \"../channel-adapters\" }"),
-        "gateway must own channel and channel-adapter integration"
+            && gateway_dependencies.contains("surface = { path = \"../surface\" }")
+            && !gateway_dependencies.contains("channel-adapters = "),
+        "gateway must own channel contracts and Surface sidecar protocol without adapter SDK coupling"
     );
 
     let runtime_host =
         production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
     assert!(
-        !runtime_host.contains(".run_turn_async(")
-            && runtime_host.contains(".run_turn_with_timeout(")
-            && runtime_host.contains("runtime_service = app_state")
-            && runtime_host.contains("runtime service unavailable for platform inbound"),
-        "platform inbound handling must execute turns through Gateway RuntimeService"
+        !runtime_host.contains(".run_turn_async("),
+        "runtime host must not directly call run_turn_async"
+    );
+    assert!(
+        runtime_host.contains("RuntimeService::new("),
+        "runtime host must assemble Gateway RuntimeService instead of executing turns directly"
+    );
+    assert!(
+        runtime_host.contains("GatewayServices::new(")
+            && runtime_host.contains("Arc::new(RuntimeService::new("),
+        "runtime host must register RuntimeService through GatewayServices"
+    );
+    assert!(
+        !runtime_host.contains("PlatformRuntime"),
+        "runtime host must not embed platform runtime"
     );
 
     let gateway_services = read_repo("crates/gateway/src/services/registry.rs");
@@ -1261,6 +1274,7 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
         runtime_lib.contains("pub mod source_self_audit")
             && runtime_lib.contains("RuntimeSourceSelfAudit")
             && runtime_audit.contains("runtime.no_channel_dependency")
+            && runtime_audit.contains("gateway.owns_surface_boundary")
             && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
             && runtime_audit.contains("ai_eval.repair_hints"),
         "runtime must expose source-aware self audit checks with repair hints"

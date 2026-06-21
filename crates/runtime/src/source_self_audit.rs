@@ -38,7 +38,7 @@ impl RuntimeSourceSelfAudit {
         let repo_root = repo_root.as_ref();
         let checks = vec![
             runtime_does_not_depend_on_channel(repo_root),
-            gateway_owns_channel(repo_root),
+            gateway_owns_surface_boundary(repo_root),
             runtime_host_uses_runtime_service(repo_root),
             growth_routes_are_observable(repo_root),
             ai_eval_has_repair_hints(repo_root),
@@ -69,24 +69,25 @@ fn runtime_does_not_depend_on_channel(repo_root: &Path) -> SourceSelfAuditCheck 
         passed,
         "runtime must not depend on channel crates",
         vec![path],
-        "remove channel/channel-adapters dependencies from crates/runtime/Cargo.toml and route platform traffic through Gateway services",
+        "remove channel/channel-adapters dependencies from crates/runtime/Cargo.toml and route external traffic through Gateway Surface services",
     )
 }
 
-fn gateway_owns_channel(repo_root: &Path) -> SourceSelfAuditCheck {
+fn gateway_owns_surface_boundary(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/Cargo.toml");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
         source.contains("channel = { path = \"../channel\" }")
-            && source.contains("channel-adapters = { path = \"../channel-adapters\" }")
+            && source.contains("surface = { path = \"../surface\" }")
+            && !source.contains("channel-adapters = ")
     });
     check(
-        "gateway.owns_channel_boundary",
+        "gateway.owns_surface_boundary",
         "gateway",
         passed,
-        "gateway must own channel contracts and adapter SDK host",
+        "gateway must own channel contracts and Surface sidecar protocol without adapter SDK coupling",
         vec![path],
-        "add channel and channel-adapters to gateway dependencies and keep platform adapter hosting out of runtime",
+        "keep channel contracts and surface protocol in gateway; move platform SDKs behind JSONL Surface sidecars",
     )
 }
 
@@ -100,7 +101,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
         "gateway.runtime_host_uses_runtime_service",
         "gateway-runtime-host",
         passed,
-        "platform inbound execution must go through RuntimeService",
+        "external inbound execution must go through RuntimeService",
         vec![path],
         "replace direct runtime.run_turn_async calls with RuntimeService::run_turn_with_timeout and preserve turn receipts",
     )
