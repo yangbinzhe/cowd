@@ -372,10 +372,17 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 kind: surface::SurfaceKind::ExternalIntegration,
                 entry: Some(format!("./cowd-surface-{id}")),
                 transport: surface::SurfaceTransport::StdioJsonl,
+                lifecycle: surface::SurfaceLifecycle::Managed,
                 capabilities: channel::channel_transport_capabilities(&id)
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                routes: Vec::new(),
+                resources: Vec::new(),
+                health: surface::SurfaceHealthSpec {
+                    mode: surface::SurfaceHealthMode::Jsonl,
+                    interval_ms: 30_000,
+                },
                 config_schema: serde_json::json!({ "required": required }),
                 default_enabled: p.enabled,
             }

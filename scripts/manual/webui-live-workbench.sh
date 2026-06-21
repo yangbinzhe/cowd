@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${COWD_WEBUI_REPO:-}" ]]; then
-  echo "live WebUI workbench scenario moved to cowd-webui; set COWD_WEBUI_REPO to run it cross-repo"
+SURFACE_WEBUI_DIR="${COWD_SURFACE_WEBUI_DIR:-}"
+
+if [[ -z "$SURFACE_WEBUI_DIR" ]]; then
+  echo "live WebUI workbench scenario moved to cowd-surface; set COWD_SURFACE_WEBUI_DIR to surfaces/webui"
   exit 0
 fi
 
-if [[ ! -d "$COWD_WEBUI_REPO" ]]; then
-  echo "COWD_WEBUI_REPO does not exist: $COWD_WEBUI_REPO" >&2
+if [[ ! -d "$SURFACE_WEBUI_DIR" ]]; then
+  echo "COWD_SURFACE_WEBUI_DIR does not exist: $SURFACE_WEBUI_DIR" >&2
   exit 2
 fi
 
@@ -17,10 +19,10 @@ BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_WEBUI_LIVE_PORT:-18669}"
 BASE_URL="http://127.0.0.1:$PORT"
 CHROMIUM="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium}"
-SESSION="cowd-webui-live-$$"
-WORKDIR="$(mktemp -d -t cowd-webui-live-workspace-XXXXXX)"
-CONFIG_HOME="$(mktemp -d -t cowd-webui-live-config-XXXXXX)"
-HOME_DIR="$(mktemp -d -t cowd-webui-live-home-XXXXXX)"
+SESSION="cowd-surface-webui-live-$$"
+WORKDIR="$(mktemp -d -t cowd-surface-webui-live-workspace-XXXXXX)"
+CONFIG_HOME="$(mktemp -d -t cowd-surface-webui-live-config-XXXXXX)"
+HOME_DIR="$(mktemp -d -t cowd-surface-webui-live-home-XXXXXX)"
 LOG="$WORKDIR/gateway.log"
 
 cleanup() {
@@ -55,7 +57,7 @@ memory:
   enabled: false
 gateway:
   enabled: true
-  webui_dir: "$COWD_WEBUI_REPO/dist"
+  webui_dir: "$SURFACE_WEBUI_DIR/dist"
   sessionReset: "none"
   platforms:
     - platformType: "api_server"
@@ -84,7 +86,7 @@ done
 curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
 
 (
-  cd "$COWD_WEBUI_REPO"
+  cd "$SURFACE_WEBUI_DIR"
   env COWD_WEBUI_BASE_URL="$BASE_URL" \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" \
     npx playwright test tasks-workbench.live.e2e.spec.js \

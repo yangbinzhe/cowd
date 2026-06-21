@@ -59,7 +59,7 @@ if [[ "$CLEAN_TMP" -eq 1 ]]; then
     -name 'cowd-status-*' -o \
     -name 'storage-*' -o \
     -name 'cowd-tui-*' -o \
-    -name 'cowd-webui-*' -o \
+    -name 'cowd-surface-webui-*' -o \
     -name 'cowd_*' \
   \) -exec rm -rf {} + 2>/dev/null || true
 fi

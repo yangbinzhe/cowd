@@ -35,8 +35,6 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
     ];
     let checked_files = [
         "crates/channel/src/lib.rs",
-        "crates/channel-adapters/src/lib.rs",
-        "crates/channel-adapters/src/platform/mod.rs",
         "crates/connector/src/lib.rs",
         "crates/gateway/src/api_routes.rs",
         "crates/gateway/src/runtime_host/mod.rs",
@@ -385,6 +383,11 @@ fn connector_is_independent_external_resource_boundary() {
 
 #[test]
 fn channel_contracts_drive_gateway_surface_readiness() {
+    assert!(
+        !repo_root().join("crates/channel-adapters").exists(),
+        "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-surface"
+    );
+
     let channel_source = production_part(&read_repo("crates/channel/src/lib.rs")).to_string();
     for required in [
         "pub struct ChannelContract",
@@ -409,7 +412,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
-        "gateway must not depend on channel-adapters; platform SDKs live behind Surface sidecars"
+        "gateway must not depend on channel-adapters; platform SDKs live in cowd-surface sidecars"
     );
     let channel_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/channel_routes.rs",
@@ -1001,6 +1004,14 @@ fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
 #[test]
 fn entry_boundary_crates_exist_as_migration_targets() {
     let root = repo_root();
+    let workspace_manifest = read_repo("Cargo.toml");
+    assert!(
+        workspace_manifest.contains("default-members = [")
+            && !source_between(&workspace_manifest, "default-members = [", "]")
+                .contains("\"crates/tui\""),
+        "workspace default members must exclude tui; TUI builds only through explicit full/surface selection"
+    );
+
     for crate_name in ["cli", "gateway", "tui"] {
         let manifest = root.join(format!("crates/{crate_name}/Cargo.toml"));
         assert!(
@@ -1019,16 +1030,19 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "cli must depend on gateway only for backend management commands"
     );
     assert!(
-        cli_dependencies.contains("tui = { path = \"../tui\" }"),
-        "cli must depend on tui directly for the terminal UI launcher"
+        cli_dependencies.contains("tui = { path = \"../tui\", optional = true }")
+            && cli_manifest.contains("full = [\"tui-surface\"]"),
+        "cli must keep TUI as a full-build-only optional surface dependency"
     );
     assert!(
-        cli_main.contains("tui::terminal_entry()"),
-        "cli launcher must route no-arg or explicit tui usage directly to the TUI entry"
+        cli_main.contains("open_tui_or_exit()")
+            && cli_main.contains("#[cfg(feature = \"tui-surface\")]")
+            && cli_main.contains("tui::terminal_entry()"),
+        "cli launcher must route TUI usage through the feature-gated TUI surface entry"
     );
     assert!(
-        cli_main.contains("fn should_open_tui(") && cli_main.contains("\"--resume\""),
-        "cli launcher must route resume/session startup flags directly to the TUI entry"
+        cli_main.contains("TUI surface is not built in this binary"),
+        "minimal CLI build must fail explicitly when a user asks for TUI-only startup"
     );
     assert!(
         cli_main.contains("gateway::backend_entry()"),

@@ -44,7 +44,7 @@ matrix-repository = { path = "../matrix/repository" }
 sha2 = "0.10"
 toml = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "io-std", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "io-std", "io-util", "macros", "sync", "net", "process"] }
 tokio-stream = "0.1"
 tools = { path = "../tools" }
 tower-http = { version = "0.5", features = ["cors", "fs"] }

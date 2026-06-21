@@ -586,6 +586,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     emit_startup_diagnostics(&startup_diagnostics);
 
     let surface_host = Arc::new(crate::surface_host::SurfaceHost::default_for(&approval_dir));
+    if let Some(webui_dir) = static_webui.configured_path.as_deref() {
+        if static_webui.available {
+            surface_host.register_webui_static_resource(webui_dir);
+        }
+    }
     let surface_discovery = surface_host.discover();
     tracing::info!(
         discovered = surface_discovery.discovered,
@@ -728,7 +733,7 @@ mod tests {
 
     fn temp_webui_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(
-            "cowd-webui-{label}-{}-{}",
+            "cowd-surface-webui-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -885,7 +890,14 @@ mod tests {
             kind: surface::SurfaceKind::ExternalIntegration,
             entry: Some("./cowd-surface-feishu".to_string()),
             transport: surface::SurfaceTransport::StdioJsonl,
+            lifecycle: surface::SurfaceLifecycle::Managed,
             capabilities: vec!["ingress".to_string(), "delivery".to_string()],
+            routes: Vec::new(),
+            resources: Vec::new(),
+            health: surface::SurfaceHealthSpec {
+                mode: surface::SurfaceHealthMode::Jsonl,
+                interval_ms: 30_000,
+            },
             config_schema: serde_json::json!({"required": ["app_id", "app_secret"]}),
             default_enabled: true,
         };

@@ -49,6 +49,87 @@ pub enum SurfaceTransport {
     StdioJsonl,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceLifecycle {
+    Builtin,
+    OneShot,
+    Managed,
+}
+
+fn default_lifecycle() -> SurfaceLifecycle {
+    SurfaceLifecycle::OneShot
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceRouteKind {
+    Callback,
+    Webhook,
+    OAuthRedirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceRoute {
+    pub kind: SurfaceRouteKind,
+    pub path: String,
+    #[serde(default = "default_route_method")]
+    pub method: String,
+    #[serde(default)]
+    pub public: bool,
+}
+
+fn default_route_method() -> String {
+    "POST".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceResourceKind {
+    Static,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceResource {
+    pub kind: SurfaceResourceKind,
+    pub mount: String,
+    pub dir: String,
+    #[serde(default)]
+    pub spa: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceHealthMode {
+    Registry,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceHealthSpec {
+    #[serde(default = "default_health_mode")]
+    pub mode: SurfaceHealthMode,
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_health_mode() -> SurfaceHealthMode {
+    SurfaceHealthMode::Registry
+}
+
+fn default_health_interval_ms() -> u64 {
+    30_000
+}
+
+impl Default for SurfaceHealthSpec {
+    fn default() -> Self {
+        Self {
+            mode: default_health_mode(),
+            interval_ms: default_health_interval_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceCapability {
     pub id: String,
@@ -76,8 +157,16 @@ pub struct SurfaceManifest {
     pub entry: Option<String>,
     #[serde(default = "default_transport")]
     pub transport: SurfaceTransport,
+    #[serde(default = "default_lifecycle")]
+    pub lifecycle: SurfaceLifecycle,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<SurfaceRoute>,
+    #[serde(default)]
+    pub resources: Vec<SurfaceResource>,
+    #[serde(default)]
+    pub health: SurfaceHealthSpec,
     #[serde(default)]
     pub config_schema: Value,
     #[serde(default)]
@@ -99,10 +188,14 @@ impl SurfaceManifest {
             kind,
             entry: None,
             transport: SurfaceTransport::StdioJsonl,
+            lifecycle: SurfaceLifecycle::Builtin,
             capabilities: capabilities
                 .iter()
                 .map(|item| (*item).to_string())
                 .collect(),
+            routes: Vec::new(),
+            resources: Vec::new(),
+            health: SurfaceHealthSpec::default(),
             config_schema: Value::Null,
             default_enabled: true,
         }
@@ -146,6 +239,32 @@ impl SurfaceManifest {
                 reason: "external surface requires entry".to_string(),
             });
         }
+        for route in &self.routes {
+            validate_surface_path(&self.id, "route.path", &route.path)?;
+            if route.method.trim().is_empty() {
+                return Err(SurfaceError::InvalidManifest {
+                    surface: self.id.clone(),
+                    reason: "route.method is required".to_string(),
+                });
+            }
+        }
+        for resource in &self.resources {
+            validate_surface_path(&self.id, "resource.mount", &resource.mount)?;
+            if resource.dir.trim().is_empty() {
+                return Err(SurfaceError::InvalidManifest {
+                    surface: self.id.clone(),
+                    reason: "resource.dir is required".to_string(),
+                });
+            }
+            if resource.dir.split('/').any(|part| part == "..")
+                || resource.dir.split('\\').any(|part| part == "..")
+            {
+                return Err(SurfaceError::InvalidManifest {
+                    surface: self.id.clone(),
+                    reason: "resource.dir must not contain path traversal".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -156,6 +275,22 @@ impl SurfaceManifest {
             .map(|capability| SurfaceCapability::new(&self.id, capability.clone()))
             .collect()
     }
+}
+
+fn validate_surface_path(surface: &str, field: &str, path: &str) -> Result<(), SurfaceError> {
+    if !path.starts_with('/') {
+        return Err(SurfaceError::InvalidManifest {
+            surface: surface.to_string(),
+            reason: format!("{field} must start with `/`"),
+        });
+    }
+    if path.split('/').any(|part| part == "..") || path.split('\\').any(|part| part == "..") {
+        return Err(SurfaceError::InvalidManifest {
+            surface: surface.to_string(),
+            reason: format!("{field} must not contain path traversal"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +313,11 @@ pub struct SurfaceDescriptor {
     pub status: SurfaceStatus,
     pub source: String,
     pub entry: Option<String>,
+    pub lifecycle: SurfaceLifecycle,
     pub capabilities: Vec<SurfaceCapability>,
+    pub routes: Vec<SurfaceRoute>,
+    pub resources: Vec<SurfaceResource>,
+    pub health: SurfaceHealthSpec,
     pub diagnostics: Vec<String>,
 }
 
@@ -197,7 +336,11 @@ impl SurfaceDescriptor {
             },
             source: source.into(),
             entry: manifest.entry.clone(),
+            lifecycle: manifest.lifecycle,
             capabilities: manifest.capability_rows(),
+            routes: manifest.routes.clone(),
+            resources: manifest.resources.clone(),
+            health: manifest.health.clone(),
             diagnostics: Vec::new(),
         }
     }
@@ -454,5 +597,57 @@ mod tests {
     fn normalizes_legacy_wechat_ids_without_channel_runtime() {
         assert_eq!(normalize_surface_id("wechat_ilink"), "wechat-ilink");
         assert_eq!(normalize_surface_id("WeChat"), "wechat-ilink");
+    }
+
+    #[test]
+    fn manifest_v2_accepts_routes_resources_and_health() {
+        let manifest = serde_json::from_str::<SurfaceManifest>(
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "feishu",
+                "name": "Feishu Surface",
+                "version": "1.0.0",
+                "kind": "external-integration",
+                "entry": "./cowd-surface-feishu",
+                "transport": "stdio-jsonl",
+                "lifecycle": "managed",
+                "capabilities": ["send_text", "callback"],
+                "routes": [
+                    {"kind": "callback", "path": "/webhook", "method": "POST", "public": true}
+                ],
+                "resources": [
+                    {"kind": "static", "mount": "/", "dir": "./public", "spa": true}
+                ],
+                "health": {"mode": "jsonl", "interval_ms": 1000}
+            }"#,
+        )
+        .unwrap();
+
+        manifest.validate().unwrap();
+        let descriptor = SurfaceDescriptor::from_manifest(&manifest, "/tmp/surface.json");
+        assert_eq!(descriptor.lifecycle, SurfaceLifecycle::Managed);
+        assert_eq!(descriptor.routes.len(), 1);
+        assert_eq!(descriptor.resources.len(), 1);
+        assert_eq!(descriptor.health.mode, SurfaceHealthMode::Jsonl);
+    }
+
+    #[test]
+    fn manifest_v2_rejects_unsafe_resource_paths() {
+        let manifest = serde_json::from_str::<SurfaceManifest>(
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "bad",
+                "name": "Bad Surface",
+                "version": "1.0.0",
+                "kind": "external-integration",
+                "entry": "./bad",
+                "resources": [
+                    {"kind": "static", "mount": "/assets", "dir": "../secret", "spa": false}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(manifest.validate().is_err());
     }
 }

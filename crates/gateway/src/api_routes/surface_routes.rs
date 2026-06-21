@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, State as AxumState},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, Method, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -17,8 +18,20 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/surfaces", get(list_surfaces_handler))
         .route("/api/surfaces/health", get(surface_health_handler))
         .route("/api/surfaces/:id", get(get_surface_handler))
+        .route("/api/surfaces/:id/routes", get(get_surface_routes_handler))
+        .route(
+            "/api/surfaces/:id/resources",
+            get(get_surface_resources_handler),
+        )
+        .route("/api/surfaces/:id/health", get(get_surface_health_handler))
+        .route("/api/surfaces/:id/events", get(get_surface_events_handler))
         .route("/api/surfaces/:id/send", post(send_surface_handler))
         .route("/api/surfaces/:id/action", post(action_surface_handler))
+        .route("/s/:surface/*path", get(surface_static_handler))
+        .route(
+            "/surface-callback/:surface/*path",
+            get(surface_callback_handler).post(surface_callback_handler),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +64,7 @@ async fn surface_health_handler(AxumState(state): AxumState<Arc<AppState>>) -> i
         "kind": "surface.health",
         "status": "ready",
         "surface_count": snapshot.surfaces.len(),
+        "host": state.services.surface.health(),
         "registry": snapshot,
     }))
 }
@@ -71,6 +85,69 @@ async fn get_surface_handler(
     Ok(Json(serde_json::json!({
         "kind": "surface.detail",
         "surface": surface,
+    })))
+}
+
+async fn get_surface_routes_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let routes = state
+        .services
+        .surface
+        .routes(&id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("surface `{id}` not found")))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.routes",
+        "surface": routes.surface,
+        "routes": routes.routes,
+    })))
+}
+
+async fn get_surface_resources_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let resources = state
+        .services
+        .surface
+        .resources(&id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("surface `{id}` not found")))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.resources",
+        "surface": resources.surface,
+        "resources": resources.resources,
+    })))
+}
+
+async fn get_surface_health_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = state
+        .services
+        .surface
+        .check_surface_health(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(result))
+}
+
+async fn get_surface_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let events = state.services.surface.events(&id).await;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.events",
+        "surface": surface::normalize_surface_id(&id),
+        "events": events,
     })))
 }
 
@@ -110,4 +187,69 @@ async fn action_surface_handler(
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
     Ok(Json(result))
+}
+
+async fn surface_static_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((surface, path)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let Some(file) = state
+        .services
+        .surface
+        .resolve_static(&surface, &path)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
+    else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface static resource `{surface}/{path}` not found"),
+        ));
+    };
+    let bytes = tokio::fs::read(&file.file_path)
+        .await
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error.to_string()))?;
+    let content_type = content_type_for_path(&file.file_path);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("x-cowd-surface", file.surface)
+        .header("x-cowd-surface-spa-fallback", file.spa_fallback.to_string())
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn surface_callback_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    method: Method,
+    Path((surface, path)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let payload = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|_| {
+        serde_json::json!({
+            "raw": String::from_utf8_lossy(&body).to_string()
+        })
+    });
+    let result = state
+        .services
+        .surface
+        .callback(&surface, &format!("/{path}"), method.as_str(), payload)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(result))
+}
+
+fn content_type_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+    {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
 }

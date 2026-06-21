@@ -18,7 +18,6 @@ members = [
     "crates/plugins",
     "crates/provider",
     "crates/channel",
-    "crates/channel-adapters",
     "crates/connector",
     "crates/runtime",
     "crates/session",
@@ -30,9 +29,37 @@ members = [
     "crates/tui",
 ]
 resolver = "2"
+default-members = [
+    "crates/ai-kernel",
+    "crates/ai-eval",
+    "crates/ai-task",
+    "crates/app-mfg",
+    "crates/approval",
+    "crates/cli",
+    "crates/slash/contract",
+    "crates/slash/catalog",
+    "crates/fact-kernel",
+    "crates/gateway",
+    "crates/matrix/core",
+    "crates/matrix/repository",
+    "crates/mcp",
+    "crates/memory",
+    "crates/model-protocol",
+    "crates/plugins",
+    "crates/provider",
+    "crates/channel",
+    "crates/connector",
+    "crates/runtime",
+    "crates/session",
+    "crates/skill/service",
+    "crates/storage",
+    "crates/surface",
+    "crates/telemetry",
+    "crates/tools",
+]
 
 [workspace.package]
-version = "0.9.352"
+version = "0.9.353"
 edition = "2021"
 license = "MIT"
 publish = false
