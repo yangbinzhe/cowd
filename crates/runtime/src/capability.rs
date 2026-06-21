@@ -15,6 +15,8 @@ pub enum CowdCapabilityKind {
     Context,
     Memory,
     StructuredData,
+    Reality,
+    Fact,
     Event,
     Graph,
     Skill,
@@ -85,6 +87,30 @@ impl CowdCapabilityRegistry {
         Self {
             capabilities: vec![
                 kernel_capability(
+                    "cowd.reality.core",
+                    "Reality Core",
+                    CowdCapabilityKind::Reality,
+                    "gateway::services::RealityService",
+                    "Read-only Reality Core projection across fact semantics, Memory, Matrix, Growth, Context, and Audit.",
+                    &["read:reality"],
+                ),
+                kernel_capability(
+                    "cowd.reality.fact_flow",
+                    "Fact Flow",
+                    CowdCapabilityKind::Fact,
+                    "gateway::services::RealityService",
+                    "Runtime trace of events, evidence, candidates, fact-kernel decisions, and Memory/Matrix targets.",
+                    &["read:reality", "read:growth"],
+                ),
+                kernel_capability(
+                    "cowd.fact.kernel",
+                    "fact-kernel",
+                    CowdCapabilityKind::Fact,
+                    "fact-kernel",
+                    "Internal fact semantics, evidence, confidence, promotion decisions, and fact health.",
+                    &["read:reality"],
+                ),
+                kernel_capability(
                     "cowd.runtime.session",
                     "Runtime Session",
                     CowdCapabilityKind::Runtime,
@@ -102,11 +128,19 @@ impl CowdCapabilityRegistry {
                 ),
                 kernel_capability(
                     "cowd.memory.runtime",
-                    "Memory Runtime",
+                    "Memory Engine",
                     CowdCapabilityKind::Memory,
                     "memory",
                     "Long-term recall, cognitive layers, links and maintenance state.",
                     &["read:memory", "write:memory"],
+                ),
+                kernel_capability(
+                    "cowd.matrix.engine",
+                    "Matrix Engine",
+                    CowdCapabilityKind::StructuredData,
+                    "matrix",
+                    "Structured facts, entities, relations, metrics, evidence, lineage, and computation.",
+                    &["read:matrix", "write:matrix"],
                 ),
                 kernel_capability(
                     "cowd.structured_data.core",
@@ -115,6 +149,22 @@ impl CowdCapabilityRegistry {
                     "runtime::structured_data",
                     "Source, mapping, fact, evidence, ingest, watermark and delta contracts.",
                     &["read:structured_data", "write:structured_data"],
+                ),
+                kernel_capability(
+                    "cowd.growth.channel",
+                    "Growth Channel",
+                    CowdCapabilityKind::Fact,
+                    "ai_kernel::growth",
+                    "Candidate promotion channel from runtime events into fact-kernel, Memory, and Matrix.",
+                    &["read:growth", "write:growth"],
+                ),
+                kernel_capability(
+                    "cowd.audit.trace",
+                    "Audit Trace",
+                    CowdCapabilityKind::Governance,
+                    "gateway::services::AuditService",
+                    "Approval, risk, promotion, and execution trace governance.",
+                    &["read:audit"],
                 ),
                 kernel_capability(
                     "cowd.runtime.event",
@@ -245,8 +295,14 @@ mod tests {
 
         assert!(registry.ids_are_unique());
         assert!(registry.capability("cowd.runtime.session").is_some());
+        assert!(registry.capability("cowd.reality.core").is_some());
+        assert!(registry.capability("cowd.reality.fact_flow").is_some());
+        assert!(registry.capability("cowd.fact.kernel").is_some());
         assert!(registry.capability("cowd.context.runtime").is_some());
         assert!(registry.capability("cowd.memory.runtime").is_some());
+        assert!(registry.capability("cowd.matrix.engine").is_some());
+        assert!(registry.capability("cowd.growth.channel").is_some());
+        assert!(registry.capability("cowd.audit.trace").is_some());
         assert!(registry.capability("cowd.structured_data.core").is_some());
     }
 
@@ -274,18 +330,21 @@ mod tests {
     }
 
     #[test]
-    fn capability_registry_excludes_matrix_and_mfg_application_boundaries() {
+    fn capability_registry_declares_matrix_as_reality_core_engine_without_mfg_ownership() {
         let registry = CowdCapabilityRegistry::core();
 
-        assert!(registry.capability("cowd.matrix.runtime").is_none());
+        let matrix = registry
+            .capability("cowd.matrix.engine")
+            .expect("matrix engine capability should exist");
+        assert_eq!(matrix.layer, CowdCapabilityLayer::Kernel);
+        assert_eq!(matrix.kind, CowdCapabilityKind::StructuredData);
+        assert_eq!(matrix.owner_module, "matrix");
+        assert!(matrix.description.contains("Structured facts"));
         assert!(registry
             .capability("mfg.manufacturing.application")
             .is_none());
         assert!(registry.capabilities.iter().all(|capability| {
-            !capability.id.contains("matrix")
-                && !capability.id.starts_with("mfg.")
-                && capability.owner_module != "matrix"
-                && capability.owner_module != "app-mfg"
+            !capability.id.starts_with("mfg.") && capability.owner_module != "app-mfg"
         }));
     }
 

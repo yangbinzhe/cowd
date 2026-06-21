@@ -373,8 +373,8 @@ pub struct TuiState {
     /// Agent team panel showing team hierarchy and status.
     pub agent_team_panel: AgentTeamPanel,
 
-    /// L4 knowledge view showing shared/team-scoped memory entries.
-    pub l4_knowledge_view: L4KnowledgeView,
+    /// L4 memory view showing shared/team-scoped memory entries.
+    pub l4_memory_view: L4MemoryView,
 
     /// Thinking panel for reasoning + tool progress during active turns.
     pub thinking_panel: ThinkingPanel,
@@ -538,7 +538,7 @@ impl TuiState {
         let toast_manager = ToastManager::new();
         let agents_overlay = AgentsOverlay::new();
         let agent_team_panel = AgentTeamPanel::new();
-        let l4_knowledge_view = L4KnowledgeView::new();
+        let l4_memory_view = L4MemoryView::new();
         let thinking_panel = ThinkingPanel::new();
         let command_palette = CommandPalette::new();
         let question_form = None;
@@ -588,7 +588,7 @@ impl TuiState {
             memory_panel_last_sync: None,
             agents_overlay,
             agent_team_panel,
-            l4_knowledge_view,
+            l4_memory_view,
             thinking_panel,
             command_palette,
             question_form,
@@ -1273,10 +1273,10 @@ impl TuiState {
             }
         }
 
-        // 5.5 Keep L4 knowledge cached, but do not auto-render it as a startup
+        // 5.5 Keep L4 memory cached, but do not auto-render it as a startup
         // overlay. The full memory/L4 surfaces are opened explicitly from the
         // sidebar/topic panels so they cannot cover the first screen.
-        self.l4_knowledge_view.sync_from_app(&self.app);
+        self.l4_memory_view.sync_from_app(&self.app);
 
         // 6. Render toast notifications at top-right
         if !self.toast_manager.is_empty() {
@@ -3658,14 +3658,14 @@ pub enum StartupPhase {
 const STARTUP_SHOW_DELAY_MS: u64 = 500;
 const STARTUP_MIN_DISPLAY_MS: u64 = 3000;
 
-// ── L4KnowledgeView ──────────────────────────────────────────────
+// ── L4MemoryView ─────────────────────────────────────────────────
 
 /// Displays L4 (shared/team-scoped) memory entries in the overlay layer.
 ///
 /// Synced from `MemoryOrchestrator` each render frame when available.
 /// Shows a compact list of recent L4 memory entries with title, tags,
 /// and confidence.
-pub struct L4KnowledgeView {
+pub struct L4MemoryView {
     /// Cached L4 entry titles (synced from orchestrator).
     pub entries: Vec<String>,
     /// Whether the view has been synced at least once.
@@ -3676,8 +3676,8 @@ pub struct L4KnowledgeView {
     last_sync_at: Option<Instant>,
 }
 
-impl L4KnowledgeView {
-    /// Create a new empty L4KnowledgeView.
+impl L4MemoryView {
+    /// Create a new empty L4MemoryView.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -3713,14 +3713,14 @@ impl L4KnowledgeView {
         self.last_sync_at = Some(Instant::now());
     }
 
-    /// Render the L4 knowledge view as a compact overlay.
+    /// Render the L4 memory view as a compact overlay.
     pub fn render(&self, ctx: &mut crate::components::RenderContext, area: ratatui::layout::Rect) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
 
         let block = Block::default()
-            .title(" L4 Knowledge ")
+            .title(" L4 Memory ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan));
 
@@ -3811,7 +3811,7 @@ where
     }
 }
 
-impl Default for L4KnowledgeView {
+impl Default for L4MemoryView {
     fn default() -> Self {
         Self::new()
     }
@@ -3983,11 +3983,11 @@ mod tests {
             content: "TUI L4 Decision".to_string(),
             priority: "high".to_string(),
         }];
-        state.l4_knowledge_view.sync_from_app(&state.app);
+        state.l4_memory_view.sync_from_app(&state.app);
 
         assert!(
             state
-                .l4_knowledge_view
+                .l4_memory_view
                 .entries
                 .iter()
                 .any(|entry| entry.contains("TUI L4 Decision")),

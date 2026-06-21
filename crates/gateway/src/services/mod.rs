@@ -21,6 +21,7 @@ mod matrix_service;
 mod memory_service;
 mod mfg_service;
 mod policy;
+pub(crate) mod reality_service;
 mod receipt;
 mod registry;
 mod session_service;
@@ -42,6 +43,7 @@ pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
     MfgService,
 };
+pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
 pub(crate) use session_service::{SessionService, SessionUpdateRequest};
 pub(crate) use skill_service::{
@@ -219,7 +221,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.353 Provider service boundary",
+            owner: "0.9.354 Provider service boundary",
         }
     }
 
@@ -306,7 +308,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.353 Growth service boundary",
+            owner: "0.9.354 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -453,6 +455,7 @@ pub(crate) struct GatewayServices {
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
     pub(crate) provider: ProviderService,
+    pub(crate) reality: RealityService,
     pub(crate) growth: GrowthService,
     pub(crate) workspace: WorkspaceService,
     pub(crate) skill: SkillService,
@@ -673,7 +676,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.353 GatewayServices");
+        assert_eq!(services.owner, "0.9.354 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
@@ -693,6 +696,7 @@ mod tests {
                 "system",
                 "audit",
                 "provider",
+                "reality",
                 "growth",
                 "workspace",
                 "skill",
@@ -730,6 +734,8 @@ mod tests {
             services.provider.config_projection_contract().operation,
             "config_projection"
         );
+        assert_eq!(services.reality.status_contract().operation, "status");
+        assert_eq!(services.reality.flow_contract().operation, "flow");
         assert_eq!(
             services.growth.risk_gate_event_contract().operation,
             "risk_gate_event"

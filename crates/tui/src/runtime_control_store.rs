@@ -115,6 +115,27 @@ pub struct StructuredDataSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealityCoreSummary {
+    pub status: String,
+    pub memory_status: String,
+    pub matrix_status: String,
+    pub growth_status: String,
+    pub context_status: String,
+    pub audit_status: String,
+    pub degraded_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FactFlowSummary {
+    pub source: String,
+    pub session_id: Option<String>,
+    pub stage_count: u64,
+    pub event_count: u64,
+    pub promotion_count: u64,
+    pub boundary_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub gateway_running: bool,
     pub active_sessions: usize,
@@ -143,6 +164,8 @@ pub struct RuntimeControlSnapshot {
     pub surface_events: Vec<SurfaceEventSummary>,
     pub cowd_kernel: Option<CowdKernelSummary>,
     pub structured_data: Option<StructuredDataSummary>,
+    pub reality_core: Option<RealityCoreSummary>,
+    pub fact_flow: Option<FactFlowSummary>,
     pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
@@ -212,6 +235,8 @@ impl RuntimeControlSnapshot {
             surface_events: app.gateway_surface_events.clone(),
             cowd_kernel: app.gateway_cowd_kernel.clone(),
             structured_data: app.gateway_structured_data.clone(),
+            reality_core: app.gateway_reality_core.clone(),
+            fact_flow: app.gateway_fact_flow.clone(),
             connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
             degraded_reasons: app.gateway_degraded_reasons.clone(),
             ..Self::default()
@@ -254,6 +279,8 @@ impl RuntimeControlSnapshot {
         app.gateway_surface_events = self.surface_events.clone();
         app.gateway_cowd_kernel = self.cowd_kernel.clone();
         app.gateway_structured_data = self.structured_data.clone();
+        app.gateway_reality_core = self.reality_core.clone();
+        app.gateway_fact_flow = self.fact_flow.clone();
         app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.gateway_degraded_reasons = self.degraded_reasons.clone();
         app.gateway_lease_owner = self.lease_owner.clone();
@@ -438,6 +465,56 @@ impl RuntimeControlSnapshot {
             sample_facts: structured_samples(facts, &["fact_id", "id"]),
             sample_evidence: structured_samples(evidence, &["evidence_id", "id"]),
             sample_watermarks: structured_samples(watermarks, &["source_ref", "id"]),
+        });
+    }
+
+    pub fn ingest_reality_status(&mut self, value: &serde_json::Value) {
+        self.reality_core = Some(RealityCoreSummary {
+            status: value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            memory_status: reality_component_status(value, "memory"),
+            matrix_status: reality_component_status(value, "matrix"),
+            growth_status: reality_component_status(value, "growth"),
+            context_status: reality_component_status(value, "context"),
+            audit_status: reality_component_status(value, "audit"),
+            degraded_reasons: value
+                .get("degraded_reasons")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        });
+    }
+
+    pub fn ingest_fact_flow(
+        &mut self,
+        flow: &serde_json::Value,
+        boundaries: Option<&serde_json::Value>,
+    ) {
+        self.fact_flow = Some(FactFlowSummary {
+            source: flow
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            session_id: flow
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            stage_count: json_array_len(flow, "stages"),
+            event_count: json_array_len(flow, "events"),
+            promotion_count: json_array_len(flow, "promotions"),
+            boundary_count: boundaries
+                .map(|value| json_array_len(value, "boundaries"))
+                .unwrap_or_default(),
         });
     }
 
@@ -838,6 +915,30 @@ fn structured_samples(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn reality_component_status(value: &serde_json::Value, component: &str) -> String {
+    value
+        .get("engines")
+        .and_then(|engines| engines.get(component))
+        .and_then(|engine| engine.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get(component)
+                .and_then(|engine| engine.get("status"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn json_array_len(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or_default()
+}
+
 fn connector_account_from_json(value: &serde_json::Value) -> Option<ConnectorAccountSummary> {
     let provider = value.get("provider").and_then(serde_json::Value::as_str)?;
     let account_id = value
@@ -1081,6 +1182,33 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
         Err(err) => snapshot.degrade(format!("memory Gateway API unavailable: {err}")),
+    }
+    let (reality_status, reality_flow, reality_boundaries) = tokio::join!(
+        projection.reality_status(),
+        projection.reality_flow(session_id),
+        projection.reality_boundaries()
+    );
+    match (reality_status, reality_flow, reality_boundaries) {
+        (Ok(status), Ok(flow), Ok(boundaries)) => {
+            snapshot.ingest_reality_status(&status);
+            snapshot.ingest_fact_flow(&flow, Some(&boundaries));
+        }
+        (status, flow, boundaries) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = status {
+                reasons.push(format!("status: {err}"));
+            }
+            if let Err(err) = flow {
+                reasons.push(format!("fact flow: {err}"));
+            }
+            if let Err(err) = boundaries {
+                reasons.push(format!("boundaries: {err}"));
+            }
+            snapshot.degrade(format!(
+                "reality core projection unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
     }
     let (capabilities, projection_state, surfaces, release_gate) = tokio::join!(
         projection.cowd_capabilities(),
@@ -1379,6 +1507,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_extracts_reality_core_and_fact_flow_summaries() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_reality_status(&serde_json::json!({
+            "kind": "reality.status",
+            "status": "ready",
+            "engines": {
+                "memory": {"status": "ready"},
+                "matrix": {"status": "ready"},
+                "growth": {"status": "ready"},
+                "context": {"status": "ready"},
+                "audit": {"status": "ready"}
+            },
+            "degraded_reasons": []
+        }));
+        snapshot.ingest_fact_flow(
+            &serde_json::json!({
+                "kind": "reality.fact_flow",
+                "source": "growth.promotions",
+                "session_id": "session-fact",
+                "stages": [{"id": "capture"}, {"id": "promote"}],
+                "events": [{"event_id": "event-1"}],
+                "promotions": [{"target": "memory"}]
+            }),
+            Some(&serde_json::json!({
+                "kind": "reality.boundaries",
+                "boundaries": [{"name": "memory"}, {"name": "matrix"}]
+            })),
+        );
+
+        let reality = snapshot.reality_core.as_ref().expect("reality summary");
+        assert_eq!(reality.status, "ready");
+        assert_eq!(reality.memory_status, "ready");
+        assert_eq!(reality.matrix_status, "ready");
+        assert_eq!(reality.growth_status, "ready");
+
+        let flow = snapshot.fact_flow.as_ref().expect("fact flow summary");
+        assert_eq!(flow.source, "growth.promotions");
+        assert_eq!(flow.session_id.as_deref(), Some("session-fact"));
+        assert_eq!(flow.stage_count, 2);
+        assert_eq!(flow.event_count, 1);
+        assert_eq!(flow.promotion_count, 1);
+        assert_eq!(flow.boundary_count, 2);
+    }
+
+    #[test]
     fn snapshot_round_trips_cowd_structured_through_app() {
         let mut app = App::new("claude-sonnet-4-6", "session-cowd-structured");
         let snapshot = RuntimeControlSnapshot {
@@ -1400,6 +1573,23 @@ mod tests {
                 sample_evidence: vec!["evidence-a".to_string()],
                 sample_watermarks: vec!["pack-a".to_string()],
             }),
+            reality_core: Some(RealityCoreSummary {
+                status: "ready".to_string(),
+                memory_status: "ready".to_string(),
+                matrix_status: "ready".to_string(),
+                growth_status: "ready".to_string(),
+                context_status: "ready".to_string(),
+                audit_status: "ready".to_string(),
+                degraded_reasons: Vec::new(),
+            }),
+            fact_flow: Some(FactFlowSummary {
+                source: "growth.promotions".to_string(),
+                session_id: Some("session-cowd-structured".to_string()),
+                stage_count: 5,
+                event_count: 2,
+                promotion_count: 1,
+                boundary_count: 4,
+            }),
             ..RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot())
         };
 
@@ -1416,10 +1606,22 @@ mod tests {
                 .map(|data| data.fact_count),
             Some(3)
         );
+        assert_eq!(
+            app.gateway_reality_core
+                .as_ref()
+                .map(|reality| reality.status.as_str()),
+            Some("ready")
+        );
+        assert_eq!(
+            app.gateway_fact_flow.as_ref().map(|flow| flow.stage_count),
+            Some(5)
+        );
 
         let restored = RuntimeControlSnapshot::from_app(&app);
         assert_eq!(restored.cowd_kernel, snapshot.cowd_kernel);
         assert_eq!(restored.structured_data, snapshot.structured_data);
+        assert_eq!(restored.reality_core, snapshot.reality_core);
+        assert_eq!(restored.fact_flow, snapshot.fact_flow);
     }
 
     #[test]

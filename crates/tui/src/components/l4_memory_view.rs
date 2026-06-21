@@ -11,13 +11,13 @@ use ratatui::{
 use crate::app::{App, MemoryEntry};
 use crate::components::{Component, EventResult, RenderContext};
 
-pub struct L4KnowledgeView {
+pub struct L4MemoryView {
     entries: Vec<MemoryEntry>,
     selected: usize,
     visible: bool,
 }
 
-impl L4KnowledgeView {
+impl L4MemoryView {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -43,13 +43,13 @@ impl L4KnowledgeView {
     }
 }
 
-impl Default for L4KnowledgeView {
+impl Default for L4MemoryView {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Component for L4KnowledgeView {
+impl Component for L4MemoryView {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         if !self.visible {
             return;
@@ -87,7 +87,7 @@ impl Component for L4KnowledgeView {
             }
         }
         let block = Block::default()
-            .title(" L4 Knowledge ")
+            .title(" L4 Memory ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
         ctx.frame_mut().render_widget(
@@ -120,7 +120,7 @@ impl Component for L4KnowledgeView {
     }
 
     fn id(&self) -> &str {
-        "l4_knowledge_view"
+        "l4_memory_view"
     }
 }
 

@@ -402,6 +402,25 @@ impl GatewayApiClient {
         self.get_json("/api/memory/status").await
     }
 
+    pub async fn reality_status(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/reality/status").await
+    }
+
+    pub async fn reality_flow(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let path = match session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => format!("/api/reality/flow?session_id={}", url_encode(id)),
+            None => "/api/reality/flow".to_string(),
+        };
+        self.get_json(&path).await
+    }
+
+    pub async fn reality_boundaries(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/reality/boundaries").await
+    }
+
     pub async fn task_status(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/tasks").await
     }
@@ -1073,6 +1092,9 @@ mod tests {
             "complete_task",
             "pending_approvals",
             "memory_status",
+            "reality_status",
+            "reality_flow",
+            "reality_boundaries",
             "context_snapshot",
             "respond_approval",
             "connector_resources",
@@ -1120,7 +1142,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 61);
+        assert_eq!(migrated.len(), 64);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -1232,6 +1254,67 @@ mod tests {
         assert_eq!(
             client.structured_watermarks().await.expect("watermarks")["kind"],
             "cowd.structured.watermarks"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn reality_projection_gets_status_flow_and_boundaries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "/api/reality/status",
+                    r#"{"kind":"reality.status","status":"ready","engines":{}}"#,
+                ),
+                (
+                    "/api/reality/flow?session_id=session-tui",
+                    r#"{"kind":"reality.fact_flow","source":"growth.promotions","session_id":"session-tui","stages":[],"events":[],"promotions":[]}"#,
+                ),
+                (
+                    "/api/reality/boundaries",
+                    r#"{"kind":"reality.boundaries","boundaries":[]}"#,
+                ),
+            ];
+            for (path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept reality");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read reality");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with(&format!("GET {path} HTTP/1.1")),
+                    "unexpected request: {req}"
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write reality");
+            }
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        assert_eq!(
+            client.reality_status().await.expect("status")["kind"],
+            "reality.status"
+        );
+        assert_eq!(
+            client
+                .reality_flow(Some("session-tui"))
+                .await
+                .expect("flow")["source"],
+            "growth.promotions"
+        );
+        assert_eq!(
+            client.reality_boundaries().await.expect("boundaries")["kind"],
+            "reality.boundaries"
         );
         server.await.expect("server task");
     }

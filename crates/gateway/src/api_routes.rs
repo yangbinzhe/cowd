@@ -11,7 +11,7 @@ use std::{
 use axum::{
     body::Body,
     extract::State as AxumState,
-    http::{header, Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json},
     Router,
@@ -65,6 +65,7 @@ mod mfg_outcomes;
 mod mfg_routes;
 mod profile_routes;
 mod public_routes;
+mod reality_routes;
 mod runtime_routes;
 mod session_routes;
 mod skill_routes;
@@ -197,6 +198,10 @@ async fn auth_middleware(
     next: Next,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if let Some(token) = &state.auth_token {
+        if is_webui_internal_request(request.headers()) {
+            return Ok(next.run(request).await);
+        }
+
         let auth_header = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -214,6 +219,25 @@ async fn auth_middleware(
     } else {
         Ok(next.run(request).await)
     }
+}
+
+fn is_webui_internal_request(headers: &HeaderMap) -> bool {
+    let Some(fetch_site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    if fetch_site != "same-origin" {
+        return false;
+    }
+
+    let destination = headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    destination == "empty" || destination == "document"
 }
 
 // ── Router ─────────────────────────────────────────────────────
@@ -236,6 +260,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(memory_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
+        .merge(reality_routes::router())
         .merge(runtime_routes::router())
         .merge(session_routes::router())
         .merge(skill_routes::router())
@@ -1977,6 +2002,52 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
         assert!(config_home.join("storage").join("matrix.sqlite").exists());
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn reality_core_routes_expose_stable_read_only_projection() {
+        let workspace = test_temp_dir("reality-core");
+        let config_home = test_temp_dir("reality-core-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        for (uri, kind) in [
+            ("/api/reality/status", "reality.status"),
+            ("/api/reality/static", "reality.static"),
+            ("/api/reality/flow", "reality.fact_flow"),
+            ("/api/reality/promotions", "reality.promotions"),
+            ("/api/reality/boundaries", "reality.boundaries"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["kind"], kind, "{uri}");
+            assert!(json.get("envelope").is_some(), "{uri}");
+        }
+
+        let flow = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reality/flow?session_id=session-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(flow.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "growth.promotions");
+        assert!(json["stages"].as_array().is_some());
+
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
     }
@@ -9690,6 +9761,80 @@ providers:
             .oneshot(
                 Request::builder()
                     .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webui_same_origin_requests_bypass_browser_token_handling() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
+        let state = Arc::new(AppState {
+            tool_registry: tools,
+            config: None,
+            event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
+            approval_gate: None,
+            auth_token: Some("test-token".into()),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            services: test_services(session_kernel, task_kernel, None),
+            session_lease_registry: None,
+        });
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("sec-fetch-dest", "empty")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_site_requests_still_require_bearer_auth() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let task_kernel = test_task_kernel();
+        let state = Arc::new(AppState {
+            tool_registry: tools,
+            config: None,
+            event_bus,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
+            approval_gate: None,
+            auth_token: Some("test-token".into()),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            services: test_services(session_kernel, task_kernel, None),
+            session_lease_registry: None,
+        });
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .header("sec-fetch-site", "cross-site")
+                    .header("sec-fetch-dest", "empty")
                     .body(Body::empty())
                     .unwrap(),
             )

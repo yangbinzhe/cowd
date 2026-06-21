@@ -610,17 +610,49 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && gateway_approval_routes.contains("&state.services.matrix"),
         "approval API must expose risk receipt projection through audit and durable growth promotion services"
     );
-    let gateway_services =
-        production_part(&read_repo("crates/gateway/src/services/mod.rs")).to_string();
+    let gateway_services = read_repo("crates/gateway/src/services/mod.rs");
+    let gateway_service_registry = read_repo("crates/gateway/src/services/registry.rs");
     assert!(
         gateway_services.contains("pub(crate) struct ProviderService")
             && gateway_services.contains("pub(crate) struct GrowthService")
             && gateway_services.contains("config_projection")
             && gateway_services.contains("risk_gate_event")
+            && gateway_services.contains("pub(crate) use reality_service::RealityService")
+            && gateway_services.contains("pub(crate) reality: RealityService")
+            && gateway_service_registry.contains("reality: RealityService::new()")
+            && gateway_service_registry.contains("contracts.extend(self.reality.contracts())")
             && gateway_services.contains("risk_gate_projection"),
-        "GatewayServices must include concrete provider, growth, and audit projections"
+        "GatewayServices must include concrete provider, reality, growth, and audit projections"
     );
     let api_routes = read_repo("crates/gateway/src/api_routes.rs");
+    let reality_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/reality_routes.rs",
+    ))
+    .to_string();
+    assert!(
+        api_routes.contains("mod reality_routes")
+            && api_routes.contains(".merge(reality_routes::router())")
+            && reality_routes.contains("/api/reality/status")
+            && reality_routes.contains("/api/reality/static")
+            && reality_routes.contains("/api/reality/flow")
+            && reality_routes.contains("/api/reality/promotions")
+            && reality_routes.contains("/api/reality/boundaries"),
+        "Reality Core must expose read-only /api/reality/* projections"
+    );
+    let reality_service =
+        production_part(&read_repo("crates/gateway/src/services/reality_service.rs")).to_string();
+    assert!(
+        reality_service.contains("pub(crate) struct RealityService")
+            && reality_service.contains("FactFlowProjection")
+            && reality_service.contains("status_projection")
+            && reality_service.contains("flow_projection")
+            && reality_service.contains("MemoryService")
+            && reality_service.contains("MatrixService")
+            && reality_service.contains("GrowthService")
+            && !reality_service.contains("remember_entry_with_context(")
+            && !reality_service.contains("ingest_fact("),
+        "RealityService must be a read-only projection over Memory, Matrix, and Growth"
+    );
     let growth_routes =
         production_part(&read_repo("crates/gateway/src/api_routes/growth_routes.rs")).to_string();
     assert!(

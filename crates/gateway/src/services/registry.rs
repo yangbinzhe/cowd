@@ -51,13 +51,14 @@ impl GatewayServices {
             system: SystemService::new(),
             audit: AuditService::new(),
             provider: ProviderService::new(),
+            reality: RealityService::new(),
             growth: GrowthService::new(),
             workspace: WorkspaceService::new(),
             skill: SkillService::new(),
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.353 GatewayServices",
+            owner: "0.9.354 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -128,6 +129,7 @@ impl GatewayServices {
             self.system.label,
             self.audit.label,
             self.provider.label,
+            self.reality.label,
             self.growth.label,
             self.workspace.label,
             self.skill.label,
@@ -151,6 +153,7 @@ impl GatewayServices {
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
         contracts.extend(self.provider.contracts());
+        contracts.extend(self.reality.contracts());
         contracts.extend(self.growth.contracts());
         contracts.extend(self.workspace.contracts());
         contracts.extend(self.skill.contracts());
@@ -207,6 +210,11 @@ impl GatewayServices {
             ("audit", "risk_gate_projection"),
             ("provider", "config_projection"),
             ("provider", "model_routing"),
+            ("reality", "status"),
+            ("reality", "static"),
+            ("reality", "flow"),
+            ("reality", "promotions"),
+            ("reality", "boundaries"),
             ("growth", "risk_gate_event"),
             ("growth", "memory_candidates"),
             ("growth", "matrix_signals"),

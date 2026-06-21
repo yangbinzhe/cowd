@@ -23,8 +23,8 @@ use crate::{
     app::App,
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-        CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary,
-        SurfaceHealthSummary, SurfaceSummary,
+        CowdKernelSummary, FactFlowSummary, RealityCoreSummary, RuntimeActionReceiptSummary,
+        StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
     },
 };
 
@@ -61,6 +61,10 @@ pub struct GatewayPanel {
     pub cowd_kernel: Option<CowdKernelSummary>,
     /// Structured data-plane summary.
     pub structured_data: Option<StructuredDataSummary>,
+    /// Reality Core engine health summary.
+    pub reality_core: Option<RealityCoreSummary>,
+    /// Fact Flow trace summary.
+    pub fact_flow: Option<FactFlowSummary>,
     /// Surface registry summaries managed by Gateway SurfaceHost.
     pub surfaces: Vec<SurfaceSummary>,
     /// Surface host health summary.
@@ -100,6 +104,8 @@ impl GatewayPanel {
             execution_receipts: Vec::new(),
             cowd_kernel: None,
             structured_data: None,
+            reality_core: None,
+            fact_flow: None,
             surfaces: Vec::new(),
             surface_health: None,
             connector_accounts: Vec::new(),
@@ -135,6 +141,8 @@ impl GatewayPanel {
         self.surface_health = app.gateway_surface_health.clone();
         self.cowd_kernel = app.gateway_cowd_kernel.clone();
         self.structured_data = app.gateway_structured_data.clone();
+        self.reality_core = app.gateway_reality_core.clone();
+        self.fact_flow = app.gateway_fact_flow.clone();
         self.connector_degraded_reasons = app.gateway_connector_degraded_reasons.clone();
         self.degraded_reasons = app.gateway_degraded_reasons.clone();
         if app.server_running {
@@ -321,6 +329,83 @@ impl Component for GatewayPanel {
                     Span::styled("Memory: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(memory_status.clone(), Style::default().fg(Color::Green)),
                 ]));
+            }
+
+            if let Some(reality) = self.reality_core.as_ref() {
+                let status_color = match reality.status.as_str() {
+                    "ready" => Color::Green,
+                    "degraded" => Color::Yellow,
+                    _ => Color::White,
+                };
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Reality Core ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Core: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(reality.status.clone(), Style::default().fg(status_color)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Engines: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "memory {} · matrix {} · growth {}",
+                            reality.memory_status, reality.matrix_status, reality.growth_status
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Bridge: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "context {} · audit {}",
+                            reality.context_status, reality.audit_status
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+                if !reality.degraded_reasons.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Reality degraded: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            reality
+                                .degraded_reasons
+                                .iter()
+                                .take(2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" · "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+
+            if let Some(flow) = self.fact_flow.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Fact Flow: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "stages {}, events {}, promotions {}, boundaries {}",
+                            flow.stage_count,
+                            flow.event_count,
+                            flow.promotion_count,
+                            flow.boundary_count
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+                if let Some(session_id) = flow.session_id.as_ref() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Session: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{} · {}", session_id, flow.source),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
             }
 
             if let Some(kernel) = self.cowd_kernel.as_ref() {
@@ -697,6 +782,11 @@ impl Component for GatewayPanel {
             ("GET  /api/memory", "Memory status"),
             ("GET  /api/memory/stats", "Memory statistics"),
             ("GET  /api/memory/search", "Search memory"),
+            ("GET  /api/reality/status", "Reality Core health"),
+            ("GET  /api/reality/static", "Reality Core map"),
+            ("GET  /api/reality/flow", "Fact Flow trace"),
+            ("GET  /api/reality/promotions", "Growth promotion trace"),
+            ("GET  /api/reality/boundaries", "Reality boundary map"),
             ("GET  /api/config", "View config"),
             ("PUT  /api/config", "Update config"),
             ("GET  /api/platforms", "List platforms"),
@@ -1080,6 +1170,62 @@ mod tests {
     }
 
     #[test]
+    fn render_shows_reality_core_and_fact_flow_state() {
+        use crate::skin::SkinConfig;
+        use crate::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.reality_core = Some(RealityCoreSummary {
+            status: "ready".to_string(),
+            memory_status: "ready".to_string(),
+            matrix_status: "ready".to_string(),
+            growth_status: "ready".to_string(),
+            context_status: "ready".to_string(),
+            audit_status: "ready".to_string(),
+            degraded_reasons: Vec::new(),
+        });
+        panel.fact_flow = Some(FactFlowSummary {
+            source: "growth.promotions".to_string(),
+            session_id: Some("session-tui".to_string()),
+            stage_count: 5,
+            event_count: 2,
+            promotion_count: 1,
+            boundary_count: 4,
+        });
+
+        let mut terminal = MockTerminal::new(100, 34);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 100, 34));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Reality Core"),
+            "Should show Reality Core section, got: {joined}"
+        );
+        assert!(
+            joined.contains("memory ready")
+                && joined.contains("matrix ready")
+                && joined.contains("growth ready"),
+            "Should show Reality engines, got: {joined}"
+        );
+        assert!(
+            joined.contains("Fact Flow")
+                && joined.contains("stages 5")
+                && joined.contains("promotions 1")
+                && joined.contains("boundaries 4"),
+            "Should show Fact Flow summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("session-tui") && joined.contains("growth.promotions"),
+            "Should show Fact Flow session/source, got: {joined}"
+        );
+    }
+
+    #[test]
     fn render_shows_api_endpoints() {
         use crate::skin::SkinConfig;
         use crate::test_utils::MockTerminal;
@@ -1108,6 +1254,14 @@ mod tests {
         assert!(
             joined.contains("/api/memory"),
             "Should show memory endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/reality/status")
+                && joined.contains("/api/reality/static")
+                && joined.contains("/api/reality/flow")
+                && joined.contains("/api/reality/promotions")
+                && joined.contains("/api/reality/boundaries"),
+            "Should show Reality Core endpoints, got: {joined}"
         );
         assert!(
             joined.contains("/api/config"),
