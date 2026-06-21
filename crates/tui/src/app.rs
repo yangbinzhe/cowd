@@ -2,7 +2,8 @@
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary, TaskSummary,
+    CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary,
+    SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
 use crate::CowdEvent;
 use ratatui::widgets::{Block, Borders};
@@ -228,6 +229,12 @@ pub struct App {
     pub gateway_connector_resources: Vec<ConnectorResourceSummary>,
     /// Recent runtime action receipts produced by TUI controls.
     pub gateway_action_receipts: Vec<RuntimeActionReceiptSummary>,
+    /// Surface registry summaries observed through Gateway SurfaceHost.
+    pub gateway_surfaces: Vec<SurfaceSummary>,
+    /// Surface host health observed through Gateway SurfaceHost.
+    pub gateway_surface_health: Option<SurfaceHealthSummary>,
+    /// Recent surface events observed through Gateway SurfaceHost.
+    pub gateway_surface_events: Vec<SurfaceEventSummary>,
     /// Cowd kernel capability and release-gate summary observed through projection API.
     pub gateway_cowd_kernel: Option<CowdKernelSummary>,
     /// Structured data-plane summary observed through projection API.
@@ -504,6 +511,9 @@ impl App {
             gateway_connector_capabilities: Vec::new(),
             gateway_connector_resources: Vec::new(),
             gateway_action_receipts: Vec::new(),
+            gateway_surfaces: Vec::new(),
+            gateway_surface_health: None,
+            gateway_surface_events: Vec::new(),
             gateway_cowd_kernel: None,
             gateway_structured_data: None,
             gateway_connector_degraded_reasons: Vec::new(),

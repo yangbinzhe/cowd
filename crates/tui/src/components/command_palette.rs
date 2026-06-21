@@ -454,6 +454,33 @@ impl CommandPalette {
             ));
         }
 
+        if !snapshot.surfaces.is_empty() || snapshot.surface_health.is_some() {
+            let health = snapshot.surface_health.as_ref();
+            self.all_commands.push(CommandEntry::dynamic(
+                "Inspect Surfaces",
+                format!(
+                    "{} surfaces, {} external, host {}",
+                    health
+                        .map(|item| item.surface_count)
+                        .unwrap_or(snapshot.surfaces.len() as u64),
+                    health.map(|item| item.external_surface_count).unwrap_or(0),
+                    health.map(|item| item.status.as_str()).unwrap_or("unknown")
+                ),
+                Action::Execute("/surfaces".into()),
+            ));
+            if let Some(surface) = snapshot
+                .surfaces
+                .iter()
+                .find(|surface| matches!(surface.status.as_str(), "unavailable" | "error"))
+            {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Inspect Surface Issue",
+                    format!("{} is {}", surface.id, surface.status),
+                    Action::Execute("/surfaces".into()),
+                ));
+            }
+        }
+
         if snapshot
             .connector_capabilities
             .iter()

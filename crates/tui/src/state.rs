@@ -49,6 +49,7 @@ use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
 use crate::components::skills_panel::SkillsPanel;
 use crate::components::status_bar::StatusBar;
+use crate::components::surface_panel::SurfacePanel;
 use crate::components::system_status_bar::SystemStatusBar;
 use crate::components::thinking_panel::ThinkingPanel;
 use crate::components::toast::{ToastManager, ToastVariant};
@@ -76,7 +77,7 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 9;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 10;
 pub(crate) const TAB_RUNTIME: usize = 0;
 pub(crate) const TAB_TOOLS: usize = 1;
 pub(crate) const TAB_CHANGES: usize = 2;
@@ -85,7 +86,8 @@ pub(crate) const TAB_APPROVALS: usize = 4;
 pub(crate) const TAB_TODO: usize = 5;
 pub(crate) const TAB_FILES: usize = 6;
 pub(crate) const TAB_SESSIONS: usize = 7;
-pub(crate) const TAB_GATEWAY: usize = 8;
+pub(crate) const TAB_SURFACES: usize = 8;
+pub(crate) const TAB_GATEWAY: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -157,7 +159,7 @@ impl SidebarTopicPanel {
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {
         vec![
-            "Run", "Tool", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Gate",
+            "Run", "Tool", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Surf", "Gate",
         ]
     } else {
         vec![
@@ -169,6 +171,7 @@ fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
             "Todo",
             "Files",
             "Sessions",
+            "Surfaces",
             "Gateway",
         ]
     }
@@ -435,6 +438,9 @@ pub struct TuiState {
     /// Gateway panel showing backend runtime/API gateway status.
     pub gateway_panel: GatewayPanel,
 
+    /// Surface panel showing Gateway-managed UI and external surface registry.
+    pub surface_panel: SurfacePanel,
+
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
@@ -449,7 +455,7 @@ pub struct TuiState {
     pub activity_panel_visible: bool,
 
     /// Active tab index in the sidebar.
-    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Gateway.
+    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=Gateway.
     pub sidebar_active_tab: usize,
 
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
@@ -561,6 +567,7 @@ impl TuiState {
         let performance_dashboard = PerformanceDashboard::new();
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
+        let surface_panel = SurfacePanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
@@ -607,6 +614,7 @@ impl TuiState {
             performance_dashboard,
             skills_panel,
             gateway_panel,
+            surface_panel,
             runtime_activity_panel,
             tool_ops_panel,
             system_status_bar,
@@ -774,6 +782,7 @@ impl TuiState {
                         self.session_sidebar
                             .set_current_session(&self.app.session_id);
                     }
+                    TAB_SURFACES => self.surface_panel.sync_from_app(&self.app),
                     TAB_GATEWAY => self.gateway_panel.sync_from_app(&self.app),
                     _ => {}
                 }
@@ -1115,6 +1124,14 @@ impl TuiState {
                                 "session_sidebar",
                                 AssertUnwindSafe(|| {
                                     self.session_sidebar.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        TAB_SURFACES => {
+                            let _ = error_recovery::catch_render_panic(
+                                "surface_panel",
+                                AssertUnwindSafe(|| {
+                                    self.surface_panel.render(&mut main_ctx, panel_area);
                                 }),
                             );
                         }
@@ -2208,6 +2225,7 @@ impl TuiState {
             TAB_TODO => self.todo_panel.handle_event(&event),
             TAB_FILES => self.file_tree.handle_event(&event),
             TAB_SESSIONS => self.session_sidebar.handle_event(&event),
+            TAB_SURFACES => self.surface_panel.handle_event(&event),
             TAB_GATEWAY => self.gateway_panel.handle_event(&event),
             _ => crate::components::EventResult::NotConsumed,
         } == crate::components::EventResult::Consumed;
@@ -2602,6 +2620,7 @@ impl TuiState {
             "todo" => Some((TAB_TODO, "Todo")),
             "files" => Some((TAB_FILES, "Files")),
             "sessions" => Some((TAB_SESSIONS, "Sessions")),
+            "surfaces" | "surface" => Some((TAB_SURFACES, "Surfaces")),
             "gateway" => Some((TAB_GATEWAY, "Gateway")),
             _ => None,
         }) else {
@@ -2624,6 +2643,7 @@ impl TuiState {
             "tasks" => self.open_sidebar_tab(TAB_GOALS, "Goals"),
             "approvals" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
             "session" | "resume" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
+            "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
             "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             _ => {}
         }
@@ -2679,6 +2699,7 @@ impl TuiState {
             "todo" => self.open_sidebar_tab(TAB_TODO, "Todo"),
             "files" => self.open_sidebar_tab(TAB_FILES, "Files"),
             "sessions" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
+            "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
             "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
             "memory" => self.open_topic_panel(SidebarTopicPanel::Memory),
@@ -3406,6 +3427,7 @@ impl TuiState {
         self.approval_cockpit_panel.sync_from_app(&self.app);
         self.goal_workbench_panel.sync_from_app(&self.app);
         self.gateway_panel.sync_from_app(&self.app);
+        self.surface_panel.sync_from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
     }
 

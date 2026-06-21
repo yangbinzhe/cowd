@@ -486,6 +486,75 @@ impl GatewayApiClient {
         self.get_json(&path).await
     }
 
+    pub async fn surface_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/surfaces").await
+    }
+
+    pub async fn surface_health_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/surfaces/health").await
+    }
+
+    pub async fn surface_detail(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_routes(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/routes", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_resources(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/resources", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_health(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/health", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_events(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/events", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_send(
+        &self,
+        id: &str,
+        recipient: &str,
+        thread: Option<&str>,
+        text: &str,
+        metadata: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/send", url_encode(id)),
+            serde_json::json!({
+                "recipient": recipient,
+                "thread": thread,
+                "text": text,
+                "metadata": metadata,
+            }),
+        )
+        .await
+    }
+
+    pub async fn surface_action(
+        &self,
+        id: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/action", url_encode(id)),
+            serde_json::json!({
+                "action": action,
+                "payload": payload,
+            }),
+        )
+        .await
+    }
+
     pub async fn connector_service_tools(
         &self,
         service: &str,
@@ -1242,11 +1311,46 @@ mod tests {
         let json = client
             .preflight_cross_plane_action(serde_json::json!({
                 "operation": "send_text",
-                "capability": "channel.feishu.send_text",
+                "capability": "surface.webui.send",
             }))
             .await
             .expect("json");
         assert_eq!(json["ready"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn surface_send_posts_gateway_surface_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/surfaces/webui/send HTTP/1.1"));
+            assert!(req.contains("\"recipient\":\"user:demo\""));
+            assert!(req.contains("\"text\":\"hello\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 39\r\n\r\n{\"kind\":\"surface.result\",\"status\":\"ok\"}",
+                )
+                .await
+                .expect("write");
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        let json = client
+            .surface_send(
+                "webui",
+                "user:demo",
+                None,
+                "hello",
+                serde_json::json!({"source": "test"}),
+            )
+            .await
+            .expect("json");
+        assert_eq!(json["status"], "ok");
         server.await.expect("server task");
     }
 

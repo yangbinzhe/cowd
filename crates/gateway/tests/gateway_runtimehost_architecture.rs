@@ -1210,6 +1210,49 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
 }
 
 #[test]
+fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_templates() {
+    let gateway_client =
+        production_part(&read_repo("crates/tui/src/gateway_client.rs")).to_string();
+    for required in [
+        "pub async fn surface_registry",
+        "pub async fn surface_health_summary",
+        "pub async fn surface_events",
+        "pub async fn surface_send",
+        "pub async fn surface_action",
+        "/api/surfaces",
+        "/api/surfaces/{}/send",
+        "/api/surfaces/{}/action",
+    ] {
+        assert!(
+            gateway_client.contains(required),
+            "TUI GatewayApiClient must expose Gateway surface API `{required}`"
+        );
+    }
+
+    for file in [
+        "crates/tui/src/components/gateway_panel.rs",
+        "crates/tui/src/components/command_palette.rs",
+        "crates/tui/src/state.rs",
+        "crates/tui/src/runner.rs",
+    ] {
+        let source = production_part(&read_repo(file)).to_string();
+        for forbidden in [
+            "channel.feishu.send_text",
+            "channel.feishu.send_image",
+            "channel.feishu.send_file",
+            "Cross-Plane Adapters",
+            "GatewayActionTemplate",
+            "GatewayAdapterCapability",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{file} must not retain legacy platform channel template `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     let runtime_manifest = read_repo("crates/runtime/Cargo.toml");
     let runtime_dependencies = manifest_dependencies(&runtime_manifest);

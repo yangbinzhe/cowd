@@ -62,6 +62,37 @@ pub struct RuntimeActionReceiptSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceSummary {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub lifecycle: String,
+    pub transport: String,
+    pub capability_count: u64,
+    pub route_count: u64,
+    pub resource_count: u64,
+    pub entry: Option<String>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceHealthSummary {
+    pub status: String,
+    pub surface_count: u64,
+    pub external_surface_count: u64,
+    pub route_count: u64,
+    pub resource_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceEventSummary {
+    pub surface: String,
+    pub event_type: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CowdKernelSummary {
     pub capability_count: u64,
     pub projection_capability_count: u64,
@@ -107,6 +138,9 @@ pub struct RuntimeControlSnapshot {
     pub connector_capabilities: Vec<ConnectorCapabilitySummary>,
     pub connector_resources: Vec<ConnectorResourceSummary>,
     pub action_receipts: Vec<RuntimeActionReceiptSummary>,
+    pub surfaces: Vec<SurfaceSummary>,
+    pub surface_health: Option<SurfaceHealthSummary>,
+    pub surface_events: Vec<SurfaceEventSummary>,
     pub cowd_kernel: Option<CowdKernelSummary>,
     pub structured_data: Option<StructuredDataSummary>,
     pub connector_degraded_reasons: Vec<String>,
@@ -173,6 +207,9 @@ impl RuntimeControlSnapshot {
             connector_capabilities: app.gateway_connector_capabilities.clone(),
             connector_resources: app.gateway_connector_resources.clone(),
             action_receipts: app.gateway_action_receipts.clone(),
+            surfaces: app.gateway_surfaces.clone(),
+            surface_health: app.gateway_surface_health.clone(),
+            surface_events: app.gateway_surface_events.clone(),
             cowd_kernel: app.gateway_cowd_kernel.clone(),
             structured_data: app.gateway_structured_data.clone(),
             connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
@@ -212,6 +249,9 @@ impl RuntimeControlSnapshot {
         app.gateway_connector_capabilities = self.connector_capabilities.clone();
         app.gateway_connector_resources = self.connector_resources.clone();
         app.gateway_action_receipts = self.action_receipts.clone();
+        app.gateway_surfaces = self.surfaces.clone();
+        app.gateway_surface_health = self.surface_health.clone();
+        app.gateway_surface_events = self.surface_events.clone();
         app.gateway_cowd_kernel = self.cowd_kernel.clone();
         app.gateway_structured_data = self.structured_data.clone();
         app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
@@ -445,6 +485,87 @@ impl RuntimeControlSnapshot {
         {
             self.connector_degraded_reasons.push(reason.to_string());
         }
+    }
+
+    pub fn ingest_surface_registry(&mut self, value: &serde_json::Value) {
+        self.surfaces = value
+            .pointer("/registry/surfaces")
+            .or_else(|| value.pointer("/surfaces"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(surface_summary_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_surface_health(&mut self, value: &serde_json::Value) {
+        let host = value.get("host").unwrap_or(value);
+        self.surface_health = Some(SurfaceHealthSummary {
+            status: host
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    value
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                })
+                .to_string(),
+            surface_count: host
+                .get("surface_count")
+                .or_else(|| value.get("surface_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(self.surfaces.len() as u64),
+            external_surface_count: host
+                .get("external_surface_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    self.surfaces
+                        .iter()
+                        .filter(|surface| surface.entry.is_some())
+                        .count() as u64
+                }),
+            route_count: host
+                .get("route_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    self.surfaces
+                        .iter()
+                        .map(|surface| surface.route_count)
+                        .sum()
+                }),
+            resource_count: host
+                .get("resource_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    self.surfaces
+                        .iter()
+                        .map(|surface| surface.resource_count)
+                        .sum()
+                }),
+        });
+    }
+
+    pub fn ingest_surface_events(&mut self, surface: &str, value: &serde_json::Value) {
+        let mut events = value
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| surface_event_summary_from_json(surface, item))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.surface_events.append(&mut events);
+        self.surface_events.truncate(24);
+    }
+
+    pub fn begin_surface_event_refresh(&mut self) {
+        self.surface_events.clear();
     }
 
     pub fn degrade(&mut self, reason: impl Into<String>) {
@@ -816,6 +937,109 @@ fn connector_resource_from_json(value: &serde_json::Value) -> Option<ConnectorRe
     })
 }
 
+fn surface_summary_from_json(value: &serde_json::Value) -> Option<SurfaceSummary> {
+    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    let capabilities = value
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or_default();
+    let routes = value
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or_default();
+    let resources = value
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or_default();
+    Some(SurfaceSummary {
+        id: id.to_string(),
+        name: value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id)
+            .to_string(),
+        kind: value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        status: value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        lifecycle: value
+            .get("lifecycle")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        transport: value
+            .get("transport")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("stdio-jsonl")
+            .to_string(),
+        capability_count: capabilities,
+        route_count: routes,
+        resource_count: resources,
+        entry: value
+            .get("entry")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        diagnostics: value
+            .get("diagnostics")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .take(3)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn surface_event_summary_from_json(
+    fallback_surface: &str,
+    value: &serde_json::Value,
+) -> Option<SurfaceEventSummary> {
+    let event_type = value
+        .get("type")
+        .or_else(|| value.get("event"))
+        .and_then(serde_json::Value::as_str)?;
+    let surface = value
+        .get("surface")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback_surface);
+    let detail = value
+        .get("message")
+        .or_else(|| value.get("code"))
+        .or_else(|| value.get("payload"))
+        .map(|item| match item.as_str() {
+            Some(text) => text.to_string(),
+            None => truncate_json(item),
+        })
+        .unwrap_or_default();
+    Some(SurfaceEventSummary {
+        surface: surface.to_string(),
+        event_type: event_type.to_string(),
+        detail,
+    })
+}
+
+fn truncate_json(value: &serde_json::Value) -> String {
+    let rendered = value.to_string();
+    if rendered.chars().count() <= 96 {
+        rendered
+    } else {
+        format!("{}...", rendered.chars().take(93).collect::<String>())
+    }
+}
+
 pub async fn refresh_runtime_control_snapshot(
     gateway_client: Option<&GatewayApiClient>,
     session_id: Option<&str>,
@@ -937,6 +1161,29 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.connector_resources(None, 20, 0).await {
         Ok(value) => snapshot.ingest_connector_resources(&value),
         Err(err) => snapshot.degrade(format!("connector resources unavailable: {err}")),
+    }
+    match projection.surface_registry().await {
+        Ok(value) => snapshot.ingest_surface_registry(&value),
+        Err(err) => snapshot.degrade(format!("surface registry unavailable: {err}")),
+    }
+    match projection.surface_health_summary().await {
+        Ok(value) => snapshot.ingest_surface_health(&value),
+        Err(err) => snapshot.degrade(format!("surface health unavailable: {err}")),
+    }
+    let surface_ids = snapshot
+        .surfaces
+        .iter()
+        .map(|surface| surface.id.clone())
+        .take(6)
+        .collect::<Vec<_>>();
+    snapshot.begin_surface_event_refresh();
+    for surface_id in surface_ids {
+        match projection.surface_events(&surface_id).await {
+            Ok(value) => snapshot.ingest_surface_events(&surface_id, &value),
+            Err(err) => {
+                snapshot.degrade(format!("surface `{surface_id}` events unavailable: {err}"))
+            }
+        }
     }
 
     if let Some(session_id) = session_id {
@@ -1215,6 +1462,40 @@ mod tests {
             .degraded_reasons
             .iter()
             .any(|reason| reason.contains("task")));
+    }
+
+    #[test]
+    fn surface_event_refresh_replaces_previous_batch() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+
+        snapshot.begin_surface_event_refresh();
+        snapshot.ingest_surface_events(
+            "webui",
+            &serde_json::json!({
+                "events": [{
+                    "type": "surface.message.sent",
+                    "surface": "webui",
+                    "message": "first"
+                }]
+            }),
+        );
+        assert_eq!(snapshot.surface_events.len(), 1);
+        assert_eq!(snapshot.surface_events[0].detail, "first");
+
+        snapshot.begin_surface_event_refresh();
+        snapshot.ingest_surface_events(
+            "webui",
+            &serde_json::json!({
+                "events": [{
+                    "type": "surface.message.sent",
+                    "surface": "webui",
+                    "message": "second"
+                }]
+            }),
+        );
+
+        assert_eq!(snapshot.surface_events.len(), 1);
+        assert_eq!(snapshot.surface_events[0].detail, "second");
     }
 
     #[test]

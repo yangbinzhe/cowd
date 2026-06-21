@@ -24,6 +24,7 @@ use crate::{
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
         CowdKernelSummary, RuntimeActionReceiptSummary, StructuredDataSummary,
+        SurfaceHealthSummary, SurfaceSummary,
     },
 };
 
@@ -54,16 +55,16 @@ pub struct GatewayPanel {
     pub lease_mode: Option<String>,
     /// Memory/kernel status visible through runtime control.
     pub memory_status: Option<String>,
-    /// Cross-plane adapter capability summaries.
-    pub adapter_capabilities: Vec<GatewayAdapterCapability>,
     /// Recent cross-plane execution receipts.
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
     /// Cowd kernel capability and release-gate summary.
     pub cowd_kernel: Option<CowdKernelSummary>,
     /// Structured data-plane summary.
     pub structured_data: Option<StructuredDataSummary>,
-    /// Recent dispatch target readiness summaries.
-    pub dispatch_targets: Vec<GatewayDispatchTarget>,
+    /// Surface registry summaries managed by Gateway SurfaceHost.
+    pub surfaces: Vec<SurfaceSummary>,
+    /// Surface host health summary.
+    pub surface_health: Option<SurfaceHealthSummary>,
     /// Connector provider account summaries.
     pub connector_accounts: Vec<ConnectorAccountSummary>,
     /// Connector capability summaries.
@@ -78,53 +79,7 @@ pub struct GatewayPanel {
     pub scroll_offset: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayAdapterCapability {
-    pub platform: String,
-    pub operation: String,
-    pub live_supported: bool,
-    pub adapter_bound: bool,
-}
-
 pub type GatewayExecutionReceipt = RuntimeActionReceiptSummary;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayDispatchTarget {
-    pub platform: String,
-    pub operation: String,
-    pub session_key: Option<String>,
-    pub ready: bool,
-    pub blockers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GatewayActionTemplate {
-    operation: &'static str,
-    capability: &'static str,
-    resource_ref: &'static str,
-    risk: &'static str,
-}
-
-const GATEWAY_ACTION_TEMPLATES: [GatewayActionTemplate; 3] = [
-    GatewayActionTemplate {
-        operation: "send_text",
-        capability: "channel.feishu.send_text",
-        resource_ref: "text://hello",
-        risk: "low",
-    },
-    GatewayActionTemplate {
-        operation: "send_image",
-        capability: "channel.feishu.send_image",
-        resource_ref: "image://https://example.test/panel.png",
-        risk: "high",
-    },
-    GatewayActionTemplate {
-        operation: "send_file",
-        capability: "channel.feishu.send_file",
-        resource_ref: "workspace://file/reports/panel.txt",
-        risk: "high",
-    },
-];
 
 impl GatewayPanel {
     /// Create a new GatewayPanel in default stopped state.
@@ -142,11 +97,11 @@ impl GatewayPanel {
             lease_owner: None,
             lease_mode: None,
             memory_status: None,
-            adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
             cowd_kernel: None,
             structured_data: None,
-            dispatch_targets: Vec::new(),
+            surfaces: Vec::new(),
+            surface_health: None,
             connector_accounts: Vec::new(),
             connector_capabilities: Vec::new(),
             connector_resources: Vec::new(),
@@ -176,6 +131,8 @@ impl GatewayPanel {
         self.connector_capabilities = app.gateway_connector_capabilities.clone();
         self.connector_resources = app.gateway_connector_resources.clone();
         self.execution_receipts = app.gateway_action_receipts.clone();
+        self.surfaces = app.gateway_surfaces.clone();
+        self.surface_health = app.gateway_surface_health.clone();
         self.cowd_kernel = app.gateway_cowd_kernel.clone();
         self.structured_data = app.gateway_structured_data.clone();
         self.connector_degraded_reasons = app.gateway_connector_degraded_reasons.clone();
@@ -214,16 +171,8 @@ impl GatewayPanel {
         self.active_sessions = count;
     }
 
-    pub fn set_adapter_capabilities(&mut self, capabilities: Vec<GatewayAdapterCapability>) {
-        self.adapter_capabilities = capabilities;
-    }
-
     pub fn set_execution_receipts(&mut self, receipts: Vec<GatewayExecutionReceipt>) {
         self.execution_receipts = receipts;
-    }
-
-    pub fn set_dispatch_targets(&mut self, targets: Vec<GatewayDispatchTarget>) {
-        self.dispatch_targets = targets;
     }
 
     pub fn set_connector_accounts(&mut self, accounts: Vec<ConnectorAccountSummary>) {
@@ -466,6 +415,62 @@ impl Component for GatewayPanel {
                 }
             }
 
+            if !self.surfaces.is_empty() || self.surface_health.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Surface Host ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                let health = self.surface_health.as_ref();
+                let surface_count = health
+                    .map(|item| item.surface_count)
+                    .unwrap_or(self.surfaces.len() as u64);
+                let external_count = health
+                    .map(|item| item.external_surface_count)
+                    .unwrap_or_else(|| {
+                        self.surfaces
+                            .iter()
+                            .filter(|surface| surface.entry.is_some())
+                            .count() as u64
+                    });
+                lines.push(Line::from(vec![
+                    Span::styled("Surfaces: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} total, {} external, routes {}, resources {}",
+                            surface_count,
+                            external_count,
+                            health.map(|item| item.route_count).unwrap_or_default(),
+                            health.map(|item| item.resource_count).unwrap_or_default()
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                if let Some(health) = health {
+                    lines.push(Line::from(vec![
+                        Span::styled("Host: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(health.status.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+                let preview = self
+                    .surfaces
+                    .iter()
+                    .take(4)
+                    .map(|surface| format!("{}:{}", surface.id, surface.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !preview.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Preview: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(preview, Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "Open /surfaces for routes, resources, events, send/action.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
             if self.task_count.is_some() || self.pending_approvals.is_some() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
@@ -516,40 +521,6 @@ impl Component for GatewayPanel {
             }
         }
 
-        if !self.adapter_capabilities.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "─ Cross-Plane Adapters ─",
-                Style::default().fg(Color::Cyan),
-            )));
-            for capability in self.adapter_capabilities.iter().take(4) {
-                let support = if capability.live_supported {
-                    "live"
-                } else {
-                    "plan"
-                };
-                let binding = if capability.adapter_bound {
-                    "bound"
-                } else {
-                    "not-bound"
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:12}", capability.platform),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        format!("{:12}", capability.operation),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        format!("{support} · {binding}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-        }
-
         if !self.execution_receipts.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -575,40 +546,6 @@ impl Component for GatewayPanel {
                         format!("{} · {}{}", receipt.mode, receipt.capability, idem),
                         Style::default().fg(Color::DarkGray),
                     ),
-                ]));
-            }
-        }
-
-        if !self.dispatch_targets.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "─ Dispatch Targets ─",
-                Style::default().fg(Color::Cyan),
-            )));
-            for target in self.dispatch_targets.iter().take(3) {
-                let state = if target.ready { "ready" } else { "blocked" };
-                let detail = target
-                    .session_key
-                    .as_deref()
-                    .map(|key| format!("session {key}"))
-                    .or_else(|| target.blockers.first().map(|blocker| blocker.to_string()))
-                    .unwrap_or_else(|| "no target".to_string());
-                let state_color = if target.ready {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:8}", state), Style::default().fg(state_color)),
-                    Span::styled(
-                        format!("{:10}", target.platform),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        format!("{:12}", target.operation),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
                 ]));
             }
         }
@@ -752,7 +689,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 31] = [
+        let endpoints: &[(&str, &str)] = &[
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -801,6 +738,11 @@ impl Component for GatewayPanel {
                 "Connector capabilities",
             ),
             ("GET  /api/connectors/resources", "Connector resources"),
+            ("GET  /api/surfaces", "Surface registry"),
+            ("GET  /api/surfaces/health", "Surface host health"),
+            ("GET  /api/surfaces/:id/events", "Surface event buffer"),
+            ("POST /api/surfaces/:id/send", "Surface message egress"),
+            ("POST /api/surfaces/:id/action", "Surface action dispatch"),
             (
                 "GET  /api/connectors/services/mock.docs/tools",
                 "Mock docs service tools",
@@ -816,7 +758,7 @@ impl Component for GatewayPanel {
             ("GET  /api/cross-plane/audit", "Interop audit records"),
         ];
 
-        for (endpoint, desc) in &endpoints {
+        for (endpoint, desc) in endpoints {
             let method_color = if endpoint.starts_with("GET") {
                 Color::Green
             } else if endpoint.starts_with("POST") {
@@ -842,31 +784,11 @@ impl Component for GatewayPanel {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "─ Action Composer Contract ─",
+            "─ Surface Dispatch Contract ─",
             Style::default().fg(Color::Cyan),
         )));
         lines.push(Line::from(Span::styled(
-            "POST /api/cross-plane/action/preflight  POST /api/cross-plane/action/execute",
-            Style::default().fg(Color::DarkGray),
-        )));
-        for template in GATEWAY_ACTION_TEMPLATES {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:10}", template.operation),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{:26}", template.capability),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    format!("{} · {}", template.risk, template.resource_ref),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-        lines.push(Line::from(Span::styled(
-            "source local:tui · principal user:demo · target channel://feishu/chat/demo",
+            "Gateway owns routing. TUI submits surface send/action requests by surface id.",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1210,40 +1132,50 @@ mod tests {
             "Should show structured data endpoints, got: {joined}"
         );
         assert!(
-            joined.contains("/api/cross-plane/action/adapters"),
-            "Should show cross-plane adapter endpoint, got: {joined}"
+            joined.contains("/api/surfaces"),
+            "Should show surface registry endpoint, got: {joined}"
         );
         assert!(
-            joined.contains("/api/cross-plane/action/executions"),
-            "Should show cross-plane execution endpoint, got: {joined}"
+            joined.contains("/api/surfaces/:id/send")
+                && joined.contains("/api/surfaces/:id/action"),
+            "Should show surface dispatch endpoints, got: {joined}"
         );
     }
 
     #[test]
-    fn render_shows_cross_plane_adapter_and_execution_state() {
+    fn render_shows_surface_host_and_execution_state() {
         use crate::skin::SkinConfig;
         use crate::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        panel.set_adapter_capabilities(vec![GatewayAdapterCapability {
-            platform: "feishu".to_string(),
-            operation: "send_text".to_string(),
-            live_supported: true,
-            adapter_bound: false,
-        }]);
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.surfaces = vec![crate::runtime_control_store::SurfaceSummary {
+            id: "webui".to_string(),
+            name: "WebUI".to_string(),
+            kind: "web-surface".to_string(),
+            status: "builtin".to_string(),
+            lifecycle: "builtin".to_string(),
+            transport: "stdio-jsonl".to_string(),
+            capability_count: 3,
+            route_count: 0,
+            resource_count: 1,
+            entry: None,
+            diagnostics: Vec::new(),
+        }];
+        panel.surface_health = Some(crate::runtime_control_store::SurfaceHealthSummary {
+            status: "ready".to_string(),
+            surface_count: 1,
+            external_surface_count: 0,
+            route_count: 0,
+            resource_count: 1,
+        });
         panel.set_execution_receipts(vec![GatewayExecutionReceipt {
             status: "planned".to_string(),
             dispatch_status: "dry_run".to_string(),
             mode: "dry_run".to_string(),
-            capability: "channel.feishu.send_text".to_string(),
+            capability: "surface.webui.action".to_string(),
             idempotency_key: Some("idem-demo".to_string()),
-        }]);
-        panel.set_dispatch_targets(vec![GatewayDispatchTarget {
-            platform: "feishu".to_string(),
-            operation: "send_text".to_string(),
-            session_key: Some("feishu:open-id:chat-id".to_string()),
-            ready: true,
-            blockers: Vec::new(),
         }]);
 
         let mut terminal = MockTerminal::new(96, 30);
@@ -1255,20 +1187,16 @@ mod tests {
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
         assert!(
-            joined.contains("Cross-Plane Adapters"),
-            "Should show adapter section, got: {joined}"
+            joined.contains("Surface Host"),
+            "Should show surface section, got: {joined}"
         );
         assert!(
-            joined.contains("feishu"),
-            "Should show platform, got: {joined}"
+            joined.contains("webui") && joined.contains("builtin"),
+            "Should show surface status, got: {joined}"
         );
         assert!(
-            joined.contains("send_text"),
-            "Should show operation, got: {joined}"
-        );
-        assert!(
-            joined.contains("live") && joined.contains("not-bound"),
-            "Should show adapter support and binding state, got: {joined}"
+            joined.contains("routes 0") && joined.contains("resources 1"),
+            "Should show surface health counts, got: {joined}"
         );
         assert!(
             joined.contains("Execution Receipts"),
@@ -1279,21 +1207,17 @@ mod tests {
             "Should show receipt state, got: {joined}"
         );
         assert!(
-            joined.contains("channel.feishu.send_text") && joined.contains("idem-demo"),
+            joined.contains("surface.webui.action") && joined.contains("idem-demo"),
             "Should show receipt capability and idempotency key, got: {joined}"
         );
         assert!(
-            joined.contains("Dispatch Targets"),
-            "Should show dispatch target section, got: {joined}"
-        );
-        assert!(
-            joined.contains("ready") && joined.contains("feishu:open-id:chat-id"),
-            "Should show target readiness and session key, got: {joined}"
+            !joined.contains("channel.feishu"),
+            "Gateway panel must not hard-code platform channel capabilities, got: {joined}"
         );
     }
 
     #[test]
-    fn render_shows_cross_plane_action_contracts() {
+    fn render_shows_surface_dispatch_contracts() {
         use crate::skin::SkinConfig;
         use crate::test_utils::MockTerminal;
 
@@ -1306,22 +1230,17 @@ mod tests {
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(
-            joined.contains("Action Composer Contract"),
-            "Should show action contract section, got: {joined}"
+            joined.contains("Surface Dispatch Contract"),
+            "Should show surface dispatch contract section, got: {joined}"
         );
         assert!(
-            joined.contains("channel.feishu.send_text")
-                && joined.contains("channel.feishu.send_image")
-                && joined.contains("channel.feishu.send_file"),
-            "Should show typed send capabilities, got: {joined}"
+            joined.contains("/api/surfaces/:id/send")
+                && joined.contains("/api/surfaces/:id/action"),
+            "Should show surface dispatch endpoints, got: {joined}"
         );
         assert!(
-            joined.contains("workspace://file/reports/panel.txt"),
-            "Should show canonical workspace file reference, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/cross-plane/action/execute"),
-            "Should show execute endpoint, got: {joined}"
+            !joined.contains("channel.feishu"),
+            "Should not show legacy channel templates, got: {joined}"
         );
     }
 
