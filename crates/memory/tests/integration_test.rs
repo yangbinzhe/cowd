@@ -3,16 +3,18 @@
 //! Tests the full flow: init code graph → index project → ask code question
 //! → verify symbols injected → verify symbol linked to conversation.
 
+#[cfg(feature = "code-index")]
 use std::io::Write;
 
 use memory::config::{BudgetConfig, StoreConfig};
+#[cfg(feature = "code-index")]
 use memory::store::sqlite::SqliteStore;
+#[cfg(feature = "code-index")]
 use memory::store::MemoryStore;
 use memory::types::Message;
-use memory::{
-    CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig, SymbolEdge,
-    SymbolEdgeType, SymbolKind, TokenBudget, TuningConfig,
-};
+#[cfg(feature = "code-index")]
+use memory::{CodeIndexer, CodeSymbol, SymbolEdge, SymbolEdgeType, SymbolKind};
+use memory::{CognitiveContextManager, ImpactReport, MemoryConfig, TokenBudget, TuningConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,6 +47,7 @@ fn test_config_with_sandbox(db_path: &std::path::Path) -> MemoryConfig {
     }
 }
 
+#[cfg(feature = "code-index")]
 fn write_rust_file(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.path().join(name);
     if let Some(parent) = path.parent() {
@@ -59,6 +62,7 @@ fn write_rust_file(dir: &tempfile::TempDir, name: &str, content: &str) -> std::p
 // F1: Integration tests (7 tests)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "code-index")]
 #[tokio::test]
 async fn test_integration_init_code_graph_indexes_symbols() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -186,6 +190,7 @@ async fn test_integration_build_context_with_code_wraps_prepare() {
     assert!(ctx.total_tokens <= ctx.budget.total);
 }
 
+#[cfg(feature = "code-index")]
 #[tokio::test]
 async fn test_integration_impact_analysis_with_store() {
     let tmp = tempfile::TempDir::new().unwrap();

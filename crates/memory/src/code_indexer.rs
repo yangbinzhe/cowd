@@ -6,13 +6,20 @@
 //!
 //! Supports Rust, Python, TypeScript/TSX, Go, and Java.
 
+#[cfg(feature = "code-index")]
 use std::collections::HashMap;
+#[cfg(feature = "code-index")]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "code-index")]
+use std::path::PathBuf;
+#[cfg(feature = "code-index")]
 use std::sync::Arc;
+#[cfg(feature = "code-index")]
 use tree_sitter::{Parser, TreeCursor};
 
 use crate::error::MemoryError;
+#[cfg(feature = "code-index")]
 use crate::store::MemoryStore;
 
 // ---------------------------------------------------------------------------
@@ -179,6 +186,7 @@ pub struct ImpactReport {
 /// Holds one parser per supported language, walks project trees to extract
 /// symbols and call-graph edges, and supports incremental re-indexing via
 /// file fingerprints.
+#[cfg(feature = "code-index")]
 pub struct CodeIndexer {
     /// One parser per supported language (pre-warmed with grammar).
     parsers: HashMap<IndexLanguage, Parser>,
@@ -190,6 +198,7 @@ pub struct CodeIndexer {
     store: Option<Arc<dyn MemoryStore>>,
 }
 
+#[cfg(feature = "code-index")]
 impl CodeIndexer {
     // -----------------------------------------------------------------------
     // Construction
@@ -1291,11 +1300,61 @@ impl CodeIndexer {
     }
 }
 
+#[cfg(not(feature = "code-index"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CodeIndexer;
+
+#[cfg(not(feature = "code-index"))]
+impl CodeIndexer {
+    pub fn new(_project_root: &Path) -> Result<Self, MemoryError> {
+        Err(MemoryError::Store(
+            "memory/code-index feature is not enabled".into(),
+        ))
+    }
+
+    pub fn index_file(
+        &mut self,
+        _path: &Path,
+    ) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
+        Err(MemoryError::Store(
+            "memory/code-index feature is not enabled".into(),
+        ))
+    }
+
+    pub fn index_content(
+        &mut self,
+        _source: &str,
+        _path: &Path,
+    ) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
+        Err(MemoryError::Store(
+            "memory/code-index feature is not enabled".into(),
+        ))
+    }
+
+    pub async fn scan(&mut self) -> Result<IndexStats, MemoryError> {
+        Err(MemoryError::Store(
+            "memory/code-index feature is not enabled".into(),
+        ))
+    }
+
+    #[must_use]
+    pub fn with_store(self, _store: std::sync::Arc<dyn crate::store::MemoryStore>) -> Self {
+        self
+    }
+
+    pub async fn get_impact(&self, symbol_name: &str, _depth: usize) -> ImpactReport {
+        ImpactReport {
+            symbol_name: symbol_name.to_string(),
+            ..ImpactReport::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "code-index"))]
 mod tests {
     use super::*;
     use std::io::Write;

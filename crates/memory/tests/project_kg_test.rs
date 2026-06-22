@@ -1177,6 +1177,7 @@ fn test_is_kg_stale_unknown_project() {
 // TDD: unified_scan tests
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "code-index")]
 #[test]
 fn test_unified_scan_produces_both_entities_and_symbols() {
     use memory::code_indexer::CodeIndexer;

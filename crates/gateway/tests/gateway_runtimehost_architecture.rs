@@ -1063,7 +1063,9 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     );
     assert!(
         cli_dependencies.contains("tui = { path = \"../tui\", optional = true }")
-            && cli_manifest.contains("full = [\"tui-surface\"]"),
+            && cli_manifest.contains("\"tui-surface\"")
+            && cli_manifest.contains("\"tui/code-highlight\"")
+            && cli_manifest.contains("\"gateway/code-index\""),
         "cli must keep TUI as a full-build-only optional surface dependency"
     );
     assert!(

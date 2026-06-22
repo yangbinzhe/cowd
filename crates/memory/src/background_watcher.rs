@@ -6,15 +6,16 @@
 //! ensures we only rebuild after a period of inactivity — avoiding thrash
 //! during rapid save sequences.
 
-use std::{
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::path::PathBuf;
+#[cfg(feature = "watch")]
+use std::time::{Duration, Instant};
 
+#[cfg(feature = "watch")]
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::entity::KnowledgeGraph;
+#[cfg(feature = "watch")]
 use crate::project_scope::build_project_kg;
 
 // ---------------------------------------------------------------------------
@@ -109,10 +110,24 @@ impl BackgroundWatcher {
         config: BackgroundWatcherConfig,
         kg_rebuild_tx: mpsc::UnboundedSender<KnowledgeGraph>,
     ) -> BackgroundWatcherHandle {
-        let poll_interval = Duration::from_secs(config.poll_interval_secs);
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        #[cfg(not(feature = "watch"))]
+        {
+            let _ = workspace_root;
+            let _ = config;
+            let _ = kg_rebuild_tx;
+            let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+            tracing::debug!(
+                "background_watcher: memory/watch feature disabled; watcher not started"
+            );
+            return BackgroundWatcherHandle { _stop: stop_tx };
+        }
 
-        std::thread::Builder::new()
+        #[cfg(feature = "watch")]
+        {
+            let poll_interval = Duration::from_secs(config.poll_interval_secs);
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+            std::thread::Builder::new()
             .name("bg-fs-watcher".into())
             .spawn(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -216,7 +231,8 @@ impl BackgroundWatcher {
             })
             .expect("failed to spawn background watcher thread");
 
-        BackgroundWatcherHandle { _stop: stop_tx }
+            BackgroundWatcherHandle { _stop: stop_tx }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -224,6 +240,7 @@ impl BackgroundWatcher {
     // -------------------------------------------------------------------
 
     /// Returns `true` if `path` has a recognised source-code extension.
+    #[cfg(any(feature = "watch", test))]
     fn is_source_file(path: &std::path::Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

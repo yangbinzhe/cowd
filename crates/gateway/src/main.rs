@@ -8944,7 +8944,13 @@ mod tests {
         assert!(item.content.contains(&root.display().to_string()));
         assert!(item.content.contains("model_context_window=200000"));
         assert!(item.content.contains("src/lib.rs"));
+        #[cfg(feature = "code-index")]
         assert!(item.content.contains("workspace_context_probe"));
+        #[cfg(not(feature = "code-index"))]
+        assert!(
+            !item.content.contains("workspace_context_probe"),
+            "default gateway build should not force code-index hot symbol extraction"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

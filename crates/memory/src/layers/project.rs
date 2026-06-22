@@ -560,6 +560,7 @@ mod tests {
         assert!(symbols.is_empty());
     }
 
+    #[cfg(feature = "code-index")]
     #[tokio::test]
     async fn test_project_layer_injects_code_symbols() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -623,6 +624,7 @@ pub enum AuthError {
         assert!(missing.is_empty());
     }
 
+    #[cfg(feature = "code-index")]
     #[tokio::test]
     async fn test_auto_index_on_init() {
         let tmp = tempfile::TempDir::new().unwrap();

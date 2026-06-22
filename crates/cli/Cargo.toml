@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 default = []
 tui-surface = ["dep:tui"]
-full = ["tui-surface"]
+full = ["tui-surface", "tui/code-highlight", "gateway/code-index"]
 
 [dev-dependencies]
 serde_json.workspace = true

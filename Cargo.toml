@@ -59,7 +59,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.354"
+version = "0.9.355"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -71,11 +71,17 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 memory = { path = "crates/memory" }
 gateway = { path = "crates/gateway" }
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+strip = "symbols"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

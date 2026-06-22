@@ -16,7 +16,7 @@ reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
-syntect = "5"
+syntect = { version = "5", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 toml = "0.8"
 tui-textarea = "0.7"
@@ -25,6 +25,7 @@ uuid = { workspace = true }
 
 [features]
 default = []
+code-highlight = ["dep:syntect"]
 
 [dev-dependencies]
 serial_test = "3"

@@ -15,6 +15,7 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "code-highlight")]
 use std::sync::LazyLock;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
@@ -22,8 +23,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
+#[cfg(feature = "code-highlight")]
 use syntect::easy::HighlightLines;
+#[cfg(feature = "code-highlight")]
 use syntect::highlighting::ThemeSet;
+#[cfg(feature = "code-highlight")]
 use syntect::parsing::SyntaxSet;
 
 use crate::components::base::{Component, EventResult, RenderContext};
@@ -31,7 +35,9 @@ use crate::components::panel_scroll::{clamp_u16_offset, offset_to_u16, PanelScro
 
 /// Local static references to syntect data, duplicating those in
 /// `md_renderer` so the module can compile independently.
+#[cfg(feature = "code-highlight")]
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+#[cfg(feature = "code-highlight")]
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1170,35 +1176,47 @@ fn detect_language(path: &str) -> Option<String> {
 /// Syntax-highlight a single code line using syntect.
 /// Returns spans with the highlight colors applied on top of `bg_color`.
 fn highlight_code_line(code: &str, language: Option<&str>, bg_color: Color) -> Vec<Span<'static>> {
-    let lang = match language.and_then(|l| SYNTAX_SET.find_syntax_by_token(l)) {
-        Some(s) => s,
-        None => {
-            // No syntax found: return plain text
-            return vec![Span::styled(
-                code.to_string(),
-                Style::default().fg(Color::White).bg(bg_color),
-            )];
-        }
-    };
+    #[cfg(not(feature = "code-highlight"))]
+    {
+        let _ = language;
+        return vec![Span::styled(
+            code.to_string(),
+            Style::default().fg(Color::White).bg(bg_color),
+        )];
+    }
 
-    let theme = &THEME_SET.themes["base16-ocean.dark"];
-    let mut highlighter = HighlightLines::new(lang, theme);
+    #[cfg(feature = "code-highlight")]
+    {
+        let lang = match language.and_then(|l| SYNTAX_SET.find_syntax_by_token(l)) {
+            Some(s) => s,
+            None => {
+                // No syntax found: return plain text
+                return vec![Span::styled(
+                    code.to_string(),
+                    Style::default().fg(Color::White).bg(bg_color),
+                )];
+            }
+        };
 
-    // syntect highlights by line; we feed our single line
-    let line_with_ending = format!("{}\n", code);
-    match highlighter.highlight_line(&line_with_ending, &SYNTAX_SET) {
-        Ok(highlighted) => highlighted
-            .into_iter()
-            .map(|(style, text)| {
-                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                Span::styled(text.to_string(), Style::default().fg(fg).bg(bg_color))
-            })
-            .collect(),
-        Err(_) => {
-            vec![Span::styled(
-                code.to_string(),
-                Style::default().fg(Color::White).bg(bg_color),
-            )]
+        let theme = &THEME_SET.themes["base16-ocean.dark"];
+        let mut highlighter = HighlightLines::new(lang, theme);
+
+        // syntect highlights by line; we feed our single line
+        let line_with_ending = format!("{}\n", code);
+        match highlighter.highlight_line(&line_with_ending, &SYNTAX_SET) {
+            Ok(highlighted) => highlighted
+                .into_iter()
+                .map(|(style, text)| {
+                    let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                    Span::styled(text.to_string(), Style::default().fg(fg).bg(bg_color))
+                })
+                .collect(),
+            Err(_) => {
+                vec![Span::styled(
+                    code.to_string(),
+                    Style::default().fg(Color::White).bg(bg_color),
+                )]
+            }
         }
     }
 }

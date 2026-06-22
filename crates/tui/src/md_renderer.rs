@@ -1,17 +1,24 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
+#[cfg(feature = "code-highlight")]
 use std::sync::LazyLock;
+#[cfg(feature = "code-highlight")]
 use syntect::easy::HighlightLines;
+#[cfg(feature = "code-highlight")]
 use syntect::highlighting::ThemeSet;
+#[cfg(feature = "code-highlight")]
 use syntect::parsing::SyntaxSet;
+#[cfg(feature = "code-highlight")]
 use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::Theme;
 
+#[cfg(feature = "code-highlight")]
 pub(crate) static SYNTAX_SET: LazyLock<SyntaxSet> =
     LazyLock::new(SyntaxSet::load_defaults_newlines);
+#[cfg(feature = "code-highlight")]
 pub(crate) static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 /// Render markdown text into ratatui Lines using theme-aware colors.
@@ -444,6 +451,7 @@ fn code_block_lines(content: &str, language: Option<&str>, theme: &Theme) -> Vec
         Style::default().fg(muted).bg(bg),
     )]));
 
+    #[cfg(feature = "code-highlight")]
     if let Some(syntax) = language.and_then(|l| SYNTAX_SET.find_syntax_by_token(l)) {
         let syntect_theme = &THEME_SET.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, syntect_theme);
@@ -464,7 +472,27 @@ fn code_block_lines(content: &str, language: Option<&str>, theme: &Theme) -> Vec
                 .collect();
             lines.push(Line::from(spans));
         }
-    } else {
+    }
+
+    #[cfg(not(feature = "code-highlight"))]
+    let _ = language;
+
+    #[cfg(not(feature = "code-highlight"))]
+    {
+        for line in content.lines() {
+            let trimmed = line.trim_end();
+            lines.push(Line::from(Span::styled(
+                trimmed.to_string(),
+                Style::default().fg(fg).bg(bg),
+            )));
+        }
+    }
+
+    #[cfg(feature = "code-highlight")]
+    if language
+        .and_then(|l| SYNTAX_SET.find_syntax_by_token(l))
+        .is_none()
+    {
         for line in content.lines() {
             let trimmed = line.trim_end();
             lines.push(Line::from(Span::styled(
