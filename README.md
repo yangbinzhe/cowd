@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.353`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.354`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -235,6 +235,25 @@ cargo check -p cli --bin cowd --features full
 cargo build -p cli --bin cowd --features full
 ```
 
+TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Terminal Control Surface`：
+
+- 默认以键盘优先、正文优先、低噪声方式操控后端服务。
+- 通过 Gateway HTTP/SSE attach session、订阅事件、发送消息、执行 cancel 和刷新投影。
+- 支持 `Clean / Panorama` 两种显示语义：Clean 只保留正文和关键计数，Panorama 展开运行线索和证据。
+- 顶部状态条展示 Gateway/session、turn 状态、display mode、context/memory/reality evidence 摘要。
+- `Control Deck` 聚合 Gateway、Runtime readiness、session、lease、task、approval、surface、Reality Core、Fact Flow 和 degraded signal。
+- TUI 不直接读取 runtime/channel/provider/store，不越过 Gateway 查内部表。
+
+常用终端快捷键：
+
+| 快捷键 | 用途 |
+|---|---|
+| `Alt+V` | 切换 Clean / Panorama |
+| `Alt+E` | 打开 runtime/evidence panorama 面板 |
+| `Alt+G` | 打开 Gateway Control Deck |
+| `Ctrl+P` | 打开命令面板 |
+| `Esc Esc` 或 `Ctrl+C Ctrl+C` | 当前 turn 中取消，空闲时退出 |
+
 ## 5. 主要 API 能力
 
 ### 5.1 健康与状态
@@ -393,7 +412,7 @@ Capability Registry
 设计要求：
 
 - WebUI 是最强管理面，适合复杂表格、过滤、批量操作、治理证据和可视化。
-- TUI 保持同一核心能力集，但以终端密度和键盘操作为优先。
+- TUI 保持同一核心能力集，但以终端密度和键盘操作为优先；它用 Clean/Panorama、证据摘要和 Control Deck 实现对后端服务的快速掌控。
 - CLI 只保留轻控制、配置、状态、诊断和启动，不做复杂业务管理。
 - 外部渠道 surface 只负责消息入口、消息投递、callback、长连接和静态资源，不成为 Runtime 的一部分。
 
@@ -423,7 +442,9 @@ cargo fmt --all --check
 cargo check
 cargo check -p cli --bin cowd --features full
 cargo test -p surface
+cargo test -p tui
 cargo test -p gateway --test gateway_runtimehost_architecture --no-default-features
+scripts/scenarios/tui-daemon-attach.sh
 ```
 
 surface 仓库验证：
@@ -452,4 +473,5 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - `crates/gateway` 保留 `channel` 合同和 `surface` 协议，但不依赖平台 SDK。
 - `crates/runtime` 不依赖 channel/surface adapter。
 - `cowd-surface` 承载 WebUI 和非 TUI sidecar。
-- 版本标签：`v0.9.353`。
+- TUI 已形成 Clean/Panorama、Control Deck 和 Gateway attach 场景验证闭环。
+- 版本标签：`v0.9.354`。

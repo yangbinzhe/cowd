@@ -1213,6 +1213,9 @@ impl App {
                 self.is_loading = true;
                 self.turn_active = true;
                 self.streaming_received = false;
+                self.latest_context_envelope = None;
+                self.latest_runtime_policy = None;
+                self.latest_workgraph_summary = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
                 self.pre_turn_output = self.output_tokens;
@@ -1417,6 +1420,37 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(expected_id.as_str())
         );
+    }
+
+    #[test]
+    fn turn_started_clears_previous_turn_runtime_evidence() {
+        let mut app = App::new("test", "sess");
+        app.latest_context_envelope = Some(serde_json::json!({"selected": [{"id": "old"}]}));
+        app.latest_runtime_policy = Some(crate::RuntimePolicyDecisionSummary {
+            level: "complex".into(),
+            score: 80,
+            recommended_profile: "deep".into(),
+            agent_mode: "team".into(),
+            requires_review: true,
+            signal_count: 3,
+        });
+        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+            graph_id: Some("g".into()),
+            board_id: Some("b".into()),
+            status: "done".into(),
+            agent_tasks: 1,
+            memory_candidates: 2,
+            conflicts: 0,
+            completion_rate: Some(1.0),
+            synthesis_lift: None,
+            complementarity_score: None,
+        });
+
+        app.apply_event(CowdEvent::TurnStarted);
+
+        assert!(app.latest_context_envelope.is_none());
+        assert!(app.latest_runtime_policy.is_none());
+        assert!(app.latest_workgraph_summary.is_none());
     }
 
     #[test]

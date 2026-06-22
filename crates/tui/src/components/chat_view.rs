@@ -44,6 +44,16 @@ pub struct ChatView {
     session_input_tokens: u64,
     session_output_tokens: u64,
     memory_total_entries: usize,
+    context_selected_count: usize,
+    context_omitted_count: usize,
+    memory_candidate_count: usize,
+    reality_stage_count: u64,
+    reality_event_count: u64,
+    reality_promotion_count: u64,
+    reality_boundary_count: u64,
+    pending_approval_count: u64,
+    surface_count: usize,
+    degraded_count: usize,
     spinner_idx: usize,
 
     // ── Message menu (Task 5) ──
@@ -110,6 +120,16 @@ impl ChatView {
             session_input_tokens: 0,
             session_output_tokens: 0,
             memory_total_entries: 0,
+            context_selected_count: 0,
+            context_omitted_count: 0,
+            memory_candidate_count: 0,
+            reality_stage_count: 0,
+            reality_event_count: 0,
+            reality_promotion_count: 0,
+            reality_boundary_count: 0,
+            pending_approval_count: 0,
+            surface_count: 0,
+            degraded_count: 0,
             spinner_idx: 0,
             pending_message_menu: false,
             pending_menu_entry_idx: 0,
@@ -185,6 +205,38 @@ impl ChatView {
         self.session_input_tokens = app.input_tokens;
         self.session_output_tokens = app.output_tokens;
         self.memory_total_entries = app.memory_total_entries.unwrap_or(app.memory_entries.len());
+        self.context_selected_count = app
+            .latest_context_envelope
+            .as_ref()
+            .and_then(|value| value.get("selected").and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+            .unwrap_or_default();
+        self.context_omitted_count = app
+            .latest_context_envelope
+            .as_ref()
+            .and_then(|value| value.get("omitted").and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+            .unwrap_or_default();
+        self.memory_candidate_count = app
+            .latest_workgraph_summary
+            .as_ref()
+            .map(|summary| summary.memory_candidates)
+            .unwrap_or_default();
+        if let Some(flow) = &app.gateway_fact_flow {
+            self.reality_stage_count = flow.stage_count;
+            self.reality_event_count = flow.event_count;
+            self.reality_promotion_count = flow.promotion_count;
+            self.reality_boundary_count = flow.boundary_count;
+        } else {
+            self.reality_stage_count = 0;
+            self.reality_event_count = 0;
+            self.reality_promotion_count = 0;
+            self.reality_boundary_count = 0;
+        }
+        self.pending_approval_count = app.gateway_pending_approvals.unwrap_or_default();
+        self.surface_count = app.gateway_surfaces.len();
+        self.degraded_count =
+            app.gateway_degraded_reasons.len() + app.gateway_connector_degraded_reasons.len();
         self.spinner_idx = app.spinner_idx;
         self.theme = app.theme;
         self.msg_version = app.msg_version;
@@ -647,6 +699,32 @@ impl ChatView {
         lines.push(Line::from(Span::styled(
             format!("  {}", stats_parts.join(" · ")),
             Style::default().fg(self.theme.warn_color()),
+        )));
+
+        let mut evidence_parts = Vec::new();
+        evidence_parts.push(format!(
+            "ctx {}/{}",
+            self.context_selected_count, self.context_omitted_count
+        ));
+        evidence_parts.push(format!(
+            "mem candidates {} / total {}",
+            self.memory_candidate_count, self.memory_total_entries
+        ));
+        evidence_parts.push(format!(
+            "reality s{} e{} p{} b{}",
+            self.reality_stage_count,
+            self.reality_event_count,
+            self.reality_promotion_count,
+            self.reality_boundary_count
+        ));
+        evidence_parts.push(format!("approvals {}", self.pending_approval_count));
+        evidence_parts.push(format!("surfaces {}", self.surface_count));
+        if self.degraded_count > 0 {
+            evidence_parts.push(format!("issues {}", self.degraded_count));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  Evidence: {}", evidence_parts.join(" · ")),
+            Style::default().fg(self.theme.muted_color()),
         )));
 
         lines

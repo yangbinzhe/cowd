@@ -204,9 +204,9 @@ impl GatewayPanel {
     /// Build the title string for the block border.
     fn build_title(&self) -> String {
         if self.server_running {
-            " Gateway ● ".to_string()
+            " Control Deck ● ".to_string()
         } else {
-            " Gateway ○ ".to_string()
+            " Control Deck ○ ".to_string()
         }
     }
 
@@ -267,6 +267,107 @@ impl Component for GatewayPanel {
             "Keys: r refresh  h health  s start/stop  / connector actions",
             Style::default().fg(Color::DarkGray),
         )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "─ Operator Summary ─",
+            Style::default().fg(Color::Cyan),
+        )));
+        let issue_count = self.degraded_reasons.len() + self.connector_degraded_reasons.len();
+        let surface_count = self.surfaces.len();
+        let surface_status = self
+            .surface_health
+            .as_ref()
+            .map(|health| health.status.as_str())
+            .unwrap_or("unknown");
+        let reality_status = self
+            .reality_core
+            .as_ref()
+            .map(|core| core.status.as_str())
+            .unwrap_or("unknown");
+        let flow = self.fact_flow.as_ref();
+        lines.push(Line::from(vec![
+            Span::styled("Gateway ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.server_running { "ready" } else { "down" },
+                Style::default().fg(if self.server_running {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
+            Span::styled(" · Runtime ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                self.runtime_readiness
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(" · Sessions ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", self.active_sessions),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Work ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "tasks {} approvals {}",
+                    self.task_count.unwrap_or_default(),
+                    self.pending_approvals.unwrap_or_default()
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(" · Lease ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                self.lease_owner
+                    .as_deref()
+                    .map(|owner| {
+                        format!(
+                            "{} ({})",
+                            owner,
+                            self.lease_mode.as_deref().unwrap_or("unknown")
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string()),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Surface ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{surface_count} / {surface_status}"),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(" · Reality ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                reality_status.to_string(),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(" · FactFlow ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                flow.map(|flow| {
+                    format!(
+                        "s{} e{} p{} b{}",
+                        flow.stage_count,
+                        flow.event_count,
+                        flow.promotion_count,
+                        flow.boundary_count
+                    )
+                })
+                .unwrap_or_else(|| "none".to_string()),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        if issue_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("Issues ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{issue_count} degraded signals"),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
 
         // ── Health check ───────────────────────────────────────
         if let Some(ref health) = self.health_status {
@@ -1231,11 +1332,11 @@ mod tests {
         use crate::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        let mut terminal = MockTerminal::new(82, 42);
+        let mut terminal = MockTerminal::new(82, 72);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
             let mut ctx = RenderContext::new(f, &skin);
-            panel.render(&mut ctx, Rect::new(0, 0, 82, 42));
+            panel.render(&mut ctx, Rect::new(0, 0, 82, 72));
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
@@ -1376,11 +1477,11 @@ mod tests {
         use crate::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        let mut terminal = MockTerminal::new(118, 54);
+        let mut terminal = MockTerminal::new(118, 72);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
             let mut ctx = RenderContext::new(f, &skin);
-            panel.render(&mut ctx, Rect::new(0, 0, 118, 54));
+            panel.render(&mut ctx, Rect::new(0, 0, 118, 72));
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(

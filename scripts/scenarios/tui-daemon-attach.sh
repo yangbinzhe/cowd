@@ -6,16 +6,15 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_TUI_DAEMON_ATTACH_PORT:-18672}"
 BASE_URL="http://127.0.0.1:$PORT"
-GATEWAY_SESSION="cowd-tui-daemon-gateway-$$"
-TUI_SESSION="cowd-tui-daemon-tui-$$"
-TMP_DIR="$(mktemp -d /tmp/cowd-tui-daemon-tui-daemon.XXXXXX)"
+GATEWAY_SESSION="cowd-tui-gateway-attach-gateway-$$"
+TUI_SESSION="cowd-tui-gateway-attach-tui-$$"
+TMP_DIR="$(mktemp -d /tmp/cowd-tui-gateway-attach.XXXXXX)"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
-SOCKET="$TMP_DIR/cowd.sock"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 TUI_CAPTURE="$TMP_DIR/tui-pane.txt"
-SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-daemon-scenario}"
+SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-gateway-scenario}"
 
 cleanup() {
   if command -v tmux >/dev/null 2>&1; then
@@ -39,7 +38,7 @@ print_logs() {
 
 on_error() {
   local status=$?
-  echo "TUI daemon attach TUI daemon attach scenario failed with status $status" >&2
+  echo "TUI Gateway attach scenario failed with status $status" >&2
   print_logs
   exit "$status"
 }
@@ -47,9 +46,9 @@ on_error() {
 trap cleanup EXIT
 trap on_error ERR
 
-for cmd in tmux curl rg ss sqlite3; do
+for cmd in tmux curl rg ss; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "$cmd is required for TUI daemon attach TUI daemon attach scenario" >&2
+    echo "$cmd is required for TUI Gateway attach scenario" >&2
     exit 1
   fi
 done
@@ -61,10 +60,10 @@ fi
 
 cd "$ROOT"
 if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
-  cargo build -p cli
+  cargo build -p cli --features full
 fi
 if [[ ! -x "$BIN" ]]; then
-  echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
+  echo "missing cowd binary at $BIN; run cargo build -p cli --features full first" >&2
   exit 1
 fi
 
@@ -99,18 +98,16 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_DAEMON_SOCKET='$SOCKET' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 
 for _ in {1..100}; do
-  if [[ -S "$SOCKET" ]] && curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
 done
 
-[[ -S "$SOCKET" ]]
 curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/api/cowd/projection?surface=tui" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("surface") == "tui", data; assert data.get("contract_version") == "cowd.projection.v1", data; assert data.get("capabilities"), data'
@@ -127,9 +124,9 @@ curl -fsS -X POST "$BASE_URL/api/connectors/services/mock.docs/execute" \
 tmux new-session -d -s "$TUI_SESSION" -x 140 -y 42 \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_DAEMON_SOCKET='$SOCKET' && \
     export HOME='$HOME_DIR' && \
     export ANTHROPIC_API_KEY='$SCENARIO_API_KEY' && \
+    export COWD_GATEWAY_URL='$BASE_URL' && \
     export COWD_DISABLE_DAEMON_AUTOSTART=1 && \
     export COWD_TUI_ACCESSIBILITY=1 && \
     export COWD_TUI_SKIP_RAW_MODE=1 && \
@@ -139,7 +136,7 @@ tmux new-session -d -s "$TUI_SESSION" -x 140 -y 42 \
 
 for _ in {1..60}; do
   tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE" 2>/dev/null || true
-  if rg -q "Daemon control connected|Daemon session (created|attached)|Daemon session lease acquired" "$TUI_CAPTURE"; then
+  if rg -q "Gateway session (created|attached)|Gateway session lease acquired" "$TUI_CAPTURE"; then
     break
   fi
   sleep 0.25
@@ -147,19 +144,18 @@ done
 
 tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE"
 
-rg -q "Daemon control connected" "$TUI_CAPTURE"
-rg -q "Daemon session (created|attached)" "$TUI_CAPTURE"
-rg -q "Daemon lifecycle attached" "$TUI_CAPTURE"
-rg -q "Daemon replay ready" "$TUI_CAPTURE"
-rg -q "Daemon session lease acquired" "$TUI_CAPTURE"
-rg -q "Daemon runtime projection connected|Daemon projection degraded" "$TUI_CAPTURE"
+rg -q "Gateway session (created|attached)" "$TUI_CAPTURE"
+rg -q "Gateway lifecycle attached" "$TUI_CAPTURE"
+rg -q "Gateway replay ready" "$TUI_CAPTURE"
+rg -q "Gateway session lease acquired" "$TUI_CAPTURE"
+rg -q "Gateway runtime projection connected|Gateway projection degraded" "$TUI_CAPTURE"
 if rg -q "__COWD_TUI_EXIT__[1-9]|panic|backtrace|thread .* panicked|failed to initialize terminal|Run cowd --help" "$TUI_CAPTURE"; then
   exit 1
 fi
 
-sqlite3 "$WORKDIR/.cowd/resource-directory.sqlite" "SELECT reference FROM connector_resources;" \
-  | rg -q "service://mock.docs/document/tui-daemon-tui-doc"
+curl -fsS "$BASE_URL/api/connectors/resources" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); text=json.dumps(data); assert "tui-daemon-tui-doc" in text or "tui-daemon TUI Attach Doc" in text, data'
 
 tmux kill-session -t "$TUI_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
-echo "TUI daemon attach TUI daemon attach scenario passed"
+echo "TUI Gateway attach scenario passed"

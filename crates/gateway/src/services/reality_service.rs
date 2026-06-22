@@ -215,8 +215,8 @@ impl RealityService {
                     "id": "matrix",
                     "label": "Matrix Engine",
                     "scope": "Structured source packs, facts, entities, relations, metrics, evidence, quality gates, and lineage.",
-                    "route": "/apps/mfg?section=matrix",
-                    "api": ["/api/matrix/*", "/api/apps/mfg/*"],
+                    "route": "/reality?section=matrix",
+                    "api": ["/api/matrix/*"],
                     "owner": "gateway.matrix",
                     "mode": "read-write"
                 },

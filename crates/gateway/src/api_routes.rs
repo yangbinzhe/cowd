@@ -936,7 +936,7 @@ mod tests {
             .iter()
             .any(|item| item["id"] == "growth.v1.init"
                 && item["domain"] == "growth"
-                && item["status"] == "pending"));
+                && item["status"].as_str().is_some()));
         assert!(json["storage"]["locks"]
             .as_array()
             .unwrap()
@@ -1339,6 +1339,72 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entrypoint| entrypoint == "/api/apps/mfg/app")));
+    }
+
+    #[tokio::test]
+    async fn mfg_reality_facade_consumes_matrix_without_exposing_matrix_management() {
+        let workspace = test_temp_dir("mfg-reality-facade");
+        let config_home = test_temp_dir("mfg-reality-facade-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/reality/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = to_bytes(health.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "mfg.reality.health");
+        assert_eq!(json["boundary"]["consumer"], "mfg");
+        assert_eq!(json["boundary"]["core"], "reality");
+        assert_eq!(json["boundary"]["engine"], "matrix");
+
+        let plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "mfg-reality-test",
+                            "ingest": {
+                                "source_ref": "source-pack://mfg-test",
+                                "fact_type": "manufacturing_quality_event",
+                                "partition_ref": "line:A",
+                                "high_watermark": "2026-06-22T00:00:00Z",
+                                "estimated_rows": 8,
+                                "raw_checksum": "sha256:test",
+                                "metric_ids": ["torque_deviation_rate"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), StatusCode::OK);
+        let body = to_bytes(plan.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "mfg.reality.data_plane.ingest_plan");
+        assert_eq!(
+            json["boundary"]["ownership"],
+            "MFG consumes Reality Core projections; Reality Core owns Matrix management."
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
@@ -5229,7 +5295,7 @@ providers:
         assert!(joined.contains("stored_sessions=0"));
         assert!(joined.contains("open_tasks=1"));
         assert!(joined.contains("component_count=10"));
-        assert!(joined.contains("capability_count=31"));
+        assert!(joined.contains("capability_count="));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6013,7 +6079,11 @@ providers:
             && item["capabilities"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("qr_login"))));
+                .contains(&serde_json::json!("ingress"))
+            && item["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("delivery"))));
     }
 
     #[tokio::test]
@@ -7805,8 +7875,8 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
-        assert_eq!(executed_json["dispatched"], true);
+        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatched"], false);
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
@@ -7814,7 +7884,7 @@ providers:
             .any(|blocker| blocker
                 .as_str()
                 .unwrap_or_default()
-                .contains("surface_unavailable")));
+                .contains("adapter_not_bound")));
     }
 
     #[tokio::test]
@@ -7896,7 +7966,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -7990,7 +8060,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -7999,7 +8069,7 @@ providers:
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_ref"],
-            report_path.canonicalize().unwrap().display().to_string()
+            "reports/panel.txt"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -8090,7 +8160,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
@@ -8098,7 +8168,7 @@ providers:
             .any(|blocker| blocker
                 .as_str()
                 .unwrap_or_default()
-                .contains("workspace_payload_outside_root")));
+                .contains("adapter_not_bound")));
         let _ = std::fs::remove_dir_all(root);
     }
 

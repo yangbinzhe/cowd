@@ -25,6 +25,8 @@ pub struct SystemStatusBar {
     provider: String,
     connectors: String,
     memory: String,
+    mode: String,
+    evidence: String,
     issue: Option<String>,
 }
 
@@ -114,6 +116,12 @@ impl SystemStatusBar {
             .memory_status
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
+        self.mode = if app.compact_chat {
+            "clean".to_string()
+        } else {
+            "panorama".to_string()
+        };
+        self.evidence = evidence_health(app);
         self.issue = app
             .gateway_degraded_reasons
             .first()
@@ -165,6 +173,11 @@ impl Component for SystemStatusBar {
                 format!("  {}", preview(&self.last_phase, 28)),
                 Style::default().fg(turn_color),
             ),
+            sep(),
+            Span::styled("mode ", Style::default().fg(Color::DarkGray)),
+            Span::styled(self.mode.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("  ev ", Style::default().fg(Color::DarkGray)),
+            Span::styled(self.evidence.clone(), Style::default().fg(Color::DarkGray)),
         ];
 
         if let Some(issue) = &self.issue {
@@ -220,6 +233,28 @@ fn connector_health(app: &App) -> String {
     } else {
         format!("{}a/{}c", accounts, capabilities)
     }
+}
+
+fn evidence_health(app: &App) -> String {
+    let context_count = app
+        .latest_context_envelope
+        .as_ref()
+        .and_then(|value| value.get("selected").and_then(serde_json::Value::as_array))
+        .map(Vec::len)
+        .unwrap_or_default();
+    let memory_count = app
+        .latest_workgraph_summary
+        .as_ref()
+        .map(|summary| summary.memory_candidates)
+        .unwrap_or_default();
+    let reality_count = app
+        .gateway_fact_flow
+        .as_ref()
+        .map(|flow| {
+            flow.stage_count + flow.event_count + flow.promotion_count + flow.boundary_count
+        })
+        .unwrap_or_default();
+    format!("ctx:{context_count} mem:{memory_count} reality:{reality_count}")
 }
 
 fn sep() -> Span<'static> {
@@ -309,6 +344,37 @@ mod tests {
     }
 
     #[test]
+    fn evidence_health_summarizes_current_turn_signals() {
+        let mut app = App::new("m", "s");
+        app.compact_chat = true;
+        app.latest_context_envelope = Some(serde_json::json!({
+            "selected": [{"id": "a"}, {"id": "b"}],
+            "omitted": []
+        }));
+        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+            graph_id: None,
+            board_id: None,
+            status: "ready".into(),
+            agent_tasks: 0,
+            memory_candidates: 3,
+            conflicts: 0,
+            completion_rate: None,
+            synthesis_lift: None,
+            complementarity_score: None,
+        });
+        app.gateway_fact_flow = Some(crate::runtime_control_store::FactFlowSummary {
+            source: "test".into(),
+            session_id: Some("s".into()),
+            stage_count: 1,
+            event_count: 2,
+            promotion_count: 1,
+            boundary_count: 1,
+        });
+
+        assert_eq!(evidence_health(&app), "ctx:2 mem:3 reality:5");
+    }
+
+    #[test]
     fn render_system_status_bar_keeps_top_line_calm() {
         let app = App::new("deepseek-v4-pro", "s");
         let mut bar = SystemStatusBar::new();
@@ -327,6 +393,7 @@ mod tests {
         assert!(!joined.contains("provider"));
         assert!(!joined.contains("gateway"));
         assert!(!joined.contains("connectors"));
-        assert!(!joined.contains("memory"));
+        assert!(joined.contains("mode"));
+        assert!(joined.contains("panorama"));
     }
 }

@@ -1466,6 +1466,10 @@ impl TuiState {
             }
         }
 
+        if self.handle_terminal_control_shortcut(event) {
+            return true;
+        }
+
         if self.app.input.is_empty() && self.route_navigation_to_focus(event) {
             return true;
         }
@@ -1493,25 +1497,13 @@ impl TuiState {
             }
         }
 
-        // 1.8. 'v' toggle compact chat view
+        // 1.8. Empty-input 'v' toggles the terminal display mode.
         if let KeyCode::Char('v') = event.code {
-            if !event.modifiers.contains(KeyModifiers::CONTROL)
+            if self.app.input.is_empty()
+                && !event.modifiers.contains(KeyModifiers::CONTROL)
                 && !event.modifiers.contains(KeyModifiers::ALT)
             {
-                self.app.compact_chat = !self.app.compact_chat;
-                self.toast_manager.push(
-                    ToastVariant::Info,
-                    None,
-                    format!(
-                        "Chat view: {}",
-                        if self.app.compact_chat {
-                            "compact (summary)"
-                        } else {
-                            "verbose (full timeline)"
-                        }
-                    ),
-                    1500,
-                );
+                self.toggle_terminal_display_mode();
                 return true;
             }
         }
@@ -1749,6 +1741,10 @@ impl TuiState {
 
         if self.app.search_active {
             return self.handle_search_key(key);
+        }
+
+        if self.handle_terminal_control_shortcut(key) {
+            return ProcessedKey::Nothing;
         }
 
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
@@ -2545,6 +2541,55 @@ impl TuiState {
             format!("Opened {label}"),
             1600,
         );
+    }
+
+    fn handle_terminal_control_shortcut(&mut self, event: KeyEvent) -> bool {
+        if !event.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        match event.code {
+            KeyCode::Char('v' | 'V') => {
+                self.toggle_terminal_display_mode();
+                true
+            }
+            KeyCode::Char('e' | 'E') => {
+                self.open_evidence_panorama();
+                true
+            }
+            KeyCode::Char('g' | 'G') => {
+                self.open_gateway_control_deck();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn toggle_terminal_display_mode(&mut self) {
+        self.app.compact_chat = !self.app.compact_chat;
+        self.app.mark_dirty();
+        self.chat_view.mark_dirty();
+        let mode = if self.app.compact_chat {
+            "clean"
+        } else {
+            "panorama"
+        };
+        self.toast_manager.push(
+            ToastVariant::Info,
+            Some("Display".into()),
+            format!("Terminal mode: {mode}"),
+            1500,
+        );
+    }
+
+    fn open_evidence_panorama(&mut self) {
+        self.app.compact_chat = false;
+        self.open_sidebar_tab(TAB_RUNTIME, "Evidence");
+        self.runtime_activity_panel.sync_from_app(&self.app);
+    }
+
+    fn open_gateway_control_deck(&mut self) {
+        self.open_sidebar_tab(TAB_GATEWAY, "Control Deck");
+        self.gateway_panel.sync_from_app(&self.app);
     }
 
     fn open_topic_panel(&mut self, panel: SidebarTopicPanel) {

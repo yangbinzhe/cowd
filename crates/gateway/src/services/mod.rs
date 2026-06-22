@@ -683,7 +683,7 @@ mod tests {
             services.service_labels(),
             vec![
                 "runtime",
-                "channel",
+                "surface",
                 "slash",
                 "session",
                 "task",

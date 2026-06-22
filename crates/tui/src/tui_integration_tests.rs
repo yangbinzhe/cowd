@@ -19,7 +19,7 @@
 // -------------------------------------------------------------------
 
 use crate::app::App;
-use crate::state::{ProcessedKey, TuiState, SIDEBAR_TAB_COUNT};
+use crate::state::{ProcessedKey, TuiState, SIDEBAR_TAB_COUNT, TAB_GATEWAY, TAB_RUNTIME};
 use crate::test_utils::MockTerminal;
 use crate::CowdEvent;
 
@@ -31,6 +31,10 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn key_ctrl(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
+fn key_alt(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::ALT)
 }
 
 #[test]
@@ -106,6 +110,67 @@ fn integration_panel_switch() {
     // Final Tab wraps back to 0.
     state.handle_input(key(KeyCode::Tab));
     assert_eq!(state.sidebar_active_tab, 0);
+}
+
+#[test]
+fn integration_terminal_display_mode_and_control_shortcuts() {
+    let mut state = TuiState::new("test-model", "test-session");
+
+    assert!(!state.app.compact_chat);
+    state.process_raw_key(key_alt(KeyCode::Char('v')));
+    assert!(state.app.compact_chat);
+    state.process_raw_key(key_alt(KeyCode::Char('v')));
+    assert!(!state.app.compact_chat);
+
+    state.process_raw_key(key_alt(KeyCode::Char('e')));
+    assert!(state.layout_state.sidebar_visible);
+    assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+    assert!(!state.app.compact_chat);
+
+    state.process_raw_key(key_alt(KeyCode::Char('g')));
+    assert!(state.layout_state.sidebar_visible);
+    assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
+}
+
+#[test]
+fn integration_clean_mode_renders_current_turn_evidence_summary() {
+    let mut terminal = MockTerminal::new(120, 24);
+    let mut state = TuiState::new("test-model", "test-session");
+    state.app.compact_chat = true;
+    state.app.add_message("user", "Run a diagnostic");
+    state.app.add_message("assistant", "Diagnostic complete.");
+    state.app.latest_context_envelope = Some(serde_json::json!({
+        "selected": [{"id": "ctx-1"}, {"id": "ctx-2"}],
+        "omitted": [{"id": "ctx-old"}]
+    }));
+    state.app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        graph_id: None,
+        board_id: None,
+        status: "ready".into(),
+        agent_tasks: 0,
+        memory_candidates: 4,
+        conflicts: 0,
+        completion_rate: None,
+        synthesis_lift: None,
+        complementarity_score: None,
+    });
+    state.app.gateway_fact_flow = Some(crate::runtime_control_store::FactFlowSummary {
+        source: "test".into(),
+        session_id: Some("test-session".into()),
+        stage_count: 2,
+        event_count: 3,
+        promotion_count: 1,
+        boundary_count: 1,
+    });
+    state.app.gateway_pending_approvals = Some(1);
+
+    terminal.draw(|frame| state.render(frame));
+    let joined = terminal.buffer_lines().join("\n");
+    assert!(joined.contains("Evidence:"));
+    assert!(joined.contains("ctx 2/1"));
+    assert!(joined.contains("mem candidates 4"));
+    assert!(joined.contains("reality s2 e3 p1 b1"));
+    assert!(joined.contains("approvals 1"));
 }
 
 #[test]
