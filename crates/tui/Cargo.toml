@@ -13,7 +13,7 @@ libc = "0.2.186"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
 reqwest.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 syntect = { version = "5", optional = true }

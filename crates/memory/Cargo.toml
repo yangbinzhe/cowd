@@ -22,7 +22,6 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 storage = { path = "../storage" }
 walkdir = "2"
-tempfile = "3"
 regex = "1"
 tree-sitter = { version = "0.24", optional = true }
 tree-sitter-rust = { version = "0.23", optional = true }
@@ -50,6 +49,7 @@ watch = ["code-index", "dep:notify"]
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "allow"

@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 gateway = { path = "../gateway" }
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 tui = { path = "../tui", optional = true }
 
 [[bin]]

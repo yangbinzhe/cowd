@@ -221,7 +221,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.355 Provider service boundary",
+            owner: "0.9.356 Provider service boundary",
         }
     }
 
@@ -308,7 +308,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.355 Growth service boundary",
+            owner: "0.9.356 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.355 GatewayServices");
+        assert_eq!(services.owner, "0.9.356 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
