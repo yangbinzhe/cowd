@@ -87,6 +87,7 @@ pub mod provider_runtime_client;
 pub mod quality_gate;
 pub mod release_gate;
 pub mod session_lifecycle;
+pub mod session_relation_graph;
 pub mod skill_activation;
 pub mod skill_dependency;
 pub mod skill_memory;
@@ -310,6 +311,10 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
+};
+pub use session_relation_graph::{
+    global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
+    SessionRelationKind, SessionRouteCommand, SessionRouteReceipt,
 };
 pub use skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
 pub use skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};

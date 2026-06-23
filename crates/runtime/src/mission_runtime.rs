@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::global_session_relation_graph;
 use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +70,7 @@ pub struct MissionProjection {
     pub team_projection: serde_json::Value,
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
+    pub relation_projection: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +284,7 @@ impl MissionRuntime {
             team_projection: global_team_runtime_service().projection(),
             agent_projection: global_agent_lifecycle_service().projection(),
             approval_projection: global_approval_queue().projection(),
+            relation_projection: global_session_relation_graph().projection(),
         }
     }
 
@@ -433,6 +436,10 @@ mod tests {
         assert_eq!(
             projection.approval_projection["kind"],
             "runtime.global_approvals"
+        );
+        assert_eq!(
+            projection.relation_projection["kind"],
+            "runtime.session_relations"
         );
     }
 }
