@@ -76,6 +76,7 @@ pub mod pairing;
 pub mod profile;
 pub mod projection;
 pub mod provider_registry;
+pub mod provider_runtime_client;
 pub mod quality_gate;
 pub mod release_gate;
 pub mod session_lifecycle;
@@ -87,6 +88,7 @@ mod sse;
 pub mod stale_base;
 pub mod stale_branch;
 pub mod structured_data;
+pub mod subagent_turn;
 pub mod summary_compression;
 pub mod surface_contract;
 pub mod task_packet;
@@ -245,6 +247,10 @@ pub use provider_registry::{
     init_global_providers, list_all_models, list_all_providers, list_models_for_provider,
     resolve_global_provider,
 };
+pub use provider_runtime_client::{
+    push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
+    ProviderToolDefinition,
+};
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
     RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
@@ -277,6 +283,9 @@ pub use stale_base::{
 pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
+};
+pub use subagent_turn::{
+    final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
 };
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,

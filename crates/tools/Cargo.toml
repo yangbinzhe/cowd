@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 futures = "0.3"
-provider = { path = "../provider" }
 base64 = "0.22"
 skill-service = { path = "../skill/service" }
 flate2 = "1"

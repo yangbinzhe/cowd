@@ -2,14 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mcp::McpService;
 use plugins::PluginTool;
-use provider::ToolDefinition;
 use runtime::{
     lsp_client::LspRegistry,
     permission_enforcer::PermissionEnforcer,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::WorkerRegistry,
-    McpDegradedReport, PermissionMode,
+    McpDegradedReport, PermissionMode, ProviderToolDefinition as ToolDefinition,
 };
 use serde_json::Value;
 
