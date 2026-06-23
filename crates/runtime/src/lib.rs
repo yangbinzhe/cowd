@@ -94,6 +94,7 @@ pub mod source_self_audit;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
+pub mod steward_agent;
 pub mod structured_data;
 pub mod subagent_turn;
 pub mod summary_compression;
@@ -323,6 +324,9 @@ pub use stale_base::{
 pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
+};
+pub use steward_agent::{
+    StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
 };
 pub use subagent_turn::{
     final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
