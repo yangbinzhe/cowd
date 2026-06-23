@@ -261,8 +261,9 @@ pub use mcp_stdio::{
     UnsupportedMcpServer,
 };
 pub use mission_runtime::{
-    global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection, MissionRuntime,
-    MissionSessionSnapshot, MissionSessionStatus, StartMissionSessionRequest,
+    global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection,
+    MissionRoutedCommand, MissionRuntime, MissionSessionSnapshot, MissionSessionStatus,
+    StartMissionSessionRequest,
 };
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
@@ -343,9 +344,9 @@ pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus as RegistryT
 pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
 pub use team_runtime::{
-    global_team_runtime_service, StartTeamRuntimeRequest, TeamRuntimeAgent,
-    TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService, TeamRuntimeSnapshot,
-    TeamRuntimeStatus,
+    global_team_runtime_service, StartTeamRuntimeAgentRequest, StartTeamRuntimeRequest,
+    TeamRuntimeAgent, TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService,
+    TeamRuntimeSnapshot, TeamRuntimeStatus,
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_invocation::{

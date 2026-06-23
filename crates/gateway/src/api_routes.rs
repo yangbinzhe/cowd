@@ -1239,6 +1239,26 @@ mod tests {
             Some(session_id.as_str())
         );
 
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/mission/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: serde_json::Value =
+            serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(detail["kind"], "mission.session");
+        assert_eq!(
+            detail["session"]["session_id"].as_str(),
+            Some(session_id.as_str())
+        );
+
         let backgrounded = app
             .clone()
             .oneshot(
@@ -1282,6 +1302,251 @@ mod tests {
             .unwrap()
             .iter()
             .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+    }
+
+    #[tokio::test]
+    async fn mission_routes_write_approvals_relations_proxies_and_routes() {
+        let app = api_router(test_state());
+        let session_a = format!("mission-route-a-{}", uuid::Uuid::new_v4());
+        let session_b = format!("mission-route-b-{}", uuid::Uuid::new_v4());
+        for session_id in [&session_a, &session_b] {
+            let created = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/mission/sessions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "title": format!("route session {session_id}"),
+                                "session_id": session_id,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+        }
+
+        let original_config_home = std::env::var_os("COWD_CONFIG_HOME");
+        let team_agent_home =
+            std::env::temp_dir().join(format!("cowd-mission-team-agents-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("COWD_CONFIG_HOME", &team_agent_home);
+        let team = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/sessions/{session_a}/teams/runtime"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "objective": "research architecture and review implementation"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(team.status(), StatusCode::OK);
+        let team_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(team.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(team_json["ok"], true);
+        assert!(!team_json["team"]["team_id"]
+            .as_str()
+            .expect("team id")
+            .is_empty());
+        assert!(team_json["team"]["agents"]
+            .as_array()
+            .expect("team agents")
+            .iter()
+            .all(|agent| agent["agent_id"].as_str().is_some_and(|id| !id.is_empty())));
+        if let Some(value) = original_config_home {
+            std::env::set_var("COWD_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(team_agent_home);
+
+        let approval = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/approvals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": {
+                                "kind": "session",
+                                "session_id": session_a.clone(),
+                                "agent_id": null,
+                                "team_id": null,
+                                "mission_id": "mission-a"
+                            },
+                            "action": "apply_patch",
+                            "summary": "modify runtime",
+                            "risk": "medium",
+                            "evidence_refs": ["trace:1"],
+                            "timeout_policy": "pending"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+        let approval_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(approval.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(approval_json["ok"], true);
+        let approval_id = approval_json["approval"]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+        assert_eq!(approval_json["approval"]["status"], "pending");
+        assert!(
+            approval_json["approvals"]["pending_count"]
+                .as_u64()
+                .expect("pending count")
+                >= 1
+        );
+
+        let approval_decision = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/approvals/{approval_id}/decision"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "approved": true,
+                            "decided_by": "route-test",
+                            "reason": "verified"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approval_decision.status(), StatusCode::OK);
+        let approval_decision_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(approval_decision.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            approval_decision_json["receipt"]["approval_id"].as_str(),
+            Some(approval_id.as_str())
+        );
+        assert_eq!(approval_decision_json["receipt"]["status"], "approved");
+
+        let relation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/relations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "from_session_id": session_a.clone(),
+                            "to_session_id": session_b.clone(),
+                            "kind": "reviews",
+                            "summary": "A reviews B",
+                            "evidence_refs": ["trace:2"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relation.status(), StatusCode::CREATED);
+        let relation_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(relation.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            relation_json["relations"]["relation_count"]
+                .as_u64()
+                .expect("relation count")
+                >= 1
+        );
+        assert_eq!(relation_json["relation"]["from_session_id"], session_a);
+        assert_eq!(relation_json["relation"]["to_session_id"], session_b);
+
+        let proxy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/proxies")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": session_b.clone(),
+                            "summary": "B summary",
+                            "evidence_refs": ["trace:3"],
+                            "decisions": ["ship"],
+                            "open_questions": ["risk?"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proxy.status(), StatusCode::OK);
+        let proxy_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(proxy.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(proxy_json["proxy"]["session_id"], session_b);
+
+        let routed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/route")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "from_session_id": session_a.clone(),
+                            "target_ref": format!("@{session_b}"),
+                            "command": "review"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed.status(), StatusCode::OK);
+        let routed_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            routed_json["receipt"]["resolved_session_id"].as_str(),
+            Some(session_b.as_str())
+        );
+        assert_eq!(routed_json["routed"]["kind"], "mission.session_command");
+        assert_eq!(
+            routed_json["routed"]["command"]["target_session_id"].as_str(),
+            Some(session_b.as_str())
+        );
+        assert!(routed_json["mission"]["routed_commands"]
+            .as_array()
+            .expect("routed commands")
+            .iter()
+            .any(|command| command["target_session_id"].as_str() == Some(session_b.as_str())));
     }
 
     #[tokio::test]
@@ -2979,6 +3244,121 @@ mod tests {
 
         let manifest = std::fs::read_to_string(&manifest_file).unwrap();
         assert!(manifest.contains("\"status\": \"cancel_requested\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_agent_routes_deliver_input_interrupt_and_shutdown_commands() {
+        let app = api_router(test_state());
+        let agent_id = format!("agent-command-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(format!("cowd-agent-command-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_file = dir.join("agent.md");
+        let manifest_file = dir.join("agent.json");
+        std::fs::write(&output_file, "# Agent Task\n").unwrap();
+        let snapshot = runtime::AgentSnapshot {
+            agent_id: agent_id.clone(),
+            name: String::from("command-agent"),
+            description: String::from("command test"),
+            subagent_type: Some(String::from("Explore")),
+            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
+            status: String::from("running"),
+            backend: runtime::AgentExecutionBackendKind::ProcessJsonl,
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: String::from("1"),
+            started_at: Some(String::from("1")),
+            completed_at: None,
+            lane_events: vec![],
+            current_blocker: None,
+            derived_state: String::from("working"),
+            error: None,
+        };
+        runtime::global_agent_lifecycle_service()
+            .register_started(snapshot, runtime::CancellationToken::new());
+        let (tx, rx) = std::sync::mpsc::channel::<runtime::AgentExecutionCommand>();
+        runtime::global_agent_lifecycle_service()
+            .attach_command_channel(&agent_id, tx)
+            .expect("command channel");
+
+        for (path, expected) in [
+            ("input", runtime::AgentExecutionCommandKind::Input),
+            ("interrupt", runtime::AgentExecutionCommandKind::Interrupt),
+            ("shutdown", runtime::AgentExecutionCommandKind::Shutdown),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/runtime/agents/{agent_id}/{path}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"payload": {"text": path}}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["receipt"]["status"], "accepted");
+            let delivered = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            assert_eq!(delivered.command, expected);
+            assert_eq!(delivered.agent_id, agent_id);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_agent_command_reports_backend_without_channel_as_conflict() {
+        let app = api_router(test_state());
+        let agent_id = format!("agent-no-command-channel-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(format!(
+            "cowd-agent-no-command-channel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_file = dir.join("agent.md");
+        let manifest_file = dir.join("agent.json");
+        std::fs::write(&output_file, "# Agent Task\n").unwrap();
+        runtime::global_agent_lifecycle_service().register_started(
+            runtime::AgentSnapshot {
+                agent_id: agent_id.clone(),
+                name: String::from("no-command-agent"),
+                description: String::from("no command channel test"),
+                subagent_type: Some(String::from("Explore")),
+                model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
+                status: String::from("queued"),
+                backend: runtime::AgentExecutionBackendKind::InProcess,
+                output_file: output_file.display().to_string(),
+                manifest_file: manifest_file.display().to_string(),
+                created_at: String::from("1"),
+                started_at: Some(String::from("1")),
+                completed_at: None,
+                lane_events: vec![],
+                current_blocker: None,
+                derived_state: String::from("queued"),
+                error: None,
+            },
+            runtime::CancellationToken::new(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/agents/{agent_id}/input"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"payload": {"text": "hi"}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let _ = std::fs::remove_dir_all(dir);
     }
 

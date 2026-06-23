@@ -11,7 +11,8 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_runtime_control_plane, CollaborationDecision, CollaborationPlan, CollaborationTemplateId,
+    global_agent_lifecycle_service, global_runtime_control_plane, AgentSnapshot,
+    CollaborationDecision, CollaborationPlan, CollaborationTemplateId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +89,17 @@ pub struct StartTeamRuntimeRequest {
     pub session_id: String,
     pub objective: String,
     pub collaboration_decision: CollaborationDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartTeamRuntimeAgentRequest {
+    pub team_id: String,
+    pub session_id: String,
+    pub objective: String,
+    pub role_id: String,
+    pub responsibility: String,
+    pub allowed_tools: Vec<String>,
+    pub evidence_duties: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +192,85 @@ impl TeamRuntimeService {
         Ok(snapshot)
     }
 
+    pub fn start_with_agent_spawner<F>(
+        &self,
+        request: StartTeamRuntimeRequest,
+        mut spawner: F,
+    ) -> Result<TeamRuntimeSnapshot, String>
+    where
+        F: FnMut(StartTeamRuntimeAgentRequest) -> Result<AgentSnapshot, String>,
+    {
+        let snapshot = self.start(request)?;
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for agent in &snapshot.agents {
+            let spawn_request = StartTeamRuntimeAgentRequest {
+                team_id: snapshot.team_id.clone(),
+                session_id: snapshot.session_id.clone(),
+                objective: snapshot.objective.clone(),
+                role_id: agent.role_id.clone(),
+                responsibility: agent.responsibility.clone(),
+                allowed_tools: agent.allowed_tools.clone(),
+                evidence_duties: agent.evidence_duties.clone(),
+            };
+            let spawned = match spawner(spawn_request) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    for (_, agent_id) in &bindings {
+                        let _ = global_agent_lifecycle_service().cancel(agent_id);
+                    }
+                    let _ = self.with_record(&snapshot.team_id, "bind_agents_failed", |record| {
+                        record.snapshot.status = TeamRuntimeStatus::Failed;
+                        for (role_id, agent_id) in bindings {
+                            if let Some(agent) = record
+                                .snapshot
+                                .agents
+                                .iter_mut()
+                                .find(|agent| agent.role_id == role_id)
+                            {
+                                agent.agent_id = Some(agent_id);
+                                agent.status = TeamRuntimeStatus::Cancelled;
+                            }
+                        }
+                        for agent in &mut record.snapshot.agents {
+                            if !agent.status.is_terminal() {
+                                agent.status = TeamRuntimeStatus::Failed;
+                            }
+                        }
+                        record.touch();
+                        record.push_event(
+                            "team.agents_bind_failed",
+                            format!("team runtime agent binding failed: {error}"),
+                        );
+                        "agent binding failed".to_string()
+                    });
+                    return Err(error);
+                }
+            };
+            bindings.push((agent.role_id.clone(), spawned.agent_id));
+        }
+        self.with_record(&snapshot.team_id, "bind_agents", |record| {
+            for (role_id, agent_id) in bindings {
+                if let Some(agent) = record
+                    .snapshot
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.role_id == role_id)
+                {
+                    agent.agent_id = Some(agent_id);
+                    agent.status = TeamRuntimeStatus::Running;
+                }
+            }
+            record.touch();
+            record.push_event(
+                "team.agents_bound",
+                "team runtime agents bound to lifecycle",
+            );
+            "agents bound".to_string()
+        })?;
+        self.get(&snapshot.team_id)
+            .ok_or_else(|| format!("team runtime not found: {}", snapshot.team_id))
+    }
+
     #[must_use]
     pub fn get(&self, team_id: &str) -> Option<TeamRuntimeSnapshot> {
         self.runs
@@ -240,6 +331,15 @@ impl TeamRuntimeService {
 
     pub fn cancel(&self, team_id: &str) -> Result<TeamRuntimeCommandReceipt, String> {
         self.with_record(team_id, "cancel", |record| {
+            let agent_ids = record
+                .snapshot
+                .agents
+                .iter()
+                .filter_map(|agent| agent.agent_id.clone())
+                .collect::<Vec<_>>();
+            for agent_id in agent_ids {
+                let _ = global_agent_lifecycle_service().cancel(&agent_id);
+            }
             record.snapshot.status = TeamRuntimeStatus::Cancelled;
             for agent in &mut record.snapshot.agents {
                 if !agent.status.is_terminal() {
@@ -434,5 +534,138 @@ mod tests {
             .iter()
             .all(|agent| agent.status == TeamRuntimeStatus::Completed));
         assert!(service.events(&snapshot.team_id).unwrap().len() >= 4);
+    }
+
+    #[test]
+    fn team_runtime_binds_spawned_agents_to_roles() {
+        let service = TeamRuntimeService::new();
+        let prompt = "research alternatives and synthesize a decision";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let mut spawned_roles = Vec::new();
+
+        let snapshot = service
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id: "session-team-bind".to_string(),
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| {
+                    spawned_roles.push(request.role_id.clone());
+                    Ok(fake_agent_snapshot(&request.role_id))
+                },
+            )
+            .expect("team starts and binds agents");
+
+        assert!(!spawned_roles.is_empty());
+        assert!(snapshot.agents.iter().all(|agent| agent
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("agent-"))));
+        assert!(service
+            .events(&snapshot.team_id)
+            .expect("events")
+            .iter()
+            .any(|event| event.event_type == "team.agents_bound"));
+    }
+
+    #[test]
+    fn team_runtime_cancel_propagates_to_bound_agents() {
+        let service = TeamRuntimeService::new();
+        let prompt = "implement and review a focused change";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let temp_root =
+            std::env::temp_dir().join(format!("cowd-team-runtime-agents-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).expect("temp root");
+        let mut spawned_ids = Vec::new();
+
+        let snapshot = service
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id: "session-team-cancel".to_string(),
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| {
+                    let snapshot = fake_registered_agent_snapshot(&temp_root, &request.role_id);
+                    spawned_ids.push(snapshot.agent_id.clone());
+                    Ok(snapshot)
+                },
+            )
+            .expect("team starts");
+
+        service.cancel(&snapshot.team_id).expect("team cancel");
+        for agent_id in spawned_ids {
+            assert_eq!(
+                global_agent_lifecycle_service()
+                    .get(&agent_id)
+                    .expect("agent")
+                    .status,
+                "cancel_requested"
+            );
+        }
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn team_runtime_marks_failed_when_agent_binding_fails() {
+        let service = TeamRuntimeService::new();
+        let prompt = "research and review a complex architecture";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+
+        let result = service.start_with_agent_spawner(
+            StartTeamRuntimeRequest {
+                session_id: "session-team-bind-fails".to_string(),
+                objective: prompt.to_string(),
+                collaboration_decision: decision,
+            },
+            |_request| Err("spawner unavailable".to_string()),
+        );
+
+        assert!(result.is_err());
+        let failed = service.projection()["teams"]
+            .as_array()
+            .expect("teams")
+            .iter()
+            .find(|team| team["session_id"] == "session-team-bind-fails")
+            .cloned()
+            .expect("failed team");
+        assert_eq!(failed["status"], "failed");
+    }
+
+    fn fake_agent_snapshot(role_id: &str) -> AgentSnapshot {
+        AgentSnapshot {
+            agent_id: format!("agent-{role_id}-{}", uuid::Uuid::new_v4()),
+            name: role_id.to_string(),
+            description: format!("agent for {role_id}"),
+            subagent_type: Some("Explore".to_string()),
+            model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
+            status: "running".to_string(),
+            backend: crate::AgentExecutionBackendKind::InProcess,
+            output_file: String::new(),
+            manifest_file: String::new(),
+            created_at: "1".to_string(),
+            started_at: Some("1".to_string()),
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        }
+    }
+
+    fn fake_registered_agent_snapshot(root: &std::path::Path, role_id: &str) -> AgentSnapshot {
+        let snapshot = AgentSnapshot {
+            output_file: root.join(format!("{role_id}.md")).display().to_string(),
+            manifest_file: root.join(format!("{role_id}.json")).display().to_string(),
+            ..fake_agent_snapshot(role_id)
+        };
+        std::fs::write(&snapshot.output_file, "# Agent Task\n").expect("output");
+        global_agent_lifecycle_service()
+            .register_started(snapshot.clone(), crate::CancellationToken::new());
+        snapshot
     }
 }

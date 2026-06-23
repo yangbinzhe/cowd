@@ -62,11 +62,22 @@ pub struct MissionCommandReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionRoutedCommand {
+    pub route_id: String,
+    pub from_session_id: String,
+    pub target_session_id: String,
+    pub command: String,
+    pub status: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionProjection {
     pub kind: String,
     pub active_session_id: Option<String>,
     pub sessions: Vec<MissionSessionSnapshot>,
     pub events: Vec<MissionEvent>,
+    pub routed_commands: Vec<MissionRoutedCommand>,
     pub team_projection: serde_json::Value,
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
@@ -84,6 +95,7 @@ struct MissionRuntimeState {
     active_session_id: Option<String>,
     sessions: BTreeMap<String, MissionSessionSnapshot>,
     events: Vec<MissionEvent>,
+    routed_commands: Vec<MissionRoutedCommand>,
     next_sequence: u64,
 }
 
@@ -93,6 +105,7 @@ impl Default for MissionRuntimeState {
             active_session_id: None,
             sessions: BTreeMap::new(),
             events: Vec::new(),
+            routed_commands: Vec::new(),
             next_sequence: 0,
         }
     }
@@ -241,6 +254,45 @@ impl MissionRuntime {
         })
     }
 
+    pub fn record_routed_session_command(
+        &self,
+        from_session_id: &str,
+        target_session_id: &str,
+        command: impl Into<String>,
+    ) -> Result<MissionRoutedCommand, String> {
+        let command = command.into();
+        if command.trim().is_empty() {
+            return Err("route command must not be empty".to_string());
+        }
+        let now = now_ms();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.sessions.contains_key(from_session_id) {
+            return Err(format!("mission session not found: {from_session_id}"));
+        }
+        let Some(target) = state.sessions.get_mut(target_session_id) else {
+            return Err(format!("mission session not found: {target_session_id}"));
+        };
+        target.updated_at_ms = now;
+        let routed = MissionRoutedCommand {
+            route_id: format!("mission-route-{}", uuid::Uuid::new_v4()),
+            from_session_id: from_session_id.to_string(),
+            target_session_id: target_session_id.to_string(),
+            command,
+            status: "queued".to_string(),
+            created_at_ms: now,
+        };
+        state.routed_commands.push(routed.clone());
+        state.push_event(
+            "mission.session.command_routed",
+            format!("command routed to mission session {target_session_id}"),
+            Some(target_session_id.to_string()),
+        );
+        Ok(routed)
+    }
+
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<MissionSessionSnapshot> {
         self.state
@@ -281,6 +333,7 @@ impl MissionRuntime {
             active_session_id: state.active_session_id.clone(),
             sessions: state.sessions.values().cloned().collect(),
             events: state.events.clone(),
+            routed_commands: state.routed_commands.clone(),
             team_projection: global_team_runtime_service().projection(),
             agent_projection: global_agent_lifecycle_service().projection(),
             approval_projection: global_approval_queue().projection(),
@@ -418,9 +471,15 @@ mod tests {
         runtime
             .background_session("mission-session-a")
             .expect("background session");
+        let routed = runtime
+            .record_routed_session_command("mission-session-a", "mission-session-b", "review")
+            .expect("route command");
+        assert_eq!(routed.status, "queued");
+        assert_eq!(routed.target_session_id, "mission-session-b");
 
         let projection = runtime.projection();
         assert_eq!(projection.active_session_id, None);
+        assert_eq!(projection.routed_commands.len(), 1);
         let session = projection
             .sessions
             .iter()

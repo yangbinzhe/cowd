@@ -33,6 +33,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(runtime_agent_cancel_handler),
         )
         .route(
+            "/api/runtime/agents/:id/input",
+            post(runtime_agent_input_handler),
+        )
+        .route(
+            "/api/runtime/agents/:id/interrupt",
+            post(runtime_agent_interrupt_handler),
+        )
+        .route(
+            "/api/runtime/agents/:id/shutdown",
+            post(runtime_agent_shutdown_handler),
+        )
+        .route(
             "/api/agents/team-profiles",
             get(agent_team_profiles_list_handler).post(agent_team_profile_create_handler),
         )
@@ -66,6 +78,12 @@ struct AgentDiscoverQuery {
 struct AgentAssembleRequest {
     #[serde(default)]
     task: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeAgentCommandRequest {
+    #[serde(default)]
+    payload: Option<Value>,
 }
 
 async fn agent_catalog_handler(
@@ -183,6 +201,63 @@ async fn runtime_agent_cancel_handler(
             }))
         })
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn runtime_agent_input_handler(
+    Path(id): Path<String>,
+    Json(body): Json<RuntimeAgentCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime_agent_command_result(&id, runtime::AgentExecutionCommandKind::Input, body.payload)
+}
+
+async fn runtime_agent_interrupt_handler(
+    Path(id): Path<String>,
+    Json(body): Json<RuntimeAgentCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime_agent_command_result(
+        &id,
+        runtime::AgentExecutionCommandKind::Interrupt,
+        body.payload,
+    )
+}
+
+async fn runtime_agent_shutdown_handler(
+    Path(id): Path<String>,
+    Json(body): Json<RuntimeAgentCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime_agent_command_result(
+        &id,
+        runtime::AgentExecutionCommandKind::Shutdown,
+        body.payload,
+    )
+}
+
+fn runtime_agent_command_result(
+    id: &str,
+    command: runtime::AgentExecutionCommandKind,
+    payload: Option<Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    runtime::global_agent_lifecycle_service()
+        .command(id, command, payload)
+        .map(|receipt| {
+            Json(serde_json::json!({
+                "kind": "runtime.agent.command",
+                "receipt": receipt,
+            }))
+        })
+        .map_err(|error| api_error(runtime_agent_command_error_status(&error), error))
+}
+
+fn runtime_agent_command_error_status(error: &str) -> StatusCode {
+    if error.contains("agent not found") {
+        StatusCode::NOT_FOUND
+    } else if error.contains("does not expose a command channel") {
+        StatusCode::CONFLICT
+    } else if error.contains("failed to deliver agent command") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 async fn agent_team_profiles_list_handler(

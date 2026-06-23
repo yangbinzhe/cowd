@@ -433,12 +433,114 @@ impl GatewayApiClient {
         self.get_json("/api/mission/projection").await
     }
 
+    pub async fn mission_session_detail(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/mission/sessions/{}", url_encode(session_id)))
+            .await
+    }
+
     pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/mission/approvals").await
     }
 
     pub async fn mission_relations(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/mission/relations").await
+    }
+
+    pub async fn submit_mission_approval(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/approvals", body).await
+    }
+
+    pub async fn start_mission_team_runtime(
+        &self,
+        session_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/mission/sessions/{}/teams/runtime",
+                url_encode(session_id)
+            ),
+            body,
+        )
+        .await
+    }
+
+    pub async fn decide_mission_approval(
+        &self,
+        approval_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/mission/approvals/{}/decision",
+                url_encode(approval_id)
+            ),
+            body,
+        )
+        .await
+    }
+
+    pub async fn add_mission_relation(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/relations", body).await
+    }
+
+    pub async fn upsert_mission_proxy(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/proxies", body).await
+    }
+
+    pub async fn route_mission_command(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/route", body).await
+    }
+
+    pub async fn runtime_agent_input(
+        &self,
+        agent_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/runtime/agents/{}/input", url_encode(agent_id)),
+            serde_json::json!({ "payload": payload }),
+        )
+        .await
+    }
+
+    pub async fn runtime_agent_interrupt(
+        &self,
+        agent_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/runtime/agents/{}/interrupt", url_encode(agent_id)),
+            serde_json::json!({ "payload": payload }),
+        )
+        .await
+    }
+
+    pub async fn runtime_agent_shutdown(
+        &self,
+        agent_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/runtime/agents/{}/shutdown", url_encode(agent_id)),
+            serde_json::json!({ "payload": payload }),
+        )
+        .await
     }
 
     pub async fn respond_approval(
@@ -1104,8 +1206,18 @@ mod tests {
             "complete_task",
             "pending_approvals",
             "mission_projection",
+            "mission_session_detail",
             "mission_approvals",
             "mission_relations",
+            "submit_mission_approval",
+            "start_mission_team_runtime",
+            "decide_mission_approval",
+            "add_mission_relation",
+            "upsert_mission_proxy",
+            "route_mission_command",
+            "runtime_agent_input",
+            "runtime_agent_interrupt",
+            "runtime_agent_shutdown",
             "memory_status",
             "reality_status",
             "reality_flow",
@@ -1157,7 +1269,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 67);
+        assert_eq!(migrated.len(), 77);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
