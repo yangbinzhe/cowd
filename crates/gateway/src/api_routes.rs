@@ -2837,6 +2837,7 @@ mod tests {
             subagent_type: Some(String::from("Explore")),
             model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
             status: String::from("running"),
+            backend: runtime::AgentExecutionBackendKind::InProcess,
             output_file: output_file.display().to_string(),
             manifest_file: manifest_file.display().to_string(),
             created_at: String::from("1"),

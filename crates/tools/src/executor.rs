@@ -20,7 +20,7 @@ use runtime::{
         get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
         put_cached_tool_result_scoped, tool_cache_stats,
     },
-    worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
+    worker_boot::{WorkerReadySnapshot, WorkerTaskReceipt},
     write_file, BashCommandInput, BashCommandOutput, BranchFreshness, CheckpointCreateInput,
     CheckpointDiffInput, CheckpointRestoreInput, ConfigLoader, GrepSearchInput, LaneContext,
     LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
@@ -35,10 +35,7 @@ use crate::prepared::{
     ToolExecutionContext,
 };
 use crate::tool_specs::{mvp_tool_specs, ToolSpec};
-use crate::{
-    configured_mcp_service, global_cron_registry, global_lsp_registry, global_task_registry,
-    global_team_registry, global_worker_registry, GlobalToolRegistry,
-};
+use crate::{configured_mcp_service, global_lsp_registry, GlobalToolRegistry};
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
@@ -401,7 +398,7 @@ fn resolve_ask_user_answer(response: &str, options: Option<&[String]>) -> String
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     let task = registry.create(&input.prompt, input.description.as_deref());
     to_pretty_json(json!({
         "task_id": task.task_id,
@@ -415,7 +412,7 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_packet(input: TaskPacket) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     let task = registry
         .create_from_packet(input)
         .map_err(|error| error.to_string())?;
@@ -432,7 +429,7 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     match registry.get(&input.task_id) {
         Some(task) => to_pretty_json(json!({
             "task_id": task.task_id,
@@ -450,7 +447,7 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
 }
 
 fn run_task_list(_input: Value) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     let tasks: Vec<_> = registry
         .list(None)
         .into_iter()
@@ -475,7 +472,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     match registry.stop(&input.task_id) {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
@@ -488,7 +485,7 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     match registry.update(&input.task_id, &input.message) {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
@@ -502,7 +499,7 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = runtime::global_task_registry();
     match registry.output(&input.task_id) {
         Ok(output) => to_pretty_json(json!({
             "task_id": input.task_id,
@@ -526,91 +523,69 @@ fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
         .into_iter()
         .chain(input.trusted_roots.iter().cloned())
         .collect();
-    let worker = global_worker_registry().create(
+    let worker = runtime::global_runtime_control_plane().create_worker(
         &input.cwd,
         &merged_roots,
         input.auto_recover_prompt_misdelivery,
     );
-    let _ = persist_worker_state(&worker);
     to_pretty_json(worker)
-}
-
-/// Persist worker state to `~/.cowd/worker-state.json`.
-fn persist_worker_state(worker: &Worker) -> std::io::Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let state_path = runtime::cowd_dirs::worker_state_path();
-    if let Some(parent) = state_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let state = serde_json::json!({
-        "worker_id": worker.worker_id,
-        "status": worker.status.to_string(),
-        "is_ready": matches!(worker.status, WorkerStatus::ReadyForPrompt),
-        "trust_gate_cleared": worker.trust_gate_cleared,
-        "seconds_since_update": now.saturating_sub(worker.updated_at),
-    });
-    std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_get(input: WorkerIdInput) -> Result<String, String> {
-    global_worker_registry().get(&input.worker_id).map_or_else(
-        || Err(format!("worker not found: {}", input.worker_id)),
-        to_pretty_json,
-    )
+    runtime::global_runtime_control_plane()
+        .get_worker(&input.worker_id)
+        .map_or_else(
+            || Err(format!("worker not found: {}", input.worker_id)),
+            to_pretty_json,
+        )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_observe(input: WorkerObserveInput) -> Result<String, String> {
-    let worker = global_worker_registry().observe(&input.worker_id, &input.screen_text)?;
-    let _ = persist_worker_state(&worker);
+    let worker = runtime::global_runtime_control_plane()
+        .observe_worker(&input.worker_id, &input.screen_text)?;
     to_pretty_json(worker)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_resolve_trust(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().resolve_trust(&input.worker_id)?;
-    let _ = persist_worker_state(&worker);
+    let worker = runtime::global_runtime_control_plane().resolve_worker_trust(&input.worker_id)?;
     to_pretty_json(worker)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_await_ready(input: WorkerIdInput) -> Result<String, String> {
-    let snapshot: WorkerReadySnapshot = global_worker_registry().await_ready(&input.worker_id)?;
+    let snapshot: WorkerReadySnapshot =
+        runtime::global_runtime_control_plane().await_worker_ready(&input.worker_id)?;
     to_pretty_json(snapshot)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_send_prompt(input: WorkerSendPromptInput) -> Result<String, String> {
-    let worker = global_worker_registry().send_prompt(
+    let worker = runtime::global_runtime_control_plane().send_worker_prompt(
         &input.worker_id,
         input.prompt.as_deref(),
         input.task_receipt,
     )?;
-    let _ = persist_worker_state(&worker);
     to_pretty_json(worker)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_restart(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().restart(&input.worker_id)?;
-    let _ = persist_worker_state(&worker);
+    let worker = runtime::global_runtime_control_plane().restart_worker(&input.worker_id)?;
     to_pretty_json(worker)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_terminate(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().terminate(&input.worker_id)?;
-    let _ = persist_worker_state(&worker);
+    let worker = runtime::global_runtime_control_plane().terminate_worker(&input.worker_id)?;
     to_pretty_json(worker)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<String, String> {
-    let worker = global_worker_registry().observe_completion(
+    let worker = runtime::global_runtime_control_plane().observe_worker_completion(
         &input.worker_id,
         &input.finish_reason,
         input.tokens_output,
@@ -625,11 +600,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         .iter()
         .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
         .collect();
-    let team = global_team_registry().create(&input.name, task_ids);
-    // Register team assignment on each task
-    for task_id in &team.task_ids {
-        let _ = global_task_registry().assign_team(task_id, &team.team_id);
-    }
+    let team = runtime::global_runtime_control_plane().create_team(&input.name, task_ids);
     to_pretty_json(json!({
         "team_id": team.team_id,
         "name": team.name,
@@ -642,7 +613,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
-    match global_team_registry().delete(&input.team_id) {
+    match runtime::global_runtime_control_plane().delete_team(&input.team_id) {
         Ok(team) => to_pretty_json(json!({
             "team_id": team.team_id,
             "name": team.name,
@@ -655,8 +626,11 @@ fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
-    let entry =
-        global_cron_registry().create(&input.schedule, &input.prompt, input.description.as_deref());
+    let entry = runtime::global_runtime_control_plane().create_cron(
+        &input.schedule,
+        &input.prompt,
+        input.description.as_deref(),
+    );
     to_pretty_json(json!({
         "cron_id": entry.cron_id,
         "schedule": entry.schedule,
@@ -669,7 +643,7 @@ fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
-    match global_cron_registry().delete(&input.cron_id) {
+    match runtime::global_runtime_control_plane().delete_cron(&input.cron_id) {
         Ok(entry) => to_pretty_json(json!({
             "cron_id": entry.cron_id,
             "schedule": entry.schedule,
@@ -681,8 +655,8 @@ fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
 }
 
 fn run_cron_list(_input: Value) -> Result<String, String> {
-    let entries: Vec<_> = global_cron_registry()
-        .list(false)
+    let entries: Vec<_> = runtime::global_runtime_control_plane()
+        .list_crons(false)
         .into_iter()
         .map(|e| {
             json!({
@@ -3398,6 +3372,7 @@ fn build_spawn_agent_request(input: AgentInput) -> Result<runtime::SpawnAgentReq
         permission_policy: agent_permission_policy(),
         max_iterations: runtime::DEFAULT_AGENT_MAX_ITERATIONS,
         store_dir: None,
+        backend: runtime::AgentExecutionBackendKind::InProcess,
     })
 }
 
@@ -6830,6 +6805,34 @@ mod tests {
             );
         }
         assert!(source.contains("runtime::spawn_provider_agent"));
+    }
+
+    #[test]
+    fn tools_crate_does_not_own_runtime_control_plane_registries() {
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let executor_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/executor.rs");
+        let lib = std::fs::read_to_string(lib_path).expect("lib source should be readable");
+        let executor =
+            std::fs::read_to_string(executor_path).expect("executor source should be readable");
+
+        for forbidden in [
+            ["fn ", "global_worker_registry"].concat(),
+            ["fn ", "global_team_registry"].concat(),
+            ["fn ", "global_cron_registry"].concat(),
+            ["fn ", "global_task_registry"].concat(),
+            ["WorkerRegistry", "::new"].concat(),
+            ["TeamRegistry", "::new"].concat(),
+            ["CronRegistry", "::new"].concat(),
+            ["TaskRegistry", "::new"].concat(),
+        ] {
+            assert!(
+                !lib.contains(&forbidden) && !executor.contains(&forbidden),
+                "tools must not own runtime control-plane registry `{forbidden}`"
+            );
+        }
+        assert!(executor.contains("runtime::global_runtime_control_plane()"));
+        assert!(executor.contains("runtime::global_task_registry()"));
     }
 
     #[derive(Debug)]

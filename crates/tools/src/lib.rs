@@ -3,12 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use mcp::McpService;
 use plugins::PluginTool;
 use runtime::{
-    lsp_client::LspRegistry,
-    permission_enforcer::PermissionEnforcer,
-    task_registry::TaskRegistry,
-    team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::WorkerRegistry,
-    McpDegradedReport, PermissionMode, ProviderToolDefinition as ToolDefinition,
+    lsp_client::LspRegistry, permission_enforcer::PermissionEnforcer, McpDegradedReport,
+    PermissionMode, ProviderToolDefinition as ToolDefinition,
 };
 use serde_json::Value;
 
@@ -39,30 +35,6 @@ pub fn set_mcp_service(service: std::sync::Arc<dyn McpService>) -> Result<(), &'
 
 fn configured_mcp_service() -> Option<std::sync::Arc<dyn McpService>> {
     global_mcp_service().get().cloned()
-}
-
-fn global_team_registry() -> &'static TeamRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TeamRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TeamRegistry::new)
-}
-
-fn global_cron_registry() -> &'static CronRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(CronRegistry::new)
-}
-
-fn global_task_registry() -> &'static TaskRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TaskRegistry::new)
-}
-
-fn global_worker_registry() -> &'static WorkerRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<WorkerRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(WorkerRegistry::new)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

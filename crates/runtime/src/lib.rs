@@ -18,6 +18,7 @@ pub mod capability;
 mod compact;
 mod config;
 pub mod config_validate;
+pub mod control_plane;
 mod conversation;
 pub mod doc_ingestion;
 pub mod error;
@@ -57,6 +58,7 @@ pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
 pub mod agent;
+pub mod agent_backend;
 pub mod agent_collaboration;
 pub mod agent_discussion;
 pub mod agent_kernel;
@@ -111,6 +113,10 @@ pub use agent::{
     ProductionExecutor, SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback,
     SubAgentResult, SubAgentToolMode,
 };
+pub use agent_backend::{
+    AgentExecutionBackendKind, AgentExecutionCommand, AgentExecutionCommandKind,
+    AgentExecutionCommandReceipt, AgentExecutionEventEnvelope,
+};
 pub use agent_collaboration::{
     AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOps, CollaborationOrchestrator,
     CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, MemoryPulseCandidate,
@@ -163,6 +169,7 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
+pub use control_plane::{global_runtime_control_plane, global_task_registry, RuntimeControlPlane};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
@@ -299,6 +306,8 @@ pub use subagent_turn::{
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
+pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus as RegistryTaskStatus};
+pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_invocation::{
@@ -318,7 +327,7 @@ pub use wave::{
 pub use worker_boot::{
     StartupEvidenceBundle, StartupFailureClassification, Worker, WorkerEvent, WorkerEventKind,
     WorkerEventPayload, WorkerFailure, WorkerFailureKind, WorkerPromptTarget, WorkerReadySnapshot,
-    WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+    WorkerRegistry, WorkerStatus, WorkerTaskReceipt, WorkerTrustResolution,
 };
 
 pub mod cached_prompt;

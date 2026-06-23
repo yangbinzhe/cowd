@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     dedupe_superseded_commit_events, final_assistant_text, load_system_prompt,
-    run_provider_subagent_turn, summary_compression::compress_summary_text, CancellationToken,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass, PermissionPolicy,
-    ProviderSubAgentTurnConfig, ProviderToolDefinition, ToolExecutor,
+    run_provider_subagent_turn, summary_compression::compress_summary_text,
+    AgentExecutionBackendKind, CancellationToken, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneFailureClass, PermissionPolicy, ProviderSubAgentTurnConfig,
+    ProviderToolDefinition, ToolExecutor,
 };
 
 pub const DEFAULT_AGENT_MODEL: &str = "claude-sonnet-4-6";
@@ -25,6 +26,8 @@ pub struct AgentSnapshot {
     pub subagent_type: Option<String>,
     pub model: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub backend: AgentExecutionBackendKind,
     #[serde(rename = "outputFile")]
     pub output_file: String,
     #[serde(rename = "manifestFile")]
@@ -58,6 +61,7 @@ pub struct SpawnAgentRequest {
     pub permission_policy: PermissionPolicy,
     pub max_iterations: usize,
     pub store_dir: Option<PathBuf>,
+    pub backend: AgentExecutionBackendKind,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +293,7 @@ pub fn prepare_agent_job(request: SpawnAgentRequest) -> Result<AgentJob, String>
         subagent_type: Some(normalized_subagent_type),
         model: Some(model),
         status: String::from("running"),
+        backend: request.backend,
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
         created_at: created_at.clone(),
@@ -1016,6 +1021,7 @@ mod tests {
             subagent_type: Some(String::from("Explore")),
             model: Some(String::from(DEFAULT_AGENT_MODEL)),
             status: String::from("running"),
+            backend: AgentExecutionBackendKind::InProcess,
             output_file: output_file.display().to_string(),
             manifest_file: manifest_file.display().to_string(),
             created_at: String::from("1"),
@@ -1064,6 +1070,7 @@ mod tests {
             subagent_type: Some(String::from("Explore")),
             model: Some(String::from(DEFAULT_AGENT_MODEL)),
             status: String::from("completed"),
+            backend: AgentExecutionBackendKind::InProcess,
             output_file: output_file.display().to_string(),
             manifest_file: manifest_file.display().to_string(),
             created_at: String::from("1"),

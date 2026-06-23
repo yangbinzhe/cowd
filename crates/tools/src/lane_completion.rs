@@ -138,6 +138,7 @@ mod tests {
             subagent_type: None,
             model: None,
             status: "Finished".to_string(),
+            backend: runtime::AgentExecutionBackendKind::InProcess,
             output_file: "/tmp/test.output".to_string(),
             manifest_file: "/tmp/test.manifest".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
