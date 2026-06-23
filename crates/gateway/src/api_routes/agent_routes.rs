@@ -22,6 +22,16 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/assemble", post(agent_assemble_handler))
         .route("/api/agents/reputation", get(agent_reputation_handler))
         .route("/api/agents/runs", get(agent_runs_handler))
+        .route("/api/runtime/agents", get(runtime_agents_list_handler))
+        .route("/api/runtime/agents/:id", get(runtime_agent_detail_handler))
+        .route(
+            "/api/runtime/agents/:id/events",
+            get(runtime_agent_events_handler),
+        )
+        .route(
+            "/api/runtime/agents/:id/cancel",
+            post(runtime_agent_cancel_handler),
+        )
         .route(
             "/api/agents/team-profiles",
             get(agent_team_profiles_list_handler).post(agent_team_profile_create_handler),
@@ -125,6 +135,54 @@ async fn agent_reputation_handler(
 
 async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.services.agent.list_agent_graphs(&state.services.task))
+}
+
+async fn runtime_agents_list_handler() -> impl IntoResponse {
+    Json(runtime::global_agent_lifecycle_service().projection())
+}
+
+async fn runtime_agent_detail_handler(
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime::global_agent_lifecycle_service()
+        .get(&id)
+        .map(|agent| {
+            Json(serde_json::json!({
+                "kind": "runtime.agent",
+                "agent": agent,
+            }))
+        })
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))
+}
+
+async fn runtime_agent_events_handler(
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime::global_agent_lifecycle_service()
+        .events(&id)
+        .map(|events| {
+            Json(serde_json::json!({
+                "kind": "runtime.agent.events",
+                "agentId": id,
+                "count": events.len(),
+                "events": events,
+            }))
+        })
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))
+}
+
+async fn runtime_agent_cancel_handler(
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime::global_agent_lifecycle_service()
+        .cancel(&id)
+        .map(|receipt| {
+            Json(serde_json::json!({
+                "kind": "runtime.agent.cancel",
+                "receipt": receipt,
+            }))
+        })
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }
 
 async fn agent_team_profiles_list_handler(

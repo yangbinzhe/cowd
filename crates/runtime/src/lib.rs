@@ -122,10 +122,11 @@ pub use agent_discussion::{
 pub use agent_kernel::{AgentGraphError, AgentRunGraph};
 pub use agent_lifecycle::{
     agent_store_dir, build_agent_system_prompt, classify_lane_failure, derive_agent_state,
-    iso8601_now, maybe_commit_provenance, normalize_subagent_type, persist_agent_terminal_state,
-    prepare_agent_job, resolve_agent_model, slugify_agent_name, spawn_provider_agent, AgentJob,
-    AgentSnapshot, SpawnAgentRequest, DEFAULT_AGENT_MAX_ITERATIONS, DEFAULT_AGENT_MODEL,
-    DEFAULT_AGENT_SYSTEM_DATE,
+    global_agent_lifecycle_service, iso8601_now, maybe_commit_provenance, normalize_subagent_type,
+    persist_agent_terminal_state, prepare_agent_job, resolve_agent_model, slugify_agent_name,
+    spawn_provider_agent, AgentCommandReceipt, AgentJob, AgentLifecycleEvent,
+    AgentLifecycleService, AgentSnapshot, SpawnAgentRequest, DEFAULT_AGENT_MAX_ITERATIONS,
+    DEFAULT_AGENT_MODEL, DEFAULT_AGENT_SYSTEM_DATE,
 };
 pub use agent_protocol::{
     AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,

@@ -2822,6 +2822,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_agent_routes_project_events_and_cancel() {
+        let app = api_router(test_state());
+        let agent_id = format!("agent-route-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(format!("cowd-agent-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_file = dir.join("agent.md");
+        let manifest_file = dir.join("agent.json");
+        std::fs::write(&output_file, "# Agent Task\n").unwrap();
+        let snapshot = runtime::AgentSnapshot {
+            agent_id: agent_id.clone(),
+            name: String::from("route-agent"),
+            description: String::from("route test"),
+            subagent_type: Some(String::from("Explore")),
+            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
+            status: String::from("running"),
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: String::from("1"),
+            started_at: Some(String::from("1")),
+            completed_at: None,
+            lane_events: vec![],
+            current_blocker: None,
+            derived_state: String::from("working"),
+            error: None,
+        };
+        runtime::global_agent_lifecycle_service()
+            .register_started(snapshot, runtime::CancellationToken::new());
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/agents/{agent_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+
+        let cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/agents/{agent_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::OK);
+        let body = to_bytes(cancel.into_body(), usize::MAX).await.unwrap();
+        let cancel_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancel_json["receipt"]["status"], "accepted");
+
+        let events = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/agents/{agent_id}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        let body = to_bytes(events.into_body(), usize::MAX).await.unwrap();
+        let events_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            events_json["events"][1]["eventType"],
+            "agent.cancel_requested"
+        );
+
+        let manifest = std::fs::read_to_string(&manifest_file).unwrap();
+        assert!(manifest.contains("\"status\": \"cancel_requested\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn agent_team_profiles_crud_persists_receipts() {
         let workspace = test_temp_dir("agent-team-profiles");
         let config_home = test_temp_dir("agent-team-profiles-config");

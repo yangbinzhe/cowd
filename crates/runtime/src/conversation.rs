@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
 impl CancellationToken {

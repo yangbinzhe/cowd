@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     dedupe_superseded_commit_events, final_assistant_text, load_system_prompt,
-    run_provider_subagent_turn, summary_compression::compress_summary_text, LaneCommitProvenance,
-    LaneEvent, LaneEventBlocker, LaneFailureClass, PermissionPolicy, ProviderSubAgentTurnConfig,
-    ProviderToolDefinition, ToolExecutor,
+    run_provider_subagent_turn, summary_compression::compress_summary_text, CancellationToken,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass, PermissionPolicy,
+    ProviderSubAgentTurnConfig, ProviderToolDefinition, ToolExecutor,
 };
 
 pub const DEFAULT_AGENT_MODEL: &str = "claude-sonnet-4-6";
@@ -68,6 +69,159 @@ pub struct AgentJob {
     pub tool_definitions: Vec<ProviderToolDefinition>,
     pub permission_policy: PermissionPolicy,
     pub max_iterations: usize,
+    pub cancellation_token: CancellationToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLifecycleEvent {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+    #[serde(rename = "emittedAt")]
+    pub emitted_at: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCommandReceipt {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub command: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRuntimeRecord {
+    snapshot: AgentSnapshot,
+    events: Vec<AgentLifecycleEvent>,
+    cancellation_token: CancellationToken,
+}
+
+#[derive(Debug, Default)]
+pub struct AgentLifecycleService {
+    agents: Mutex<BTreeMap<String, AgentRuntimeRecord>>,
+}
+
+impl AgentLifecycleService {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_started(&self, snapshot: AgentSnapshot, token: CancellationToken) {
+        let event = AgentLifecycleEvent {
+            agent_id: snapshot.agent_id.clone(),
+            event_type: String::from("agent.started"),
+            emitted_at: iso8601_now(),
+            message: format!("Agent `{}` started", snapshot.name),
+        };
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                snapshot.agent_id.clone(),
+                AgentRuntimeRecord {
+                    snapshot,
+                    events: vec![event],
+                    cancellation_token: token,
+                },
+            );
+    }
+
+    pub fn update_snapshot(&self, snapshot: AgentSnapshot, event_type: &str, message: String) {
+        let event = AgentLifecycleEvent {
+            agent_id: snapshot.agent_id.clone(),
+            event_type: event_type.to_string(),
+            emitted_at: iso8601_now(),
+            message,
+        };
+        if let Some(record) = self
+            .agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&snapshot.agent_id)
+        {
+            record.snapshot = snapshot;
+            record.events.push(event);
+        }
+    }
+
+    pub fn list(&self) -> Vec<AgentSnapshot> {
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|record| record.snapshot.clone())
+            .collect()
+    }
+
+    pub fn get(&self, agent_id: &str) -> Option<AgentSnapshot> {
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .map(|record| record.snapshot.clone())
+    }
+
+    pub fn events(&self, agent_id: &str) -> Option<Vec<AgentLifecycleEvent>> {
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .map(|record| record.events.clone())
+    }
+
+    pub fn cancel(&self, agent_id: &str) -> Result<AgentCommandReceipt, String> {
+        let mut agents = self
+            .agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| String::from("agent not found"))?;
+        if is_terminal_or_cancel_requested_status(&record.snapshot.status) {
+            return Ok(AgentCommandReceipt {
+                agent_id: agent_id.to_string(),
+                command: String::from("cancel"),
+                status: String::from("noop"),
+                message: format!("agent is already {}", record.snapshot.status),
+            });
+        }
+        record.cancellation_token.cancel();
+        let snapshot = persist_agent_control_state(
+            &record.snapshot,
+            "cancel_requested",
+            "Cancellation requested for agent",
+        )?;
+        record.snapshot = snapshot;
+        record.events.push(AgentLifecycleEvent {
+            agent_id: agent_id.to_string(),
+            event_type: String::from("agent.cancel_requested"),
+            emitted_at: iso8601_now(),
+            message: String::from("Cancellation requested for agent"),
+        });
+        Ok(AgentCommandReceipt {
+            agent_id: agent_id.to_string(),
+            command: String::from("cancel"),
+            status: String::from("accepted"),
+            message: String::from("cancellation requested"),
+        })
+    }
+
+    pub fn projection(&self) -> serde_json::Value {
+        let agents = self.list();
+        serde_json::json!({
+            "kind": "runtime.agents",
+            "count": agents.len(),
+            "agents": agents,
+        })
+    }
+}
+
+pub fn global_agent_lifecycle_service() -> &'static AgentLifecycleService {
+    static SERVICE: OnceLock<AgentLifecycleService> = OnceLock::new();
+    SERVICE.get_or_init(AgentLifecycleService::new)
 }
 
 pub fn spawn_provider_agent<T>(
@@ -79,9 +233,16 @@ where
 {
     let job = prepare_agent_job(request)?;
     let manifest = job.manifest.clone();
+    global_agent_lifecycle_service()
+        .register_started(manifest.clone(), job.cancellation_token.clone());
     if let Err(error) = spawn_agent_job(job, tool_executor) {
         let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        let failed = persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        global_agent_lifecycle_service().update_snapshot(
+            failed,
+            "agent.failed",
+            String::from("Agent failed before background execution started"),
+        );
         return Err(error);
     }
     Ok(manifest)
@@ -148,6 +309,7 @@ pub fn prepare_agent_job(request: SpawnAgentRequest) -> Result<AgentJob, String>
         tool_definitions: request.tool_definitions,
         permission_policy: request.permission_policy,
         max_iterations: request.max_iterations,
+        cancellation_token: CancellationToken::new(),
     })
 }
 
@@ -165,16 +327,39 @@ where
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    let cancelled = job.cancellation_token.is_cancelled()
+                        || error.to_ascii_lowercase().contains("cancel");
+                    let status = if cancelled { "cancelled" } else { "failed" };
+                    let event_type = if cancelled {
+                        "agent.cancelled"
+                    } else {
+                        "agent.failed"
+                    };
+                    let message = if cancelled {
+                        String::from("Agent cancelled")
+                    } else {
+                        String::from("Agent execution failed")
+                    };
+                    if let Ok(failed) =
+                        persist_agent_terminal_state(&job.manifest, status, None, Some(error))
+                    {
+                        global_agent_lifecycle_service()
+                            .update_snapshot(failed, event_type, message);
+                    }
                 }
                 Err(_) => {
-                    let _ = persist_agent_terminal_state(
+                    if let Ok(failed) = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
                         None,
                         Some(String::from("sub-agent thread panicked")),
-                    );
+                    ) {
+                        global_agent_lifecycle_service().update_snapshot(
+                            failed,
+                            "agent.failed",
+                            String::from("Agent thread panicked"),
+                        );
+                    }
                 }
             }
         })
@@ -198,12 +383,20 @@ where
             tool_definitions: job.tool_definitions.clone(),
             permission_policy: job.permission_policy.clone(),
             max_iterations: job.max_iterations,
+            cancellation_token: Some(job.cancellation_token.clone()),
         },
         tool_executor,
         job.prompt.clone(),
     )?;
     let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    let completed =
+        persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)?;
+    global_agent_lifecycle_service().update_snapshot(
+        completed,
+        "agent.completed",
+        String::from("Agent completed"),
+    );
+    Ok(())
 }
 
 pub fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -281,8 +474,13 @@ pub fn persist_agent_terminal_state(
     status: &str,
     result: Option<&str>,
     error: Option<String>,
-) -> Result<(), String> {
-    let blocker = error.as_deref().map(classify_lane_blocker);
+) -> Result<AgentSnapshot, String> {
+    let is_cancelled = status.eq_ignore_ascii_case("cancelled");
+    let blocker = if is_cancelled {
+        None
+    } else {
+        error.as_deref().map(classify_lane_blocker)
+    };
     append_agent_output(
         &manifest.output_file,
         &format_agent_terminal_output(status, result, blocker.as_ref(), error.as_deref()),
@@ -294,7 +492,18 @@ pub fn persist_agent_terminal_state(
     next_manifest.derived_state =
         derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
     next_manifest.error = error;
-    if let Some(blocker) = blocker {
+    if is_cancelled {
+        next_manifest.current_blocker = None;
+        next_manifest.derived_state = String::from("interrupted_transport");
+        next_manifest.lane_events.push(
+            LaneEvent::new(
+                crate::LaneEventName::Closed,
+                crate::LaneEventStatus::Closed,
+                iso8601_now(),
+            )
+            .with_detail("Agent cancelled"),
+        );
+    } else if let Some(blocker) = blocker {
         next_manifest
             .lane_events
             .push(LaneEvent::blocked(iso8601_now(), &blocker));
@@ -318,7 +527,39 @@ pub fn persist_agent_terminal_state(
             ));
         }
     }
-    write_agent_manifest(&next_manifest)
+    write_agent_manifest(&next_manifest)?;
+    Ok(next_manifest)
+}
+
+fn persist_agent_control_state(
+    manifest: &AgentSnapshot,
+    status: &str,
+    detail: &str,
+) -> Result<AgentSnapshot, String> {
+    append_agent_output(
+        &manifest.output_file,
+        &format!("\n## Control\n\n- status: {status}\n- detail: {detail}\n"),
+    )?;
+    let mut next_manifest = manifest.clone();
+    next_manifest.status = status.to_string();
+    next_manifest.derived_state = String::from("interrupted_transport");
+    next_manifest.lane_events.push(
+        LaneEvent::new(
+            crate::LaneEventName::Blocked,
+            crate::LaneEventStatus::Blocked,
+            iso8601_now(),
+        )
+        .with_detail(detail),
+    );
+    write_agent_manifest(&next_manifest)?;
+    Ok(next_manifest)
+}
+
+fn is_terminal_or_cancel_requested_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "failed" | "cancelled" | "cancel_requested"
+    )
 }
 
 pub fn derive_agent_state(
@@ -339,6 +580,9 @@ pub fn derive_agent_state(
         } else {
             "finished_pending_report"
         };
+    }
+    if normalized_status == "cancelled" || normalized_status == "cancel_requested" {
+        return "interrupted_transport";
     }
     if normalized_error.contains("background") {
         return "blocked_background_job";
@@ -754,5 +998,92 @@ mod tests {
         for (message, expected) in cases {
             assert_eq!(classify_lane_failure(message), expected, "{message}");
         }
+    }
+
+    #[test]
+    fn lifecycle_service_projects_events_and_cancel_token() {
+        let service = AgentLifecycleService::new();
+        let token = CancellationToken::new();
+        let dir = std::env::temp_dir().join(format!("cowd-agent-lifecycle-{}", make_agent_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let output_file = dir.join("agent-test.md");
+        let manifest_file = dir.join("agent-test.json");
+        std::fs::write(&output_file, "# Agent Task\n").expect("output");
+        let snapshot = AgentSnapshot {
+            agent_id: String::from("agent-test"),
+            name: String::from("test-agent"),
+            description: String::from("test"),
+            subagent_type: Some(String::from("Explore")),
+            model: Some(String::from(DEFAULT_AGENT_MODEL)),
+            status: String::from("running"),
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: String::from("1"),
+            started_at: Some(String::from("1")),
+            completed_at: None,
+            lane_events: vec![],
+            current_blocker: None,
+            derived_state: String::from("working"),
+            error: None,
+        };
+
+        service.register_started(snapshot.clone(), token.clone());
+        assert_eq!(service.list().len(), 1);
+        assert_eq!(
+            service.events("agent-test").expect("events")[0].event_type,
+            "agent.started"
+        );
+
+        let receipt = service.cancel("agent-test").expect("cancel receipt");
+        assert_eq!(receipt.status, "accepted");
+        assert!(token.is_cancelled());
+        assert_eq!(
+            service.get("agent-test").expect("snapshot").status,
+            "cancel_requested"
+        );
+        assert_eq!(
+            service.events("agent-test").expect("events")[1].event_type,
+            "agent.cancel_requested"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifecycle_cancel_does_not_rewrite_terminal_agents() {
+        let service = AgentLifecycleService::new();
+        let token = CancellationToken::new();
+        let dir = std::env::temp_dir().join(format!("cowd-agent-lifecycle-{}", make_agent_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let output_file = dir.join("agent-terminal.md");
+        let manifest_file = dir.join("agent-terminal.json");
+        std::fs::write(&output_file, "# Agent Task\n").expect("output");
+        let snapshot = AgentSnapshot {
+            agent_id: String::from("agent-terminal"),
+            name: String::from("terminal-agent"),
+            description: String::from("test"),
+            subagent_type: Some(String::from("Explore")),
+            model: Some(String::from(DEFAULT_AGENT_MODEL)),
+            status: String::from("completed"),
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: String::from("1"),
+            started_at: Some(String::from("1")),
+            completed_at: Some(String::from("2")),
+            lane_events: vec![],
+            current_blocker: None,
+            derived_state: String::from("finished_cleanable"),
+            error: None,
+        };
+        write_agent_manifest(&snapshot).expect("manifest");
+        service.register_started(snapshot, token.clone());
+
+        let receipt = service.cancel("agent-terminal").expect("cancel receipt");
+        assert_eq!(receipt.status, "noop");
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            service.get("agent-terminal").expect("snapshot").status,
+            "completed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

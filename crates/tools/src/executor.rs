@@ -6470,6 +6470,7 @@ mod tests {
                     Some("Finished successfully in commit abc1234"),
                     None,
                 )
+                .map(|_| ())
             },
         )
         .expect("completed agent should succeed");
@@ -6529,6 +6530,7 @@ mod tests {
                     None,
                     Some(String::from("tool failed: simulated failure")),
                 )
+                .map(|_| ())
             },
         )
         .expect("failed agent should still spawn");
@@ -6578,6 +6580,7 @@ mod tests {
                     Some("commit push everyting, keep sweeping $ralph"),
                     None,
                 )
+                .map(|_| ())
             },
         )
         .expect("normalized agent should succeed");

@@ -1,6 +1,6 @@
 use crate::{
-    ConversationRuntime, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition, Session,
-    SharedPrompter, ToolExecutor, TurnSummary,
+    CancellationToken, ConversationRuntime, PermissionPolicy, ProviderRuntimeClient,
+    ProviderToolDefinition, Session, SharedPrompter, ToolExecutor, TurnSummary,
 };
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,7 @@ pub struct ProviderSubAgentTurnConfig {
     pub tool_definitions: Vec<ProviderToolDefinition>,
     pub permission_policy: PermissionPolicy,
     pub max_iterations: usize,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 pub fn run_provider_subagent_turn<T>(
@@ -29,6 +30,9 @@ where
         config.system_prompt,
     )
     .with_max_iterations(config.max_iterations);
+    if let Some(token) = config.cancellation_token {
+        runtime = runtime.with_cancellation_token(token);
+    }
     let local_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
