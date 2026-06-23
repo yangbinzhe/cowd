@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::RuntimePermissionRuleConfig;
 
 /// Permission level assigned to a tool invocation or runtime session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,

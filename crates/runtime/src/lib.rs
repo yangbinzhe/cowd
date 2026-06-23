@@ -67,6 +67,7 @@ pub mod agent_protocol;
 pub mod agent_workgraph;
 pub mod ai_kernel;
 pub mod approval_gate;
+pub mod autonomy_profile;
 pub mod checkpoint;
 pub mod collaboration_template;
 pub mod context_fanout;
@@ -145,6 +146,11 @@ pub use agent_workgraph::{
     WorkGraphRef, WorkGraphStatus,
 };
 pub use ai_kernel::{RuntimeAiKernel, RuntimeAiKernelTrace};
+pub use autonomy_profile::{
+    ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
+    AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,
+    AutonomyProfileSpec, InterruptionPolicy as AutonomyInterruptionPolicy,
+};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

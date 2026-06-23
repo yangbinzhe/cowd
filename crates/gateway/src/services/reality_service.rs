@@ -28,7 +28,7 @@ impl RealityService {
     pub(crate) fn new() -> Self {
         Self {
             label: "reality",
-            owner: "0.9.362 Reality Core service boundary",
+            owner: "0.9.363 Reality Core service boundary",
         }
     }
 
