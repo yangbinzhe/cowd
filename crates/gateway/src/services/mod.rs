@@ -20,6 +20,7 @@ mod growth_service;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
+mod mission_service;
 mod policy;
 pub(crate) mod reality_service;
 mod receipt;
@@ -42,6 +43,9 @@ pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
     MfgService,
+};
+pub(crate) use mission_service::{
+    AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest, StartMissionSessionHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -221,7 +225,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.367 Provider service boundary",
+            owner: "0.9.368 Provider service boundary",
         }
     }
 
@@ -308,7 +312,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.367 Growth service boundary",
+            owner: "0.9.368 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -426,6 +430,12 @@ pub(crate) struct AgentService {
     pub(crate) owner: &'static str,
 }
 
+#[derive(Clone)]
+pub(crate) struct MissionService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
 impl AgentService {
     pub(crate) fn new() -> Self {
         Self {
@@ -462,6 +472,7 @@ pub(crate) struct GatewayServices {
     pub(crate) agent: AgentService,
     pub(crate) matrix: MatrixService,
     pub(crate) mfg: MfgService,
+    pub(crate) mission: MissionService,
     pub(crate) owner: &'static str,
     pub(crate) boundary_status: &'static str,
 }
@@ -676,7 +687,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.367 GatewayServices");
+        assert_eq!(services.owner, "0.9.368 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
@@ -703,6 +714,7 @@ mod tests {
                 "agent",
                 "matrix",
                 "mfg",
+                "mission",
             ]
         );
         assert!(services.has_minimum_service_contract());
@@ -763,6 +775,14 @@ mod tests {
             .contracts()
             .iter()
             .any(|contract| contract.operation == "incident"));
+        assert_eq!(
+            services.mission.projection_contract().operation,
+            "projection"
+        );
+        assert_eq!(
+            services.mission.session_control_contract().operation,
+            "session_control"
+        );
         let _registry: ServiceRegistry = services.clone();
         let ctx = ServiceContext::new()
             .with_workspace(std::path::PathBuf::from("/tmp/cowd-service-context-test"))

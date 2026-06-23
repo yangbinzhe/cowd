@@ -58,7 +58,8 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.367 GatewayServices",
+            mission: MissionService::new(),
+            owner: "0.9.368 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }
@@ -136,6 +137,7 @@ impl GatewayServices {
             self.agent.label,
             self.matrix.label,
             self.mfg.label,
+            self.mission.label,
         ]
     }
 
@@ -160,6 +162,7 @@ impl GatewayServices {
         contracts.extend(self.agent.contracts());
         contracts.extend(self.matrix.contracts());
         contracts.extend(self.mfg.contracts());
+        contracts.extend(self.mission.contracts());
         contracts
     }
 
@@ -229,6 +232,10 @@ impl GatewayServices {
             ("mfg", "incident"),
             ("mfg", "analysis"),
             ("mfg", "skill_run"),
+            ("mission", "projection"),
+            ("mission", "session_control"),
+            ("mission", "approval_projection"),
+            ("mission", "relation_projection"),
         ]
         .into_iter()
         .all(|(service, operation)| has(service, operation))

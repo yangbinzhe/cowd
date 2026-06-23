@@ -63,6 +63,7 @@ pub(crate) mod memory_routes;
 mod message_routes;
 mod mfg_outcomes;
 mod mfg_routes;
+mod mission_routes;
 mod profile_routes;
 mod public_routes;
 mod reality_routes;
@@ -257,6 +258,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(growth_routes::router())
         .merge(matrix_routes::router())
         .merge(mfg_routes::router())
+        .merge(mission_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
@@ -1202,6 +1204,84 @@ mod tests {
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(snapshot["turns"][0]["turn_id"], turn_id);
+    }
+
+    #[tokio::test]
+    async fn mission_routes_expose_runtime_projection_and_session_control() {
+        let app = api_router(test_state());
+        let session_id = format!("mission-route-test-{}", uuid::Uuid::new_v4());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "verify mission route",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["mission"]["kind"], "mission.runtime");
+        assert_eq!(
+            created["mission"]["active_session_id"].as_str(),
+            Some(session_id.as_str())
+        );
+
+        let backgrounded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/sessions/{session_id}/background"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backgrounded.status(), StatusCode::OK);
+        let backgrounded: serde_json::Value = serde_json::from_slice(
+            &to_bytes(backgrounded.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backgrounded["receipt"]["status"], "accepted");
+        assert_eq!(
+            backgrounded["mission"]["active_session_id"],
+            serde_json::Value::Null
+        );
+
+        let projection = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mission/projection")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(projection.status(), StatusCode::OK);
+        let projection: serde_json::Value =
+            serde_json::from_slice(&to_bytes(projection.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(projection["envelope"]["service"], "mission");
+        assert!(projection["mission"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
     }
 
     #[tokio::test]
