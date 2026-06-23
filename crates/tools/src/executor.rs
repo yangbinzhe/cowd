@@ -10,24 +10,22 @@ use reqwest::blocking::Client;
 use runtime::tool_orchestrator::tool_execution_profile;
 use runtime::{
     check_freshness, checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore,
-    dedupe_superseded_commit_events, edit_file, execute_bash,
+    edit_file, execute_bash,
     gates::{GateContext, GateEvaluator},
-    glob_search, grep_search, load_system_prompt,
+    glob_search, grep_search,
     mutation_plan::{apply_mutations, preview_mutations},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
-    summary_compression::compress_summary_text,
     tool_cache::{
         get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
         put_cached_tool_result_scoped, tool_cache_stats,
     },
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
     write_file, BashCommandInput, BashCommandOutput, BranchFreshness, CheckpointCreateInput,
-    CheckpointDiffInput, CheckpointRestoreInput, ConfigLoader, GrepSearchInput,
-    LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MutationApplyInput, MutationPreviewInput, PermissionMode,
-    PermissionPolicy, ProviderSubAgentTurnConfig, ProviderToolDefinition, TaskPacket, ToolError,
-    ToolExecutor,
+    CheckpointDiffInput, CheckpointRestoreInput, ConfigLoader, GrepSearchInput, LaneContext,
+    LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
+    MutationApplyInput, MutationPreviewInput, PermissionMode, PermissionPolicy,
+    ProviderToolDefinition, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1223,7 +1221,7 @@ fn branch_divergence_output(
             LaneEvent::new(
                 LaneEventName::BranchStaleAgainstMain,
                 LaneEventStatus::Blocked,
-                iso8601_now(),
+                runtime::iso8601_now(),
             )
             .with_failure_class(LaneFailureClass::BranchDivergence)
             .with_detail(stderr.clone())
@@ -2500,43 +2498,10 @@ struct SkillOutput {
     prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AgentOutput {
-    #[serde(rename = "agentId")]
-    pub(crate) agent_id: String,
-    pub(crate) name: String,
-    pub(crate) description: String,
-    #[serde(rename = "subagentType")]
-    pub(crate) subagent_type: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) status: String,
-    #[serde(rename = "outputFile")]
-    pub(crate) output_file: String,
-    #[serde(rename = "manifestFile")]
-    pub(crate) manifest_file: String,
-    #[serde(rename = "createdAt")]
-    pub(crate) created_at: String,
-    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-    pub(crate) started_at: Option<String>,
-    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
-    pub(crate) completed_at: Option<String>,
-    #[serde(rename = "laneEvents", default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) lane_events: Vec<LaneEvent>,
-    #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
-    pub(crate) current_blocker: Option<LaneEventBlocker>,
-    #[serde(rename = "derivedState")]
-    pub(crate) derived_state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
-}
+pub(crate) type AgentOutput = runtime::AgentSnapshot;
 
-#[derive(Debug, Clone)]
-pub(crate) struct AgentJob {
-    manifest: AgentOutput,
-    prompt: String,
-    system_prompt: Vec<String>,
-    allowed_tools: BTreeSet<String>,
-}
+#[cfg(test)]
+pub(crate) type AgentJob = runtime::AgentJob;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolSearchOutput {
@@ -3395,167 +3360,45 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
-
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    let request = build_spawn_agent_request(input)?;
+    let tool_executor = SubagentToolExecutor::new(request.allowed_tools.clone())
+        .with_enforcer(PermissionEnforcer::new(request.permission_policy.clone()));
+    runtime::spawn_provider_agent(request, tool_executor)
 }
 
+#[cfg(test)]
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
-    if input.description.trim().is_empty() {
-        return Err(String::from("description must not be empty"));
-    }
-    if input.prompt.trim().is_empty() {
-        return Err(String::from("prompt must not be empty"));
-    }
-
-    let agent_id = make_agent_id();
-    let output_dir = agent_store_dir()?;
-    std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
-    let output_file = output_dir.join(format!("{agent_id}.md"));
-    let manifest_file = output_dir.join(format!("{agent_id}.json"));
-    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
-    let agent_name = input
-        .name
-        .as_deref()
-        .map(slugify_agent_name)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| slugify_agent_name(&input.description));
-    let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
-
-    let output_contents = format!(
-        "# Agent Task
-
-- id: {}
-- name: {}
-- description: {}
-- subagent_type: {}
-- created_at: {}
-
-## Prompt
-
-{}
-",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
-    );
-    std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
-
-    let manifest = AgentOutput {
-        agent_id,
-        name: agent_name,
-        description: input.description,
-        subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
-        status: String::from("running"),
-        output_file: output_file.display().to_string(),
-        manifest_file: manifest_file.display().to_string(),
-        created_at: created_at.clone(),
-        started_at: Some(created_at),
-        completed_at: None,
-        lane_events: vec![LaneEvent::started(iso8601_now())],
-        current_blocker: None,
-        derived_state: String::from("working"),
-        error: None,
-    };
-    write_agent_manifest(&manifest)?;
-
-    let manifest_for_spawn = manifest.clone();
-    let job = AgentJob {
-        manifest: manifest_for_spawn,
-        prompt: input.prompt,
-        system_prompt,
-        allowed_tools,
-    };
+    let job = runtime::prepare_agent_job(build_spawn_agent_request(input)?)?;
+    let manifest = job.manifest.clone();
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        runtime::persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
         return Err(error);
     }
 
     Ok(manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("cowd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
-                }
-            }
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
-    let allowed_tools = job.allowed_tools.clone();
-    let permission_policy = agent_permission_policy();
-    let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    let summary = runtime::run_provider_subagent_turn(
-        ProviderSubAgentTurnConfig {
-            model,
-            system_prompt: job.system_prompt.clone(),
-            tool_definitions: provider_tool_definitions_for_allowed_tools(Some(&job.allowed_tools)),
-            permission_policy,
-            max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
-        },
-        tool_executor,
-        job.prompt.clone(),
-    )?;
-    let final_text = runtime::final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
-}
-
-fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
-        cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
-        std::env::consts::OS,
-        "unknown",
-    )
-    .map_err(|error| error.to_string())?;
-    prompt.push(format!(
-        "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
-    ));
-    Ok(prompt)
-}
-
-fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+fn build_spawn_agent_request(input: AgentInput) -> Result<runtime::SpawnAgentRequest, String> {
+    let normalized_subagent_type = runtime::normalize_subagent_type(input.subagent_type.as_deref());
+    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    Ok(runtime::SpawnAgentRequest {
+        description: input.description,
+        prompt: input.prompt,
+        subagent_type: Some(normalized_subagent_type.clone()),
+        name: input.name,
+        model: Some(runtime::resolve_agent_model(input.model.as_deref())),
+        system_prompt: runtime::build_agent_system_prompt(&normalized_subagent_type)?,
+        tool_definitions: provider_tool_definitions_for_allowed_tools(Some(&allowed_tools)),
+        allowed_tools,
+        permission_policy: agent_permission_policy(),
+        max_iterations: runtime::DEFAULT_AGENT_MAX_ITERATIONS,
+        store_dir: None,
+    })
 }
 
 pub(crate) fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -3644,364 +3487,6 @@ pub(crate) fn agent_permission_policy() -> PermissionPolicy {
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
         |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
     )
-}
-
-fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
-    let mut normalized = manifest.clone();
-    normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
-    std::fs::write(
-        &normalized.manifest_file,
-        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-pub(crate) fn persist_agent_terminal_state(
-    manifest: &AgentOutput,
-    status: &str,
-    result: Option<&str>,
-    error: Option<String>,
-) -> Result<(), String> {
-    let blocker = error.as_deref().map(classify_lane_blocker);
-    append_agent_output(
-        &manifest.output_file,
-        &format_agent_terminal_output(status, result, blocker.as_ref(), error.as_deref()),
-    )?;
-    let mut next_manifest = manifest.clone();
-    next_manifest.status = status.to_string();
-    next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker.clone_from(&blocker);
-    next_manifest.derived_state =
-        derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
-    next_manifest.error = error;
-    if let Some(blocker) = blocker {
-        next_manifest
-            .lane_events
-            .push(LaneEvent::blocked(iso8601_now(), &blocker));
-        next_manifest
-            .lane_events
-            .push(LaneEvent::failed(iso8601_now(), &blocker));
-    } else {
-        next_manifest.current_blocker = None;
-        let finished_summary = build_lane_finished_summary(&next_manifest, result);
-        next_manifest.lane_events.push(
-            LaneEvent::finished(iso8601_now(), finished_summary.detail).with_data(
-                serde_json::to_value(&finished_summary.data)
-                    .expect("lane summary metadata should serialize"),
-            ),
-        );
-        if let Some(provenance) = maybe_commit_provenance(result) {
-            next_manifest.lane_events.push(LaneEvent::commit_created(
-                iso8601_now(),
-                Some(format!("commit {}", provenance.commit)),
-                provenance,
-            ));
-        }
-    }
-    write_agent_manifest(&next_manifest)
-}
-
-const MIN_LANE_SUMMARY_WORDS: usize = 7;
-const CONTROL_ONLY_SUMMARY_WORDS: &[&str] = &[
-    "ack",
-    "commit",
-    "continue",
-    "everyting",
-    "everything",
-    "keep",
-    "next",
-    "push",
-    "ralph",
-    "resume",
-    "retry",
-    "run",
-    "stop",
-    "sweep",
-    "sweeping",
-    "team",
-];
-const CONTEXTUAL_SUMMARY_WORDS: &[&str] = &[
-    "added",
-    "audited",
-    "blocked",
-    "completed",
-    "documented",
-    "failed",
-    "finished",
-    "fixed",
-    "implemented",
-    "investigated",
-    "merged",
-    "pushed",
-    "refactored",
-    "removed",
-    "reviewed",
-    "tested",
-    "updated",
-    "verified",
-];
-
-#[derive(Debug, Clone, Serialize)]
-struct LaneFinishedSummaryData {
-    #[serde(rename = "qualityFloorApplied")]
-    quality_floor_applied: bool,
-    reasons: Vec<String>,
-    #[serde(rename = "rawSummary", skip_serializing_if = "Option::is_none")]
-    raw_summary: Option<String>,
-    #[serde(rename = "wordCount")]
-    word_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct LaneFinishedSummary {
-    detail: Option<String>,
-    data: LaneFinishedSummaryData,
-}
-
-#[derive(Debug)]
-struct LaneSummaryAssessment {
-    apply_quality_floor: bool,
-    reasons: Vec<String>,
-    word_count: usize,
-}
-
-fn build_lane_finished_summary(
-    manifest: &AgentOutput,
-    result: Option<&str>,
-) -> LaneFinishedSummary {
-    let raw_summary = result.map(str::trim).filter(|value| !value.is_empty());
-    let assessment = assess_lane_summary_quality(raw_summary.unwrap_or_default());
-    let detail = match raw_summary {
-        Some(summary) if !assessment.apply_quality_floor => Some(compress_summary_text(summary)),
-        Some(summary) => Some(compose_lane_summary_fallback(manifest, Some(summary))),
-        None => Some(compose_lane_summary_fallback(manifest, None)),
-    };
-
-    LaneFinishedSummary {
-        detail,
-        data: LaneFinishedSummaryData {
-            quality_floor_applied: raw_summary.is_none() || assessment.apply_quality_floor,
-            reasons: assessment.reasons,
-            raw_summary: raw_summary.map(str::to_string),
-            word_count: assessment.word_count,
-        },
-    }
-}
-
-fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
-    let words = summary
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '#'))
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-
-    let word_count = words.len();
-    let mut reasons = Vec::new();
-    if summary.trim().is_empty() {
-        reasons.push(String::from("empty"));
-    }
-
-    let control_only = !words.is_empty()
-        && words
-            .iter()
-            .all(|word| CONTROL_ONLY_SUMMARY_WORDS.contains(&word.as_str()));
-    if control_only {
-        reasons.push(String::from("control_only"));
-    }
-
-    let has_context_signal = summary.contains('`')
-        || summary.contains('/')
-        || summary.contains(':')
-        || summary.contains('#')
-        || words
-            .iter()
-            .any(|word| CONTEXTUAL_SUMMARY_WORDS.contains(&word.as_str()));
-    if word_count < MIN_LANE_SUMMARY_WORDS && !has_context_signal {
-        reasons.push(String::from("too_short_without_context"));
-    }
-
-    LaneSummaryAssessment {
-        apply_quality_floor: !reasons.is_empty(),
-        reasons,
-        word_count,
-    }
-}
-
-fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&str>) -> String {
-    let target = manifest.description.trim();
-    let base = format!(
-        "Completed lane `{}` for target: {}. Status: completed.",
-        manifest.name,
-        if target.is_empty() {
-            "unspecified task"
-        } else {
-            target
-        }
-    );
-    match raw_summary {
-        Some(summary) => format!(
-            "{base} Original stop summary was too vague to keep as the lane result: \"{}\".",
-            summary.trim()
-        ),
-        None => format!("{base} No usable stop summary was produced by the lane."),
-    }
-}
-
-pub(crate) fn derive_agent_state(
-    status: &str,
-    result: Option<&str>,
-    error: Option<&str>,
-    blocker: Option<&LaneEventBlocker>,
-) -> &'static str {
-    let normalized_status = status.trim().to_ascii_lowercase();
-    let normalized_error = error.unwrap_or_default().to_ascii_lowercase();
-
-    if normalized_status == "running" {
-        return "working";
-    }
-    if normalized_status == "completed" {
-        return if result.is_some_and(|value| !value.trim().is_empty()) {
-            "finished_cleanable"
-        } else {
-            "finished_pending_report"
-        };
-    }
-    if normalized_error.contains("background") {
-        return "blocked_background_job";
-    }
-    if normalized_error.contains("merge conflict") || normalized_error.contains("cherry-pick") {
-        return "blocked_merge_conflict";
-    }
-    if normalized_error.contains("mcp") {
-        return "degraded_mcp";
-    }
-    if normalized_error.contains("transport")
-        || normalized_error.contains("broken pipe")
-        || normalized_error.contains("connection")
-        || normalized_error.contains("interrupted")
-    {
-        return "interrupted_transport";
-    }
-    if blocker.is_some() {
-        return "truly_idle";
-    }
-    "truly_idle"
-}
-
-pub(crate) fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
-    let commit = extract_commit_sha(result?)?;
-    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
-    let worktree = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string());
-    Some(LaneCommitProvenance {
-        commit: commit.clone(),
-        branch,
-        worktree,
-        canonical_commit: Some(commit.clone()),
-        superseded_by: None,
-        lineage: vec![commit],
-    })
-}
-
-fn extract_commit_sha(result: &str) -> Option<String> {
-    result
-        .split(|c: char| !c.is_ascii_hexdigit())
-        .find(|token| token.len() >= 7 && token.len() <= 40)
-        .map(str::to_string)
-}
-
-fn current_git_branch() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(suffix.as_bytes())
-        .map_err(|error| error.to_string())
-}
-
-fn format_agent_terminal_output(
-    status: &str,
-    result: Option<&str>,
-    blocker: Option<&LaneEventBlocker>,
-    error: Option<&str>,
-) -> String {
-    let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
-    if let Some(blocker) = blocker {
-        sections.push(format!(
-            "\n### Blocker\n\n- failure_class: {}\n- detail: {}\n",
-            serde_json::to_string(&blocker.failure_class)
-                .unwrap_or_else(|_| "\"infra\"".to_string())
-                .trim_matches('"'),
-            blocker.detail.trim()
-        ));
-    }
-    if let Some(result) = result.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Final response\n\n{}\n", result.trim()));
-    }
-    if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Error\n\n{}\n", error.trim()));
-    }
-    sections.join("")
-}
-
-fn classify_lane_blocker(error: &str) -> LaneEventBlocker {
-    let detail = error.trim().to_string();
-    LaneEventBlocker {
-        failure_class: classify_lane_failure(error),
-        detail,
-    }
-}
-
-pub(crate) fn classify_lane_failure(error: &str) -> LaneFailureClass {
-    let normalized = error.to_ascii_lowercase();
-
-    if normalized.contains("prompt") && normalized.contains("deliver") {
-        LaneFailureClass::PromptDelivery
-    } else if normalized.contains("trust") {
-        LaneFailureClass::TrustGate
-    } else if normalized.contains("branch")
-        && (normalized.contains("stale") || normalized.contains("diverg"))
-    {
-        LaneFailureClass::BranchDivergence
-    } else if normalized.contains("gateway") || normalized.contains("routing") {
-        LaneFailureClass::GatewayRouting
-    } else if normalized.contains("compile")
-        || normalized.contains("build failed")
-        || normalized.contains("cargo check")
-    {
-        LaneFailureClass::Compile
-    } else if normalized.contains("test") {
-        LaneFailureClass::Test
-    } else if normalized.contains("tool failed")
-        || normalized.contains("runtime tool")
-        || normalized.contains("tool runtime")
-    {
-        LaneFailureClass::ToolRuntime
-    } else if normalized.contains("workspace") && normalized.contains("mismatch") {
-        LaneFailureClass::WorkspaceMismatch
-    } else if normalized.contains("plugin") {
-        LaneFailureClass::PluginStartup
-    } else if normalized.contains("mcp") && normalized.contains("handshake") {
-        LaneFailureClass::McpHandshake
-    } else if normalized.contains("mcp") {
-        LaneFailureClass::McpStartup
-    } else {
-        LaneFailureClass::Infra
-    }
 }
 
 pub(crate) struct SubagentToolExecutor {
@@ -4171,69 +3656,6 @@ fn canonical_tool_token(value: &str) -> String {
         canonical = stripped.to_string();
     }
     canonical
-}
-
-fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("COWD_AGENT_STORE") {
-        return Ok(std::path::PathBuf::from(path));
-    }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".cowd/agents"));
-    }
-    Ok(cwd.join(".cowd/agents"))
-}
-
-fn make_agent_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("agent-{nanos}")
-}
-
-fn slugify_agent_name(description: &str) -> String {
-    let mut out = description
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-    out.trim_matches('-').chars().take(32).collect()
-}
-
-fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
-    let trimmed = subagent_type.map(str::trim).unwrap_or_default();
-    if trimmed.is_empty() {
-        return String::from("general-purpose");
-    }
-
-    match canonical_tool_token(trimmed).as_str() {
-        "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
-        "explore" | "explorer" | "exploreagent" => String::from("Explore"),
-        "plan" | "planagent" => String::from("Plan"),
-        "verification" | "verificationagent" | "verify" | "verifier" => {
-            String::from("Verification")
-        }
-        "cowdguide" | "cowdguideagent" | "guide" => String::from("cowd-guide"),
-        "statusline" | "statuslinesetup" => String::from("statusline-setup"),
-        _ => trimmed.to_string(),
-    }
-}
-
-fn iso8601_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5072,7 +4494,7 @@ fn iso8601_timestamp() -> String {
             return String::from_utf8_lossy(&output.stdout).trim().to_string();
         }
     }
-    iso8601_now()
+    runtime::iso8601_now()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -5337,9 +4759,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, maybe_commit_provenance,
-        persist_agent_terminal_state, run_task_packet, AgentInput, AgentJob, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
+        execute_tool, run_task_packet, AgentInput, AgentJob, SubagentToolExecutor,
     };
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
     use runtime::{
@@ -7043,7 +6464,7 @@ mod tests {
                 role: None,
             },
             |job| {
-                persist_agent_terminal_state(
+                runtime::persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
                     Some("Finished successfully in commit abc1234"),
@@ -7102,7 +6523,7 @@ mod tests {
                 role: None,
             },
             |job| {
-                persist_agent_terminal_state(
+                runtime::persist_agent_terminal_state(
                     &job.manifest,
                     "failed",
                     None,
@@ -7151,7 +6572,7 @@ mod tests {
                 role: None,
             },
             |job| {
-                persist_agent_terminal_state(
+                runtime::persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
                     Some("commit push everyting, keep sweeping $ralph"),
@@ -7229,21 +6650,24 @@ mod tests {
 
     #[test]
     fn agent_state_classification_covers_finished_and_specific_blockers() {
-        assert_eq!(derive_agent_state("running", None, None, None), "working");
         assert_eq!(
-            derive_agent_state("completed", Some("done"), None, None),
+            runtime::derive_agent_state("running", None, None, None),
+            "working"
+        );
+        assert_eq!(
+            runtime::derive_agent_state("completed", Some("done"), None, None),
             "finished_cleanable"
         );
         assert_eq!(
-            derive_agent_state("completed", None, None, None),
+            runtime::derive_agent_state("completed", None, None, None),
             "finished_pending_report"
         );
         assert_eq!(
-            derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
+            runtime::derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
             "degraded_mcp"
         );
         assert_eq!(
-            derive_agent_state(
+            runtime::derive_agent_state(
                 "failed",
                 None,
                 Some("background terminal still running"),
@@ -7252,11 +6676,16 @@ mod tests {
             "blocked_background_job"
         );
         assert_eq!(
-            derive_agent_state("failed", None, Some("merge conflict while rebasing"), None),
+            runtime::derive_agent_state(
+                "failed",
+                None,
+                Some("merge conflict while rebasing"),
+                None
+            ),
             "blocked_merge_conflict"
         );
         assert_eq!(
-            derive_agent_state(
+            runtime::derive_agent_state(
                 "failed",
                 None,
                 Some("transport interrupted after partial progress"),
@@ -7268,8 +6697,9 @@ mod tests {
 
     #[test]
     fn commit_provenance_is_extracted_from_agent_results() {
-        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
-            .expect("commit provenance");
+        let provenance =
+            runtime::maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
+                .expect("commit provenance");
         assert_eq!(provenance.commit, "deadbee");
         assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
         assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
@@ -7316,7 +6746,11 @@ mod tests {
         ];
 
         for (message, expected) in cases {
-            assert_eq!(classify_lane_failure(message), expected, "{message}");
+            assert_eq!(
+                runtime::classify_lane_failure(message),
+                expected,
+                "{message}"
+            );
         }
     }
 
@@ -7373,6 +6807,26 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+    }
+
+    #[test]
+    fn tools_executor_does_not_own_agent_lifecycle() {
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/executor.rs");
+        let source =
+            std::fs::read_to_string(source_path).expect("executor source should be readable");
+        for forbidden in [
+            ["fn ", "spawn_agent_job"].concat(),
+            ["fn ", "run_agent_job"].concat(),
+            ["fn ", "write_agent_manifest"].concat(),
+            ["fn ", "persist_agent_terminal_state"].concat(),
+            ["std::thread::", "Builder::new()"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "tools executor must not own Agent lifecycle primitive `{forbidden}`"
+            );
+        }
+        assert!(source.contains("runtime::spawn_provider_agent"));
     }
 
     #[derive(Debug)]
