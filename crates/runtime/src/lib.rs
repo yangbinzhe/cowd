@@ -99,6 +99,7 @@ pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod team_discovery;
+pub mod team_runtime;
 pub mod tool_cache;
 pub mod tool_dispatch;
 pub mod tool_execution_plan;
@@ -315,6 +316,11 @@ pub use task_packet::{
 pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus as RegistryTaskStatus};
 pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
+pub use team_runtime::{
+    global_team_runtime_service, StartTeamRuntimeRequest, TeamRuntimeAgent,
+    TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService, TeamRuntimeSnapshot,
+    TeamRuntimeStatus,
+};
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
