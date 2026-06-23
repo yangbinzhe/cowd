@@ -58,7 +58,7 @@ impl GatewayServices {
             agent: AgentService::new(),
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
-            owner: "0.9.364 GatewayServices",
+            owner: "0.9.365 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
     }

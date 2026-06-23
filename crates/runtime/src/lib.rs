@@ -29,6 +29,7 @@ pub mod graph_contract;
 pub mod green_contract;
 pub mod wave;
 pub use green_contract::GreenLevel;
+pub mod global_approval_queue;
 mod hooks;
 mod json;
 pub use json::JsonValue;
@@ -216,6 +217,11 @@ pub use gates::{
     PreFlightGate, RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use global_approval_queue::{
+    global_approval_queue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
+    GlobalApprovalDecision, GlobalApprovalDecisionReceipt, GlobalApprovalQueue,
+    GlobalApprovalRequest, GlobalApprovalStatus, SubmitGlobalApprovalRequest,
+};
 pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
