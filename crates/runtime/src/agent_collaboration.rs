@@ -11,9 +11,11 @@ use uuid::Uuid;
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
 use crate::agent_workgraph::AgentWorkGraph;
+use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextItem;
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
+use ai_kernel::strategy::{decide_strategy, StrategyInput};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::fact_checker::{FactCheckResult, FactChecker};
@@ -45,6 +47,7 @@ pub struct CollaborationTask {
     pub required_skills: Vec<String>,
     pub subtasks: Vec<SubTask>,
     pub review_criteria: Option<String>,
+    pub collaboration_decision: Option<CollaborationDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -684,6 +687,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     ) -> Option<CollaborationContextResult> {
         // 1. Decompose
         let subtasks = self.decompose_sequential(task);
+        let strategy = decide_strategy(&StrategyInput::from_prompt(task));
+        let collaboration_decision =
+            CollaborationTemplateMatcher::default().decide(task, &strategy);
 
         // 2. Assemble team
         let collab_task = CollaborationTask {
@@ -691,6 +697,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             required_skills: required_skills.to_vec(),
             subtasks: subtasks.clone(),
             review_criteria: None,
+            collaboration_decision: Some(collaboration_decision),
         };
         let team = self.assemble_team(&collab_task)?;
 
@@ -1280,6 +1287,7 @@ mod tests {
             required_skills: vec!["quantum-xeno-linguistics".to_string()],
             subtasks: vec![],
             review_criteria: None,
+            collaboration_decision: None,
         };
         assert!(orch.assemble_team(&task).is_none());
     }
@@ -1608,6 +1616,34 @@ Memory: lightweight spike has a live-memory pulse candidate"
     fn infer_skills_falls_back_to_general() {
         let skills = infer_skills("do something completely unrelated");
         assert_eq!(skills, vec!["general".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_with_context_attaches_collaboration_template_decision() {
+        AgentDirectory::global().register(dummy_agent_info(
+            "template-contract-worker",
+            vec!["rust".to_string(), "testing".to_string()],
+        ));
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+
+        let result = orch
+            .run_with_context(
+                "implement a runtime refactor then compile and test",
+                &["rust".to_string(), "testing".to_string()],
+            )
+            .await
+            .expect("collaboration result");
+        let decision = result
+            .collaboration_task
+            .collaboration_decision
+            .expect("collaboration decision");
+
+        assert_eq!(
+            decision.template_id,
+            crate::collaboration_template::CollaborationTemplateId::ImplementationReviewFix
+        );
+        assert!(decision.plan.review_contract.contains("mandatory"));
+        assert!(decision.plan.budget_policy.max_parallel_agents >= 2);
     }
 
     fn dummy_agent_info(id: &str, capabilities: Vec<String>) -> AgentInfo {

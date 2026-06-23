@@ -68,6 +68,7 @@ pub mod agent_workgraph;
 pub mod ai_kernel;
 pub mod approval_gate;
 pub mod checkpoint;
+pub mod collaboration_template;
 pub mod context_fanout;
 pub mod cowd_event;
 pub mod cross_plane_policy;
@@ -150,6 +151,11 @@ pub use checkpoint::{
     checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
     CheckpointDiffInput, CheckpointDiffOutput, CheckpointListOutput, CheckpointRestoreInput,
     CheckpointSummary,
+};
+pub use collaboration_template::{
+    BudgetPolicy, CollaborationContextVisibility, CollaborationDecision, CollaborationPlan,
+    CollaborationPlanAgent, CollaborationRoleSpec, CollaborationTemplate,
+    CollaborationTemplateCatalog, CollaborationTemplateId, CollaborationTemplateMatcher,
 };
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,

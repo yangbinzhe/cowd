@@ -533,6 +533,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
         required_skills: vec![rust_skill.into()],
         subtasks: vec![],
         review_criteria: None,
+        collaboration_decision: None,
     };
 
     let team = orch.assemble_team(&task).expect("should assemble team");

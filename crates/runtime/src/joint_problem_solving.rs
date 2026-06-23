@@ -518,6 +518,7 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             review_criteria: Some(
                 "Solutions must be concrete, feasible, and respect constraints".to_string(),
             ),
+            collaboration_decision: None,
         };
 
         let team = match collab.assemble_team(&task) {
@@ -744,6 +745,7 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             required_skills: skills,
             subtasks: subtasks.clone(),
             review_criteria: Some("Implementation must satisfy all success criteria".to_string()),
+            collaboration_decision: None,
         };
 
         let team = match collab.assemble_team(&task) {

@@ -574,6 +574,7 @@ mod tests {
                 },
             ],
             review_criteria: None,
+            collaboration_decision: None,
         };
 
         let graph = AgentWorkGraph::from_collaboration_task("session-1", &task);
@@ -595,6 +596,7 @@ mod tests {
             required_skills: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
+            collaboration_decision: None,
         };
         let trace = AgentTaskTrace {
             task_id: "review-node".to_string(),
@@ -647,6 +649,7 @@ mod tests {
             required_skills: Vec::new(),
             subtasks: Vec::new(),
             review_criteria: None,
+            collaboration_decision: None,
         };
         let trace = AgentTaskTrace {
             task_id: "worker".to_string(),
@@ -689,6 +692,7 @@ mod tests {
                 depends_on: Vec::new(),
             }],
             review_criteria: None,
+            collaboration_decision: None,
         };
 
         let graph = AgentWorkGraph::from_collaboration_task("session-1", &task);
@@ -719,6 +723,7 @@ mod tests {
             required_skills: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
+            collaboration_decision: None,
         };
         let trace = AgentTaskTrace {
             task_id: "review-node".to_string(),

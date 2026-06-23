@@ -3375,6 +3375,11 @@ where
                 "risk": format!("{:?}", trace.strategy.understanding.risk),
                 "decorators": trace.strategy.decorators.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
             },
+            "collaboration": {
+                "template_id": trace.collaboration_decision.template_id.as_str(),
+                "rationale": trace.collaboration_decision.rationale,
+                "plan": trace.collaboration_decision.plan,
+            },
             "context": {
                 "epoch_id": trace.context_epoch.epoch_id,
                 "envelope_id": trace.context_envelope_id,
@@ -5127,6 +5132,30 @@ mod tests {
                 "strategy-router-v2"
             );
             assert_eq!(
+                ai_kernel_trace.payload["collaboration"]["template_id"],
+                "single_executor"
+            );
+            assert_eq!(
+                ai_kernel_trace.payload["collaboration"]["plan"]["template_id"],
+                "single_executor"
+            );
+            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["agents"].is_array());
+            assert!(
+                ai_kernel_trace.payload["collaboration"]["plan"]["context_visibility"].is_string()
+            );
+            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["memory_policy"].is_string());
+            assert!(
+                ai_kernel_trace.payload["collaboration"]["plan"]["evidence_policy"].is_string()
+            );
+            assert!(
+                ai_kernel_trace.payload["collaboration"]["plan"]["handoff_contract"].is_string()
+            );
+            assert!(
+                ai_kernel_trace.payload["collaboration"]["plan"]["review_contract"].is_string()
+            );
+            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["merge_contract"].is_string());
+            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["budget_policy"].is_object());
+            assert_eq!(
                 ai_kernel_trace.payload["verification"]["can_finalize"],
                 true
             );
@@ -5227,6 +5256,7 @@ mod tests {
                         depends_on: Vec::new(),
                     }],
                     review_criteria: None,
+                    collaboration_decision: None,
                 };
                 let review_packet = CollaborationReviewPacket {
                     board_id: "board-stub".to_string(),

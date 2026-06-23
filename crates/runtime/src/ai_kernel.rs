@@ -29,11 +29,13 @@ use ai_kernel::verification::{
 use ai_kernel::workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
 use serde::{Deserialize, Serialize};
 
+use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextProfile;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAiKernelTrace {
     pub strategy: StrategyDecision,
+    pub collaboration_decision: CollaborationDecision,
     pub context_epoch: ContextEpoch,
     pub context_envelope_id: Option<String>,
     pub context_alignment: Option<ContextAlignmentReport>,
@@ -58,6 +60,7 @@ pub struct RuntimeAiKernelTrace {
 pub struct RuntimeAiKernel {
     user_input: String,
     strategy: StrategyDecision,
+    collaboration_decision: CollaborationDecision,
     context_epoch: ContextEpoch,
     tool_transaction: Option<ToolTransactionPlan>,
     workgraph: Option<WorkGraph>,
@@ -94,6 +97,8 @@ impl RuntimeAiKernel {
         let session_id = session_id.into();
         let user_input = user_input.into();
         let strategy = decide_strategy(&strategy_input);
+        let collaboration_decision =
+            CollaborationTemplateMatcher::default().decide(&user_input, &strategy);
         let behavior_policy = decide_behavior_policy(&user_input, &strategy);
         let context_epoch =
             build_context_epoch(&session_id, &user_input, profile, system_prompt, &strategy);
@@ -101,6 +106,7 @@ impl RuntimeAiKernel {
         Self {
             user_input,
             strategy,
+            collaboration_decision,
             context_epoch,
             tool_transaction: None,
             workgraph,
@@ -372,6 +378,7 @@ impl RuntimeAiKernel {
             });
         RuntimeAiKernelTrace {
             strategy: self.strategy,
+            collaboration_decision: self.collaboration_decision,
             context_epoch: self.context_epoch,
             context_envelope_id: self.context_envelope_id,
             context_alignment,
@@ -575,6 +582,7 @@ fn bench_kind_for_mode(mode: ExecutionMode) -> BenchCaseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collaboration_template::CollaborationTemplateId;
 
     #[test]
     fn runtime_kernel_builds_trace_for_simple_turn() {
@@ -596,6 +604,10 @@ mod tests {
         assert_eq!(
             trace.growth_event.source_event_kind,
             "runtime.ai_kernel.trace"
+        );
+        assert_eq!(
+            trace.collaboration_decision.template_id,
+            CollaborationTemplateId::SingleExecutor
         );
     }
 
@@ -648,5 +660,33 @@ mod tests {
         assert!(quality.is_dag);
         assert!(quality.has_review_node);
         assert!(quality.has_synthesis_node);
+        assert_eq!(
+            trace.collaboration_decision.template_id,
+            CollaborationTemplateId::LongRunningProject
+        );
+        assert!(trace.collaboration_decision.plan.agents.len() >= 3);
+    }
+
+    #[test]
+    fn runtime_kernel_selects_debate_template_for_tradeoff_turn() {
+        let kernel = RuntimeAiKernel::begin_turn(
+            "session-1",
+            "分析这个架构选择的利弊，是否应该拆 crate",
+            ContextProfile::MainTurn,
+            &[],
+        );
+
+        let trace = kernel.finalize("decided", 0, 0);
+
+        assert_eq!(
+            trace.collaboration_decision.template_id,
+            CollaborationTemplateId::DebateConsensus
+        );
+        assert!(trace
+            .collaboration_decision
+            .plan
+            .agents
+            .iter()
+            .any(|agent| agent.role_id == "skeptic"));
     }
 }

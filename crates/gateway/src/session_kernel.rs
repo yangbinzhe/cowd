@@ -635,6 +635,7 @@ mod tests {
             required_skills: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
+            collaboration_decision: None,
         };
         AgentWorkGraph::from_collaboration_task("closed-loop-session", &task)
             .with_review_packet(packet)
