@@ -2,8 +2,9 @@
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, FactFlowSummary, RealityCoreSummary, RuntimeActionReceiptSummary,
-    StructuredDataSummary, SurfaceEventSummary, SurfaceHealthSummary, SurfaceSummary, TaskSummary,
+    CowdKernelSummary, FactFlowSummary, MissionControlSummary, RealityCoreSummary,
+    RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary, SurfaceHealthSummary,
+    SurfaceSummary, TaskSummary,
 };
 use crate::CowdEvent;
 use ratatui::widgets::{Block, Borders};
@@ -243,6 +244,8 @@ pub struct App {
     pub gateway_reality_core: Option<RealityCoreSummary>,
     /// Fact Flow trace summary observed through Gateway projection API.
     pub gateway_fact_flow: Option<FactFlowSummary>,
+    /// Mission Runtime global control summary observed through Gateway projection API.
+    pub gateway_mission_control: Option<MissionControlSummary>,
     /// Connector-specific degraded reasons observed through the Gateway API API.
     pub gateway_connector_degraded_reasons: Vec<String>,
     /// Degraded Gateway API/control reasons collected during snapshot refresh.
@@ -522,6 +525,7 @@ impl App {
             gateway_structured_data: None,
             gateway_reality_core: None,
             gateway_fact_flow: None,
+            gateway_mission_control: None,
             gateway_connector_degraded_reasons: Vec::new(),
             gateway_degraded_reasons: Vec::new(),
             gateway_lease_owner: None,

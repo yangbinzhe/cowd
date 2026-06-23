@@ -136,6 +136,31 @@ pub struct FactFlowSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissionSessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub status: String,
+    pub team_count: u64,
+    pub agent_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissionControlSummary {
+    pub active_session_id: Option<String>,
+    pub session_count: u64,
+    pub active_count: u64,
+    pub background_count: u64,
+    pub paused_count: u64,
+    pub closed_count: u64,
+    pub team_count: u64,
+    pub agent_count: u64,
+    pub pending_approvals: u64,
+    pub relation_count: u64,
+    pub event_count: u64,
+    pub sessions: Vec<MissionSessionSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub gateway_running: bool,
     pub active_sessions: usize,
@@ -166,6 +191,7 @@ pub struct RuntimeControlSnapshot {
     pub structured_data: Option<StructuredDataSummary>,
     pub reality_core: Option<RealityCoreSummary>,
     pub fact_flow: Option<FactFlowSummary>,
+    pub mission_control: Option<MissionControlSummary>,
     pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
@@ -237,6 +263,7 @@ impl RuntimeControlSnapshot {
             structured_data: app.gateway_structured_data.clone(),
             reality_core: app.gateway_reality_core.clone(),
             fact_flow: app.gateway_fact_flow.clone(),
+            mission_control: app.gateway_mission_control.clone(),
             connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
             degraded_reasons: app.gateway_degraded_reasons.clone(),
             ..Self::default()
@@ -281,6 +308,7 @@ impl RuntimeControlSnapshot {
         app.gateway_structured_data = self.structured_data.clone();
         app.gateway_reality_core = self.reality_core.clone();
         app.gateway_fact_flow = self.fact_flow.clone();
+        app.gateway_mission_control = self.mission_control.clone();
         app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.gateway_degraded_reasons = self.degraded_reasons.clone();
         app.gateway_lease_owner = self.lease_owner.clone();
@@ -515,6 +543,64 @@ impl RuntimeControlSnapshot {
             boundary_count: boundaries
                 .map(|value| json_array_len(value, "boundaries"))
                 .unwrap_or_default(),
+        });
+    }
+
+    pub fn ingest_mission_projection(&mut self, value: &serde_json::Value) {
+        let mission = value.get("mission").unwrap_or(value);
+        let sessions = mission
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(mission_session_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut active_count = 0;
+        let mut background_count = 0;
+        let mut paused_count = 0;
+        let mut closed_count = 0;
+        let mut team_count = 0;
+        let mut agent_count = 0;
+        for session in &sessions {
+            match session.status.as_str() {
+                "active" => active_count += 1,
+                "background" => background_count += 1,
+                "paused" => paused_count += 1,
+                "closed" => closed_count += 1,
+                _ => {}
+            }
+            team_count += session.team_count;
+            agent_count += session.agent_count;
+        }
+        self.mission_control = Some(MissionControlSummary {
+            active_session_id: mission
+                .get("active_session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            session_count: sessions.len() as u64,
+            active_count,
+            background_count,
+            paused_count,
+            closed_count,
+            team_count,
+            agent_count,
+            pending_approvals: mission
+                .pointer("/approval_projection/pending_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            relation_count: mission
+                .pointer("/relation_projection/relation_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            event_count: mission
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .map(|events| events.len() as u64)
+                .unwrap_or_default(),
+            sessions,
         });
     }
 
@@ -931,6 +1017,38 @@ fn reality_component_status(value: &serde_json::Value, component: &str) -> Strin
         .to_string()
 }
 
+fn mission_session_from_json(value: &serde_json::Value) -> Option<MissionSessionSummary> {
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("id"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(MissionSessionSummary {
+        session_id: session_id.to_string(),
+        title: value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(session_id)
+            .to_string(),
+        status: value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        team_count: value
+            .get("active_team_ids")
+            .or_else(|| value.get("team_ids"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.len() as u64)
+            .unwrap_or_default(),
+        agent_count: value
+            .get("active_agent_ids")
+            .or_else(|| value.get("agent_ids"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.len() as u64)
+            .unwrap_or_default(),
+    })
+}
+
 fn json_array_len(value: &serde_json::Value, key: &str) -> u64 {
     value
         .get(key)
@@ -1178,6 +1296,10 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.pending_approvals().await {
         Ok(value) => snapshot.ingest_pending_approvals(&value),
         Err(err) => snapshot.degrade(format!("approval Gateway API unavailable: {err}")),
+    }
+    match projection.mission_projection().await {
+        Ok(value) => snapshot.ingest_mission_projection(&value),
+        Err(err) => snapshot.degrade(format!("mission control projection unavailable: {err}")),
     }
     match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
@@ -1552,6 +1674,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_extracts_mission_control_summary() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_mission_projection(&serde_json::json!({
+            "envelope": {"service": "mission"},
+            "mission": {
+                "kind": "mission.runtime",
+                "active_session_id": "session-a",
+                "sessions": [
+                    {
+                        "session_id": "session-a",
+                        "title": "Primary task",
+                        "status": "active",
+                        "active_team_ids": ["team-a"],
+                        "active_agent_ids": ["agent-a", "agent-b"]
+                    },
+                    {
+                        "session_id": "session-b",
+                        "title": "Background audit",
+                        "status": "background",
+                        "active_team_ids": [],
+                        "active_agent_ids": []
+                    }
+                ],
+                "events": [{"sequence": 1}, {"sequence": 2}],
+                "approval_projection": {"pending_count": 3},
+                "relation_projection": {"relation_count": 4}
+            }
+        }));
+
+        let mission = snapshot
+            .mission_control
+            .as_ref()
+            .expect("mission control summary");
+        assert_eq!(mission.active_session_id.as_deref(), Some("session-a"));
+        assert_eq!(mission.session_count, 2);
+        assert_eq!(mission.active_count, 1);
+        assert_eq!(mission.background_count, 1);
+        assert_eq!(mission.team_count, 1);
+        assert_eq!(mission.agent_count, 2);
+        assert_eq!(mission.pending_approvals, 3);
+        assert_eq!(mission.relation_count, 4);
+        assert_eq!(mission.event_count, 2);
+    }
+
+    #[test]
     fn snapshot_round_trips_cowd_structured_through_app() {
         let mut app = App::new("claude-sonnet-4-6", "session-cowd-structured");
         let snapshot = RuntimeControlSnapshot {
@@ -1590,6 +1757,26 @@ mod tests {
                 promotion_count: 1,
                 boundary_count: 4,
             }),
+            mission_control: Some(MissionControlSummary {
+                active_session_id: Some("session-cowd-structured".to_string()),
+                session_count: 1,
+                active_count: 1,
+                background_count: 0,
+                paused_count: 0,
+                closed_count: 0,
+                team_count: 1,
+                agent_count: 2,
+                pending_approvals: 0,
+                relation_count: 0,
+                event_count: 1,
+                sessions: vec![MissionSessionSummary {
+                    session_id: "session-cowd-structured".to_string(),
+                    title: "structured task".to_string(),
+                    status: "active".to_string(),
+                    team_count: 1,
+                    agent_count: 2,
+                }],
+            }),
             ..RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot())
         };
 
@@ -1616,12 +1803,19 @@ mod tests {
             app.gateway_fact_flow.as_ref().map(|flow| flow.stage_count),
             Some(5)
         );
+        assert_eq!(
+            app.gateway_mission_control
+                .as_ref()
+                .map(|mission| mission.agent_count),
+            Some(2)
+        );
 
         let restored = RuntimeControlSnapshot::from_app(&app);
         assert_eq!(restored.cowd_kernel, snapshot.cowd_kernel);
         assert_eq!(restored.structured_data, snapshot.structured_data);
         assert_eq!(restored.reality_core, snapshot.reality_core);
         assert_eq!(restored.fact_flow, snapshot.fact_flow);
+        assert_eq!(restored.mission_control, snapshot.mission_control);
     }
 
     #[test]

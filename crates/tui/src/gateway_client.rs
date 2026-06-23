@@ -429,6 +429,18 @@ impl GatewayApiClient {
         self.get_json("/api/approval/pending").await
     }
 
+    pub async fn mission_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/mission/projection").await
+    }
+
+    pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/mission/approvals").await
+    }
+
+    pub async fn mission_relations(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/mission/relations").await
+    }
+
     pub async fn respond_approval(
         &self,
         id: &str,
@@ -1091,6 +1103,9 @@ mod tests {
             "cancel_task",
             "complete_task",
             "pending_approvals",
+            "mission_projection",
+            "mission_approvals",
+            "mission_relations",
             "memory_status",
             "reality_status",
             "reality_flow",
@@ -1142,7 +1157,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 64);
+        assert_eq!(migrated.len(), 67);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));

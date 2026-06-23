@@ -23,8 +23,8 @@ use crate::{
     app::App,
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-        CowdKernelSummary, FactFlowSummary, RealityCoreSummary, RuntimeActionReceiptSummary,
-        StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
+        CowdKernelSummary, FactFlowSummary, MissionControlSummary, RealityCoreSummary,
+        RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
     },
 };
 
@@ -65,6 +65,8 @@ pub struct GatewayPanel {
     pub reality_core: Option<RealityCoreSummary>,
     /// Fact Flow trace summary.
     pub fact_flow: Option<FactFlowSummary>,
+    /// Mission Runtime global control summary.
+    pub mission_control: Option<MissionControlSummary>,
     /// Surface registry summaries managed by Gateway SurfaceHost.
     pub surfaces: Vec<SurfaceSummary>,
     /// Surface host health summary.
@@ -106,6 +108,7 @@ impl GatewayPanel {
             structured_data: None,
             reality_core: None,
             fact_flow: None,
+            mission_control: None,
             surfaces: Vec::new(),
             surface_health: None,
             connector_accounts: Vec::new(),
@@ -143,6 +146,7 @@ impl GatewayPanel {
         self.structured_data = app.gateway_structured_data.clone();
         self.reality_core = app.gateway_reality_core.clone();
         self.fact_flow = app.gateway_fact_flow.clone();
+        self.mission_control = app.gateway_mission_control.clone();
         self.connector_degraded_reasons = app.gateway_connector_degraded_reasons.clone();
         self.degraded_reasons = app.gateway_degraded_reasons.clone();
         if app.server_running {
@@ -504,6 +508,70 @@ impl Component for GatewayPanel {
                         Span::styled(
                             format!("{} · {}", session_id, flow.source),
                             Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+
+            if let Some(mission) = self.mission_control.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Mission Control ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Sessions: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} total, {} active, {} bg, {} paused",
+                            mission.session_count,
+                            mission.active_count,
+                            mission.background_count,
+                            mission.paused_count
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Teams/Agents: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} / {}", mission.team_count, mission.agent_count),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        "  Approvals/Relations: ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{} / {}", mission.pending_approvals, mission.relation_count),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+                if let Some(active) = mission.active_session_id.as_ref() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(active.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+                for session in mission.sessions.iter().take(3) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:10}", session.status),
+                            Style::default().fg(match session.status.as_str() {
+                                "active" => Color::Green,
+                                "paused" => Color::Yellow,
+                                "closed" => Color::DarkGray,
+                                _ => Color::Cyan,
+                            }),
+                        ),
+                        Span::styled(
+                            format!(
+                                "{} · teams {} agents {}",
+                                compact_text(&session.title, 28),
+                                session.team_count,
+                                session.agent_count
+                            ),
+                            Style::default().fg(Color::White),
                         ),
                     ]));
                 }
@@ -1054,6 +1122,19 @@ impl Component for GatewayPanel {
     }
 }
 
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let text = value.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut output = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    output.push_str("...");
+    output
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1468,6 +1549,57 @@ mod tests {
         assert!(
             !joined.contains("channel.feishu"),
             "Gateway panel must not hard-code platform channel capabilities, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_mission_control_state() {
+        use crate::runtime_control_store::{MissionControlSummary, MissionSessionSummary};
+        use crate::skin::SkinConfig;
+        use crate::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.mission_control = Some(MissionControlSummary {
+            active_session_id: Some("mission-a".to_string()),
+            session_count: 2,
+            active_count: 1,
+            background_count: 1,
+            paused_count: 0,
+            closed_count: 0,
+            team_count: 1,
+            agent_count: 2,
+            pending_approvals: 3,
+            relation_count: 4,
+            event_count: 5,
+            sessions: vec![MissionSessionSummary {
+                session_id: "mission-a".to_string(),
+                title: "Primary mission control task".to_string(),
+                status: "active".to_string(),
+                team_count: 1,
+                agent_count: 2,
+            }],
+        });
+
+        let mut terminal = MockTerminal::new(96, 32);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 96, 32));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Mission Control"),
+            "Should show mission section, got: {joined}"
+        );
+        assert!(
+            joined.contains("2 total, 1 active, 1 bg"),
+            "Should show session counts, got: {joined}"
+        );
+        assert!(
+            joined.contains("1 / 2") && joined.contains("3 / 4"),
+            "Should show team/agent and approval/relation counts, got: {joined}"
         );
     }
 
