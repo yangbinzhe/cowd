@@ -122,7 +122,7 @@ pub use agent::{
 };
 pub use agent_backend::{
     AgentExecutionBackendKind, AgentExecutionCommand, AgentExecutionCommandKind,
-    AgentExecutionCommandReceipt, AgentExecutionEventEnvelope,
+    AgentExecutionCommandReceipt, AgentExecutionEventEnvelope, AgentProcessJsonlSpec,
 };
 pub use agent_collaboration::{
     AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOps, CollaborationOrchestrator,

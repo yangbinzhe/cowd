@@ -23,7 +23,7 @@ impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.369 Mission Runtime service boundary",
+            owner: "0.9.370 Mission Runtime service boundary",
         }
     }
 

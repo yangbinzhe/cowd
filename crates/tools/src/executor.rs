@@ -3360,6 +3360,7 @@ where
 fn build_spawn_agent_request(input: AgentInput) -> Result<runtime::SpawnAgentRequest, String> {
     let normalized_subagent_type = runtime::normalize_subagent_type(input.subagent_type.as_deref());
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let (backend, process_jsonl) = resolve_agent_execution_backend()?;
     Ok(runtime::SpawnAgentRequest {
         description: input.description,
         prompt: input.prompt,
@@ -3372,8 +3373,46 @@ fn build_spawn_agent_request(input: AgentInput) -> Result<runtime::SpawnAgentReq
         permission_policy: agent_permission_policy(),
         max_iterations: runtime::DEFAULT_AGENT_MAX_ITERATIONS,
         store_dir: None,
-        backend: runtime::AgentExecutionBackendKind::InProcess,
+        backend,
+        process_jsonl,
     })
+}
+
+fn resolve_agent_execution_backend() -> Result<
+    (
+        runtime::AgentExecutionBackendKind,
+        Option<runtime::AgentProcessJsonlSpec>,
+    ),
+    String,
+> {
+    let backend = std::env::var("COWD_AGENT_EXECUTION_BACKEND")
+        .unwrap_or_else(|_| "in-process".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "" | "in-process" | "inprocess" => Ok((runtime::AgentExecutionBackendKind::InProcess, None)),
+        "process-jsonl" | "process_jsonl" => {
+            let command = std::env::var("COWD_AGENT_PROCESS_JSONL_COMMAND")
+                .map_err(|_| "COWD_AGENT_PROCESS_JSONL_COMMAND is required for process-jsonl agent backend".to_string())?;
+            let args = match std::env::var("COWD_AGENT_PROCESS_JSONL_ARGS") {
+                Ok(raw) if !raw.trim().is_empty() => serde_json::from_str::<Vec<String>>(&raw)
+                    .map_err(|error| format!("COWD_AGENT_PROCESS_JSONL_ARGS must be a JSON string array: {error}"))?,
+                _ => Vec::new(),
+            };
+            Ok((
+                runtime::AgentExecutionBackendKind::ProcessJsonl,
+                Some(runtime::AgentProcessJsonlSpec {
+                    command,
+                    args,
+                    cwd: None,
+                    env: std::collections::BTreeMap::new(),
+                }),
+            ))
+        }
+        other => Err(format!(
+            "unsupported COWD_AGENT_EXECUTION_BACKEND `{other}`; expected in-process or process-jsonl"
+        )),
+    }
 }
 
 pub(crate) fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -4735,7 +4774,8 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
-        execute_tool, run_task_packet, AgentInput, AgentJob, SubagentToolExecutor,
+        execute_tool, resolve_agent_execution_backend, run_task_packet, AgentInput, AgentJob,
+        SubagentToolExecutor,
     };
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
     use runtime::{
@@ -4759,6 +4799,16 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+
         fn set_path(key: &'static str, value: &Path) -> Self {
             let original = std::env::var(key).ok();
             std::env::set_var(key, value);
@@ -6389,6 +6439,10 @@ mod tests {
             .clone()
             .expect("spawn job should be captured");
         assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
+        assert_eq!(
+            captured_job.manifest.backend,
+            runtime::AgentExecutionBackendKind::InProcess
+        );
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
@@ -6417,6 +6471,34 @@ mod tests {
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_backend_can_be_selected_as_process_jsonl_without_tools_owning_lifecycle() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _backend_guard =
+            EnvVarGuard::set("COWD_AGENT_EXECUTION_BACKEND", Some("process-jsonl"));
+        let _command_guard =
+            EnvVarGuard::set("COWD_AGENT_PROCESS_JSONL_COMMAND", Some("cowd-agent"));
+        let _args_guard = EnvVarGuard::set(
+            "COWD_AGENT_PROCESS_JSONL_ARGS",
+            Some("[\"--stdio-jsonl\",\"--profile\",\"test\"]"),
+        );
+
+        let (backend, spec) = resolve_agent_execution_backend().expect("backend");
+        let spec = spec.expect("process spec");
+        assert_eq!(backend, runtime::AgentExecutionBackendKind::ProcessJsonl);
+        assert_eq!(spec.command, "cowd-agent");
+        assert_eq!(
+            spec.args,
+            vec![
+                "--stdio-jsonl".to_string(),
+                "--profile".to_string(),
+                "test".to_string()
+            ]
+        );
     }
 
     #[test]
