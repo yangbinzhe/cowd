@@ -45,6 +45,7 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod mission_runtime;
 pub mod permission_enforcer;
 pub mod permissions;
 pub mod plugin_lifecycle;
@@ -250,6 +251,10 @@ pub use mcp_stdio::{
     McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
+};
+pub use mission_runtime::{
+    global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection, MissionRuntime,
+    MissionSessionSnapshot, MissionSessionStatus, StartMissionSessionRequest,
 };
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
