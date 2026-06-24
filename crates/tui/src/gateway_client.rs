@@ -441,6 +441,17 @@ impl GatewayApiClient {
             .await
     }
 
+    pub async fn mission_session_inbox(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/mission/sessions/{}/inbox",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
     pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/mission/approvals").await
     }
@@ -505,6 +516,55 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/mission/route", body).await
+    }
+
+    pub async fn consume_mission_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        mode: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/mission/sessions/{}/inbox/{}/consume",
+                url_encode(session_id),
+                url_encode(command_id)
+            ),
+            serde_json::json!({ "mode": mode }),
+        )
+        .await
+    }
+
+    pub async fn cancel_mission_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/mission/sessions/{}/inbox/{}/cancel",
+                url_encode(session_id),
+                url_encode(command_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn retry_mission_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/mission/sessions/{}/inbox/{}/retry",
+                url_encode(session_id),
+                url_encode(command_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn runtime_agent_input(
@@ -1207,6 +1267,7 @@ mod tests {
             "pending_approvals",
             "mission_projection",
             "mission_session_detail",
+            "mission_session_inbox",
             "mission_approvals",
             "mission_relations",
             "submit_mission_approval",
@@ -1215,6 +1276,9 @@ mod tests {
             "add_mission_relation",
             "upsert_mission_proxy",
             "route_mission_command",
+            "consume_mission_session_command",
+            "cancel_mission_session_command",
+            "retry_mission_session_command",
             "runtime_agent_input",
             "runtime_agent_interrupt",
             "runtime_agent_shutdown",
@@ -1269,7 +1333,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 77);
+        assert_eq!(migrated.len(), 81);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
