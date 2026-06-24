@@ -86,6 +86,7 @@ pub mod provider_registry;
 pub mod provider_runtime_client;
 pub mod quality_gate;
 pub mod release_gate;
+pub mod runtime_event_store;
 pub mod session_lifecycle;
 pub mod session_relation_graph;
 pub mod skill_activation;
@@ -304,6 +305,10 @@ pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
+};
+pub use runtime_event_store::{
+    global_runtime_event_store, record_runtime_event, DurableRuntimeEvent, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
 };
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,

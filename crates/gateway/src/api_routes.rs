@@ -1704,6 +1704,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_events_api_exposes_durable_mission_events() {
+        let _guard = mission_route_lock().lock().await;
+        let app = api_router(test_state());
+        let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "runtime event session",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let events = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/events?stream_id=session:{session_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        let events_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(events_json["kind"], "runtime.events");
+        assert!(events_json["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .any(|event| event["kind"].as_str() == Some("mission.session.started")));
+    }
+
+    #[tokio::test]
     async fn cowd_capabilities_route_exposes_core_registry() {
         let app = api_router(test_state());
         let response = app

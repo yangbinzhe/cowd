@@ -36,6 +36,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(reload_runtime_providers),
         )
         .route("/api/runtime/status", get(get_runtime_status))
+        .route("/api/runtime/events", get(get_runtime_events))
         .route("/api/runtime/snapshot", get(get_runtime_snapshot))
         .route("/api/runtime/source-audit", get(get_runtime_source_audit))
         .route(
@@ -110,6 +111,63 @@ struct RuntimeTurnSubmitRequest {
     session_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeEventsParams {
+    #[serde(default)]
+    stream_id: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn get_runtime_events(
+    Query(params): Query<RuntimeEventsParams>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let limit = params.limit.unwrap_or(100).min(500);
+    let store = runtime::global_runtime_event_store();
+    let events = if let Some(stream_id) = params.stream_id {
+        store
+            .list_stream(&stream_id)
+            .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    } else if let Some(scope) = params.scope {
+        store
+            .list_scope(parse_runtime_event_scope(&scope), limit)
+            .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    } else {
+        store
+            .all_events(limit)
+            .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    };
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.events",
+        "store_path": store.path(),
+        "count": events.len(),
+        "events": events,
+    })))
+}
+
+fn runtime_event_error(status: StatusCode, error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (status, Json(ErrorResponse { error }))
+}
+
+fn parse_runtime_event_scope(scope: &str) -> runtime::RuntimeEventScope {
+    match scope {
+        "session" => runtime::RuntimeEventScope::Session,
+        "session_command" => runtime::RuntimeEventScope::SessionCommand,
+        "team" => runtime::RuntimeEventScope::Team,
+        "agent" => runtime::RuntimeEventScope::Agent,
+        "approval" => runtime::RuntimeEventScope::Approval,
+        "relation" => runtime::RuntimeEventScope::Relation,
+        "steward" => runtime::RuntimeEventScope::Steward,
+        "task" => runtime::RuntimeEventScope::Task,
+        "worker" => runtime::RuntimeEventScope::Worker,
+        "schedule" => runtime::RuntimeEventScope::Schedule,
+        "tool" => runtime::RuntimeEventScope::Tool,
+        _ => runtime::RuntimeEventScope::Mission,
+    }
 }
 
 async fn submit_runtime_turn(

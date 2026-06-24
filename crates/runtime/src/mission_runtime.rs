@@ -10,7 +10,10 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{cowd_dirs, global_session_relation_graph};
+use crate::{
+    cowd_dirs, global_session_relation_graph, record_runtime_event, RuntimeEventInput,
+    RuntimeEventScope,
+};
 use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,12 +754,33 @@ impl MissionRuntimeState {
         message: impl Into<String>,
         session_id: Option<String>,
     ) {
+        let event_type = event_type.into();
+        let message = message.into();
         self.events.push(MissionEvent {
             sequence: self.next_sequence,
-            event_type: event_type.into(),
-            message: message.into(),
-            session_id,
+            event_type: event_type.clone(),
+            message: message.clone(),
+            session_id: session_id.clone(),
             emitted_at_ms: now_ms(),
+        });
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: session_id
+                .as_ref()
+                .map(|id| format!("session:{id}"))
+                .unwrap_or_else(|| "mission:global".to_string()),
+            scope: if session_id.is_some() {
+                RuntimeEventScope::Session
+            } else {
+                RuntimeEventScope::Mission
+            },
+            kind: event_type,
+            status: None,
+            actor: Some("mission_runtime".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "message": message,
+                "session_id": session_id,
+            }),
         });
         self.next_sequence += 1;
     }

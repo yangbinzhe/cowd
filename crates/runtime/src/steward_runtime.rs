@@ -12,8 +12,9 @@ use ai_kernel::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
-    StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
+    record_runtime_event, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
+    AutonomyProfileId, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, StewardActionRequest,
+    StewardActionStatus, StewardAgent, StewardDecisionRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +399,8 @@ impl StewardRuntimeService {
         summary: impl Into<String>,
         related_approval_id: Option<String>,
     ) {
+        let kind = kind.into();
+        let summary = summary.into();
         self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -405,11 +408,31 @@ impl StewardRuntimeService {
                 event_id: format!("steward-event-{}", uuid::Uuid::new_v4()),
                 steward_id: session.steward_id.clone(),
                 mission_id: session.mission_id.clone(),
-                kind: kind.into(),
-                summary: summary.into(),
-                related_approval_id,
+                kind: kind.clone(),
+                summary: summary.clone(),
+                related_approval_id: related_approval_id.clone(),
                 created_at_ms: now_ms(),
             });
+        let refs = related_approval_id
+            .into_iter()
+            .map(|id| RuntimeEventRef {
+                kind: "approval".to_string(),
+                id,
+            })
+            .collect();
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("steward:{}", session.steward_id),
+            scope: RuntimeEventScope::Steward,
+            kind,
+            status: Some(session.status.as_str().to_string()),
+            actor: Some("steward_runtime".to_string()),
+            refs,
+            payload: serde_json::json!({
+                "summary": summary,
+                "mission_id": session.mission_id,
+                "root_session_id": session.root_session_id,
+            }),
+        });
     }
 }
 

@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use ai_kernel::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
+use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalSourceKind {
@@ -124,6 +126,20 @@ impl GlobalApprovalQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(approval_id, approval.clone());
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("approval:{}", approval.approval_id),
+            scope: RuntimeEventScope::Approval,
+            kind: "approval.submitted".to_string(),
+            status: Some(approval.status.as_str().to_string()),
+            actor: Some("global_approval_queue".to_string()),
+            refs: approval_source_refs(&approval.source),
+            payload: serde_json::json!({
+                "action": approval.action,
+                "summary": approval.summary,
+                "risk": approval.risk,
+                "timeout_policy": approval.timeout_policy,
+            }),
+        });
         Ok(approval)
     }
 
@@ -155,7 +171,7 @@ impl GlobalApprovalQueue {
             GlobalApprovalStatus::Denied
         };
         request.resolved_at_ms = Some(now_ms());
-        Ok(GlobalApprovalDecisionReceipt {
+        let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
             status: request.status,
             route_back: request.source.clone(),
@@ -164,7 +180,21 @@ impl GlobalApprovalQueue {
             } else {
                 format!("denied by {}: {}", decision.decided_by, decision.reason)
             },
-        })
+        };
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("approval:{}", request.approval_id),
+            scope: RuntimeEventScope::Approval,
+            kind: "approval.decided".to_string(),
+            status: Some(request.status.as_str().to_string()),
+            actor: Some(decision.decided_by),
+            refs: approval_source_refs(&request.source),
+            payload: serde_json::json!({
+                "approved": decision.approved,
+                "reason": decision.reason,
+                "message": receipt.message,
+            }),
+        });
+        Ok(receipt)
     }
 
     pub fn timeout(&self, approval_id: &str) -> Result<GlobalApprovalDecisionReceipt, String> {
@@ -192,7 +222,7 @@ impl GlobalApprovalQueue {
         if request.status == GlobalApprovalStatus::TimedOut {
             request.resolved_at_ms = Some(now_ms());
         }
-        Ok(GlobalApprovalDecisionReceipt {
+        let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
             status: request.status,
             route_back: request.source.clone(),
@@ -203,7 +233,20 @@ impl GlobalApprovalQueue {
                     "approval timed out; source should continue alternative path".to_string()
                 }
             },
-        })
+        };
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("approval:{}", request.approval_id),
+            scope: RuntimeEventScope::Approval,
+            kind: "approval.timed_out".to_string(),
+            status: Some(request.status.as_str().to_string()),
+            actor: Some("global_approval_queue".to_string()),
+            refs: approval_source_refs(&request.source),
+            payload: serde_json::json!({
+                "timeout_policy": request.timeout_policy,
+                "message": receipt.message,
+            }),
+        });
+        Ok(receipt)
     }
 
     #[must_use]
@@ -263,6 +306,42 @@ fn status_label(status: GlobalApprovalStatus) -> &'static str {
         GlobalApprovalStatus::Denied => "denied",
         GlobalApprovalStatus::TimedOut => "timed_out",
     }
+}
+
+impl GlobalApprovalStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        status_label(self)
+    }
+}
+
+fn approval_source_refs(source: &ApprovalSource) -> Vec<RuntimeEventRef> {
+    let mut refs = Vec::new();
+    if let Some(id) = &source.session_id {
+        refs.push(RuntimeEventRef {
+            kind: "session".to_string(),
+            id: id.clone(),
+        });
+    }
+    if let Some(id) = &source.agent_id {
+        refs.push(RuntimeEventRef {
+            kind: "agent".to_string(),
+            id: id.clone(),
+        });
+    }
+    if let Some(id) = &source.team_id {
+        refs.push(RuntimeEventRef {
+            kind: "team".to_string(),
+            id: id.clone(),
+        });
+    }
+    if let Some(id) = &source.mission_id {
+        refs.push(RuntimeEventRef {
+            kind: "mission".to_string(),
+            id: id.clone(),
+        });
+    }
+    refs
 }
 
 fn now_ms() -> u64 {
