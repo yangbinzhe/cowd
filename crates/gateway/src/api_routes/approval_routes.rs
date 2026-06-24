@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use runtime::{permission_enforcer::ApprovalPersistence, ApprovalConfig};
+use runtime::ApprovalConfig;
 use serde::Deserialize;
 
 use super::{api_error, AppState, ErrorResponse};
@@ -86,15 +86,11 @@ async fn approval_respond_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ApprovalRespondRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let persistence = match body.persistence.as_deref().unwrap_or("once") {
-        "session" => ApprovalPersistence::Session,
-        "always" => ApprovalPersistence::Always,
-        _ => ApprovalPersistence::Once,
-    };
+    let _persistence = body.persistence.as_deref().unwrap_or("once");
     state
         .services
         .approval
-        .respond(&body.id, body.approved, persistence, body.reason)
+        .respond(&body.id, body.approved, body.reason)
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))

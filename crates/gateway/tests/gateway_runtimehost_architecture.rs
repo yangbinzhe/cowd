@@ -141,6 +141,26 @@ fn socket_business_commands_are_removed_after_tui_gateway_migration() {
 }
 
 #[test]
+fn approval_api_uses_global_queue_for_decisions() {
+    let full_source = read_repo("crates/gateway/src/services/approval_service.rs");
+    let source = production_part(&full_source);
+    assert!(
+        source.contains("runtime::global_approval_queue().pending()"),
+        "approval pending API must read the unified GlobalApprovalQueue"
+    );
+    assert!(
+        source.contains("runtime::global_approval_queue().decide("),
+        "approval respond API must decide through the unified GlobalApprovalQueue"
+    );
+    for forbidden in ["get_pending_requests", "resolve_approval"] {
+        assert!(
+            !source.contains(forbidden),
+            "ApprovalService must not use SmartApprovalGate {forbidden} as a production decision path"
+        );
+    }
+}
+
+#[test]
 fn compat_harness_is_not_a_workspace_dependency() {
     let root = repo_root();
     assert!(

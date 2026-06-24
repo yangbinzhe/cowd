@@ -2,11 +2,7 @@ use std::sync::Arc;
 
 use ai_kernel::policy::RiskGateReceipt;
 use approval::{ApprovalRepository, FileApprovalRepository};
-use runtime::{
-    approval_gate::SmartApprovalGate,
-    permission_enforcer::{ApprovalPersistence, ApprovalVerdict},
-    ApprovalConfig,
-};
+use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
 
 use super::ServiceEnvelope;
 
@@ -58,11 +54,13 @@ impl ApprovalService {
     }
 
     pub(crate) async fn pending(&self) -> serde_json::Value {
-        let pending = match &self.gate {
-            Some(gate) => gate.get_pending_requests().await,
-            None => Vec::new(),
-        };
-        serde_json::json!(pending)
+        let projection = runtime::global_approval_queue().projection();
+        let pending = runtime::global_approval_queue().pending();
+        serde_json::json!({
+            "kind": "gateway.unified_approval_pending",
+            "pending": pending,
+            "approvals": projection,
+        })
     }
 
     pub(crate) async fn config(&self) -> ApprovalConfig {
@@ -104,33 +102,26 @@ impl ApprovalService {
         &self,
         id: &str,
         approved: bool,
-        persistence: ApprovalPersistence,
         reason: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let gate = self
-            .gate
-            .as_ref()
-            .ok_or_else(|| "approval gate not configured".to_string())?;
-        let deny_reason = reason
-            .clone()
-            .unwrap_or_else(|| "denied by user".to_string());
-        let verdict = if approved {
-            ApprovalVerdict::Approved
-        } else {
-            ApprovalVerdict::Denied {
-                reason: deny_reason.clone(),
-            }
-        };
-        let request = gate
-            .resolve_approval(id, verdict, persistence)
-            .await
-            .ok_or_else(|| "approval request not found".to_string())?;
+        let receipt = runtime::global_approval_queue().decide(runtime::GlobalApprovalDecision {
+            approval_id: id.to_string(),
+            approved,
+            decided_by: "human".to_string(),
+            reason: reason.unwrap_or_else(|| {
+                if approved {
+                    "approved via gateway approval API".to_string()
+                } else {
+                    "denied via gateway approval API".to_string()
+                }
+            }),
+        })?;
         Ok(serde_json::json!({
             "id": id,
             "resolved": true,
             "approved": approved,
-            "tool": "bash",
-            "action": request.command,
+            "receipt": receipt,
+            "approvals": runtime::global_approval_queue().projection(),
         }))
     }
 

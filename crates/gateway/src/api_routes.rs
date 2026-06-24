@@ -1431,17 +1431,45 @@ mod tests {
                 >= 1
         );
 
+        let approval_pending = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approval/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approval_pending.status(), StatusCode::OK);
+        let approval_pending_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(approval_pending.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            approval_pending_json["kind"],
+            "gateway.unified_approval_pending"
+        );
+        assert!(approval_pending_json["pending"]
+            .as_array()
+            .expect("pending")
+            .iter()
+            .any(|approval| approval["approval_id"].as_str() == Some(approval_id.as_str())));
+
         let approval_decision = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/mission/approvals/{approval_id}/decision"))
+                    .uri("/api/approval/respond")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "id": approval_id,
                             "approved": true,
-                            "decided_by": "route-test",
+                            "persistence": "once",
                             "reason": "verified"
                         })
                         .to_string(),
