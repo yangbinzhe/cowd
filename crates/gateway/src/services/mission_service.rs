@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+
 use ai_kernel::strategy::{decide_strategy, StrategyInput};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{service_envelope, MissionService, ServiceEnvelope};
 
@@ -25,6 +27,17 @@ pub(crate) struct StartMissionTeamRuntimeHttpRequest {
     pub(crate) objective: String,
     #[serde(default)]
     pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) execution_mode: MissionTeamExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissionTeamExecutionMode {
+    #[default]
+    ProviderInProcess,
+    ProcessJsonl,
+    RegisterOnly,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,11 +88,29 @@ pub(crate) struct RouteMissionCommandHttpRequest {
     pub(crate) command: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ConsumeMissionSessionCommandHttpRequest {
+    #[serde(default)]
+    pub(crate) actor_id: Option<String>,
+    #[serde(default)]
+    pub(crate) mode: MissionSessionCommandConsumeMode,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissionSessionCommandConsumeMode {
+    #[default]
+    MarkClaimedOnly,
+    StartTurn,
+}
+
 impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.371 Mission Runtime service boundary",
+            owner: "0.9.372 Mission Runtime service boundary",
         }
     }
 
@@ -233,7 +264,11 @@ impl MissionService {
                 collaboration_decision: decision,
             },
             |agent_request| {
-                prepare_lifecycle_agent_for_team(&agent_request, request.model.as_deref())
+                spawn_lifecycle_agent_for_team(
+                    &agent_request,
+                    request.model.as_deref(),
+                    request.execution_mode,
+                )
             },
         )?;
         runtime::global_mission_runtime().attach_team(session_id, team.team_id.clone())?;
@@ -360,6 +395,99 @@ impl MissionService {
         }))
     }
 
+    pub(crate) fn session_inbox(&self, session_id: &str) -> Result<serde_json::Value, String> {
+        if runtime::global_mission_runtime()
+            .get_session(session_id)
+            .is_none()
+        {
+            return Err(format!("mission session not found: {session_id}"));
+        }
+        let commands = runtime::global_mission_runtime().list_session_commands(session_id);
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "session_id": session_id,
+            "commands": commands,
+            "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
+    pub(crate) fn session_command_detail(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let command = runtime::global_mission_runtime()
+            .get_session_command(command_id)
+            .ok_or_else(|| format!("mission session command not found: {command_id}"))?;
+        if command.target_session_id != session_id {
+            return Err(format!(
+                "command {command_id} does not belong to session {session_id}"
+            ));
+        }
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "command": command,
+            "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
+    pub(crate) fn consume_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        request: ConsumeMissionSessionCommandHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        if request.mode == MissionSessionCommandConsumeMode::StartTurn {
+            return Err(
+                "start_turn command consumption must be handled by the async mission route"
+                    .to_string(),
+            );
+        }
+        let command =
+            runtime::global_mission_runtime().claim_session_command(session_id, command_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "mode": request.mode,
+            "actor_id": request.actor_id,
+            "reason": request.reason,
+            "command": command,
+            "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
+    pub(crate) fn cancel_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let command =
+            runtime::global_mission_runtime().cancel_session_command(session_id, command_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "command": command,
+            "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
+    pub(crate) fn retry_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let command =
+            runtime::global_mission_runtime().retry_session_command(session_id, command_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "command": command,
+            "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
     fn command_value(
         &self,
         receipt: runtime::MissionCommandReceipt,
@@ -380,7 +508,101 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn prepare_lifecycle_agent_for_team(
+fn spawn_lifecycle_agent_for_team(
+    request: &runtime::StartTeamRuntimeAgentRequest,
+    model: Option<&str>,
+    execution_mode: MissionTeamExecutionMode,
+) -> Result<runtime::AgentSnapshot, String> {
+    match execution_mode {
+        MissionTeamExecutionMode::ProviderInProcess => {
+            spawn_provider_lifecycle_agent_for_team(request, model)
+        }
+        MissionTeamExecutionMode::ProcessJsonl => spawn_process_jsonl_lifecycle_agent_for_team(
+            request,
+            model,
+            resolve_team_process_jsonl_spec()?,
+        ),
+        MissionTeamExecutionMode::RegisterOnly => register_lifecycle_agent_for_team(request, model),
+    }
+}
+
+fn spawn_provider_lifecycle_agent_for_team(
+    request: &runtime::StartTeamRuntimeAgentRequest,
+    model: Option<&str>,
+) -> Result<runtime::AgentSnapshot, String> {
+    runtime::spawn_provider_agent(
+        build_spawn_request_for_team(
+            request,
+            model,
+            runtime::AgentExecutionBackendKind::InProcess,
+            None,
+        )?,
+        runtime::StaticToolExecutor::new(),
+    )
+}
+
+fn spawn_process_jsonl_lifecycle_agent_for_team(
+    request: &runtime::StartTeamRuntimeAgentRequest,
+    model: Option<&str>,
+    spec: runtime::AgentProcessJsonlSpec,
+) -> Result<runtime::AgentSnapshot, String> {
+    runtime::spawn_provider_agent(
+        build_spawn_request_for_team(
+            request,
+            model,
+            runtime::AgentExecutionBackendKind::ProcessJsonl,
+            Some(spec),
+        )?,
+        runtime::StaticToolExecutor::new(),
+    )
+}
+
+fn build_spawn_request_for_team(
+    request: &runtime::StartTeamRuntimeAgentRequest,
+    model: Option<&str>,
+    backend: runtime::AgentExecutionBackendKind,
+    process_jsonl: Option<runtime::AgentProcessJsonlSpec>,
+) -> Result<runtime::SpawnAgentRequest, String> {
+    let subagent_type = runtime::normalize_subagent_type(Some(&request.role_id));
+    let prompt = team_role_prompt(request);
+    Ok(runtime::SpawnAgentRequest {
+        description: format!("{}: {}", request.role_id, request.responsibility),
+        prompt,
+        subagent_type: Some(subagent_type.clone()),
+        name: Some(format!("{}-{}", request.team_id, request.role_id)),
+        model: Some(runtime::resolve_agent_model(model)),
+        system_prompt: runtime::build_agent_system_prompt(&subagent_type)?,
+        allowed_tools: BTreeSet::new(),
+        tool_definitions: Vec::new(),
+        permission_policy: runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
+        max_iterations: runtime::DEFAULT_AGENT_MAX_ITERATIONS,
+        store_dir: None,
+        backend,
+        process_jsonl,
+    })
+}
+
+fn resolve_team_process_jsonl_spec() -> Result<runtime::AgentProcessJsonlSpec, String> {
+    let command = std::env::var("COWD_AGENT_PROCESS_JSONL_COMMAND").map_err(|_| {
+        "COWD_AGENT_PROCESS_JSONL_COMMAND is required for process-jsonl team execution".to_string()
+    })?;
+    let args = match std::env::var("COWD_AGENT_PROCESS_JSONL_ARGS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str::<Vec<String>>(&raw).map_err(|error| {
+                format!("COWD_AGENT_PROCESS_JSONL_ARGS must be a JSON string array: {error}")
+            })?
+        }
+        _ => Vec::new(),
+    };
+    Ok(runtime::AgentProcessJsonlSpec {
+        command,
+        args,
+        cwd: None,
+        env: Default::default(),
+    })
+}
+
+fn register_lifecycle_agent_for_team(
     request: &runtime::StartTeamRuntimeAgentRequest,
     model: Option<&str>,
 ) -> Result<runtime::AgentSnapshot, String> {
@@ -389,15 +611,7 @@ fn prepare_lifecycle_agent_for_team(
     std::fs::create_dir_all(&agent_dir).map_err(|error| error.to_string())?;
     let output_file = agent_dir.join(format!("{agent_id}.md"));
     let manifest_file = agent_dir.join(format!("{agent_id}.json"));
-    let prompt = format!(
-            "Mission session: {}\nTeam: {}\nObjective: {}\nRole: {}\nResponsibility: {}\nEvidence duties: {}\n",
-            request.session_id,
-            request.team_id,
-            request.objective,
-            request.role_id,
-            request.responsibility,
-            request.evidence_duties.join(", ")
-        );
+    let prompt = team_role_prompt(request);
     let created_at = current_time_ms().to_string();
     std::fs::write(
         &output_file,
@@ -432,19 +646,32 @@ fn prepare_lifecycle_agent_for_team(
     Ok(snapshot)
 }
 
+fn team_role_prompt(request: &runtime::StartTeamRuntimeAgentRequest) -> String {
+    format!(
+        "Mission session: {}\nTeam: {}\nObjective: {}\nRole: {}\nResponsibility: {}\nAllowed tools: {}\nEvidence duties: {}\n\nWork only on this delegated role. Produce a concise terminal report with evidence references, blockers, and changed artifacts if any.\n",
+        request.session_id,
+        request.team_id,
+        request.objective,
+        request.role_id,
+        request.responsibility,
+        request.allowed_tools.join(", "),
+        request.evidence_duties.join(", ")
+    )
+}
+
 fn route_mission_command_receipt(
     receipt: &runtime::SessionRouteReceipt,
     command: &str,
 ) -> Result<serde_json::Value, String> {
     if let Some(session_id) = &receipt.resolved_session_id {
-        let routed = runtime::global_mission_runtime().record_routed_session_command(
+        let command = runtime::global_mission_runtime().enqueue_session_command(
             &receipt.from_session_id,
             session_id,
             command.to_string(),
         )?;
         return Ok(serde_json::json!({
             "kind": "mission.session_command",
-            "command": routed,
+            "command": command,
         }));
     }
     if let Some(agent_id) = &receipt.resolved_agent_id {

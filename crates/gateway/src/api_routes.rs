@@ -466,9 +466,15 @@ mod tests {
 
     static TRACE_CAPTURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
         std::sync::OnceLock::new();
+    static MISSION_ROUTE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
 
     fn trace_capture_lock() -> &'static tokio::sync::Mutex<()> {
         TRACE_CAPTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    fn mission_route_lock() -> &'static tokio::sync::Mutex<()> {
+        MISSION_ROUTE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     impl CapturedTraceEvents {
@@ -1208,6 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn mission_routes_expose_runtime_projection_and_session_control() {
+        let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("mission-route-test-{}", uuid::Uuid::new_v4());
         let created = app
@@ -1234,10 +1241,11 @@ mod tests {
                 .unwrap();
         assert_eq!(created["ok"], true);
         assert_eq!(created["mission"]["kind"], "mission.runtime");
-        assert_eq!(
-            created["mission"]["active_session_id"].as_str(),
-            Some(session_id.as_str())
-        );
+        assert!(created["mission"]["sessions"]
+            .as_array()
+            .expect("mission sessions")
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
 
         let detail = app
             .clone()
@@ -1278,10 +1286,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(backgrounded["receipt"]["status"], "accepted");
-        assert_eq!(
-            backgrounded["mission"]["active_session_id"],
-            serde_json::Value::Null
-        );
+        assert!(backgrounded["mission"]["sessions"]
+            .as_array()
+            .expect("mission sessions")
+            .iter()
+            .any(
+                |session| session["session_id"].as_str() == Some(session_id.as_str())
+                    && session["status"].as_str() == Some("background")
+            ));
 
         let projection = app
             .oneshot(
@@ -1306,6 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn mission_routes_write_approvals_relations_proxies_and_routes() {
+        let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_a = format!("mission-route-a-{}", uuid::Uuid::new_v4());
         let session_b = format!("mission-route-b-{}", uuid::Uuid::new_v4());
@@ -1344,7 +1357,8 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "objective": "research architecture and review implementation"
+                            "objective": "research architecture and review implementation",
+                            "execution_mode": "register_only"
                         })
                         .to_string(),
                     ))

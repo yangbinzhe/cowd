@@ -95,7 +95,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/src/runtime_host/mod.rs");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
-        source.contains(".run_turn_with_timeout(") && !source.contains(".run_turn_async(")
+        source.contains("RuntimeService::new(") && !source.contains(".run_turn_async(")
     });
     check(
         "gateway.runtime_host_uses_runtime_service",

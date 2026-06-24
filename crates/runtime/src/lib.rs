@@ -262,8 +262,9 @@ pub use mcp_stdio::{
 };
 pub use mission_runtime::{
     global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection,
-    MissionRoutedCommand, MissionRuntime, MissionSessionSnapshot, MissionSessionStatus,
-    StartMissionSessionRequest,
+    MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
+    MissionSessionCommandStatus, MissionSessionCommandSummary, MissionSessionSnapshot,
+    MissionSessionStatus, StartMissionSessionRequest,
 };
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,

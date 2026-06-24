@@ -5,11 +5,12 @@
 //! projection that Mission Control surfaces can render.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::global_session_relation_graph;
+use crate::{cowd_dirs, global_session_relation_graph};
 use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +72,78 @@ pub struct MissionRoutedCommand {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionSessionCommandStatus {
+    Pending,
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl MissionSessionCommandStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionSessionCommandKind {
+    UserInstruction,
+    ReviewRequest,
+    FollowUp,
+    Summarize,
+    Delegate,
+    InspectEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionSessionCommand {
+    pub command_id: String,
+    pub route_id: String,
+    pub from_session_id: String,
+    pub target_session_id: String,
+    pub kind: MissionSessionCommandKind,
+    pub command: String,
+    pub payload: serde_json::Value,
+    pub status: MissionSessionCommandStatus,
+    pub attempt: u32,
+    pub created_at_ms: u64,
+    pub claimed_at_ms: Option<u64>,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub failed_at_ms: Option<u64>,
+    pub result_ref: Option<String>,
+    pub error: Option<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionSessionCommandSummary {
+    pub pending: usize,
+    pub claimed: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionProjection {
     pub kind: String,
@@ -78,6 +151,8 @@ pub struct MissionProjection {
     pub sessions: Vec<MissionSessionSnapshot>,
     pub events: Vec<MissionEvent>,
     pub routed_commands: Vec<MissionRoutedCommand>,
+    pub session_command_summary: MissionSessionCommandSummary,
+    pub session_commands: Vec<MissionSessionCommand>,
     pub team_projection: serde_json::Value,
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
@@ -90,12 +165,13 @@ pub struct StartMissionSessionRequest {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MissionRuntimeState {
     active_session_id: Option<String>,
     sessions: BTreeMap<String, MissionSessionSnapshot>,
     events: Vec<MissionEvent>,
     routed_commands: Vec<MissionRoutedCommand>,
+    session_commands: BTreeMap<String, MissionSessionCommand>,
     next_sequence: u64,
 }
 
@@ -106,20 +182,39 @@ impl Default for MissionRuntimeState {
             sessions: BTreeMap::new(),
             events: Vec::new(),
             routed_commands: Vec::new(),
+            session_commands: BTreeMap::new(),
             next_sequence: 0,
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MissionRuntime {
     state: Mutex<MissionRuntimeState>,
+    persistent: bool,
+}
+
+impl Default for MissionRuntime {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MissionRuntimeState::default()),
+            persistent: false,
+        }
+    }
 }
 
 impl MissionRuntime {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn persistent() -> Self {
+        Self {
+            state: Mutex::new(load_state().unwrap_or_default()),
+            persistent: true,
+        }
     }
 
     pub fn start_session(
@@ -162,6 +257,7 @@ impl MissionRuntime {
             "mission session started",
             Some(session_id),
         );
+        self.persist_if_enabled(&state)?;
         Ok(snapshot)
     }
 
@@ -290,7 +386,206 @@ impl MissionRuntime {
             format!("command routed to mission session {target_session_id}"),
             Some(target_session_id.to_string()),
         );
+        self.persist_if_enabled(&state)?;
         Ok(routed)
+    }
+
+    pub fn enqueue_session_command(
+        &self,
+        from_session_id: &str,
+        target_session_id: &str,
+        command: impl Into<String>,
+    ) -> Result<MissionSessionCommand, String> {
+        let command = command.into();
+        let routed = self.record_routed_session_command(
+            from_session_id,
+            target_session_id,
+            command.clone(),
+        )?;
+        let route_id = routed.route_id.clone();
+        let now = now_ms();
+        let session_command = MissionSessionCommand {
+            command_id: format!("mission-command-{}", uuid::Uuid::new_v4()),
+            route_id: route_id.clone(),
+            from_session_id: from_session_id.to_string(),
+            target_session_id: target_session_id.to_string(),
+            kind: MissionSessionCommandKind::UserInstruction,
+            command,
+            payload: serde_json::json!({
+                "route_id": route_id,
+                "from_session_id": from_session_id,
+                "target_session_id": target_session_id,
+            }),
+            status: MissionSessionCommandStatus::Pending,
+            attempt: 0,
+            created_at_ms: now,
+            claimed_at_ms: None,
+            started_at_ms: None,
+            completed_at_ms: None,
+            failed_at_ms: None,
+            result_ref: None,
+            error: None,
+            evidence_refs: vec![format!("mission.route:{}", routed.route_id)],
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .session_commands
+            .insert(session_command.command_id.clone(), session_command.clone());
+        state.push_event(
+            "mission.session.command_enqueued",
+            format!("command enqueued for mission session {target_session_id}"),
+            Some(target_session_id.to_string()),
+        );
+        self.persist_if_enabled(&state)?;
+        Ok(session_command)
+    }
+
+    #[must_use]
+    pub fn list_session_commands(&self, session_id: &str) -> Vec<MissionSessionCommand> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_commands
+            .values()
+            .filter(|command| command.target_session_id == session_id)
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get_session_command(&self, command_id: &str) -> Option<MissionSessionCommand> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_commands
+            .get(command_id)
+            .cloned()
+    }
+
+    pub fn claim_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<MissionSessionCommand, String> {
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status != MissionSessionCommandStatus::Pending {
+                return Err(format!(
+                    "command {} is not pending: {}",
+                    command.command_id,
+                    command.status.as_str()
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Claimed;
+            command.claimed_at_ms = Some(now_ms());
+            Ok("mission.session.command_claimed")
+        })
+    }
+
+    pub fn mark_session_command_running(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<MissionSessionCommand, String> {
+        self.update_session_command(session_id, command_id, |command| {
+            if !matches!(
+                command.status,
+                MissionSessionCommandStatus::Pending | MissionSessionCommandStatus::Claimed
+            ) {
+                return Err(format!(
+                    "command {} cannot run from {}",
+                    command.command_id,
+                    command.status.as_str()
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Running;
+            command.started_at_ms = Some(now_ms());
+            Ok("mission.session.command_running")
+        })
+    }
+
+    pub fn complete_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        result_ref: Option<String>,
+    ) -> Result<MissionSessionCommand, String> {
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status.is_terminal() {
+                return Err(format!(
+                    "command {} is already terminal",
+                    command.command_id
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Completed;
+            command.completed_at_ms = Some(now_ms());
+            command.result_ref = result_ref;
+            Ok("mission.session.command_completed")
+        })
+    }
+
+    pub fn fail_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        error: impl Into<String>,
+    ) -> Result<MissionSessionCommand, String> {
+        let error = error.into();
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status.is_terminal() {
+                return Err(format!(
+                    "command {} is already terminal",
+                    command.command_id
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Failed;
+            command.failed_at_ms = Some(now_ms());
+            command.error = Some(error);
+            Ok("mission.session.command_failed")
+        })
+    }
+
+    pub fn cancel_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<MissionSessionCommand, String> {
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status.is_terminal() {
+                return Err(format!(
+                    "command {} is already terminal",
+                    command.command_id
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Cancelled;
+            command.completed_at_ms = Some(now_ms());
+            Ok("mission.session.command_cancelled")
+        })
+    }
+
+    pub fn retry_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<MissionSessionCommand, String> {
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status != MissionSessionCommandStatus::Failed {
+                return Err(format!(
+                    "command {} can retry only from failed status",
+                    command.command_id
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Pending;
+            command.attempt = command.attempt.saturating_add(1);
+            command.claimed_at_ms = None;
+            command.started_at_ms = None;
+            command.completed_at_ms = None;
+            command.failed_at_ms = None;
+            command.error = None;
+            Ok("mission.session.command_retried")
+        })
     }
 
     #[must_use]
@@ -334,6 +629,8 @@ impl MissionRuntime {
             sessions: state.sessions.values().cloned().collect(),
             events: state.events.clone(),
             routed_commands: state.routed_commands.clone(),
+            session_command_summary: session_command_summary(&state.session_commands),
+            session_commands: state.session_commands.values().cloned().collect(),
             team_projection: global_team_runtime_service().projection(),
             agent_projection: global_agent_lifecycle_service().projection(),
             approval_projection: global_approval_queue().projection(),
@@ -393,12 +690,57 @@ impl MissionRuntime {
         }
         let message = update(&mut state, &mut session);
         state.sessions.insert(session_id.to_string(), session);
+        self.persist_if_enabled(&state)?;
         Ok(MissionCommandReceipt {
             command: command.to_string(),
             status: "accepted".to_string(),
             message,
             session_id: Some(session_id.to_string()),
         })
+    }
+
+    fn update_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        update: impl FnOnce(&mut MissionSessionCommand) -> Result<&'static str, String>,
+    ) -> Result<MissionSessionCommand, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.sessions.contains_key(session_id) {
+            return Err(format!("mission session not found: {session_id}"));
+        }
+        let command = state
+            .session_commands
+            .get_mut(command_id)
+            .ok_or_else(|| format!("mission session command not found: {command_id}"))?;
+        if command.target_session_id != session_id {
+            return Err(format!(
+                "command {command_id} does not belong to session {session_id}"
+            ));
+        }
+        let event_type = update(command)?;
+        let updated = command.clone();
+        state.push_event(
+            event_type,
+            format!(
+                "mission session command {} -> {}",
+                updated.command_id,
+                updated.status.as_str()
+            ),
+            Some(session_id.to_string()),
+        );
+        self.persist_if_enabled(&state)?;
+        Ok(updated)
+    }
+
+    fn persist_if_enabled(&self, state: &MissionRuntimeState) -> Result<(), String> {
+        if self.persistent {
+            persist_state(state)?;
+        }
+        Ok(())
     }
 }
 
@@ -422,7 +764,7 @@ impl MissionRuntimeState {
 
 pub fn global_mission_runtime() -> &'static MissionRuntime {
     static RUNTIME: OnceLock<MissionRuntime> = OnceLock::new();
-    RUNTIME.get_or_init(MissionRuntime::new)
+    RUNTIME.get_or_init(MissionRuntime::persistent)
 }
 
 fn now_ms() -> u64 {
@@ -430,6 +772,64 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn session_command_summary(
+    commands: &BTreeMap<String, MissionSessionCommand>,
+) -> MissionSessionCommandSummary {
+    let mut summary = MissionSessionCommandSummary {
+        pending: 0,
+        claimed: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+    };
+    for command in commands.values() {
+        match command.status {
+            MissionSessionCommandStatus::Pending => summary.pending += 1,
+            MissionSessionCommandStatus::Claimed => summary.claimed += 1,
+            MissionSessionCommandStatus::Running => summary.running += 1,
+            MissionSessionCommandStatus::Completed => summary.completed += 1,
+            MissionSessionCommandStatus::Failed => summary.failed += 1,
+            MissionSessionCommandStatus::Cancelled => summary.cancelled += 1,
+        }
+    }
+    summary
+}
+
+fn state_path() -> PathBuf {
+    cowd_dirs::user_agents_dir()
+        .join("mission-runtime")
+        .join("state.json")
+}
+
+fn load_state() -> Result<MissionRuntimeState, String> {
+    let path = state_path();
+    if !path.exists() {
+        return Ok(MissionRuntimeState::default());
+    }
+    let payload = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&payload).map_err(|error| {
+        format!(
+            "failed to load mission runtime state {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn persist_state(state: &MissionRuntimeState) -> Result<(), String> {
+    let path = state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let payload = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    std::fs::write(&path, payload).map_err(|error| {
+        format!(
+            "failed to persist mission runtime state {}: {error}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]

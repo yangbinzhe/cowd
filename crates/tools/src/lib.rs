@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use ai_kernel::tool::{
+    ToolDefinition as KernelToolDefinition, ToolPermissionMode as KernelToolPermissionMode,
+};
 use mcp::McpService;
 use plugins::PluginTool;
 use runtime::{
@@ -267,6 +270,50 @@ impl GlobalToolRegistry {
         builtin.chain(runtime).chain(plugin).collect()
     }
 
+    #[must_use]
+    pub fn kernel_definitions(
+        &self,
+        allowed_tools: Option<&BTreeSet<String>>,
+    ) -> Vec<KernelToolDefinition> {
+        let builtin = mvp_tool_specs()
+            .into_iter()
+            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .map(|spec| KernelToolDefinition {
+                name: spec.name.to_string(),
+                description: Some(spec.description.to_string()),
+                input_schema: spec.input_schema,
+                required_permission: kernel_permission_mode(spec.required_permission),
+            });
+        let runtime = self
+            .runtime_tools
+            .iter()
+            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .map(|tool| KernelToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                required_permission: kernel_permission_mode(tool.required_permission),
+            });
+        let plugin = self
+            .plugin_tools
+            .iter()
+            .filter(|tool| {
+                allowed_tools
+                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            })
+            .filter_map(|tool| {
+                permission_mode_from_plugin(tool.required_permission())
+                    .ok()
+                    .map(|permission| KernelToolDefinition {
+                        name: tool.definition().name.clone(),
+                        description: tool.definition().description.clone(),
+                        input_schema: tool.definition().input_schema.clone(),
+                        required_permission: kernel_permission_mode(permission),
+                    })
+            });
+        builtin.chain(runtime).chain(plugin).collect()
+    }
+
     pub fn permission_specs(
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
@@ -354,6 +401,16 @@ impl GlobalToolRegistry {
             description: tool.definition().description.clone().unwrap_or_default(),
         });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+}
+
+fn kernel_permission_mode(permission: PermissionMode) -> KernelToolPermissionMode {
+    match permission {
+        PermissionMode::ReadOnly => KernelToolPermissionMode::ReadOnly,
+        PermissionMode::WorkspaceWrite => KernelToolPermissionMode::WorkspaceWrite,
+        PermissionMode::DangerFullAccess | PermissionMode::Prompt | PermissionMode::Allow => {
+            KernelToolPermissionMode::DangerFullAccess
+        }
     }
 }
 pub mod executor;

@@ -7,6 +7,79 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ToolPermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl ToolPermissionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::DangerFullAccess => "danger_full_access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+    pub required_permission: ToolPermissionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Succeeded,
+    Failed,
+    Denied,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionReceipt {
+    pub tool_name: String,
+    pub status: ToolExecutionStatus,
+    pub permission: ToolPermissionMode,
+    pub evidence_refs: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl ToolExecutionReceipt {
+    #[must_use]
+    pub fn succeeded(tool_name: impl Into<String>, permission: ToolPermissionMode) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Succeeded,
+            permission,
+            evidence_refs: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(
+        tool_name: impl Into<String>,
+        permission: ToolPermissionMode,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Failed,
+            permission,
+            evidence_refs: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolAccessMode {
     Read,
     Write,

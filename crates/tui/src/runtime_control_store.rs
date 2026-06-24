@@ -157,6 +157,13 @@ pub struct MissionControlSummary {
     pub pending_approvals: u64,
     pub relation_count: u64,
     pub event_count: u64,
+    pub command_pending: u64,
+    pub command_claimed: u64,
+    pub command_running: u64,
+    pub command_completed: u64,
+    pub command_failed: u64,
+    pub command_cancelled: u64,
+    pub command_total: u64,
     pub sessions: Vec<MissionSessionSummary>,
 }
 
@@ -599,6 +606,35 @@ impl RuntimeControlSnapshot {
                 .get("events")
                 .and_then(serde_json::Value::as_array)
                 .map(|events| events.len() as u64)
+                .unwrap_or_default(),
+            command_pending: mission
+                .pointer("/session_command_summary/pending")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_claimed: mission
+                .pointer("/session_command_summary/claimed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_running: mission
+                .pointer("/session_command_summary/running")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_completed: mission
+                .pointer("/session_command_summary/completed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_failed: mission
+                .pointer("/session_command_summary/failed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_cancelled: mission
+                .pointer("/session_command_summary/cancelled")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            command_total: mission
+                .get("session_commands")
+                .and_then(serde_json::Value::as_array)
+                .map(|commands| commands.len() as u64)
                 .unwrap_or_default(),
             sessions,
         });
@@ -1698,6 +1734,15 @@ mod tests {
                     }
                 ],
                 "events": [{"sequence": 1}, {"sequence": 2}],
+                "session_command_summary": {
+                    "pending": 2,
+                    "claimed": 1,
+                    "running": 1,
+                    "completed": 3,
+                    "failed": 1,
+                    "cancelled": 0
+                },
+                "session_commands": [{"command_id": "a"}, {"command_id": "b"}],
                 "approval_projection": {"pending_count": 3},
                 "relation_projection": {"relation_count": 4}
             }
@@ -1716,6 +1761,13 @@ mod tests {
         assert_eq!(mission.pending_approvals, 3);
         assert_eq!(mission.relation_count, 4);
         assert_eq!(mission.event_count, 2);
+        assert_eq!(mission.command_pending, 2);
+        assert_eq!(mission.command_claimed, 1);
+        assert_eq!(mission.command_running, 1);
+        assert_eq!(mission.command_completed, 3);
+        assert_eq!(mission.command_failed, 1);
+        assert_eq!(mission.command_cancelled, 0);
+        assert_eq!(mission.command_total, 2);
     }
 
     #[test]
@@ -1769,6 +1821,13 @@ mod tests {
                 pending_approvals: 0,
                 relation_count: 0,
                 event_count: 1,
+                command_pending: 0,
+                command_claimed: 0,
+                command_running: 0,
+                command_completed: 0,
+                command_failed: 0,
+                command_cancelled: 0,
+                command_total: 0,
                 sessions: vec![MissionSessionSummary {
                     session_id: "session-cowd-structured".to_string(),
                     title: "structured task".to_string(),

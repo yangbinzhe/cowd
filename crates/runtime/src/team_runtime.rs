@@ -6,12 +6,13 @@
 //! redefining team state.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_lifecycle_service, global_runtime_control_plane, AgentSnapshot,
+    cowd_dirs, global_agent_lifecycle_service, global_runtime_control_plane, AgentSnapshot,
     CollaborationDecision, CollaborationPlan, CollaborationTemplateId,
 };
 
@@ -59,6 +60,48 @@ pub struct TeamRuntimeAgent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRuntimeSynthesisStatus {
+    NotStarted,
+    Deterministic,
+    ModelAssistedPending,
+    ModelAssistedCompleted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRuntimeRoleSummary {
+    pub role_id: String,
+    pub agent_id: Option<String>,
+    pub status: TeamRuntimeStatus,
+    pub summary: Option<String>,
+    pub output_file: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRuntimeExecutionSummary {
+    pub team_id: String,
+    pub session_id: String,
+    pub objective: String,
+    pub status: TeamRuntimeStatus,
+    pub role_summaries: Vec<TeamRuntimeRoleSummary>,
+    pub completed_agents: Vec<String>,
+    pub failed_agents: Vec<String>,
+    pub cancelled_agents: Vec<String>,
+    pub output_files: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub blocker_summary: Option<String>,
+    pub failed_reasons: Vec<String>,
+    pub synthesis_status: TeamRuntimeSynthesisStatus,
+    pub synthesis_output_file: Option<String>,
+    pub review_required: bool,
+    pub review_reason: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamRuntimeEvent {
     pub team_id: String,
     pub event_type: String,
@@ -80,6 +123,8 @@ pub struct TeamRuntimeSnapshot {
     pub pending_inputs: Vec<String>,
     pub review_notes: Vec<String>,
     pub merge_summary: Option<String>,
+    pub execution_summary: Option<TeamRuntimeExecutionSummary>,
+    pub result_artifact_file: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -172,6 +217,8 @@ impl TeamRuntimeService {
             pending_inputs: Vec::new(),
             review_notes: Vec::new(),
             merge_summary: None,
+            execution_summary: None,
+            result_artifact_file: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -273,6 +320,7 @@ impl TeamRuntimeService {
 
     #[must_use]
     pub fn get(&self, team_id: &str) -> Option<TeamRuntimeSnapshot> {
+        let _ = self.refresh_from_agent_lifecycle(team_id);
         self.runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -282,6 +330,16 @@ impl TeamRuntimeService {
 
     #[must_use]
     pub fn list(&self) -> Vec<TeamRuntimeSnapshot> {
+        let team_ids = self
+            .runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for team_id in team_ids {
+            let _ = self.refresh_from_agent_lifecycle(&team_id);
+        }
         self.runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -384,10 +442,140 @@ impl TeamRuntimeService {
                     agent.status = TeamRuntimeStatus::Completed;
                 }
             }
+            let execution_summary = build_execution_summary(&record.snapshot);
+            match write_execution_summary_artifact(&execution_summary) {
+                Ok(path) => {
+                    record.snapshot.result_artifact_file = Some(path.display().to_string());
+                    record.snapshot.execution_summary = Some(TeamRuntimeExecutionSummary {
+                        synthesis_output_file: Some(path.display().to_string()),
+                        ..execution_summary
+                    });
+                }
+                Err(error) => {
+                    record.snapshot.execution_summary = Some(TeamRuntimeExecutionSummary {
+                        synthesis_status: TeamRuntimeSynthesisStatus::Failed,
+                        review_required: true,
+                        review_reason: Some(format!("team summary artifact write failed: {error}")),
+                        ..execution_summary
+                    });
+                }
+            }
             record.touch();
             record.push_event("team.completed", "team merge completed");
             "merge completed".to_string()
         })
+    }
+
+    pub fn finalize_execution_summary(
+        &self,
+        team_id: &str,
+    ) -> Result<TeamRuntimeExecutionSummary, String> {
+        let _ = self.refresh_from_agent_lifecycle(team_id);
+        let mut runs = self
+            .runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = runs
+            .get_mut(team_id)
+            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
+        let mut summary = build_execution_summary(&record.snapshot);
+        let artifact = write_execution_summary_artifact(&summary)?;
+        summary.synthesis_output_file = Some(artifact.display().to_string());
+        record.snapshot.result_artifact_file = Some(artifact.display().to_string());
+        record.snapshot.execution_summary = Some(summary.clone());
+        record.push_event(
+            "team.summary.finalized",
+            "team deterministic execution summary finalized",
+        );
+        record.touch();
+        Ok(summary)
+    }
+
+    pub fn refresh_from_agent_lifecycle(
+        &self,
+        team_id: &str,
+    ) -> Result<TeamRuntimeSnapshot, String> {
+        let mut runs = self
+            .runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = runs
+            .get_mut(team_id)
+            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
+        if record.snapshot.status.is_terminal() {
+            return Ok(record.snapshot.clone());
+        }
+
+        let mut changed = false;
+        for agent in &mut record.snapshot.agents {
+            let Some(agent_id) = agent.agent_id.as_deref() else {
+                continue;
+            };
+            let Some(snapshot) = global_agent_lifecycle_service().get(agent_id) else {
+                continue;
+            };
+            let next_status = team_status_from_agent_status(&snapshot.status);
+            if agent.status != next_status {
+                agent.status = next_status;
+                changed = true;
+            }
+            let next_summary = agent_summary_from_snapshot(&snapshot);
+            if agent.latest_summary != next_summary {
+                agent.latest_summary = next_summary;
+                changed = true;
+            }
+        }
+
+        let all_terminal = !record.snapshot.agents.is_empty()
+            && record
+                .snapshot
+                .agents
+                .iter()
+                .all(|agent| agent.status.is_terminal());
+        if all_terminal {
+            let has_failed = record
+                .snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.status == TeamRuntimeStatus::Failed);
+            let has_cancelled = record
+                .snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.status == TeamRuntimeStatus::Cancelled);
+            record.snapshot.status = if has_failed {
+                TeamRuntimeStatus::Failed
+            } else if has_cancelled {
+                TeamRuntimeStatus::Cancelled
+            } else {
+                TeamRuntimeStatus::Completed
+            };
+            let mut summary = build_execution_summary(&record.snapshot);
+            match write_execution_summary_artifact(&summary) {
+                Ok(path) => {
+                    summary.synthesis_output_file = Some(path.display().to_string());
+                    record.snapshot.result_artifact_file = Some(path.display().to_string());
+                    record.snapshot.execution_summary = Some(summary);
+                }
+                Err(error) => {
+                    summary.synthesis_status = TeamRuntimeSynthesisStatus::Failed;
+                    summary.review_required = true;
+                    summary.review_reason =
+                        Some(format!("team summary artifact write failed: {error}"));
+                    record.snapshot.execution_summary = Some(summary);
+                }
+            }
+            record.push_event(
+                "team.summary.auto_finalized",
+                "team runtime auto-finalized from agent lifecycle",
+            );
+            changed = true;
+        }
+
+        if changed {
+            record.touch();
+        }
+        Ok(record.snapshot.clone())
     }
 
     pub fn projection(&self) -> serde_json::Value {
@@ -473,6 +661,140 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn build_execution_summary(snapshot: &TeamRuntimeSnapshot) -> TeamRuntimeExecutionSummary {
+    let role_summaries = snapshot
+        .agents
+        .iter()
+        .map(|agent| TeamRuntimeRoleSummary {
+            role_id: agent.role_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            status: agent.status.clone(),
+            summary: agent.latest_summary.clone(),
+            output_file: agent
+                .agent_id
+                .as_deref()
+                .and_then(|agent_id| global_agent_lifecycle_service().get(agent_id))
+                .map(|snapshot| snapshot.output_file),
+            evidence_refs: agent
+                .evidence_duties
+                .iter()
+                .map(|duty| {
+                    format!(
+                        "team:{}:role:{}:evidence:{duty}",
+                        snapshot.team_id, agent.role_id
+                    )
+                })
+                .collect(),
+            blocker: if agent.status == TeamRuntimeStatus::Failed {
+                Some(format!(
+                    "role {} failed or did not produce terminal output",
+                    agent.role_id
+                ))
+            } else {
+                None
+            },
+        })
+        .collect::<Vec<_>>();
+    let output_files = role_summaries
+        .iter()
+        .filter_map(|role| role.output_file.clone())
+        .collect::<Vec<_>>();
+    let evidence_refs = role_summaries
+        .iter()
+        .flat_map(|role| role.evidence_refs.clone())
+        .collect::<Vec<_>>();
+    let failed_reasons = role_summaries
+        .iter()
+        .filter_map(|role| role.blocker.clone())
+        .collect::<Vec<_>>();
+    let review_required = snapshot.status == TeamRuntimeStatus::ReviewRequested
+        || !failed_reasons.is_empty()
+        || snapshot
+            .agents
+            .iter()
+            .any(|agent| !agent.status.is_terminal() && agent.status != TeamRuntimeStatus::Running);
+    TeamRuntimeExecutionSummary {
+        team_id: snapshot.team_id.clone(),
+        session_id: snapshot.session_id.clone(),
+        objective: snapshot.objective.clone(),
+        status: snapshot.status.clone(),
+        role_summaries,
+        completed_agents: snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.status == TeamRuntimeStatus::Completed)
+            .filter_map(|agent| agent.agent_id.clone())
+            .collect(),
+        failed_agents: snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.status == TeamRuntimeStatus::Failed)
+            .filter_map(|agent| agent.agent_id.clone())
+            .collect(),
+        cancelled_agents: snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.status == TeamRuntimeStatus::Cancelled)
+            .filter_map(|agent| agent.agent_id.clone())
+            .collect(),
+        output_files,
+        evidence_refs,
+        blocker_summary: if failed_reasons.is_empty() {
+            None
+        } else {
+            Some(failed_reasons.join("; "))
+        },
+        failed_reasons,
+        synthesis_status: TeamRuntimeSynthesisStatus::Deterministic,
+        synthesis_output_file: None,
+        review_required,
+        review_reason: if review_required {
+            Some("deterministic summary requires human or model-assisted review".to_string())
+        } else {
+            None
+        },
+        created_at_ms: now_ms(),
+    }
+}
+
+fn team_status_from_agent_status(status: &str) -> TeamRuntimeStatus {
+    match status {
+        "completed" | "finished" => TeamRuntimeStatus::Completed,
+        "failed" => TeamRuntimeStatus::Failed,
+        "cancelled" | "canceled" => TeamRuntimeStatus::Cancelled,
+        "queued" | "planned" => TeamRuntimeStatus::Planned,
+        _ => TeamRuntimeStatus::Running,
+    }
+}
+
+fn agent_summary_from_snapshot(snapshot: &AgentSnapshot) -> Option<String> {
+    if let Some(error) = snapshot
+        .error
+        .as_ref()
+        .filter(|error| !error.trim().is_empty())
+    {
+        return Some(error.clone());
+    }
+    if let Some(blocker) = snapshot.current_blocker.as_ref() {
+        return Some(format!("{blocker:?}"));
+    }
+    if !snapshot.derived_state.trim().is_empty() {
+        return Some(snapshot.derived_state.clone());
+    }
+    None
+}
+
+fn write_execution_summary_artifact(
+    summary: &TeamRuntimeExecutionSummary,
+) -> Result<PathBuf, String> {
+    let dir = cowd_dirs::user_agents_dir().join("team-results");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join(format!("{}-summary.json", summary.team_id));
+    let payload = serde_json::to_string_pretty(summary).map_err(|error| error.to_string())?;
+    std::fs::write(&path, payload).map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 #[cfg(test)]

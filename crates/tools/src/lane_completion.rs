@@ -16,7 +16,7 @@ use runtime::{
     PolicyCondition, PolicyEngine, PolicyRule, ReviewStatus,
 };
 
-use crate::AgentOutput;
+type AgentOutput = runtime::AgentSnapshot;
 
 /// Detects if a lane should be automatically marked as completed.
 ///
