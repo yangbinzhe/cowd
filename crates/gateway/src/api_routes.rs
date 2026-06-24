@@ -1592,6 +1592,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mission_routes_manage_steward_runtime_lifecycle() {
+        let _guard = mission_route_lock().lock().await;
+        let app = api_router(test_state());
+        let session_id = format!("mission-steward-session-{}", uuid::Uuid::new_v4());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "steward controlled session",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/stewards")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "mission_id": "mission-runtime",
+                            "root_session_id": session_id,
+                            "profile_id": "stewarded",
+                            "objective": "supervise high risk implementation"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let started_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let steward_id = started_json["steward"]["steward_id"]
+            .as_str()
+            .expect("steward id")
+            .to_string();
+        assert_eq!(started_json["steward"]["status"], "running");
+
+        let tick = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/stewards/{steward_id}/tick"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action": "apply patch",
+                            "summary": "write runtime changes",
+                            "risk": "high",
+                            "requested_tool": "apply_patch",
+                            "requires_write": true,
+                            "timeout_policy": "continue_alternative"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tick.status(), StatusCode::OK);
+        let tick_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tick.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(tick_json["decision"]["status"], "approval_submitted");
+        assert!(
+            tick_json["approvals"]["pending_count"]
+                .as_u64()
+                .expect("pending approvals")
+                >= 1
+        );
+
+        let takeover = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/stewards/{steward_id}/takeover"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(takeover.status(), StatusCode::OK);
+        let takeover_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(takeover.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(takeover_json["report"]["status"], "handed_off");
+        assert_eq!(
+            takeover_json["report"]["decisions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn cowd_capabilities_route_exposes_core_registry() {
         let app = api_router(test_state());
         let response = app

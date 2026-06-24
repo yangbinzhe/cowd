@@ -106,11 +106,46 @@ pub(crate) enum MissionSessionCommandConsumeMode {
     StartTurn,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StartMissionStewardHttpRequest {
+    pub(crate) mission_id: String,
+    #[serde(default)]
+    pub(crate) root_session_id: Option<String>,
+    pub(crate) profile_id: runtime::AutonomyProfileId,
+    pub(crate) objective: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TickMissionStewardHttpRequest {
+    #[serde(default)]
+    pub(crate) action: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
+    #[serde(default)]
+    pub(crate) risk: Option<ai_kernel::core::TaskRisk>,
+    #[serde(default)]
+    pub(crate) requested_tool: Option<String>,
+    #[serde(default)]
+    pub(crate) requires_write: bool,
+    #[serde(default)]
+    pub(crate) is_critical_operation: bool,
+    #[serde(default)]
+    pub(crate) evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub(crate) timeout_policy: Option<runtime::ApprovalTimeoutPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct InterruptMissionStewardHttpRequest {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
 impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.374 Mission Runtime service boundary",
+            owner: "0.9.375 Mission Runtime service boundary",
         }
     }
 
@@ -157,6 +192,7 @@ impl MissionService {
         serde_json::json!({
             "envelope": self.projection_contract(),
             "mission": runtime::global_mission_runtime().projection(),
+            "stewards": runtime::global_steward_runtime_service().projection(),
         })
     }
 
@@ -172,6 +208,44 @@ impl MissionService {
             "envelope": self.relation_projection_contract(),
             "relations": runtime::global_session_relation_graph().projection(),
         })
+    }
+
+    pub(crate) fn stewards(&self) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "stewards": runtime::global_steward_runtime_service().projection(),
+        })
+    }
+
+    pub(crate) fn steward_detail(&self, steward_id: &str) -> Result<serde_json::Value, String> {
+        let steward = runtime::global_steward_runtime_service()
+            .get(steward_id)
+            .ok_or_else(|| format!("steward not found: {steward_id}"))?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "steward": steward,
+            "report": runtime::global_steward_runtime_service().report(steward_id)?,
+        }))
+    }
+
+    pub(crate) fn start_steward(
+        &self,
+        request: StartMissionStewardHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        let steward = runtime::global_steward_runtime_service().start(
+            runtime::StartStewardRuntimeRequest {
+                mission_id: request.mission_id,
+                root_session_id: request.root_session_id,
+                profile_id: request.profile_id,
+                objective: request.objective,
+            },
+        )?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "steward": steward,
+            "stewards": runtime::global_steward_runtime_service().projection(),
+        }))
     }
 
     pub(crate) fn start_session(
@@ -485,6 +559,87 @@ impl MissionService {
             "ok": true,
             "command": command,
             "mission": runtime::global_mission_runtime().projection(),
+        }))
+    }
+
+    pub(crate) fn tick_steward(
+        &self,
+        steward_id: &str,
+        request: TickMissionStewardHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        let record = runtime::global_steward_runtime_service().tick(
+            steward_id,
+            runtime::TickStewardRuntimeRequest {
+                action: request.action,
+                summary: request.summary,
+                risk: request.risk.unwrap_or(ai_kernel::core::TaskRisk::Low),
+                requested_tool: request.requested_tool,
+                requires_write: request.requires_write,
+                is_critical_operation: request.is_critical_operation,
+                evidence_refs: request.evidence_refs,
+                timeout_policy: request
+                    .timeout_policy
+                    .unwrap_or(runtime::ApprovalTimeoutPolicy::Pending),
+            },
+        )?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "decision": record,
+            "stewards": runtime::global_steward_runtime_service().projection(),
+            "approvals": runtime::global_approval_queue().projection(),
+        }))
+    }
+
+    pub(crate) fn pause_steward(&self, steward_id: &str) -> Result<serde_json::Value, String> {
+        self.steward_status_value(runtime::global_steward_runtime_service().pause(steward_id)?)
+    }
+
+    pub(crate) fn resume_steward(&self, steward_id: &str) -> Result<serde_json::Value, String> {
+        self.steward_status_value(runtime::global_steward_runtime_service().resume(steward_id)?)
+    }
+
+    pub(crate) fn interrupt_steward(
+        &self,
+        steward_id: &str,
+        request: InterruptMissionStewardHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        self.steward_status_value(
+            runtime::global_steward_runtime_service().interrupt(
+                steward_id,
+                request
+                    .reason
+                    .unwrap_or_else(|| "interrupted from Mission API".to_string()),
+            )?,
+        )
+    }
+
+    pub(crate) fn takeover_steward(&self, steward_id: &str) -> Result<serde_json::Value, String> {
+        let report = runtime::global_steward_runtime_service().takeover(steward_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "report": report,
+            "stewards": runtime::global_steward_runtime_service().projection(),
+        }))
+    }
+
+    pub(crate) fn steward_report(&self, steward_id: &str) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "report": runtime::global_steward_runtime_service().report(steward_id)?,
+        }))
+    }
+
+    fn steward_status_value(
+        &self,
+        steward: runtime::StewardSession,
+    ) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "steward": steward,
+            "stewards": runtime::global_steward_runtime_service().projection(),
         }))
     }
 

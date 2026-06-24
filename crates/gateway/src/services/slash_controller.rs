@@ -49,7 +49,7 @@ impl SlashController {
                 service: self.label(),
                 operation,
                 status: "service_boundary_ready",
-                owner: "0.9.374 Slash controller boundary",
+                owner: "0.9.375 Slash controller boundary",
                 boundary_status: "0620_final_boundary",
             })
             .collect()

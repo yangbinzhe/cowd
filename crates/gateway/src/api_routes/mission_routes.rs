@@ -11,9 +11,10 @@ use axum::{
 use crate::services::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
-    MissionSessionCommandConsumeMode, RouteMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, UpsertMissionProxyHttpRequest,
+    InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
+    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
+    StartMissionTeamRuntimeHttpRequest, SubmitMissionApprovalHttpRequest,
+    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 
 use super::{api_error, AppState, ErrorResponse};
@@ -92,6 +93,38 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(mission_relations_handler).post(add_mission_relation_handler),
         )
         .route("/api/mission/proxies", post(upsert_mission_proxy_handler))
+        .route(
+            "/api/mission/stewards",
+            get(mission_stewards_handler).post(start_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id",
+            get(mission_steward_detail_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/tick",
+            post(tick_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/pause",
+            post(pause_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/resume",
+            post(resume_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/interrupt",
+            post(interrupt_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/takeover",
+            post(takeover_mission_steward_handler),
+        )
+        .route(
+            "/api/mission/stewards/:id/report",
+            get(mission_steward_report_handler),
+        )
         .route("/api/mission/route", post(route_mission_command_handler))
 }
 
@@ -111,6 +144,22 @@ async fn mission_relations_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     Json(state.services.mission.relations())
+}
+
+async fn mission_stewards_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.services.mission.stewards())
+}
+
+async fn mission_steward_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .steward_detail(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }
 
 async fn mission_session_detail_handler(
@@ -148,6 +197,92 @@ async fn decide_mission_approval_handler(
         .decide_approval(&id, body)
         .map(Json)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn start_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<StartMissionStewardHttpRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .start_steward(body)
+        .map(|value| (StatusCode::CREATED, Json(value)))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn tick_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<TickMissionStewardHttpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .tick_steward(&id, body)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn pause_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .pause_steward(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn resume_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .resume_steward(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn interrupt_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<InterruptMissionStewardHttpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .interrupt_steward(&id, body)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn takeover_mission_steward_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .takeover_steward(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn mission_steward_report_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .steward_report(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }
 
 async fn add_mission_relation_handler(

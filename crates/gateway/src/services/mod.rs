@@ -47,9 +47,10 @@ pub(crate) use mfg_service::{
 pub(crate) use mission_service::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
-    MissionSessionCommandConsumeMode, RouteMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, UpsertMissionProxyHttpRequest,
+    InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
+    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
+    StartMissionTeamRuntimeHttpRequest, SubmitMissionApprovalHttpRequest,
+    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -229,7 +230,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.374 Provider service boundary",
+            owner: "0.9.375 Provider service boundary",
         }
     }
 
@@ -316,7 +317,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.374 Growth service boundary",
+            owner: "0.9.375 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -691,7 +692,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.374 GatewayServices");
+        assert_eq!(services.owner, "0.9.375 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(

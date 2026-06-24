@@ -96,6 +96,7 @@ mod sse;
 pub mod stale_base;
 pub mod stale_branch;
 pub mod steward_agent;
+pub mod steward_runtime;
 pub mod structured_data;
 pub mod subagent_turn;
 pub mod summary_compression;
@@ -334,6 +335,11 @@ pub use stale_branch::{
 };
 pub use steward_agent::{
     StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
+};
+pub use steward_runtime::{
+    global_steward_runtime_service, StartStewardRuntimeRequest, StewardEvent, StewardHandoffReport,
+    StewardRuntimeProjection, StewardRuntimeService, StewardSession, StewardStatus,
+    TickStewardRuntimeRequest,
 };
 pub use subagent_turn::{
     final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
