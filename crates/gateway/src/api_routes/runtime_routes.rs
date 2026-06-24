@@ -37,6 +37,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/runtime/status", get(get_runtime_status))
         .route("/api/runtime/events", get(get_runtime_events))
+        .route(
+            "/api/runtime/events/replay-report",
+            get(get_runtime_events_replay_report),
+        )
+        .route("/api/runtime/events/recover", post(recover_runtime_events))
         .route("/api/runtime/snapshot", get(get_runtime_snapshot))
         .route("/api/runtime/source-audit", get(get_runtime_source_audit))
         .route(
@@ -123,6 +128,12 @@ struct RuntimeEventsParams {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct RuntimeReplayParams {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 async fn get_runtime_events(
     Query(params): Query<RuntimeEventsParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -147,6 +158,70 @@ async fn get_runtime_events(
         "count": events.len(),
         "events": events,
     })))
+}
+
+async fn get_runtime_events_replay_report(
+    Query(params): Query<RuntimeReplayParams>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    runtime_replay_report(params.limit.unwrap_or(500).min(2_000)).map(Json)
+}
+
+async fn recover_runtime_events(
+    Query(params): Query<RuntimeReplayParams>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let report = runtime::RuntimeEventReplayer::report(
+        runtime::global_runtime_event_store(),
+        params.limit.unwrap_or(500).min(2_000),
+    )
+    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    for action in &report.actions {
+        match action.action {
+            runtime::RuntimeRecoveryActionKind::PauseRecoveryRequired
+                if action.stream_id.starts_with("steward:") =>
+            {
+                let steward_id = action.stream_id.trim_start_matches("steward:");
+                match runtime::global_steward_runtime_service()
+                    .mark_recovery_required(steward_id, action.reason.clone())
+                {
+                    Ok(steward) => applied.push(serde_json::json!({
+                        "stream_id": action.stream_id,
+                        "action": action.action,
+                        "steward": steward,
+                    })),
+                    Err(error) => skipped.push(serde_json::json!({
+                        "stream_id": action.stream_id,
+                        "action": action.action,
+                        "error": error,
+                    })),
+                }
+            }
+            _ => skipped.push(serde_json::json!({
+                "stream_id": action.stream_id,
+                "action": action.action,
+                "reason": "safe report-only recovery action",
+            })),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.recovery_result",
+        "ok": true,
+        "applied": applied,
+        "skipped": skipped,
+        "report": report,
+    })))
+}
+
+fn runtime_replay_report(limit: usize) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+    let store = runtime::global_runtime_event_store();
+    let report = runtime::RuntimeEventReplayer::report(store, limit)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(serde_json::json!({
+        "kind": "runtime.events.replay_report",
+        "store_path": store.path(),
+        "report": report,
+    }))
 }
 
 fn runtime_event_error(status: StatusCode, error: String) -> (StatusCode, Json<ErrorResponse>) {

@@ -86,6 +86,7 @@ pub mod provider_registry;
 pub mod provider_runtime_client;
 pub mod quality_gate;
 pub mod release_gate;
+pub mod runtime_event_replay;
 pub mod runtime_event_store;
 pub mod session_lifecycle;
 pub mod session_relation_graph;
@@ -306,6 +307,9 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
+pub use runtime_event_replay::{
+    RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeReplayReport,
+};
 pub use runtime_event_store::{
     global_runtime_event_store, record_runtime_event, DurableRuntimeEvent, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
@@ -343,8 +347,8 @@ pub use steward_agent::{
 };
 pub use steward_runtime::{
     global_steward_runtime_service, StartStewardRuntimeRequest, StewardEvent, StewardHandoffReport,
-    StewardRuntimeProjection, StewardRuntimeService, StewardSession, StewardStatus,
-    TickStewardRuntimeRequest,
+    StewardLoopReport, StewardRuntimeProjection, StewardRuntimeService, StewardSession,
+    StewardStatus, TickStewardRuntimeRequest,
 };
 pub use subagent_turn::{
     final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,

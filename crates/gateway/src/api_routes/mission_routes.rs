@@ -98,6 +98,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(mission_stewards_handler).post(start_mission_steward_handler),
         )
         .route(
+            "/api/mission/stewards/tick-all",
+            post(tick_all_mission_stewards_handler),
+        )
+        .route(
             "/api/mission/stewards/:id",
             get(mission_steward_detail_handler),
         )
@@ -148,6 +152,12 @@ async fn mission_relations_handler(
 
 async fn mission_stewards_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.services.mission.stewards())
+}
+
+async fn tick_all_mission_stewards_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(state.services.mission.tick_all_stewards())
 }
 
 async fn mission_steward_detail_handler(

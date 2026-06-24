@@ -133,6 +133,15 @@ pub struct StewardRuntimeProjection {
     pub events: Vec<StewardEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StewardLoopReport {
+    pub kind: String,
+    pub ticked: usize,
+    pub skipped: usize,
+    pub decisions: Vec<StewardDecisionRecord>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct StewardRuntimeService {
     sessions: Mutex<BTreeMap<String, StewardSession>>,
@@ -259,6 +268,50 @@ impl StewardRuntimeService {
         Ok(record)
     }
 
+    pub fn tick_all_once(&self) -> StewardLoopReport {
+        let sessions = self.list();
+        let mut decisions = Vec::new();
+        let mut errors = Vec::new();
+        let mut skipped = 0usize;
+
+        for session in sessions {
+            if !matches!(
+                session.status,
+                StewardStatus::Running | StewardStatus::WaitingDependency
+            ) {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            match self.tick(
+                &session.steward_id,
+                TickStewardRuntimeRequest {
+                    action: Some(format!("watch mission {}", session.mission_id)),
+                    summary: Some(format!(
+                        "supervise objective and preserve evidence: {}",
+                        session.objective
+                    )),
+                    risk: TaskRisk::Low,
+                    requested_tool: Some("read_file".to_string()),
+                    requires_write: false,
+                    is_critical_operation: false,
+                    evidence_refs: session.evidence_refs.clone(),
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            ) {
+                Ok(decision) => decisions.push(decision),
+                Err(error) => errors.push(format!("{}: {error}", session.steward_id)),
+            }
+        }
+
+        StewardLoopReport {
+            kind: "runtime.steward_loop_report".to_string(),
+            ticked: decisions.len(),
+            skipped,
+            decisions,
+            errors,
+        }
+    }
+
     pub fn pause(&self, steward_id: &str) -> Result<StewardSession, String> {
         self.set_status(steward_id, StewardStatus::Paused, "steward.paused")
     }
@@ -277,6 +330,21 @@ impl StewardRuntimeService {
         let session =
             self.set_status(steward_id, StewardStatus::HandedOff, "steward.handed_off")?;
         Ok(self.report_for(&session))
+    }
+
+    pub fn mark_recovery_required(
+        &self,
+        steward_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<StewardSession, String> {
+        let reason = reason.into();
+        let session = self.set_status(
+            steward_id,
+            StewardStatus::Paused,
+            "steward.recovery_required",
+        )?;
+        self.push_event(&session, "steward.recovery_required", reason, None);
+        Ok(session)
     }
 
     pub fn report(&self, steward_id: &str) -> Result<StewardHandoffReport, String> {
@@ -484,5 +552,37 @@ mod tests {
         assert_eq!(report.status, StewardStatus::HandedOff);
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(runtime.projection().count, 1);
+    }
+
+    #[test]
+    fn steward_runtime_ticks_all_active_sessions_and_marks_recovery() {
+        let runtime = StewardRuntimeService::new();
+        let steward = runtime
+            .start(StartStewardRuntimeRequest {
+                mission_id: "mission-loop".to_string(),
+                root_session_id: Some("session-loop".to_string()),
+                profile_id: AutonomyProfileId::Stewarded,
+                objective: "keep mission moving".to_string(),
+            })
+            .expect("start steward");
+
+        let report = runtime.tick_all_once();
+        assert_eq!(report.kind, "runtime.steward_loop_report");
+        assert_eq!(report.ticked, 1);
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            runtime.get(&steward.steward_id).expect("steward").status,
+            StewardStatus::WaitingDependency
+        );
+
+        let recovered = runtime
+            .mark_recovery_required(&steward.steward_id, "gateway restart")
+            .expect("mark recovery");
+        assert_eq!(recovered.status, StewardStatus::Paused);
+        assert!(runtime
+            .projection()
+            .events
+            .iter()
+            .any(|event| event.kind == "steward.recovery_required"));
     }
 }

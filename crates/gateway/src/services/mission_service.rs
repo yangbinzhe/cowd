@@ -145,7 +145,7 @@ impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.378 Mission Runtime service boundary",
+            owner: "0.9.379 Mission Runtime service boundary",
         }
     }
 
@@ -214,6 +214,17 @@ impl MissionService {
         serde_json::json!({
             "envelope": self.session_control_contract(),
             "stewards": runtime::global_steward_runtime_service().projection(),
+        })
+    }
+
+    pub(crate) fn tick_all_stewards(&self) -> serde_json::Value {
+        let report = runtime::global_steward_runtime_service().tick_all_once();
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": report.errors.is_empty(),
+            "report": report,
+            "stewards": runtime::global_steward_runtime_service().projection(),
+            "approvals": runtime::global_approval_queue().projection(),
         })
     }
 

@@ -1645,6 +1645,26 @@ mod tests {
             .to_string();
         assert_eq!(started_json["steward"]["status"], "running");
 
+        let tick_all = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/stewards/tick-all")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tick_all.status(), StatusCode::OK);
+        let tick_all_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tick_all.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            tick_all_json["report"]["kind"],
+            "runtime.steward_loop_report"
+        );
+
         let tick = app
             .clone()
             .oneshot(
@@ -1693,12 +1713,12 @@ mod tests {
             serde_json::from_slice(&to_bytes(takeover.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(takeover_json["report"]["status"], "handed_off");
-        assert_eq!(
+        assert!(
             takeover_json["report"]["decisions"]
                 .as_array()
                 .unwrap()
-                .len(),
-            1
+                .len()
+                >= 2
         );
     }
 
@@ -1748,6 +1768,75 @@ mod tests {
             .expect("events")
             .iter()
             .any(|event| event["kind"].as_str() == Some("mission.session.started")));
+    }
+
+    #[tokio::test]
+    async fn runtime_event_replay_report_and_recover_marks_steward_review() {
+        let _guard = mission_route_lock().lock().await;
+        let app = api_router(test_state());
+        let steward_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/stewards")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "mission_id": "mission-replay",
+                            "root_session_id": "session-replay",
+                            "profile_id": "stewarded",
+                            "objective": "verify recovery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(steward_response.status(), StatusCode::CREATED);
+
+        let report = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/events/replay-report?limit=2000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::OK);
+        let report_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(report.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(report_json["kind"], "runtime.events.replay_report");
+        assert!(report_json["report"]["actions"]
+            .as_array()
+            .expect("actions")
+            .iter()
+            .any(|action| action["action"] == "pause_recovery_required"));
+
+        let recover = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/events/recover?limit=2000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recover.status(), StatusCode::OK);
+        let recover_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(recover.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(recover_json["kind"], "runtime.recovery_result");
+        assert!(recover_json["applied"]
+            .as_array()
+            .expect("applied")
+            .iter()
+            .any(|item| item["action"] == "pause_recovery_required"));
     }
 
     #[tokio::test]
