@@ -456,7 +456,6 @@ mod tests {
     use runtime::{ContextProfile, ResumeContextSource};
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::time::Duration;
     use tower::ServiceExt;
 
     #[derive(Clone, Default)]
@@ -6659,42 +6658,45 @@ providers:
     }
 
     #[tokio::test]
-    async fn approval_routes_resolve_pending_gate_request() {
-        let gate = test_approval_gate();
-        let state = test_state_with_approval_gate(gate.clone());
+    async fn approval_routes_resolve_global_queue_request() {
+        let state = test_state();
         let app = api_router(state);
+        let approval = runtime::global_approval_queue()
+            .submit(runtime::SubmitGlobalApprovalRequest {
+                source: runtime::ApprovalSource {
+                    kind: runtime::ApprovalSourceKind::Session,
+                    session_id: Some(format!("approval-route-{}", uuid::Uuid::new_v4())),
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: Some("mission-approval-route".to_string()),
+                },
+                action: "apply_patch".to_string(),
+                summary: "modify runtime file".to_string(),
+                risk: ai_kernel::core::TaskRisk::High,
+                evidence_refs: vec!["approval-route:test".to_string()],
+                timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval submitted");
 
-        let eval_gate = gate.clone();
-        let eval = tokio::spawn(async move {
-            eval_gate
-                .evaluate("bash", r#"{"command":"rm -rf /tmp/cowd-approval-e2e"}"#)
-                .await
-        });
-
-        let pending_json = loop {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/api/approval/pending")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            if json.as_array().is_some_and(|items| !items.is_empty()) {
-                break json;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        let request_id = pending_json[0]["id"].as_str().unwrap().to_string();
-        assert!(pending_json[0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("rm -rf"));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approval/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let pending_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pending_json["kind"], "gateway.unified_approval_pending");
+        assert!(pending_json["pending"]
+            .as_array()
+            .expect("pending approvals")
+            .iter()
+            .any(|item| item["approval_id"].as_str() == Some(approval.approval_id.as_str())));
 
         let response = app
             .clone()
@@ -6705,7 +6707,7 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "id": request_id,
+                            "id": approval.approval_id,
                             "approved": true,
                             "persistence": "once"
                         })
@@ -6716,52 +6718,12 @@ providers:
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
-        let result = eval.await.unwrap();
-        assert!(matches!(
-            result,
-            runtime::approval_gate::ApprovalGateResult::Approved { .. }
-        ));
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let history_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/approval/history")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(history_response.status(), StatusCode::OK);
-        let body = to_bytes(history_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(history[0]["request_id"], pending_json[0]["id"]);
-
-        let export_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/audit/export?source=approval&limit=10")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(export_response.status(), StatusCode::OK);
-        let body = to_bytes(export_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let export: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(export["kind"], "audit_export");
-        assert_eq!(export["source"], "approval");
-        assert_eq!(export["totals"]["approval"], 1);
-        assert_eq!(export["records"][0]["source"], "approval");
         assert_eq!(
-            export["records"][0]["record"]["request_id"],
-            pending_json[0]["id"]
+            runtime::global_approval_queue()
+                .get(&approval.approval_id)
+                .expect("approval exists")
+                .status,
+            runtime::GlobalApprovalStatus::Approved
         );
     }
 
