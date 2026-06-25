@@ -131,7 +131,7 @@ pub(crate) fn status_json_value(
             "staged_files": context.git_summary.staged_files,
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
-            "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "session": context.session_path.as_ref().map_or_else(|| "gateway-session".to_string(), |path| path.display().to_string()),
             "session_id": context.session_id.as_deref(),
             "session_store": context.session_store.as_str(),
             "loaded_config_files": context.loaded_config_files,
@@ -188,7 +188,7 @@ pub(crate) fn status_context_for_session(
             })
         }),
         session_store: session_path.map_or_else(
-            || "live-repl".to_string(),
+            || "gateway-session".to_string(),
             |path| {
                 if path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
                     "SQLite session store".to_string()
@@ -378,10 +378,10 @@ pub(crate) fn format_status_report(
             context.git_summary.unstaged_files,
             context.git_summary.untracked_files,
             context.session_path.as_ref().map_or_else(
-                || "live-repl".to_string(),
+                || "gateway-session".to_string(),
                 |path| path.display().to_string()
             ),
-            context.session_id.as_deref().unwrap_or("live-repl"),
+            context.session_id.as_deref().unwrap_or("gateway-session"),
             context.session_store.as_str(),
             context.loaded_config_files,
             context.discovered_config_files,

@@ -85,7 +85,7 @@ pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n下一步:");
     println!("  1. 编辑配置文件添加更多 Provider 配置");
     println!("  2. 运行 'cowd --help' 查看使用说明");
-    println!("  3. 运行 'cowd' 启动交互式 REPL\n");
+    println!("  3. 运行 'cowd' 启动交互式 TUI\n");
 
     Ok(())
 }

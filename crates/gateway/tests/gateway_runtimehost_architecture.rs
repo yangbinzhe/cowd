@@ -785,9 +785,14 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     let session_service =
         production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();
     assert!(
-        session_service.contains("pub(crate) fn last_context_envelope_nonblocking")
-            && session_service.contains("pub(crate) async fn active_messages_page"),
-        "session service must own active runtime read projections"
+        runtime_service.contains("pub(crate) fn last_context_envelope_nonblocking")
+            && runtime_service.contains("pub(crate) async fn active_messages_page")
+            && runtime_service.contains("pub(crate) async fn compact_active_session")
+            && runtime_service.contains("pub(crate) async fn active_session_stats")
+            && !session_service.contains("last_context_envelope_nonblocking")
+            && !session_service.contains("active_messages_page")
+            && !session_service.contains("runtime_guard"),
+        "RuntimeService must own active runtime read projections while SessionService stays durable-session focused"
     );
     let session_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/session_routes.rs",
@@ -796,12 +801,11 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     assert!(
         !session_routes.contains(".active_runtime(")
             && !session_routes.contains(".remove_active_runtime(")
-            && !session_routes.contains("state.services.runtime.as_ref()")
             && session_routes.contains(".attach_session_value(")
             && session_routes.contains(".replay_session_value(")
-            && session_routes.contains("has_active_runtime")
+            && session_routes.contains("runtime_service.has_active_session")
             && session_routes.contains("session_exists"),
-        "session routes must use SessionService semantic helpers instead of runtime registry internals"
+        "session routes must use RuntimeService active-session helpers and SessionService durable-session helpers"
     );
     let runtime_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/runtime_routes.rs",
@@ -1240,8 +1244,6 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
         "local TUI runtime active",
         "local runtime remains active",
         "Gateway API unavailable for this message",
-        "capture_stdout(|| cli.handle_repl_command",
-        "cli.handle_repl_command",
         "run_turn_async",
         "Gateway turn cancellation API is not wired yet",
     ] {
@@ -1374,6 +1376,62 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
         runtime_service.contains("run_turn_with_timeout")
             && runtime_service.contains(".run_turn_async("),
         "RuntimeService is the gateway-owned boundary allowed to call the runtime turn engine"
+    );
+}
+
+#[test]
+fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell() {
+    let main_source = read_repo("crates/gateway/src/main.rs");
+    let production_main = production_part(&main_source);
+    for forbidden in [
+        "struct BuiltRuntime",
+        "impl BuiltRuntime",
+        "AnthropicRuntimeClient",
+        "CliToolExecutor",
+        "CliPermissionPrompter",
+        "LiveCli",
+        "struct PromptHistoryEntry",
+        "run_prompt(",
+        "handle_repl_command",
+        "run_removed_repl",
+    ] {
+        assert!(
+            !main_source.contains(forbidden),
+            "gateway main must not retain legacy direct AI shell symbol {forbidden}"
+        );
+    }
+    for forbidden in [
+        "use provider::",
+        "provider::ProviderClient",
+        "ApiProviderClient",
+        "CachedProviderClient",
+        "PromptCache",
+        "MessageRequest",
+        "ApiStreamEvent",
+        "ContentBlockDelta",
+    ] {
+        assert!(
+            !production_main.contains(forbidden),
+            "gateway production main must not directly create provider clients: {forbidden}"
+        );
+    }
+
+    let runtime_factory = read_repo("crates/gateway/src/runtime_factory.rs");
+    assert!(
+        runtime_factory.contains("pub(crate) fn build_runtime(")
+            && runtime_factory.contains("pub(crate) fn build_runtime_with_session_store(")
+            && runtime_factory.contains("runtime::ProviderRuntimeClient::new")
+            && runtime_factory.contains("GatewayToolExecutor::new"),
+        "runtime_factory must own GatewayRuntimeEntry assembly through runtime provider/tool hosts"
+    );
+
+    let session_routes = read_repo("crates/gateway/src/api_routes/session_routes.rs");
+    assert!(
+        session_routes.contains("crate::runtime_factory::build_runtime(")
+            && session_routes.contains("crate::runtime_factory::build_runtime_with_session_store(")
+            && !session_routes.contains("crate::build_runtime(")
+            && !session_routes.contains("crate::build_runtime_with_session_store("),
+        "session routes must call runtime_factory instead of gateway root factories"
     );
 }
 

@@ -35,7 +35,7 @@ pub(crate) fn format_unknown_option(option: &str) -> String {
 }
 
 pub(crate) fn format_unknown_direct_slash_command(name: &str) -> String {
-    let mut message = format!("unknown slash command outside the REPL: /{name}");
+    let mut message = format!("unknown slash command outside the TUI: /{name}");
     if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
     {
         message.push('\n');

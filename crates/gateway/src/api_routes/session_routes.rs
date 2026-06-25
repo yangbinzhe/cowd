@@ -369,7 +369,7 @@ async fn create_session(
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
     let runtime = if let Some(store) = state.services.session.unified_store() {
-        crate::build_runtime_with_session_store(
+        crate::runtime_factory::build_runtime_with_session_store(
             store.clone(),
             session,
             &session_id,
@@ -383,7 +383,7 @@ async fn create_session(
             None,
         )
     } else {
-        crate::build_runtime(
+        crate::runtime_factory::build_runtime(
             session,
             &session_id,
             model.clone(),
@@ -405,11 +405,15 @@ async fn create_session(
         )
     })?;
 
-    if let Err(error) = state
-        .services
-        .session
-        .register_runtime(session_id.clone(), runtime)
-    {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service not configured".to_string(),
+            }),
+        )
+    })?;
+    if let Err(error) = runtime_service.register_runtime(session_id.clone(), runtime) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -455,14 +459,19 @@ async fn ensure_session_handler(
     }
 
     let mut created = false;
-    if !state.services.session.has_active_runtime(&id) {
+    if !state
+        .services
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime_service| runtime_service.has_active_session(&id))
+    {
         let session = runtime::Session::new();
         let model = body
             .model
             .filter(|model| !model.trim().is_empty())
             .unwrap_or_else(|| default_session_model(&state));
         let runtime = if let Some(store) = state.services.session.unified_store() {
-            crate::build_runtime_with_session_store(
+            crate::runtime_factory::build_runtime_with_session_store(
                 store.clone(),
                 session,
                 &id,
@@ -476,7 +485,7 @@ async fn ensure_session_handler(
                 None,
             )
         } else {
-            crate::build_runtime(
+            crate::runtime_factory::build_runtime(
                 session,
                 &id,
                 model.clone(),
@@ -498,7 +507,15 @@ async fn ensure_session_handler(
             )
         })?;
 
-        if let Err(error) = state.services.session.register_runtime(id.clone(), runtime) {
+        let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime service not configured".to_string(),
+                }),
+            )
+        })?;
+        if let Err(error) = runtime_service.register_runtime(id.clone(), runtime) {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
@@ -561,7 +578,12 @@ async fn get_session(
         }
     }
 
-    if state.services.session.has_active_runtime(&id) {
+    if state
+        .services
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime_service| runtime_service.has_active_session(&id))
+    {
         Ok(Json(active_session_info(id)))
     } else {
         Err((
@@ -661,7 +683,11 @@ async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state.services.session.remove_active_runtime_if_present(&id);
+    let removed_active = state
+        .services
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime_service| runtime_service.remove_active_runtime_if_present(&id));
     let removed_stored = state
         .services
         .session
@@ -943,7 +969,15 @@ async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    match state.services.session.compact_active_session(&id).await {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service not configured".to_string(),
+            }),
+        )
+    })?;
+    match runtime_service.compact_active_session(&id).await {
         Ok(Some(result)) => {
             tracing::info!(
                 session_id = %id,
@@ -974,9 +1008,15 @@ async fn get_session_stats_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .session
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service not configured".to_string(),
+            }),
+        )
+    })?;
+    runtime_service
         .active_session_stats(&id)
         .await
         .map(Json)
@@ -995,7 +1035,15 @@ async fn update_session_handler(
     Path(id): Path<String>,
     Json(body): Json<SessionUpdateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let found = state
+    let active_found = match state.services.runtime.as_ref() {
+        Some(runtime_service) => {
+            runtime_service
+                .update_active_session_model(&id, body.model.as_deref())
+                .await
+        }
+        None => false,
+    };
+    let stored_found = state
         .services
         .session
         .update_session(&id, body)
@@ -1009,7 +1057,7 @@ async fn update_session_handler(
             )
         })?;
 
-    if found {
+    if active_found || stored_found {
         Ok(Json(serde_json::json!({
             "session_id": id,
             "updated": true,

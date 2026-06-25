@@ -280,7 +280,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "resume",
         aliases: &[],
-        summary: "Load a saved session into the REPL",
+        summary: "Load a saved session into the TUI",
         argument_hint: Some("<session-id|latest>"),
         resume_supported: false,
     },
@@ -585,7 +585,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "exit",
         aliases: &[],
-        summary: "Exit the REPL session",
+        summary: "Exit the TUI session",
         argument_hint: None,
         resume_supported: false,
     },

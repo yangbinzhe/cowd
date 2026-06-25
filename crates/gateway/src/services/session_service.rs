@@ -144,47 +144,17 @@ impl SessionService {
             .map_or_else(Vec::new, |kernel| kernel.list_active_session_ids())
     }
 
-    pub(crate) fn has_active_runtime(&self, session_id: &str) -> bool {
-        self.active_runtime(session_id).is_some()
-    }
-
     pub(crate) async fn session_exists(&self, session_id: &str) -> Result<bool, MemoryError> {
-        if self.has_active_runtime(session_id) {
+        if self
+            .list_active_session_ids()
+            .iter()
+            .any(|id| id == session_id)
+        {
             return Ok(true);
         }
         self.stored_session(session_id)
             .await
             .map(|record| record.is_some())
-    }
-
-    pub(crate) fn active_runtime(
-        &self,
-        session_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>> {
-        self.kernel()
-            .and_then(|kernel| kernel.active_runtime(session_id))
-    }
-
-    pub(crate) fn register_runtime(
-        &self,
-        session_id: String,
-        runtime: crate::BuiltRuntime,
-    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>>, String> {
-        self.kernel()
-            .ok_or_else(|| "session service not configured".to_string())?
-            .register_runtime(session_id, runtime)
-    }
-
-    pub(crate) fn remove_active_runtime(
-        &self,
-        session_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::BuiltRuntime>>> {
-        self.kernel()
-            .and_then(|kernel| kernel.remove_active_runtime(session_id))
-    }
-
-    pub(crate) fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
-        self.remove_active_runtime(session_id).is_some()
     }
 
     pub(crate) async fn attach_session_value(
@@ -558,227 +528,12 @@ impl SessionService {
         }
     }
 
-    pub(crate) async fn sync_runtime_session_snapshot(
-        &self,
-        session_id: &str,
-        session: &runtime::Session,
-    ) -> Result<(), MemoryError> {
-        match self.kernel() {
-            Some(kernel) => kernel
-                .sync_runtime_session_snapshot(session_id, session)
-                .await
-                .map(|_| ()),
-            None => Ok(()),
-        }
-    }
-
-    pub(crate) async fn compact_active_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionCompactResult>, MemoryError> {
-        let Some(runtime_entry) = self.active_runtime(session_id) else {
-            return Ok(None);
-        };
-
-        let mut runtime_guard = runtime_entry.lock().await;
-        let result = runtime_guard.compact(runtime::CompactionConfig::default());
-        if result.removed_message_count > 0 {
-            *runtime_guard.session_mut() = result.compacted_session.clone();
-        }
-        let session_snapshot = runtime_guard.session().clone();
-        drop(runtime_guard);
-
-        self.sync_runtime_session_snapshot(session_id, &session_snapshot)
-            .await?;
-
-        Ok(Some(SessionCompactResult {
-            session_id: session_id.to_string(),
-            compacted: result.removed_message_count > 0,
-            removed_message_count: result.removed_message_count,
-            summary: result.formatted_summary,
-        }))
-    }
-
-    pub(crate) async fn active_session_stats(
-        &self,
-        session_id: &str,
-    ) -> Option<SessionStatsSnapshot> {
-        let runtime_entry = self.active_runtime(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
-        let session = runtime_guard.session();
-        let messages = &session.messages;
-
-        let user_count = messages
-            .iter()
-            .filter(|message| message.role == runtime::MessageRole::User)
-            .count();
-        let assistant_count = messages
-            .iter()
-            .filter(|message| message.role == runtime::MessageRole::Assistant)
-            .count();
-        let tool_count = messages
-            .iter()
-            .filter(|message| message.role == runtime::MessageRole::Tool)
-            .count();
-
-        let input: u32 = messages
-            .iter()
-            .filter_map(|message| message.usage.as_ref())
-            .map(|usage| usage.input_tokens)
-            .sum();
-        let output: u32 = messages
-            .iter()
-            .filter_map(|message| message.usage.as_ref())
-            .map(|usage| usage.output_tokens)
-            .sum();
-
-        let mut tool_usage = HashMap::new();
-        for message in messages {
-            if message.role == runtime::MessageRole::Assistant {
-                for block in &message.blocks {
-                    if let runtime::ContentBlock::ToolUse { name, .. } = block {
-                        *tool_usage.entry(name.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-
-        Some(SessionStatsSnapshot {
-            session_id: session_id.to_string(),
-            message_count: messages.len(),
-            message_counts: SessionMessageCounts {
-                user: user_count,
-                assistant: assistant_count,
-                tool: tool_count,
-            },
-            tokens: SessionTokenCounts {
-                input,
-                output,
-                total: input + output,
-            },
-            tool_usage,
-            duration_ms: session.updated_at_ms.saturating_sub(session.created_at_ms),
-        })
-    }
-
-    pub(crate) fn last_context_envelope_nonblocking(
-        &self,
-        session_id: &str,
-    ) -> Option<runtime::ContextEnvelope> {
-        let runtime_entry = self.active_runtime(session_id)?;
-        let envelope = match runtime_entry.try_lock() {
-            Ok(runtime) => runtime.last_context_envelope(),
-            Err(_) => {
-                tracing::debug!(
-                    %session_id,
-                    "runtime context envelope skipped because active runtime is busy"
-                );
-                None
-            }
-        };
-        envelope
-    }
-
-    pub(crate) async fn active_messages_page(
-        &self,
-        session_id: &str,
-        offset: usize,
-        from_seq: Option<usize>,
-        limit: usize,
-    ) -> Option<ActiveMessagesPage> {
-        let runtime_entry = self.active_runtime(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
-        let session = runtime_guard.session();
-
-        let all_messages: Vec<serde_json::Value> = session
-            .messages
-            .iter()
-            .map(|msg| {
-                let role = match msg.role {
-                    runtime::MessageRole::System => "system",
-                    runtime::MessageRole::User => "user",
-                    runtime::MessageRole::Assistant => "assistant",
-                    runtime::MessageRole::Tool => "tool",
-                };
-                let blocks: Vec<serde_json::Value> = msg
-                    .blocks
-                    .iter()
-                    .map(|block| match block {
-                        runtime::ContentBlock::Text { text } => {
-                            serde_json::json!({"type": "text", "text": text})
-                        }
-                        runtime::ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        } => {
-                            let mut value =
-                                serde_json::json!({"type": "thinking", "thinking": thinking});
-                            if let Some(signature) = signature {
-                                value["signature"] =
-                                    serde_json::Value::String(signature.clone());
-                            }
-                            value
-                        }
-                        runtime::ContentBlock::ToolUse { id, name, input } => {
-                            serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
-                        }
-                        runtime::ContentBlock::ToolResult {
-                            tool_use_id,
-                            tool_name,
-                            output,
-                            is_error,
-                        } => {
-                            serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error})
-                        }
-                    })
-                    .collect();
-
-                let mut value = serde_json::json!({"role": role, "blocks": blocks});
-                if let Some(usage) = &msg.usage {
-                    value["usage"] = serde_json::json!({
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens,
-                    });
-                }
-                value
-            })
-            .collect();
-        let total = all_messages.len();
-        let start = from_seq.unwrap_or(offset);
-        let messages: Vec<serde_json::Value> =
-            all_messages.into_iter().skip(start).take(limit).collect();
-        let next_seq = (!messages.is_empty()).then_some(start + messages.len());
-        let has_more = next_seq.map(|seq| seq < total).unwrap_or(start < total);
-
-        Some(ActiveMessagesPage {
-            session_id: session_id.to_string(),
-            messages,
-            total,
-            offset,
-            from_seq,
-            next_seq,
-            limit,
-            has_more,
-        })
-    }
-
     pub(crate) async fn update_session(
         &self,
         session_id: &str,
         update: SessionUpdateRequest,
     ) -> Result<bool, MemoryError> {
         let mut found = false;
-
-        if let Some(runtime_entry) = self.active_runtime(session_id) {
-            found = true;
-            let mut runtime_guard = runtime_entry.lock().await;
-            let mut session = runtime_guard.session_mut_async().await;
-            if let Some(ref model) = update.model {
-                session.model = Some(model.clone());
-            }
-        }
 
         if let Some(mut record) = self.stored_session(session_id).await? {
             found = true;

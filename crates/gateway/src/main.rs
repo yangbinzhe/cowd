@@ -21,6 +21,7 @@ mod gateway_health;
 mod gateway_service;
 mod gateway_static;
 mod gateway_storage;
+mod gateway_tool_executor;
 mod init;
 mod logging;
 mod matrix_sqlite_repository;
@@ -28,6 +29,8 @@ mod mcp_serve;
 mod plugin_static;
 mod runtime_bootstrap;
 mod runtime_boundary;
+mod runtime_entry;
+mod runtime_factory;
 mod runtime_host;
 mod runtime_protocol;
 mod runtime_service;
@@ -46,28 +49,23 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::ops::{Deref, DerefMut};
 #[cfg(test)]
 use std::os::unix::io::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-#[cfg(test)]
-use std::time::UNIX_EPOCH;
 
 use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 use model_protocol::usage::TokenUsage;
+#[cfg(test)]
 use provider::{
-    detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    resolve_startup_auth_source, AuthSource, InputContentBlock, InputMessage, MessageResponse,
+    OutputContentBlock, ProviderClient as ApiProviderClient, ToolResultContentBlock,
 };
 
 #[cfg(test)]
@@ -77,17 +75,19 @@ use crate::command::slash::{
     SkillSlashDispatch, SlashCommand,
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
-use plugins::PluginRegistry;
 use runtime::ContextProfile;
+#[cfg(test)]
+use runtime::PromptCacheEvent;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
-    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ResolvedPermissionMode, ResumeContextPacket,
-    ResumeContextSource, RuntimeError, Session, ToolError, ToolExecutor, UsageTracker,
+    resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy, ResolvedPermissionMode,
+    ResumeContextPacket, ResumeContextSource, Session, UsageTracker,
 };
-use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpState};
-use serde::Deserialize;
+#[cfg(test)]
+use runtime::{AssistantEvent, RuntimeError};
+use runtime_bootstrap::GatewayToolRegistry;
+use runtime_entry::GatewayRuntimeEntry;
 use serde_json::json;
 use services::GatewayServices;
 
@@ -95,11 +95,6 @@ use services::GatewayServices;
 pub(crate) use entry::env_entry::resolve_tui_model;
 pub(crate) use entry::env_entry::{
     default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
-};
-#[cfg(test)]
-pub(crate) use entry::gateway_projection_entry::{
-    handle_gateway_approvals_command, handle_gateway_context_command,
-    handle_gateway_cross_plane_command, handle_gateway_tasks_command,
 };
 #[cfg(test)]
 pub(crate) use entry::gateway_projection_entry::{
@@ -115,12 +110,9 @@ pub(crate) use entry::local_command_entry::print_help_to;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::{
     format_bughunter_report, format_issue_report, format_pr_report, format_ultraplan_report,
-    render_last_tool_debug_report, render_teleport_report,
 };
 pub(crate) use entry::local_command_entry::{print_help, print_help_topic};
 use entry::mcp_entry::{handle_mcp_slash_command, handle_mcp_slash_command_json};
-#[cfg(test)]
-use entry::plugin_entry::{execute_plugin_command, print_plugin_command};
 pub(crate) use entry::session_archive_entry::{
     render_export_text, resolve_export_path, run_export,
 };
@@ -130,9 +122,8 @@ pub(crate) use entry::session_archive_entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::session_store_entry::{
-    confirm_session_deletion, create_managed_session_handle, delete_managed_session,
-    discover_local_session_import_candidates, hydrate_session_from_unified_store,
-    import_local_session_file, jsonl_sessions_dir, load_or_create_live_session,
+    create_managed_session_handle, discover_local_session_import_candidates,
+    hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
     resolve_session_reference, SessionHandle,
 };
 pub(crate) use entry::session_store_entry::{
@@ -147,6 +138,8 @@ use entry::static_entry::{
     print_system_prompt, print_version, render_version_report, version_json_value,
 };
 #[cfg(test)]
+pub(crate) use entry::status_entry::parse_git_status_branch;
+#[cfg(test)]
 pub(crate) use entry::status_entry::parse_git_status_metadata_for;
 pub(crate) use entry::status_entry::{
     format_sandbox_report, format_status_report, parse_git_status_metadata,
@@ -154,8 +147,6 @@ pub(crate) use entry::status_entry::{
     sandbox_json_value, status_context, status_context_for_session, status_json_value,
     GitWorkspaceSummary, StatusContext, StatusUsage,
 };
-#[cfg(test)]
-pub(crate) use entry::status_entry::{parse_git_status_branch, resolve_git_branch_for};
 use entry::workspace_entry::{
     print_setup, render_config_json, render_config_report, render_diff_json_for,
     render_diff_report_for, render_memory_json, render_memory_report, render_setup_json,
@@ -163,11 +154,9 @@ use entry::workspace_entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::workspace_entry::{render_diff_report, SetupItem, SetupSnapshot};
+use gateway_tool_executor::GatewayToolExecutor;
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
-    provider::max_tokens_for_model(model)
-}
 /// Global list of gateway child processes that must be reaped.
 /// Children are adopted (stored here) instead of dropping the handle,
 /// which prevents zombie processes when the gateway process exits.
@@ -1145,7 +1134,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
-        // rather than starting the interactive REPL (which would consume the pipe and
+        // rather than starting the interactive terminal shell (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
         if !std::io::stdin().is_terminal() {
             let mut buf = String::new();
@@ -1405,27 +1394,27 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
     cli::permission_mode_from_resolved(mode)
 }
 
-fn provider_label(kind: ProviderKind) -> &'static str {
+fn provider_label(kind: runtime::ProviderKind) -> &'static str {
     match kind {
-        ProviderKind::Anthropic => "anthropic",
-        ProviderKind::Xai => "xai",
-        ProviderKind::OpenAi => "openai",
+        runtime::ProviderKind::Anthropic => "anthropic",
+        runtime::ProviderKind::Xai => "xai",
+        runtime::ProviderKind::OpenAi => "openai",
     }
 }
 
 fn format_connected_line(model: &str) -> String {
-    let provider = provider_label(detect_provider_kind(model));
+    let provider = provider_label(runtime::detect_provider_kind(model));
     format!("Connected: {model} via {provider}")
 }
 
-fn filter_tool_specs(
+pub(crate) fn filter_tool_specs(
     tool_registry: &GatewayToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
-) -> Vec<ToolDefinition> {
+) -> Vec<runtime::ProviderToolDefinition> {
     tool_registry
         .definitions(allowed_tools)
         .into_iter()
-        .map(|tool| ToolDefinition {
+        .map(|tool| runtime::ProviderToolDefinition {
             name: tool.name,
             description: tool.description,
             input_schema: tool.input_schema,
@@ -2318,7 +2307,7 @@ fn run_resume_command(
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 return Err(
-                    "resumed /skills invocations are interactive-only; start `cowd` and run `/skills <skill>` in the REPL".into(),
+                    "resumed /skills invocations are interactive-only; start `cowd` and run `/skills <skill>` in the TUI".into(),
                 );
             }
             let cwd = env::current_dir()?;
@@ -2578,94 +2567,6 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[cfg(test)]
-fn run_removed_repl(
-    _model: String,
-    _session_id: Option<String>,
-    _allowed_tools: Option<AllowedToolSet>,
-    _permission_mode: PermissionMode,
-    _base_commit: Option<String>,
-    _reasoning_effort: Option<String>,
-    _allow_broad_cwd: bool,
-    _yolo_mode: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Err(
-        "interactive TUI is owned by the cowd CLI; run `cowd` instead of entering gateway directly"
-            .into(),
-    )
-}
-
-#[cfg(test)]
-struct SessionSwitchReport {
-    session_id: String,
-    session_path: PathBuf,
-    message_count: usize,
-}
-
-#[cfg(test)]
-fn activate_live_cli_session(
-    cli: &mut LiveCli,
-    handle: SessionHandle,
-    session: Session,
-    action: &str,
-) -> Result<SessionSwitchReport, Box<dyn std::error::Error>> {
-    let message_count = session.messages.len();
-    let session_id = session.session_id.clone();
-    let registry_session = session.clone();
-    let runtime = build_runtime(
-        session,
-        &handle.id,
-        cli.model.clone(),
-        cli.system_prompt.clone(),
-        true,
-        true,
-        cli.allowed_tools.clone(),
-        cli.permission_mode,
-        None,
-        None,
-    )?;
-    if let Some(ref active_sessions) = cli.active_sessions {
-        let registry_runtime = build_runtime(
-            registry_session,
-            &handle.id,
-            cli.model.clone(),
-            cli.system_prompt.clone(),
-            true,
-            true,
-            cli.allowed_tools.clone(),
-            cli.permission_mode,
-            None,
-            None,
-        )?;
-        if let Err(e) = active_sessions.register(session_id.clone(), registry_runtime) {
-            tracing::warn!("failed to register {action} session in ActiveSessions: {e}");
-        }
-    }
-    cli.replace_runtime(runtime)?;
-    cli.session = SessionHandle {
-        id: session_id.clone(),
-        path: handle.path.clone(),
-    };
-    Ok(SessionSwitchReport {
-        session_id,
-        session_path: handle.path,
-        message_count,
-    })
-}
-
-#[cfg(test)]
-fn switch_live_cli_session(
-    cli: &mut LiveCli,
-    target: &str,
-) -> Result<SessionSwitchReport, Box<dyn std::error::Error>> {
-    let (handle, session) = load_session_reference(target)?;
-    activate_live_cli_session(cli, handle, session, "switched")
-}
-
-/// Process all pending CowdEvents from the channel without blocking.
-/// This is called at the top of the TUI render loop to keep the display
-/// in sync with the background turn runner.
 #[cfg(test)]
 fn capture_stdout<F, R>(f: F) -> Result<(R, String), Box<dyn std::error::Error>>
 where
@@ -2699,114 +2600,10 @@ where
     Ok((result?, buf))
 }
 
-#[cfg(test)]
-pub(crate) struct LiveCli {
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    yolo_mode: bool,
-    yolo_task: Option<task_kernel::TaskRecord>,
-    next_turn_resume_profile: bool,
-    system_prompt: Vec<String>,
-    runtime: BuiltRuntime,
-    session: SessionHandle,
-    prompt_history: Vec<PromptHistoryEntry>,
-    active_sessions: Option<Arc<crate::gateway::ActiveSessions>>,
-}
-
 #[derive(Debug, Clone)]
-pub(crate) struct PromptHistoryEntry {
+pub(crate) struct SessionPromptHistoryEntry {
     timestamp_ms: u64,
     text: String,
-}
-
-pub(crate) struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
-    plugin_registry: PluginRegistry,
-    plugins_active: bool,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    mcp_active: bool,
-    resume_context_loaded: bool,
-}
-
-impl BuiltRuntime {
-    fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
-        plugin_registry: PluginRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-        resume_context_loaded: bool,
-    ) -> Self {
-        Self {
-            runtime: Some(runtime),
-            plugin_registry,
-            plugins_active: true,
-            mcp_state,
-            mcp_active: true,
-            resume_context_loaded,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_runtime_shell() -> Self {
-        Self {
-            runtime: None,
-            plugin_registry: PluginRegistry::default(),
-            plugins_active: false,
-            mcp_state: None,
-            mcp_active: false,
-            resume_context_loaded: false,
-        }
-    }
-
-    fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing hook abort signal");
-        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
-        self
-    }
-
-    pub(crate) fn install_turn_control(
-        &mut self,
-        cancellation_token: runtime::CancellationToken,
-        hook_abort_signal: runtime::HookAbortSignal,
-    ) {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing turn control");
-        self.runtime = Some(
-            runtime
-                .with_cancellation_token(cancellation_token)
-                .with_hook_abort_signal(hook_abort_signal),
-        );
-    }
-
-    fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.plugins_active {
-            self.plugin_registry.shutdown()?;
-            self.plugins_active = false;
-        }
-        Ok(())
-    }
-
-    fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.mcp_active {
-            if let Some(mcp_state) = &self.mcp_state {
-                mcp_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .shutdown()?;
-            }
-            self.mcp_active = false;
-        }
-        Ok(())
-    }
-
-    fn resume_context_loaded(&self) -> bool {
-        self.resume_context_loaded
-    }
 }
 
 fn cli_turn_context_profile(
@@ -2829,7 +2626,7 @@ fn cli_turn_context_profile(
 }
 
 fn apply_cli_turn_context_profile(
-    runtime: &BuiltRuntime,
+    runtime: &GatewayRuntimeEntry,
     yolo_mode: bool,
     permission_mode: PermissionMode,
     resume_context: bool,
@@ -2841,56 +2638,6 @@ fn apply_cli_turn_context_profile(
         resume_context,
         review_context,
     ));
-}
-
-impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
-
-    fn deref(&self) -> &Self::Target {
-        self.runtime
-            .as_ref()
-            .expect("runtime should exist while built runtime is alive")
-    }
-}
-
-impl DerefMut for BuiltRuntime {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.runtime
-            .as_mut()
-            .expect("runtime should exist while built runtime is alive")
-    }
-}
-
-impl Drop for BuiltRuntime {
-    fn drop(&mut self) {
-        let _ = self.shutdown_mcp();
-        let _ = self.shutdown_plugins();
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolSearchRequest {
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpToolRequest {
-    #[serde(rename = "qualifiedName")]
-    qualified_name: Option<String>,
-    tool: Option<String>,
-    arguments: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListMcpResourcesRequest {
-    server: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadMcpResourceRequest {
-    server: String,
-    uri: String,
 }
 
 struct HookAbortMonitor {
@@ -3066,1139 +2813,11 @@ fn current_task_phase_for_display(
         .or_else(|| task.phases.last())
 }
 
-#[cfg(test)]
-impl LiveCli {
-    fn new(
-        model: String,
-        session_id: Option<String>,
-        enable_tools: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
-        yolo_mode: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
-        let (session, session_state) = load_or_create_live_session(session_id)?;
-        let cwd = std::env::current_dir()?;
-        init_runtime_providers_for_cwd(&cwd);
-        let runtime = build_runtime(
-            session_state,
-            &session.id,
-            model.clone(),
-            system_prompt.clone(),
-            enable_tools,
-            true,
-            allowed_tools.clone(),
-            permission_mode,
-            None,
-            None,
-        )?;
-        let cli = Self {
-            model,
-            allowed_tools,
-            permission_mode,
-            yolo_mode,
-            yolo_task: None,
-            next_turn_resume_profile: false,
-            system_prompt,
-            runtime,
-            session,
-            prompt_history: Vec::new(),
-            active_sessions: None,
-        };
-        cli.persist_session()?;
-        Ok(cli)
-    }
-
-    fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(effort);
-        }
-    }
-
-    /// Set the shared ActiveSessions registry for session tracking.
-    pub(crate) fn set_active_sessions(
-        &mut self,
-        active_sessions: Arc<crate::gateway::ActiveSessions>,
-    ) {
-        self.active_sessions = Some(active_sessions);
-    }
-
-    fn startup_banner(&self) -> String {
-        format_startup_banner_with_task(
-            &self.model,
-            self.yolo_mode,
-            &self.session.id,
-            self.yolo_task.as_ref(),
-        )
-    }
-
-    fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
-            &self.model,
-            Some(&self.session.id),
-            list_managed_sessions()?
-                .into_iter()
-                .map(|session| session.id)
-                .collect(),
-        ))
-    }
-
-    fn prepare_turn_runtime(
-        &self,
-        emit_output: bool,
-        tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-        stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-    ) -> Result<
-        (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
-        Box<dyn std::error::Error>,
-    > {
-        let hook_abort_signal = runtime::HookAbortSignal::new();
-        let abort_for_caller = hook_abort_signal.clone();
-        let runtime = build_runtime(
-            self.runtime.session().without_persistence(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            tool_callback,
-            stream_callback,
-        )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
-
-        Ok((runtime, hook_abort_monitor, abort_for_caller))
-    }
-
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.shutdown_plugins()?;
-        self.runtime = runtime;
-        Ok(())
-    }
-
-    fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _) = self.prepare_turn_runtime(true, None, None)?;
-        let resume_context = std::mem::take(&mut self.next_turn_resume_profile);
-        apply_cli_turn_context_profile(
-            &runtime,
-            self.yolo_mode,
-            self.permission_mode,
-            resume_context,
-            false,
-        );
-        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
-            CliPermissionPrompter::new(self.permission_mode),
-        ));
-        let handle =
-            tokio::runtime::Handle::try_current().unwrap_or_else(|_| SHARED_RT.handle().clone());
-        let result = handle.block_on(runtime.run_turn_async(input, &prompter));
-        hook_abort_monitor.stop();
-        match result {
-            Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
-                }
-                self.persist_session()?;
-                Ok(())
-            }
-            Err(error) => {
-                runtime.shutdown_plugins()?;
-                Err(Box::new(error))
-            }
-        }
-    }
-
-    fn handle_gateway_tasks_command(
-        &mut self,
-        args: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        handle_gateway_tasks_command(args)
-    }
-
-    fn handle_gateway_approvals_command(
-        &mut self,
-        args: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        handle_gateway_approvals_command(args)
-    }
-
-    fn handle_gateway_context_command(
-        &mut self,
-        args: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        handle_gateway_context_command(args, &self.session.id)
-    }
-
-    fn handle_gateway_cross_plane_command(
-        &mut self,
-        args: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        handle_gateway_cross_plane_command(args)
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn handle_repl_command(
-        &mut self,
-        command: SlashCommand,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        Ok(match command {
-            SlashCommand::Help => {
-                println!("## Cowd Commands\n");
-                println!(
-                    "**Session**: /status /cost /resume /session /new /clear /compact /retry /undo"
-                );
-                println!("**Memory**: /memory /closet /sandbox");
-                println!("**Agent**: /subagent /pipeline /agents");
-                println!("**Gateway**: /tasks /approvals /context /cross-plane");
-                println!("**Project**: /state /diff /commit /init /config /title");
-                println!("**Model**: use --model or config aliases (main/fast/coder/reasoning)");
-                println!("Type /<command> --help for details.");
-                false
-            }
-            SlashCommand::Status => {
-                self.print_status();
-                false
-            }
-            SlashCommand::Bughunter { scope } => {
-                self.run_bughunter(scope.as_deref())?;
-                false
-            }
-            SlashCommand::Commit => {
-                self.run_commit(None)?;
-                false
-            }
-            SlashCommand::Pr { context } => {
-                self.run_pr(context.as_deref())?;
-                false
-            }
-            SlashCommand::Issue { context } => {
-                self.run_issue(context.as_deref())?;
-                false
-            }
-            SlashCommand::Ultraplan { task } => {
-                self.run_ultraplan(task.as_deref())?;
-                false
-            }
-            SlashCommand::Teleport { target } => {
-                Self::run_teleport(target.as_deref())?;
-                false
-            }
-            SlashCommand::DebugToolCall => {
-                self.run_debug_tool_call(None)?;
-                false
-            }
-            SlashCommand::Sandbox => {
-                Self::print_sandbox_status();
-                false
-            }
-            SlashCommand::Compact => {
-                self.compact()?;
-                false
-            }
-            SlashCommand::Model { model } => self.set_model(model)?,
-            SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
-            SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
-            SlashCommand::Cost => {
-                self.print_cost();
-                false
-            }
-            SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
-            SlashCommand::Config { section } => {
-                Self::print_config(section.as_deref())?;
-                false
-            }
-            SlashCommand::Setup => {
-                Self::print_setup()?;
-                false
-            }
-            SlashCommand::Mcp { action, target } => {
-                let args = match (action.as_deref(), target.as_deref()) {
-                    (None, None) => None,
-                    (Some(action), None) => Some(action.to_string()),
-                    (Some(action), Some(target)) => Some(format!("{action} {target}")),
-                    (None, Some(target)) => Some(target.to_string()),
-                };
-                Self::print_mcp(args.as_deref(), CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Memory => {
-                Self::print_memory()?;
-                false
-            }
-            SlashCommand::Init => {
-                run_init(CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Diff => {
-                Self::print_diff()?;
-                false
-            }
-            SlashCommand::Version => {
-                Self::print_version(CliOutputFormat::Text);
-                false
-            }
-            SlashCommand::Export { path } => {
-                self.export_session(path.as_deref())?;
-                false
-            }
-            SlashCommand::Session { action, target } => {
-                self.handle_session_command(action.as_deref(), target.as_deref())?
-            }
-            SlashCommand::Plugins { action, target } => {
-                self.handle_plugins_command(action.as_deref(), target.as_deref())?
-            }
-            SlashCommand::Agents { args } => {
-                Self::print_agents(args.as_deref(), CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Skills { args } => {
-                match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
-                    SkillSlashDispatch::Local => {
-                        Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
-                    }
-                }
-                false
-            }
-            SlashCommand::Doctor => {
-                println!("{}", doctor::render_doctor_report()?.render());
-                false
-            }
-            SlashCommand::History { count } => {
-                self.print_prompt_history(count.as_deref());
-                false
-            }
-            SlashCommand::Tasks { args } => {
-                self.handle_gateway_tasks_command(args.as_deref())?;
-                false
-            }
-            SlashCommand::Approvals { args } => {
-                self.handle_gateway_approvals_command(args.as_deref())?;
-                false
-            }
-            SlashCommand::Context { action } => {
-                self.handle_gateway_context_command(action.as_deref())?;
-                false
-            }
-            SlashCommand::CrossPlane { args } => {
-                self.handle_gateway_cross_plane_command(args.as_deref())?;
-                false
-            }
-            SlashCommand::Stats => {
-                let usage = UsageTracker::from_session(&self.runtime.session()).cumulative_usage();
-                println!("{}", format_cost_report(usage));
-                false
-            }
-            SlashCommand::Login
-            | SlashCommand::Logout
-            | SlashCommand::Vim
-            | SlashCommand::Upgrade
-            | SlashCommand::Share
-            | SlashCommand::Feedback
-            | SlashCommand::Files
-            | SlashCommand::Fast
-            | SlashCommand::Exit
-            | SlashCommand::Summary
-            | SlashCommand::Desktop
-            | SlashCommand::Brief
-            | SlashCommand::Advisor
-            | SlashCommand::Stickers
-            | SlashCommand::Insights
-            | SlashCommand::Thinkback
-            | SlashCommand::ReleaseNotes
-            | SlashCommand::SecurityReview
-            | SlashCommand::Keybindings
-            | SlashCommand::PrivacySettings
-            | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
-            | SlashCommand::Theme { .. }
-            | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
-            | SlashCommand::Rename { .. }
-            | SlashCommand::Copy { .. }
-            | SlashCommand::Hooks { .. }
-            | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
-            | SlashCommand::Branch { .. }
-            | SlashCommand::Rewind { .. }
-            | SlashCommand::Ide { .. }
-            | SlashCommand::Tag { .. }
-            | SlashCommand::OutputStyle { .. }
-            | SlashCommand::AddDir { .. }
-            | SlashCommand::Handoff { .. }
-            | SlashCommand::AgentProfile { .. } => {
-                eprintln!("{} not yet implemented.", command.slash_name());
-                false
-            }
-            SlashCommand::Closet { topic } => {
-                let q = topic.unwrap_or_default();
-                println!("## Closet: {q}\nUse /memory for full management.");
-                false
-            }
-            SlashCommand::SandboxSearch { query } => {
-                let q = query.unwrap_or_default();
-                println!("## Sandbox: {q}\nUse /sandbox <query> to search tool outputs.");
-                false
-            }
-            SlashCommand::Retry => {
-                println!("Retry: resend last message.");
-                false
-            }
-            SlashCommand::Undo => {
-                println!("Undo: remove last exchange.");
-                false
-            }
-            SlashCommand::NewSession => self.handle_session_command(Some("new"), None)?,
-            SlashCommand::Title { name } => {
-                println!("Title: {}", name.unwrap_or_default());
-                false
-            }
-            SlashCommand::Compress => {
-                println!("Compacting...");
-                false
-            }
-            SlashCommand::State => {
-                println!("## Project State\nCtrl+T toggles theme. /state for status.");
-                false
-            }
-            SlashCommand::Pipeline { task } => {
-                let t = task.unwrap_or_default();
-                if !t.is_empty() {
-                    println!("## Pipeline: Reasoner→Executor→Reviewer");
-                    let _ = self.run_turn(&format!(
-                        "[Reasoner] Analyze this task and propose approach: {t}"
-                    ));
-                    let _ = self.run_turn(
-                        "[Executor] Implement the proposed approach. Write code and commit.",
-                    );
-                    let _ = self.run_turn(
-                        "[Reviewer] Review the implementation. Check correctness and completeness.",
-                    );
-                } else {
-                    println!("Usage: /pipeline <task description>");
-                }
-                false
-            }
-            SlashCommand::Solve { problem } => {
-                let p = problem.as_deref().unwrap_or("");
-                if p.is_empty() {
-                    println!("Usage: /solve \"problem description\"");
-                    println!("Runs the 7-phase Joint Problem Solving protocol (P8.3).");
-                } else {
-                    println!("## Joint Problem Solving (P8.3)");
-                    println!("Problem: {p}");
-                    println!(
-                        "Phases: ProblemFraming → SolutionBrainstorming → SolutionMerger → Evaluation → Selection → Execution → Review"
-                    );
-                    let prompt = format!(
-                        "Solve the following problem using the Joint Problem Solving protocol (P8.3).\n\n\
-                         ## Problem\n{p}\n\n\
-                         Follow the 7-phase protocol:\n\
-                         1. ProblemFraming - Analyze and frame the problem\n\
-                         2. SolutionBrainstorming - Propose concrete solutions\n\
-                         3. SolutionMerger - Deduplicate and merge similar solutions\n\
-                         4. Evaluation - Score all solutions on clarity, feasibility, novelty, impact, efficiency\n\
-                         5. Selection - Select the best solution\n\
-                         6. Execution - Implement the selected solution\n\
-                         7. Review - Review the results\n\n\
-                         Begin with Phase 1: ProblemFraming."
-                    );
-                    if let Err(e) = self.run_turn(&prompt) {
-                        eprintln!("Solve error: {e}");
-                    }
-                }
-                false
-            }
-            SlashCommand::SubAgent { role, task } => {
-                let r = role.as_deref().unwrap_or("executor");
-                let t = task.as_deref().unwrap_or("");
-                if t.is_empty() {
-                    println!("Usage: /subagent <role> <task>");
-                    println!("Roles: reasoner, executor, reviewer");
-                } else {
-                    let prefix = match r {
-                        "reasoner" => "You are a Reasoner. Analyze, don't execute. ",
-                        "executor" => "You are an Executor. Implement the plan. ",
-                        "reviewer" => "You are a Reviewer. Check quality. ",
-                        _ => "",
-                    };
-                    if let Err(e) = self.run_turn(&format!("{prefix}Task: {t}")) {
-                        eprintln!("SubAgent error: {e}");
-                    }
-                }
-                false
-            }
-            SlashCommand::Unknown(name) => {
-                eprintln!("{}", suggestions::format_unknown_slash_command(&name));
-                false
-            }
-        })
-    }
-
-    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let session = self.runtime.session();
-        if let Ok(store) = get_unified_store() {
-            sync_cli_session_to_unified_store(
-                store,
-                &self.session,
-                Some(self.model.as_str()),
-                &session,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn print_status(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
-        let latest = self.runtime.usage().current_turn_usage();
-        println!(
-            "{}",
-            format_status_report(
-                &self.model,
-                StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
-                    latest,
-                    cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
-                },
-                self.permission_mode.as_str(),
-                if self.yolo_mode { "yolo" } else { "standard" },
-                &status_context_for_session(
-                    Some(&self.session.path),
-                    Some(self.session.id.as_str())
-                )
-                .expect("status context should load"),
-            )
-        );
-    }
-
-    fn record_prompt_history(&mut self, prompt: &str) {
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map_or(self.runtime.session().updated_at_ms, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            });
-        let entry = PromptHistoryEntry {
-            timestamp_ms,
-            text: prompt.to_string(),
-        };
-        self.prompt_history.push(entry);
-        if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
-            eprintln!("warning: failed to persist prompt history: {error}");
-        }
-    }
-
-    fn print_prompt_history(&self, count: Option<&str>) {
-        let limit = match parse_history_count(count) {
-            Ok(limit) => limit,
-            Err(message) => {
-                eprintln!("{message}");
-                return;
-            }
-        };
-        let session_entries = &self.runtime.session().prompt_history;
-        let entries = if session_entries.is_empty() {
-            if self.prompt_history.is_empty() {
-                collect_session_prompt_history(&self.runtime.session())
-            } else {
-                self.prompt_history
-                    .iter()
-                    .map(|entry| PromptHistoryEntry {
-                        timestamp_ms: entry.timestamp_ms,
-                        text: entry.text.clone(),
-                    })
-                    .collect()
-            }
-        } else {
-            session_entries
-                .iter()
-                .map(|entry| PromptHistoryEntry {
-                    timestamp_ms: entry.timestamp_ms,
-                    text: entry.text.clone(),
-                })
-                .collect()
-        };
-        println!("{}", render_prompt_history_report(&entries, limit));
-    }
-
-    fn print_sandbox_status() {
-        let cwd = env::current_dir().expect("current dir");
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader
-            .load()
-            .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-        println!(
-            "{}",
-            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
-        );
-    }
-
-    fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(model) = model else {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
-            );
-            return Ok(false);
-        };
-
-        let model = resolve_model_alias_with_config(&model);
-
-        if model == self.model {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
-            );
-            return Ok(false);
-        }
-
-        let previous = self.model.clone();
-        let message_count = self.runtime.session().messages.len();
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().switch_model(&model)?;
-        }
-        self.model.clone_from(&model);
-        println!(
-            "{}",
-            format_model_switch_report(&previous, &model, message_count)
-        );
-        Ok(true)
-    }
-
-    fn set_permissions(
-        &mut self,
-        mode: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(mode) = mode else {
-            println!(
-                "{}",
-                format_permissions_report(self.permission_mode.as_str())
-            );
-            return Ok(false);
-        };
-
-        let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })?;
-
-        if normalized == self.permission_mode.as_str() {
-            println!("{}", format_permissions_report(normalized));
-            return Ok(false);
-        }
-
-        let previous = self.permission_mode.as_str().to_string();
-        let session = self.runtime.session().without_persistence();
-        self.permission_mode = permission_mode_from_label(normalized);
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!(
-            "{}",
-            format_permissions_switch_report(&previous, normalized)
-        );
-        Ok(true)
-    }
-
-    fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
-        if !confirm {
-            println!(
-                "clear: confirmation required; run /clear --confirm to start a fresh session."
-            );
-            return Ok(false);
-        }
-
-        let previous_session = self.session.clone();
-        let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
-        let runtime = build_runtime(
-            session_state,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!(
-            "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Store            SQLite session store",
-            previous_session.id,
-            previous_session.id,
-            self.model,
-            self.permission_mode.as_str(),
-            self.session.id,
-        );
-        Ok(true)
-    }
-
-    fn print_cost(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
-    }
-
-    fn resume_session(
-        &mut self,
-        session_path: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(session_ref) = session_path else {
-            println!("{}", render_resume_usage());
-            return Ok(false);
-        };
-
-        let (handle, session) = load_session_reference(&session_ref)?;
-        let message_count = session.messages.len();
-        let session_id = session.session_id.clone();
-        let runtime = build_runtime(
-            session,
-            &handle.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
-        self.next_turn_resume_profile = true;
-        println!(
-            "{}",
-            format_resume_report(
-                &self.session.path.display().to_string(),
-                message_count,
-                self.runtime.usage().turns(),
-            )
-        );
-        Ok(true)
-    }
-
-    fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_config_report(section)?);
-        Ok(())
-    }
-
-    fn print_setup() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_setup_report()?);
-        Ok(())
-    }
-
-    fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_memory_report()?);
-        Ok(())
-    }
-
-    fn print_agents(
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        let agent_service = GatewayServices::baseline().agent;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", agent_service.command_text(&cwd, args)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&agent_service.command_json(&cwd, args)?)?
-            ),
-        }
-        Ok(())
-    }
-
-    fn print_mcp(
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
-            ),
-        }
-        Ok(())
-    }
-
-    fn print_skills(
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        let skill_service = GatewayServices::baseline().skill;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&skill_service.command_json(&cwd, args)?)?
-            ),
-        }
-        Ok(())
-    }
-
-    fn print_plugins(
-        action: Option<&str>,
-        target: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        print_plugin_command(action, target, output_format)
-    }
-
-    fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_diff_report()?);
-        Ok(())
-    }
-
-    fn print_version(output_format: CliOutputFormat) {
-        let _ = crate::print_version(output_format);
-    }
-
-    fn export_session(
-        &self,
-        requested_path: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let export_path = resolve_export_path(requested_path, &self.runtime.session())?;
-        fs::write(&export_path, render_export_text(&self.runtime.session()))?;
-        println!(
-            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
-            export_path.display(),
-            self.runtime.session().messages.len(),
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn handle_session_command(
-        &mut self,
-        action: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        match action {
-            None | Some("list") => {
-                println!("{}", render_session_list(&self.session.id)?);
-                Ok(false)
-            }
-            Some("switch") => {
-                let Some(target) = target else {
-                    println!("Usage: /session switch <session-id>");
-                    return Ok(false);
-                };
-                let report = switch_live_cli_session(self, target)?;
-                println!(
-                    "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
-                    report.session_id,
-                    report.session_path.display(),
-                    report.message_count,
-                );
-                Ok(true)
-            }
-            Some("new") => {
-                // Create a fresh session
-                let new_session = new_cli_session()?;
-                let session_id = new_session.session_id.clone();
-                let handle = create_managed_session_handle(&session_id)?;
-                let message_count = new_session.messages.len();
-                let registry_session = new_session.clone();
-                let runtime = build_runtime(
-                    new_session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                    None,
-                )?;
-                // Register in ActiveSessions for API access
-                if let Some(ref as2) = self.active_sessions {
-                    let registry_runtime = build_runtime(
-                        registry_session,
-                        &handle.id,
-                        self.model.clone(),
-                        self.system_prompt.clone(),
-                        true,
-                        true,
-                        self.allowed_tools.clone(),
-                        self.permission_mode,
-                        None,
-                        None,
-                    )?;
-                    if let Err(e) = as2.register(session_id.clone(), registry_runtime) {
-                        tracing::warn!("failed to register new session in ActiveSessions: {e}");
-                    }
-                }
-                self.replace_runtime(runtime)?;
-                self.session = handle;
-                let _ = self.persist_session();
-                println!(
-                    "New session created\n  Active session   {}\n  File             {}\n  Messages         {}",
-                    self.session.id,
-                    self.session.path.display(),
-                    message_count,
-                );
-                Ok(true)
-            }
-            Some("fork") => {
-                let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
-                let parent_session_id = self.session.id.clone();
-                let handle = create_managed_session_handle(&forked.session_id)?;
-                let branch_name = forked
-                    .fork
-                    .as_ref()
-                    .and_then(|fork| fork.branch_name.clone());
-                let message_count = forked.messages.len();
-                activate_live_cli_session(self, handle, forked, "forked")?;
-                self.persist_session()?;
-                println!(
-                    "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
-                    parent_session_id,
-                    self.session.id,
-                    branch_name.as_deref().unwrap_or("(unnamed)"),
-                    self.session.path.display(),
-                    message_count,
-                );
-                Ok(true)
-            }
-            Some("delete") => {
-                let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
-                    return Ok(false);
-                };
-                let handle = resolve_session_reference(target)?;
-                if handle.id == self.session.id {
-                    println!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    return Ok(false);
-                }
-                if !confirm_session_deletion(&handle.id) {
-                    println!("delete: cancelled.");
-                    return Ok(false);
-                }
-                delete_managed_session(&handle.id)?;
-                println!(
-                    "Session deleted\n  Deleted session  {}\n  Store            {}",
-                    handle.id,
-                    session_db_path().display(),
-                );
-                Ok(false)
-            }
-            Some("delete-force") => {
-                let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
-                    return Ok(false);
-                };
-                let handle = resolve_session_reference(target)?;
-                if handle.id == self.session.id {
-                    println!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    return Ok(false);
-                }
-                delete_managed_session(&handle.id)?;
-                println!(
-                    "Session deleted\n  Deleted session  {}\n  Store            {}",
-                    handle.id,
-                    session_db_path().display(),
-                );
-                Ok(false)
-            }
-            Some(other) => {
-                println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    fn handle_plugins_command(
-        &mut self,
-        action: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let outcome = execute_plugin_command(action, target)?;
-        println!("{}", outcome.message);
-        if outcome.reload_runtime {
-            self.reload_runtime_features()?;
-        }
-        Ok(false)
-    }
-
-    fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = build_runtime(
-            self.runtime.session().without_persistence(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()
-    }
-
-    fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
-        let removed = result.removed_message_count;
-        let kept = result.compacted_session.messages.len();
-        let skipped = removed == 0;
-        let runtime = build_runtime(
-            result.compacted_session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!("{}", format_compact_report(removed, kept, skipped));
-        Ok(())
-    }
-
-    fn run_internal_prompt_text(
-        &self,
-        prompt: &str,
-        enable_tools: bool,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let session = self.runtime.session().without_persistence();
-        let mut runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            enable_tools,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        apply_cli_turn_context_profile(&runtime, self.yolo_mode, self.permission_mode, false, true);
-        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
-            CliPermissionPrompter::new(self.permission_mode),
-        ));
-        let handle =
-            tokio::runtime::Handle::try_current().unwrap_or_else(|_| SHARED_RT.handle().clone());
-        let summary = handle.block_on(runtime.run_turn_async(prompt, &prompter))?;
-        let text = final_assistant_text(&summary).trim().to_string();
-        runtime.shutdown_plugins()?;
-        Ok(text)
-    }
-
-    fn run_bughunter(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_bughunter_report(scope));
-        Ok(())
-    }
-
-    fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_ultraplan_report(task));
-        Ok(())
-    }
-
-    fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
-            println!("Usage: /teleport <symbol-or-path>");
-            return Ok(());
-        };
-
-        println!("{}", render_teleport_report(target)?);
-        Ok(())
-    }
-
-    fn run_debug_tool_call(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        validate_no_args("/debug-tool-call", args)?;
-        println!(
-            "{}",
-            render_last_tool_debug_report(&self.runtime.session())?
-        );
-        Ok(())
-    }
-
-    fn run_commit(&mut self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        validate_no_args("/commit", args)?;
-        let status = git_output(&["status", "--short", "--branch"])?;
-        let summary = parse_git_workspace_summary(Some(&status));
-        let branch = parse_git_status_branch(Some(&status));
-        if summary.is_clean() {
-            println!("{}", format_commit_skipped_report());
-            return Ok(());
-        }
-
-        println!(
-            "{}",
-            format_commit_preflight_report(branch.as_deref(), summary)
-        );
-        Ok(())
-    }
-
-    fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let branch =
-            resolve_git_branch_for(&env::current_dir()?).unwrap_or_else(|| "unknown".to_string());
-        println!("{}", format_pr_report(&branch, context));
-        Ok(())
-    }
-
-    fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_issue_report(context));
-        Ok(())
-    }
-}
-
 fn render_terminal_help() -> String {
     [
-        "REPL".to_string(),
-        "  /exit                Quit the REPL".to_string(),
-        "  /quit                Quit the REPL".to_string(),
+        "Terminal controls".to_string(),
+        "  /exit                Quit the terminal session".to_string(),
+        "  /quit                Quit the terminal session".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
@@ -4368,7 +2987,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
+fn render_prompt_history_report(entries: &[SessionPromptHistoryEntry], limit: usize) -> String {
     if entries.is_empty() {
         return "Prompt history\n  Result           no prompts recorded yet".to_string();
     }
@@ -4380,7 +2999,7 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
         "Prompt history".to_string(),
         format!("  Total            {total}"),
         format!("  Showing          {} most recent", shown.len()),
-        format!("  Reverse search   Ctrl-R in the REPL"),
+        format!("  Reverse search   available in TUI history"),
         String::new(),
     ];
     for (offset, entry) in shown.iter().enumerate() {
@@ -4398,12 +3017,12 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
     lines.join("\n")
 }
 
-fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> {
+fn collect_session_prompt_history(session: &Session) -> Vec<SessionPromptHistoryEntry> {
     if !session.prompt_history.is_empty() {
         return session
             .prompt_history
             .iter()
-            .map(|entry| PromptHistoryEntry {
+            .map(|entry| SessionPromptHistoryEntry {
                 timestamp_ms: entry.timestamp_ms,
                 text: entry.text.clone(),
             })
@@ -4416,7 +3035,7 @@ fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> 
         .filter(|message| message.role == MessageRole::User)
         .filter_map(|message| {
             message.blocks.iter().find_map(|block| match block {
-                ContentBlock::Text { text } => Some(PromptHistoryEntry {
+                ContentBlock::Text { text } => Some(SessionPromptHistoryEntry {
                     timestamp_ms,
                     text: text.clone(),
                 }),
@@ -4577,91 +3196,6 @@ fn init_runtime_providers_for_cwd(cwd: &Path) {
     }
 }
 
-#[cfg(test)]
-fn run_prompt(
-    text: &str,
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    base_commit: Option<String>,
-    reasoning_effort: Option<String>,
-    allow_broad_cwd: bool,
-    yolo_mode: bool,
-    compact: bool,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
-    run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_tui_model(model);
-    let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
-    let session_state = new_cli_session()?;
-    let session = create_managed_session_handle(&session_state.session_id)?;
-    let cwd = std::env::current_dir()?;
-    init_runtime_providers_for_cwd(&cwd);
-    let mut runtime = build_runtime(
-        session_state,
-        &session.id,
-        resolved_model,
-        system_prompt,
-        true,
-        false,
-        allowed_tools,
-        permission_mode,
-        None,
-        None,
-    )?;
-    apply_cli_turn_context_profile(&runtime, yolo_mode, permission_mode, false, false);
-    if let Some(effort) = reasoning_effort {
-        if let Some(rt) = runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(Some(effort));
-        }
-    }
-    let prompter = runtime::permissions::SharedPrompter::new(Box::new(CliPermissionPrompter::new(
-        permission_mode,
-    )));
-    let handle =
-        tokio::runtime::Handle::try_current().unwrap_or_else(|_| SHARED_RT.handle().clone());
-    let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
-    runtime.shutdown_plugins()?;
-    let final_text = final_assistant_text(&summary).trim().to_string();
-    match output_format {
-        CliOutputFormat::Text => {
-            if compact {
-                // --compact: print only the final assistant text
-                println!("{final_text}");
-            } else {
-                // Full output: print text (includes any thinking blocks)
-                println!("{final_text}");
-            }
-        }
-        CliOutputFormat::Json => {
-            let cost = summary.usage.estimate_cost_usd().total_cost_usd();
-            let response = serde_json::json!({
-                "message": final_text,
-                "text": final_text,
-                "iterations": summary.iterations,
-                "tool_uses": collect_tool_uses(&summary),
-                "tool_results": collect_tool_results(&summary),
-                "prompt_cache_events": collect_prompt_cache_events(&summary),
-                "auto_compaction": summary.auto_compaction.as_ref().map(|event| json!({
-                    "removed_message_count": event.removed_message_count,
-                })),
-                "usage": {
-                    "input_tokens": summary.usage.input_tokens,
-                    "output_tokens": summary.usage.output_tokens,
-                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                    "total_tokens": summary.usage.total_tokens(),
-                },
-                "estimated_cost": model_protocol::usage::format_usd(cost),
-                "compact": compact,
-            });
-            println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-    }
-    Ok(())
-}
-
 fn gateway_auth_token_from_platform(platform: &runtime::GatewayPlatformConfig) -> Option<String> {
     // Prefer flat auth_token key (legacy format).
     let flat = platform.extra.get("auth_token").and_then(|v| v.as_str());
@@ -4738,7 +3272,7 @@ fn compact_message_text(message: &ConversationMessage) -> String {
         .join(" ")
 }
 
-fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPacket> {
+pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPacket> {
     if session.messages.is_empty()
         && session.compaction.is_none()
         && session.fork.is_none()
@@ -4805,7 +3339,7 @@ fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPa
     })
 }
 
-fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContextPacket {
+pub(crate) fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContextPacket {
     let active_task = handoff.task_states.first().map(|task| {
         format!(
             "task={} progress={} checkpoint={} context={}",
@@ -4847,8 +3381,8 @@ fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContext
     }
 }
 
-fn inject_auto_resume_context(
-    runtime: &ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+pub(crate) fn inject_auto_resume_context(
+    runtime: &ConversationRuntime<runtime::ProviderRuntimeClient, GatewayToolExecutor>,
     session_packet: Option<ResumeContextPacket>,
     session_id: &str,
 ) -> bool {
@@ -4877,7 +3411,7 @@ fn inject_auto_resume_context(
     injected
 }
 
-fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::ContextItem {
+pub(crate) fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::ContextItem {
     let root_path = session
         .workspace_root
         .clone()
@@ -5030,816 +3564,12 @@ fn workspace_hot_symbols(
     hot_symbols
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_runtime(
-    session: Session,
-    session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = runtime_bootstrap::assemble_runtime_state()?;
-    build_runtime_with_plugin_state(
-        None,
-        session,
-        session_id,
-        model,
-        system_prompt,
-        enable_tools,
-        emit_output,
-        allowed_tools,
-        permission_mode,
-        tool_callback,
-        stream_callback,
-        runtime_plugin_state,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_runtime_with_session_store(
-    session_store: Arc<memory::session_store::UnifiedSessionStore>,
-    session: Session,
-    session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = runtime_bootstrap::assemble_runtime_state()?;
-    build_runtime_with_plugin_state(
-        Some(session_store),
-        session,
-        session_id,
-        model,
-        system_prompt,
-        enable_tools,
-        emit_output,
-        allowed_tools,
-        permission_mode,
-        tool_callback,
-        stream_callback,
-        runtime_plugin_state,
-    )
-}
-
-/// Production executor for sub-agent tasks in the CLI.
-
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
-fn build_runtime_with_plugin_state(
-    session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
-    mut session: Session,
-    session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-    runtime_plugin_state: RuntimeBootstrapState,
-) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    // Persist the model in session metadata so resumed sessions can report it.
-    if session.model.is_none() {
-        session.model = Some(model.clone());
-    }
-    let session_resume_packet = session_db_resume_context_packet(&session);
-    let RuntimeBootstrapState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    } = runtime_plugin_state;
-    plugin_registry.initialize()?;
-    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
-    let overrides = feature_config.model_context_windows();
-    let model_ctx = provider::model_context_window_with_overrides(&model, Some(&overrides));
-    let workspace_item = workspace_context_item(&session, model_ctx);
-    // Clone model for sub-agent usage before it's consumed by the main runtime.
-    let subagent_model = model.clone();
-    // Shared tool executor — used by both the main runtime and sub-agent factory.
-    let subagent_tool_executor = std::sync::Arc::new(CliToolExecutor::new(
-        allowed_tools.clone(),
-        emit_output,
-        tool_registry.clone(),
-        mcp_state.clone(),
-    ));
-    let mut runtime = ConversationRuntime::new_with_features(
-        session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            stream_callback.clone(),
-        )?,
-        subagent_tool_executor.clone(),
-        policy,
-        system_prompt,
-        &feature_config,
-    );
-    runtime = runtime.with_model_context_window(model_ctx);
-    if let Some(store) = session_store {
-        runtime = runtime.with_session_store(store);
-    }
-    if let Some(ref tx) = stream_callback {
-        let _ = tx.try_send(runtime::CowdEvent::ContextWindow(model_ctx as u64));
-    }
-    if let Some(callback) = tool_callback {
-        runtime = runtime.with_tool_callback(callback);
-    }
-    if emit_output {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
-    }
-    let cowd_bus = runtime::CowdEventBus::new();
-    runtime = runtime.with_cowd_event_bus(cowd_bus);
-    runtime.push_external_context_item(workspace_item);
-    let resume_context_loaded =
-        inject_auto_resume_context(&runtime, session_resume_packet, session_id);
-    // Wire the production sub-agent executor so the collaboration pipeline
-    // can delegate real work to sub-agents.
-    {
-        let session_id_owned = session_id.to_string();
-        let allowed_tools_clone = allowed_tools.clone();
-        let tool_registry_clone = tool_registry.clone();
-        let executor = runtime::agent::ProductionExecutor::new(
-            move || {
-                AnthropicRuntimeClient::new(
-                    &session_id_owned,
-                    subagent_model.clone(),
-                    true,  // sub-agents need tool access
-                    false, // no TUI streaming for sub-agents
-                    allowed_tools_clone.clone(),
-                    tool_registry_clone.clone(),
-                    None, // no stream callback for sub-agents
-                )
-                .expect("sub-agent API client creation failed")
-            },
-            subagent_tool_executor.clone(),
-        );
-        let executor_arc = std::sync::Arc::new(executor);
-        runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed(
-            executor_arc.clone(),
-        ));
-        // Wire JPS pipeline for complex task routing
-        let jps_pipeline = runtime::joint_problem_solving::new_boxed::<
-            runtime::agent::ProductionExecutor<AnthropicRuntimeClient, CliToolExecutor>,
-        >(executor_arc);
-        runtime = runtime.with_jps_pipeline(jps_pipeline);
-    }
-    Ok(BuiltRuntime::new(
-        runtime,
-        plugin_registry,
-        mcp_state,
-        resume_context_loaded,
-    ))
-}
-
-struct CliHookProgressReporter;
-
-impl runtime::HookProgressReporter for CliHookProgressReporter {
-    fn on_event(&mut self, event: &runtime::HookProgressEvent) {
-        match event {
-            runtime::HookProgressEvent::Started {
-                event,
-                tool_name,
-                command,
-            } => tracing::info!(
-                "[hook {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Completed {
-                event,
-                tool_name,
-                command,
-            } => tracing::info!(
-                "[hook done {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Cancelled {
-                event,
-                tool_name,
-                command,
-            } => tracing::info!(
-                "[hook cancelled {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
-pub(crate) struct CliPermissionPrompter {
-    current_mode: PermissionMode,
-}
-
-#[cfg(test)]
-impl CliPermissionPrompter {
-    fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
-    }
-}
-
-#[cfg(test)]
-impl runtime::PermissionPrompter for CliPermissionPrompter {
-    fn decide(
-        &mut self,
-        request: &runtime::PermissionRequest,
-    ) -> runtime::PermissionPromptDecision {
-        println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
-        if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
-        }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
-
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
-                    }
-                }
-            }
-            Err(error) => runtime::PermissionPromptDecision::Deny {
-                reason: format!("permission approval failed: {error}"),
-            },
-        }
-    }
-}
-
-// NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
-// now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
-// `detect_provider_kind(&model)`. The struct name is kept to avoid
-// churning `BuiltRuntime` and every Deref/DerefMut site that references
-// it. See ROADMAP #29 for the provider-dispatch routing fix.
-struct AnthropicRuntimeClient {
-    client: ApiProviderClient,
-    cached_client: CachedProviderClient,
-    session_id: String,
-    model: String,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GatewayToolRegistry,
-    reasoning_effort: Option<String>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-}
-
-impl AnthropicRuntimeClient {
-    fn new(
-        session_id: &str,
-        model: String,
-        enable_tools: bool,
-        emit_output: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        tool_registry: GatewayToolRegistry,
-        stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `provider::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and lets configured test or
-        // staging endpoints exercise the same provider path as
-        // production. We also attach a session-scoped prompt cache on
-        // the Anthropic path; the prompt cache is Anthropic-only so
-        // non-Anthropic variants skip it.
-        let resolved_model = model.trim().to_string();
-
-        let provider = runtime::resolve_global_provider(&resolved_model).ok_or_else(|| {
-            provider::ApiError::NoProviderConfigured {
-                model: resolved_model.clone(),
-            }
-        })?;
-
-        let mut client = ApiProviderClient::from_config(&provider)?;
-
-        if provider.protocol.as_deref() == Some("anthropic") {
-            client = client.with_prompt_cache(PromptCache::new(session_id));
-        }
-
-        let cached_client = CachedProviderClient::new(client.clone(), session_id);
-        Ok(Self {
-            client,
-            cached_client,
-            session_id: session_id.to_string(),
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            reasoning_effort: None,
-            stream_callback,
-        })
-    }
-
-    fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        self.reasoning_effort = effort;
-    }
-
-    /// 运行时切换模型（不改配置文件）。重建内部 ProviderClient 和 CachedProviderClient
-    pub fn switch_model(&mut self, new_model: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let provider = runtime::resolve_global_provider(new_model).ok_or_else(|| {
-            provider::ApiError::NoProviderConfigured {
-                model: new_model.to_string(),
-            }
-        })?;
-
-        let mut client = ApiProviderClient::from_config(&provider)?;
-
-        if provider.protocol.as_deref() == Some("anthropic") {
-            client = client.with_prompt_cache(PromptCache::new(&self.session_id));
-        }
-
-        self.client = client.clone();
-        self.cached_client = CachedProviderClient::new(client, &self.session_id);
-        self.model = new_model.to_string();
-
-        Ok(())
-    }
-}
-
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, provider::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
-impl ApiClient for AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
-    fn stream(
-        &mut self,
-        request: ApiRequest,
-    ) -> Pin<
-        Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
-    > {
-        match self.stream_collect(request) {
-            Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
-            Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
-        }
-    }
-}
-
-impl AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
-    fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let is_post_tool = request_ends_with_tool_result(&request);
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
-            ..Default::default()
-        };
-
-        let max_attempts: usize = if is_post_tool { 2 } else { 1 };
-
-        // Clone fields needed for standalone execution when inside a runtime.
-        let client = self.client.clone();
-        let session_id = self.session_id.clone();
-        let emit_output = self.emit_output;
-        let stream_callback = self.stream_callback.clone();
-
-        // When resuming after tool execution, apply a stall timeout on the
-        // first stream event.  If the model does not respond within the
-        // deadline we drop the stalled connection and re-send the request as
-        // a continuation nudge (one retry only).
-
-        // If we are already inside a tokio runtime, calling block_on again
-        // will panic with "nested enter_runtime". Spawn a dedicated OS thread
-        // with its own single-threaded runtime to avoid the nesting.
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("stream_collect rt");
-                    let result = rt.block_on(async {
-                        for attempt in 1..=max_attempts {
-                            let apply_stall = is_post_tool && attempt == 1;
-                            let result = consume_stream_standalone(
-                                client.clone(),
-                                session_id.clone(),
-                                emit_output,
-                                stream_callback.clone(),
-                                message_request.clone(),
-                                apply_stall,
-                            )
-                            .await;
-                            match result {
-                                Ok(events) => return Ok(events),
-                                Err(error)
-                                    if error.to_string().contains("post-tool stall")
-                                        && attempt < max_attempts =>
-                                {
-                                    continue;
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-                    });
-                    let _ = tx.send(result);
-                });
-                rx.recv()
-                    .map_err(|_| RuntimeError::new("stream thread panicked"))?
-            }
-            Err(_) => {
-                // Not inside a runtime — use SHARED_RT directly (original path).
-                SHARED_RT.block_on(async {
-                    for attempt in 1..=max_attempts {
-                        let apply_stall = is_post_tool && attempt == 1;
-                        let result = self.consume_stream(&message_request, apply_stall).await;
-                        match result {
-                            Ok(events) => return Ok(events),
-                            Err(error)
-                                if error.to_string().contains("post-tool stall")
-                                    && attempt < max_attempts =>
-                            {
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-                })
-            }
-        }
-    }
-}
-
-impl AnthropicRuntimeClient {
-    /// Consume a single streaming response, optionally applying a stall
-    /// timeout on the first event for post-tool continuations.
-    #[allow(clippy::too_many_lines)]
-    async fn consume_stream(
-        &self,
-        message_request: &MessageRequest,
-        apply_stall_timeout: bool,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut stdout = io::stdout();
-        let mut sink = io::sink();
-        let out: &mut dyn Write = if self.emit_output {
-            &mut stdout
-        } else {
-            &mut sink
-        };
-        let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
-        let mut block_has_thinking_summary = false;
-        let mut saw_stop = false;
-        let mut received_any_event = false;
-
-        loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
-                    }
-                }
-            } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
-            };
-
-            let Some(event) = next else {
-                break;
-            };
-            received_any_event = true;
-
-            match event {
-                ApiStreamEvent::MessageStart(start) => {
-                    for block in start.message.content {
-                        push_output_block(
-                            block,
-                            out,
-                            &mut events,
-                            &mut pending_tool,
-                            true,
-                            &mut block_has_thinking_summary,
-                        )?;
-                    }
-                }
-                ApiStreamEvent::ContentBlockStart(start) => {
-                    push_output_block(
-                        start.content_block,
-                        out,
-                        &mut events,
-                        &mut pending_tool,
-                        true,
-                        &mut block_has_thinking_summary,
-                    )?;
-                }
-                ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                    ContentBlockDelta::TextDelta { text } => {
-                        if !text.is_empty() {
-                            write!(out, "{text}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            events.push(AssistantEvent::TextDelta(text.clone()));
-                            if let Some(ref cb) = self.stream_callback {
-                                let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
-                            }
-                        }
-                    }
-                    ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
-                            input.push_str(&partial_json);
-                        }
-                    }
-                    ContentBlockDelta::ThinkingDelta { thinking } => {
-                        if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
-                            block_has_thinking_summary = true;
-                        }
-                        events.push(AssistantEvent::ThinkingDelta(thinking.clone()));
-                        if let Some(ref cb) = self.stream_callback {
-                            let _ = cb.try_send(runtime::CowdEvent::ThinkingDelta { thinking });
-                        }
-                    }
-                    ContentBlockDelta::SignatureDelta { signature } => {
-                        tracing::debug!("signature delta received");
-                        events.push(AssistantEvent::SignatureDelta(signature));
-                    }
-                },
-                ApiStreamEvent::ContentBlockStop(_) => {
-                    block_has_thinking_summary = false;
-                    if let Some((id, name, input)) = pending_tool.take() {
-                        // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::ToolUse { id, name, input });
-                    }
-                }
-                ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                }
-                ApiStreamEvent::MessageStop(_) => {
-                    saw_stop = true;
-                    events.push(AssistantEvent::MessageStop);
-                }
-            }
-        }
-
-        push_prompt_cache_record(&self.client, &mut events);
-
-        if !saw_stop
-            && events.iter().any(|event| {
-                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                    || matches!(event, AssistantEvent::ToolUse { .. })
-            })
-        {
-            events.push(AssistantEvent::MessageStop);
-        }
-
-        if events
-            .iter()
-            .any(|event| matches!(event, AssistantEvent::MessageStop))
-        {
-            return Ok(events);
-        }
-
-        let (response, cache_record) = self
-            .cached_client
-            .send_message(&MessageRequest {
-                stream: false,
-                ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut events = response_to_events(response, out)?;
-        // Forward cache-break record from CachedProviderClient if present.
-        if let Some(record) = cache_record {
-            if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-                events.push(AssistantEvent::PromptCache(event));
-            }
-        }
-        push_prompt_cache_record(&self.client, &mut events);
-        Ok(events)
-    }
-}
-
-/// Standalone version of `consume_stream` that takes owned parameters
-/// instead of `&self`. Used from `stream_collect` when we are already
-/// inside a tokio runtime and must spawn a dedicated OS thread with its
-/// own single-threaded runtime to avoid nested `enter_runtime` panics.
-#[allow(clippy::too_many_lines)]
-async fn consume_stream_standalone(
-    client: ApiProviderClient,
-    session_id: String,
-    emit_output: bool,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-    message_request: MessageRequest,
-    apply_stall_timeout: bool,
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut stream = client
-        .stream_message(&message_request)
-        .await
-        .map_err(|error| RuntimeError::new(format_user_visible_api_error(&session_id, &error)))?;
-    let mut stdout = io::stdout();
-    let mut sink = io::sink();
-    let out: &mut dyn Write = if emit_output { &mut stdout } else { &mut sink };
-    let mut events = Vec::new();
-    let mut pending_tool: Option<(String, String, String)> = None;
-    let mut block_has_thinking_summary = false;
-    let mut saw_stop = false;
-    let mut received_any_event = false;
-
-    loop {
-        let next = if apply_stall_timeout && !received_any_event {
-            match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                Ok(inner) => inner.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&session_id, &error))
-                })?,
-                Err(_elapsed) => {
-                    return Err(RuntimeError::new(
-                        "post-tool stall: model did not respond within timeout",
-                    ));
-                }
-            }
-        } else {
-            stream.next_event().await.map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&session_id, &error))
-            })?
-        };
-
-        let Some(event) = next else {
-            break;
-        };
-        received_any_event = true;
-
-        match event {
-            ApiStreamEvent::MessageStart(start) => {
-                for block in start.message.content {
-                    push_output_block(
-                        block,
-                        out,
-                        &mut events,
-                        &mut pending_tool,
-                        true,
-                        &mut block_has_thinking_summary,
-                    )?;
-                }
-            }
-            ApiStreamEvent::ContentBlockStart(start) => {
-                push_output_block(
-                    start.content_block,
-                    out,
-                    &mut events,
-                    &mut pending_tool,
-                    true,
-                    &mut block_has_thinking_summary,
-                )?;
-            }
-            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty() {
-                        write!(out, "{text}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::TextDelta(text.clone()));
-                        if let Some(ref cb) = stream_callback {
-                            let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
-                        }
-                    }
-                }
-                ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = &mut pending_tool {
-                        input.push_str(&partial_json);
-                    }
-                }
-                ContentBlockDelta::ThinkingDelta { thinking } => {
-                    if !block_has_thinking_summary {
-                        render_thinking_block_summary(out, None, false)?;
-                        block_has_thinking_summary = true;
-                    }
-                    events.push(AssistantEvent::ThinkingDelta(thinking.clone()));
-                    if let Some(ref cb) = stream_callback {
-                        let _ = cb.try_send(runtime::CowdEvent::ThinkingDelta { thinking });
-                    }
-                }
-                ContentBlockDelta::SignatureDelta { signature } => {
-                    tracing::debug!("signature delta received");
-                    events.push(AssistantEvent::SignatureDelta(signature));
-                }
-            },
-            ApiStreamEvent::ContentBlockStop(_) => {
-                block_has_thinking_summary = false;
-                if let Some((id, name, input)) = pending_tool.take() {
-                    writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                        .and_then(|()| out.flush())
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    events.push(AssistantEvent::ToolUse { id, name, input });
-                }
-            }
-            ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-            }
-            ApiStreamEvent::MessageStop(_) => {
-                saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
-            }
-        }
-    }
-
-    push_prompt_cache_record(&client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
-    }
-
-    if events
-        .iter()
-        .any(|event| matches!(event, AssistantEvent::MessageStop))
-    {
-        return Ok(events);
-    }
-
-    let response = client
-        .send_message(&MessageRequest {
-            stream: false,
-            ..message_request.clone()
-        })
-        .await
-        .map_err(|error| RuntimeError::new(format_user_visible_api_error(&session_id, &error)))?;
-    let mut events = response_to_events(response, out)?;
-    push_prompt_cache_record(&client, &mut events);
-    Ok(events)
-}
-
-/// Returns `true` when the conversation ends with a tool-result message,
-/// meaning the model is expected to continue after tool execution.
-fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
-    request
-        .messages
-        .last()
-        .is_some_and(|message| message.role == MessageRole::Tool)
-}
-
+#[cfg(test)]
 fn format_user_visible_api_error(session_id: &str, error: &provider::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_error(session_id, error)
@@ -5859,6 +3589,7 @@ fn format_user_visible_api_error(session_id: &str, error: &provider::ApiError) -
     }
 }
 
+#[cfg(test)]
 fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> String {
     let mut lines: Vec<String> = vec!["context_window_blocked".to_string(), String::new()];
 
@@ -6009,7 +3740,7 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 }
 
 /// Slash commands that are registered in the spec list but not yet implemented
-/// in this build. Used to filter both REPL completions and help output so the
+/// in this build. Used to filter terminal completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
     "login",
@@ -6042,7 +3773,7 @@ const STUB_COMMANDS: &[&str] = &[
     "add-dir",
     // Spec entries with no parse arm — produce circular "Did you mean" error
     // without this guard. Adding here routes them to the proper unsupported
-    // message and excludes them from REPL completions / help.
+    // message and excludes them from terminal completions / help.
     // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
     "allowed-tools",
     "bookmarks",
@@ -6612,6 +4343,7 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     preview
 }
 
+#[cfg(test)]
 fn render_thinking_block_summary(
     out: &mut (impl Write + ?Sized),
     char_count: Option<usize>,
@@ -6629,6 +4361,7 @@ fn render_thinking_block_summary(
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
+#[cfg(test)]
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
@@ -6673,6 +4406,7 @@ fn push_output_block(
     Ok(())
 }
 
+#[cfg(test)]
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
@@ -6700,6 +4434,7 @@ fn response_to_events(
     Ok(events)
 }
 
+#[cfg(test)]
 fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
     // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
     // to the Anthropic variant and returns `None` for OpenAI-compat /
@@ -6713,6 +4448,7 @@ fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<Assista
     }
 }
 
+#[cfg(test)]
 fn prompt_cache_record_to_runtime_event(
     record: provider::PromptCacheRecord,
 ) -> Option<PromptCacheEvent> {
@@ -6726,136 +4462,7 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
-pub(crate) struct CliToolExecutor {
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GatewayToolRegistry,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-}
-
-impl CliToolExecutor {
-    fn new(
-        allowed_tools: Option<AllowedToolSet>,
-        emit_output: bool,
-        tool_registry: GatewayToolRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    ) -> Self {
-        Self {
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            mcp_state,
-        }
-    }
-
-    fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
-        let input: ToolSearchRequest = serde_json::from_value(value)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    state.pending_servers(),
-                    state
-                        .degraded_report()
-                        .and_then(|report| serde_json::to_value(report).ok()),
-                )
-            });
-        serde_json::to_string_pretty(&self.tool_registry.search(
-            &input.query,
-            input.max_results.unwrap_or(5),
-            pending_mcp_servers,
-            mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn execute_runtime_tool(
-        &self,
-        tool_name: &str,
-        value: serde_json::Value,
-    ) -> Result<String, ToolError> {
-        let Some(mcp_state) = &self.mcp_state else {
-            return Err(ToolError::new(format!(
-                "runtime tool `{tool_name}` is unavailable without configured MCP servers"
-            )));
-        };
-        let mut mcp_state = mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        match tool_name {
-            "MCPTool" => {
-                let input: McpToolRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                let qualified_name = input
-                    .qualified_name
-                    .or(input.tool)
-                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                mcp_state.call_tool(&qualified_name, input.arguments)
-            }
-            "ListMcpResourcesTool" => {
-                let input: ListMcpResourcesRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                match input.server {
-                    Some(server_name) => mcp_state.list_resources_for_server(&server_name),
-                    None => mcp_state.list_resources_for_all_servers(),
-                }
-            }
-            "ReadMcpResourceTool" => {
-                let input: ReadMcpResourceRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                mcp_state.read_resource(&input.server, &input.uri)
-            }
-            _ => mcp_state.call_tool(tool_name, Some(value)),
-        }
-    }
-}
-
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if self
-            .allowed_tools
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
-        {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
-        }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
-            self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
-        } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
-        };
-        match result {
-            Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    print!("{markdown}");
-                }
-                Ok(output)
-            }
-            Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    print!("{markdown}");
-                }
-                Err(error)
-            }
-        }
-    }
-}
-
-fn permission_policy(
+pub(crate) fn permission_policy(
     mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GatewayToolRegistry,
@@ -6879,6 +4486,7 @@ fn runtime_permission_mode_from_tool(mode: tools::permissions::PermissionMode) -
     }
 }
 
+#[cfg(test)]
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
@@ -6931,19 +4539,19 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 mod tests {
     #![allow(unused_imports)]
     use super::{
-        activate_live_cli_session, build_runtime_with_plugin_state, build_system_prompt_for_mode,
-        cli_turn_context_profile, collect_session_prompt_history, create_managed_session_handle,
-        discover_local_session_import_candidates, ensure_yolo_task, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_startup_banner, format_startup_banner_with_task,
-        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
-        hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        build_system_prompt_for_mode, cli_turn_context_profile, collect_session_prompt_history,
+        create_managed_session_handle, discover_local_session_import_candidates, ensure_yolo_task,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_startup_banner,
+        format_startup_banner_with_task, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
+        format_user_visible_api_error, gateway_auth_token_from_platform, get_unified_store,
+        handoff_resume_context_packet, hydrate_session_from_unified_store,
+        import_local_session_file, jsonl_sessions_dir, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args,
         parse_gateway_approval_slash_command, parse_gateway_args,
         parse_gateway_context_slash_command, parse_gateway_cross_plane_slash_command,
         parse_gateway_task_slash_command, parse_git_status_branch, parse_git_status_metadata_for,
@@ -6958,12 +4566,14 @@ mod tests {
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
         workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        CliToolExecutor, GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
-        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GitWorkspaceSummary, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
+        GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
+        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
+        STUB_COMMANDS,
     };
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
+    use crate::runtime_factory::build_runtime_with_bootstrap_state;
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
@@ -8538,7 +6148,7 @@ mod tests {
     #[test]
     fn tui_help_includes_shared_commands_and_exit() {
         let help = render_terminal_help();
-        assert!(help.lines().any(|line| line.trim() == "REPL"));
+        assert!(help.lines().any(|line| line.trim() == "Terminal controls"));
         for command in [
             "/help",
             "/status",
@@ -9739,95 +7349,6 @@ UU conflicted.rs",
     }
 
     #[test]
-    #[serial_test::serial(provider_registry)]
-    #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
-    fn tui_sidebar_switch_replaces_live_runtime_session() {
-        let _cwd_guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _env_guard = env_lock();
-        let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
-        let api_key_original = std::env::var("ANTHROPIC_API_KEY").ok();
-        let workspace = temp_workspace("tui-switch-runtime");
-        let config_home = temp_workspace("tui-switch-config");
-        let previous = std::env::current_dir().expect("cwd");
-        std::fs::create_dir_all(&workspace).expect("workspace should create");
-        std::fs::create_dir_all(&config_home).expect("config home should create");
-        std::env::set_current_dir(&workspace).expect("switch cwd");
-        std::env::set_var("COWD_CONFIG_HOME", &config_home);
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-tui-switch");
-        std::fs::write(
-            config_home.join("config.yaml"),
-            r#"
-model: claude-sonnet-4-6
-providers:
-  test-anthropic:
-    base_url: http://127.0.0.1:9
-    api_key: test-dummy-key-for-tui-switch
-    protocol: anthropic
-    models:
-      - claude-sonnet-4-6
-"#,
-        )
-        .expect("test provider config should write");
-        runtime::init_global_providers(ProvidersConfig {
-            providers: std::collections::HashMap::from([(
-                "test-anthropic".to_string(),
-                ProviderConfig {
-                    name: "test-anthropic".to_string(),
-                    base_url: "http://127.0.0.1:9".to_string(),
-                    api_key: "test-dummy-key-for-tui-switch".to_string(),
-                    models: vec!["claude-sonnet-4-6".to_string()],
-                    protocol: Some("anthropic".to_string()),
-                },
-            )]),
-        });
-
-        let mut cli = LiveCli::new(
-            "claude-sonnet-4-6".to_string(),
-            None,
-            true,
-            None,
-            PermissionMode::DangerFullAccess,
-            false,
-        )
-        .expect("cli should initialize");
-        let original_id = cli.runtime.session().session_id.clone();
-
-        let target_handle =
-            create_managed_session_handle("session-target").expect("target handle should create");
-        let target_session = Session::new().with_workspace_root(workspace.clone());
-        let target_session_id = target_session.session_id.clone();
-        let store = get_unified_store().expect("store should open");
-        sync_cli_session_to_unified_store(
-            store,
-            &target_handle,
-            Some("claude-sonnet-4-6"),
-            &target_session,
-        )
-        .expect("target session should sync");
-
-        let report = crate::switch_live_cli_session(&mut cli, &target_session_id)
-            .expect("switch should succeed");
-
-        assert_ne!(original_id, report.session_id);
-        assert_eq!(report.session_id, target_session_id);
-        assert_eq!(cli.session.id, target_session_id);
-        assert_eq!(cli.runtime.session().session_id, target_session_id);
-        assert!(cli.session.path.ends_with("session.sqlite"));
-
-        std::env::remove_var("COWD_CONFIG_HOME");
-        if let Some(v) = config_home_original {
-            std::env::set_var("COWD_CONFIG_HOME", v);
-        }
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        if let Some(v) = api_key_original {
-            std::env::set_var("ANTHROPIC_API_KEY", v);
-        }
-        std::env::set_current_dir(previous).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_home);
-    }
-
-    #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
         let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
@@ -10076,11 +7597,11 @@ providers:
     fn render_prompt_history_report_lists_entries_with_timestamps() {
         // given
         let entries = vec![
-            PromptHistoryEntry {
+            SessionPromptHistoryEntry {
                 timestamp_ms: 1_673_786_096_000,
                 text: "first prompt".to_string(),
             },
-            PromptHistoryEntry {
+            SessionPromptHistoryEntry {
                 timestamp_ms: 1_673_786_100_000,
                 text: "second prompt".to_string(),
             },
@@ -10093,7 +7614,7 @@ providers:
         assert!(rendered.contains("Prompt history"));
         assert!(rendered.contains("Total            2"));
         assert!(rendered.contains("Showing          2 most recent"));
-        assert!(rendered.contains("Reverse search   Ctrl-R in the REPL"));
+        assert!(rendered.contains("Reverse search   available in TUI history"));
         assert!(rendered.contains("2023-01-15T12:34:56.000Z"));
         assert!(rendered.contains("first prompt"));
         assert!(rendered.contains("second prompt"));
@@ -10103,15 +7624,15 @@ providers:
     fn render_prompt_history_report_truncates_to_limit_from_the_tail() {
         // given
         let entries = vec![
-            PromptHistoryEntry {
+            SessionPromptHistoryEntry {
                 timestamp_ms: 1_000,
                 text: "older".to_string(),
             },
-            PromptHistoryEntry {
+            SessionPromptHistoryEntry {
                 timestamp_ms: 2_000,
                 text: "middle".to_string(),
             },
-            PromptHistoryEntry {
+            SessionPromptHistoryEntry {
                 timestamp_ms: 3_000,
                 text: "latest".to_string(),
             },
@@ -10131,7 +7652,7 @@ providers:
     #[test]
     fn render_prompt_history_report_handles_empty_history() {
         // given
-        let entries: Vec<PromptHistoryEntry> = Vec::new();
+        let entries: Vec<SessionPromptHistoryEntry> = Vec::new();
 
         // when
         let rendered = render_prompt_history_report(&entries, 10);
@@ -10517,7 +8038,7 @@ providers:
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("MCPTool"));
 
-        let executor = CliToolExecutor::new(
+        let executor = GatewayToolExecutor::new(
             None,
             false,
             state.tool_registry.clone(),
@@ -10619,7 +8140,7 @@ providers:
             &runtime_config,
         )
         .expect("runtime plugin state should load");
-        let executor = CliToolExecutor::new(
+        let executor = GatewayToolExecutor::new(
             None,
             false,
             state.tool_registry.clone(),
@@ -10679,7 +8200,7 @@ providers:
             &runtime_config,
         )
         .expect("plugin state should load");
-        let mut runtime = build_runtime_with_plugin_state(
+        let mut runtime = build_runtime_with_bootstrap_state(
             None,
             Session::new(),
             "runtime-plugin-lifecycle",
@@ -10749,14 +8270,14 @@ providers:
     }
 
     #[test]
-    fn stub_commands_absent_from_repl_completions() {
+    fn stub_commands_absent_from_terminal_completions() {
         let candidates =
             slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
         for stub in STUB_COMMANDS {
             let with_slash = format!("/{stub}");
             assert!(
                 !candidates.contains(&with_slash),
-                "stub command {with_slash} should not appear in REPL completions"
+                "stub command {with_slash} should not appear in terminal completions"
             );
         }
     }

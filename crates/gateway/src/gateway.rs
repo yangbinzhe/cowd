@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
-use crate::BuiltRuntime;
+use crate::runtime_entry::GatewayRuntimeEntry;
 
 /// Callback trait for session lifecycle events.
 ///
@@ -18,12 +18,12 @@ pub trait SessionLifecycle: Send + Sync {
 const DEFAULT_MAX_SESSIONS: usize = 100;
 
 #[allow(clippy::type_complexity)]
-type SessionEntry = Arc<Mutex<BuiltRuntime>>;
+type SessionEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 
 /// Thread-safe registry of active session runtimes.
 ///
 /// Each session is identified by a string key and maps to a built runtime
-/// wrapped in `Arc<Mutex<BuiltRuntime>>`, allowing exclusive mutable access
+/// wrapped in `Arc<Mutex<GatewayRuntimeEntry>>`, allowing exclusive mutable access
 /// across async tasks without TOCTOU races.
 pub struct ActiveSessions {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
@@ -80,7 +80,7 @@ impl ActiveSessions {
     pub fn register(
         &self,
         id: String,
-        runtime: BuiltRuntime,
+        runtime: GatewayRuntimeEntry,
     ) -> Result<Option<SessionEntry>, String> {
         let mut map = self
             .sessions
@@ -136,8 +136,8 @@ impl Default for ActiveSessions {
 mod tests {
     use super::*;
 
-    fn test_runtime() -> crate::BuiltRuntime {
-        crate::BuiltRuntime::test_runtime_shell()
+    fn test_runtime() -> crate::runtime_entry::GatewayRuntimeEntry {
+        crate::runtime_entry::GatewayRuntimeEntry::test_runtime_entry()
     }
 
     #[test]

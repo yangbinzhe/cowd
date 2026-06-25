@@ -179,7 +179,7 @@ pub(crate) fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error:
         cwd: cwd.clone(),
         session_path: None,
         session_id: None,
-        session_store: "live-repl".to_string(),
+        session_store: "gateway-session".to_string(),
         loaded_config_files: config
             .as_ref()
             .ok()

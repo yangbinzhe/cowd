@@ -241,10 +241,8 @@ impl<'a> RuntimeTurnSink<'a> {
             .await;
         if let Some(session_snapshot) = session_snapshot {
             if let Err(e) = self
-                .state
-                .services
-                .session
-                .sync_runtime_session_snapshot(session_id, &session_snapshot)
+                .runtime_service
+                .sync_session_snapshot(session_id, &session_snapshot)
                 .await
             {
                 tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
@@ -693,9 +691,16 @@ async fn get_session_messages(
         })));
     }
 
-    state
-        .services
-        .session
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service not configured".to_string(),
+            }),
+        )
+    })?;
+
+    runtime_service
         .active_messages_page(&id, offset, from_seq, limit)
         .await
         .map(|page| Json(serde_json::to_value(page).unwrap_or_else(|_| serde_json::json!({}))))

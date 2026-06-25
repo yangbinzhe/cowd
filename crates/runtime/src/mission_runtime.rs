@@ -873,16 +873,29 @@ fn load_state() -> Result<MissionRuntimeState, String> {
 
 fn persist_state(state: &MissionRuntimeState) -> Result<(), String> {
     let path = state_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
     let payload = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
-    std::fs::write(&path, payload).map_err(|error| {
+    write_state_file(&path, payload.as_bytes()).map_err(|error| {
         format!(
             "failed to persist mission runtime state {}: {error}",
             path.display()
         )
     })
+}
+
+fn write_state_file(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::write(path, payload) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, payload)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

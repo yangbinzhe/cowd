@@ -50,7 +50,7 @@ pub(crate) fn assemble_runtime_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let (mcp_state, runtime_tools) = assemble_mcp_tool_state(runtime_config)?;
     let tool_registry =
         GatewayToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
             .with_runtime_tools(runtime_tools)?;
@@ -328,7 +328,7 @@ impl RuntimeMcpState {
     }
 }
 
-fn build_runtime_mcp_state(
+fn assemble_mcp_tool_state(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {

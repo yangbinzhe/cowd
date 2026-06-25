@@ -71,10 +71,9 @@ async fn context_current_handler(
         .cloned()
         .or_else(|| state.list_active_session_ids().into_iter().next());
     let active_envelope = requested_session_id.as_deref().and_then(|session_id| {
-        state
-            .services
-            .session
-            .last_context_envelope_nonblocking(session_id)
+        state.services.runtime.as_ref().and_then(|runtime_service| {
+            runtime_service.last_context_envelope_nonblocking(session_id)
+        })
     });
     Json(
         state

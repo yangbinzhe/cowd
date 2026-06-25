@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.381`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.382`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -479,7 +479,7 @@ runtime
 tools
   -> harness-contract
   -> mcp / plugins / skill-service
-  -> runtime
+  -> no runtime/provider dependency
 
 fact-kernel
   -> no workspace domain dependency
@@ -522,13 +522,16 @@ model-protocol
 - 非 TUI surface 不再进入 core workspace，外部 surface 通过 `surface.json` 和 JSONL sidecar 与 Gateway 连接。
 - Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
 - Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface、MFG 的 API 暴露。
+- Tools 已经从 `runtime` 和 `provider` 中解耦，只保留工具 schema、权限需求、纯执行支撑和工具局部治理能力。
+- Gateway 的生产路径不再保留旧 `LiveCli`、`run_prompt`、REPL prompt loop、`AnthropicRuntimeClient` 和 `CliToolExecutor` 执行壳；Runtime 装载由 `runtime_factory` 创建，热 runtime 生命周期由 `GatewayRuntimeEntry` 与 `RuntimeService` 承接。
+- API routes 和 services 不直接持有热 runtime lock，不直接调用 `run_turn_async`；运行时操作收敛到 `RuntimeService` 边界。
 
 仍需继续收束的部分：
 
-- `tools -> runtime` 仍然存在，但已完成第一轮收束：tools 不再返回 provider 专用 ToolDefinition，不再在搜索 DTO 中暴露 runtime MCP degraded 类型，lane completion 已迁入 runtime。剩余依赖集中在 executor 对 runtime 文件、bash、checkpoint、mutation、cache、权限、LSP/MCP host 和测试用 subagent runtime 的复用。终态仍应改成 `runtime -> tools` 或由独立 tool contract 承接共享类型。
 - `runtime` 不再依赖 connector/channel；`CrossPlaneRisk`、`DataClassification` 已进入 `harness-contract::policy`，connector 继续负责外部资源目录与能力描述。
 - `gateway` 作为聚合 crate 依赖面很宽，这是服务入口的正常代价，但需要继续保持“route/service 薄编排，业务状态归 runtime/domain”的纪律，避免 Gateway 变成第二套 runtime。
 - `runtime` 内部模块数量已经很大，Mission、Agent、Team、Steward、Recovery 已接入，但后续需要更清晰的子目录或 crate 内分层，减少 `lib.rs` 直接暴露过宽的问题。
+- `gateway` 仍在测试夹具中保留少量 provider 错误格式化和响应转换辅助，用于覆盖历史输出兼容测试；生产路径由架构测试明确禁止直接 provider client。
 
 ## 9. 配置
 
@@ -600,7 +603,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
 - Harness Eval 已具备 quick/full/deep 三层验证报告，最新计划目录中已有 quick/full/deep 通过记录。
-- 版本标签：`v0.9.381`。
+- 版本标签：`v0.9.382`。
 
 ### 11.2 是否达到当前阶段目标
 
@@ -609,9 +612,9 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 更具体地说：
 
 - 对“Runtime 是 AI Harness 核心”的目标：基本达成。Mission、session、team、agent、steward、approval、event、recovery 都已回到 runtime。
-- 对“Gateway 干净，只做后台入口和编排”的目标：大体达成。Gateway 依赖面宽，但业务核心没有明显回流成第二套 runtime。
+- 对“Gateway 干净，只做后台入口和编排”的目标：阶段性达成。旧 LiveCli/run_prompt/REPL prompt loop 已删除，热 runtime 承载体已迁到 `GatewayRuntimeEntry`，routes/services 的热 runtime 操作已收敛到 `RuntimeService`。
 - 对“surface 与 runtime 解耦”的目标：已达成核心边界。TUI/WebUI/channel 都不应直接进入 runtime，当前 runtime 没有依赖 channel/surface。
-- 对“tools 只是 AI 的手脚”的目标：完成了契约层收束和 host-only lane completion 迁移，但尚未完全达成。`tools` 仍依赖 `runtime` 的 executor 实现能力，下一步应迁出权限、MCP/LSP、bash/file/mutation/checkpoint host 复用。
+- 对“tools 只是 AI 的手脚”的目标：当前阶段已达成核心边界。`tools` 不再依赖 runtime/provider，后续重点是继续提高工具合同、审计、checkpoint、mutation preview 的能力质量，而不是再承担 harness 生命周期。
 - 对“多 agent 高阶协同”的目标：完成基础底座，但还不是完整智能团队运行时。当前 team execution 更像任务分派、事件、证据和 agent input 投递闭环，最终综合、复杂依赖调度、失败恢复、跨 agent 互看输出和人类实时介入仍需继续增强。
 - 对“长对话控制多 session / Mission Control”的目标：完成主要控制模型和 API 底座，但高级自然语言跨 session 指挥、session 间代理互拉、全局托管 agent 汇报仍需要更深的 runtime 策略层。
 - 对“自我成长和事实内核”的目标：Memory、Matrix、Fact Kernel 已有边界，但成长闭环还更多是可记录、可召回、可验证的基础能力，没有完全形成长期自动提炼、冲突治理、衰减、质量评分和自我修正的成熟闭环。
@@ -620,9 +623,9 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 
 必须继续处理的架构缺口：
 
-- `tools -> runtime` 需要继续拆掉。已完成 provider schema DTO、MCP degraded DTO、lane completion 的第一轮清理；下一步建议新增或强化 `tool-contract` / `runtime-tool-host` 边界，让 tools 只暴露 schema、权限需求、纯执行器和结果，不直接使用 `PermissionEnforcer`、`ProviderRuntimeClient`、`ConversationRuntime`、`tool_cache` 等 runtime 内部类型。
 - Cross-plane 风险和数据分类合同已经上移到 `harness-contract::policy`，后续仍需把更多跨入口治理合同继续从 connector 中剥离，避免 connector 变成治理语义大桶。
 - Runtime 内部模块应进一步结构化。当前 `lib.rs` 暴露面过宽，后续应按 `mission/`、`agent/`、`team/`、`steward/`、`recovery/`、`tooling/`、`context/` 分组，而不是持续平铺。
+- Gateway 聚合依赖还包括 provider crate，这是当前服务测试、模型配置和 runtime factory 装载链路的现实结果；生产代码必须继续维持“不直接执行 provider turn”的架构门禁。
 - Recovery 目前更像状态恢复和事件补偿，不是完整的 provider turn 续跑系统。真实 kill/restart、进程中断、provider stream 中断、agent 半完成任务恢复还需要场景化强化。
 - Steward 目前具备 tick 和 ledger，但长期托管执行还需要后台循环、预算、策略退避、审批超时、失败降级和汇报生成的完整服务化。
 - Team Execution 目前能派发任务和记录证据，但还需要真实并行 agent 执行、角色依赖阻塞、最终 synthesis、review gate、人类插手、agent 间互阅输出的强闭环。
@@ -631,7 +634,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 
 ### 11.4 下一步演进原则
 
-- 先补边界，再补体验。`tools -> runtime` 是当前最需要继续收束的依赖边界；cross-plane 合同已从 connector 中抽离，后续继续清理 connector 中的治理语义残留。
+- 先补边界，再补体验。`tools -> runtime` 反向依赖已经清零；cross-plane 合同已从 connector 中抽离，后续继续清理 connector 中的治理语义残留。
 - Runtime 继续承载 AI Harness 内核，但 runtime 内部要按业务子域收束，避免变成无边界大桶。
 - Gateway 保持统一后台入口，继续承接 surface、WebUI、TUI、channel sidecar、callback、静态资源和服务 API，但不保存第二套执行状态。
 - WebUI 做最完整的 Mission Control / Reality Core / Tool / Skill / Surface 管理面；TUI 做低噪声、高效率、键盘优先的终端控制面。

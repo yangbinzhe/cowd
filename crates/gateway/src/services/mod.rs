@@ -54,7 +54,10 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use session_service::{SessionService, SessionUpdateRequest};
+pub(crate) use session_service::{
+    ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
+    SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
+};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };

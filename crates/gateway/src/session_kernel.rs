@@ -13,9 +13,9 @@ use tokio::sync::Mutex;
 
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
-use crate::BuiltRuntime;
+use crate::runtime_entry::GatewayRuntimeEntry;
 
-type RuntimeEntry = Arc<Mutex<BuiltRuntime>>;
+type RuntimeEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeCommand {
@@ -130,7 +130,7 @@ impl SessionKernel {
     pub(crate) fn register_runtime(
         &self,
         session_id: String,
-        runtime: BuiltRuntime,
+        runtime: GatewayRuntimeEntry,
     ) -> Result<Option<RuntimeEntry>, String> {
         self.active_sessions.register(session_id, runtime)
     }

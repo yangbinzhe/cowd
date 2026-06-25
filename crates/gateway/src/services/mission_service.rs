@@ -1018,7 +1018,17 @@ mod tests {
         assert_eq!(started["ok"], true);
         assert_eq!(started["envelope"]["service"], "mission");
         assert_eq!(
-            started["mission"]["active_session_id"].as_str(),
+            started["session"]["session_id"].as_str(),
+            Some(session_id.as_str())
+        );
+        assert!(started["mission"]["sessions"]
+            .as_array()
+            .expect("mission sessions")
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+        let detail = service.session_detail(&session_id).expect("session detail");
+        assert_eq!(
+            detail["session"]["session_id"].as_str(),
             Some(session_id.as_str())
         );
 

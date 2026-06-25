@@ -314,6 +314,7 @@ pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
     SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
+pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
 pub use provider_registry::{
     init_global_providers, list_all_models, list_all_providers, list_models_for_provider,
     resolve_global_provider,

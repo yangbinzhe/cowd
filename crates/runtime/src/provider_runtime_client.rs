@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::pin::Pin;
 
 use provider::{
@@ -24,6 +25,9 @@ pub struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     tool_definitions: Vec<ToolDefinition>,
+    reasoning_effort: Option<String>,
+    emit_output: bool,
+    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
 }
 
 impl ProviderRuntimeClient {
@@ -57,6 +61,9 @@ impl ProviderRuntimeClient {
                 .map_err(|error| error.to_string())?,
             chain,
             tool_definitions,
+            reasoning_effort: None,
+            emit_output: false,
+            stream_callback: None,
         })
     }
 
@@ -66,6 +73,45 @@ impl ProviderRuntimeClient {
             .iter()
             .map(|entry| entry.model.as_str())
             .collect()
+    }
+
+    #[must_use]
+    pub fn with_emit_output(mut self, emit_output: bool) -> Self {
+        self.emit_output = emit_output;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stream_callback(
+        mut self,
+        stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    ) -> Self {
+        self.stream_callback = stream_callback;
+        self
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
+    }
+
+    pub fn switch_model(&mut self, new_model: &str) -> Result<(), String> {
+        self.chain = vec![build_provider_entry(new_model)?];
+        self.model_fallbacks_extend();
+        Ok(())
+    }
+
+    fn model_fallbacks_extend(&mut self) {
+        for fallback_model in load_provider_fallback_config() {
+            match build_provider_entry(&fallback_model) {
+                Ok(entry) => self.chain.push(entry),
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
+                }
+            }
+        }
+        self.chain.dedup_by(|a, b| a.model == b.model);
     }
 }
 
@@ -129,10 +175,16 @@ impl ProviderRuntimeClient {
                 tools: (!self.tool_definitions.is_empty()).then(|| self.tool_definitions.clone()),
                 tool_choice: tool_choice.clone(),
                 stream: true,
+                reasoning_effort: self.reasoning_effort.clone(),
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            let attempt = runtime.block_on(stream_with_provider(
+                &entry.client,
+                &message_request,
+                self.emit_output,
+                self.stream_callback.clone(),
+            ));
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
@@ -157,6 +209,8 @@ impl ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
+    emit_output: bool,
+    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
 ) -> Result<Vec<AssistantEvent>, ApiError> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
@@ -182,6 +236,14 @@ async fn stream_with_provider(
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
+                        if emit_output {
+                            print!("{text}");
+                            let _ = std::io::stdout().flush();
+                        }
+                        if let Some(callback) = &stream_callback {
+                            let _ = callback
+                                .try_send(crate::CowdEvent::TextDelta { text: text.clone() });
+                        }
                         events.push(AssistantEvent::TextDelta(text));
                     }
                 }

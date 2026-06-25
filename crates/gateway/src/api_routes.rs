@@ -93,8 +93,6 @@ pub struct AppState {
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
 }
 
-type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
-
 #[derive(Clone)]
 struct ActiveTurnControl {
     run_id: String,
@@ -170,22 +168,6 @@ impl AppState {
 
     pub(crate) fn list_active_session_ids(&self) -> Vec<String> {
         self.services.session.list_active_session_ids()
-    }
-
-    pub(crate) fn active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
-        self.services.session.active_runtime(session_id)
-    }
-
-    fn register_runtime(
-        &self,
-        session_id: String,
-        runtime: crate::BuiltRuntime,
-    ) -> Result<Option<RuntimeEntry>, String> {
-        self.services.session.register_runtime(session_id, runtime)
-    }
-
-    fn remove_active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
-        self.services.session.remove_active_runtime(session_id)
     }
 }
 
@@ -1487,7 +1469,8 @@ mod tests {
                             "actor": "test-human",
                             "payload": {
                                 "agent_id": "agent-for-stage-i",
-                                "command": "perform sensitive intervention"
+                                "command": "perform sensitive intervention",
+                                "require_approval": true
                             }
                         })
                         .to_string(),
