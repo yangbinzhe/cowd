@@ -25,20 +25,21 @@ impl CancellationToken {
     }
 }
 
-use ai_kernel::strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput};
 use futures::stream::Stream;
+use harness_contract::strategy::{
+    StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+};
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
+use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
-use telemetry::SessionTracer;
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
-use crate::ai_kernel::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -52,6 +53,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
+use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
 use crate::tool_execution_plan::ToolExecutionPlan;
@@ -1385,7 +1387,7 @@ where
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
         let strategy_input = self.strategy_input_for_turn(&user_input);
-        let mut ai_kernel = RuntimeAiKernel::begin_turn_with_strategy_input(
+        let mut runtime_harness = RuntimeAiKernel::begin_turn_with_strategy_input(
             self.session().session_id.clone(),
             user_input.clone(),
             self.context_profile(),
@@ -1799,7 +1801,7 @@ where
                         depends_on: Vec::new(),
                     })
                     .collect();
-                ai_kernel.record_tool_requests(&pending_tool_uses);
+                runtime_harness.record_tool_requests(&pending_tool_uses);
                 let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
@@ -2247,13 +2249,13 @@ where
             .join("");
         let failed_tool_results = count_failed_tool_results(&tool_results);
         if let Some(envelope) = self.last_context_envelope() {
-            ai_kernel.record_context_envelope(
+            runtime_harness.record_context_envelope(
                 envelope.id,
                 envelope.selected.len(),
                 envelope.omitted.len(),
             );
         }
-        let ai_kernel_trace = ai_kernel.finalize(
+        let ai_kernel_trace = runtime_harness.finalize(
             &assistant_text,
             tool_results.len().saturating_sub(failed_tool_results),
             failed_tool_results,
@@ -3505,7 +3507,7 @@ where
             session_id.clone(),
             sequence,
             memory::RuntimeEventScope::Task,
-            "runtime.ai_kernel.trace",
+            "runtime.harness_contract.trace",
             payload,
             created_at_ms,
         );
@@ -3925,16 +3927,16 @@ fn growth_maintenance_candidates(
             memory::MaintenanceCandidate {
                 id: candidate.id.clone(),
                 kind: match candidate.kind {
-                    ai_kernel::growth::GrowthMemoryCandidateKind::Conflict => {
+                    harness_contract::growth::GrowthMemoryCandidateKind::Conflict => {
                         memory::MaintenanceCandidateKind::Conflict
                     }
-                    ai_kernel::growth::GrowthMemoryCandidateKind::Stale => {
+                    harness_contract::growth::GrowthMemoryCandidateKind::Stale => {
                         memory::MaintenanceCandidateKind::Stale
                     }
-                    ai_kernel::growth::GrowthMemoryCandidateKind::AuthorityPromotion => {
+                    harness_contract::growth::GrowthMemoryCandidateKind::AuthorityPromotion => {
                         memory::MaintenanceCandidateKind::AuthorityPromotion
                     }
-                    ai_kernel::growth::GrowthMemoryCandidateKind::RelationshipRefresh => {
+                    harness_contract::growth::GrowthMemoryCandidateKind::RelationshipRefresh => {
                         memory::MaintenanceCandidateKind::RelationshipRefresh
                     }
                 },
@@ -4106,6 +4108,7 @@ mod tests {
     use crate::SubAgentConfig;
     use crate::ToolError;
     use futures::stream::Stream;
+    use model_protocol::telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
     use model_protocol::usage::TokenUsage;
     use std::fs;
     use std::future::Future;
@@ -4113,7 +4116,6 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4321,7 +4323,7 @@ mod tests {
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(
             summary.ai_kernel_trace.strategy.mode,
-            ai_kernel::core::ExecutionMode::DirectAnswer
+            harness_contract::core::ExecutionMode::DirectAnswer
         );
         assert!(summary.ai_kernel_trace.verification_report.can_finalize);
         assert!(summary.ai_kernel_trace.tool_transaction.is_some());
@@ -5046,7 +5048,7 @@ mod tests {
                 let events = store.get_events(&session_id, 0).await.unwrap();
                 if events.iter().any(|event| {
                     memory::RuntimeEvent::from_session_event(event)
-                        .map(|runtime_event| runtime_event.kind == "runtime.ai_kernel.trace")
+                        .map(|runtime_event| runtime_event.kind == "runtime.harness_contract.trace")
                         .unwrap_or(false)
                 }) {
                     break;
@@ -5123,7 +5125,7 @@ mod tests {
             let ai_kernel_trace = events
                 .iter()
                 .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .find(|event| event.kind == "runtime.ai_kernel.trace")
+                .find(|event| event.kind == "runtime.harness_contract.trace")
                 .expect("AI kernel trace event");
             assert_eq!(ai_kernel_trace.scope, memory::RuntimeEventScope::Task);
             assert_eq!(ai_kernel_trace.payload["strategy"]["mode"], "direct_answer");

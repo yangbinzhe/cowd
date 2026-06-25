@@ -11,6 +11,7 @@ mod bootstrap;
 mod boundary_policy;
 mod checks;
 mod cli;
+mod command;
 mod compat_manifest;
 mod doctor;
 mod entry;
@@ -69,6 +70,12 @@ use provider::{
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
+#[cfg(test)]
+use crate::command::slash::resume_supported_slash_commands;
+use crate::command::slash::{
+    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
+    SkillSlashDispatch, SlashCommand,
+};
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use plugins::PluginRegistry;
 use runtime::ContextProfile;
@@ -83,15 +90,9 @@ use runtime_bootstrap::{GatewayToolRegistry, RuntimeBootstrapState, RuntimeMcpSt
 use serde::Deserialize;
 use serde_json::json;
 use services::GatewayServices;
-#[cfg(test)]
-use slash_catalog::resume_supported_slash_commands;
-use slash_catalog::{
-    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
-    SkillSlashDispatch, SlashCommand,
-};
 
 #[cfg(test)]
-pub(crate) use entry::env_entry::resolve_repl_model;
+pub(crate) use entry::env_entry::resolve_tui_model;
 pub(crate) use entry::env_entry::{
     default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
 };
@@ -360,7 +361,7 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
             let id = surface::normalize_surface_id(&p.platform_type);
-            let required = channel::channel_required_fields(&id)
+            let required = surface::channel::channel_required_fields(&id)
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>();
@@ -373,7 +374,7 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 entry: Some(format!("./cowd-surface-{id}")),
                 transport: surface::SurfaceTransport::StdioJsonl,
                 lifecycle: surface::SurfaceLifecycle::Managed,
-                capabilities: channel::channel_transport_capabilities(&id)
+                capabilities: surface::channel::channel_transport_capabilities(&id)
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -579,7 +580,7 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
             path,
             output_format,
         } => run_import_session(&path, output_format)?,
-        CliAction::Repl { .. } => {
+        CliAction::Tui { .. } => {
             return Err(
                 "interactive TUI is owned by the cowd CLI; run `cowd` or `cowd tui` instead".into(),
             );
@@ -779,8 +780,8 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
     Err("wechat QR login is provided by the `wechat-ilink` Surface sidecar; install and enable `cowd-surface-wechat-ilink`".into())
 }
 
-fn should_bootstrap_for_action(action: &CliAction) -> bool {
-    matches!(action, CliAction::Repl { .. })
+fn should_bootstrap_for_action(_action: &CliAction) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,7 +893,7 @@ pub(crate) enum CliAction {
         path: PathBuf,
         output_format: CliOutputFormat,
     },
-    Repl {
+    Tui {
         model: String,
         session_id: Option<String>,
         allowed_tools: Option<AllowedToolSet>,
@@ -1156,7 +1157,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 );
             }
         }
-        return Ok(CliAction::Repl {
+        return Ok(CliAction::Tui {
             model,
             session_id,
             allowed_tools,
@@ -1193,7 +1194,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "tui" => Ok(CliAction::Repl {
+        "tui" => Ok(CliAction::Tui {
             model,
             session_id,
             allowed_tools,
@@ -1267,7 +1268,7 @@ fn parse_single_word_command_alias(
         "help" => Some(Ok(CliAction::Help { output_format })),
         "version" => Some(Ok(CliAction::Version { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
-        "tui" => Some(Ok(CliAction::Repl {
+        "tui" => Some(Ok(CliAction::Tui {
             model: model.to_string(),
             session_id: None,
             allowed_tools: None,
@@ -1421,7 +1422,15 @@ fn filter_tool_specs(
     tool_registry: &GatewayToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
+    tool_registry
+        .definitions(allowed_tools)
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        })
+        .collect()
 }
 
 fn parse_system_prompt_args(
@@ -1628,7 +1637,7 @@ fn parse_resume_args(
         );
     }
 
-    Ok(CliAction::Repl {
+    Ok(CliAction::Tui {
         model,
         session_id: Some(session_path.display().to_string()),
         allowed_tools,
@@ -2083,8 +2092,8 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             session_path: None,
-            message: Some(render_repl_help()),
-            json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
+            message: Some(render_terminal_help()),
+            json: Some(serde_json::json!({ "kind": "help", "text": render_terminal_help() })),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2571,7 +2580,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 
 #[allow(clippy::needless_pass_by_value)]
 #[cfg(test)]
-fn run_repl(
+fn run_removed_repl(
     _model: String,
     _session_id: Option<String>,
     _allowed_tools: Option<AllowedToolSet>,
@@ -4185,7 +4194,7 @@ impl LiveCli {
     }
 }
 
-fn render_repl_help() -> String {
+fn render_terminal_help() -> String {
     [
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
@@ -4583,7 +4592,7 @@ fn run_prompt(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
     run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_repl_model(model);
+    let resolved_model = resolve_tui_model(model);
     let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
     let session_state = new_cli_session()?;
     let session = create_managed_session_handle(&session_state.session_id)?;
@@ -6747,7 +6756,12 @@ impl CliToolExecutor {
                 let state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.pending_servers(), state.degraded_report())
+                (
+                    state.pending_servers(),
+                    state
+                        .degraded_report()
+                        .and_then(|report| serde_json::to_value(report).ok()),
+                )
             });
         serde_json::to_string_pretty(&self.tool_registry.search(
             &input.query,
@@ -6924,9 +6938,9 @@ mod tests {
         parse_gateway_task_slash_command, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, render_setup_json, render_setup_report,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        render_memory_report, render_prompt_history_report, render_resume_usage,
+        render_session_markdown, render_setup_json, render_setup_report, render_terminal_help,
+        resolve_model_alias_with_config, resolve_session_reference, resolve_tui_model,
         response_to_events, resume_supported_slash_commands, run_resume_command, session_db_path,
         session_db_resume_context_packet, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
@@ -7445,13 +7459,13 @@ mod tests {
         .expect("write plugin manifest");
     }
     #[test]
-    fn defaults_to_repl_when_no_args() {
+    fn defaults_to_tui_when_no_args() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         std::env::remove_var("COWD_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: None,
                 allowed_tools: None,
@@ -7729,7 +7743,7 @@ mod tests {
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: None,
                 allowed_tools: None,
@@ -7743,7 +7757,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_repl_session_flag() {
+    fn parses_tui_session_flag() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         std::env::remove_var("COWD_PERMISSION_MODE");
@@ -7751,7 +7765,7 @@ mod tests {
         assert_eq!(
             parse_args(&["--session".to_string(), "session-alpha".to_string()])
                 .expect("session flag should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: Some("session-alpha".to_string()),
                 allowed_tools: None,
@@ -7766,7 +7780,7 @@ mod tests {
         assert_eq!(
             parse_args(&["--session=session-beta".to_string()])
                 .expect("inline session flag should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: Some("session-beta".to_string()),
                 allowed_tools: None,
@@ -7780,7 +7794,7 @@ mod tests {
     }
 
     #[test]
-    fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
+    fn dangerously_skip_permissions_flag_forces_danger_full_access_in_tui() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         std::env::set_var("COWD_PERMISSION_MODE", "read-only");
@@ -7790,7 +7804,7 @@ mod tests {
 
         assert_eq!(
             parsed,
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: None,
                 allowed_tools: None,
@@ -7805,7 +7819,7 @@ mod tests {
 
     #[test]
     #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
-    fn yolo_flag_forces_danger_full_access_and_marks_repl_mode() {
+    fn yolo_flag_forces_danger_full_access_and_marks_tui_mode() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         std::env::set_var("COWD_PERMISSION_MODE", "read-only");
@@ -7815,7 +7829,7 @@ mod tests {
 
         assert_eq!(
             parsed,
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: None,
                 allowed_tools: None,
@@ -7885,7 +7899,7 @@ mod tests {
         ];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: None,
                 allowed_tools: Some(
@@ -8406,7 +8420,7 @@ mod tests {
     fn parses_resume_flag_without_path_as_latest_session() {
         assert_eq!(
             parse_args(&["--resume".to_string()]).expect("args should parse"),
-            CliAction::Repl {
+            CliAction::Tui {
                 model: DEFAULT_MODEL.to_string(),
                 session_id: Some("latest".to_string()),
                 allowed_tools: None,
@@ -8471,7 +8485,7 @@ mod tests {
 
     #[test]
     fn shared_help_uses_resume_annotation_copy() {
-        let help = slash_catalog::render_slash_command_help();
+        let help = crate::command::slash::render_slash_command_help();
         assert!(help.contains("Slash commands"));
         assert!(
             help.contains("[resumed TUI]     available after `cowd --resume <session-id|latest>`")
@@ -8511,8 +8525,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_help_includes_shared_commands_and_exit() {
-        let help = render_repl_help();
+    fn tui_help_includes_shared_commands_and_exit() {
+        let help = render_terminal_help();
         assert!(help.lines().any(|line| line.trim() == "REPL"));
         for command in [
             "/help",
@@ -8537,7 +8551,7 @@ mod tests {
             "/exit",
         ] {
             assert!(
-                repl_help_contains_command(&help, command),
+                tui_help_contains_command(&help, command),
                 "missing command {command} in help:\n{help}"
             );
         }
@@ -8714,7 +8728,7 @@ mod tests {
             .collect()
     }
 
-    fn repl_help_contains_command(help: &str, command: &str) -> bool {
+    fn tui_help_contains_command(help: &str, command: &str) -> bool {
         help.lines().any(|line| {
             let trimmed = line.trim_start();
             trimmed == command
@@ -8744,17 +8758,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
+    fn resolve_tui_model_returns_user_supplied_model_unchanged_when_explicit() {
         let user_model = "gpt-4o".to_string();
 
-        let resolved = resolve_repl_model(user_model);
+        let resolved = resolve_tui_model(user_model);
 
         assert_eq!(resolved, "gpt-4o");
     }
 
     #[test]
     #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
-    fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
+    fn resolve_tui_model_falls_back_to_anthropic_model_env_when_default() {
         let _guard = env_lock();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
@@ -8764,7 +8778,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -8775,7 +8789,7 @@ mod tests {
 
     #[test]
     #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
-    fn resolve_repl_model_returns_default_when_env_unset_and_no_config() {
+    fn resolve_tui_model_returns_default_when_env_unset_and_no_config() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         let root = temp_dir();
@@ -8785,7 +8799,7 @@ mod tests {
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
@@ -9950,8 +9964,8 @@ providers:
         assert_eq!(converted[2].role, "user");
     }
     #[test]
-    fn repl_help_mentions_history_completion_and_multiline() {
-        let help = render_repl_help();
+    fn tui_help_mentions_history_completion_and_multiline() {
+        let help = render_terminal_help();
         for command in [
             "/history",
             "/tasks",
@@ -9960,7 +9974,7 @@ providers:
             "/cross-plane",
         ] {
             assert!(
-                repl_help_contains_command(&help, command),
+                tui_help_contains_command(&help, command),
                 "missing command {command} in help:\n{help}"
             );
         }
@@ -10714,7 +10728,7 @@ providers:
                 result.is_ok(),
                 "--reasoning-effort {value} should be accepted, got: {result:?}"
             );
-            if let Ok(CliAction::Repl {
+            if let Ok(CliAction::Tui {
                 reasoning_effort, ..
             }) = result
             {

@@ -554,7 +554,8 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn ingest_mission_projection(&mut self, value: &serde_json::Value) {
-        let mission = value.get("mission").unwrap_or(value);
+        let projection = value.get("projection").unwrap_or(value);
+        let mission = projection.get("mission").unwrap_or(projection);
         let sessions = mission
             .get("sessions")
             .and_then(serde_json::Value::as_array)
@@ -596,16 +597,24 @@ impl RuntimeControlSnapshot {
             agent_count,
             pending_approvals: mission
                 .pointer("/approval_projection/pending_count")
+                .or_else(|| projection.pointer("/approvals/pending_count"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
             relation_count: mission
                 .pointer("/relation_projection/relation_count")
+                .or_else(|| projection.pointer("/relations/relation_count"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
             event_count: mission
                 .get("events")
                 .and_then(serde_json::Value::as_array)
                 .map(|events| events.len() as u64)
+                .or_else(|| {
+                    projection
+                        .pointer("/event_digest/latest")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|events| events.len() as u64)
+                })
                 .unwrap_or_default(),
             command_pending: mission
                 .pointer("/session_command_summary/pending")
@@ -1333,7 +1342,7 @@ pub async fn refresh_runtime_control_snapshot(
         Ok(value) => snapshot.ingest_pending_approvals(&value),
         Err(err) => snapshot.degrade(format!("approval Gateway API unavailable: {err}")),
     }
-    match projection.mission_projection().await {
+    match projection.mission_control().await {
         Ok(value) => snapshot.ingest_mission_projection(&value),
         Err(err) => snapshot.degrade(format!("mission control projection unavailable: {err}")),
     }

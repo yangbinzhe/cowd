@@ -4,8 +4,8 @@
 //! TeamRuntime/MissionRuntime execution. It decides how a task should be
 //! organized without spawning agents or executing tools.
 
-use ai_kernel::core::{ExecutionMode, StrategyDecorator, TaskComplexity, TaskRisk};
-use ai_kernel::strategy::{StrategyDecision, TaskDomain};
+use harness_contract::core::{ExecutionMode, StrategyDecorator, TaskComplexity, TaskRisk};
+use harness_contract::strategy::{StrategyDecision, TaskDomain};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -652,7 +652,7 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_kernel::strategy::{decide_strategy, StrategyInput};
+    use harness_contract::strategy::{decide_strategy, StrategyInput};
 
     #[test]
     fn catalog_contains_all_built_in_templates() {

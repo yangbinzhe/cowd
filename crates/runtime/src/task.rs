@@ -1,9 +1,7 @@
-//! Task control plane for Cowd AI work kernel.
+//! Runtime task lifecycle, phase audit, and task persistence.
 //!
-//! This crate owns task lifecycle and persistence. It deliberately does not
-//! depend on `runtime` or `gateway`; graph/workgraph data is stored as a typed
-//! attachment so upper layers can adapt their own projection without creating
-//! dependency cycles.
+//! Gateway may project task state into UI-specific agent graphs, but the task
+//! lifecycle itself belongs to the runtime harness.
 
 use std::{
     path::PathBuf,
@@ -11,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ai_kernel::strategy::StrategyDecision;
+use harness_contract::strategy::StrategyDecision;
 use rusqlite::params;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use storage::{SqliteConnectionFactory, StorageHandle};
@@ -741,15 +739,18 @@ mod tests {
     }
 
     fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("cowd-ai-task-{label}-{}.db", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "cowd-runtime-task-{label}-{}.db",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     fn temp_handle(label: &str) -> StorageHandle {
         StorageHandle::sqlite(
             "tasks",
             temp_path(label),
-            "ai-task-test",
-            "ai-task-test-schema",
+            "runtime-task-test",
+            "runtime-task-test-schema",
         )
     }
 

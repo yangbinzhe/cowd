@@ -34,7 +34,7 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
         "doc_ops",
     ];
     let checked_files = [
-        "crates/channel/src/lib.rs",
+        "crates/surface/src/channel.rs",
         "crates/connector/src/lib.rs",
         "crates/gateway/src/api_routes.rs",
         "crates/gateway/src/runtime_host/mod.rs",
@@ -185,12 +185,12 @@ fn compat_harness_is_not_a_workspace_dependency() {
 #[test]
 fn ai_kernel_is_pure_semantic_crate() {
     let root = repo_root();
-    let manifest_path = root.join("crates/ai-kernel/Cargo.toml");
+    let manifest_path = root.join("crates/harness-contract/Cargo.toml");
     assert!(
         manifest_path.is_file(),
-        "ai-kernel must exist as the unified AI harness semantic crate"
+        "harness-contract must exist as the unified AI harness semantic crate"
     );
-    let manifest = read_repo("crates/ai-kernel/Cargo.toml");
+    let manifest = read_repo("crates/harness-contract/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);
     let absorbed_crates = [
         "ai-core",
@@ -217,7 +217,7 @@ fn ai_kernel_is_pure_semantic_crate() {
         );
         assert!(
             !dependencies.contains(absorbed),
-            "ai-kernel must own {absorbed} semantics internally, not depend on it"
+            "harness-contract must own {absorbed} semantics internally, not depend on it"
         );
     }
     for forbidden in [
@@ -236,11 +236,11 @@ fn ai_kernel_is_pure_semantic_crate() {
     ] {
         assert!(
             !dependencies.contains(forbidden),
-            "ai-kernel must not depend on heavy implementation crate {forbidden}"
+            "harness-contract must not depend on heavy implementation crate {forbidden}"
         );
     }
 
-    let source = read_repo("crates/ai-kernel/src/lib.rs");
+    let source = read_repo("crates/harness-contract/src/lib.rs");
     for module in [
         "pub mod core",
         "pub mod turn",
@@ -255,7 +255,7 @@ fn ai_kernel_is_pure_semantic_crate() {
         "pub mod growth",
         "pub mod harness",
     ] {
-        assert!(source.contains(module), "ai-kernel missing {module}");
+        assert!(source.contains(module), "harness-contract missing {module}");
     }
 }
 
@@ -309,7 +309,7 @@ fn fact_kernel_is_pure_semantic_crate() {
 
 #[test]
 fn external_boundary_crates_do_not_depend_on_runtime_or_gateway() {
-    for crate_name in ["model-protocol", "channel", "connector"] {
+    for crate_name in ["model-protocol", "surface", "connector"] {
         let manifest_path = format!("crates/{crate_name}/Cargo.toml");
         let manifest = read_repo(&manifest_path);
         let dependencies = manifest_dependencies(&manifest);
@@ -374,8 +374,9 @@ fn connector_is_independent_external_resource_boundary() {
     let runtime_cross_plane =
         production_part(&read_repo("crates/runtime/src/cross_plane_policy.rs")).to_string();
     assert!(
-        runtime_cross_plane.contains("use connector::{CrossPlaneRisk, DataClassification};"),
-        "runtime policy must consume connector-owned risk/data contracts"
+        runtime_cross_plane
+            .contains("use harness_contract::policy::{CrossPlaneRisk, DataClassification};"),
+        "runtime policy must consume harness-contract risk/data contracts"
     );
 
     let gateway_connector_route = production_part(&read_repo(
@@ -407,8 +408,12 @@ fn channel_contracts_drive_gateway_surface_readiness() {
         !repo_root().join("crates/channel-adapters").exists(),
         "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-surface"
     );
+    assert!(
+        !repo_root().join("crates/channel").exists(),
+        "channel contracts are absorbed into surface::channel"
+    );
 
-    let channel_source = production_part(&read_repo("crates/channel/src/lib.rs")).to_string();
+    let channel_source = production_part(&read_repo("crates/surface/src/channel.rs")).to_string();
     for required in [
         "pub struct ChannelContract",
         "pub fn channel_required_fields",
@@ -423,12 +428,12 @@ fn channel_contracts_drive_gateway_surface_readiness() {
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     assert!(
-        manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
-        "gateway must depend on channel for platform/channel contracts"
-    );
-    assert!(
         manifest_dependencies(&gateway_manifest).contains("surface = { path = \"../surface\" }"),
         "gateway must depend on surface for JSONL sidecar protocol hosting"
+    );
+    assert!(
+        !manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
+        "gateway must consume channel contracts through surface::channel"
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
@@ -439,7 +444,8 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     ))
     .to_string();
     assert!(
-        channel_routes.contains("use channel::{channel_required_fields, ChannelContract};"),
+        channel_routes
+            .contains("use surface::channel::{channel_required_fields, ChannelContract};"),
         "gateway channel routes must consume channel contract"
     );
     assert!(
@@ -592,8 +598,8 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     let runtime_approval =
         production_part(&read_repo("crates/runtime/src/approval_gate.rs")).to_string();
     assert!(
-        runtime_approval.contains("use ai_kernel::policy::{"),
-        "runtime approval gate must consume ai-kernel policy contracts"
+        runtime_approval.contains("use harness_contract::policy::{"),
+        "runtime approval gate must consume harness-contract policy contracts"
     );
     for required in [
         "pub async fn policy_receipt",
@@ -814,12 +820,13 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         "session lifecycle API must live under /api/sessions/*, not /api/runtime/sessions/*"
     );
 
-    let ai_policy = production_part(&read_repo("crates/ai-kernel/src/policy/mod.rs")).to_string();
+    let ai_policy =
+        production_part(&read_repo("crates/harness-contract/src/policy/mod.rs")).to_string();
     assert!(
         ai_policy.contains("pub enum PermissionResource")
             && ai_policy.contains("Tool")
             && ai_policy.contains("pub struct RiskGateReceipt"),
-        "ai-kernel policy must expose generic tool risk-gate contracts"
+        "harness-contract policy must expose generic tool risk-gate contracts"
     );
 }
 
@@ -1030,8 +1037,8 @@ fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
     let manifest = read_repo("crates/runtime/Cargo.toml");
     let dependencies = manifest_dependencies(&manifest);
     assert!(
-        dependencies.contains("ai-kernel = { path = \"../ai-kernel\" }"),
-        "runtime must depend on ai-kernel as the unified harness semantic entrypoint"
+        dependencies.contains("harness-contract = { path = \"../harness-contract\" }"),
+        "runtime must depend on harness-contract as the unified harness semantic entrypoint"
     );
     for forbidden in [
         "ai-core",
@@ -1048,7 +1055,7 @@ fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
     ] {
         assert!(
             !dependencies.contains(forbidden),
-            "runtime must not directly depend on legacy AI semantic crate {forbidden}; use ai-kernel"
+            "runtime must not directly depend on legacy AI semantic crate {forbidden}; use harness-contract"
         );
     }
 }
@@ -1174,8 +1181,6 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "matrix-core",
         "matrix-repository",
         "memory",
-        "slash-contract",
-        "slash-catalog",
         "storage",
         "tools",
         "rusqlite",
@@ -1187,23 +1192,23 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     }
 
     assert!(
-        !root.join("crates/slash/catalog/src/parser.rs").exists(),
-        "slash-catalog must not duplicate the slash parser owned by slash-contract"
+        !root.join("crates/slash").exists(),
+        "slash crates are absorbed into gateway"
     );
     let lockfile = read_repo("Cargo.lock");
     assert!(
-        lockfile.contains("name = \"slash-contract\"")
-            && lockfile.contains("name = \"slash-catalog\"")
+        !lockfile.contains("name = \"slash-contract\"")
+            && !lockfile.contains("name = \"slash-catalog\"")
             && !lockfile.contains("name = \"command-contract\"")
             && !lockfile.contains("name = \"command-service\""),
-        "slash crates must use final package names, not legacy command package names"
+        "slash command parsing must not be split into standalone command crates"
     );
-    let slash_catalog_source = read_repo("crates/slash/catalog/src/lib.rs");
+    let slash_catalog_source = read_repo("crates/gateway/src/command/slash/mod.rs");
     assert!(
-        slash_catalog_source.contains("pub use slash_contract::{")
+        slash_catalog_source.contains("pub mod parser")
             && slash_catalog_source.contains("classify_skills_slash_command")
-            && !slash_catalog_source.contains("pub mod parser"),
-        "slash-catalog must re-export slash-contract parser APIs instead of owning parser logic"
+            && slash_catalog_source.contains("pub mod specs"),
+        "gateway command::slash must own slash parser/spec projection"
     );
     let system_routes = read_repo("crates/gateway/src/api_routes/system_routes.rs");
     let slash_routes = read_repo("crates/gateway/src/api_routes/slash_routes.rs");
@@ -1319,10 +1324,10 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     let gateway_dependencies = manifest_dependencies(&gateway_manifest);
     assert!(
-        gateway_dependencies.contains("channel = { path = \"../channel\" }")
+        !gateway_dependencies.contains("channel = { path = \"../channel\" }")
             && gateway_dependencies.contains("surface = { path = \"../surface\" }")
             && !gateway_dependencies.contains("channel-adapters = "),
-        "gateway must own channel contracts and Surface sidecar protocol without adapter SDK coupling"
+        "gateway must consume surface::channel contracts and Surface sidecar protocol without adapter SDK coupling"
     );
 
     let runtime_host =
@@ -1387,7 +1392,7 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
             && runtime_audit.contains("runtime.no_channel_dependency")
             && runtime_audit.contains("gateway.owns_surface_boundary")
             && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
-            && runtime_audit.contains("ai_eval.repair_hints"),
+            && runtime_audit.contains("harness_eval.repair_hints"),
         "runtime must expose source-aware self audit checks with repair hints"
     );
     assert!(

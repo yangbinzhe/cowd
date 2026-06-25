@@ -4,7 +4,7 @@
 //! It evaluates an intended action, either delegates it, denies it, or submits
 //! an approval request for human/global resolution.
 
-use ai_kernel::core::TaskRisk;
+use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{

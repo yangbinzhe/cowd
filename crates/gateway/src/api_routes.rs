@@ -1316,6 +1316,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mission_control_route_exposes_runtime_projection_and_command_router() {
+        let _guard = mission_route_lock().lock().await;
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4();
+        let session_a = format!("mission-control-route-a-{suffix}");
+        let session_b = format!("mission-control-route-b-{suffix}");
+
+        let created_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": "mission",
+                            "action": "start_session",
+                            "actor": "test-human",
+                            "payload": {
+                                "title": "mission control command a",
+                                "session_id": session_a,
+                            },
+                            "evidence_refs": ["test:mission-control"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_a.status(), StatusCode::OK);
+        let created_a: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created_a.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(created_a["kind"], "mission_control.command_result");
+        assert_eq!(created_a["ok"], true);
+        assert_eq!(created_a["receipt"]["status"], "executed");
+        assert_eq!(
+            created_a["projection"]["kind"],
+            "mission_control.projection"
+        );
+
+        let created_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": "mission",
+                            "action": "start_session",
+                            "actor": "test-human",
+                            "payload": {
+                                "title": "mission control command b",
+                                "session_id": session_b,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_b.status(), StatusCode::OK);
+
+        let routed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": { "session": { "session_id": session_a } },
+                            "action": "route_to_session",
+                            "actor": "test-human",
+                            "payload": {
+                                "target_session_id": session_b,
+                                "command": "review from mission control"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed.status(), StatusCode::OK);
+        let routed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(routed["receipt"]["status"], "queued");
+
+        let dispatch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/sessions/dispatch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "max_commands": 20,
+                            "dispatch_mode": "mark_claimed_only",
+                            "allow_background": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let dispatch: serde_json::Value =
+            serde_json::from_slice(&to_bytes(dispatch.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(dispatch["kind"], "mission_control.session_dispatch_result");
+        assert_eq!(dispatch["ok"], true);
+        assert!(dispatch["report"]["dispatched"]
+            .as_array()
+            .expect("dispatch receipts")
+            .iter()
+            .any(|receipt| receipt["status_after"].as_str() == Some("claimed")));
+
+        let steward_started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": { "session": { "session_id": session_a } },
+                            "action": "start_steward",
+                            "actor": "test-human",
+                            "payload": {
+                                "objective": "supervise mission control route"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let steward_started: serde_json::Value = serde_json::from_slice(
+            &to_bytes(steward_started.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(steward_started["receipt"]["status"], "executed");
+
+        let approval_required = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": { "session": { "session_id": session_a } },
+                            "action": "route_to_agent",
+                            "actor": "test-human",
+                            "payload": {
+                                "agent_id": "agent-for-stage-i",
+                                "command": "perform sensitive intervention"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let approval_required: serde_json::Value = serde_json::from_slice(
+            &to_bytes(approval_required.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(approval_required["receipt"]["status"], "approval_required");
+        let approval_id = approval_required["receipt"]["result"]["approval"]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+
+        let decided = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": { "approval": { "approval_id": approval_id } },
+                            "action": "decide_approval",
+                            "actor": "test-human",
+                            "payload": {
+                                "approved": true,
+                                "reason": "stage i route test"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let decided: serde_json::Value =
+            serde_json::from_slice(&to_bytes(decided.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(decided["receipt"]["status"], "executed");
+
+        let control = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mission/control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK);
+        let control: serde_json::Value =
+            serde_json::from_slice(&to_bytes(control.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(control["projection"]["kind"], "mission_control.projection");
+        assert!(control["projection"]["sessions"].as_array().unwrap().len() >= 2);
+        assert!(
+            control["projection"]["event_digest"]["total_recent_events"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert_eq!(
+            control["projection"]["relations"]["kind"],
+            "runtime.session_relations"
+        );
+    }
+
+    #[tokio::test]
     async fn mission_routes_write_approvals_relations_proxies_and_routes() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
@@ -5853,7 +6101,7 @@ providers:
 
     #[tokio::test]
     async fn slash_catalog_dispatch_and_history_are_available() {
-        let root = test_temp_dir("slash-catalog");
+        let root = test_temp_dir("slash-gateway");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -6761,7 +7009,7 @@ providers:
                 },
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
-                risk: ai_kernel::core::TaskRisk::High,
+                risk: harness_contract::core::TaskRisk::High,
                 evidence_refs: vec!["approval-route:test".to_string()],
                 timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
             })

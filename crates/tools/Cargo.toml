@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 futures = "0.3"
-ai-kernel = { path = "../ai-kernel" }
+harness-contract = { path = "../harness-contract" }
 base64 = "0.22"
 skill-service = { path = "../skill/service" }
 flate2 = "1"

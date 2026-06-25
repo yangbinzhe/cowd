@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::command::slash::SkillSlashDispatch;
 use crate::services::GatewayServices;
-use slash_catalog::SkillSlashDispatch;
 
 pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();

@@ -64,7 +64,7 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
-pub(crate) fn resolve_repl_model(cli_model: String) -> String {
+pub(crate) fn resolve_tui_model(cli_model: String) -> String {
     if cli_model != DEFAULT_MODEL {
         return cli_model;
     }

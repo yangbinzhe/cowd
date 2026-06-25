@@ -75,19 +75,23 @@ fn runtime_does_not_depend_on_channel(repo_root: &Path) -> SourceSelfAuditCheck 
 
 fn gateway_owns_surface_boundary(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/Cargo.toml");
+    let channel_routes = repo_root.join("crates/gateway/src/api_routes/channel_routes.rs");
     let source = read_source(&path);
+    let route_source = read_source(&channel_routes);
     let passed = source.as_deref().is_some_and(|source| {
-        source.contains("channel = { path = \"../channel\" }")
-            && source.contains("surface = { path = \"../surface\" }")
+        source.contains("surface = { path = \"../surface\" }")
+            && !source.contains("channel = { path = \"../channel\" }")
             && !source.contains("channel-adapters = ")
-    });
+    }) && route_source
+        .as_deref()
+        .is_some_and(|source| source.contains("surface::channel"));
     check(
         "gateway.owns_surface_boundary",
         "gateway",
         passed,
-        "gateway must own channel contracts and Surface sidecar protocol without adapter SDK coupling",
-        vec![path],
-        "keep channel contracts and surface protocol in gateway; move platform SDKs behind JSONL Surface sidecars",
+        "gateway must expose channel APIs through Surface contracts without adapter SDK coupling",
+        vec![path, channel_routes],
+        "depend on surface, use surface::channel contracts, and keep platform SDKs behind JSONL Surface sidecars",
     )
 }
 
@@ -128,14 +132,14 @@ fn growth_routes_are_observable(repo_root: &Path) -> SourceSelfAuditCheck {
 }
 
 fn ai_eval_has_repair_hints(repo_root: &Path) -> SourceSelfAuditCheck {
-    let path = repo_root.join("crates/ai-eval/src/lib.rs");
+    let path = repo_root.join("crates/harness-eval/src/lib.rs");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
         source.contains("repair_hint") && source.contains("FailedScenarioCheck")
     });
     check(
-        "ai_eval.repair_hints",
-        "ai-eval",
+        "harness_eval.repair_hints",
+        "harness-eval",
         passed,
         "scenario checks must produce repair hints for self-repair planning",
         vec![path],
@@ -198,6 +202,6 @@ mod tests {
         assert!(report
             .checks
             .iter()
-            .any(|check| check.id == "ai_eval.repair_hints"));
+            .any(|check| check.id == "harness_eval.repair_hints"));
     }
 }

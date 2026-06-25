@@ -5,7 +5,7 @@
 //! returns a stable decision that UI, audit, and runtime routing can consume.
 
 use chrono::{DateTime, Utc};
-use connector::{CrossPlaneRisk, DataClassification};
+use harness_contract::policy::{CrossPlaneRisk, DataClassification};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;

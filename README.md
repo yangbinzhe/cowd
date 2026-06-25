@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.360`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.380`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -26,18 +26,16 @@ Gateway
   Surface static/callback/health/events
 
 AI Harness core
-  Session
-  Runtime turn
-  Context
-  Approval
-  Tools
-  Skills
-  MCP
-  Provider
-  Memory
-  Matrix
-  Task/Eval/Growth
-  Telemetry
+  Conversation Runtime
+  Mission Runtime
+  Mission Control Runtime
+  Session Execution Plane
+  Team Execution Loop
+  Agent Lifecycle / Mailbox / Event Bus
+  Steward Runtime / Steward Scheduler
+  Runtime Event Store / Recovery
+  Context / Approval / Tools / Skills / MCP / Provider
+  Memory / Matrix / Task / Eval / Telemetry
 
 Fact/application layer
   fact-kernel
@@ -100,15 +98,44 @@ WebUI、飞书、邮件、企微、微信 iLink 不再进入 core workspace。�
 
 | crate | 职责 |
 |---|---|
-| `crates/ai-kernel` | AI Harness 语义入口，承载策略、目标、工作图等核心语义。 |
-| `crates/ai-task` | 任务结构、推进状态和任务级持久化。 |
-| `crates/ai-eval` | 评测和能力验证边界。 |
-| `crates/runtime` | 会话运行、上下文组装、工具/MCP/provider 调度、运行时控制。 |
+| `crates/harness-contract` | AI Harness 语义入口，承载策略、目标、工作图等核心语义。 |
+| `crates/harness-eval` | 评测和能力验证边界。 |
+| `crates/runtime` | 会话运行、上下文组装、任务生命周期、工具/MCP/provider 调度、运行时控制。 |
 | `crates/session` | session 合同和生命周期存储。 |
 | `crates/approval` | 用户介入、审批记录、权限与审计。 |
 | `crates/model-protocol` | 模型协议、prompt cache、usage 合同。 |
 | `crates/provider` | OpenAI/Anthropic/DeepSeek/Qwen 等模型 provider 适配。 |
 | `crates/mcp` | MCP stdio / lifecycle 合同。 |
+
+#### Runtime 内部能力
+
+`crates/runtime` 是当前 AI Harness 的真正执行核心。它不是 UI 层、不是 Gateway 层，也不是 channel 适配层。它现在承载的核心子域如下：
+
+```text
+runtime
+  conversation                 单次 turn、模型调用、工具回调、上下文压缩
+  provider_runtime_client      provider fallback、模型链、请求执行
+  mission_runtime              mission session、命令队列、proxy、steward 入口
+  mission_control              Mission Control 全局投影和控制命令
+  session_execution            session 状态、跨 session 消息、后台/切换/关闭
+  team_runtime                 team 模板、角色、agent 组队
+  team_execution               role task 生成、agent task 投递、evidence 记录
+  agent_lifecycle              agent 进程/任务生命周期、状态和控制命令
+  agent_mailbox                agent task mailbox
+  agent_event_bus              agent progress event
+  steward_runtime              autonomy profile 驱动的托管执行
+  steward_scheduler            steward tick、ledger、schedule evidence
+  runtime_event_store          mission/session/team/agent/tool/recovery 事件账本
+  runtime_event_replay         事件回放和恢复前分析
+  recovery                     failed/stale/recovery required 状态恢复执行器
+  global_approval_queue        全局审批队列和投影
+  cross_plane_policy           跨入口身份、授权、风险、审计和 dispatch receipt
+  tool_*                       工具调度、工具账本、工具记忆、工具执行计划
+  collaboration_template       多 agent 协作模板和匹配
+  context_* / memory bridge    context packet、memory recall、skill memory
+```
+
+当前实现已经把“多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复”这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。
 
 ### 3.3 Fact 层
 
@@ -127,8 +154,8 @@ Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结
 |---|---|
 | `crates/tools` | 内置工具、工具 schema、工具执行和工具治理。 |
 | `crates/skill/service` | skill catalog、projection、run、governance 和 API 服务。 |
-| `crates/connector` | 外部资源、账号、服务、资源状态和 cross-plane 合同。 |
-| `crates/channel` | Gateway 层使用的平台/channel 合同，不包含 SDK 实现。 |
+| `crates/connector` | 外部资源、账号、服务和资源状态。 |
+| `crates/surface::channel` | Gateway 层使用的平台/channel 合同，不包含 SDK 实现。 |
 | `crates/plugins` | plugin manifest、registry 和生命周期。 |
 
 渠道自身的聊天、收发消息、长连接、静态资源等属于 surface/sidecar；渠道附带的文档操作、平台高级能力未来应作为 skill/tool 安装，而不是塞回 Runtime 或 Gateway。
@@ -139,7 +166,7 @@ Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结
 |---|---|
 | `crates/app-mfg` | MFG 制造应用层。基于 Matrix/Memory，不属于内核。 |
 | `crates/storage` | 通用 SQLite/存储基础。 |
-| `crates/telemetry` | 事件和遥测基础类型。 |
+| `crates/model-protocol::telemetry` | provider/runtime 共享的事件和遥测基础类型。 |
 
 ## 4. Gateway 与 Surface
 
@@ -416,7 +443,94 @@ Capability Registry
 - CLI 只保留轻控制、配置、状态、诊断和启动，不做复杂业务管理。
 - 外部渠道 surface 只负责消息入口、消息投递、callback、长连接和静态资源，不成为 Runtime 的一部分。
 
-## 8. 配置
+## 8. 当前依赖关系
+
+### 8.1 Workspace crate 依赖图
+
+以下是当前 workspace 内部依赖的主链路，省略 `serde/tokio/chrono` 等通用第三方包：
+
+```text
+cli
+  -> gateway
+  -> tui optional, only with `tui-surface/full`
+
+tui
+  -> no core crate dependency
+  -> Gateway HTTP/SSE only
+
+gateway
+  -> runtime
+  -> tools
+  -> provider / model-protocol / mcp
+  -> memory / fact-kernel / matrix-core / matrix-repository
+  -> approval / session / harness-contract
+  -> skill-service / plugins
+  -> connector / surface
+  -> app-mfg
+
+runtime
+  -> harness-contract
+  -> provider / model-protocol
+  -> memory / storage / approval
+  -> plugins
+  -> runtime::task / runtime::eval_gate / runtime::runtime_harness
+  -> matrix-core only in dev-dependencies
+
+tools
+  -> harness-contract
+  -> mcp / plugins / skill-service
+  -> runtime
+
+fact-kernel
+  -> no workspace domain dependency
+
+memory
+  -> fact-kernel
+  -> storage
+
+matrix-core
+  -> fact-kernel
+
+matrix-repository
+  -> matrix-core
+  -> storage
+
+app-mfg
+  -> matrix-core / matrix-repository
+  -> storage
+
+harness-eval
+  -> harness-contract
+  -> runtime
+
+provider
+  -> model-protocol
+
+surface
+  -> surface::channel contracts
+
+model-protocol
+  -> provider config / telemetry / usage contracts
+```
+
+### 8.2 依赖边界判断
+
+已经符合目标的部分：
+
+- TUI 不直接依赖 Gateway 内部 crate、runtime、provider、memory、channel，只通过 Gateway HTTP/SSE 使用能力。
+- Runtime 不依赖 `channel` 和 `surface`，也不链接飞书、邮件、企微、WebUI 等平台 SDK。
+- 非 TUI surface 不再进入 core workspace，外部 surface 通过 `surface.json` 和 JSONL sidecar 与 Gateway 连接。
+- Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
+- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface、MFG 的 API 暴露。
+
+仍需继续收束的部分：
+
+- `tools -> runtime` 仍然存在，但已完成第一轮收束：tools 不再返回 provider 专用 ToolDefinition，不再在搜索 DTO 中暴露 runtime MCP degraded 类型，lane completion 已迁入 runtime。剩余依赖集中在 executor 对 runtime 文件、bash、checkpoint、mutation、cache、权限、LSP/MCP host 和测试用 subagent runtime 的复用。终态仍应改成 `runtime -> tools` 或由独立 tool contract 承接共享类型。
+- `runtime` 不再依赖 connector/channel；`CrossPlaneRisk`、`DataClassification` 已进入 `harness-contract::policy`，connector 继续负责外部资源目录与能力描述。
+- `gateway` 作为聚合 crate 依赖面很宽，这是服务入口的正常代价，但需要继续保持“route/service 薄编排，业务状态归 runtime/domain”的纪律，避免 Gateway 变成第二套 runtime。
+- `runtime` 内部模块数量已经很大，Mission、Agent、Team、Steward、Recovery 已接入，但后续需要更清晰的子目录或 crate 内分层，减少 `lib.rs` 直接暴露过宽的问题。
+
+## 9. 配置
 
 常见配置片段：
 
@@ -433,7 +547,7 @@ gateway:
 
 模型/API 密钥属于配置和 secrets，不应成为顶层 auth 模块。Gateway 的 WebUI 静态资源配置是可选项，缺失时服务仍应可用。
 
-## 9. 验证
+## 10. 验证
 
 core 发布前验证：
 
@@ -466,12 +580,59 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 
 默认情况下第一条不应输出 TUI 渲染依赖；第二条不应输出平台 SDK。
 
-## 10. 当前状态
+## 11. 当前实现状态
+
+### 11.1 已经落成的能力
 
 - core workspace 已删除旧平台适配 crate。
 - `crates/cli` 默认不编译 `crates/tui`。
-- `crates/gateway` 保留 `channel` 合同和 `surface` 协议，但不依赖平台 SDK。
+- `crates/gateway` 通过 `surface::channel` 使用 channel 合同和 `surface` 协议，但不依赖平台 SDK。
 - `crates/runtime` 不依赖 channel/surface adapter。
 - `cowd-surface` 承载 WebUI 和非 TUI sidecar。
 - TUI 已形成 Clean/Panorama、Control Deck 和 Gateway attach 场景验证闭环。
-- 版本标签：`v0.9.360`。
+- WebUI/TUI 的核心入口都走 Gateway，符合 Gateway 作为唯一后台服务入口的原则。
+- Mission Control Runtime 已提供全局 projection 和 command receipt。
+- Mission Runtime 已支持 session、proxy、command queue、steward request、projection。
+- Session Execution Plane 已支持 session 切换、后台运行、跨 session message、pause/close 等控制语义。
+- Team Execution Loop 已能根据 team/template 生成 role task，投递到 agent mailbox/lifecycle，记录 agent event 和 mission evidence。
+- Agent Mailbox 和 Agent Event Bus 已进入 runtime，主 session 能看到 team/agent 进展的基础事件来源。
+- Steward Scheduler 已具备 tick、ledger、profile、approval action、evidence 记录等托管推进基础。
+- Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
+- Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
+- Harness Eval 已具备 quick/full/deep 三层验证报告，最新计划目录中已有 quick/full/deep 通过记录。
+- 版本标签：`v0.9.380`。
+
+### 11.2 是否达到当前阶段目标
+
+结论：当前代码已经达到“核心链路接线、可被 Gateway/TUI/WebUI 投影、可用 harness-eval 验证”的阶段目标，但还没有达到“完全自主、多 agent 深度协作、自我成长闭环完全成熟”的终局状态。
+
+更具体地说：
+
+- 对“Runtime 是 AI Harness 核心”的目标：基本达成。Mission、session、team、agent、steward、approval、event、recovery 都已回到 runtime。
+- 对“Gateway 干净，只做后台入口和编排”的目标：大体达成。Gateway 依赖面宽，但业务核心没有明显回流成第二套 runtime。
+- 对“surface 与 runtime 解耦”的目标：已达成核心边界。TUI/WebUI/channel 都不应直接进入 runtime，当前 runtime 没有依赖 channel/surface。
+- 对“tools 只是 AI 的手脚”的目标：完成了契约层收束和 host-only lane completion 迁移，但尚未完全达成。`tools` 仍依赖 `runtime` 的 executor 实现能力，下一步应迁出权限、MCP/LSP、bash/file/mutation/checkpoint host 复用。
+- 对“多 agent 高阶协同”的目标：完成基础底座，但还不是完整智能团队运行时。当前 team execution 更像任务分派、事件、证据和 agent input 投递闭环，最终综合、复杂依赖调度、失败恢复、跨 agent 互看输出和人类实时介入仍需继续增强。
+- 对“长对话控制多 session / Mission Control”的目标：完成主要控制模型和 API 底座，但高级自然语言跨 session 指挥、session 间代理互拉、全局托管 agent 汇报仍需要更深的 runtime 策略层。
+- 对“自我成长和事实内核”的目标：Memory、Matrix、Fact Kernel 已有边界，但成长闭环还更多是可记录、可召回、可验证的基础能力，没有完全形成长期自动提炼、冲突治理、衰减、质量评分和自我修正的成熟闭环。
+
+### 11.3 当前主要缺口
+
+必须继续处理的架构缺口：
+
+- `tools -> runtime` 需要继续拆掉。已完成 provider schema DTO、MCP degraded DTO、lane completion 的第一轮清理；下一步建议新增或强化 `tool-contract` / `runtime-tool-host` 边界，让 tools 只暴露 schema、权限需求、纯执行器和结果，不直接使用 `PermissionEnforcer`、`ProviderRuntimeClient`、`ConversationRuntime`、`tool_cache` 等 runtime 内部类型。
+- Cross-plane 风险和数据分类合同已经上移到 `harness-contract::policy`，后续仍需把更多跨入口治理合同继续从 connector 中剥离，避免 connector 变成治理语义大桶。
+- Runtime 内部模块应进一步结构化。当前 `lib.rs` 暴露面过宽，后续应按 `mission/`、`agent/`、`team/`、`steward/`、`recovery/`、`tooling/`、`context/` 分组，而不是持续平铺。
+- Recovery 目前更像状态恢复和事件补偿，不是完整的 provider turn 续跑系统。真实 kill/restart、进程中断、provider stream 中断、agent 半完成任务恢复还需要场景化强化。
+- Steward 目前具备 tick 和 ledger，但长期托管执行还需要后台循环、预算、策略退避、审批超时、失败降级和汇报生成的完整服务化。
+- Team Execution 目前能派发任务和记录证据，但还需要真实并行 agent 执行、角色依赖阻塞、最终 synthesis、review gate、人类插手、agent 间互阅输出的强闭环。
+- Mission Control 的自然语言控制还没有完全成为一等能力。现在 API/命令底座存在，但“用户在一个高级视窗里用自然语言管理全部 session/agent/team/steward”的体验还需要 WebUI/TUI 继续上层实现。
+- Harness Eval 已能证明核心链路健康，但测试矩阵还缺少长时间压测、并发 session、真实 sidecar、持久化重启、故障注入、权限审批超时、跨 surface 多入口投递等场景。
+
+### 11.4 下一步演进原则
+
+- 先补边界，再补体验。`tools -> runtime` 是当前最需要继续收束的依赖边界；cross-plane 合同已从 connector 中抽离，后续继续清理 connector 中的治理语义残留。
+- Runtime 继续承载 AI Harness 内核，但 runtime 内部要按业务子域收束，避免变成无边界大桶。
+- Gateway 保持统一后台入口，继续承接 surface、WebUI、TUI、channel sidecar、callback、静态资源和服务 API，但不保存第二套执行状态。
+- WebUI 做最完整的 Mission Control / Reality Core / Tool / Skill / Surface 管理面；TUI 做低噪声、高效率、键盘优先的终端控制面。
+- Memory 和 Matrix 继续作为 Reality Core 的两个事实引擎，MFG 作为消费 Reality Core 的应用，不再混入内核概念。

@@ -419,7 +419,7 @@ mod tests {
 
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: "session-1".to_string(),
-            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            source_event_kind: "runtime.harness_contract.trace".to_string(),
             strategy_mode: ExecutionMode::PlanExecute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(

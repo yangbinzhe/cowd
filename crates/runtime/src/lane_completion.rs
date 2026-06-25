@@ -11,12 +11,12 @@
 use std::process::Command;
 use std::time::Duration;
 
-use runtime::{
+use crate::{
     check_freshness, evaluate, BranchFreshness, GreenLevel, LaneBlocker, LaneContext, PolicyAction,
     PolicyCondition, PolicyEngine, PolicyRule, ReviewStatus,
 };
 
-type AgentOutput = runtime::AgentSnapshot;
+type AgentOutput = crate::AgentSnapshot;
 
 /// Detects if a lane should be automatically marked as completed.
 ///
@@ -63,7 +63,7 @@ pub(crate) fn detect_lane_completion(
         stale_branch: None,
         blocker: LaneBlocker::None,
         review_status: ReviewStatus::Approved,
-        diff_scope: runtime::DiffScope::Scoped,
+        diff_scope: crate::DiffScope::Scoped,
         completed: true,
         reconciled: false,
     })
@@ -128,7 +128,7 @@ fn branch_freshness_to_duration(freshness: &BranchFreshness) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{DiffScope, LaneBlocker};
+    use crate::{DiffScope, LaneBlocker};
 
     fn test_output() -> AgentOutput {
         AgentOutput {
@@ -138,7 +138,7 @@ mod tests {
             subagent_type: None,
             model: None,
             status: "Finished".to_string(),
-            backend: runtime::AgentExecutionBackendKind::InProcess,
+            backend: crate::AgentExecutionBackendKind::InProcess,
             output_file: "/tmp/test.output".to_string(),
             manifest_file: "/tmp/test.manifest".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),

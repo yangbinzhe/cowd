@@ -12,7 +12,7 @@ use crate::runtime_boundary::{
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
-use ai_kernel::{
+use harness_contract::{
     task::{TaskId, TaskTurnBinding},
     turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus},
 };

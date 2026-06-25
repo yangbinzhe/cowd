@@ -28,6 +28,7 @@ pub enum RuntimeEventScope {
     Worker,
     Schedule,
     Tool,
+    Recovery,
 }
 
 impl RuntimeEventScope {
@@ -46,6 +47,7 @@ impl RuntimeEventScope {
             Self::Worker => "worker",
             Self::Schedule => "schedule",
             Self::Tool => "tool",
+            Self::Recovery => "recovery",
         }
     }
 }
@@ -326,6 +328,7 @@ fn parse_scope(scope: &str) -> RuntimeEventScope {
         "worker" => RuntimeEventScope::Worker,
         "schedule" => RuntimeEventScope::Schedule,
         "tool" => RuntimeEventScope::Tool,
+        "recovery" => RuntimeEventScope::Recovery,
         _ => RuntimeEventScope::Mission,
     }
 }

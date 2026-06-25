@@ -433,6 +433,31 @@ impl GatewayApiClient {
         self.get_json("/api/mission/projection").await
     }
 
+    pub async fn mission_control(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/mission/control").await
+    }
+
+    pub async fn dispatch_mission_sessions(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/control/sessions/dispatch", body)
+            .await
+    }
+
+    pub async fn tick_mission_steward_scheduler(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/mission/control/stewards/scheduler", body)
+            .await
+    }
+
+    pub async fn apply_runtime_recovery(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/runtime/events/recover", serde_json::json!({}))
+            .await
+    }
+
     pub async fn mission_session_detail(
         &self,
         session_id: &str,

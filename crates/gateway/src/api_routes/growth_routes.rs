@@ -52,7 +52,7 @@ async fn growth_events_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
     }))
 }
 
-fn growth_sources(events: &[ai_kernel::growth::GrowthEvent]) -> Vec<String> {
+fn growth_sources(events: &[harness_contract::growth::GrowthEvent]) -> Vec<String> {
     let mut sources = events
         .iter()
         .map(|event| event.source_event_kind.clone())

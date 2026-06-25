@@ -23,6 +23,34 @@ const MISSION_COMMAND_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/api/mission/control",
+            get(mission_control_handler).post(execute_mission_control_command_handler),
+        )
+        .route(
+            "/api/mission/control/command",
+            post(execute_mission_control_command_handler),
+        )
+        .route(
+            "/api/mission/control/sessions/dispatch",
+            post(dispatch_mission_sessions_handler),
+        )
+        .route(
+            "/api/mission/control/sessions/bridge",
+            post(bridge_mission_session_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/execution",
+            get(team_execution_plan_handler).post(tick_team_execution_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/evidence",
+            get(team_mission_evidence_handler),
+        )
+        .route(
+            "/api/mission/control/agents/:agent_id/events",
+            get(agent_mission_events_handler),
+        )
         .route("/api/mission/projection", get(mission_projection_handler))
         .route(
             "/api/mission/sessions",
@@ -102,6 +130,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(tick_all_mission_stewards_handler),
         )
         .route(
+            "/api/mission/control/stewards/scheduler",
+            get(mission_steward_scheduler_handler).post(tick_mission_steward_scheduler_handler),
+        )
+        .route(
+            "/api/mission/control/stewards/:id/handoff",
+            get(mission_steward_scheduler_handoff_handler),
+        )
+        .route(
             "/api/mission/stewards/:id",
             get(mission_steward_detail_handler),
         )
@@ -138,6 +174,69 @@ async fn mission_projection_handler(
     Json(state.services.mission.projection())
 }
 
+async fn mission_control_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.services.mission.mission_control())
+}
+
+async fn execute_mission_control_command_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<runtime::MissionControlCommand>,
+) -> impl IntoResponse {
+    Json(state.services.mission.execute_mission_control_command(body))
+}
+
+async fn dispatch_mission_sessions_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<runtime::SessionExecutionPolicy>,
+) -> impl IntoResponse {
+    Json(state.services.mission.dispatch_mission_sessions(body))
+}
+
+async fn bridge_mission_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<runtime::CrossSessionMessage>,
+) -> impl IntoResponse {
+    Json(state.services.mission.bridge_mission_session(body))
+}
+
+async fn team_execution_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .team_execution_plan(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn tick_team_execution_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .tick_team_execution(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn agent_mission_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.services.mission.agent_mission_events(&agent_id))
+}
+
+async fn team_mission_evidence_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.services.mission.team_mission_evidence(&team_id))
+}
+
 async fn mission_approvals_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -158,6 +257,26 @@ async fn tick_all_mission_stewards_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     Json(state.services.mission.tick_all_stewards())
+}
+
+async fn mission_steward_scheduler_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(state.services.mission.steward_scheduler())
+}
+
+async fn tick_mission_steward_scheduler_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<runtime::StewardSchedulerConfig>,
+) -> impl IntoResponse {
+    Json(state.services.mission.tick_steward_scheduler(body))
+}
+
+async fn mission_steward_scheduler_handoff_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.services.mission.steward_scheduler_handoff(&id))
 }
 
 async fn mission_steward_detail_handler(

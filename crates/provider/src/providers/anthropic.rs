@@ -8,10 +8,12 @@ use model_protocol::oauth::{
     load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
     OAuthTokenExchangeRequest,
 };
+use model_protocol::telemetry::{
+    AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer,
+};
 use model_protocol::usage::format_usd;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;

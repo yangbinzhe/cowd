@@ -1,13 +1,24 @@
-use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite};
-use ai_kernel::core::TaskRisk;
-use ai_kernel::strategy::{decide_strategy, StrategyInput};
+use harness_contract::core::TaskRisk;
+use harness_contract::strategy::{decide_strategy, StrategyInput};
+use harness_eval::{
+    ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+};
 use runtime::{
-    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
-    CollaborationTemplateMatcher, MissionRuntime, RuntimeEventInput, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeEventStore, StartMissionSessionRequest, StartStewardRuntimeRequest,
-    StartTeamRuntimeRequest, StewardActionStatus, StewardRuntimeService, TickStewardRuntimeRequest,
+    global_mission_runtime, global_session_relation_graph, global_steward_runtime_service,
+    global_team_runtime_service, AgentExecutionBackendKind, AgentSnapshot, ApiClient, ApiRequest,
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AssistantEvent, AutonomyProfileId,
+    CancellationToken, CollaborationTemplateMatcher, ContentBlock, ConversationMessage,
+    CrossSessionMessage, MessageRole, MissionControlAction, MissionControlCommand,
+    MissionControlCommandTarget, MissionControlRuntime, ProviderRuntimeClient, RecoveryExecutor,
+    RuntimeEventInput, RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore,
+    SessionExecutionPlane, SessionProxy, StartMissionSessionRequest, StartStewardRuntimeRequest,
+    StartTeamRuntimeRequest, StewardActionStatus, StewardScheduler, StewardSchedulerConfig,
+    TeamExecutionLoop, TickStewardRuntimeRequest, DEFAULT_AGENT_MODEL,
 };
 use serde::Serialize;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 const REPORT_DIR: &str = "/media/yi/Datas/workspace/plan/0624-Mission-Harness闭环补齐/reports";
 
@@ -119,12 +130,12 @@ fn run_quick() -> MissionHarnessEvalReport {
 
 fn run_full() -> MissionHarnessEvalReport {
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
+    let gateway = probe_gateway_contract();
     scenarios.push(CapabilityResult {
         capability: "gateway_contract_surface",
-        status: "passed",
-        evidence: "mission/team/approval/inbox/replay contracts exercised in-process".to_string(),
-        notes: "gateway_process=false; use WebUI/TUI tests for browser and terminal smoke"
-            .to_string(),
+        status: if gateway.0 { "passed" } else { "degraded" },
+        evidence: gateway.1,
+        notes: "full eval probes live gateway when COWD_GATEWAY_URL is running".to_string(),
     });
     scenarios.push(CapabilityResult {
         capability: "runtime_recovery_report",
@@ -132,13 +143,18 @@ fn run_full() -> MissionHarnessEvalReport {
         evidence: replay_evidence,
         notes: "full layer verifies recovery semantics without spawning provider".to_string(),
     });
+    let status = if scenarios.iter().all(|item| item.status == "passed") && gateway.0 {
+        "passed"
+    } else {
+        "failed"
+    };
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Full,
-        status: "passed",
+        status,
         provider: None,
         budget: None,
-        gateway_process: false,
+        gateway_process: gateway.0,
         scenarios,
     }
 }
@@ -161,14 +177,15 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         };
     }
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
+    let gateway = probe_gateway_contract();
+    let provider_smoke = run_provider_smoke();
+    let provider_passed = provider_smoke.status == "passed";
+    scenarios.push(provider_smoke);
     scenarios.push(CapabilityResult {
-        capability: "deep_provider_eval",
-        status: "gated",
-        evidence:
-            "provider configured flag accepted; real model scenario not executed by default harness"
-                .to_string(),
-        notes: "wire a provider-backed scenario here when an explicit token budget is approved"
-            .to_string(),
+        capability: "gateway_contract_surface",
+        status: if gateway.0 { "passed" } else { "degraded" },
+        evidence: gateway.1,
+        notes: "deep eval includes live gateway probe when available".to_string(),
     });
     scenarios.push(CapabilityResult {
         capability: "runtime_recovery_report",
@@ -176,19 +193,84 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         evidence: replay_evidence,
         notes: "deep preflight recovery report generated".to_string(),
     });
+    let all_scenarios_passed = scenarios.iter().all(|item| item.status == "passed");
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Deep,
-        status: "gated",
+        status: if provider_passed && gateway.0 && all_scenarios_passed {
+            "passed"
+        } else {
+            "failed"
+        },
         provider,
         budget,
-        gateway_process: false,
+        gateway_process: gateway.0,
         scenarios,
     }
 }
 
+fn run_provider_smoke() -> CapabilityResult {
+    let model = "deepseek-v4-flash";
+    let mut client = match ProviderRuntimeClient::new(model.to_string(), Vec::new()) {
+        Ok(client) => client,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_provider_eval",
+                status: "failed",
+                evidence: format!("provider client unavailable: {}", abbreviate(&error, 180)),
+                notes: "real provider smoke did not start".to_string(),
+            };
+        }
+    };
+    let request = ApiRequest {
+        system_prompt: vec![
+            "You are a strict health-check responder. Return exactly: OK".to_string(),
+        ],
+        messages: vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: "Return exactly OK.".to_string(),
+            }],
+            usage: None,
+        }],
+        model: model.to_string(),
+    };
+    match client.stream_collect(request) {
+        Ok(events) => {
+            let text = events
+                .iter()
+                .filter_map(|event| match event {
+                    AssistantEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            if text.trim().is_empty() {
+                CapabilityResult {
+                    capability: "deep_provider_eval",
+                    status: "failed",
+                    evidence: "provider returned no text".to_string(),
+                    notes: "real provider call completed without usable assistant text".to_string(),
+                }
+            } else {
+                CapabilityResult {
+                    capability: "deep_provider_eval",
+                    status: "passed",
+                    evidence: format!("{model} -> {}", abbreviate(text.trim(), 80)),
+                    notes: "real provider call returned assistant text under explicit configured budget".to_string(),
+                }
+            }
+        }
+        Err(error) => CapabilityResult {
+            capability: "deep_provider_eval",
+            status: "failed",
+            evidence: abbreviate(&error.to_string(), 180),
+            notes: "real provider call failed; inspect provider credentials/network".to_string(),
+        },
+    }
+}
+
 fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
-    let mission = MissionRuntime::new();
+    let mission = global_mission_runtime();
     let session = mission
         .start_session(StartMissionSessionRequest {
             title: "Mission Harness eval".to_string(),
@@ -198,7 +280,7 @@ fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
     let prompt = "validate mission harness runtime loop";
     let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
     let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-    let team = runtime::TeamRuntimeService::new()
+    let team = global_team_runtime_service()
         .start(StartTeamRuntimeRequest {
             session_id: session.session_id.clone(),
             objective: prompt.to_string(),
@@ -228,7 +310,106 @@ fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
             "summarize evidence".to_string(),
         )
         .expect("command enqueued");
-    let steward_runtime = StewardRuntimeService::new();
+    let session_b = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Mission Harness peer".to_string(),
+            session_id: Some(format!("mission-eval-peer-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("peer mission starts");
+    global_session_relation_graph()
+        .upsert_proxy(SessionProxy {
+            session_id: session_b.session_id.clone(),
+            summary: "mission harness peer proxy".to_string(),
+            evidence_refs: vec![format!("session:{}", session_b.session_id)],
+            decisions: Vec::new(),
+            open_questions: Vec::new(),
+            updated_at_ms: 0,
+        })
+        .expect("peer proxy");
+    let bridged = SessionExecutionPlane::bridge(CrossSessionMessage {
+        from_session_id: session.session_id.clone(),
+        target_ref: format!("@{}", session_b.session_id),
+        command: "inspect peer evidence".to_string(),
+        actor: Some("harness_eval".to_string()),
+        evidence_refs: vec![format!("team:{}", team.team_id)],
+    });
+    assert_eq!(bridged.status, "routed");
+    let team_report = TeamExecutionLoop::tick_ready(&team.team_id).expect("team execution ticks");
+    let direct_agent_id = format!("mission-eval-agent-{}", uuid::Uuid::new_v4());
+    runtime::global_agent_lifecycle_service().register_started(
+        AgentSnapshot {
+            agent_id: direct_agent_id.clone(),
+            name: "mission-eval-agent".to_string(),
+            description: "harness eval direct route agent".to_string(),
+            subagent_type: Some("worker".to_string()),
+            model: Some(DEFAULT_AGENT_MODEL.to_string()),
+            status: "running".to_string(),
+            backend: AgentExecutionBackendKind::InProcess,
+            output_file: String::new(),
+            manifest_file: String::new(),
+            created_at: "1".to_string(),
+            started_at: Some("1".to_string()),
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        },
+        CancellationToken::new(),
+    );
+    let agent_route_receipt = MissionControlRuntime::execute(MissionControlCommand {
+        target: MissionControlCommandTarget::Session {
+            session_id: session.session_id.clone(),
+        },
+        action: MissionControlAction::RouteToAgent,
+        actor: Some("harness_eval".to_string()),
+        payload: serde_json::json!({
+            "agent_id": direct_agent_id,
+            "team_id": team.team_id.clone(),
+            "role_id": "direct_route",
+            "command": "record routed mission-control input",
+        }),
+        evidence_refs: vec![format!("team:{}", team.team_id)],
+    });
+    assert_ne!(
+        agent_route_receipt.status,
+        runtime::MissionControlCommandStatus::ApprovalRequired
+    );
+    assert!(agent_route_receipt.result["task"]["task_id"]
+        .as_str()
+        .is_some());
+    assert_eq!(
+        agent_route_receipt.result["progress"]["event_type"].as_str(),
+        Some("agent.task.routed")
+    );
+    let scheduler_report = StewardScheduler::tick(StewardSchedulerConfig {
+        max_session_commands_per_tick: 100,
+        max_team_ticks: 10,
+        allow_background_sessions: true,
+    });
+    let dispatch = scheduler_report.session_dispatch.clone();
+    assert!(!dispatch.dispatched.is_empty());
+    assert!(!scheduler_report.ledger_records.is_empty());
+    let control = MissionControlRuntime::projection();
+    assert!(control.summary.session_count >= 2);
+    let control_receipt = MissionControlRuntime::execute(MissionControlCommand {
+        target: MissionControlCommandTarget::Session {
+            session_id: session.session_id.clone(),
+        },
+        action: MissionControlAction::RouteToSession,
+        actor: Some("harness_eval".to_string()),
+        payload: serde_json::json!({
+            "target_session_id": session_b.session_id,
+            "command": "handoff control summary",
+        }),
+        evidence_refs: vec![format!("session-command:{}", command.command_id)],
+    });
+    assert!(matches!(
+        control_receipt.status,
+        runtime::MissionControlCommandStatus::Queued
+            | runtime::MissionControlCommandStatus::Executed
+    ));
+    let steward_runtime = global_steward_runtime_service();
     let steward = steward_runtime
         .start(StartStewardRuntimeRequest {
             mission_id: "mission-eval".to_string(),
@@ -275,6 +456,7 @@ fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
         })
         .expect("event append");
     let replay = RuntimeEventReplayer::report(&event_store, 100).expect("replay report");
+    let recovery = RecoveryExecutor::execute(100).expect("recovery executes");
 
     let scenario = ScenarioSpec::new("mission_harness_eval", prompt)
         .expect_mode(strategy.mode)
@@ -328,14 +510,119 @@ fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
                 notes: "mission command inbox accepted routed command".to_string(),
             },
             CapabilityResult {
+                capability: "multi_session_bridge",
+                status: "passed",
+                evidence: bridged.message,
+                notes: "cross-session bridge routed command into peer session".to_string(),
+            },
+            CapabilityResult {
+                capability: "session_execution_plane",
+                status: "passed",
+                evidence: format!("{} dispatched", dispatch.dispatched.len()),
+                notes: "execution plane claimed/completed pending session commands".to_string(),
+            },
+            CapabilityResult {
+                capability: "team_execution_loop",
+                status: "passed",
+                evidence: format!("{} assigned", team_report.assigned_task_count),
+                notes: "team runtime produced role tasks, events, and evidence".to_string(),
+            },
+            CapabilityResult {
+                capability: "mission_control_route_to_agent",
+                status: "passed",
+                evidence: agent_route_receipt.message,
+                notes: "Mission Control created agent task, progress event, and mission evidence for direct agent route".to_string(),
+            },
+            CapabilityResult {
                 capability: "steward_runtime",
                 status: "passed",
                 evidence: steward.steward_id,
                 notes: "steward explicit tick produced delegated decision".to_string(),
             },
+            CapabilityResult {
+                capability: "steward_scheduler",
+                status: "passed",
+                evidence: format!("{} ledger records", scheduler_report.ledger_records.len()),
+                notes: "scheduler connected steward loop, session dispatch, and team tick".to_string(),
+            },
+            CapabilityResult {
+                capability: "mission_control_projection",
+                status: "passed",
+                evidence: format!("{} sessions", control.summary.session_count),
+                notes: "Mission Control projection aggregates sessions, teams, agents, approvals, stewards, and events".to_string(),
+            },
+            CapabilityResult {
+                capability: "runtime_recovery_executor",
+                status: "passed",
+                evidence: format!("{} applied", recovery.applied.len()),
+                notes: "recovery executor produced an auditable execution report".to_string(),
+            },
         ],
         format!("{} recovery actions", replay.recovery_required),
     )
+}
+
+fn probe_gateway_contract() -> (bool, String) {
+    let base =
+        std::env::var("COWD_GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8642".to_string());
+    match http_get_json_prefix(&base, "/healthz") {
+        Ok(body) if body.contains("\"status\":\"healthy\"") => {
+            (true, format!("{base}/healthz healthy"))
+        }
+        Ok(body) => (
+            false,
+            format!(
+                "{base}/healthz returned unexpected body: {}",
+                abbreviate(&body, 120)
+            ),
+        ),
+        Err(error) => (false, format!("{base} unavailable: {error}")),
+    }
+}
+
+fn http_get_json_prefix(base: &str, path: &str) -> Result<String, String> {
+    let without_scheme = base
+        .strip_prefix("http://")
+        .ok_or_else(|| "only http:// gateway URLs are supported by std probe".to_string())?;
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing gateway authority".to_string())?;
+    let mut addrs = authority
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| format!("gateway address did not resolve: {authority}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(800))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1200)))
+        .map_err(|error| error.to_string())?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| error.to_string())?;
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return Err(abbreviate(&response, 120));
+    }
+    Ok(response)
+}
+
+fn abbreviate(value: &str, max: usize) -> String {
+    let compact = value.replace('\n', " ");
+    if compact.len() <= max {
+        compact
+    } else {
+        format!("{}...", &compact[..max])
+    }
 }
 
 fn write_report(

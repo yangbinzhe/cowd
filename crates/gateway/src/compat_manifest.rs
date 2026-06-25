@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::command::slash::{CommandManifestEntry, CommandRegistry, CommandSource};
 use runtime::{BootstrapPhase, BootstrapPlan};
-use slash_contract::{CommandManifestEntry, CommandRegistry, CommandSource};
 use tools::{ToolManifestEntry, ToolRegistry, ToolSource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

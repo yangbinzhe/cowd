@@ -253,10 +253,12 @@ mod tests {
         let mut ledger = VerificationLedger::new();
         let claim = ledger.add_claim(Claim::required(
             ClaimKind::TestPassed,
-            "ai-task tests passed",
+            "runtime task tests passed",
         ));
-        let evidence =
-            ledger.add_evidence(Evidence::new(EvidenceKind::Test, "cargo test -p ai-task"));
+        let evidence = ledger.add_evidence(Evidence::new(
+            EvidenceKind::Test,
+            "cargo test -p runtime task",
+        ));
 
         ledger.support_claim(&claim, &evidence).unwrap();
 

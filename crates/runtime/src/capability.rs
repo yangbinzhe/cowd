@@ -154,7 +154,7 @@ impl CowdCapabilityRegistry {
                     "cowd.growth.channel",
                     "Growth Channel",
                     CowdCapabilityKind::Fact,
-                    "ai_kernel::growth",
+                    "harness_contract::growth",
                     "Candidate promotion channel from runtime events into fact-kernel, Memory, and Matrix.",
                     &["read:growth", "write:growth"],
                 ),

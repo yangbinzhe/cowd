@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use ai_kernel::core::TaskRisk;
+use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{

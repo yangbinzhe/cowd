@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use ai_kernel::strategy::{decide_strategy, StrategyInput};
+use harness_contract::strategy::{decide_strategy, StrategyInput};
 use serde::{Deserialize, Serialize};
 
 use super::{service_envelope, MissionService, ServiceEnvelope};
@@ -45,7 +45,7 @@ pub(crate) struct SubmitMissionApprovalHttpRequest {
     pub(crate) source: runtime::ApprovalSource,
     pub(crate) action: String,
     pub(crate) summary: String,
-    pub(crate) risk: ai_kernel::core::TaskRisk,
+    pub(crate) risk: harness_contract::core::TaskRisk,
     #[serde(default)]
     pub(crate) evidence_refs: Vec<String>,
     pub(crate) timeout_policy: runtime::ApprovalTimeoutPolicy,
@@ -122,7 +122,7 @@ pub(crate) struct TickMissionStewardHttpRequest {
     #[serde(default)]
     pub(crate) summary: Option<String>,
     #[serde(default)]
-    pub(crate) risk: Option<ai_kernel::core::TaskRisk>,
+    pub(crate) risk: Option<harness_contract::core::TaskRisk>,
     #[serde(default)]
     pub(crate) requested_tool: Option<String>,
     #[serde(default)]
@@ -145,7 +145,7 @@ impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.379 Mission Runtime service boundary",
+            owner: "0.9.380 Mission Runtime service boundary",
         }
     }
 
@@ -196,6 +196,106 @@ impl MissionService {
         })
     }
 
+    pub(crate) fn mission_control(&self) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn execute_mission_control_command(
+        &self,
+        command: runtime::MissionControlCommand,
+    ) -> serde_json::Value {
+        let receipt = runtime::MissionControlRuntime::execute(command);
+        let ok = !matches!(
+            receipt.status,
+            runtime::MissionControlCommandStatus::Failed
+                | runtime::MissionControlCommandStatus::Rejected
+        );
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.command_result",
+            "ok": ok,
+            "receipt": receipt,
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn dispatch_mission_sessions(
+        &self,
+        policy: runtime::SessionExecutionPolicy,
+    ) -> serde_json::Value {
+        let report = runtime::SessionExecutionPlane::dispatch_pending(policy);
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.session_dispatch_result",
+            "ok": report.errors.is_empty(),
+            "report": report,
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn bridge_mission_session(
+        &self,
+        message: runtime::CrossSessionMessage,
+    ) -> serde_json::Value {
+        let receipt = runtime::SessionExecutionPlane::bridge(message);
+        let ok = receipt.status == "routed";
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.session_bridge_result",
+            "ok": ok,
+            "receipt": receipt,
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn team_execution_plan(&self, team_id: &str) -> Result<serde_json::Value, String> {
+        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_execution_plan",
+            "ok": true,
+            "plan": plan,
+        }))
+    }
+
+    pub(crate) fn tick_team_execution(&self, team_id: &str) -> Result<serde_json::Value, String> {
+        let report = runtime::TeamExecutionLoop::tick_ready(team_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_execution_tick",
+            "ok": report.errors.is_empty(),
+            "report": report,
+            "projection": runtime::MissionControlRuntime::projection(),
+        }))
+    }
+
+    pub(crate) fn agent_mission_events(&self, agent_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.agent_events",
+            "ok": true,
+            "agent_id": agent_id,
+            "events": runtime::global_agent_event_bus().list_for_agent(agent_id),
+            "tasks": runtime::global_agent_task_mailbox().list_for_agent(agent_id),
+        })
+    }
+
+    pub(crate) fn team_mission_evidence(&self, team_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_evidence",
+            "ok": true,
+            "team_id": team_id,
+            "events": runtime::global_agent_event_bus().list_for_team(team_id),
+            "tasks": runtime::global_agent_task_mailbox().list_for_team(team_id),
+            "evidence": runtime::global_mission_evidence_bus().list_for_team(team_id),
+        })
+    }
+
     pub(crate) fn approvals(&self) -> serde_json::Value {
         serde_json::json!({
             "envelope": self.approval_projection_contract(),
@@ -225,6 +325,40 @@ impl MissionService {
             "report": report,
             "stewards": runtime::global_steward_runtime_service().projection(),
             "approvals": runtime::global_approval_queue().projection(),
+        })
+    }
+
+    pub(crate) fn steward_scheduler(&self) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.steward_scheduler",
+            "ok": true,
+            "scheduler": runtime::StewardScheduler::projection(),
+        })
+    }
+
+    pub(crate) fn tick_steward_scheduler(
+        &self,
+        config: runtime::StewardSchedulerConfig,
+    ) -> serde_json::Value {
+        let report = runtime::StewardScheduler::tick(config);
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.steward_scheduler_tick",
+            "ok": report.errors.is_empty(),
+            "report": report,
+            "scheduler": runtime::StewardScheduler::projection(),
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn steward_scheduler_handoff(&self, steward_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.steward_handoff_summary",
+            "ok": true,
+            "handoff": runtime::StewardScheduler::handoff_summary(steward_id),
+            "runtime_report": runtime::global_steward_runtime_service().report(steward_id).ok(),
         })
     }
 
@@ -583,7 +717,9 @@ impl MissionService {
             runtime::TickStewardRuntimeRequest {
                 action: request.action,
                 summary: request.summary,
-                risk: request.risk.unwrap_or(ai_kernel::core::TaskRisk::Low),
+                risk: request
+                    .risk
+                    .unwrap_or(harness_contract::core::TaskRisk::Low),
                 requested_tool: request.requested_tool,
                 requires_write: request.requires_write,
                 is_critical_operation: request.is_critical_operation,

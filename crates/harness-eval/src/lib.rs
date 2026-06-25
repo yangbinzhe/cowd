@@ -1,6 +1,6 @@
 //! CowdBench evaluation contracts and lightweight scoring.
 
-use ai_kernel::core::ExecutionMode;
+use harness_contract::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,7 +548,7 @@ fn missing_observation_verdict(spec: &ScenarioSpec) -> ScenarioVerdict {
         score: 0.0,
         failed_checks: vec![FailedScenarioCheck {
             check_id: "scenario.observation".to_string(),
-            owner: "ai-eval".to_string(),
+            owner: "harness-eval".to_string(),
             expected: "observation present".to_string(),
             actual: "missing".to_string(),
             repair_hint: "ensure scenario runner emits HarnessObservation".to_string(),

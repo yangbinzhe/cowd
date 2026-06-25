@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, RwLock};
 
-use ai_kernel::policy::{
+use harness_contract::policy::{
     PermissionOperation, PermissionResource, PermissionScope,
     PolicyDecisionKind as KernelPolicyDecisionKind, RiskAssessment, RiskGateReceipt,
     RiskLevel as KernelRiskLevel,

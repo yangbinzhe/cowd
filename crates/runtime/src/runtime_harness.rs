@@ -1,32 +1,34 @@
 //! Runtime integration facade for the Cowd AI work kernel crates.
 
-use ai_eval::{
+use crate::eval_gate::{
     score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
     RegressionGateVerdict, Trajectory,
 };
-use ai_kernel::behavior::{decide_behavior_policy, BehaviorPolicyDecision};
-use ai_kernel::context::{
+use harness_contract::behavior::{decide_behavior_policy, BehaviorPolicyDecision};
+use harness_contract::context::{
     ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
-use ai_kernel::core::{ExecutionMode, StrategyDecorator};
-use ai_kernel::growth::{
+use harness_contract::core::{ExecutionMode, StrategyDecorator};
+use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
 };
-use ai_kernel::harness::{CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt};
-use ai_kernel::policy::{
+use harness_contract::harness::{
+    CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt,
+};
+use harness_contract::policy::{
     agent_spec_policy_receipts, behavior_policy_receipt, tool_transaction_policy_receipts,
     PolicyReceipt,
 };
-use ai_kernel::strategy::{decide_strategy, StrategyDecision, StrategyInput};
-use ai_kernel::tool::{
+use harness_contract::strategy::{decide_strategy, StrategyDecision, StrategyInput};
+use harness_contract::tool::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
 };
-use ai_kernel::verification::{
+use harness_contract::verification::{
     Claim, ClaimKind, Evidence, EvidenceKind, VerificationLedger, VerificationReport,
 };
-use ai_kernel::workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
+use harness_contract::workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
@@ -251,8 +253,8 @@ impl RuntimeAiKernel {
         let workgraph_quality = self
             .workgraph
             .as_ref()
-            .map(ai_kernel::workgraph::WorkGraph::quality_report);
-        let agent_spec = ai_kernel::agent::AgentSpec::for_turn(
+            .map(harness_contract::workgraph::WorkGraph::quality_report);
+        let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
             self.strategy.mode,
             self.strategy.understanding.risk,
@@ -340,7 +342,7 @@ impl RuntimeAiKernel {
         }
         let growth_event = GrowthEvent::from_input(GrowthEventInput {
             session_id: self.context_epoch.identity.session_id.clone(),
-            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            source_event_kind: "runtime.harness_contract.trace".to_string(),
             strategy_mode: self.strategy.mode,
             learning_record: learning_record.clone(),
             evidence_refs,
@@ -500,12 +502,12 @@ fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Opt
     let _ = graph.add_edge(
         &plan,
         &verify,
-        ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+        harness_contract::workgraph::WorkEdgeKind::DependsOn,
     );
     let _ = graph.add_edge(
         &verify,
         &synthesize,
-        ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+        harness_contract::workgraph::WorkEdgeKind::DependsOn,
     );
     Some(graph)
 }
@@ -603,7 +605,7 @@ mod tests {
         assert!(!trace.learning_record.has_blocker());
         assert_eq!(
             trace.growth_event.source_event_kind,
-            "runtime.ai_kernel.trace"
+            "runtime.harness_contract.trace"
         );
         assert_eq!(
             trace.collaboration_decision.template_id,

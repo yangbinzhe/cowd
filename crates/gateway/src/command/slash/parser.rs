@@ -1,4 +1,4 @@
-use crate::specs::{
+use super::specs::{
     SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
 impl SlashCommand {

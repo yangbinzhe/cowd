@@ -1,16 +1,18 @@
 use std::pin::Pin;
 
-use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite};
-use ai_kernel::core::{ExecutionMode, TaskComplexity, TaskRisk};
-use ai_kernel::growth::{
+use futures::Stream;
+use harness_contract::core::{ExecutionMode, TaskComplexity, TaskRisk};
+use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
 };
-use ai_kernel::strategy::{
+use harness_contract::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
-use futures::Stream;
 use matrix_core::{MatrixEvidencePacket, MatrixQualityGateDecision};
+use runtime::eval_gate::{
+    ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationRuntime, PermissionMode,
     PermissionPolicy, RuntimeAiKernel, RuntimeAiKernelTrace, RuntimeError, Session, SharedPrompter,
@@ -112,7 +114,7 @@ fn simple_question_stays_direct_and_clean() {
             "workgraph.present",
             ScenarioCheckKind::WorkgraphPresent,
             false,
-            "ai-strategy/runtime-ai-kernel",
+            "ai-strategy/runtime-harness-contract",
             "simple direct answers should not allocate workgraph",
         ))
         .require(ScenarioCheck::bool(
@@ -156,7 +158,7 @@ fn complex_task_builds_plan_execute_workgraph() {
         "workgraph.present",
         ScenarioCheckKind::WorkgraphPresent,
         true,
-        "ai-strategy/runtime-ai-kernel",
+        "ai-strategy/runtime-harness-contract",
         "complex tasks must allocate a workgraph",
     ))
     .require(ScenarioCheck::bool(
@@ -170,7 +172,7 @@ fn complex_task_builds_plan_execute_workgraph() {
         "regression.allowed",
         ScenarioCheckKind::RegressionAllowed,
         true,
-        "ai-eval",
+        "harness-eval",
         "successful complex trace must pass regression gate",
     ));
     let kernel = RuntimeAiKernel::begin_turn(
@@ -203,7 +205,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
             "regression.allowed",
             ScenarioCheckKind::RegressionAllowed,
             false,
-            "ai-eval",
+            "harness-eval",
             "blocked finalization must fail regression gate",
         ))
         .require(ScenarioCheck::bool(
@@ -364,7 +366,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
 
 #[test]
 fn underspecified_complex_trace_exposes_improvement_signal() {
-    let record = LearningRecord::from_input(ai_kernel::growth::GrowthInput {
+    let record = LearningRecord::from_input(harness_contract::growth::GrowthInput {
         selected_mode: ExecutionMode::DirectAnswer,
         complexity: TaskComplexity::Complex,
         risk: TaskRisk::Medium,

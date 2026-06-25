@@ -1,8 +1,8 @@
-use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
-use ai_kernel::core::ExecutionMode;
-use ai_kernel::strategy::{
+use harness_contract::core::ExecutionMode;
+use harness_contract::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
+use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
 use runtime::{
     AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, ReviewVerdict, RuntimeAiKernel,
 };
@@ -74,7 +74,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
             "workgraph.present",
             ScenarioCheckKind::WorkgraphPresent,
             true,
-            "runtime-ai-kernel",
+            "runtime-harness-contract",
             "complex closure must allocate a workgraph",
         ))
         .require(ScenarioCheck::bool(
@@ -91,7 +91,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
             "ai-growth/matrix",
             "emit matrix-compatible evidence before final synthesis",
         ));
-    let observation = ai_eval::ScenarioObservation {
+    let observation = runtime::eval_gate::ScenarioObservation {
         scenario_id: "deep_task_closure".to_string(),
         strategy_mode: trace.strategy.mode,
         finalization_blocked: trace.finalization_blocked,
@@ -274,7 +274,7 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
             domain: understanding.domain,
             complexity: understanding.complexity,
             risk: understanding.risk,
-            selected_mode: ai_kernel::core::ExecutionMode::SupervisorSubagents,
+            selected_mode: harness_contract::core::ExecutionMode::SupervisorSubagents,
             succeeded: idx == 0,
             verification_blocked: false,
             context_pressure: false,
@@ -284,7 +284,10 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
     }
 
     let adapted = decide_strategy(&store.enrich_input(StrategyInput::from_prompt(prompt)));
-    assert_eq!(adapted.mode, ai_kernel::core::ExecutionMode::PlanExecute);
+    assert_eq!(
+        adapted.mode,
+        harness_contract::core::ExecutionMode::PlanExecute
+    );
     assert!(adapted
         .reasons
         .iter()

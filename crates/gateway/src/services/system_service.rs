@@ -4,13 +4,12 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use provider::ToolDefinition;
 use runtime::{
     classify_intent, plan_context_fanout, tool_cache::tool_cache_stats, tool_execution_profile,
     ConfigLoader, JsonValue, RuntimeConfig, ToolSafetyCategory,
 };
 use serde::Serialize;
-use tools::GlobalToolRegistry;
+use tools::{GlobalToolRegistry, ToolDefinition};
 
 use super::SystemService;
 

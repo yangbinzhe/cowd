@@ -84,6 +84,7 @@ pub enum MissionSessionCommandStatus {
     Completed,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 impl MissionSessionCommandStatus {
@@ -96,12 +97,16 @@ impl MissionSessionCommandStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
     }
 }
 
@@ -145,6 +150,7 @@ pub struct MissionSessionCommandSummary {
     pub completed: usize,
     pub failed: usize,
     pub cancelled: usize,
+    pub interrupted: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +574,27 @@ impl MissionRuntime {
         })
     }
 
+    pub fn interrupt_session_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<MissionSessionCommand, String> {
+        let reason = reason.into();
+        self.update_session_command(session_id, command_id, |command| {
+            if command.status.is_terminal() {
+                return Err(format!(
+                    "command {} is already terminal",
+                    command.command_id
+                ));
+            }
+            command.status = MissionSessionCommandStatus::Interrupted;
+            command.completed_at_ms = Some(now_ms());
+            command.error = Some(reason);
+            Ok("mission.session.command_interrupted")
+        })
+    }
+
     pub fn retry_session_command(
         &self,
         session_id: &str,
@@ -808,6 +835,7 @@ fn session_command_summary(
         completed: 0,
         failed: 0,
         cancelled: 0,
+        interrupted: 0,
     };
     for command in commands.values() {
         match command.status {
@@ -817,6 +845,7 @@ fn session_command_summary(
             MissionSessionCommandStatus::Completed => summary.completed += 1,
             MissionSessionCommandStatus::Failed => summary.failed += 1,
             MissionSessionCommandStatus::Cancelled => summary.cancelled += 1,
+            MissionSessionCommandStatus::Interrupted => summary.interrupted += 1,
         }
     }
     summary

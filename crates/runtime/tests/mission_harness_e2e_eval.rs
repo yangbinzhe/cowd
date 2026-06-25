@@ -1,6 +1,8 @@
-use ai_eval::{ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite};
-use ai_kernel::core::TaskRisk;
-use ai_kernel::strategy::{decide_strategy, StrategyInput};
+use harness_contract::core::TaskRisk;
+use harness_contract::strategy::{decide_strategy, StrategyInput};
+use runtime::eval_gate::{
+    ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+};
 use runtime::{
     ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
     CollaborationTemplateMatcher, MissionRuntime, RuntimeEventInput, RuntimeEventScope,

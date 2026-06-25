@@ -801,7 +801,7 @@ fn write_execution_summary_artifact(
 mod tests {
     use super::*;
     use crate::CollaborationTemplateMatcher;
-    use ai_kernel::strategy::{decide_strategy, StrategyInput};
+    use harness_contract::strategy::{decide_strategy, StrategyInput};
 
     #[test]
     fn team_runtime_starts_from_collaboration_template_and_tracks_commands() {

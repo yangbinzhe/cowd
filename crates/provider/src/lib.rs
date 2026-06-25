@@ -34,7 +34,7 @@ pub use types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-pub use telemetry::{
+pub use model_protocol::telemetry::{
     AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, JsonlTelemetrySink,
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
     DEFAULT_ANTHROPIC_VERSION,

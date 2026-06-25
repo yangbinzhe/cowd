@@ -46,6 +46,8 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod mission_control;
+pub mod mission_evidence;
 pub mod mission_runtime;
 pub mod permission_enforcer;
 pub mod permissions;
@@ -53,6 +55,7 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
 pub mod provider_pool;
+pub mod recovery;
 pub mod recovery_recipes;
 mod remote;
 pub mod runtime_control;
@@ -63,11 +66,12 @@ pub mod agent;
 pub mod agent_backend;
 pub mod agent_collaboration;
 pub mod agent_discussion;
+pub mod agent_event_bus;
 pub mod agent_kernel;
 pub mod agent_lifecycle;
+pub mod agent_mailbox;
 pub mod agent_protocol;
 pub mod agent_workgraph;
-pub mod ai_kernel;
 pub mod approval_gate;
 pub mod autonomy_profile;
 pub mod checkpoint;
@@ -75,9 +79,11 @@ pub mod collaboration_template;
 pub mod context_fanout;
 pub mod cowd_event;
 pub mod cross_plane_policy;
+pub mod eval_gate;
 pub mod execution_scheduler;
 pub mod intent_planner;
 pub mod joint_problem_solving;
+pub mod lane_completion;
 pub mod mutation_plan;
 pub mod pairing;
 pub mod profile;
@@ -88,6 +94,8 @@ pub mod quality_gate;
 pub mod release_gate;
 pub mod runtime_event_replay;
 pub mod runtime_event_store;
+pub mod runtime_harness;
+pub mod session_execution;
 pub mod session_lifecycle;
 pub mod session_relation_graph;
 pub mod skill_activation;
@@ -99,14 +107,17 @@ pub mod stale_base;
 pub mod stale_branch;
 pub mod steward_agent;
 pub mod steward_runtime;
+pub mod steward_scheduler;
 pub mod structured_data;
 pub mod subagent_turn;
 pub mod summary_compression;
 pub mod surface_contract;
+pub mod task;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod team_discovery;
+pub mod team_execution;
 pub mod team_runtime;
 pub mod tool_cache;
 pub mod tool_dispatch;
@@ -135,6 +146,7 @@ pub use agent_collaboration::{
 pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
 };
+pub use agent_event_bus::{global_agent_event_bus, AgentEventBus, AgentProgressEvent};
 pub use agent_kernel::{AgentGraphError, AgentRunGraph};
 pub use agent_lifecycle::{
     agent_store_dir, build_agent_system_prompt, classify_lane_failure, derive_agent_state,
@@ -144,6 +156,10 @@ pub use agent_lifecycle::{
     AgentLifecycleService, AgentSnapshot, SpawnAgentRequest, DEFAULT_AGENT_MAX_ITERATIONS,
     DEFAULT_AGENT_MODEL, DEFAULT_AGENT_SYSTEM_DATE,
 };
+pub use agent_mailbox::{
+    global_agent_task_mailbox, AgentTask, AgentTaskMailboxService, AgentTaskReceipt,
+    AgentTaskStatus,
+};
 pub use agent_protocol::{
     AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
     AgentTaskNode, ReviewVerdict,
@@ -152,7 +168,6 @@ pub use agent_workgraph::{
     AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
     WorkGraphRef, WorkGraphStatus,
 };
-pub use ai_kernel::{RuntimeAiKernel, RuntimeAiKernelTrace};
 pub use autonomy_profile::{
     ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
     AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,
@@ -240,6 +255,7 @@ pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass,
 };
+pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -263,6 +279,14 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
+pub use mission_control::{
+    MissionControlAction, MissionControlAgentNode, MissionControlApprovalNode,
+    MissionControlCommand, MissionControlCommandReceipt, MissionControlCommandStatus,
+    MissionControlCommandTarget, MissionControlEventDigest, MissionControlEventLine,
+    MissionControlProjection, MissionControlRuntime, MissionControlSessionNode,
+    MissionControlStewardNode, MissionControlSummary, MissionControlTeamNode, MissionWorkspace,
+};
+pub use mission_evidence::{global_mission_evidence_bus, MissionEvidenceBus, MissionEvidenceRef};
 pub use mission_runtime::{
     global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection,
     MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
@@ -298,6 +322,10 @@ pub use provider_runtime_client::{
     push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
     ProviderToolDefinition,
 };
+pub use recovery::{
+    RecoveryAppliedAction, RecoveryExecutionReport, RecoveryExecutor, RecoveryFailedAction,
+    RecoveryPlan, RecoveryPlanner, RecoverySkippedAction,
+};
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
     RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
@@ -323,6 +351,11 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
+};
+pub use session_execution::{
+    CrossSessionBridgeReceipt, CrossSessionMessage, SessionCommandDispatchReceipt,
+    SessionDispatchMode, SessionExecutionPlane, SessionExecutionPolicy, SessionExecutionReport,
+    SessionExecutionSkip, SessionLeaseState,
 };
 pub use session_relation_graph::{
     global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
@@ -350,6 +383,11 @@ pub use steward_runtime::{
     StewardLoopReport, StewardRuntimeProjection, StewardRuntimeService, StewardSession,
     StewardStatus, TickStewardRuntimeRequest,
 };
+pub use steward_scheduler::{
+    global_steward_decision_ledger, StewardDecisionLedger, StewardDecisionLedgerRecord,
+    StewardScheduler, StewardSchedulerConfig, StewardSchedulerHandoffSummary,
+    StewardSchedulerProjection, StewardSchedulerTickReport,
+};
 pub use subagent_turn::{
     final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
 };
@@ -359,6 +397,10 @@ pub use task_packet::{
 pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus as RegistryTaskStatus};
 pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
+pub use team_execution::{
+    CollaborationTemplateRuntimeSpec, TeamExecutionDependency, TeamExecutionLoop,
+    TeamExecutionPlan, TeamExecutionReport, TeamExecutionRoleSpec,
+};
 pub use team_runtime::{
     global_team_runtime_service, StartTeamRuntimeAgentRequest, StartTeamRuntimeRequest,
     TeamRuntimeAgent, TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService,

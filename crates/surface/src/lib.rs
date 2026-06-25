@@ -7,6 +7,8 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod channel;
+
 pub const SURFACE_PROTOCOL: &str = "cowd.surface.v1";
 pub const SURFACE_MANIFEST_FILE: &str = "surface.json";
 

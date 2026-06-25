@@ -3,6 +3,9 @@ use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
+use model_protocol::telemetry::{
+    ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent,
+};
 use provider::{
     AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
@@ -10,7 +13,6 @@ use provider::{
     ToolDefinition,
 };
 use serde_json::json;
-use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;

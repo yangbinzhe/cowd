@@ -6,9 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-ai-kernel = { path = "../ai-kernel" }
-ai-eval = { path = "../ai-eval" }
-connector = { path = "../connector" }
+harness-contract = { path = "../harness-contract" }
 model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
 storage = { path = "../storage" }
@@ -28,7 +26,6 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
-telemetry = { path = "../telemetry" }
 fs2 = "0.4"
 walkdir = "2"
 uuid = { version = "1", features = ["v4"] }

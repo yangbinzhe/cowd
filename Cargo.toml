@@ -1,13 +1,9 @@
 [workspace]
 members = [
-    "crates/ai-kernel",
-    "crates/ai-eval",
-    "crates/ai-task",
+    "crates/harness-contract",
     "crates/app-mfg",
     "crates/approval",
     "crates/cli",
-    "crates/slash/contract",
-    "crates/slash/catalog",
     "crates/fact-kernel",
     "crates/gateway",
     "crates/harness-eval",
@@ -18,27 +14,21 @@ members = [
     "crates/model-protocol",
     "crates/plugins",
     "crates/provider",
-    "crates/channel",
     "crates/connector",
     "crates/runtime",
     "crates/session",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
-    "crates/telemetry",
     "crates/tools",
     "crates/tui",
 ]
 resolver = "2"
 default-members = [
-    "crates/ai-kernel",
-    "crates/ai-eval",
-    "crates/ai-task",
+    "crates/harness-contract",
     "crates/app-mfg",
     "crates/approval",
     "crates/cli",
-    "crates/slash/contract",
-    "crates/slash/catalog",
     "crates/fact-kernel",
     "crates/gateway",
     "crates/harness-eval",
@@ -49,19 +39,17 @@ default-members = [
     "crates/model-protocol",
     "crates/plugins",
     "crates/provider",
-    "crates/channel",
     "crates/connector",
     "crates/runtime",
     "crates/session",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
-    "crates/telemetry",
     "crates/tools",
 ]
 
 [workspace.package]
-version = "0.9.379"
+version = "0.9.380"
 edition = "2021"
 license = "MIT"
 publish = false

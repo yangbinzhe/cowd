@@ -24,8 +24,8 @@ use runtime::{
     },
     write_file, BashCommandInput, BashCommandOutput, BranchFreshness, CheckpointCreateInput,
     CheckpointDiffInput, CheckpointRestoreInput, GrepSearchInput, LaneContext, LaneEvent,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MutationApplyInput,
-    MutationPreviewInput, PermissionMode,
+    LaneEventName, LaneEventStatus, LaneFailureClass, MutationApplyInput, MutationPreviewInput,
+    PermissionMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2075,7 +2075,7 @@ pub struct ToolSearchOutput {
     #[serde(rename = "pending_mcp_servers")]
     pub(crate) pending_mcp_servers: Option<Vec<String>>,
     #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
-    pub(crate) mcp_degraded: Option<McpDegradedReport>,
+    pub(crate) mcp_degraded: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4453,22 +4453,25 @@ mod tests {
             "demo echo",
             5,
             Some(vec!["pending-server".to_string()]),
-            Some(runtime::McpDegradedReport::new(
-                vec!["demo".to_string()],
-                vec![runtime::McpFailedServer {
-                    server_name: "pending-server".to_string(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some("pending-server".to_string()),
-                        "tool discovery failed",
-                        BTreeMap::new(),
-                        true,
-                    ),
-                }],
-                vec!["mcp__demo__echo".to_string()],
-                vec!["mcp__demo__echo".to_string()],
-            )),
+            Some(
+                serde_json::to_value(runtime::McpDegradedReport::new(
+                    vec!["demo".to_string()],
+                    vec![runtime::McpFailedServer {
+                        server_name: "pending-server".to_string(),
+                        phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                        error: runtime::McpErrorSurface::new(
+                            runtime::McpLifecyclePhase::ToolDiscovery,
+                            Some("pending-server".to_string()),
+                            "tool discovery failed",
+                            BTreeMap::new(),
+                            true,
+                        ),
+                    }],
+                    vec!["mcp__demo__echo".to_string()],
+                    vec!["mcp__demo__echo".to_string()],
+                ))
+                .expect("mcp degraded report should serialize"),
+            ),
         );
         let output = serde_json::to_value(search).expect("search output should serialize");
         assert_eq!(output["matches"][0], "mcp__demo__echo");

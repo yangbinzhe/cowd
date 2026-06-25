@@ -6,8 +6,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ai_kernel::agent::AgentSpec;
-use ai_kernel::growth::GrowthSignal;
+use harness_contract::agent::AgentSpec;
+use harness_contract::growth::GrowthSignal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -94,7 +94,7 @@ impl AgentWorkGraph {
     #[must_use]
     pub fn from_ai_workgraph(
         session_id: impl Into<String>,
-        graph: &ai_kernel::workgraph::WorkGraph,
+        graph: &harness_contract::workgraph::WorkGraph,
     ) -> Self {
         let now = current_time_ms();
         let graph_id = graph.id.clone();
@@ -103,13 +103,19 @@ impl AgentWorkGraph {
             .iter()
             .map(|node| {
                 let kind = match node.kind {
-                    ai_kernel::workgraph::WorkNodeKind::AgentTask => WorkGraphNodeKind::AgentTask,
-                    ai_kernel::workgraph::WorkNodeKind::ToolTask => WorkGraphNodeKind::ToolTask,
-                    ai_kernel::workgraph::WorkNodeKind::ReadOnlyFanout => {
+                    harness_contract::workgraph::WorkNodeKind::AgentTask => {
+                        WorkGraphNodeKind::AgentTask
+                    }
+                    harness_contract::workgraph::WorkNodeKind::ToolTask => {
                         WorkGraphNodeKind::ToolTask
                     }
-                    ai_kernel::workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
-                    ai_kernel::workgraph::WorkNodeKind::Synthesis => WorkGraphNodeKind::Synthesis,
+                    harness_contract::workgraph::WorkNodeKind::ReadOnlyFanout => {
+                        WorkGraphNodeKind::ToolTask
+                    }
+                    harness_contract::workgraph::WorkNodeKind::Review => WorkGraphNodeKind::Review,
+                    harness_contract::workgraph::WorkNodeKind::Synthesis => {
+                        WorkGraphNodeKind::Synthesis
+                    }
                 };
                 WorkGraphNode {
                     node_id: node.id.clone(),
@@ -135,10 +141,18 @@ impl AgentWorkGraph {
                 from_node_id: edge.from.clone(),
                 to_node_id: edge.to.clone(),
                 kind: match edge.kind {
-                    ai_kernel::workgraph::WorkEdgeKind::DependsOn => WorkGraphEdgeKind::DependsOn,
-                    ai_kernel::workgraph::WorkEdgeKind::Verifies => WorkGraphEdgeKind::Verifies,
-                    ai_kernel::workgraph::WorkEdgeKind::Reviews => WorkGraphEdgeKind::Reviews,
-                    ai_kernel::workgraph::WorkEdgeKind::Produces => WorkGraphEdgeKind::Produces,
+                    harness_contract::workgraph::WorkEdgeKind::DependsOn => {
+                        WorkGraphEdgeKind::DependsOn
+                    }
+                    harness_contract::workgraph::WorkEdgeKind::Verifies => {
+                        WorkGraphEdgeKind::Verifies
+                    }
+                    harness_contract::workgraph::WorkEdgeKind::Reviews => {
+                        WorkGraphEdgeKind::Reviews
+                    }
+                    harness_contract::workgraph::WorkEdgeKind::Produces => {
+                        WorkGraphEdgeKind::Produces
+                    }
                 },
             })
             .collect();
@@ -513,17 +527,17 @@ mod tests {
 
     #[test]
     fn projects_ai_workgraph_into_runtime_agent_workgraph() {
-        let mut graph = ai_kernel::workgraph::WorkGraph::new("analyze runtime growth");
+        let mut graph = harness_contract::workgraph::WorkGraph::new("analyze runtime growth");
         let plan = graph
-            .add_node(ai_kernel::workgraph::WorkNode::new(
-                ai_kernel::workgraph::WorkNodeKind::AgentTask,
+            .add_node(harness_contract::workgraph::WorkNode::new(
+                harness_contract::workgraph::WorkNodeKind::AgentTask,
                 "plan",
                 "plan the work",
             ))
             .unwrap();
         let review = graph
-            .add_node(ai_kernel::workgraph::WorkNode::new(
-                ai_kernel::workgraph::WorkNodeKind::Review,
+            .add_node(harness_contract::workgraph::WorkNode::new(
+                harness_contract::workgraph::WorkNodeKind::Review,
                 "review",
                 "review evidence",
             ))
@@ -532,7 +546,7 @@ mod tests {
             .add_edge(
                 &plan,
                 &review,
-                ai_kernel::workgraph::WorkEdgeKind::DependsOn,
+                harness_contract::workgraph::WorkEdgeKind::DependsOn,
             )
             .unwrap();
 

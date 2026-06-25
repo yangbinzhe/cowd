@@ -7,9 +7,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use channel::{channel_required_fields, ChannelContract};
 use serde::Deserialize;
 use serde::Serialize;
+use surface::channel::{channel_required_fields, ChannelContract};
 use surface::SurfaceActionRequest;
 
 use super::{api_error, AppState, ErrorResponse};

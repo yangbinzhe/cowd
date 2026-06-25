@@ -169,46 +169,14 @@ async fn get_runtime_events_replay_report(
 async fn recover_runtime_events(
     Query(params): Query<RuntimeReplayParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let report = runtime::RuntimeEventReplayer::report(
-        runtime::global_runtime_event_store(),
-        params.limit.unwrap_or(500).min(2_000),
-    )
-    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let mut applied = Vec::new();
-    let mut skipped = Vec::new();
-    for action in &report.actions {
-        match action.action {
-            runtime::RuntimeRecoveryActionKind::PauseRecoveryRequired
-                if action.stream_id.starts_with("steward:") =>
-            {
-                let steward_id = action.stream_id.trim_start_matches("steward:");
-                match runtime::global_steward_runtime_service()
-                    .mark_recovery_required(steward_id, action.reason.clone())
-                {
-                    Ok(steward) => applied.push(serde_json::json!({
-                        "stream_id": action.stream_id,
-                        "action": action.action,
-                        "steward": steward,
-                    })),
-                    Err(error) => skipped.push(serde_json::json!({
-                        "stream_id": action.stream_id,
-                        "action": action.action,
-                        "error": error,
-                    })),
-                }
-            }
-            _ => skipped.push(serde_json::json!({
-                "stream_id": action.stream_id,
-                "action": action.action,
-                "reason": "safe report-only recovery action",
-            })),
-        }
-    }
+    let report = runtime::RecoveryExecutor::execute(params.limit.unwrap_or(500).min(2_000))
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "runtime.recovery_result",
-        "ok": true,
-        "applied": applied,
-        "skipped": skipped,
+        "ok": report.ok,
+        "applied": report.applied,
+        "skipped": report.skipped,
+        "failed": report.failed,
         "report": report,
     })))
 }
@@ -241,6 +209,7 @@ fn parse_runtime_event_scope(scope: &str) -> runtime::RuntimeEventScope {
         "worker" => runtime::RuntimeEventScope::Worker,
         "schedule" => runtime::RuntimeEventScope::Schedule,
         "tool" => runtime::RuntimeEventScope::Tool,
+        "recovery" => runtime::RuntimeEventScope::Recovery,
         _ => runtime::RuntimeEventScope::Mission,
     }
 }

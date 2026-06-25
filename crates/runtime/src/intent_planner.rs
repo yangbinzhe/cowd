@@ -1,10 +1,10 @@
 //! Lightweight intent and dependency planning for tool execution.
 
-use ai_kernel::strategy::{decide_strategy, StrategyInput, TaskDomain};
+use harness_contract::strategy::{decide_strategy, StrategyInput, TaskDomain};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use ai_kernel::strategy::{StrategyDecision, TaskUnderstanding};
+pub use harness_contract::strategy::{StrategyDecision, TaskUnderstanding};
 
 use crate::tool_dispatch::ToolRequest;
 
@@ -174,7 +174,7 @@ fn path_related(previous: Option<&str>, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_kernel::core::ExecutionMode;
+    use harness_contract::core::ExecutionMode;
 
     fn request(id: &str, name: &str, input: &str) -> ToolRequest {
         ToolRequest {

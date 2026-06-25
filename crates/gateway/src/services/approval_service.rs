@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use ai_kernel::policy::RiskGateReceipt;
 use approval::{ApprovalRepository, FileApprovalRepository};
+use harness_contract::policy::RiskGateReceipt;
 use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
 
 use super::ServiceEnvelope;

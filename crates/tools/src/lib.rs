@@ -1,14 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ai_kernel::tool::{
+use harness_contract::tool::{
     ToolDefinition as KernelToolDefinition, ToolPermissionMode as KernelToolPermissionMode,
 };
 use mcp::McpService;
 use plugins::PluginTool;
-use runtime::{
-    lsp_client::LspRegistry, permission_enforcer::PermissionEnforcer, McpDegradedReport,
-    PermissionMode, ProviderToolDefinition as ToolDefinition,
-};
+use runtime::{lsp_client::LspRegistry, permission_enforcer::PermissionEnforcer, PermissionMode};
 use serde_json::Value;
 
 // Re-exports from split modules
@@ -82,6 +79,13 @@ pub struct RuntimeToolDefinition {
     pub description: Option<String>,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
 }
 
 /// M4: Global registry for self-registered tools (populated via register_tool! macro)
@@ -353,7 +357,7 @@ impl GlobalToolRegistry {
         query: &str,
         max_results: usize,
         pending_mcp_servers: Option<Vec<String>>,
-        mcp_degraded: Option<McpDegradedReport>,
+        mcp_degraded: Option<Value>,
     ) -> ToolSearchOutput {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
@@ -417,7 +421,6 @@ pub mod executor;
 pub(crate) use executor::*;
 // Re-export public items needed by downstream crates
 pub use executor::{execute_tool, ToolSearchOutput};
-pub mod lane_completion;
 pub mod pdf_extract;
 pub(crate) mod prepared;
 pub mod sandbox_exec;

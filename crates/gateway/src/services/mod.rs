@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use ai_kernel::{
+use harness_contract::{
     core::{ExecutionMode, TaskComplexity, TaskRisk},
     growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     policy::{PolicyDecisionKind, RiskGateReceipt},
@@ -230,7 +230,7 @@ impl ProviderService {
     pub(crate) fn new() -> Self {
         Self {
             label: "provider",
-            owner: "0.9.379 Provider service boundary",
+            owner: "0.9.380 Provider service boundary",
         }
     }
 
@@ -317,7 +317,7 @@ impl GrowthService {
     pub(crate) fn new() -> Self {
         Self {
             label: "growth",
-            owner: "0.9.379 Growth service boundary",
+            owner: "0.9.380 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
         }
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn services_declares_gateway_boundary_owner() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.379 GatewayServices");
+        assert_eq!(services.owner, "0.9.380 GatewayServices");
         assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
@@ -820,7 +820,7 @@ mod tests {
         });
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: "growth-session-1".to_string(),
-            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            source_event_kind: "runtime.harness_contract.trace".to_string(),
             strategy_mode: ExecutionMode::PlanExecute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(

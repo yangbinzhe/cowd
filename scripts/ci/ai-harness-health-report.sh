@@ -42,9 +42,8 @@ run_check() {
 
 run_check "format-and-whitespace" "cargo fmt --all --check && git diff --check"
 run_check "ai-harness-core" "scripts/ci/ai-harness.sh"
-run_check "ai-platform-contracts" "cargo test -p ai-agent-spec -p ai-behavior-policy -p ai-harness -p ai-policy --all-targets"
-run_check "runtime-full-capability-eval" "cargo test -p runtime --test cowd_full_capability_eval"
-run_check "deep-local-scenarios" "cargo test -p runtime --test ai_harness_deep_scenarios"
+run_check "mission-harness-quick-eval" "cargo run -p harness-eval -- quick"
+run_check "runtime-lib-tests" "cargo test -p runtime --lib"
 run_check "tool-closure" "cargo test -p tools --test ai_harness_tool_closure"
 run_check "provider-failure-classification" "cargo test -p provider --test provider_failure_classification"
 
@@ -97,9 +96,9 @@ fi
   echo
   echo "## Health Criteria"
   echo
-  echo "- Strategy/context/growth/eval crates compile and pass unit tests."
-  echo "- Runtime scenario suite passes simple, complex, blocked-finalization, multi-agent adaptation, matrix quality, and growth-signal checks."
-  echo "- Memory pulse converts runtime and AI-kernel events into auditable candidates without blocking turn completion."
+  echo "- AI kernel, eval, runtime, tools, and provider checks compile and pass the current core tests."
+  echo "- Mission Harness quick eval validates mission/session/team/agent/steward/recovery deterministic core loops."
+  echo "- Runtime lib tests cover the current in-crate mission, agent, steward, recovery, and policy contracts."
   echo "- Architecture boundaries remain clean."
   echo "- Full-capability scenario validates document ingestion, memory, fact checking, session persistence, agent evidence, and structured runtime evidence."
   echo "- Scenario E2E validates gateway, session/runtime, memory, tool permission, and skill/matrix surfaces."

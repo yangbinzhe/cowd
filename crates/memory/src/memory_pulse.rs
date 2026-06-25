@@ -34,8 +34,8 @@ pub struct MemoryPulseBatch {
 
 impl MemoryPulseBatch {
     pub fn from_runtime_event(event: &RuntimeEvent) -> Option<Self> {
-        let ai_kernel_task_trace =
-            event.scope == RuntimeEventScope::Task && event.kind == "runtime.ai_kernel.trace";
+        let ai_kernel_task_trace = event.scope == RuntimeEventScope::Task
+            && event.kind == "runtime.harness_contract.trace";
         if !ai_kernel_task_trace
             && !matches!(
                 event.scope,
@@ -310,7 +310,7 @@ mod tests {
             "session-1",
             8,
             RuntimeEventScope::Task,
-            "runtime.ai_kernel.trace",
+            "runtime.harness_contract.trace",
             serde_json::json!({
                 "maintenance_candidates": [ai_candidate]
             }),

@@ -4,26 +4,26 @@ use runtime::{AgentNodeStatus, AgentRunGraph, ReviewVerdict};
 use storage::StorageHandle;
 
 #[cfg(test)]
-pub(crate) use ai_task::{TaskPhaseArtifact, TaskPhaseStatus};
-pub(crate) use ai_task::{TaskPhaseRecord, TaskStatus};
+pub(crate) use runtime::task::{TaskPhaseArtifact, TaskPhaseStatus};
+pub(crate) use runtime::task::{TaskPhaseRecord, TaskStatus};
 
-pub(crate) type TaskRecord = ai_task::TaskRecord<AgentRunGraph>;
+pub(crate) type TaskRecord = runtime::task::TaskRecord<AgentRunGraph>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TaskKernel {
-    inner: ai_task::TaskKernel,
+    inner: runtime::task::TaskKernel,
 }
 
 impl TaskKernel {
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
         Ok(Self {
-            inner: ai_task::TaskKernel::open(path)?,
+            inner: runtime::task::TaskKernel::open(path)?,
         })
     }
 
     pub(crate) fn open_storage_handle(handle: &StorageHandle) -> Result<Self, String> {
         Ok(Self {
-            inner: ai_task::TaskKernel::open_storage_handle(handle)?,
+            inner: runtime::task::TaskKernel::open_storage_handle(handle)?,
         })
     }
 
@@ -46,7 +46,7 @@ impl TaskKernel {
         sync_phase_node(&mut graph, &task, "implementation")?;
         self.inner
             .upsert_agent_graph(&task.id, graph)
-            .and_then(ai_task::TaskRecord::decode_graph)
+            .and_then(runtime::task::TaskRecord::decode_graph)
     }
 
     pub(crate) fn transition(
@@ -58,7 +58,7 @@ impl TaskKernel {
     ) -> Result<TaskRecord, String> {
         self.inner
             .transition(task_id, status, phase, message)
-            .and_then(ai_task::TaskRecord::decode_graph)
+            .and_then(runtime::task::TaskRecord::decode_graph)
     }
 
     pub(crate) fn start_phase(
@@ -185,7 +185,7 @@ impl TaskKernel {
     ) -> Result<TaskRecord, String> {
         self.inner
             .upsert_agent_graph(task_id, graph)
-            .and_then(ai_task::TaskRecord::decode_graph)
+            .and_then(runtime::task::TaskRecord::decode_graph)
     }
 }
 

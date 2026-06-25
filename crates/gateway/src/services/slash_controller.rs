@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use slash_contract::{
+use crate::command::slash::{
     command_projection, normalize_command_name, unified_command_registry, CommandActionTarget,
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
@@ -49,7 +49,7 @@ impl SlashController {
                 service: self.label(),
                 operation,
                 status: "service_boundary_ready",
-                owner: "0.9.379 Slash controller boundary",
+                owner: "0.9.380 Slash controller boundary",
                 boundary_status: "0620_final_boundary",
             })
             .collect()

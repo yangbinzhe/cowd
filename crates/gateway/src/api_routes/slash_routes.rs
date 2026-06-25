@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::command::slash::CommandSurface;
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
@@ -8,7 +9,6 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use slash_contract::CommandSurface;
 
 use super::{api_error, AppState, ErrorResponse};
 

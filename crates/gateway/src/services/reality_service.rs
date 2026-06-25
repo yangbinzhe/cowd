@@ -28,7 +28,7 @@ impl RealityService {
     pub(crate) fn new() -> Self {
         Self {
             label: "reality",
-            owner: "0.9.379 Reality Core service boundary",
+            owner: "0.9.380 Reality Core service boundary",
         }
     }
 
@@ -481,10 +481,10 @@ fn degraded_reasons(
 }
 
 fn filter_events(
-    mut events: Vec<ai_kernel::growth::GrowthEvent>,
+    mut events: Vec<harness_contract::growth::GrowthEvent>,
     session_id: Option<&str>,
     limit: usize,
-) -> Vec<ai_kernel::growth::GrowthEvent> {
+) -> Vec<harness_contract::growth::GrowthEvent> {
     if let Some(session_id) = session_id {
         events.retain(|event| event.session_id == session_id);
     }
@@ -513,7 +513,7 @@ fn filter_promotions(
 }
 
 fn fact_flow_stages(
-    events: &[ai_kernel::growth::GrowthEvent],
+    events: &[harness_contract::growth::GrowthEvent],
     promotions: &[super::growth_service::GrowthPromotionReceipt],
 ) -> Vec<serde_json::Value> {
     let mut stages = Vec::new();

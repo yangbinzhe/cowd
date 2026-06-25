@@ -4,7 +4,7 @@
 //! may do, when it must ask, and when it must escalate. They do not execute
 //! tools or spawn agents.
 
-use ai_kernel::core::TaskRisk;
+use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{CollaborationTemplateId, PermissionMode};

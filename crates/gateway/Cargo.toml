@@ -11,9 +11,8 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
-ai-kernel = { path = "../ai-kernel" }
+harness-contract = { path = "../harness-contract" }
 fact-kernel = { path = "../fact-kernel" }
-ai-task = { path = "../ai-task" }
 model-protocol = { path = "../model-protocol" }
 provider = { path = "../provider" }
 storage = { path = "../storage" }
@@ -22,9 +21,6 @@ approval = { path = "../approval" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
-channel = { path = "../channel" }
-slash-contract = { path = "../slash/contract" }
-slash-catalog = { path = "../slash/catalog" }
 connector = { path = "../connector" }
 skill-service = { path = "../skill/service" }
 app-mfg = { path = "../app-mfg" }

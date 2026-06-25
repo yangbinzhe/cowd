@@ -15,7 +15,7 @@ use crate::collaboration_template::{CollaborationDecision, CollaborationTemplate
 use crate::context_runtime::ContextItem;
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
-use ai_kernel::strategy::{decide_strategy, StrategyInput};
+use harness_contract::strategy::{decide_strategy, StrategyInput};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::fact_checker::{FactCheckResult, FactChecker};

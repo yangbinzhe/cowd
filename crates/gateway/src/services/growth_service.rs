@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use ai_kernel::growth::{GrowthEvent, GrowthMatrixSignal, GrowthMemoryCandidate};
 use chrono::Utc;
 use fact_kernel::{
     core::{EvidencePacket, FactSource, SourceKind},
@@ -10,6 +9,7 @@ use fact_kernel::{
     memory::MemoryCandidate as KernelMemoryCandidate,
     Confidence, FactId,
 };
+use harness_contract::growth::{GrowthEvent, GrowthMatrixSignal, GrowthMemoryCandidate};
 use matrix_core::{MatrixFact, MatrixFactInput};
 use memory::{
     project_scope::MemoryScope,
@@ -89,7 +89,7 @@ impl GrowthService {
         memory: &MemoryService,
         matrix: &MatrixService,
         session_id: impl Into<String>,
-        receipt: &ai_kernel::policy::RiskGateReceipt,
+        receipt: &harness_contract::policy::RiskGateReceipt,
     ) -> serde_json::Value {
         let event = self.build_risk_gate_event(session_id, receipt);
         let ingest = self
@@ -153,40 +153,41 @@ impl GrowthService {
     fn build_risk_gate_event(
         &self,
         session_id: impl Into<String>,
-        receipt: &ai_kernel::policy::RiskGateReceipt,
+        receipt: &harness_contract::policy::RiskGateReceipt,
     ) -> GrowthEvent {
-        let record =
-            ai_kernel::growth::LearningRecord::from_input(ai_kernel::growth::GrowthInput {
+        let record = harness_contract::growth::LearningRecord::from_input(
+            harness_contract::growth::GrowthInput {
                 selected_mode: if receipt.approval_required {
-                    ai_kernel::core::ExecutionMode::HumanConfirm
+                    harness_contract::core::ExecutionMode::HumanConfirm
                 } else {
-                    ai_kernel::core::ExecutionMode::RiskGate
+                    harness_contract::core::ExecutionMode::RiskGate
                 },
-                complexity: ai_kernel::core::TaskComplexity::Moderate,
+                complexity: harness_contract::core::TaskComplexity::Moderate,
                 risk: if receipt.approval_required {
-                    ai_kernel::core::TaskRisk::High
+                    harness_contract::core::TaskRisk::High
                 } else {
-                    ai_kernel::core::TaskRisk::Medium
+                    harness_contract::core::TaskRisk::Medium
                 },
                 context_omitted: 0,
                 tool_requires_checkpoint: !matches!(
                     receipt.decision,
-                    ai_kernel::policy::PolicyDecisionKind::Allow
+                    harness_contract::policy::PolicyDecisionKind::Allow
                 ),
                 tool_requires_human_confirm: receipt.approval_required,
                 verification_can_finalize: !receipt.approval_required,
                 bench_passed: true,
-            });
-        GrowthEvent::from_input(ai_kernel::growth::GrowthEventInput {
+            },
+        );
+        GrowthEvent::from_input(harness_contract::growth::GrowthEventInput {
             session_id: session_id.into(),
             source_event_kind: "approval.risk_receipt".to_string(),
             strategy_mode: if receipt.approval_required {
-                ai_kernel::core::ExecutionMode::HumanConfirm
+                harness_contract::core::ExecutionMode::HumanConfirm
             } else {
-                ai_kernel::core::ExecutionMode::RiskGate
+                harness_contract::core::ExecutionMode::RiskGate
             },
             learning_record: record,
-            evidence_refs: vec![ai_kernel::growth::GrowthEvidenceRef::new(
+            evidence_refs: vec![harness_contract::growth::GrowthEvidenceRef::new(
                 "risk_gate_receipt",
                 format!("risk:{}", receipt.issued_at.timestamp_millis()),
                 format!(
@@ -817,7 +818,7 @@ fn event_exists(config_home: &Path, event_id: &str) -> Result<bool, String> {
 mod tests {
     use std::sync::Arc;
 
-    use ai_kernel::{
+    use harness_contract::{
         core::{ExecutionMode, TaskComplexity, TaskRisk},
         growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     };
@@ -858,7 +859,7 @@ mod tests {
         });
         GrowthEvent::from_input(GrowthEventInput {
             session_id: session_id.to_string(),
-            source_event_kind: "runtime.ai_kernel.trace".to_string(),
+            source_event_kind: "runtime.harness_contract.trace".to_string(),
             strategy_mode: ExecutionMode::PlanExecute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
