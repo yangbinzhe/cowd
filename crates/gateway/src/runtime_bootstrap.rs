@@ -5,9 +5,9 @@ use std::{
 };
 
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use runtime::{ConfigLoader, McpServerManager, PermissionMode, ToolError};
+use runtime::{ConfigLoader, McpServerManager, ToolError};
 use serde_json::json;
-use tools::RuntimeToolDefinition;
+use tools::{permissions::PermissionMode as ToolPermissionMode, RuntimeToolDefinition};
 
 pub(crate) type GatewayToolRegistry = tools::GlobalToolRegistry;
 pub(crate) type RuntimePluginStateBuildOutput = (
@@ -381,7 +381,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["qualifiedName"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: ToolPermissionMode::DangerFullAccess,
         },
         RuntimeToolDefinition {
             name: "ListMcpResourcesTool".to_string(),
@@ -396,7 +396,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 },
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: ToolPermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
             name: "ReadMcpResourceTool".to_string(),
@@ -410,22 +410,22 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["server", "uri"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: ToolPermissionMode::ReadOnly,
         },
     ]
 }
 
-fn permission_mode_for_mcp_tool(tool: &runtime::McpTool) -> PermissionMode {
+fn permission_mode_for_mcp_tool(tool: &runtime::McpTool) -> ToolPermissionMode {
     let read_only = mcp_annotation_flag(tool, "readOnlyHint");
     let destructive = mcp_annotation_flag(tool, "destructiveHint");
     let open_world = mcp_annotation_flag(tool, "openWorldHint");
 
     if read_only && !destructive && !open_world {
-        PermissionMode::ReadOnly
+        ToolPermissionMode::ReadOnly
     } else if destructive || open_world {
-        PermissionMode::DangerFullAccess
+        ToolPermissionMode::DangerFullAccess
     } else {
-        PermissionMode::WorkspaceWrite
+        ToolPermissionMode::WorkspaceWrite
     }
 }
 

@@ -6863,9 +6863,20 @@ fn permission_policy(
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
         PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
         |policy, (name, required_permission)| {
-            policy.with_tool_requirement(name, required_permission)
+            policy
+                .with_tool_requirement(name, runtime_permission_mode_from_tool(required_permission))
         },
     ))
+}
+
+fn runtime_permission_mode_from_tool(mode: tools::permissions::PermissionMode) -> PermissionMode {
+    match mode {
+        tools::permissions::PermissionMode::ReadOnly => PermissionMode::ReadOnly,
+        tools::permissions::PermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
+        tools::permissions::PermissionMode::DangerFullAccess
+        | tools::permissions::PermissionMode::Prompt
+        | tools::permissions::PermissionMode::Allow => PermissionMode::DangerFullAccess,
+    }
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {

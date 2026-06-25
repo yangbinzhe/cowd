@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use runtime::PermissionMode;
+use crate::permissions::PermissionMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {

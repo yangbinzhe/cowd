@@ -5,8 +5,10 @@ use harness_contract::tool::{
 };
 use mcp::McpService;
 use plugins::PluginTool;
-use runtime::{lsp_client::LspRegistry, permission_enforcer::PermissionEnforcer, PermissionMode};
 use serde_json::Value;
+
+use crate::lsp_client::LspRegistry;
+use crate::permissions::{PermissionEnforcer, PermissionMode};
 
 // Re-exports from split modules
 pub(crate) use tool_specs::{
@@ -421,8 +423,20 @@ pub mod executor;
 pub(crate) use executor::*;
 // Re-export public items needed by downstream crates
 pub use executor::{execute_tool, ToolSearchOutput};
+pub mod bash;
+pub mod checkpoint;
+pub mod file_ops;
+pub mod gates;
+pub mod lane_events;
+pub mod lane_policy;
+pub mod lsp_client;
+pub mod mutation_plan;
 pub mod pdf_extract;
+pub mod permissions;
 pub(crate) mod prepared;
 pub mod sandbox_exec;
+pub mod stale_branch;
+pub mod tool_cache;
+pub mod tool_orchestrator;
 pub mod tool_specs;
 pub mod web_tools;

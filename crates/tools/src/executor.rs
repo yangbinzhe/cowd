@@ -7,33 +7,34 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use reqwest::blocking::Client;
-use runtime::tool_orchestrator::tool_execution_profile;
-#[cfg(test)]
-use runtime::ToolError;
-use runtime::{
-    check_freshness, checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore,
-    edit_file, execute_bash,
-    gates::{GateContext, GateEvaluator},
-    glob_search, grep_search,
-    mutation_plan::{apply_mutations, preview_mutations},
-    permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
-    tool_cache::{
-        get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
-        put_cached_tool_result_scoped, tool_cache_stats,
-    },
-    write_file, BashCommandInput, BashCommandOutput, BranchFreshness, CheckpointCreateInput,
-    CheckpointDiffInput, CheckpointRestoreInput, GrepSearchInput, LaneContext, LaneEvent,
-    LaneEventName, LaneEventStatus, LaneFailureClass, MutationApplyInput, MutationPreviewInput,
-    PermissionMode,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::bash::{execute_bash, BashCommandInput, BashCommandOutput};
+use crate::checkpoint::{
+    checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
+    CheckpointDiffInput, CheckpointRestoreInput,
+};
+use crate::file_ops::{
+    edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
+};
+use crate::gates::{GateContext, GateEvaluator};
+use crate::lane_events::{LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass};
+use crate::lane_policy::{iso8601_now, LaneContext};
+use crate::mutation_plan::{
+    apply_mutations, preview_mutations, MutationApplyInput, MutationPreviewInput,
+};
+use crate::permissions::{EnforcementResult, PermissionEnforcer, PermissionMode};
 use crate::prepared::{
     prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedToolCall, PreparedToolInvocation,
     ToolExecutionContext,
 };
+use crate::stale_branch::{check_freshness, BranchFreshness};
+use crate::tool_cache::{
+    get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
+    put_cached_tool_result_scoped, tool_cache_stats,
+};
+use crate::tool_orchestrator::{tool_execution_profile, ToolSafetyCategory, ToolSafetyRegistry};
 use crate::{configured_mcp_service, global_lsp_registry, GlobalToolRegistry};
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -886,7 +887,7 @@ fn branch_divergence_output(
             LaneEvent::new(
                 LaneEventName::BranchStaleAgainstMain,
                 LaneEventStatus::Blocked,
-                runtime::iso8601_now(),
+                iso8601_now(),
             )
             .with_failure_class(LaneFailureClass::BranchDivergence)
             .with_detail(stderr.clone())
@@ -1403,8 +1404,7 @@ fn is_allowed_readonly_batch_tool(name: &str) -> bool {
             | "mutation_preview"
             | "edit_many_preview"
             | "patch_plan"
-    ) && runtime::tool_orchestrator::ToolSafetyRegistry::global().classify(name)
-        == runtime::tool_orchestrator::ToolSafetyCategory::ReadOnly
+    ) && ToolSafetyRegistry::global().classify(name) == ToolSafetyCategory::ReadOnly
 }
 
 fn collect_snapshot_files(root: &Path, max_files: usize, files: &mut Vec<String>) {
@@ -2922,42 +2922,6 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
-pub(crate) struct SubagentToolExecutor {
-    allowed_tools: BTreeSet<String>,
-    enforcer: Option<PermissionEnforcer>,
-}
-
-#[cfg(test)]
-impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self {
-            allowed_tools,
-            enforcer: None,
-        }
-    }
-
-    fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
-        self.enforcer = Some(enforcer);
-        self
-    }
-}
-
-#[cfg(test)]
-impl runtime::ToolExecutor for SubagentToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if !self.allowed_tools.contains(tool_name) {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled for this sub-agent"
-            )));
-        }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), None, tool_name, &value)
-            .map_err(ToolError::new)
-    }
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
@@ -3910,11 +3874,11 @@ fn iso8601_timestamp() -> String {
             return String::from_utf8_lossy(&output.stdout).trim().to_string();
         }
     }
-    runtime::iso8601_now()
+    iso8601_now()
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(input: PowerShellInput) -> std::io::Result<BashCommandOutput> {
     let _ = &input.description;
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return Ok(output);
@@ -3978,7 +3942,7 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
+) -> std::io::Result<BashCommandOutput> {
     if run_in_background.unwrap_or(false) {
         let child = std::process::Command::new(shell)
             .arg("-NoProfile")
@@ -3989,7 +3953,7 @@ fn execute_shell_command(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        return Ok(runtime::BashCommandOutput {
+        return Ok(BashCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
             raw_output_path: None,
@@ -4024,7 +3988,7 @@ fn execute_shell_command(
         loop {
             if let Some(status) = child.try_wait()? {
                 let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
+                return Ok(BashCommandOutput {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     raw_output_path: None,
@@ -4058,7 +4022,7 @@ Command exceeded timeout of {timeout_ms} ms",
                         stderr.trim_end()
                     )
                 };
-                return Ok(runtime::BashCommandOutput {
+                return Ok(BashCommandOutput {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr,
                     raw_output_path: None,
@@ -4081,7 +4045,7 @@ Command exceeded timeout of {timeout_ms} ms",
     }
 
     let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
+    Ok(BashCommandOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         raw_output_path: None,
@@ -4162,26 +4126,20 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
-    use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
-    use super::{execute_tool, SubagentToolExecutor};
+    use super::execute_tool;
+    use crate::lane_events::LaneEventName;
+    use crate::permissions::{PermissionEnforcer, PermissionMode, PermissionPolicy};
+    use crate::tool_cache::reset_tool_cache_for_tests;
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
-    use runtime::{
-        permission_enforcer::PermissionEnforcer, push_provider_output_block, ApiRequest,
-        AssistantEvent, ConversationRuntime, LaneEventName, LaneFailureClass, PermissionMode,
-        PermissionPolicy, ProviderOutputContentBlock as OutputContentBlock, ProviderRuntimeClient,
-        RuntimeError, Session, SharedPrompter, ToolExecutor,
-    };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -4378,31 +4336,6 @@ mod tests {
     }
 
     #[test]
-    fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
-        // given
-        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
-            .with_enforcer(PermissionEnforcer::new(policy));
-
-        // when
-        let error = executor
-            .execute(
-                "write_file",
-                &json!({
-                    "path": "blocked.txt",
-                    "content": "blocked"
-                })
-                .to_string(),
-            )
-            .expect_err("subagent write tool should be denied before dispatch");
-
-        // then
-        assert!(error
-            .to_string()
-            .contains("requires workspace-write permission"));
-    }
-
-    #[test]
     fn permission_mode_from_plugin_rejects_invalid_inputs() {
         let unknown_permission = permission_mode_from_plugin("admin")
             .expect_err("unknown plugin permission should fail");
@@ -4424,7 +4357,7 @@ mod tests {
                     "properties": { "text": { "type": "string" } },
                     "additionalProperties": false
                 }),
-                required_permission: runtime::PermissionMode::ReadOnly,
+                required_permission: PermissionMode::ReadOnly,
             }])
             .expect("runtime tools should register");
 
@@ -4443,35 +4376,21 @@ mod tests {
             .expect("runtime tool permissions should resolve");
         assert_eq!(
             permissions,
-            vec![(
-                "mcp__demo__echo".to_string(),
-                runtime::PermissionMode::ReadOnly
-            )]
+            vec![("mcp__demo__echo".to_string(), PermissionMode::ReadOnly)]
         );
 
         let search = registry.search(
             "demo echo",
             5,
             Some(vec!["pending-server".to_string()]),
-            Some(
-                serde_json::to_value(runtime::McpDegradedReport::new(
-                    vec!["demo".to_string()],
-                    vec![runtime::McpFailedServer {
-                        server_name: "pending-server".to_string(),
-                        phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                        error: runtime::McpErrorSurface::new(
-                            runtime::McpLifecyclePhase::ToolDiscovery,
-                            Some("pending-server".to_string()),
-                            "tool discovery failed",
-                            BTreeMap::new(),
-                            true,
-                        ),
-                    }],
-                    vec!["mcp__demo__echo".to_string()],
-                    vec!["mcp__demo__echo".to_string()],
-                ))
-                .expect("mcp degraded report should serialize"),
-            ),
+            Some(json!({
+                "failed_servers": [{
+                    "server_name": "pending-server",
+                    "phase": "tool_discovery",
+                    "error": {"message": "tool discovery failed"}
+                }],
+                "available_tools": ["mcp__demo__echo"]
+            })),
         );
         let output = serde_json::to_value(search).expect("search output should serialize");
         assert_eq!(output["matches"][0], "mcp__demo__echo");
@@ -4657,63 +4576,6 @@ mod tests {
             .expect_err("invalid base URL should fail");
         std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
-    }
-
-    #[test]
-    fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
-        let mut events = Vec::new();
-        let mut pending_tools = BTreeMap::new();
-
-        push_provider_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "read_file".to_string(),
-                input: json!({}),
-            },
-            1,
-            &mut events,
-            &mut pending_tools,
-            true,
-        );
-        push_provider_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-2".to_string(),
-                name: "grep_search".to_string(),
-                input: json!({}),
-            },
-            2,
-            &mut events,
-            &mut pending_tools,
-            true,
-        );
-
-        pending_tools
-            .get_mut(&1)
-            .expect("first tool pending")
-            .2
-            .push_str("{\"path\":\"src/main.rs\"}");
-        pending_tools
-            .get_mut(&2)
-            .expect("second tool pending")
-            .2
-            .push_str("{\"pattern\":\"TODO\"}");
-
-        assert_eq!(
-            pending_tools.remove(&1),
-            Some((
-                "tool-1".to_string(),
-                "read_file".to_string(),
-                "{\"path\":\"src/main.rs\"}".to_string(),
-            ))
-        );
-        assert_eq!(
-            pending_tools.remove(&2),
-            Some((
-                "tool-2".to_string(),
-                "grep_search".to_string(),
-                "{\"pattern\":\"TODO\"}".to_string(),
-            ))
-        );
     }
 
     #[test]
@@ -5247,112 +5109,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_classification_covers_finished_and_specific_blockers() {
-        assert_eq!(
-            runtime::derive_agent_state("running", None, None, None),
-            "working"
-        );
-        assert_eq!(
-            runtime::derive_agent_state("completed", Some("done"), None, None),
-            "finished_cleanable"
-        );
-        assert_eq!(
-            runtime::derive_agent_state("completed", None, None, None),
-            "finished_pending_report"
-        );
-        assert_eq!(
-            runtime::derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
-            "degraded_mcp"
-        );
-        assert_eq!(
-            runtime::derive_agent_state(
-                "failed",
-                None,
-                Some("background terminal still running"),
-                None
-            ),
-            "blocked_background_job"
-        );
-        assert_eq!(
-            runtime::derive_agent_state(
-                "failed",
-                None,
-                Some("merge conflict while rebasing"),
-                None
-            ),
-            "blocked_merge_conflict"
-        );
-        assert_eq!(
-            runtime::derive_agent_state(
-                "failed",
-                None,
-                Some("transport interrupted after partial progress"),
-                None
-            ),
-            "interrupted_transport"
-        );
-    }
-
-    #[test]
-    fn commit_provenance_is_extracted_from_agent_results() {
-        let provenance =
-            runtime::maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
-                .expect("commit provenance");
-        assert_eq!(provenance.commit, "deadbee");
-        assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
-        assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
-    }
-    #[test]
-    fn lane_failure_taxonomy_normalizes_common_blockers() {
-        let cases = [
-            (
-                "prompt delivery failed in tmux pane",
-                LaneFailureClass::PromptDelivery,
-            ),
-            (
-                "trust prompt is still blocking startup",
-                LaneFailureClass::TrustGate,
-            ),
-            (
-                "branch stale against main after divergence",
-                LaneFailureClass::BranchDivergence,
-            ),
-            (
-                "compile failed after cargo check",
-                LaneFailureClass::Compile,
-            ),
-            ("targeted tests failed", LaneFailureClass::Test),
-            ("plugin bootstrap failed", LaneFailureClass::PluginStartup),
-            ("mcp handshake timed out", LaneFailureClass::McpHandshake),
-            (
-                "mcp startup failed before listing tools",
-                LaneFailureClass::McpStartup,
-            ),
-            (
-                "gateway routing rejected the request",
-                LaneFailureClass::GatewayRouting,
-            ),
-            (
-                "tool failed: denied tool execution from hook",
-                LaneFailureClass::ToolRuntime,
-            ),
-            (
-                "workspace mismatch while resuming the managed session",
-                LaneFailureClass::WorkspaceMismatch,
-            ),
-            ("thread creation failed", LaneFailureClass::Infra),
-        ];
-
-        for (message, expected) in cases {
-            assert_eq!(
-                runtime::classify_lane_failure(message),
-                expected,
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
     fn lane_event_schema_serializes_to_canonical_names() {
         let cases = [
             (LaneEventName::Started, "lane.started"),
@@ -5402,7 +5158,7 @@ mod tests {
             );
         }
         assert!(
-            !source.contains(&["runtime::", "spawn_provider_agent"].concat()),
+            !source.contains(&["runtime", "::", "spawn_provider_agent"].concat()),
             "tools executor must not spawn agent providers directly"
         );
     }
@@ -5432,100 +5188,13 @@ mod tests {
             );
         }
         assert!(
-            !executor.contains(&["runtime::", "global_runtime_control_plane()"].concat()),
+            !executor.contains(&["runtime", "::", "global_runtime_control_plane()"].concat()),
             "tools executor must not call runtime control-plane directly"
         );
         assert!(
-            !executor.contains(&["runtime::", "global_task_registry()"].concat()),
+            !executor.contains(&["runtime", "::", "global_task_registry()"].concat()),
             "tools executor must not call task registry directly"
         );
-    }
-
-    #[derive(Debug)]
-    struct MockSubagentApiClient {
-        calls: usize,
-        input_path: String,
-    }
-
-    impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(
-            &mut self,
-            request: ApiRequest,
-        ) -> Pin<
-            Box<
-                dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            self.calls += 1;
-            let events: Result<Vec<AssistantEvent>, RuntimeError> = match self.calls {
-                1 => {
-                    assert_eq!(request.messages.len(), 1);
-                    Ok(vec![
-                        AssistantEvent::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "read_file".to_string(),
-                            input: json!({ "path": self.input_path }).to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ])
-                }
-                2 => {
-                    assert!(request.messages.len() >= 3);
-                    Ok(vec![
-                        AssistantEvent::TextDelta("Scope: completed mock review".to_string()),
-                        AssistantEvent::MessageStop,
-                    ])
-                }
-                _ => unreachable!("extra mock stream call"),
-            };
-            Box::pin(futures::stream::iter(
-                events.into_iter().flat_map(|v| v.into_iter().map(Ok)),
-            ))
-        }
-    }
-
-    #[test]
-    fn subagent_runtime_executes_tool_loop_with_isolated_session() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = temp_path("subagent-input.txt");
-        std::fs::write(&path, "hello from child").expect("write input file");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MockSubagentApiClient {
-                calls: 0,
-                input_path: path.display().to_string(),
-            },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
-            permission_policy_for_mode(PermissionMode::DangerFullAccess),
-            vec![String::from("system prompt")],
-        );
-
-        let summary = tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(runtime.run_turn_async("Inspect the delegated file", &SharedPrompter::none()))
-            .expect("subagent loop should succeed");
-
-        assert_eq!(
-            runtime::final_assistant_text(&summary),
-            "Scope: completed mock review"
-        );
-        assert!(runtime
-            .session()
-            .messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                runtime::ContentBlock::ToolResult { output, .. }
-                    if output.contains("hello from child")
-            )));
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -6032,7 +5701,7 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        runtime::tool_cache::reset_tool_cache_for_tests();
+        reset_tool_cache_for_tests();
         let root = temp_path("tool-cache-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
@@ -6062,7 +5731,7 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        runtime::tool_cache::reset_tool_cache_for_tests();
+        reset_tool_cache_for_tests();
     }
 
     #[test]
@@ -6070,7 +5739,7 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        runtime::tool_cache::reset_tool_cache_for_tests();
+        reset_tool_cache_for_tests();
         let root = temp_path("tool-cache-external-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
@@ -6090,7 +5759,7 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        runtime::tool_cache::reset_tool_cache_for_tests();
+        reset_tool_cache_for_tests();
     }
 
     #[test]
@@ -6874,11 +6543,8 @@ printf 'pwsh:%s' "$1"
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
-        use runtime::permission_enforcer::PermissionEnforcer;
-        use runtime::PermissionPolicy;
-
         let policy = mvp_tool_specs().into_iter().fold(
-            PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
             |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
         );
         let mut registry = super::GlobalToolRegistry::builtin();
@@ -6967,140 +6633,6 @@ printf 'pwsh:%s' "$1"
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        let fallback_config: Vec<String> = vec![];
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            Vec::new(),
-            &fallback_config,
-        )
-        .expect("primary-only chain should construct");
-
-        // then
-        assert_eq!(client.chain_models(), vec!["claude-sonnet-4-6"]);
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config: Vec<String> = vec!["grok-3".to_string(), "grok-3-mini".to_string()];
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            Vec::new(),
-            &fallback_config,
-        )
-        .expect("chain with fallbacks should construct");
-
-        // then
-        assert_eq!(
-            client.chain_models(),
-            vec!["claude-sonnet-4-6", "grok-3", "grok-3-mini"]
-        );
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_matches_entry_by_constructor_model() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config: Vec<String> = vec!["claude-sonnet-4-6".to_string()];
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "grok-3".to_string(),
-            Vec::new(),
-            &fallback_config,
-        )
-        .expect("chain with matching entry should construct");
-
-        // then
-        assert_eq!(client.chain_models(), vec!["grok-3", "claude-sonnet-4-6"]);
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::remove_var("XAI_API_KEY");
-        let fallback_config: Vec<String> = vec![
-            "grok-3".to_string(),
-            "claude-haiku-4-5-20251213".to_string(),
-        ];
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            Vec::new(),
-            &fallback_config,
-        )
-        .expect("chain construction should not fail when only some fallbacks are unavailable");
-
-        // then
-        assert_eq!(
-            client.chain_models(),
-            vec!["claude-sonnet-4-6", "claude-haiku-4-5-20251213"]
-        );
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        if let Some(value) = original_xai {
-            std::env::set_var("XAI_API_KEY", value);
-        }
     }
 
     #[test]

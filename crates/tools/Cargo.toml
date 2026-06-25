@@ -11,9 +11,10 @@ harness-contract = { path = "../harness-contract" }
 base64 = "0.22"
 skill-service = { path = "../skill/service" }
 flate2 = "1"
+glob = "0.3"
 mcp = { path = "../mcp" }
 plugins = { path = "../plugins" }
-runtime = { path = "../runtime" }
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
@@ -22,6 +23,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 urlencoding = "2"
 thiserror = "2"
 tracing.workspace = true
+walkdir = "2"
 
 [lints]
 workspace = true

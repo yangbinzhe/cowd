@@ -1,10 +1,8 @@
 use std::fs;
 
 use serde_json::json;
+use tools::permissions::{PermissionEnforcer, PermissionMode, PermissionPolicy};
 use tools::GlobalToolRegistry;
-
-use runtime::permission_enforcer::PermissionEnforcer;
-use runtime::{PermissionMode, PermissionPolicy};
 
 #[test]
 fn live_tool_readonly_closure_reads_fixture_and_returns_evidence() {
