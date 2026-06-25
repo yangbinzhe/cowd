@@ -1,7 +1,8 @@
 use harness_contract::core::TaskRisk;
 use harness_contract::strategy::{decide_strategy, StrategyInput};
 use harness_eval::{
-    ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+    harness_capability_coverage_report, ScenarioCheck, ScenarioCheckKind, ScenarioObservation,
+    ScenarioSpec, ScenarioSuite,
 };
 use runtime::{
     global_mission_runtime, global_session_relation_graph, global_steward_runtime_service,
@@ -482,9 +483,20 @@ fn run_deterministic_core_loop() -> (Vec<CapabilityResult>, String) {
     };
     let suite = ScenarioSuite::new(vec![scenario]).evaluate(&[observation]);
     assert_eq!(suite.failed, 0);
+    let coverage = harness_capability_coverage_report();
+    assert_eq!(coverage.failed, 0);
 
     (
         vec![
+            CapabilityResult {
+                capability: "runtime_module_coverage",
+                status: "passed",
+                evidence: format!(
+                    "{} / {} runtime capability domains covered",
+                    coverage.passed, coverage.total
+                ),
+                notes: "runtime module map covers required harness lifecycle domains".to_string(),
+            },
             CapabilityResult {
                 capability: "mission_session",
                 status: "passed",

@@ -120,6 +120,25 @@ pub struct AgenticEvalGateReport {
     pub missing_capabilities: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCapabilityCoverageItem {
+    pub capability: String,
+    pub required: bool,
+    pub present_modules: Vec<String>,
+    pub lifecycle_modules: Vec<String>,
+    pub passed: bool,
+    pub repair_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCapabilityCoverageReport {
+    pub kind: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub items: Vec<HarnessCapabilityCoverageItem>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RegressionGate {
     pub min_average_score: f32,
@@ -170,6 +189,62 @@ impl RegressionGate {
             failed: report.failed,
             reasons,
         }
+    }
+}
+
+#[must_use]
+pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
+    let module_map = runtime::runtime_module_map();
+    let required_domains = [
+        runtime::RuntimeDomain::Conversation,
+        runtime::RuntimeDomain::Provider,
+        runtime::RuntimeDomain::Tooling,
+        runtime::RuntimeDomain::Mission,
+        runtime::RuntimeDomain::Session,
+        runtime::RuntimeDomain::Agent,
+        runtime::RuntimeDomain::Team,
+        runtime::RuntimeDomain::Steward,
+        runtime::RuntimeDomain::Approval,
+        runtime::RuntimeDomain::Context,
+        runtime::RuntimeDomain::Recovery,
+        runtime::RuntimeDomain::Policy,
+        runtime::RuntimeDomain::RealityBridge,
+    ];
+    let items = required_domains
+        .into_iter()
+        .map(|domain| {
+            let present_modules = module_map
+                .iter()
+                .filter(|descriptor| descriptor.domain == domain)
+                .map(|descriptor| descriptor.module.to_string())
+                .collect::<Vec<_>>();
+            let lifecycle_modules = module_map
+                .iter()
+                .filter(|descriptor| descriptor.domain == domain && descriptor.lifecycle_owner)
+                .map(|descriptor| descriptor.module.to_string())
+                .collect::<Vec<_>>();
+            let passed = !present_modules.is_empty() && !lifecycle_modules.is_empty();
+            HarnessCapabilityCoverageItem {
+                capability: domain.as_str().to_string(),
+                required: true,
+                present_modules,
+                lifecycle_modules,
+                passed,
+                repair_hint: format!(
+                    "map runtime {} modules in runtime::module_map and mark at least one lifecycle owner",
+                    domain.as_str()
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let total = items.len();
+    let passed = items.iter().filter(|item| item.passed).count();
+    HarnessCapabilityCoverageReport {
+        kind: "harness_capability_coverage".to_string(),
+        total,
+        passed,
+        failed: total.saturating_sub(passed),
+        items,
     }
 }
 
@@ -943,5 +1018,20 @@ mod tests {
             .covered_capabilities
             .contains(&"behavior".to_string()));
         assert!(report.required_capabilities.contains(&"policy".to_string()));
+    }
+
+    #[test]
+    fn harness_capability_coverage_requires_runtime_lifecycle_owners() {
+        let report = harness_capability_coverage_report();
+
+        assert_eq!(report.failed, 0);
+        assert!(report.items.iter().any(|item| item.capability == "agent"
+            && item
+                .lifecycle_modules
+                .contains(&"agent_lifecycle".to_string())));
+        assert!(report.items.iter().any(|item| item.capability == "tooling"
+            && item
+                .lifecycle_modules
+                .contains(&"tool_dispatch".to_string())));
     }
 }

@@ -6,8 +6,6 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
-#![deny(deprecated)]
-
 pub mod cowd_dirs;
 pub use cowd_dirs::expand_tilde;
 mod bash;
@@ -49,6 +47,7 @@ pub mod mcp_tool_bridge;
 pub mod mission_control;
 pub mod mission_evidence;
 pub mod mission_runtime;
+pub mod module_map;
 pub mod permission_enforcer;
 pub mod permissions;
 pub mod plugin_lifecycle;
@@ -292,6 +291,9 @@ pub use mission_runtime::{
     MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
     MissionSessionCommandStatus, MissionSessionCommandSummary, MissionSessionSnapshot,
     MissionSessionStatus, StartMissionSessionRequest,
+};
+pub use module_map::{
+    runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
 };
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,

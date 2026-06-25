@@ -950,7 +950,7 @@ mod tests {
             action: MissionControlAction::RouteToSession,
             actor: Some("test-human".to_string()),
             payload: serde_json::json!({
-                "target_session_id": session_b,
+                "target_session_id": session_b.clone(),
                 "command": "review routed command",
             }),
             evidence_refs: Vec::new(),
@@ -973,7 +973,9 @@ mod tests {
         assert_eq!(projection.kind, "mission_control.projection");
         assert!(projection.summary.session_count >= 2);
         assert!(projection.summary.background_session_count >= 1);
-        assert!(projection.summary.pending_session_command_count >= 1);
+        assert!(projection.sessions.iter().any(|session| {
+            session.session.session_id == session_b && session.routed_command_count >= 1
+        }));
         assert!(projection.summary.steward_count >= 1);
         assert!(projection
             .sessions

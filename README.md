@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.382`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.383`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -133,9 +133,10 @@ runtime
   tool_*                       工具调度、工具账本、工具记忆、工具执行计划
   collaboration_template       多 agent 协作模板和匹配
   context_* / memory bridge    context packet、memory recall、skill memory
+  module_map                   模块归属、生命周期 owner 与架构验收合同
 ```
 
-当前实现已经把“多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复”这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。
+当前实现已经把“多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复”这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。`runtime::module_map` 进一步把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 
 ### 3.3 Fact 层
 
@@ -602,8 +603,9 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Steward Scheduler 已具备 tick、ledger、profile、approval action、evidence 记录等托管推进基础。
 - Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
-- Harness Eval 已具备 quick/full/deep 三层验证报告，最新计划目录中已有 quick/full/deep 通过记录。
-- 版本标签：`v0.9.382`。
+- Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
+- Harness Eval 已具备 quick/full/deep 三层验证报告，并在 quick/full/deep 公共 deterministic loop 中验证 runtime capability domains 覆盖情况。
+- 版本标签：`v0.9.383`。
 
 ### 11.2 是否达到当前阶段目标
 
@@ -611,7 +613,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 
 更具体地说：
 
-- 对“Runtime 是 AI Harness 核心”的目标：基本达成。Mission、session、team、agent、steward、approval、event、recovery 都已回到 runtime。
+- 对“Runtime 是 AI Harness 核心”的目标：阶段性达成。Mission、session、team、agent、steward、approval、event、recovery 都已回到 runtime，并由 `runtime::module_map` 形成可测试的模块归属和生命周期 owner 合同。
 - 对“Gateway 干净，只做后台入口和编排”的目标：阶段性达成。旧 LiveCli/run_prompt/REPL prompt loop 已删除，热 runtime 承载体已迁到 `GatewayRuntimeEntry`，routes/services 的热 runtime 操作已收敛到 `RuntimeService`。
 - 对“surface 与 runtime 解耦”的目标：已达成核心边界。TUI/WebUI/channel 都不应直接进入 runtime，当前 runtime 没有依赖 channel/surface。
 - 对“tools 只是 AI 的手脚”的目标：当前阶段已达成核心边界。`tools` 不再依赖 runtime/provider，后续重点是继续提高工具合同、审计、checkpoint、mutation preview 的能力质量，而不是再承担 harness 生命周期。
@@ -624,7 +626,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 必须继续处理的架构缺口：
 
 - Cross-plane 风险和数据分类合同已经上移到 `harness-contract::policy`，后续仍需把更多跨入口治理合同继续从 connector 中剥离，避免 connector 变成治理语义大桶。
-- Runtime 内部模块应进一步结构化。当前 `lib.rs` 暴露面过宽，后续应按 `mission/`、`agent/`、`team/`、`steward/`、`recovery/`、`tooling/`、`context/` 分组，而不是持续平铺。
+- Runtime 内部已经具备代码级模块归属表和架构测试，后续如继续做物理目录迁移，必须保持 `runtime_module_architecture` 测试通过，避免再出现未归属公开模块。
 - Gateway 聚合依赖还包括 provider crate，这是当前服务测试、模型配置和 runtime factory 装载链路的现实结果；生产代码必须继续维持“不直接执行 provider turn”的架构门禁。
 - Recovery 目前更像状态恢复和事件补偿，不是完整的 provider turn 续跑系统。真实 kill/restart、进程中断、provider stream 中断、agent 半完成任务恢复还需要场景化强化。
 - Steward 目前具备 tick 和 ledger，但长期托管执行还需要后台循环、预算、策略退避、审批超时、失败降级和汇报生成的完整服务化。
