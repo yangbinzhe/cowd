@@ -6,127 +6,243 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+#[path = "infrastructure/cowd_dirs.rs"]
 pub mod cowd_dirs;
 pub use cowd_dirs::expand_tilde;
+#[path = "infrastructure/bash.rs"]
 mod bash;
+#[path = "infrastructure/bash_validation.rs"]
 pub mod bash_validation;
+#[path = "infrastructure/bootstrap.rs"]
 mod bootstrap;
+#[path = "session/branch_lock.rs"]
 pub mod branch_lock;
+#[path = "infrastructure/capability.rs"]
 pub mod capability;
+#[path = "conversation/compact.rs"]
 mod compact;
+#[path = "infrastructure/config.rs"]
 mod config;
+#[path = "infrastructure/config_validate.rs"]
 pub mod config_validate;
+#[path = "infrastructure/control_plane.rs"]
 pub mod control_plane;
+#[path = "conversation/conversation.rs"]
 mod conversation;
+#[path = "reality_bridge/doc_ingestion.rs"]
 pub mod doc_ingestion;
+#[path = "infrastructure/error.rs"]
 pub mod error;
+#[path = "tooling/file_ops.rs"]
 mod file_ops;
+#[path = "policy/gates.rs"]
 pub mod gates;
+#[path = "infrastructure/git_context.rs"]
 mod git_context;
+#[path = "infrastructure/graph_contract.rs"]
 pub mod graph_contract;
+#[path = "policy/green_contract.rs"]
 pub mod green_contract;
+#[path = "infrastructure/wave.rs"]
 pub mod wave;
 pub use green_contract::GreenLevel;
+#[path = "approval/global_approval_queue.rs"]
 pub mod global_approval_queue;
+#[path = "infrastructure/hooks.rs"]
 mod hooks;
+#[path = "infrastructure/json.rs"]
 mod json;
 pub use json::JsonValue;
+#[path = "context/context_profiler.rs"]
 pub mod context_profiler;
+#[path = "context/context_runtime.rs"]
 pub mod context_runtime;
+#[path = "infrastructure/effect.rs"]
 pub mod effect;
+#[path = "infrastructure/execution_outcome.rs"]
 pub mod execution_outcome;
+#[path = "infrastructure/lane_events.rs"]
 mod lane_events;
+#[path = "infrastructure/lifecycle_hooks.rs"]
 pub mod lifecycle_hooks;
+#[path = "infrastructure/lsp_client.rs"]
 pub mod lsp_client;
+#[path = "infrastructure/mcp.rs"]
 mod mcp;
+#[path = "infrastructure/mcp_client.rs"]
 mod mcp_client;
+#[path = "infrastructure/mcp_lifecycle_hardened.rs"]
 pub mod mcp_lifecycle_hardened;
+#[path = "infrastructure/mcp_server.rs"]
 pub mod mcp_server;
+#[path = "infrastructure/mcp_stdio.rs"]
 mod mcp_stdio;
+#[path = "infrastructure/mcp_tool_bridge.rs"]
 pub mod mcp_tool_bridge;
+#[path = "mission/mission_control.rs"]
 pub mod mission_control;
+#[path = "mission/mission_evidence.rs"]
 pub mod mission_evidence;
+#[path = "mission/mission_runtime.rs"]
 pub mod mission_runtime;
 pub mod module_map;
+#[path = "policy/permission_enforcer.rs"]
 pub mod permission_enforcer;
+#[path = "policy/permissions.rs"]
 pub mod permissions;
+#[path = "infrastructure/plugin_lifecycle.rs"]
 pub mod plugin_lifecycle;
+#[path = "policy/policy_engine.rs"]
 mod policy_engine;
+#[path = "conversation/prompt.rs"]
 mod prompt;
+#[path = "provider/provider_pool.rs"]
 pub mod provider_pool;
+#[path = "recovery/recovery.rs"]
 pub mod recovery;
+#[path = "recovery/recovery_recipes.rs"]
 pub mod recovery_recipes;
+#[path = "infrastructure/remote.rs"]
 mod remote;
+#[path = "infrastructure/runtime_control.rs"]
 pub mod runtime_control;
+#[path = "infrastructure/sandbox.rs"]
 pub mod sandbox;
+#[path = "session/session.rs"]
 mod session;
 pub use session::workspace_sessions_dir;
+#[path = "agent/agent.rs"]
 pub mod agent;
+#[path = "agent/agent_backend.rs"]
 pub mod agent_backend;
+#[path = "agent/agent_collaboration.rs"]
 pub mod agent_collaboration;
+#[path = "agent/agent_discussion.rs"]
 pub mod agent_discussion;
+#[path = "agent/agent_event_bus.rs"]
 pub mod agent_event_bus;
+#[path = "agent/agent_kernel.rs"]
 pub mod agent_kernel;
+#[path = "agent/agent_lifecycle.rs"]
 pub mod agent_lifecycle;
+#[path = "agent/agent_mailbox.rs"]
 pub mod agent_mailbox;
+#[path = "agent/agent_protocol.rs"]
 pub mod agent_protocol;
+#[path = "agent/agent_workgraph.rs"]
 pub mod agent_workgraph;
+#[path = "approval/approval_gate.rs"]
 pub mod approval_gate;
+#[path = "policy/autonomy_profile.rs"]
 pub mod autonomy_profile;
+#[path = "session/checkpoint.rs"]
 pub mod checkpoint;
+#[path = "agent/collaboration_template.rs"]
 pub mod collaboration_template;
+#[path = "context/context_fanout.rs"]
 pub mod context_fanout;
+#[path = "infrastructure/cowd_event.rs"]
 pub mod cowd_event;
+#[path = "policy/cross_plane_policy.rs"]
 pub mod cross_plane_policy;
+#[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
+#[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
+#[path = "agent/intent_planner.rs"]
 pub mod intent_planner;
+#[path = "agent/joint_problem_solving.rs"]
 pub mod joint_problem_solving;
+#[path = "infrastructure/lane_completion.rs"]
 pub mod lane_completion;
+#[path = "infrastructure/mutation_plan.rs"]
 pub mod mutation_plan;
+#[path = "agent/pairing.rs"]
 pub mod pairing;
+#[path = "infrastructure/profile.rs"]
 pub mod profile;
+#[path = "infrastructure/projection.rs"]
 pub mod projection;
+#[path = "provider/provider_registry.rs"]
 pub mod provider_registry;
+#[path = "provider/provider_runtime_client.rs"]
 pub mod provider_runtime_client;
+#[path = "infrastructure/quality_gate.rs"]
 pub mod quality_gate;
+#[path = "infrastructure/release_gate.rs"]
 pub mod release_gate;
+#[path = "recovery/runtime_event_replay.rs"]
 pub mod runtime_event_replay;
+#[path = "recovery/runtime_event_store.rs"]
 pub mod runtime_event_store;
+#[path = "mission/runtime_harness.rs"]
 pub mod runtime_harness;
+#[path = "session/session_execution.rs"]
 pub mod session_execution;
+#[path = "session/session_lifecycle.rs"]
 pub mod session_lifecycle;
+#[path = "session/session_relation_graph.rs"]
 pub mod session_relation_graph;
+#[path = "reality_bridge/skill_activation.rs"]
 pub mod skill_activation;
+#[path = "reality_bridge/skill_dependency.rs"]
 pub mod skill_dependency;
+#[path = "reality_bridge/skill_memory.rs"]
 pub mod skill_memory;
+#[path = "recovery/source_self_audit.rs"]
 pub mod source_self_audit;
+#[path = "conversation/sse.rs"]
 mod sse;
+#[path = "infrastructure/stale_base.rs"]
 pub mod stale_base;
+#[path = "infrastructure/stale_branch.rs"]
 pub mod stale_branch;
+#[path = "steward/steward_agent.rs"]
 pub mod steward_agent;
+#[path = "steward/steward_runtime.rs"]
 pub mod steward_runtime;
+#[path = "steward/steward_scheduler.rs"]
 pub mod steward_scheduler;
 pub mod structured_data;
+#[path = "agent/subagent_turn.rs"]
 pub mod subagent_turn;
+#[path = "conversation/summary_compression.rs"]
 pub mod summary_compression;
+#[path = "infrastructure/surface_contract.rs"]
 pub mod surface_contract;
+#[path = "mission/task.rs"]
 pub mod task;
+#[path = "mission/task_packet.rs"]
 pub mod task_packet;
+#[path = "mission/task_registry.rs"]
 pub mod task_registry;
+#[path = "team/team_cron_registry.rs"]
 pub mod team_cron_registry;
+#[path = "team/team_discovery.rs"]
 pub mod team_discovery;
+#[path = "team/team_execution.rs"]
 pub mod team_execution;
+#[path = "team/team_runtime.rs"]
 pub mod team_runtime;
+#[path = "tooling/tool_cache.rs"]
 pub mod tool_cache;
+#[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
+#[path = "tooling/tool_execution_plan.rs"]
 pub mod tool_execution_plan;
+#[path = "tooling/tool_invocation.rs"]
 pub mod tool_invocation;
+#[path = "tooling/tool_ledger.rs"]
 pub mod tool_ledger;
+#[path = "tooling/tool_memory.rs"]
 pub mod tool_memory;
+#[path = "tooling/tool_orchestrator.rs"]
 pub mod tool_orchestrator;
+#[path = "policy/trust_resolver.rs"]
 pub mod trust_resolver;
+#[path = "provider/usage.rs"]
 mod usage;
+#[path = "infrastructure/worker_boot.rs"]
 pub mod worker_boot;
 
 pub use agent::{
@@ -430,6 +546,7 @@ pub use worker_boot::{
     WorkerRegistry, WorkerStatus, WorkerTaskReceipt, WorkerTrustResolution,
 };
 
+#[path = "conversation/cached_prompt.rs"]
 pub mod cached_prompt;
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use runtime::{runtime_module_map, RuntimeDomain};
 
@@ -108,6 +108,91 @@ fn runtime_root_public_modules_are_classified_by_domain() {
 }
 
 #[test]
+fn runtime_source_files_are_grouped_by_architecture_domain() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = manifest_dir.join("src");
+    let root_files = fs::read_dir(&src_dir)
+        .expect("read runtime src")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            path.file_name()
+                .expect("source file name")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        root_files,
+        ["lib.rs", "module_map.rs"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+        "runtime root source files must stay limited to the crate entry and module map"
+    );
+
+    let expected_dirs = [
+        "agent",
+        "approval",
+        "context",
+        "conversation",
+        "infrastructure",
+        "mission",
+        "policy",
+        "provider",
+        "reality_bridge",
+        "recovery",
+        "session",
+        "steward",
+        "team",
+        "tooling",
+    ];
+    for dir in expected_dirs {
+        assert!(
+            src_dir.join(dir).is_dir(),
+            "runtime architecture directory `{dir}` must exist"
+        );
+    }
+}
+
+#[test]
+fn runtime_module_map_modules_have_physical_domain_paths() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs = fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read runtime lib.rs");
+    let path_by_module = parse_path_attrs(&lib_rs);
+    let allowed_root_modules = ["module_map", "structured_data"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+
+    let missing_paths = runtime_module_map()
+        .into_iter()
+        .filter(|descriptor| !allowed_root_modules.contains(descriptor.module))
+        .filter(|descriptor| !path_by_module.contains_key(descriptor.module))
+        .map(|descriptor| descriptor.module.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing_paths.is_empty(),
+        "runtime module map entries must have explicit physical paths: {missing_paths:#?}"
+    );
+}
+
+#[test]
+fn obsolete_telemetry_crate_is_not_present() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crates_dir = manifest_dir
+        .parent()
+        .expect("runtime crate has crates parent directory");
+    assert!(
+        !crates_dir.join("telemetry").exists(),
+        "telemetry must remain owned by model-protocol; obsolete crates/telemetry must not return"
+    );
+}
+
+#[test]
 fn runtime_does_not_depend_on_surface_or_connector_contracts() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Cargo.toml");
@@ -119,4 +204,27 @@ fn runtime_does_not_depend_on_surface_or_connector_contracts() {
             "runtime must not depend on {forbidden}"
         );
     }
+}
+
+fn parse_path_attrs(lib_rs: &str) -> BTreeMap<String, String> {
+    let mut path_by_module = BTreeMap::new();
+    let mut pending_path = None::<String>;
+    for line in lib_rs.lines() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed
+            .strip_prefix("#[path = \"")
+            .and_then(|rest| rest.strip_suffix("\"]"))
+        {
+            pending_path = Some(path.to_string());
+            continue;
+        }
+        let module = trimmed
+            .strip_prefix("pub mod ")
+            .or_else(|| trimmed.strip_prefix("mod "))
+            .and_then(|rest| rest.trim_end_matches(';').split_whitespace().next());
+        if let (Some(module), Some(path)) = (module, pending_path.take()) {
+            path_by_module.insert(module.to_string(), path);
+        }
+    }
+    path_by_module
 }

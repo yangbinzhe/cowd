@@ -371,8 +371,10 @@ fn connector_is_independent_external_resource_boundary() {
         "runtime must not republish connector as a compatibility module"
     );
 
-    let runtime_cross_plane =
-        production_part(&read_repo("crates/runtime/src/cross_plane_policy.rs")).to_string();
+    let runtime_cross_plane = production_part(&read_repo(
+        "crates/runtime/src/policy/cross_plane_policy.rs",
+    ))
+    .to_string();
     assert!(
         runtime_cross_plane
             .contains("use harness_contract::policy::{CrossPlaneRisk, DataClassification};"),
@@ -555,7 +557,7 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
             .contains("fact-kernel = { path = \"../fact-kernel\" }"),
         "memory must depend on fact-kernel for non-structured fact semantics"
     );
-    let memory_types = production_part(&read_repo("crates/memory/src/types.rs")).to_string();
+    let memory_types = production_part(&read_repo("crates/memory/src/ops/types.rs")).to_string();
     for required in [
         "to_fact_memory_candidate",
         "to_fact_record",
@@ -596,7 +598,7 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
 #[test]
 fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     let runtime_approval =
-        production_part(&read_repo("crates/runtime/src/approval_gate.rs")).to_string();
+        production_part(&read_repo("crates/runtime/src/approval/approval_gate.rs")).to_string();
     assert!(
         runtime_approval.contains("use harness_contract::policy::{"),
         "runtime approval gate must consume harness-contract policy contracts"
@@ -895,7 +897,7 @@ fn usage_contracts_are_owned_by_model_protocol_boundary() {
         );
     }
 
-    let runtime_usage = read_repo("crates/runtime/src/usage.rs");
+    let runtime_usage = read_repo("crates/runtime/src/provider/usage.rs");
     assert!(
         runtime_usage.contains("pub struct UsageTracker"),
         "runtime keeps session-derived usage tracking"
@@ -941,7 +943,7 @@ fn model_registry_is_owned_by_model_protocol_boundary() {
         "runtime must not retain a model_registry compatibility module"
     );
 
-    let runtime_usage = read_repo("crates/runtime/src/usage.rs");
+    let runtime_usage = read_repo("crates/runtime/src/provider/usage.rs");
     assert!(
         runtime_usage.contains("model_protocol::model_registry::pricing_for_model(model)"),
         "runtime pricing lookup must delegate to model-protocol model registry"
@@ -1438,7 +1440,7 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
 #[test]
 fn runtime_source_self_audit_is_exposed_through_gateway_api() {
     let runtime_lib = read_repo("crates/runtime/src/lib.rs");
-    let runtime_audit = read_repo("crates/runtime/src/source_self_audit.rs");
+    let runtime_audit = read_repo("crates/runtime/src/recovery/source_self_audit.rs");
     let runtime_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/runtime_routes.rs",
     ))

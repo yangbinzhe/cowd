@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.383`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.384`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -605,7 +605,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 - Harness Eval 已具备 quick/full/deep 三层验证报告，并在 quick/full/deep 公共 deterministic loop 中验证 runtime capability domains 覆盖情况。
-- 版本标签：`v0.9.383`。
+- 版本标签：`v0.9.384`。
 
 ### 11.2 是否达到当前阶段目标
 

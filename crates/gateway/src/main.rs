@@ -5540,9 +5540,12 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
-        let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
-            .expect_err("tool should be rejected");
-        assert!(error.contains("unsupported tool in --allowedTools: teleport"));
+        let error = parse_args(&[
+            "--allowedTools".to_string(),
+            "definitely_not_a_tool".to_string(),
+        ])
+        .expect_err("tool should be rejected");
+        assert!(error.contains("unsupported tool in --allowedTools: definitely_not_a_tool"));
     }
 
     #[test]
