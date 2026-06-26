@@ -455,11 +455,8 @@ impl RuntimeService {
         };
 
         let mut runtime_guard = runtime_entry.lock().await;
-        let result = runtime_guard.compact(runtime::CompactionConfig::default());
-        if result.removed_message_count > 0 {
-            *runtime_guard.session_mut() = result.compacted_session.clone();
-        }
-        let session_snapshot = runtime_guard.session().clone();
+        let (result, session_snapshot) =
+            runtime_guard.compact_active_session(runtime::CompactionConfig::default());
         drop(runtime_guard);
 
         self.sync_session_snapshot(session_id, &session_snapshot)
@@ -479,7 +476,7 @@ impl RuntimeService {
     ) -> Option<SessionStatsSnapshot> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
-        let session = runtime_guard.session();
+        let session = runtime_guard.active_session_stats_session();
         let messages = &session.messages;
 
         let user_count = messages
@@ -650,8 +647,7 @@ impl RuntimeService {
             return true;
         };
         let mut runtime_guard = runtime_entry.lock().await;
-        let mut session = runtime_guard.session_mut_async().await;
-        session.model = Some(model.to_string());
+        runtime_guard.update_session_model(model).await;
         true
     }
 

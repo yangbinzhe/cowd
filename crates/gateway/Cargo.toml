@@ -14,7 +14,6 @@ path = "src/main.rs"
 harness-contract = { path = "../harness-contract" }
 fact-kernel = { path = "../fact-kernel" }
 model-protocol = { path = "../model-protocol" }
-provider = { path = "../provider" }
 storage = { path = "../storage" }
 surface = { path = "../surface" }
 approval = { path = "../approval" }
@@ -57,6 +56,7 @@ unsafe_code = "allow"
 
 [dev-dependencies]
 async-trait = "0.1"
+provider = { path = "../provider" }
 serde_json.workspace = true
 serial_test = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }

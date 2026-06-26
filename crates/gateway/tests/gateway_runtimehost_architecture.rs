@@ -1504,21 +1504,34 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
         );
     }
 
-    let runtime_factory = read_repo("crates/gateway/src/runtime/runtime_factory.rs");
+    let runtime_factory =
+        production_part(&read_repo("crates/gateway/src/runtime/runtime_factory.rs")).to_string();
     assert!(
-        runtime_factory.contains("pub(crate) fn build_runtime(")
-            && runtime_factory.contains("pub(crate) fn build_runtime_with_session_store(")
-            && runtime_factory.contains("runtime::ProviderRuntimeClient::new")
-            && runtime_factory.contains("GatewayToolExecutor::new"),
-        "runtime_factory must own GatewayRuntimeEntry assembly through runtime provider/tool hosts"
+        runtime_factory.contains("pub(crate) fn create_runtime_entry(")
+            && runtime_factory.contains("pub(crate) fn create_runtime_entry_with_session_store(")
+            && runtime_factory.contains("runtime::StandardRuntimeHost::new")
+            && runtime_factory.contains("GatewayToolExecutor::new")
+            && !runtime_factory.contains("ProviderRuntimeClient")
+            && !runtime_factory.contains("ConversationRuntime::new"),
+        "runtime_factory must delegate provider/conversation assembly to runtime::StandardRuntimeHost"
+    );
+
+    let runtime_entry =
+        production_part(&read_repo("crates/gateway/src/runtime/runtime_entry.rs")).to_string();
+    assert!(
+        runtime_entry.contains("runtime::StandardRuntimeHost<GatewayToolExecutor>")
+            && !runtime_entry.contains("ProviderRuntimeClient")
+            && !runtime_entry.contains("ConversationRuntime<"),
+        "GatewayRuntimeEntry must keep provider/conversation concrete types hidden behind Runtime host"
     );
 
     let session_routes = read_repo("crates/gateway/src/api_routes/session_routes.rs");
     assert!(
-        session_routes.contains("crate::runtime_factory::build_runtime(")
-            && session_routes.contains("crate::runtime_factory::build_runtime_with_session_store(")
-            && !session_routes.contains("crate::build_runtime(")
-            && !session_routes.contains("crate::build_runtime_with_session_store("),
+        session_routes.contains("crate::runtime_factory::create_runtime_entry(")
+            && session_routes
+                .contains("crate::runtime_factory::create_runtime_entry_with_session_store(")
+            && !session_routes.contains("crate::create_runtime_entry(")
+            && !session_routes.contains("crate::create_runtime_entry_with_session_store("),
         "session routes must call runtime_factory instead of gateway root factories"
     );
 }

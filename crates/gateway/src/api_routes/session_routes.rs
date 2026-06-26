@@ -369,7 +369,7 @@ async fn create_session(
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
     let runtime = if let Some(store) = state.services.session.unified_store() {
-        crate::runtime_factory::build_runtime_with_session_store(
+        crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
             session,
             &session_id,
@@ -383,7 +383,7 @@ async fn create_session(
             None,
         )
     } else {
-        crate::runtime_factory::build_runtime(
+        crate::runtime_factory::create_runtime_entry(
             session,
             &session_id,
             model.clone(),
@@ -471,7 +471,7 @@ async fn ensure_session_handler(
             .filter(|model| !model.trim().is_empty())
             .unwrap_or_else(|| default_session_model(&state));
         let runtime = if let Some(store) = state.services.session.unified_store() {
-            crate::runtime_factory::build_runtime_with_session_store(
+            crate::runtime_factory::create_runtime_entry_with_session_store(
                 store.clone(),
                 session,
                 &id,
@@ -485,7 +485,7 @@ async fn ensure_session_handler(
                 None,
             )
         } else {
-            crate::runtime_factory::build_runtime(
+            crate::runtime_factory::create_runtime_entry(
                 session,
                 &id,
                 model.clone(),

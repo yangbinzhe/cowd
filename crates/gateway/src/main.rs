@@ -92,7 +92,9 @@ use std::time::Duration;
 use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 use model_protocol::usage::TokenUsage;
 #[cfg(test)]
-use provider::{
+use provider as provider_crate;
+#[cfg(test)]
+use provider_crate::{
     resolve_startup_auth_source, AuthSource, InputContentBlock, InputMessage, MessageResponse,
     OutputContentBlock, ProviderClient as ApiProviderClient, ToolResultContentBlock,
 };
@@ -110,8 +112,8 @@ use runtime::PromptCacheEvent;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
     resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy, ResolvedPermissionMode,
-    ResumeContextPacket, ResumeContextSource, Session, UsageTracker,
+    MessageRole, PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
+    ResumeContextSource, Session, UsageTracker,
 };
 #[cfg(test)]
 use runtime::{AssistantEvent, RuntimeError};
@@ -183,6 +185,7 @@ use entry::workspace_entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::workspace_entry::{render_diff_report, SetupItem, SetupSnapshot};
+#[cfg(test)]
 use gateway_tool_executor::GatewayToolExecutor;
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -3411,7 +3414,7 @@ pub(crate) fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> Re
 }
 
 pub(crate) fn inject_auto_resume_context(
-    runtime: &ConversationRuntime<runtime::ProviderRuntimeClient, GatewayToolExecutor>,
+    runtime: &GatewayRuntimeEntry,
     session_packet: Option<ResumeContextPacket>,
     session_id: &str,
 ) -> bool {
@@ -3594,12 +3597,12 @@ fn workspace_hot_symbols(
 }
 
 #[cfg(test)]
-fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, provider::ApiError> {
+fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, provider_crate::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
 #[cfg(test)]
-fn format_user_visible_api_error(session_id: &str, error: &provider::ApiError) -> String {
+fn format_user_visible_api_error(session_id: &str, error: &provider_crate::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
@@ -3619,11 +3622,11 @@ fn format_user_visible_api_error(session_id: &str, error: &provider::ApiError) -
 }
 
 #[cfg(test)]
-fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> String {
+fn format_context_window_error(session_id: &str, error: &provider_crate::ApiError) -> String {
     let mut lines: Vec<String> = vec!["context_window_blocked".to_string(), String::new()];
 
     match error {
-        provider::ApiError::ContextWindowExceeded {
+        provider_crate::ApiError::ContextWindowExceeded {
             model,
             estimated_input_tokens,
             requested_output_tokens: _,
@@ -3652,7 +3655,7 @@ fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> 
             ));
             lines.push(format!("{:<17}rerun", "Retry"));
         }
-        provider::ApiError::Api {
+        provider_crate::ApiError::Api {
             message,
             request_id,
             ..
@@ -3667,7 +3670,7 @@ fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> 
             lines.push(format!("{:<17}/compact", "Compact"));
             lines.push(format!("{:<17}/clear --confirm", "Fresh session"));
         }
-        provider::ApiError::RetriesExhausted {
+        provider_crate::ApiError::RetriesExhausted {
             attempts,
             last_error,
         } => {
@@ -3677,7 +3680,7 @@ fn format_context_window_error(session_id: &str, error: &provider::ApiError) -> 
             if let Some(rid) = last_error.request_id() {
                 lines.push(format!("{:<17}{rid}", "Trace"));
             }
-            if let provider::ApiError::Api {
+            if let provider_crate::ApiError::Api {
                 message: Some(ref msg),
                 ..
             } = **last_error
@@ -4479,7 +4482,7 @@ fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<Assista
 
 #[cfg(test)]
 fn prompt_cache_record_to_runtime_event(
-    record: provider::PromptCacheRecord,
+    record: provider_crate::PromptCacheRecord,
 ) -> Option<PromptCacheEvent> {
     let cache_break = record.cache_break?;
     Some(PromptCacheEvent {
@@ -4601,8 +4604,9 @@ mod tests {
         SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
         STUB_COMMANDS,
     };
+    use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
-    use crate::runtime_factory::build_runtime_with_bootstrap_state;
+    use crate::runtime_factory::create_runtime_entry_with_bootstrap_state;
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
@@ -4613,7 +4617,6 @@ mod tests {
         PluginManager as Pm, PluginManagerConfig as Pmc, PluginTool, PluginToolDefinition,
         PluginToolPermission,
     };
-    use provider::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use runtime::{
         AssistantEvent, ConfigLoader, ContentBlock, ContextProfile, ConversationMessage,
         GatewayPlatformConfig, JsonValue, MessageRole, PermissionMode, Session, ToolExecutor,
@@ -8204,7 +8207,7 @@ UU conflicted.rs",
 
     #[ignore]
     #[test]
-    fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+    fn create_runtime_entry_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that
         // set/remove ANTHROPIC_API_KEY do not race with this test.
         let _guard = env_lock();
@@ -8232,7 +8235,7 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("plugin state should load");
-        let mut runtime = build_runtime_with_bootstrap_state(
+        let mut runtime = create_runtime_entry_with_bootstrap_state(
             None,
             Session::new(),
             "runtime-plugin-lifecycle",

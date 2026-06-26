@@ -254,9 +254,9 @@ pub use agent_backend::{
     AgentExecutionCommandReceipt, AgentExecutionEventEnvelope, AgentProcessJsonlSpec,
 };
 pub use agent_collaboration::{
-    AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOps, CollaborationOrchestrator,
-    CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, MemoryPulseCandidate,
-    MemoryPulseKind, SharedBoardEntry, SubTask,
+    AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationContextResult, CollaborationOps,
+    CollaborationOrchestrator, CollaborationReviewPacket, CollaborationScorecard,
+    CollaborationTask, MemoryPulseCandidate, MemoryPulseKind, SharedBoardEntry, SubTask,
 };
 pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
@@ -361,6 +361,9 @@ pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
+#[path = "conversation/host.rs"]
+pub mod host;
+pub use host::{StandardRuntimeHost, StandardRuntimeHostConfig};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

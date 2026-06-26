@@ -77,6 +77,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
     };
     vec![
         RuntimeModuleDescriptor::public("conversation", Conversation, "runtime", true),
+        RuntimeModuleDescriptor::public("host", Conversation, "runtime", true),
         RuntimeModuleDescriptor::public("cowd_event", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("runtime_control", Infrastructure, "runtime", true),
         RuntimeModuleDescriptor::public("runtime_harness", Infrastructure, "runtime", true),
