@@ -723,10 +723,35 @@ impl CodeIndexer {
         }
     }
 
-    fn extract_rust_doc(&self, _node: tree_sitter::Node<'_>, _source: &str) -> Option<String> {
-        // TODO: Walk preceding sibling nodes to find doc comments (/// or /** */)
-        // For now, return None — doc extraction is a future enhancement.
-        None
+    fn extract_rust_doc(&self, node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+        let mut docs = Vec::new();
+        let mut previous = node.prev_sibling();
+        let mut expected_row = node.start_position().row;
+
+        while let Some(comment) = previous {
+            if !matches!(comment.kind(), "line_comment" | "block_comment") {
+                break;
+            }
+
+            let end_row = comment.end_position().row;
+            if end_row + 1 < expected_row {
+                break;
+            }
+
+            let raw = comment.utf8_text(source.as_bytes()).ok()?.trim();
+            let Some(cleaned) = clean_rust_doc_comment(raw) else {
+                break;
+            };
+            docs.push(cleaned);
+            expected_row = comment.start_position().row;
+            previous = comment.prev_sibling();
+        }
+
+        if docs.is_empty() {
+            return None;
+        }
+        docs.reverse();
+        Some(docs.join("\n").trim().to_string()).filter(|doc| !doc.is_empty())
     }
 
     fn extract_rust_method_call(
@@ -1300,6 +1325,30 @@ impl CodeIndexer {
     }
 }
 
+#[cfg(feature = "code-index")]
+fn clean_rust_doc_comment(raw: &str) -> Option<String> {
+    if let Some(line) = raw.strip_prefix("///").or_else(|| raw.strip_prefix("//!")) {
+        return Some(line.trim().to_string());
+    }
+
+    let block = raw
+        .strip_prefix("/**")
+        .and_then(|text| text.strip_suffix("*/"))
+        .or_else(|| {
+            raw.strip_prefix("/*!")
+                .and_then(|text| text.strip_suffix("*/"))
+        })?;
+
+    let cleaned = block
+        .lines()
+        .map(|line| line.trim().trim_start_matches('*').trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    Some(cleaned)
+}
+
 #[cfg(not(feature = "code-index"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CodeIndexer;
@@ -1367,6 +1416,37 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
+    }
+
+    #[test]
+    fn test_rust_doc_comments_attached_to_symbols() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_temp_file(
+            &dir,
+            "src/lib.rs",
+            r#"
+/// First line.
+/// Second line.
+pub fn documented() {}
+
+// Ordinary comment should not be attached.
+pub fn plain() {}
+"#,
+        );
+        let mut indexer = CodeIndexer::new(dir.path()).unwrap();
+        let (symbols, _) = indexer.index_file(&path).unwrap();
+
+        let documented = symbols
+            .iter()
+            .find(|symbol| symbol.name == "documented")
+            .unwrap();
+        assert_eq!(documented.doc.as_deref(), Some("First line.\nSecond line."));
+
+        let plain = symbols
+            .iter()
+            .find(|symbol| symbol.name == "plain")
+            .unwrap();
+        assert!(plain.doc.is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -4,6 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
+use memory::{temporal_graph::Triple, FactChecker};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentContent {
@@ -553,6 +557,7 @@ pub struct IngestionResult {
 pub struct DocumentIngestor {
     classifier: DocumentClassifier,
     conflict_strategy: ConflictStrategy,
+    conflict_checker: Mutex<FactChecker>,
 }
 
 impl DocumentIngestor {
@@ -561,6 +566,7 @@ impl DocumentIngestor {
         Self {
             classifier: DocumentClassifier::new(),
             conflict_strategy: ConflictStrategy::HighestConfidence,
+            conflict_checker: Mutex::new(FactChecker::new()),
         }
     }
 
@@ -595,10 +601,20 @@ impl DocumentIngestor {
     }
 
     /// Detect potential conflicts with existing documents.
-    fn detect_conflict(&self, _content: &DocumentContent) -> bool {
-        // This would query existing documents in the memory system
-        // For now, return false (no conflict detection implemented)
-        false
+    fn detect_conflict(&self, content: &DocumentContent) -> bool {
+        let triples = document_claims(content);
+        let Ok(mut checker) = self.conflict_checker.lock() else {
+            return false;
+        };
+
+        let mut has_conflict = false;
+        for triple in triples {
+            if checker.detect_conflict(&triple).is_some() {
+                has_conflict = true;
+            }
+            checker.register_triple(triple);
+        }
+        has_conflict
     }
 }
 
@@ -606,6 +622,91 @@ impl Default for DocumentIngestor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn document_claims(content: &DocumentContent) -> Vec<Triple> {
+    let subject = normalize_fact_part(&content.title);
+    let source_agent = content
+        .source
+        .clone()
+        .or_else(|| content.author.clone())
+        .unwrap_or_else(|| "document-ingestor".to_string());
+    let mut claims = content
+        .body
+        .lines()
+        .filter_map(parse_claim_line)
+        .map(|(predicate, object)| Triple {
+            id: stable_triple_id(&subject, &predicate, &object, &source_agent),
+            subject: subject.clone(),
+            predicate,
+            object,
+            valid_from: Some(chrono::Utc::now()),
+            valid_until: None,
+            confidence: 0.72,
+            source_memory_id: None,
+            source_file: content.source.clone(),
+            source_agent: Some(source_agent.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    if claims.is_empty() {
+        let predicate = "body_fingerprint".to_string();
+        let object = stable_hash(&normalize_fact_part(&content.body)).to_string();
+        claims.push(Triple {
+            id: stable_triple_id(&subject, &predicate, &object, &source_agent),
+            subject,
+            predicate,
+            object,
+            valid_from: Some(chrono::Utc::now()),
+            valid_until: None,
+            confidence: 0.6,
+            source_memory_id: None,
+            source_file: content.source.clone(),
+            source_agent: Some(source_agent),
+        });
+    }
+
+    claims
+}
+
+fn parse_claim_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line
+        .trim()
+        .trim_start_matches('-')
+        .trim_start_matches('*')
+        .trim();
+    let (key, value) = trimmed
+        .split_once(':')
+        .or_else(|| trimmed.split_once('='))?;
+    let predicate = normalize_fact_part(key);
+    let object = normalize_fact_part(value);
+    (!predicate.is_empty() && !object.is_empty()).then_some((predicate, object))
+}
+
+fn normalize_fact_part(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| ch == '`' || ch == '"' || ch == '\'')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn stable_triple_id(subject: &str, predicate: &str, object: &str, source_agent: &str) -> String {
+    format!(
+        "doc:{}:{}:{}:{}",
+        stable_hash(subject),
+        stable_hash(predicate),
+        stable_hash(object),
+        stable_hash(source_agent)
+    )
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -651,5 +752,25 @@ mod tests {
 
         let tags = classifier.generate_tags(text, DocumentCategory::Technical);
         assert!(tags.contains(&"technical_documentation".to_string()));
+    }
+
+    #[test]
+    fn test_document_ingestor_detects_fact_conflict() {
+        let ingestor = DocumentIngestor::new();
+        let mut first = create_test_doc("Release Policy", "status: draft\nowner: platform");
+        first.source = Some("agent-a".to_string());
+        let first_result = ingestor.ingest(&first);
+        assert!(!first_result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Potential conflict")));
+
+        let mut second = create_test_doc("Release Policy", "status: approved\nowner: platform");
+        second.source = Some("agent-b".to_string());
+        let second_result = ingestor.ingest(&second);
+        assert!(second_result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Potential conflict")));
     }
 }

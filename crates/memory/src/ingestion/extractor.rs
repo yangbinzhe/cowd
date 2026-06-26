@@ -57,6 +57,19 @@ use crate::{
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
+/// Live extraction source for polling mode.
+///
+/// The extractor owns only extraction policy. Runtime/session code supplies a
+/// source that exposes the current message window and the target memory store.
+pub trait MemoryExtractionSource: Send + Sync {
+    /// Return the latest message window that should be considered for memory
+    /// extraction.
+    fn latest_messages(&self) -> Vec<Message>;
+
+    /// Return the store that should receive extracted memory entries.
+    fn store(&self) -> Arc<dyn MemoryStore>;
+}
+
 // ---------------------------------------------------------------------------
 // Constants – preference-signal keywords (lower-case)
 // ---------------------------------------------------------------------------
@@ -155,6 +168,8 @@ pub struct MemoryExtractor {
     running: Arc<AtomicBool>,
     /// Optional LLM client for Pass 5 extraction enhancement.
     llm_client: Option<Arc<dyn LlmSummarizer>>,
+    /// Optional live source for polling mode.
+    source: Option<Arc<dyn MemoryExtractionSource>>,
 }
 
 impl MemoryExtractor {
@@ -169,6 +184,7 @@ impl MemoryExtractor {
             config,
             running: Arc::new(AtomicBool::new(false)),
             llm_client: None,
+            source: None,
         }
     }
 
@@ -176,6 +192,13 @@ impl MemoryExtractor {
     #[must_use]
     pub fn with_llm(mut self, llm: Arc<dyn LlmSummarizer>) -> Self {
         self.llm_client = Some(llm);
+        self
+    }
+
+    /// Attach a live source for [`Self::spawn`] polling mode.
+    #[must_use]
+    pub fn with_source(mut self, source: Arc<dyn MemoryExtractionSource>) -> Self {
+        self.source = Some(source);
         self
     }
 
@@ -367,6 +390,13 @@ impl MemoryExtractor {
     #[must_use]
     pub fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
+            if self.source.is_none() {
+                tracing::warn!(
+                    "memory extractor polling disabled: no MemoryExtractionSource configured"
+                );
+                return;
+            }
+
             let mut ticker = interval(Duration::from_secs(self.config.poll_interval_secs));
             loop {
                 ticker.tick().await;
@@ -381,16 +411,40 @@ impl MemoryExtractor {
     // Private – polling
     // -----------------------------------------------------------------------
 
-    /// Single extraction poll cycle (no-op placeholder for the polling path).
-    ///
-    /// In a fully integrated deployment this would obtain the current message
-    /// buffer from a shared state handle.  For now it is a no-op that the
-    /// polling `spawn` variant calls periodically.
+    /// Run one extraction cycle against the configured live source.
     async fn poll(&self) -> Result<()> {
-        // NOTE: The poll-based flow requires access to a shared message buffer
-        // and MemoryStore, both of which are not part of the extractor struct.
-        // Callers that need live polling should wire those in via a custom
-        // wrapper or use `spawn_background` per-turn instead.
+        let source = self.source.as_ref().ok_or_else(|| {
+            MemoryError::InvalidArgument(
+                "memory extractor polling requires MemoryExtractionSource".to_string(),
+            )
+        })?;
+
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::debug!("memory extractor poll skipped: another extraction is running");
+            return Ok(());
+        }
+        let _guard = RunningGuard(&self.running);
+
+        let messages = source.latest_messages();
+        if !Self::should_extract(&messages) {
+            return Ok(());
+        }
+
+        let entries = self.extract(&messages).await?;
+        let store = source.store();
+        for entry in entries {
+            if let Err(error) = store.insert(&entry).await {
+                tracing::warn!(
+                    title = %entry.title,
+                    error = %error,
+                    "memory extractor poll failed to persist entry"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -905,7 +959,9 @@ impl Drop for RunningGuard<'_> {
 mod tests {
     use super::*;
     use crate::config::ExtractorConfig;
+    use crate::store::sqlite::SqliteStore;
     use crate::types::{Message, MessageRole};
+    use std::sync::Mutex;
 
     fn default_extractor() -> MemoryExtractor {
         MemoryExtractor::new(ExtractorConfig {
@@ -936,6 +992,30 @@ mod tests {
                  the semicolon on line 42.",
             ),
         ]
+    }
+
+    struct TestExtractionSource {
+        messages: Mutex<Vec<Message>>,
+        store: Arc<dyn MemoryStore>,
+    }
+
+    impl TestExtractionSource {
+        fn new(messages: Vec<Message>, store: Arc<dyn MemoryStore>) -> Self {
+            Self {
+                messages: Mutex::new(messages),
+                store,
+            }
+        }
+    }
+
+    impl MemoryExtractionSource for TestExtractionSource {
+        fn latest_messages(&self) -> Vec<Message> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        fn store(&self) -> Arc<dyn MemoryStore> {
+            Arc::clone(&self.store)
+        }
     }
 
     #[test]
@@ -1017,5 +1097,32 @@ mod tests {
         let msgs = make_messages();
         let entries = ex.extract(&msgs).await.unwrap();
         assert!(entries.is_empty(), "all entries should be filtered out");
+    }
+
+    #[tokio::test]
+    async fn poll_persists_entries_from_live_source() {
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let source = Arc::new(TestExtractionSource::new(
+            make_messages(),
+            Arc::clone(&store),
+        ));
+        let extractor = default_extractor().with_source(source);
+
+        extractor.poll().await.unwrap();
+
+        let entries = store.list_all().await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.category == MemoryCategory::Decision),
+            "poll should persist extracted decision memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_requires_live_source() {
+        let extractor = default_extractor();
+        let error = extractor.poll().await.unwrap_err();
+        assert!(matches!(error, MemoryError::InvalidArgument(_)));
     }
 }

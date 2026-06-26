@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use tempfile::TempDir;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::legacy_jsonl::legacy_jsonl_session_import_enabled;
-use crate::types::{Decision, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus};
+use crate::types::{
+    Decision, DecisionStatus, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus,
+};
 
 /// Source of state for reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +264,21 @@ impl StateRebuilder {
         let session_state = self.rebuild_from_session_store().await;
         if let Some(session) = session_state {
             if state.session_id.is_none() {
-                state.session_id = Some(session.id);
+                state.session_id = Some(session.id.clone());
+            }
+            if let Some(summary) = session.context_summary {
+                state.context_summary = Some(
+                    StateItem::new(summary, StateSource::SessionStore, 0.82)
+                        .with_modified(session.updated_at),
+                );
+            }
+            for task in session.pending_tasks {
+                state
+                    .pending_tasks
+                    .push(StateItem::new(task, StateSource::SessionStore, 0.75));
+            }
+            for decision in session.decisions {
+                state.add_decision(decision, StateSource::SessionStore, 0.78);
             }
         }
 
@@ -477,9 +494,31 @@ impl StateRebuilder {
             return None;
         }
 
-        // For now, return a placeholder
-        // Full implementation would use rusqlite to query the session store
-        None
+        let conn = rusqlite::Connection::open_with_flags(
+            &store_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let latest = latest_session_entry(&conn)?;
+        let messages = recent_session_messages(&conn, &latest.id, 16);
+        let snapshot_summary = latest_snapshot_summary(&conn, &latest.id);
+        let message_summary = summarize_session_messages(&messages);
+        let context_summary = snapshot_summary.or(message_summary);
+        let pending_tasks = messages
+            .iter()
+            .flat_map(|message| extract_pending_tasks_from_text(&message.text))
+            .collect::<Vec<_>>();
+        let decisions = messages
+            .iter()
+            .flat_map(|message| extract_decisions_from_text(&message.text))
+            .collect::<Vec<_>>();
+
+        Some(SessionStoreEntry {
+            context_summary,
+            pending_tasks,
+            decisions,
+            ..latest
+        })
     }
 
     /// Quick rebuild - get essential state only.
@@ -520,10 +559,190 @@ struct HistoryRebuildState {
 #[derive(Debug)]
 struct SessionStoreEntry {
     id: String,
-    #[allow(dead_code)]
-    created_at: i64,
-    #[allow(dead_code)]
     updated_at: i64,
+    context_summary: Option<String>,
+    pending_tasks: Vec<String>,
+    decisions: Vec<Decision>,
+}
+
+#[derive(Debug)]
+struct SessionStoreMessage {
+    role: String,
+    text: String,
+    created_at_ms: i64,
+}
+
+fn latest_session_entry(conn: &rusqlite::Connection) -> Option<SessionStoreEntry> {
+    let modern = conn
+        .query_row(
+            "SELECT session_id, created_at_ms, updated_at_ms FROM sessions ORDER BY updated_at_ms DESC, created_at_ms DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(SessionStoreEntry {
+                    id: row.get(0)?,
+                    updated_at: row.get::<_, i64>(2)?,
+                    context_summary: None,
+                    pending_tasks: Vec::new(),
+                    decisions: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if modern.is_some() {
+        return modern;
+    }
+    conn.query_row(
+        "SELECT session_id, 0, 0 FROM sessions ORDER BY last_activity DESC, created_at DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(SessionStoreEntry {
+                id: row.get(0)?,
+                updated_at: row.get::<_, i64>(2)?,
+                context_summary: None,
+                pending_tasks: Vec::new(),
+                decisions: Vec::new(),
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn recent_session_messages(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    limit: usize,
+) -> Vec<SessionStoreMessage> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT role, content_json, created_at_ms FROM messages WHERE session_id = ?1 ORDER BY sequence DESC LIMIT ?2",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+        let content_json: String = row.get(1)?;
+        Ok(SessionStoreMessage {
+            role: row.get(0)?,
+            text: session_content_json_to_text(&content_json),
+            created_at_ms: row.get::<_, i64>(2).unwrap_or_default(),
+        })
+    }) else {
+        return Vec::new();
+    };
+    let mut messages = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    messages.reverse();
+    messages
+}
+
+fn latest_snapshot_summary(conn: &rusqlite::Connection, session_id: &str) -> Option<String> {
+    let payload = conn
+        .query_row(
+            "SELECT messages_json FROM session_snapshots WHERE session_id = ?1 ORDER BY event_idx DESC LIMIT 1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+    let messages = value.as_array()?;
+    let summary = messages
+        .iter()
+        .rev()
+        .take(6)
+        .filter_map(|message| {
+            message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| message.get("text").and_then(serde_json::Value::as_str))
+        })
+        .map(|text| text.chars().take(240).collect::<String>())
+        .collect::<Vec<_>>();
+    (!summary.is_empty()).then(|| summary.join("\n---\n"))
+}
+
+fn summarize_session_messages(messages: &[SessionStoreMessage]) -> Option<String> {
+    let parts = messages
+        .iter()
+        .rev()
+        .filter(|message| !message.text.trim().is_empty())
+        .take(8)
+        .map(|message| {
+            format!(
+                "{}@{}: {}",
+                message.role,
+                message.created_at_ms,
+                message.text.chars().take(220).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n---\n"))
+}
+
+fn session_content_json_to_text(content_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) else {
+        return content_json.to_string();
+    };
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    if let Some(array) = value.as_array() {
+        return array
+            .iter()
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| block.get("content").and_then(serde_json::Value::as_str))
+                    .or_else(|| block.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn extract_pending_tasks_from_text(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- [ ]") || trimmed.starts_with("[ ]") {
+                let title = trimmed
+                    .trim_start_matches("- [ ]")
+                    .trim_start_matches("[ ]")
+                    .trim();
+                (!title.is_empty()).then(|| title.chars().take(160).collect())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn extract_decisions_from_text(text: &str) -> Vec<Decision> {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("decision:")
+                || lower.contains("decided")
+                || lower.contains("决定")
+                || lower.contains("采用")
+        })
+        .enumerate()
+        .map(|(index, line)| Decision {
+            id: format!("session-store-decision-{index}"),
+            summary: line.trim().chars().take(160).collect(),
+            rationale: "Recovered from session store message text".to_string(),
+            status: DecisionStatus::Deferred,
+            made_at: chrono::Utc::now(),
+        })
+        .collect()
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -629,6 +848,81 @@ mod tests {
             .work_items
             .iter()
             .all(|item| item.source != StateSource::SessionHistory));
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_uses_session_store_context_tasks_and_decisions() {
+        let tmp = TempDir::new().unwrap();
+        let cowd_dir = tmp.path().join(".cowd");
+        fs::create_dir_all(&cowd_dir).unwrap();
+        let db_path = cowd_dir.join("sessions.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE messages (
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE session_snapshots (
+                session_id TEXT NOT NULL,
+                event_idx INTEGER NOT NULL,
+                messages_json TEXT NOT NULL
+            );
+            INSERT INTO sessions VALUES ('session-a', 10, 20);
+            INSERT INTO messages VALUES (
+                'session-a',
+                1,
+                'user',
+                '"- [ ] finish recovery\nDecision: use session store as recovery source"',
+                11
+            );
+            INSERT INTO session_snapshots VALUES (
+                'session-a',
+                1,
+                '[{"content":"snapshot summary"}]'
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let rebuilder = StateRebuilder::new(tmp.path());
+        let state = rebuilder
+            .rebuild(&RebuildOptions {
+                include_history: false,
+                include_handoff: false,
+                include_snapshots: false,
+                include_memory: Vec::new(),
+                ..RebuildOptions::default()
+            })
+            .await;
+
+        assert_eq!(state.session_id.as_deref(), Some("session-a"));
+        assert_eq!(
+            state
+                .context_summary
+                .as_ref()
+                .map(|summary| summary.data.as_str()),
+            Some("snapshot summary")
+        );
+        assert!(state
+            .pending_tasks
+            .iter()
+            .any(|item| item.source == StateSource::SessionStore
+                && item.data.contains("finish recovery")));
+        assert!(state
+            .decisions
+            .iter()
+            .any(|item| item.source == StateSource::SessionStore
+                && item.data.summary.contains("session store")));
     }
 
     #[tokio::test]
