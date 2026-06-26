@@ -1556,13 +1556,13 @@ mod tests {
                 "provider": "mock",
                 "account_id": "mock-docs",
                 "auth_mode": "none",
-                "enabled_bindings": ["service.mock.docs.read"],
+                "enabled_bindings": ["service.local.docs.read"],
                 "health": {"status": "ready"}
             }]
         }));
         snapshot.ingest_connector_capabilities(&serde_json::json!({
             "capabilities": [{
-                "capability_id": "service.mock.docs.read",
+                "capability_id": "service.local.docs.read",
                 "provider": "mock",
                 "plane": "service",
                 "risk": "low",
@@ -2041,8 +2041,8 @@ mod tests {
         }];
         app.gateway_task_count = Some(1);
         app.gateway_connector_resources = vec![ConnectorResourceSummary {
-            reference: "service://mock.docs/document/1".to_string(),
-            provider: "mock.docs".to_string(),
+            reference: "service://local.docs/document/1".to_string(),
+            provider: "local.docs".to_string(),
             resource_type: "document".to_string(),
             title: "Doc".to_string(),
             indexed_state: "indexed".to_string(),
@@ -2051,13 +2051,13 @@ mod tests {
         let mut store = RuntimeControlLocalStore::from_app(&app);
         store.apply_approval_response("approval-1");
         store.apply_task_status("task-1", "completed");
-        store.apply_connector_resource_state("service://mock.docs/document/1", "stale");
+        store.apply_connector_resource_state("service://local.docs/document/1", "stale");
         store.push_action_receipt(
             "failed",
             &"x".repeat(100),
             "daemon-control",
             "connector.resource.revalidate",
-            Some("service://mock.docs/document/1".to_string()),
+            Some("service://local.docs/document/1".to_string()),
         );
         store.apply_to_app(&mut app);
 

@@ -3973,14 +3973,15 @@ mod tests {
         let mut state = TuiState::new("test-model", "test-session");
         state.app.gateway_connector_resources =
             vec![crate::runtime_control_store::ConnectorResourceSummary {
-                reference: "service://mock.docs/document/tui-doc".to_string(),
-                provider: "mock.docs".to_string(),
+                reference: "service://local.docs/document/tui-doc".to_string(),
+                provider: "local.docs".to_string(),
                 resource_type: "document".to_string(),
                 title: "TUI Doc".to_string(),
                 indexed_state: "indexed".to_string(),
             }];
 
-        state.apply_local_connector_resource_state("service://mock.docs/document/tui-doc", "stale");
+        state
+            .apply_local_connector_resource_state("service://local.docs/document/tui-doc", "stale");
 
         assert_eq!(
             state.app.gateway_connector_resources[0].indexed_state,
@@ -5043,8 +5044,8 @@ mod tests {
             }];
         state.app.gateway_connector_resources =
             vec![crate::runtime_control_store::ConnectorResourceSummary {
-                reference: "service://mock.docs/document/1".to_string(),
-                provider: "mock.docs".to_string(),
+                reference: "service://local.docs/document/1".to_string(),
+                provider: "local.docs".to_string(),
                 resource_type: "document".to_string(),
                 title: "Bridge Doc".to_string(),
                 indexed_state: "indexed".to_string(),
@@ -5061,7 +5062,7 @@ mod tests {
             "Connector Plane",
             "available",
             "completed",
-            "mock.docs",
+            "local.docs",
             "indexed",
         ] {
             assert!(

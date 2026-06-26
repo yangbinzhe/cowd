@@ -2863,7 +2863,7 @@ mod tests {
                                 "metric_key": "material_shortage_risk",
                                 "dimensions": {"week": "2026-W24"},
                                 "measures": {"short_qty": 42},
-                                "source_ref": "connector:mock.docs:gpu-shortage",
+                                "source_ref": "connector:local.docs:gpu-shortage",
                                 "confidence": 0.91
                             }]
                         })
@@ -3046,7 +3046,7 @@ mod tests {
                                 "metric_key": "material_shortage_risk",
                                 "dimensions": {"week": "2026-W24"},
                                 "measures": {"short_qty": 42},
-                                "source_ref": "connector:mock.docs:gpu-shortage",
+                                "source_ref": "connector:local.docs:gpu-shortage",
                                 "confidence": 0.91
                             }]
                         })
@@ -7195,7 +7195,7 @@ providers:
             .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
         assert!(list
             .iter()
-            .any(|item| item["capability_id"] == "service.mock.docs.read"
+            .any(|item| item["capability_id"] == "service.local.docs.read"
                 && item["plane"] == "service"));
         assert!(!list.iter().any(|item| item["capability_id"]
             .as_str()
@@ -7377,7 +7377,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
+    async fn local_docs_service_connector_executes_through_cross_plane_receipt() {
         let workspace = unique_test_workspace("connector-mock-docs");
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({}),
@@ -7388,7 +7388,7 @@ providers:
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/connectors/services/mock.docs/tools")
+                    .uri("/api/connectors/services/local.docs/tools")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7398,15 +7398,15 @@ providers:
         let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_service_tools");
-        assert_eq!(json["service"]["id"], "mock.docs");
+        assert_eq!(json["service"]["id"], "local.docs");
         assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
-            tool["capability_id"] == "service.mock.docs.read" && tool["plane"] == "service"
+            tool["capability_id"] == "service.local.docs.read" && tool["plane"] == "service"
         }));
 
         let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
         let request = serde_json::json!({
             "actor_principal": format!("user:{key}"),
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "doc-1",
             "title": "Architecture",
             "mode": "dry_run",
@@ -7417,7 +7417,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -7428,20 +7428,20 @@ providers:
         let body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
         let first_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(first_json["kind"], "connector_service_execution");
-        assert_eq!(first_json["service"], "mock.docs");
+        assert_eq!(first_json["service"], "local.docs");
         assert_eq!(first_json["replayed"], false);
         assert_eq!(first_json["resource_persisted"], true);
         assert_eq!(
             first_json["result"]["resource"]["reference"],
-            "service://mock.docs/document/doc-1"
+            "service://local.docs/document/doc-1"
         );
         assert_eq!(
             first_json["receipt"]["action"]["requested_capability"],
-            "service.mock.docs.read"
+            "service.local.docs.read"
         );
         assert_eq!(
             first_json["receipt"]["action"]["resource_ref"],
-            "service://mock.docs/document/doc-1"
+            "service://local.docs/document/doc-1"
         );
         let receipt_id = first_json["receipt"]["id"].as_str().unwrap().to_string();
 
@@ -7463,7 +7463,7 @@ providers:
             .unwrap()
             .iter()
             .any(
-                |resource| resource["reference"] == "service://mock.docs/document/doc-1"
+                |resource| resource["reference"] == "service://local.docs/document/doc-1"
                     && resource["title"] == "Architecture"
             ));
 
@@ -7471,7 +7471,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -7495,7 +7495,7 @@ providers:
         ));
         let request = serde_json::json!({
             "actor_principal": "user:resource-persistence",
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "persisted-doc",
             "title": "Persisted Runtime Resource",
             "mode": "dry_run",
@@ -7505,7 +7505,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -7536,10 +7536,9 @@ providers:
             .as_array()
             .unwrap()
             .iter()
-            .any(
-                |resource| resource["reference"] == "service://mock.docs/document/persisted-doc"
-                    && resource["title"] == "Persisted Runtime Resource"
-            ));
+            .any(|resource| resource["reference"]
+                == "service://local.docs/document/persisted-doc"
+                && resource["title"] == "Persisted Runtime Resource"));
     }
 
     #[tokio::test]
@@ -7578,7 +7577,7 @@ providers:
         ));
         let request = serde_json::json!({
             "actor_principal": "user:connector-resource-revalidate",
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "revalidate-doc",
             "title": "Revalidate Doc",
             "mode": "commit",
@@ -7589,7 +7588,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -7599,7 +7598,7 @@ providers:
         assert_eq!(execute.status(), StatusCode::OK);
 
         let revalidate = serde_json::json!({
-            "reference": "service://mock.docs/document/revalidate-doc",
+            "reference": "service://local.docs/document/revalidate-doc",
             "state": "stale"
         });
         let response = app
@@ -7653,7 +7652,7 @@ providers:
         let app = api_router(test_state_with_memory_and_workspace(manager, tmp.clone()));
         let request = serde_json::json!({
             "actor_principal": "user:connector-resource-memory",
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "memory-doc",
             "title": "Memory Bridge Doc",
             "mode": "commit",
@@ -7664,7 +7663,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -7674,7 +7673,7 @@ providers:
         assert_eq!(execute.status(), StatusCode::OK);
 
         let promote = serde_json::json!({
-            "reference": "service://mock.docs/document/memory-doc",
+            "reference": "service://local.docs/document/memory-doc",
             "session_id": "resource-memory-session"
         });
         let response = app
@@ -7736,7 +7735,7 @@ providers:
             .find(|entry| entry["title"] == "Connector resource: Memory Bridge Doc")
             .expect("promoted resource memory should exist");
         let content = entry["content"].as_str().unwrap_or_default();
-        assert!(content.contains("service://mock.docs/document/memory-doc"));
+        assert!(content.contains("service://local.docs/document/memory-doc"));
         assert!(content.contains("body_policy: metadata_only"));
         assert!(!content.contains("external document body"));
         let duplicate_count = json["entries"]
@@ -7747,7 +7746,7 @@ providers:
                 entry["content"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("ref: service://mock.docs/document/memory-doc")
+                    .contains("ref: service://local.docs/document/memory-doc")
             })
             .count();
         assert_eq!(duplicate_count, 1);
@@ -7863,7 +7862,7 @@ providers:
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:service-commit-{suffix}");
-        let capability = "service.mock.docs.read";
+        let capability = "service.local.docs.read";
         let grant_id = format!("grant-service-commit-{suffix}");
         let grant = serde_json::json!({
             "id": grant_id,
@@ -7908,7 +7907,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(execute.to_string()))
                     .unwrap(),
@@ -7946,7 +7945,7 @@ providers:
         let action = serde_json::json!({
             "actor_principal": principal,
             "requested_capability": capability,
-            "provider_account": "mock.docs",
+            "provider_account": "local.docs",
             "source_channel": "channel://wechat/chat/service-commit",
             "resource_ref": null,
             "target_ref": null,
@@ -9317,7 +9316,7 @@ providers:
         ));
         let request = serde_json::json!({
             "actor_principal": "user:context-resource",
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "context-doc",
             "title": "Context Resource Plan",
             "mode": "dry_run",
@@ -9328,7 +9327,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -9352,7 +9351,7 @@ providers:
         let selected = json["envelope"]["selected"].as_array().unwrap();
         let resource_item = selected
             .iter()
-            .find(|item| item["id"] == "service://mock.docs/document/context-doc")
+            .find(|item| item["id"] == "service://local.docs/document/context-doc")
             .expect("resource context item should be selected");
         assert_eq!(resource_item["source"], "Workspace");
         assert_eq!(resource_item["role"], "Evidence");
@@ -9366,7 +9365,7 @@ providers:
             .contains("Mock document"));
         assert_eq!(
             resource_item["evidence"][0],
-            "service://mock.docs/document/context-doc"
+            "service://local.docs/document/context-doc"
         );
     }
 
@@ -9380,7 +9379,7 @@ providers:
         ));
         let request = serde_json::json!({
             "actor_principal": "user:resource-evidence",
-            "tool_id": "service.mock.docs.read",
+            "tool_id": "service.local.docs.read",
             "resource_id": "evidence-doc",
             "title": "Evidence Resource",
             "mode": "dry_run",
@@ -9391,7 +9390,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/connectors/services/mock.docs/execute")
+                    .uri("/api/connectors/services/local.docs/execute")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
@@ -9403,7 +9402,7 @@ providers:
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Fmock.docs%2Fdocument%2Fevidence-doc")
+                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Flocal.docs%2Fdocument%2Fevidence-doc")
                     .body(Body::empty())
                     .unwrap(),
             )

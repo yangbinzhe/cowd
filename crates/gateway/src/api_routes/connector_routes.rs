@@ -1,15 +1,15 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::{
-    extract::{Query, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use connector::{
-    default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection,
-    ConnectorHealth, ConnectorRegistrySnapshot, ExternalResourceRef, MockDocsServiceConnector,
-    ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    builtin_service_connector_registry, default_capabilities, CapabilityManifest,
+    ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth, ConnectorRegistrySnapshot,
+    ExternalResourceRef, ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
 };
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
@@ -50,13 +50,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/resources/promote-memory",
             axum::routing::post(connector_resource_promote_memory_handler),
         )
+        .route("/api/connectors/services", get(connector_services_handler))
         .route(
-            "/api/connectors/services/mock.docs/tools",
-            get(mock_docs_tools_handler),
+            "/api/connectors/services/:service_id/tools",
+            get(connector_service_tools_handler),
         )
         .route(
-            "/api/connectors/services/mock.docs/execute",
-            axum::routing::post(mock_docs_execute_handler),
+            "/api/connectors/services/:service_id/execute",
+            axum::routing::post(connector_service_execute_handler),
         )
 }
 
@@ -78,8 +79,13 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
         .collect::<Vec<_>>();
     let mcp_servers = configured_mcp_servers(state.config.as_ref());
     accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
-    let mock_docs = MockDocsServiceConnector::new();
-    accounts.push(account_from_service_connector(&mock_docs));
+    let service_registry = builtin_service_connector_registry();
+    accounts.extend(
+        service_registry
+            .connector_refs()
+            .into_iter()
+            .map(account_from_service_connector),
+    );
     let mut capabilities = base_connector_capabilities().to_vec();
     for platform in platforms {
         for operation in platform.capabilities {
@@ -122,14 +128,14 @@ fn base_connector_capabilities() -> &'static [CapabilityManifest] {
     static BASE_CONNECTOR_CAPABILITIES: OnceLock<Vec<CapabilityManifest>> = OnceLock::new();
     BASE_CONNECTOR_CAPABILITIES.get_or_init(|| {
         let mut capabilities = default_capabilities();
-        capabilities.extend(MockDocsServiceConnector::new().capabilities());
+        capabilities.extend(builtin_service_connector_registry().capabilities());
         capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
         capabilities.dedup_by(|left, right| left.capability_id == right.capability_id);
         capabilities
     })
 }
 
-fn account_from_service_connector(connector: &impl ServiceConnector) -> ProviderAccount {
+fn account_from_service_connector(connector: &dyn ServiceConnector) -> ProviderAccount {
     let metadata = connector.metadata();
     let mut account = ProviderAccount::new(
         metadata.provider.clone(),

@@ -15,7 +15,7 @@ LOG="$TMP_DIR/gateway.log"
 SUFFIX="channel-permission-$$"
 PRINCIPAL="user:$SUFFIX"
 GRANT_ID="grant-$SUFFIX"
-CAPABILITY="service.mock.docs.read"
+CAPABILITY="service.local.docs.read"
 
 cleanup() {
   if command -v tmux >/dev/null 2>&1; then
@@ -74,13 +74,13 @@ curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"$CAPABILITY\",\"account_id\":null,\"target_ref\":null,\"resource_ref\":null,\"source_channel\":null,\"grant_type\":\"single_use\",\"expires_at\":null,\"remaining_uses\":null,\"created_by\":\"channel-permission\",\"approval_id\":null}" \
   | rg -q "\"$GRANT_ID\""
 
-ACTION="{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"requested_capability\":\"$CAPABILITY\",\"provider_account\":\"mock.docs\",\"target_ref\":null,\"resource_ref\":null,\"risk\":\"medium\",\"data_classification\":\"internal\",\"identity_trust\":\"verified\"}"
+ACTION="{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"requested_capability\":\"$CAPABILITY\",\"provider_account\":\"local.docs\",\"target_ref\":null,\"resource_ref\":null,\"risk\":\"medium\",\"data_classification\":\"internal\",\"identity_trust\":\"verified\"}"
 
 curl -fsS "$BASE_URL/api/cross-plane/action/preflight" \
   -H 'content-type: application/json' \
   -d "$ACTION" | rg -q '"decision"\s*:\s*"allow"'
 
-curl -fsS "$BASE_URL/api/connectors/services/mock.docs/execute" \
+curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
   -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-dry-$SUFFIX\",\"title\":\"Channel Permission Dry Run\",\"mode\":\"dry_run\",\"idempotency_key\":\"dry-$SUFFIX\"}" \
   | rg -q '"status"\s*:\s*"dry_run"'
@@ -89,7 +89,7 @@ curl -fsS "$BASE_URL/api/cross-plane/policy/simulate" \
   -H 'content-type: application/json' \
   -d "$ACTION" | rg -q '"decision"\s*:\s*"allow"'
 
-curl -fsS "$BASE_URL/api/connectors/services/mock.docs/execute" \
+curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
   -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-$SUFFIX\",\"title\":\"Channel Permission\",\"mode\":\"commit\",\"idempotency_key\":\"commit-$SUFFIX\"}" \
   | rg -q '"status"\s*:\s*"ok"'

@@ -116,9 +116,9 @@ curl -fsS "$BASE_URL/api/cowd/surfaces" \
 curl -fsS "$BASE_URL/api/cowd/release-gate" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); checks=data.get("checks") or []; assert any(item.get("check_id") == "surface.webui_tui.parity" and item.get("status") == "pass" for item in checks), data'
 
-curl -fsS -X POST "$BASE_URL/api/connectors/services/mock.docs/execute" \
+curl -fsS -X POST "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'Content-Type: application/json' \
-  --data "{\"actor_principal\":\"user:tui-daemon\",\"tool_id\":\"service.mock.docs.read\",\"resource_id\":\"tui-daemon-tui-doc\",\"title\":\"tui-daemon TUI Attach Doc\",\"mode\":\"commit\",\"idempotency_key\":\"tui-daemon-$$\"}" \
+  --data "{\"actor_principal\":\"user:tui-daemon\",\"tool_id\":\"service.local.docs.read\",\"resource_id\":\"tui-daemon-tui-doc\",\"title\":\"tui-daemon TUI Attach Doc\",\"mode\":\"commit\",\"idempotency_key\":\"tui-daemon-$$\"}" \
   >/dev/null
 
 tmux new-session -d -s "$TUI_SESSION" -x 140 -y 42 \

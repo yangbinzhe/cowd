@@ -484,16 +484,16 @@ impl CommandPalette {
         if snapshot
             .connector_capabilities
             .iter()
-            .any(|capability| capability.capability_id == "service.mock.docs.read")
+            .any(|capability| capability.capability_id == "service.local.docs.read")
         {
             self.all_commands.push(CommandEntry::dynamic(
-                "Mock Docs Dry Run",
+                "Local Docs Dry Run",
                 "Use connector console contract for a non-destructive service read",
                 Action::Execute("/cross-plane".into()),
             ));
             self.all_commands.push(CommandEntry::dynamic(
-                "Mock Docs Commit",
-                "Commit a governed mock docs read and persist the resource ref",
+                "Local Docs Commit",
+                "Commit a governed connector service read and persist the resource ref",
                 Action::Execute("/cross-plane".into()),
             ));
         }
@@ -1294,7 +1294,7 @@ mod tests {
             }],
             connector_capabilities: vec![
                 crate::runtime_control_store::ConnectorCapabilitySummary {
-                    capability_id: "service.mock.docs.read".to_string(),
+                    capability_id: "service.local.docs.read".to_string(),
                     provider: "mock".to_string(),
                     plane: "service".to_string(),
                     risk: "low".to_string(),

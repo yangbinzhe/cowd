@@ -149,7 +149,7 @@ PY
 
 fact_json="$(curl -fsS "$BASE_URL/api/matrix/facts/ingest" \
   -H 'content-type: application/json' \
-  -d "{\"request_id\":\"release-smoke-fact\",\"session_id\":\"$SMOKE_ID\",\"facts\":[{\"fact_id\":\"fact-$SMOKE_ID\",\"snapshot_id\":\"snapshot-$SMOKE_ID\",\"fact_type\":\"supply.material_shortage\",\"entity_refs\":[\"component:gpu-a\"],\"metric_key\":\"material_shortage_risk\",\"dimensions\":{\"week\":\"2026-W24\"},\"measures\":{\"short_qty\":42},\"source_ref\":\"connector:mock.docs:gpu-shortage\",\"confidence\":0.91}]}")"
+  -d "{\"request_id\":\"release-smoke-fact\",\"session_id\":\"$SMOKE_ID\",\"facts\":[{\"fact_id\":\"fact-$SMOKE_ID\",\"snapshot_id\":\"snapshot-$SMOKE_ID\",\"fact_type\":\"supply.material_shortage\",\"entity_refs\":[\"component:gpu-a\"],\"metric_key\":\"material_shortage_risk\",\"dimensions\":{\"week\":\"2026-W24\"},\"measures\":{\"short_qty\":42},\"source_ref\":\"connector:local.docs:gpu-shortage\",\"confidence\":0.91}]}")"
 attention_id="$(printf '%s' "$fact_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["attention"][0]["attention_id"])')"
 
 curl -fsS "$BASE_URL/api/matrix/evidence/build" \
@@ -174,15 +174,15 @@ curl -fsS "$BASE_URL/api/memory/runtime" | rg -q '"runtime"'
 curl -fsS "$BASE_URL/api/connectors/summary" | rg -q '"kind"\s*:\s*"connector_summary"'
 curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -H 'content-type: application/json' \
-  -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"service.mock.docs.read\",\"grant_type\":\"single_use\",\"created_by\":\"release-smoke\"}" \
+  -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"service.local.docs.read\",\"grant_type\":\"single_use\",\"created_by\":\"release-smoke\"}" \
   | rg -q "\"$GRANT_ID\""
-curl -fsS "$BASE_URL/api/connectors/services/mock.docs/execute" \
+curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
-  -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://tui/release\",\"session_id\":\"$SMOKE_ID\",\"tool_id\":\"service.mock.docs.read\",\"resource_id\":\"release-doc-$SMOKE_ID\",\"title\":\"Release Smoke Doc\",\"mode\":\"commit\",\"idempotency_key\":\"release-$SMOKE_ID\"}" \
+  -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://tui/release\",\"session_id\":\"$SMOKE_ID\",\"tool_id\":\"service.local.docs.read\",\"resource_id\":\"release-doc-$SMOKE_ID\",\"title\":\"Release Smoke Doc\",\"mode\":\"commit\",\"idempotency_key\":\"release-$SMOKE_ID\"}" \
   | rg -q '"status"\s*:\s*"ok"'
 curl -fsS "$BASE_URL/api/cross-plane/audit" | rg -q "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
 
 sqlite3 "$WORKDIR/.cowd/resource-directory.sqlite" "SELECT reference FROM connector_resources;" \
-  | rg -q "service://mock.docs/document/release-doc-$SMOKE_ID"
+  | rg -q "service://local.docs/document/release-doc-$SMOKE_ID"
 
 echo "release full-product smoke passed"

@@ -1747,7 +1747,7 @@ mod tests {
             let mut buf = vec![0; 4096];
             let n = socket.read(&mut buf).await.expect("read tools");
             let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.starts_with("GET /api/connectors/services/mock.docs/tools HTTP/1.1"));
+            assert!(req.starts_with("GET /api/connectors/services/local.docs/tools HTTP/1.1"));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 12\r\n\r\n{\"tools\":[]}",
@@ -1759,8 +1759,8 @@ mod tests {
             let mut buf = vec![0; 4096];
             let n = socket.read(&mut buf).await.expect("read execute");
             let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.starts_with("POST /api/connectors/services/mock.docs/execute HTTP/1.1"));
-            assert!(req.contains("\"tool_id\":\"service.mock.docs.read\""));
+            assert!(req.starts_with("POST /api/connectors/services/local.docs/execute HTTP/1.1"));
+            assert!(req.contains("\"tool_id\":\"service.local.docs.read\""));
             assert!(req.contains("\"mode\":\"dry_run\""));
             socket
                 .write_all(
@@ -1772,16 +1772,16 @@ mod tests {
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let tools = client
-            .connector_service_tools("mock.docs")
+            .connector_service_tools("local.docs")
             .await
             .expect("tools");
         assert!(tools["tools"].as_array().unwrap().is_empty());
         let result = client
             .execute_connector_service(
-                "mock.docs",
+                "local.docs",
                 serde_json::json!({
                     "actor_principal": "tui:operator",
-                    "tool_id": "service.mock.docs.read",
+                    "tool_id": "service.local.docs.read",
                     "resource_id": "tui-doc",
                     "title": "TUI Doc",
                     "mode": "dry_run",
@@ -1979,7 +1979,7 @@ mod tests {
             let n = socket.read(&mut buf).await.expect("read revalidate");
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/connectors/resources/revalidate HTTP/1.1"));
-            assert!(req.contains("\"reference\":\"service://mock.docs/document/tui-doc\""));
+            assert!(req.contains("\"reference\":\"service://local.docs/document/tui-doc\""));
             assert!(req.contains("\"state\":\"stale\""));
             socket
                 .write_all(
@@ -1993,7 +1993,7 @@ mod tests {
             let n = socket.read(&mut buf).await.expect("read promote");
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/connectors/resources/promote-memory HTTP/1.1"));
-            assert!(req.contains("\"reference\":\"service://mock.docs/document/tui-doc\""));
+            assert!(req.contains("\"reference\":\"service://local.docs/document/tui-doc\""));
             assert!(req.contains("\"session_id\":\"session-tui\""));
             socket
                 .write_all(
@@ -2005,13 +2005,13 @@ mod tests {
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let revalidated = client
-            .revalidate_connector_resource("service://mock.docs/document/tui-doc", "stale")
+            .revalidate_connector_resource("service://local.docs/document/tui-doc", "stale")
             .await
             .expect("revalidate");
         assert_eq!(revalidated["ok"], true);
         let promoted = client
             .promote_connector_resource_to_memory(
-                "service://mock.docs/document/tui-doc",
+                "service://local.docs/document/tui-doc",
                 Some("session-tui"),
             )
             .await

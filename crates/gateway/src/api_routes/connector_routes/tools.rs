@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
-pub(super) struct MockDocsExecuteRequest {
+pub(super) struct ServiceExecuteRequest {
     actor_principal: String,
     #[serde(default)]
     actor_identity_ref: Option<String>,
@@ -18,19 +18,53 @@ pub(super) struct MockDocsExecuteRequest {
     idempotency_key: Option<String>,
 }
 
-pub(super) async fn mock_docs_tools_handler() -> impl IntoResponse {
-    let connector = MockDocsServiceConnector::new();
+pub(super) async fn connector_services_handler() -> impl IntoResponse {
+    let registry = builtin_service_connector_registry();
+    Json(serde_json::json!({
+        "kind": "connector_services",
+        "services": registry.services(),
+    }))
+}
+
+pub(super) async fn connector_service_tools_handler(
+    Path(service_id): Path<String>,
+) -> impl IntoResponse {
+    let registry = builtin_service_connector_registry();
+    let Some(connector) = registry.connector(&service_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "connector service not found",
+                "service": service_id,
+            })),
+        )
+            .into_response();
+    };
     Json(serde_json::json!({
         "kind": "connector_service_tools",
         "service": connector.metadata(),
         "tools": connector.capabilities(),
     }))
+    .into_response()
 }
 
-pub(super) async fn mock_docs_execute_handler(
+pub(super) async fn connector_service_execute_handler(
+    Path(service_id): Path<String>,
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MockDocsExecuteRequest>,
+    Json(request): Json<ServiceExecuteRequest>,
 ) -> impl IntoResponse {
+    let registry = builtin_service_connector_registry();
+    let Some(connector) = registry.connector(&service_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "connector service not found",
+                "service": service_id,
+            })),
+        )
+            .into_response();
+    };
+    let service_metadata = connector.metadata();
     state.services.cross_plane.ensure_loaded(&state.config_home);
     let mode = request.mode.as_deref().unwrap_or("dry_run");
     let idempotency_key = request
@@ -47,10 +81,11 @@ pub(super) async fn mock_docs_execute_handler(
         {
             return Json(serde_json::json!({
                 "kind": "connector_service_execution",
-                "service": "mock.docs",
+                "service": service_metadata.id,
                 "replayed": true,
                 "receipt": receipt,
-            }));
+            }))
+            .into_response();
         }
     }
 
@@ -61,7 +96,7 @@ pub(super) async fn mock_docs_execute_handler(
         input: serde_json::json!({}),
     };
     let preview_resource = ExternalResourceRef::new(
-        "mock.docs",
+        &service_metadata.id,
         "document",
         &service_request.resource_id,
         &service_request.title,
@@ -72,7 +107,7 @@ pub(super) async fn mock_docs_execute_handler(
         request.actor_identity_ref,
         request.source_channel,
         request.session_id,
-        "mock.docs",
+        &service_metadata.id,
         Some(preview_resource.reference.clone()),
     );
 
@@ -90,7 +125,7 @@ pub(super) async fn mock_docs_execute_handler(
     let mut bulkhead_guard = None;
     let mut bulkhead_blocker = None;
     if mode == "commit" && allowed {
-        match connector_service_bulkhead().try_acquire("mock.docs") {
+        match connector_service_bulkhead().try_acquire(&service_metadata.id) {
             Ok(guard) => {
                 bulkhead_guard = Some(guard);
             }
@@ -108,7 +143,7 @@ pub(super) async fn mock_docs_execute_handler(
         "blocked"
     };
     let dispatch_status = if mode == "commit" && allowed {
-        "service_mock_executed"
+        "service_executed"
     } else {
         "not_dispatched"
     };
@@ -130,7 +165,7 @@ pub(super) async fn mock_docs_execute_handler(
         }
     }
     let audit_summary = if blockers.is_empty() {
-        format!("mock.docs {status}")
+        format!("{} {status}", service_metadata.id)
     } else {
         blockers.join("; ")
     };
@@ -148,8 +183,8 @@ pub(super) async fn mock_docs_execute_handler(
     );
     state.services.cross_plane.save_state(&state.config_home);
     let service_result = if mode == "commit" && allowed {
-        let result = MockDocsServiceConnector::new().execute_tool(service_request);
-        connector_service_bulkhead().record_success("mock.docs");
+        let result = connector.execute_tool(service_request);
+        connector_service_bulkhead().record_success(&service_metadata.id);
         drop(bulkhead_guard);
         result
     } else {
@@ -158,7 +193,7 @@ pub(super) async fn mock_docs_execute_handler(
             tool_id: receipt.action.requested_capability.clone(),
             resource: Some(preview_resource.clone()),
             output: serde_json::json!({
-                "summary": format!("Mock docs service {} for {}", status, preview_resource.reference),
+                "summary": format!("Connector service {} {} for {}", service_metadata.id, status, preview_resource.reference),
                 "read_only": true,
             }),
         }
@@ -182,13 +217,14 @@ pub(super) async fn mock_docs_execute_handler(
 
     Json(serde_json::json!({
         "kind": "connector_service_execution",
-        "service": "mock.docs",
+        "service": service_metadata.id,
         "replayed": false,
         "result": service_result,
         "resource_persisted": resource_persisted,
         "resource_degraded_reason": resource_degraded_reason,
         "receipt": receipt,
     }))
+    .into_response()
 }
 
 fn connector_bulkhead_blocker(error: ConnectorBulkheadRejection) -> String {

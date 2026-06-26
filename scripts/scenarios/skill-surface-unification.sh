@@ -141,7 +141,7 @@ curl -fsS "$BASE_URL/api/apps/mfg/domain/server-manufacturing/seed" -X POST | rg
 
 fact_json="$(curl -fsS "$BASE_URL/api/matrix/facts/ingest" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"skill-surface-fact","session_id":"session-skill-surface","facts":[{"fact_id":"fact-skill-surface-gpu-shortage","snapshot_id":"snapshot-skill-surface","fact_type":"supply.material_shortage","entity_refs":["component:gpu-a"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W24"},"measures":{"short_qty":42},"source_ref":"connector:mock.docs:gpu-shortage","confidence":0.91}]}')"
+  -d '{"request_id":"skill-surface-fact","session_id":"session-skill-surface","facts":[{"fact_id":"fact-skill-surface-gpu-shortage","snapshot_id":"snapshot-skill-surface","fact_type":"supply.material_shortage","entity_refs":["component:gpu-a"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W24"},"measures":{"short_qty":42},"source_ref":"connector:local.docs:gpu-shortage","confidence":0.91}]}')"
 attention_id="$(printf '%s' "$fact_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["attention"][0]["attention_id"])')"
 
 packet_json="$(curl -fsS "$BASE_URL/api/matrix/evidence/build" \

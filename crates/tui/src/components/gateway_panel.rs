@@ -1022,12 +1022,12 @@ impl Component for GatewayPanel {
             ("POST /api/surfaces/:id/send", "Surface message egress"),
             ("POST /api/surfaces/:id/action", "Surface action dispatch"),
             (
-                "GET  /api/connectors/services/mock.docs/tools",
-                "Mock docs service tools",
+                "GET  /api/connectors/services/local.docs/tools",
+                "Local docs service tools",
             ),
             (
-                "POST /api/connectors/services/mock.docs/execute",
-                "Mock docs dry-run/commit",
+                "POST /api/connectors/services/local.docs/execute",
+                "Local docs dry-run/commit",
             ),
             (
                 "POST /api/cross-plane/policy/simulate",
@@ -1680,7 +1680,7 @@ mod tests {
         }]);
         panel.set_connector_capabilities(vec![
             ConnectorCapabilitySummary {
-                capability_id: "service.mock.docs.read".to_string(),
+                capability_id: "service.local.docs.read".to_string(),
                 provider: "mock".to_string(),
                 plane: "service".to_string(),
                 risk: "low".to_string(),
@@ -1729,7 +1729,7 @@ mod tests {
             "Should show connector account, got: {joined}"
         );
         assert!(
-            joined.contains("service.mock.docs.read") && joined.contains("mcp.filesystem.server"),
+            joined.contains("service.local.docs.read") && joined.contains("mcp.filesystem.server"),
             "Should show connector capabilities, got: {joined}"
         );
         assert!(

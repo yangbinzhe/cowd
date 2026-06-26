@@ -821,7 +821,7 @@ pub struct ServiceToolResult {
     pub output: Value,
 }
 
-pub trait ServiceConnector {
+pub trait ServiceConnector: Send + Sync {
     fn metadata(&self) -> ServiceConnectorMetadata;
     fn capabilities(&self) -> Vec<CapabilityManifest>;
     fn probe(&self, accounts: &[ProviderAccount]) -> ConnectorHealth {
@@ -992,23 +992,74 @@ impl Drop for ConnectorBulkheadGuard<'_> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct MockDocsServiceConnector;
+#[derive(Default)]
+pub struct ServiceConnectorRegistry {
+    connectors: Vec<Box<dyn ServiceConnector>>,
+}
 
-impl MockDocsServiceConnector {
+impl ServiceConnectorRegistry {
+    #[must_use]
+    pub fn new(connectors: Vec<Box<dyn ServiceConnector>>) -> Self {
+        Self { connectors }
+    }
+
+    #[must_use]
+    pub fn builtin() -> Self {
+        Self::new(vec![Box::new(LocalDocsServiceConnector::new())])
+    }
+
+    #[must_use]
+    pub fn services(&self) -> Vec<ServiceConnectorMetadata> {
+        self.connectors
+            .iter()
+            .map(|connector| connector.metadata())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn connector_refs(&self) -> Vec<&dyn ServiceConnector> {
+        self.connectors.iter().map(Box::as_ref).collect()
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> Vec<CapabilityManifest> {
+        self.connectors
+            .iter()
+            .flat_map(|connector| connector.capabilities())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn connector(&self, service_id: &str) -> Option<&dyn ServiceConnector> {
+        self.connectors
+            .iter()
+            .map(Box::as_ref)
+            .find(|connector| connector.metadata().id == service_id)
+    }
+}
+
+#[must_use]
+pub fn builtin_service_connector_registry() -> ServiceConnectorRegistry {
+    ServiceConnectorRegistry::builtin()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalDocsServiceConnector;
+
+impl LocalDocsServiceConnector {
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
-impl ServiceConnector for MockDocsServiceConnector {
+impl ServiceConnector for LocalDocsServiceConnector {
     fn metadata(&self) -> ServiceConnectorMetadata {
         ServiceConnectorMetadata {
-            id: "mock.docs".to_string(),
-            provider: "mock".to_string(),
-            family: "service.mock.docs".to_string(),
-            display_name: "Mock Docs".to_string(),
+            id: "local.docs".to_string(),
+            provider: "local".to_string(),
+            family: "service.local.docs".to_string(),
+            display_name: "Local Docs".to_string(),
             read_only: true,
         }
     }
@@ -1016,7 +1067,7 @@ impl ServiceConnector for MockDocsServiceConnector {
     fn capabilities(&self) -> Vec<CapabilityManifest> {
         ["read", "export", "summarize_ref"]
             .into_iter()
-            .map(|operation| CapabilityManifest::service_readonly("mock.docs", operation))
+            .map(|operation| CapabilityManifest::service_readonly("local.docs", operation))
             .collect()
     }
 
@@ -1033,14 +1084,14 @@ impl ServiceConnector for MockDocsServiceConnector {
             .filter(|value| !value.is_empty())
             .unwrap_or("read")
             .to_string();
-        let resource = ExternalResourceRef::new("mock.docs", "document", &resource_id, &title);
+        let resource = ExternalResourceRef::new("local.docs", "document", &resource_id, &title);
         ServiceToolResult {
             status: "ok".to_string(),
             tool_id,
             resource: Some(resource.clone()),
             output: serde_json::json!({
                 "operation": operation,
-                "summary": format!("Mock document `{title}` resolved as {}", resource.reference),
+                "summary": format!("Local document `{title}` resolved as {}", resource.reference),
                 "read_only": true,
             }),
         }
@@ -1069,6 +1120,7 @@ pub fn default_capabilities() -> Vec<CapabilityManifest> {
         .into_iter()
         .map(|(provider, operation)| CapabilityManifest::channel(provider, operation)),
     );
+    capabilities.extend(builtin_service_connector_registry().capabilities());
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     capabilities
 }
@@ -1114,7 +1166,7 @@ mod tests {
 
     #[test]
     fn provider_account_reports_missing_scopes() {
-        let mut account = ProviderAccount::new("mock.docs", "mock-docs-main", "api_key");
+        let mut account = ProviderAccount::new("local.docs", "local-docs-main", "api_key");
         account.scopes = vec!["document:read".to_string()];
         let required = vec!["document:read".to_string(), "document:write".to_string()];
 
@@ -1196,20 +1248,20 @@ mod tests {
     }
 
     #[test]
-    fn mock_docs_service_connector_returns_resource_ref() {
-        let connector = MockDocsServiceConnector::new();
+    fn local_docs_service_connector_returns_resource_ref() {
+        let connector = LocalDocsServiceConnector::new();
         let capabilities = connector.capabilities();
         assert!(capabilities
             .iter()
             .any(
-                |capability| capability.capability_id == "service.mock.docs.read"
+                |capability| capability.capability_id == "service.local.docs.read"
                     && capability.plane == ConnectorPlane::Service
                     && capability.supports_commit
                     && !capability.requires_approval
             ));
 
         let result = connector.execute_tool(ServiceToolRequest {
-            tool_id: "service.mock.docs.read".to_string(),
+            tool_id: "service.local.docs.read".to_string(),
             resource_id: "doc-1".to_string(),
             title: "Architecture".to_string(),
             input: serde_json::json!({}),
@@ -1218,7 +1270,7 @@ mod tests {
         assert_eq!(result.status, "ok");
         assert_eq!(
             result.resource.unwrap().reference,
-            "service://mock.docs/document/doc-1"
+            "service://local.docs/document/doc-1"
         );
     }
 
@@ -1266,7 +1318,7 @@ mod tests {
     #[test]
     fn resource_directory_upserts_and_searches_refs() {
         let directory = ResourceDirectory::new();
-        let resource = ExternalResourceRef::new("mock.docs", "document", "doc-2", "Runtime Plan");
+        let resource = ExternalResourceRef::new("local.docs", "document", "doc-2", "Runtime Plan");
         directory.upsert(resource.clone());
 
         assert_eq!(directory.get(&resource.reference), Some(resource.clone()));
@@ -1278,7 +1330,7 @@ mod tests {
     fn sqlite_resource_directory_persists_and_pages_refs() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("resources.sqlite");
-        let first = ExternalResourceRef::new("mock.docs", "document", "doc-1", "Runtime Plan");
+        let first = ExternalResourceRef::new("local.docs", "document", "doc-1", "Runtime Plan");
         let second = ExternalResourceRef::new("mcp", "resource", "res-2", "MCP Manual");
 
         {
