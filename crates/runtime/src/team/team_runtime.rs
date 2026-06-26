@@ -12,8 +12,10 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cowd_dirs, global_agent_lifecycle_service, global_runtime_control_plane, AgentSnapshot,
-    CollaborationDecision, CollaborationPlan, CollaborationTemplateId,
+    cowd_dirs, global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_mailbox,
+    global_mission_evidence_bus, global_runtime_control_plane, AgentLifecycleEvent,
+    AgentProgressEvent, AgentSnapshot, AgentTask, CollaborationDecision, CollaborationPlan,
+    CollaborationTemplateId, MissionEvidenceRef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +155,31 @@ pub struct TeamRuntimeCommandReceipt {
     pub command: String,
     pub status: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationAgentRunProjection {
+    pub role_id: String,
+    pub agent_id: Option<String>,
+    pub status: TeamRuntimeStatus,
+    pub latest_summary: Option<String>,
+    pub output_file: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub lifecycle_events: Vec<AgentLifecycleEvent>,
+    pub progress_events: Vec<AgentProgressEvent>,
+    pub tasks: Vec<AgentTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationRunProjection {
+    pub kind: String,
+    pub team: TeamRuntimeSnapshot,
+    pub team_events: Vec<TeamRuntimeEvent>,
+    pub agent_runs: Vec<CollaborationAgentRunProjection>,
+    pub mission_evidence: Vec<MissionEvidenceRef>,
+    pub execution_summary: Option<TeamRuntimeExecutionSummary>,
+    pub synthesis_ready: bool,
+    pub control_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +384,101 @@ impl TeamRuntimeService {
             .map(|record| record.events.clone())
     }
 
+    pub fn collaboration_run(&self, team_id: &str) -> Result<CollaborationRunProjection, String> {
+        let team = self
+            .get(team_id)
+            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
+        let team_events = self.events(team_id).unwrap_or_default();
+        let mission_evidence = global_mission_evidence_bus().list_for_team(team_id);
+        let team_tasks = global_agent_task_mailbox().list_for_team(team_id);
+        let team_progress_events = global_agent_event_bus().list_for_team(team_id);
+        let agent_runs = team
+            .agents
+            .iter()
+            .map(|agent| {
+                let lifecycle_events = agent
+                    .agent_id
+                    .as_deref()
+                    .and_then(|agent_id| global_agent_lifecycle_service().events(agent_id))
+                    .unwrap_or_default();
+                let progress_events = agent
+                    .agent_id
+                    .as_deref()
+                    .map(|agent_id| global_agent_event_bus().list_for_agent(agent_id))
+                    .unwrap_or_else(|| {
+                        team_progress_events
+                            .iter()
+                            .filter(|event| event.role_id == agent.role_id)
+                            .cloned()
+                            .collect()
+                    });
+                let tasks = team_tasks
+                    .iter()
+                    .filter(|task| {
+                        task.role_id == agent.role_id
+                            || task.agent_id.as_deref() == agent.agent_id.as_deref()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                CollaborationAgentRunProjection {
+                    role_id: agent.role_id.clone(),
+                    agent_id: agent.agent_id.clone(),
+                    status: agent.status.clone(),
+                    latest_summary: agent.latest_summary.clone(),
+                    output_file: agent
+                        .agent_id
+                        .as_deref()
+                        .and_then(|agent_id| global_agent_lifecycle_service().get(agent_id))
+                        .map(|snapshot| snapshot.output_file),
+                    evidence_refs: agent.evidence_duties.clone(),
+                    lifecycle_events,
+                    progress_events,
+                    tasks,
+                }
+            })
+            .collect::<Vec<_>>();
+        let synthesis_ready = !agent_runs.is_empty()
+            && agent_runs.iter().all(|agent| {
+                agent.status.is_terminal() || agent.status == TeamRuntimeStatus::Running
+            })
+            && (!team_tasks.is_empty() || !mission_evidence.is_empty());
+        let mut control_actions = vec![
+            "inspect".to_string(),
+            "synthesis".to_string(),
+            "handoff".to_string(),
+            "cancel".to_string(),
+        ];
+        if team.status == TeamRuntimeStatus::Paused {
+            control_actions.push("resume".to_string());
+        } else if !team.status.is_terminal() {
+            control_actions.push("pause".to_string());
+        }
+        Ok(CollaborationRunProjection {
+            kind: "runtime.collaboration_run".to_string(),
+            execution_summary: team.execution_summary.clone(),
+            team,
+            team_events,
+            agent_runs,
+            mission_evidence,
+            synthesis_ready,
+            control_actions,
+        })
+    }
+
+    #[must_use]
+    pub fn collaboration_projection(&self) -> serde_json::Value {
+        let runs = self
+            .list()
+            .into_iter()
+            .filter_map(|team| self.collaboration_run(&team.team_id).ok())
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "kind": "runtime.collaboration_runs",
+            "count": runs.len(),
+            "runs": runs,
+        })
+    }
+
     pub fn append_input(
         &self,
         team_id: &str,
@@ -422,6 +544,34 @@ impl TeamRuntimeService {
             record.touch();
             record.push_event("team.review_requested", "team review requested");
             "review requested".to_string()
+        })
+    }
+
+    pub fn handoff(
+        &self,
+        team_id: &str,
+        target: Option<String>,
+        note: Option<String>,
+    ) -> Result<TeamRuntimeCommandReceipt, String> {
+        let target = target
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "human-agent".to_string());
+        let note = note
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "handoff requested".to_string());
+        self.with_record(team_id, "handoff", |record| {
+            record
+                .snapshot
+                .review_notes
+                .push(format!("{target}: {note}"));
+            record.touch();
+            record.push_event(
+                "team.handoff_requested",
+                format!("handoff requested for {target}: {note}"),
+            );
+            format!("handoff requested for {target}")
         })
     }
 
@@ -584,6 +734,7 @@ impl TeamRuntimeService {
             "kind": "runtime.teams",
             "count": teams.len(),
             "teams": teams,
+            "collaboration_runs": self.collaboration_projection(),
         })
     }
 
@@ -956,6 +1107,70 @@ mod tests {
             .cloned()
             .expect("failed team");
         assert_eq!(failed["status"], "failed");
+    }
+
+    #[test]
+    fn collaboration_run_projection_exposes_agent_events_handoff_and_synthesis() {
+        let service = TeamRuntimeService::new();
+        let prompt = "research architecture, implement, review, and synthesize evidence";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let temp_root = std::env::temp_dir().join(format!(
+            "cowd-collaboration-run-agents-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp root");
+
+        let team = service
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id: "session-collaboration-run".to_string(),
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| Ok(fake_registered_agent_snapshot(&temp_root, &request.role_id)),
+            )
+            .expect("team starts");
+
+        let run = service.collaboration_run(&team.team_id).expect("run");
+        assert_eq!(run.kind, "runtime.collaboration_run");
+        assert_eq!(run.team.team_id, team.team_id);
+        assert_eq!(run.agent_runs.len(), team.agents.len());
+        assert!(run
+            .agent_runs
+            .iter()
+            .all(|agent| !agent.lifecycle_events.is_empty()));
+        assert!(run.control_actions.contains(&"synthesis".to_string()));
+
+        service
+            .handoff(
+                &team.team_id,
+                Some("human-agent".to_string()),
+                Some("review synthesis before finalizing".to_string()),
+            )
+            .expect("handoff");
+        let handed_off = service.collaboration_run(&team.team_id).expect("run");
+        assert!(handed_off
+            .team
+            .review_notes
+            .iter()
+            .any(|note| note.contains("review synthesis")));
+        assert!(handed_off
+            .team_events
+            .iter()
+            .any(|event| event.event_type == "team.handoff_requested"));
+
+        let summary = service
+            .finalize_execution_summary(&team.team_id)
+            .expect("summary");
+        assert_eq!(summary.team_id, team.team_id);
+        assert!(!summary.role_summaries.is_empty());
+        assert!(summary
+            .role_summaries
+            .iter()
+            .flat_map(|role| role.evidence_refs.iter())
+            .any(|reference| reference.starts_with("team:")));
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     fn fake_agent_snapshot(role_id: &str) -> AgentSnapshot {

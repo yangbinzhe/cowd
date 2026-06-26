@@ -4089,8 +4089,8 @@ mod tests {
         ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
     use crate::agent_collaboration::{
-        AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
-        CollaborationScorecard, CollaborationTask, SubTask,
+        AgentTaskTrace, AgentTeam, CollaborationContextResult, CollaborationOps,
+        CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, SubTask,
     };
     use crate::agent_workgraph::AgentWorkGraph;
     use crate::compact::CompactionConfig;
@@ -5231,15 +5231,20 @@ mod tests {
             )));
     }
 
-    struct StubCollaboration;
+    struct EvidenceBackedCollaboration;
 
-    impl CollaborationOps for StubCollaboration {
+    impl CollaborationOps for EvidenceBackedCollaboration {
         fn run_boxed<'a>(
             &'a self,
             _task: &'a str,
             _skills: &'a [String],
         ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
-            Box::pin(async { Some("stub synthesis".to_string()) })
+            Box::pin(async {
+                Some(
+                    "Evidence-backed synthesis: implementation and review findings agree."
+                        .to_string(),
+                )
+            })
         }
 
         fn run_with_context_boxed<'a>(
@@ -5252,34 +5257,57 @@ mod tests {
                     description: task.to_string(),
                     required_skills: skills.to_vec(),
                     subtasks: vec![SubTask {
-                        id: "stub-review".to_string(),
-                        description: "review stub collaboration".to_string(),
+                        id: "review-implementation-output".to_string(),
+                        description: "review implementation output against evidence".to_string(),
                         required_skills: vec!["review".to_string()],
                         depends_on: Vec::new(),
                     }],
                     review_criteria: None,
                     collaboration_decision: None,
                 };
+                let agent_task = AgentTaskTrace {
+                    task_id: "agent-task-review-implementation-output".to_string(),
+                    parent_run_id: Some("team-run-production-like".to_string()),
+                    agent_run_id: Some("agent-run-reviewer".to_string()),
+                    role: "reviewer".to_string(),
+                    objective: "review implementation output against evidence".to_string(),
+                    status: "completed".to_string(),
+                    context_envelope_id: Some("context-envelope-reviewer".to_string()),
+                    result_summary: "review found implementation and evidence aligned".to_string(),
+                    evidence_refs: vec![
+                        "evidence://agent-run-reviewer/output".to_string(),
+                        "workgraph://team-run-production-like/review".to_string(),
+                    ],
+                    collaboration_board_id: "board-evidence-backed".to_string(),
+                    confidence: 0.92,
+                    conflicts: Vec::new(),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                };
                 let review_packet = CollaborationReviewPacket {
-                    board_id: "board-stub".to_string(),
-                    parent_run_id: None,
+                    board_id: "board-evidence-backed".to_string(),
+                    parent_run_id: Some("team-run-production-like".to_string()),
                     scorecard: CollaborationScorecard {
                         completion_rate: 1.0,
-                        synthesis_lift: 1.1,
-                        complementarity_score: 0.5,
-                        active_memory_score: 0.0,
+                        synthesis_lift: 1.25,
+                        complementarity_score: 0.75,
+                        active_memory_score: 0.4,
                         conflict_count: 0,
-                        memory_pulse_count: 0,
+                        memory_pulse_count: 1,
                         surfaced_conflicts: Vec::new(),
                     },
-                    agent_tasks: Vec::new(),
+                    agent_tasks: vec![agent_task],
                     maintenance_candidates: Vec::new(),
                 };
-                let work_graph =
-                    AgentWorkGraph::from_collaboration_task("stub-session", &collaboration_task)
-                        .with_review_packet(&review_packet);
+                let work_graph = AgentWorkGraph::from_collaboration_task(
+                    "production-like-session",
+                    &collaboration_task,
+                )
+                .with_review_packet(&review_packet);
                 Some(CollaborationContextResult {
-                    synthesis: "stub synthesis".to_string(),
+                    synthesis:
+                        "Evidence-backed synthesis: implementation and review findings agree."
+                            .to_string(),
                     context_items: Vec::new(),
                     collaboration_task,
                     review_packet,
@@ -5309,7 +5337,7 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_collaboration(Arc::new(StubCollaboration));
+        .with_collaboration(Arc::new(EvidenceBackedCollaboration));
 
         runtime
             .run_turn_async(
@@ -5323,7 +5351,14 @@ mod tests {
             .last_collaboration_result()
             .expect("collaboration result should be recorded");
         assert_eq!(result.work_graph.session_id, session_id);
-        assert_eq!(result.review_packet.board_id, "board-stub");
+        assert_eq!(result.review_packet.board_id, "board-evidence-backed");
+        assert!(result.review_packet.scorecard.shows_multi_agent_lift());
+        assert!(result
+            .review_packet
+            .agent_tasks
+            .iter()
+            .flat_map(|task| task.evidence_refs.iter())
+            .any(|evidence| evidence.starts_with("evidence://agent-run-reviewer/")));
 
         assert!(runtime.take_collaboration_result().is_some());
         assert!(runtime.take_collaboration_result().is_none());

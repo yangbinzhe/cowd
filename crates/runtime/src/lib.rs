@@ -524,9 +524,10 @@ pub use team_execution::{
     TeamExecutionPlan, TeamExecutionReport, TeamExecutionRoleSpec,
 };
 pub use team_runtime::{
-    global_team_runtime_service, StartTeamRuntimeAgentRequest, StartTeamRuntimeRequest,
-    TeamRuntimeAgent, TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService,
-    TeamRuntimeSnapshot, TeamRuntimeStatus,
+    global_team_runtime_service, CollaborationAgentRunProjection, CollaborationRunProjection,
+    StartTeamRuntimeAgentRequest, StartTeamRuntimeRequest, TeamRuntimeAgent,
+    TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService, TeamRuntimeSnapshot,
+    TeamRuntimeStatus,
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_invocation::{

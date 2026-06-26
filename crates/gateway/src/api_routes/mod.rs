@@ -1609,6 +1609,101 @@ mod tests {
             .expect("team agents")
             .iter()
             .all(|agent| agent["agent_id"].as_str().is_some_and(|id| !id.is_empty())));
+        let team_id = team_json["team"]["team_id"].as_str().unwrap().to_string();
+        let runs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mission/control/teams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runs.status(), StatusCode::OK);
+        let runs_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(runs.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(runs_json["projection"]["runs"]
+            .as_array()
+            .expect("collaboration runs")
+            .iter()
+            .any(|run| run["team"]["team_id"] == team_id));
+
+        let run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/mission/control/teams/{team_id}/run"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status(), StatusCode::OK);
+        let run_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(run.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(run_json["run"]["kind"], "runtime.collaboration_run");
+        assert!(
+            run_json["run"]["agent_runs"]
+                .as_array()
+                .expect("agent runs")
+                .len()
+                >= 2
+        );
+
+        let handoff = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/control/teams/{team_id}/handoff"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "target": "human-agent",
+                            "note": "review before final synthesis"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handoff.status(), StatusCode::OK);
+        let handoff_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(handoff.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(handoff_json["receipt"]["command"], "handoff");
+        assert!(handoff_json["run"]["team"]["review_notes"]
+            .as_array()
+            .expect("review notes")
+            .iter()
+            .any(|note| note.as_str().is_some_and(|value| value.contains("review"))));
+
+        let synthesis = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mission/control/teams/{team_id}/synthesis"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(synthesis.status(), StatusCode::OK);
+        let synthesis_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(synthesis.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(synthesis_json["summary"]["team_id"], team_id);
+        assert!(synthesis_json["summary"]["role_summaries"]
+            .as_array()
+            .expect("role summaries")
+            .iter()
+            .flat_map(|role| role["evidence_refs"].as_array().into_iter().flatten())
+            .any(|reference| reference
+                .as_str()
+                .is_some_and(|value| value.starts_with("team:"))));
         if let Some(value) = original_config_home {
             std::env::set_var("COWD_CONFIG_HOME", value);
         } else {

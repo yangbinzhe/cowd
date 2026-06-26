@@ -12,9 +12,9 @@ use crate::services::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
     InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
-    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
-    StartMissionTeamRuntimeHttpRequest, SubmitMissionApprovalHttpRequest,
-    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    MissionTeamHandoffHttpRequest, RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest,
+    StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
+    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 
 use super::{api_error, AppState, ErrorResponse};
@@ -38,6 +38,26 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/mission/control/sessions/bridge",
             post(bridge_mission_session_handler),
+        )
+        .route(
+            "/api/mission/control/teams",
+            get(collaboration_runs_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/run",
+            get(collaboration_run_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/cancel",
+            post(cancel_team_runtime_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/handoff",
+            post(handoff_team_runtime_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/synthesis",
+            post(synthesize_team_runtime_handler),
         )
         .route(
             "/api/mission/control/teams/:team_id/execution",
@@ -197,6 +217,61 @@ async fn bridge_mission_session_handler(
     Json(body): Json<runtime::CrossSessionMessage>,
 ) -> impl IntoResponse {
     Json(state.services.mission.bridge_mission_session(body))
+}
+
+async fn collaboration_runs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(state.services.mission.collaboration_runs())
+}
+
+async fn collaboration_run_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .collaboration_run(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn cancel_team_runtime_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .cancel_team_runtime(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn handoff_team_runtime_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+    Json(body): Json<MissionTeamHandoffHttpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .handoff_team_runtime(&team_id, body)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn synthesize_team_runtime_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(team_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .synthesize_team_runtime(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }
 
 async fn team_execution_plan_handler(

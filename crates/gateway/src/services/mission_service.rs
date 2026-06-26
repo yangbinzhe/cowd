@@ -31,6 +31,14 @@ pub(crate) struct StartMissionTeamRuntimeHttpRequest {
     pub(crate) execution_mode: MissionTeamExecutionMode,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MissionTeamHandoffHttpRequest {
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MissionTeamExecutionMode {
@@ -270,6 +278,69 @@ impl MissionService {
             "ok": report.errors.is_empty(),
             "report": report,
             "projection": runtime::MissionControlRuntime::projection(),
+        }))
+    }
+
+    pub(crate) fn collaboration_runs(&self) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.collaboration_runs",
+            "ok": true,
+            "projection": runtime::global_team_runtime_service().collaboration_projection(),
+        })
+    }
+
+    pub(crate) fn collaboration_run(&self, team_id: &str) -> Result<serde_json::Value, String> {
+        let run = runtime::global_team_runtime_service().collaboration_run(team_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.collaboration_run",
+            "ok": true,
+            "run": run,
+        }))
+    }
+
+    pub(crate) fn cancel_team_runtime(&self, team_id: &str) -> Result<serde_json::Value, String> {
+        let receipt = runtime::global_team_runtime_service().cancel(team_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_cancel",
+            "ok": receipt.status != "noop",
+            "receipt": receipt,
+            "run": runtime::global_team_runtime_service().collaboration_run(team_id).ok(),
+        }))
+    }
+
+    pub(crate) fn handoff_team_runtime(
+        &self,
+        team_id: &str,
+        request: MissionTeamHandoffHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        let receipt = runtime::global_team_runtime_service().handoff(
+            team_id,
+            request.target,
+            request.note,
+        )?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_handoff",
+            "ok": receipt.status == "accepted",
+            "receipt": receipt,
+            "run": runtime::global_team_runtime_service().collaboration_run(team_id).ok(),
+        }))
+    }
+
+    pub(crate) fn synthesize_team_runtime(
+        &self,
+        team_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let summary = runtime::global_team_runtime_service().finalize_execution_summary(team_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.team_synthesis",
+            "ok": true,
+            "summary": summary,
+            "run": runtime::global_team_runtime_service().collaboration_run(team_id).ok(),
         }))
     }
 
