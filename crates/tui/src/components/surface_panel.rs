@@ -83,6 +83,20 @@ impl Component for SurfacePanel {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        lines.push(Line::from(vec![
+            Span::styled("Summary: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                surface_summary(&self.surfaces, health),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Next: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                surface_next_action(&self.surfaces, health),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
         lines.push(Line::from(Span::styled(
             "Keys: j/k select  refresh by running /surfaces",
             Style::default().fg(Color::DarkGray),
@@ -235,6 +249,47 @@ fn status_style(status: &str) -> Style {
     }
 }
 
+fn surface_summary(surfaces: &[SurfaceSummary], health: Option<&SurfaceHealthSummary>) -> String {
+    let ready = surfaces
+        .iter()
+        .filter(|surface| matches!(surface.status.as_str(), "builtin" | "ready" | "discovered"))
+        .count();
+    let routes = health
+        .map(|item| item.route_count)
+        .unwrap_or_else(|| surfaces.iter().map(|surface| surface.route_count).sum());
+    let resources = health
+        .map(|item| item.resource_count)
+        .unwrap_or_else(|| surfaces.iter().map(|surface| surface.resource_count).sum());
+    format!(
+        "{ready}/{} ready, routes {routes}, resources {resources}",
+        surfaces.len()
+    )
+}
+
+fn surface_next_action(
+    surfaces: &[SurfaceSummary],
+    health: Option<&SurfaceHealthSummary>,
+) -> &'static str {
+    if surfaces.is_empty() {
+        return "refresh Gateway surface registry";
+    }
+    if health.is_some_and(|item| item.status == "error" || item.status == "offline") {
+        return "inspect Gateway surface host health";
+    }
+    if surfaces.iter().any(|surface| {
+        matches!(
+            surface.status.as_str(),
+            "unavailable" | "error" | "disabled"
+        )
+    }) {
+        return "open selected surface diagnostics";
+    }
+    if surfaces.iter().any(|surface| surface.entry.is_some()) {
+        return "monitor sidecar routes and recent events";
+    }
+    "all registered surfaces are builtin or ready"
+}
+
 fn compact(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -305,6 +360,8 @@ mod tests {
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(joined.contains("Surfaces"), "{joined}");
+        assert!(joined.contains("Summary:"), "{joined}");
+        assert!(joined.contains("Next:"), "{joined}");
         assert!(joined.contains("tui"), "{joined}");
         assert!(joined.contains("webui"), "{joined}");
         assert!(!joined.contains("channel.feishu"), "{joined}");
