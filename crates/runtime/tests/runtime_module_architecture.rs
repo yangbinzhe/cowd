@@ -75,7 +75,6 @@ fn runtime_root_public_modules_are_classified_by_domain() {
         "graph_contract",
         "green_contract",
         "json",
-        "lsp_client",
         "module_map",
         "projection",
         "stale_base",

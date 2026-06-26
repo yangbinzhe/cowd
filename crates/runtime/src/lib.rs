@@ -65,8 +65,6 @@ pub mod execution_outcome;
 mod lane_events;
 #[path = "infrastructure/lifecycle_hooks.rs"]
 pub mod lifecycle_hooks;
-#[path = "infrastructure/lsp_client.rs"]
-pub mod lsp_client;
 #[path = "infrastructure/mcp.rs"]
 mod mcp;
 #[path = "infrastructure/mcp_client.rs"]

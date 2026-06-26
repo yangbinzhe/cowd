@@ -39,6 +39,17 @@ pub enum ToolExecutionStatus {
     Failed,
     Denied,
     Cancelled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolUnavailableReason {
+    MissingDependency,
+    ServerDisconnected,
+    CapabilityUnsupported,
+    Timeout,
+    Misconfigured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +59,7 @@ pub struct ToolExecutionReceipt {
     pub permission: ToolPermissionMode,
     pub evidence_refs: Vec<String>,
     pub error: Option<String>,
+    pub unavailable_reason: Option<ToolUnavailableReason>,
 }
 
 impl ToolExecutionReceipt {
@@ -59,6 +71,7 @@ impl ToolExecutionReceipt {
             permission,
             evidence_refs: Vec::new(),
             error: None,
+            unavailable_reason: None,
         }
     }
 
@@ -74,7 +87,31 @@ impl ToolExecutionReceipt {
             permission,
             evidence_refs: Vec::new(),
             error: Some(error.into()),
+            unavailable_reason: None,
         }
+    }
+
+    #[must_use]
+    pub fn unavailable(
+        tool_name: impl Into<String>,
+        permission: ToolPermissionMode,
+        reason: ToolUnavailableReason,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Unavailable,
+            permission,
+            evidence_refs: Vec::new(),
+            error: Some(error.into()),
+            unavailable_reason: Some(reason),
+        }
+    }
+
+    #[must_use]
+    pub fn with_evidence_ref(mut self, evidence_ref: impl Into<String>) -> Self {
+        self.evidence_refs.push(evidence_ref.into());
+        self
     }
 }
 

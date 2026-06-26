@@ -2,7 +2,10 @@
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +107,8 @@ pub struct LspServerState {
     pub root_path: Option<String>,
     pub capabilities: Vec<String>,
     pub diagnostics: Vec<LspDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +146,31 @@ impl LspRegistry {
                 root_path: root_path.map(str::to_owned),
                 capabilities,
                 diagnostics: Vec::new(),
+                command: None,
+            },
+        );
+    }
+
+    pub fn register_command(
+        &self,
+        language: &str,
+        root_path: Option<&str>,
+        capabilities: Vec<String>,
+        command: Vec<String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        inner.servers.insert(
+            language.to_owned(),
+            LspServerState {
+                language: language.to_owned(),
+                status: LspServerStatus::Connected,
+                root_path: root_path.map(str::to_owned),
+                capabilities,
+                diagnostics: Vec::new(),
+                command: Some(command),
             },
         );
     }
@@ -303,29 +333,299 @@ impl LspRegistry {
             .ok_or_else(|| format!("no LSP server available for path: {path}"))?;
 
         if server.status != LspServerStatus::Connected {
-            return Err(format!(
-                "LSP server for '{}' is not connected (status: {})",
-                server.language, server.status
+            return Ok(lsp_unavailable(
+                action,
+                path,
+                &server.language,
+                format!("server status is {}", server.status),
             ));
         }
 
-        // Return structured placeholder — actual LSP JSON-RPC calls would
-        // go through the real LSP process here.
-        Ok(serde_json::json!({
-            "action": action,
-            "path": path,
-            "line": line,
-            "character": character,
-            "language": server.language,
-            "status": "dispatched",
-            "message": format!("LSP {} dispatched to {} server", action, server.language)
-        }))
+        let Some(command) = server
+            .command
+            .as_ref()
+            .filter(|command| !command.is_empty())
+        else {
+            return Ok(lsp_unavailable(
+                action,
+                path,
+                &server.language,
+                "no stdio JSON-RPC command registered",
+            ));
+        };
+
+        match call_lsp_stdio(command, &server, lsp_action, path, line, character, _query) {
+            Ok(result) => Ok(serde_json::json!({
+                "action": action,
+                "path": path,
+                "line": line,
+                "character": character,
+                "language": server.language,
+                "status": "ok",
+                "result": result,
+                "evidence": {
+                    "transport": "lsp_stdio_json_rpc",
+                    "server": server.language,
+                    "capabilities": server.capabilities
+                }
+            })),
+            Err(error) => Ok(lsp_unavailable(action, path, &server.language, error)),
+        }
     }
+}
+
+fn lsp_unavailable(
+    action: &str,
+    path: &str,
+    language: &str,
+    reason: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": action,
+        "path": path,
+        "language": language,
+        "status": "unavailable",
+        "unavailable_reason": reason.into(),
+        "fallback": ["rg", "tree_sitter", "code_index"]
+    })
+}
+
+fn call_lsp_stdio(
+    command: &[String],
+    server: &LspServerState,
+    action: LspAction,
+    path: &str,
+    line: Option<u32>,
+    character: Option<u32>,
+    query: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let timeout = Duration::from_millis(
+        std::env::var("COWD_LSP_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3_000),
+    );
+    let command = command.to_vec();
+    let server = server.clone();
+    let path = path.to_string();
+    let query = query.map(str::to_string);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = call_lsp_stdio_inner(&command, &server, action, &path, line, character, query);
+        let _ = tx.send(result);
+    });
+
+    rx.recv_timeout(timeout).map_err(|_| {
+        format!(
+            "LSP stdio request timed out after {}ms",
+            timeout.as_millis()
+        )
+    })?
+}
+
+fn call_lsp_stdio_inner(
+    command: &[String],
+    server: &LspServerState,
+    action: LspAction,
+    path: &str,
+    line: Option<u32>,
+    character: Option<u32>,
+    query: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("spawn LSP command failed: {error}"))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "LSP command stdin unavailable".to_string())?;
+        write_lsp_message(stdin, &initialize_request(1, server))?;
+        write_lsp_message(
+            stdin,
+            &action_request(2, action, path, line, character, query),
+        )?;
+        stdin.flush().map_err(|error| error.to_string())?;
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "LSP command stdout unavailable".to_string())?;
+    let mut reader = BufReader::new(stdout);
+    let mut last_response = None;
+    for _ in 0..4 {
+        let response = read_lsp_message(&mut reader)?;
+        if response.get("id").and_then(serde_json::Value::as_i64) == Some(2) {
+            let _ = child.kill();
+            if let Some(error) = response.get("error") {
+                return Err(format!("LSP error response: {error}"));
+            }
+            return Ok(response
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+        last_response = Some(response);
+    }
+    let _ = child.kill();
+    Err(format!(
+        "LSP action response not received; last_response={}",
+        last_response
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+fn initialize_request(id: u64, server: &LspServerState) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "rootUri": server.root_path.as_deref().map(file_uri),
+            "capabilities": {}
+        }
+    })
+}
+
+fn action_request(
+    id: u64,
+    action: LspAction,
+    path: &str,
+    line: Option<u32>,
+    character: Option<u32>,
+    query: Option<String>,
+) -> serde_json::Value {
+    let position = serde_json::json!({
+        "line": line.unwrap_or(0),
+        "character": character.unwrap_or(0)
+    });
+    let text_document = serde_json::json!({ "uri": file_uri(path) });
+    let (method, params) = match action {
+        LspAction::Symbols => (
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": text_document }),
+        ),
+        LspAction::Definition => (
+            "textDocument/definition",
+            serde_json::json!({ "textDocument": text_document, "position": position }),
+        ),
+        LspAction::Hover => (
+            "textDocument/hover",
+            serde_json::json!({ "textDocument": text_document, "position": position }),
+        ),
+        LspAction::References => (
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": text_document,
+                "position": position,
+                "context": { "includeDeclaration": true }
+            }),
+        ),
+        LspAction::Completion => (
+            "textDocument/completion",
+            serde_json::json!({ "textDocument": text_document, "position": position }),
+        ),
+        LspAction::Format => (
+            "textDocument/formatting",
+            serde_json::json!({ "textDocument": text_document, "options": { "tabSize": 4, "insertSpaces": true } }),
+        ),
+        LspAction::Diagnostics => (
+            "workspace/symbol",
+            serde_json::json!({ "query": query.unwrap_or_default() }),
+        ),
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params
+    })
+}
+
+fn file_uri(path: &str) -> String {
+    if path.starts_with("file://") {
+        return path.to_string();
+    }
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    };
+    format!("file://{}", absolute.to_string_lossy().replace('\\', "/"))
+}
+
+fn write_lsp_message(writer: &mut dyn Write, payload: &serde_json::Value) -> Result<(), String> {
+    let body = payload.to_string();
+    write!(
+        writer,
+        "Content-Length: {}\r\n\r\n{}",
+        body.as_bytes().len(),
+        body
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_lsp_message(reader: &mut BufReader<impl Read>) -> Result<serde_json::Value, String> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            return Err("LSP stdout closed before headers".to_string());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid LSP Content-Length: {error}"))?,
+            );
+        }
+    }
+    let length = content_length.ok_or_else(|| "missing LSP Content-Length".to_string())?;
+    let mut body = vec![0_u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|error| format!("invalid LSP JSON response: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn framed_json(value: &serde_json::Value) -> String {
+        let body = value.to_string();
+        format!("Content-Length: {}\r\n\r\n{}", body.as_bytes().len(), body)
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn chrono_like_test_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
 
     #[test]
     fn registers_and_retrieves_server() {
@@ -419,6 +719,11 @@ mod tests {
             .unwrap();
         assert_eq!(result["action"], "hover");
         assert_eq!(result["language"], "rust");
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no stdio JSON-RPC command registered"));
     }
 
     #[test]
@@ -426,9 +731,14 @@ mod tests {
         let registry = LspRegistry::new();
         registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
 
-        assert!(registry
+        let result = registry
             .dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None)
-            .is_err());
+            .unwrap();
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("disconnected"));
     }
 
     #[test]
@@ -591,9 +901,76 @@ mod tests {
         let result = registry.dispatch("hover", Some("src/index.ts"), Some(3), Some(2), None);
 
         // then
-        let error = result.expect_err("disconnected server should fail");
-        assert!(error.contains("typescript"));
-        assert!(error.contains("disconnected"));
+        let result = result.expect("disconnected server should return unavailable payload");
+        assert_eq!(result["language"], "typescript");
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("disconnected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_symbols_uses_stdio_json_rpc_when_command_registered() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let init = framed_json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "capabilities": { "documentSymbolProvider": true } }
+        }));
+        let symbols = framed_json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "main",
+                "kind": 12,
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 1, "character": 9 }
+                },
+                "selectionRange": {
+                    "start": { "line": 1, "character": 3 },
+                    "end": { "line": 1, "character": 7 }
+                }
+            }]
+        }));
+        let script_path = std::env::temp_dir().join(format!(
+            "cowd-fake-lsp-{}-{}.sh",
+            std::process::id(),
+            chrono_like_test_nonce()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null &\nprintf %s {}\nprintf %s {}\n",
+                shell_quote(&init),
+                shell_quote(&symbols)
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+
+        let registry = LspRegistry::new();
+        registry.register_command(
+            "rust",
+            None,
+            vec!["textDocument/documentSymbol".into()],
+            vec![script_path.to_string_lossy().to_string()],
+        );
+
+        let result = registry
+            .dispatch("symbols", Some("src/main.rs"), None, None, None)
+            .unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["result"][0]["name"], "main");
+        assert_eq!(result["evidence"]["transport"], "lsp_stdio_json_rpc");
+
+        let _ = std::fs::remove_file(script_path);
     }
 
     #[test]
