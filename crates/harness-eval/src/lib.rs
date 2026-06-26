@@ -3,7 +3,7 @@
 use harness_contract::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchCaseKind {
     SimpleAnswer,
@@ -864,6 +864,180 @@ pub fn score_report(cases: &[CowdBenchCase], trajectories: &[Trajectory]) -> Ben
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum E2eScenarioKind {
+    SimpleOnce,
+    ComplexPlan,
+    TeamParallel,
+    RealityMemory,
+    ToolLsp,
+    GovernedConnector,
+    Recovery,
+}
+
+impl E2eScenarioKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SimpleOnce => "simple_once",
+            Self::ComplexPlan => "complex_plan",
+            Self::TeamParallel => "team_parallel",
+            Self::RealityMemory => "reality_memory",
+            Self::ToolLsp => "tool_lsp",
+            Self::GovernedConnector => "governed_connector",
+            Self::Recovery => "recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eScenarioMatrixItem {
+    pub id: String,
+    pub kind: E2eScenarioKind,
+    pub objective: String,
+    pub required_evidence: Vec<String>,
+    pub fake_provider_gate: bool,
+    pub real_provider_gate: bool,
+}
+
+#[must_use]
+pub fn stable_ai_scenario_matrix() -> Vec<E2eScenarioMatrixItem> {
+    use E2eScenarioKind::{
+        ComplexPlan, GovernedConnector, RealityMemory, Recovery, SimpleOnce, TeamParallel, ToolLsp,
+    };
+    [
+        (
+            "simple_once",
+            SimpleOnce,
+            "simple task completes in one assistant turn with no unnecessary planning",
+            ["strategy", "assistant_text", "no_repair_required"],
+            true,
+            true,
+        ),
+        (
+            "complex_plan",
+            ComplexPlan,
+            "complex task forms a plan, executes, reviews, and emits evidence",
+            ["workgraph", "tool_events", "review_verdict"],
+            true,
+            true,
+        ),
+        (
+            "team_parallel",
+            TeamParallel,
+            "multi-agent team creates parallel role tasks and a synthesis verdict",
+            ["team_graph", "agent_runs", "synthesis"],
+            true,
+            true,
+        ),
+        (
+            "reality_memory",
+            RealityMemory,
+            "reality core recalls, writes, and detects conflicting facts",
+            ["memory_candidate", "matrix_signal", "fact_conflict"],
+            true,
+            false,
+        ),
+        (
+            "tool_lsp",
+            ToolLsp,
+            "tool runtime records real tool output or structured unavailable fallback",
+            ["tool_receipt", "lsp_result", "evidence_ref"],
+            true,
+            false,
+        ),
+        (
+            "governed_connector",
+            GovernedConnector,
+            "connector/channel action is governed by approval and audit evidence",
+            ["approval", "audit", "dispatch_policy"],
+            true,
+            false,
+        ),
+        (
+            "recovery",
+            Recovery,
+            "failure produces recovery actions and blocks false finalization",
+            ["failure_kind", "recovery_report", "repair_hint"],
+            true,
+            true,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(id, kind, objective, required_evidence, fake_provider_gate, real_provider_gate)| {
+            E2eScenarioMatrixItem {
+                id: id.to_string(),
+                kind,
+                objective: objective.to_string(),
+                required_evidence: required_evidence
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                fake_provider_gate,
+                real_provider_gate,
+            }
+        },
+    )
+    .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StableAiHealthReport {
+    pub kind: String,
+    pub version: String,
+    pub status: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub real_provider_enabled: bool,
+    pub real_provider_reason: String,
+    pub scenario_matrix: Vec<E2eScenarioMatrixItem>,
+    pub fake_provider_result: ScenarioSuiteReport,
+    pub coverage: HarnessCapabilityCoverageReport,
+    pub gateway_smoke: String,
+    pub surface_smoke: String,
+    pub recovery_evidence: String,
+}
+
+impl StableAiHealthReport {
+    #[must_use]
+    pub fn from_fake_eval(
+        version: impl Into<String>,
+        provider: impl Into<String>,
+        model: Option<String>,
+        real_provider_enabled: bool,
+        real_provider_reason: impl Into<String>,
+        fake_provider_result: ScenarioSuiteReport,
+        coverage: HarnessCapabilityCoverageReport,
+        gateway_smoke: impl Into<String>,
+        surface_smoke: impl Into<String>,
+        recovery_evidence: impl Into<String>,
+    ) -> Self {
+        let coverage_passed = coverage.failed == 0;
+        let status = if fake_provider_result.failed == 0 && coverage_passed {
+            "passed"
+        } else {
+            "failed"
+        };
+        Self {
+            kind: "cowd.stable_ai_health_report".to_string(),
+            version: version.into(),
+            status: status.to_string(),
+            provider: provider.into(),
+            model,
+            real_provider_enabled,
+            real_provider_reason: real_provider_reason.into(),
+            scenario_matrix: stable_ai_scenario_matrix(),
+            fake_provider_result,
+            coverage,
+            gateway_smoke: gateway_smoke.into(),
+            surface_smoke: surface_smoke.into(),
+            recovery_evidence: recovery_evidence.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,5 +1207,109 @@ mod tests {
             && item
                 .lifecycle_modules
                 .contains(&"tool_dispatch".to_string())));
+    }
+
+    #[test]
+    fn stable_ai_scenario_matrix_covers_required_e2e_kinds() {
+        let matrix = stable_ai_scenario_matrix();
+        let kinds = matrix
+            .iter()
+            .map(|item| item.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(matrix.len(), 7);
+        assert!(kinds.contains(&E2eScenarioKind::SimpleOnce));
+        assert!(kinds.contains(&E2eScenarioKind::ComplexPlan));
+        assert!(kinds.contains(&E2eScenarioKind::TeamParallel));
+        assert!(kinds.contains(&E2eScenarioKind::RealityMemory));
+        assert!(kinds.contains(&E2eScenarioKind::ToolLsp));
+        assert!(kinds.contains(&E2eScenarioKind::GovernedConnector));
+        assert!(kinds.contains(&E2eScenarioKind::Recovery));
+        assert!(matrix.iter().all(|item| !item.required_evidence.is_empty()));
+    }
+
+    #[test]
+    fn stable_ai_health_report_records_real_provider_gate_reason() {
+        let spec = ScenarioSpec::new("simple_once", "answer once").require(ScenarioCheck::bool(
+            "regression.allowed",
+            ScenarioCheckKind::RegressionAllowed,
+            true,
+            "harness-eval",
+            "fake provider should pass deterministic gate",
+        ));
+        let observation = ScenarioObservation {
+            scenario_id: "simple_once".to_string(),
+            strategy_mode: ExecutionMode::DirectAnswer,
+            finalization_blocked: false,
+            regression_allowed: true,
+            has_workgraph: false,
+            workgraph_quality_ok: false,
+            growth_has_blocker: false,
+            growth_signal_kinds: Vec::new(),
+            memory_candidate_count: 0,
+            matrix_signal_count: 0,
+            assistant_text: "done".to_string(),
+        };
+        let scenario_report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
+        let report = StableAiHealthReport::from_fake_eval(
+            "0.9.396",
+            "fake_provider",
+            None,
+            false,
+            "real provider not enabled",
+            scenario_report,
+            harness_capability_coverage_report(),
+            "gateway skipped",
+            "surface skipped",
+            "recovery report present",
+        );
+
+        assert_eq!(report.status, "passed");
+        assert!(!report.real_provider_enabled);
+        assert_eq!(report.real_provider_reason, "real provider not enabled");
+        assert_eq!(report.scenario_matrix.len(), 7);
+    }
+
+    #[test]
+    fn real_ai_deep_scenarios() {
+        use runtime::ApiClient;
+
+        if std::env::var("COWD_EVAL_REAL_MODEL").ok().as_deref() != Some("1") {
+            eprintln!(
+                "real_ai_deep_scenarios skipped: set COWD_EVAL_REAL_MODEL=1 to consume provider quota"
+            );
+            return;
+        }
+        let model =
+            std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+        let mut client = runtime::ProviderRuntimeClient::new(model.clone(), Vec::new())
+            .expect("provider client should initialize when real eval is enabled");
+        let request = runtime::ApiRequest {
+            system_prompt: vec![
+                "You are a strict health-check responder. Return exactly: OK".to_string(),
+            ],
+            messages: vec![runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![runtime::ContentBlock::Text {
+                    text: "Return exactly OK.".to_string(),
+                }],
+                usage: None,
+            }],
+            model,
+        };
+        let events = client
+            .stream_collect(request)
+            .expect("real provider deep scenario should return events");
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                runtime::AssistantEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            !text.trim().is_empty(),
+            "real provider deep scenario must produce assistant text"
+        );
     }
 }
