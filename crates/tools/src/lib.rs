@@ -419,24 +419,42 @@ fn kernel_permission_mode(permission: PermissionMode) -> KernelToolPermissionMod
         }
     }
 }
+#[path = "execution/executor.rs"]
 pub mod executor;
 pub(crate) use executor::*;
 // Re-export public items needed by downstream crates
 pub use executor::{execute_tool, ToolSearchOutput};
+#[path = "execution/bash.rs"]
 pub mod bash;
+#[path = "state/checkpoint.rs"]
 pub mod checkpoint;
+#[path = "filesystem/file_ops.rs"]
 pub mod file_ops;
+#[path = "policy/gates.rs"]
 pub mod gates;
+#[path = "policy/lane_events.rs"]
 pub mod lane_events;
+#[path = "policy/lane_policy.rs"]
 pub mod lane_policy;
+#[path = "state/lsp_client.rs"]
 pub mod lsp_client;
+#[path = "state/mutation_plan.rs"]
 pub mod mutation_plan;
+#[path = "filesystem/pdf_extract.rs"]
 pub mod pdf_extract;
+#[path = "policy/permissions.rs"]
 pub mod permissions;
+#[path = "execution/prepared.rs"]
 pub(crate) mod prepared;
+#[path = "execution/sandbox_exec.rs"]
 pub mod sandbox_exec;
+#[path = "policy/stale_branch.rs"]
 pub mod stale_branch;
+#[path = "state/tool_cache.rs"]
 pub mod tool_cache;
+#[path = "state/tool_orchestrator.rs"]
 pub mod tool_orchestrator;
+#[path = "registry/tool_specs.rs"]
 pub mod tool_specs;
+#[path = "registry/web_tools.rs"]
 pub mod web_tools;

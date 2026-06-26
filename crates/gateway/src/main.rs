@@ -5,42 +5,71 @@
     dead_code
 )]
 #![deny(deprecated)]
+#[path = "static/agent_static.rs"]
 mod agent_static;
 mod api_routes;
+#[path = "core/bootstrap.rs"]
 mod bootstrap;
+#[path = "core/boundary_policy.rs"]
 mod boundary_policy;
+#[path = "core/checks.rs"]
 mod checks;
 mod cli;
 mod command;
+#[path = "core/compat_manifest.rs"]
 mod compat_manifest;
+#[path = "core/doctor.rs"]
 mod doctor;
 mod entry;
+#[path = "core/event_bus.rs"]
 mod event_bus;
+#[path = "core/gateway.rs"]
 mod gateway;
+#[path = "infrastructure/gateway_health.rs"]
 mod gateway_health;
+#[path = "core/gateway_service.rs"]
 mod gateway_service;
+#[path = "infrastructure/gateway_static.rs"]
 mod gateway_static;
+#[path = "infrastructure/gateway_storage.rs"]
 mod gateway_storage;
+#[path = "runtime/gateway_tool_executor.rs"]
 mod gateway_tool_executor;
+#[path = "core/init.rs"]
 mod init;
+#[path = "core/logging.rs"]
 mod logging;
+#[path = "infrastructure/matrix_sqlite_repository.rs"]
 mod matrix_sqlite_repository;
+#[path = "runtime/mcp_serve.rs"]
 mod mcp_serve;
+#[path = "static/plugin_static.rs"]
 mod plugin_static;
+#[path = "runtime/runtime_bootstrap.rs"]
 mod runtime_bootstrap;
+#[path = "runtime/runtime_boundary.rs"]
 mod runtime_boundary;
+#[path = "runtime/runtime_entry.rs"]
 mod runtime_entry;
+#[path = "runtime/runtime_factory.rs"]
 mod runtime_factory;
 mod runtime_host;
+#[path = "runtime/runtime_protocol.rs"]
 mod runtime_protocol;
+#[path = "runtime/runtime_service.rs"]
 mod runtime_service;
 mod server;
 mod services;
+#[path = "kernel/session_kernel.rs"]
 mod session_kernel;
+#[path = "kernel/session_lifecycle_kernel.rs"]
 mod session_lifecycle_kernel;
+#[path = "static/skill_static.rs"]
 mod skill_static;
+#[path = "core/suggestions.rs"]
 mod suggestions;
 mod surface_host;
+#[path = "kernel/task_kernel.rs"]
 mod task_kernel;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};

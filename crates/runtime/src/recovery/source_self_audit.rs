@@ -112,7 +112,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
 }
 
 fn growth_routes_are_observable(repo_root: &Path) -> SourceSelfAuditCheck {
-    let routes = repo_root.join("crates/gateway/src/api_routes.rs");
+    let routes = repo_root.join("crates/gateway/src/api_routes/mod.rs");
     let growth = repo_root.join("crates/gateway/src/api_routes/growth_routes.rs");
     let routes_source = read_source(&routes);
     let growth_source = read_source(&growth);

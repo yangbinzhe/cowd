@@ -36,10 +36,10 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
     let checked_files = [
         "crates/surface/src/channel.rs",
         "crates/connector/src/lib.rs",
-        "crates/gateway/src/api_routes.rs",
+        "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
         "crates/runtime/src/lib.rs",
-        "crates/tui/src/runtime_control_store.rs",
+        "crates/tui/src/app_core/runtime_control_store.rs",
         "crates/tui/src/components/command_palette.rs",
         "crates/tui/src/components/gateway_panel.rs",
     ];
@@ -56,6 +56,66 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
 }
 
 #[test]
+fn macro_crates_keep_source_files_grouped_by_business_boundary() {
+    assert_root_rs_files("crates/gateway/src", &["main.rs"]);
+    assert_root_rs_files("crates/tui/src", &["lib.rs"]);
+    assert_root_rs_files("crates/tools/src", &["lib.rs"]);
+    assert_root_rs_files("crates/matrix/core/src", &["lib.rs"]);
+
+    for (root, dirs) in [
+        (
+            "crates/gateway/src",
+            &[
+                "api_routes",
+                "cli",
+                "command",
+                "core",
+                "entry",
+                "infrastructure",
+                "kernel",
+                "runtime",
+                "runtime_host",
+                "server",
+                "services",
+                "static",
+                "surface_host",
+            ][..],
+        ),
+        (
+            "crates/tui/src",
+            &[
+                "app_core",
+                "components",
+                "event",
+                "gateway",
+                "integration",
+                "keybind",
+                "layout",
+                "platform",
+                "rendering",
+                "test_utils",
+                "theme",
+            ][..],
+        ),
+        (
+            "crates/tools/src",
+            &["execution", "filesystem", "policy", "registry", "state"][..],
+        ),
+        (
+            "crates/matrix/core/src",
+            &["contract", "entity", "fact", "metric", "source"][..],
+        ),
+    ] {
+        for dir in dirs {
+            assert!(
+                repo_root().join(root).join(dir).is_dir(),
+                "{root}/{dir} must exist as an architecture directory"
+            );
+        }
+    }
+}
+
+#[test]
 fn daemon_module_is_removed_after_runtime_host_consolidation() {
     let root = repo_root();
     assert!(
@@ -66,6 +126,29 @@ fn daemon_module_is_removed_after_runtime_host_consolidation() {
     assert!(
         !production_part(&main_source).contains("mod daemon;"),
         "gateway main must not register daemon as a module"
+    );
+}
+
+fn assert_root_rs_files(src: &str, allowed: &[&str]) {
+    let allowed = allowed
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = std::fs::read_dir(repo_root().join(src))
+        .expect("source directory should read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .map(|path| {
+            path.file_name()
+                .expect("source file name")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual, allowed,
+        "{src} must not regain root-level source file sprawl"
     );
 }
 
@@ -89,8 +172,8 @@ fn runtime_host_owns_gateway_runtime_implementation() {
 fn production_code_does_not_depend_on_daemon_module() {
     let files = [
         "crates/gateway/src/main.rs",
-        "crates/gateway/src/api_routes.rs",
-        "crates/gateway/src/runtime_service.rs",
+        "crates/gateway/src/api_routes/mod.rs",
+        "crates/gateway/src/runtime/runtime_service.rs",
         "crates/gateway/src/runtime_host/mod.rs",
     ];
     for file in files {
@@ -463,7 +546,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     let gateway_services = production_part(&gateway_services_source);
     let surface_service_source = read_repo("crates/gateway/src/services/surface_service.rs");
     let surface_service = production_part(&surface_service_source);
-    let api_state_source = read_repo("crates/gateway/src/api_routes.rs");
+    let api_state_source = read_repo("crates/gateway/src/api_routes/mod.rs");
     let api_state = production_part(&api_state_source);
     assert!(
         gateway_services.contains("pub(crate) surface: SurfaceService"),
@@ -483,7 +566,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
 
     for source_path in [
         "crates/gateway/src/main.rs",
-        "crates/gateway/src/api_routes.rs",
+        "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
         "crates/gateway/src/api_routes/channel_routes.rs",
         "crates/gateway/src/api_routes/cross_plane_routes.rs",
@@ -504,7 +587,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
         "crates/gateway/src/api_routes/channel_routes.rs",
         "crates/gateway/src/api_routes/cross_plane_routes.rs",
         "crates/gateway/src/api_routes/mfg_routes.rs",
-        "crates/gateway/src/gateway_health.rs",
+        "crates/gateway/src/infrastructure/gateway_health.rs",
     ] {
         let source = production_part(&read_repo(source_path)).to_string();
         assert!(
@@ -578,7 +661,8 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
             .contains("fact-kernel = { path = \"../../fact-kernel\" }"),
         "matrix-core must depend on fact-kernel for structured fact semantics"
     );
-    let matrix_fact = production_part(&read_repo("crates/matrix/core/src/fact.rs")).to_string();
+    let matrix_fact =
+        production_part(&read_repo("crates/matrix/core/src/fact/fact.rs")).to_string();
     for required in [
         "to_fact_kernel_matrix_fact",
         "from_fact_kernel_matrix_fact",
@@ -652,7 +736,7 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && gateway_services.contains("risk_gate_projection"),
         "GatewayServices must include concrete provider, reality, growth, and audit projections"
     );
-    let api_routes = read_repo("crates/gateway/src/api_routes.rs");
+    let api_routes = read_repo("crates/gateway/src/api_routes/mod.rs");
     let reality_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/reality_routes.rs",
     ))
@@ -715,8 +799,10 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && growth_service.contains("deterministic_memory_contradiction"),
         "Growth memory governance must use slot plus assertion keys instead of a single coarse semantic key"
     );
-    let gateway_health =
-        production_part(&read_repo("crates/gateway/src/gateway_health.rs")).to_string();
+    let gateway_health = production_part(&read_repo(
+        "crates/gateway/src/infrastructure/gateway_health.rs",
+    ))
+    .to_string();
     assert!(
         gateway_health.contains("growth_storage_migrations")
             && gateway_health.contains("inspect_growth_migrations")
@@ -760,7 +846,7 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         "message routes must delegate active runtime reads and turn execution receipt projection to services"
     );
     let runtime_service =
-        production_part(&read_repo("crates/gateway/src/runtime_service.rs")).to_string();
+        production_part(&read_repo("crates/gateway/src/runtime/runtime_service.rs")).to_string();
     assert!(
         runtime_service.contains("pub(crate) struct RuntimeTurnExecution")
             && runtime_service.contains("fn start_running_turn")
@@ -813,7 +899,7 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         "crates/gateway/src/api_routes/runtime_routes.rs",
     ))
     .to_string();
-    let tui_gateway_client_source = read_repo("crates/tui/src/gateway_client.rs");
+    let tui_gateway_client_source = read_repo("crates/tui/src/gateway/gateway_client.rs");
     let tui_gateway_client = production_part(&tui_gateway_client_source);
     assert!(
         !runtime_routes.contains("/api/runtime/sessions/")
@@ -1235,7 +1321,7 @@ fn entry_boundary_crates_exist_as_migration_targets() {
 
 #[test]
 fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback() {
-    let full_source = read_repo("crates/tui/src/runner.rs");
+    let full_source = read_repo("crates/tui/src/gateway/runner.rs");
     let source = source_between(
         &full_source,
         "pub fn run_gateway_tui(config: GatewayTuiConfig)",
@@ -1275,7 +1361,7 @@ fn tui_terminal_path_requires_gateway_backend_instead_of_local_runtime_fallback(
 #[test]
 fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_templates() {
     let gateway_client =
-        production_part(&read_repo("crates/tui/src/gateway_client.rs")).to_string();
+        production_part(&read_repo("crates/tui/src/gateway/gateway_client.rs")).to_string();
     for required in [
         "pub async fn surface_registry",
         "pub async fn surface_health_summary",
@@ -1295,8 +1381,8 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
     for file in [
         "crates/tui/src/components/gateway_panel.rs",
         "crates/tui/src/components/command_palette.rs",
-        "crates/tui/src/state.rs",
-        "crates/tui/src/runner.rs",
+        "crates/tui/src/app_core/state.rs",
+        "crates/tui/src/gateway/runner.rs",
     ] {
         let source = production_part(&read_repo(file)).to_string();
         for forbidden in [
@@ -1372,7 +1458,7 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
         "production gateway entry must not directly execute AI turns; use RuntimeService or Gateway HTTP surfaces"
     );
 
-    let runtime_service_source = read_repo("crates/gateway/src/runtime_service.rs");
+    let runtime_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
     let runtime_service = production_part(&runtime_service_source);
     assert!(
         runtime_service.contains("run_turn_with_timeout")
@@ -1418,7 +1504,7 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
         );
     }
 
-    let runtime_factory = read_repo("crates/gateway/src/runtime_factory.rs");
+    let runtime_factory = read_repo("crates/gateway/src/runtime/runtime_factory.rs");
     assert!(
         runtime_factory.contains("pub(crate) fn build_runtime(")
             && runtime_factory.contains("pub(crate) fn build_runtime_with_session_store(")

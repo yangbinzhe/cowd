@@ -8,6 +8,9 @@ LANE="${1:-${COWD_VALIDATION_LANE:-contract}}"
 MANUAL_TARGET="${2:-}"
 
 case "$LANE" in
+  quick) LANE="quick" ;;
+  changed|changed-crates) LANE="changed-crates" ;;
+  full-regression) LANE="full-regression" ;;
   unit-fast|fast) LANE="unit-fast" ;;
   contract|core) LANE="contract" ;;
   scenario|live) LANE="scenario" ;;
@@ -18,9 +21,12 @@ case "$LANE" in
   manual) LANE="manual" ;;
   -h|--help|help)
     cat <<'EOF'
-Usage: scripts/validate.sh [unit-fast|contract|serial-global|scenario|surface|release|all|manual <name>]
+Usage: scripts/validate.sh [quick|changed-crates|full-regression|unit-fast|contract|serial-global|scenario|surface|release|all|manual <name>]
 
 Lanes:
+  quick      current default edit gate: fmt, workspace check, architecture gates, small boundary crates
+  changed-crates  precise touched-crate gate; base defaults to HEAD or COWD_CHANGED_BASE
+  full-regression final Rust regression: fmt, workspace check, workspace all-target tests single-threaded
   unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
   contract   package/API/CLI contracts without browser or tmux scenarios
   serial-global  tests that mutate process-global env/cwd/provider/session state
@@ -36,7 +42,7 @@ Governance:
   are not release gates unless explicitly promoted by that inventory.
 
 Compatibility aliases:
-  fast -> unit-fast, core -> contract, live -> scenario, full -> all
+  changed -> changed-crates, fast -> unit-fast, core -> contract, live -> scenario, full -> all
 
 Manual targets:
   agent-graph
@@ -178,29 +184,30 @@ fail_if_needed() {
 }
 
 run_unit_fast() {
-  run_step cargo_fmt cargo fmt --check
-  run_step cargo_test_plugins cargo test -p plugins --no-default-features -- --nocapture
-  run_step cargo_test_telemetry cargo test -p telemetry --no-default-features -- --nocapture
-  run_step cargo_test_command_contract cargo test -p command-contract --no-default-features -- --nocapture
-  run_step cargo_test_command_service cargo test -p command-service --no-default-features -- --nocapture
-  run_step cargo_test_memory_tuner cargo test -p memory performance_monitor::tests::test_tuner --no-default-features -- --nocapture
-  run_step cargo_test_runtime_worker_state cargo test -p runtime worker_boot::tests::emit_state_file_writes_worker_status_on_transition --no-default-features -- --nocapture
+  run_quick
+}
+
+run_quick() {
+  run_step quick_gate bash scripts/test/quick.sh
+}
+
+run_changed_crates() {
+  run_step changed_crates_gate bash scripts/test/changed-crates.sh "${COWD_CHANGED_BASE:-HEAD}"
+}
+
+run_full_regression() {
+  run_step full_regression_gate bash scripts/test/full-regression.sh
 }
 
 run_contract() {
-  run_step cargo_fmt cargo fmt --check
-  for pkg in provider command-contract command-service memory plugins runtime telemetry tools; do
-    run_step "cargo_test_$pkg" cargo test -p "$pkg" --no-default-features -- --nocapture
+  run_step cargo_fmt cargo fmt --all --check
+  run_step cargo_check_workspace cargo check --workspace --all-targets
+  for pkg in approval cli connector fact-kernel harness-contract harness-eval matrix-core model-protocol plugins provider session skill-service storage surface tools; do
+    run_step "cargo_test_$pkg" cargo test -p "$pkg" --all-targets
   done
-  run_step cargo_test_runtime_structured_data cargo test -p runtime structured_data --no-default-features -- --nocapture
-  run_step cargo_test_gateway_setup timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p gateway setup --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_gateway_gateway timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p gateway gateway::tests:: --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_gateway_runtime_control timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p gateway runtime_control --no-default-features -- --nocapture --test-threads=1
-  run_step cargo_test_gateway_connector timeout "${GATEWAY_TEST_TIMEOUT_SECS:-240}" \
-    cargo test -p gateway connector --no-default-features -- --nocapture --test-threads=1
+  run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture
+  run_step cargo_test_gateway_architecture cargo test -p gateway --test gateway_runtimehost_architecture
+  run_step cargo_test_memory_architecture cargo test -p memory --test memory_module_architecture
 }
 
 run_serial_global() {
@@ -282,6 +289,9 @@ run_manual() {
 }
 
 case "$LANE" in
+  quick) run_quick ;;
+  changed-crates) run_changed_crates ;;
+  full-regression) run_full_regression ;;
   unit-fast) run_unit_fast ;;
   contract) run_contract ;;
   serial-global) run_serial_global ;;

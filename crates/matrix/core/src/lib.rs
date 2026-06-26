@@ -1,21 +1,38 @@
 //! Matrix structured fact engine contracts.
 
+#[path = "metric/attention.rs"]
 mod attention;
+#[path = "source/change.rs"]
 mod change;
+#[path = "metric/compute.rs"]
 mod compute;
+#[path = "source/connector_runtime.rs"]
 mod connector_runtime;
+#[path = "source/data_plane.rs"]
 mod data_plane;
+#[path = "entity/entity.rs"]
 mod entity;
+#[path = "fact/evidence.rs"]
 mod evidence;
+#[path = "fact/fact.rs"]
 mod fact;
+#[path = "metric/metric.rs"]
 mod metric;
+#[path = "metric/metric_attention.rs"]
 mod metric_attention;
+#[path = "metric/metric_graph.rs"]
 mod metric_graph;
+#[path = "entity/ontology.rs"]
 mod ontology;
+#[path = "metric/quality.rs"]
 mod quality;
+#[path = "entity/relation.rs"]
 mod relation;
+#[path = "source/source.rs"]
 mod source;
+#[path = "source/source_pack.rs"]
 mod source_pack;
+#[path = "contract/structured.rs"]
 pub mod structured;
 
 pub use attention::{MatrixAttentionItem, MatrixSeverity};

@@ -5142,7 +5142,8 @@ mod tests {
 
     #[test]
     fn tools_executor_does_not_own_agent_lifecycle() {
-        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/executor.rs");
+        let source_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
         let source =
             std::fs::read_to_string(source_path).expect("executor source should be readable");
         for forbidden in [
@@ -5167,7 +5168,7 @@ mod tests {
     fn tools_crate_does_not_own_runtime_control_plane_registries() {
         let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
         let executor_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/executor.rs");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
         let lib = std::fs::read_to_string(lib_path).expect("lib source should be readable");
         let executor =
             std::fs::read_to_string(executor_path).expect("executor source should be readable");
