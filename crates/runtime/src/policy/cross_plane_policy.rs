@@ -1552,7 +1552,7 @@ mod tests {
     #[test]
     fn verified_low_risk_action_is_allowed_without_extra_grant() {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::Low;
 
@@ -1599,12 +1599,12 @@ mod tests {
     #[test]
     fn connector_context_disabled_account_denies_commit() {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.identity_trust = IdentityTrust::Verified;
         let context = ConnectorActionContext {
             provider: "mock.docs".to_string(),
             plane: "channel".to_string(),
-            capability_id: "channel.feishu.send_text".to_string(),
+            capability_id: "channel.chat.send_text".to_string(),
             provider_account: Some("mock-docs-main".to_string()),
             account_status: Some("disabled".to_string()),
             account_reason: Some("platform is disabled".to_string()),
@@ -1657,7 +1657,7 @@ mod tests {
     #[test]
     fn high_risk_requires_approval_without_matching_grant() {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        let mut action = CrossPlaneAction::new("user:yi", "service.drive.download");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::High;
 
@@ -1669,16 +1669,16 @@ mod tests {
 
     #[test]
     fn matching_grant_allows_high_risk_cross_channel_action() {
-        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.drive.download");
-        grant.resource_ref = Some("service://feishu/drive/file_1".to_string());
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.drive.download");
+        grant.resource_ref = Some("service://drive/drive/file_1".to_string());
         grant.source_channel = Some("channel://wechat/chat/u1".to_string());
 
         let engine =
             CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(vec![grant]);
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        let mut action = CrossPlaneAction::new("user:yi", "service.drive.download");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::High;
-        action.resource_ref = Some("service://feishu/drive/file_1".to_string());
+        action.resource_ref = Some("service://drive/drive/file_1".to_string());
         action.source_channel = Some("channel://wechat/chat/u1".to_string());
 
         let decision = engine.decide(&action, now());
@@ -1691,13 +1691,13 @@ mod tests {
     #[test]
     fn control_plane_consumes_single_use_grant_and_audits_evidence() {
         let control = CrossPlaneControlPlane::new();
-        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.drive.download");
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.drive.download");
         grant.grant_type = GrantType::SingleUse;
         grant.remaining_uses = None;
         let grant_id = grant.id.clone();
         control.upsert_grant(grant);
 
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        let mut action = CrossPlaneAction::new("user:yi", "service.drive.download");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::High;
 
@@ -1732,7 +1732,7 @@ mod tests {
         let control = CrossPlaneControlPlane::new();
         control.upsert_identity(CrossPlaneIdentityBinding::verified(
             "user:yi",
-            "channel://feishu/user/u1?email=Yi@Example.COM",
+            "channel://chat/user/u1?email=Yi@Example.COM",
         ));
         control.upsert_identity(CrossPlaneIdentityBinding {
             id: "idb-observed".to_string(),
@@ -1758,7 +1758,7 @@ mod tests {
         let control = CrossPlaneControlPlane::new();
         control.upsert_identity(CrossPlaneIdentityBinding::verified(
             "user:yi",
-            "channel://feishu/user/u1?email=yi@example.com",
+            "channel://chat/user/u1?email=yi@example.com",
         ));
         control.upsert_identity(CrossPlaneIdentityBinding {
             id: "idb-exact".to_string(),
@@ -1784,13 +1784,13 @@ mod tests {
         let control = CrossPlaneControlPlane::new();
         control.upsert_identity(CrossPlaneIdentityBinding::verified(
             "user:yi",
-            "channel://feishu/user/u1?email=yi@example.com",
+            "channel://chat/user/u1?email=yi@example.com",
         ));
         control.upsert_grant(CrossPlaneGrant::persistent(
             "user:yi",
-            "service.feishu.drive.download",
+            "service.drive.download",
         ));
-        let mut action = CrossPlaneAction::new("", "service.feishu.drive.download");
+        let mut action = CrossPlaneAction::new("", "service.drive.download");
         action.actor_identity_ref = Some("channel://wechat/user/wx1?email=yi@example.com".into());
         action.identity_trust = IdentityTrust::Unknown;
         action.risk = CrossPlaneRisk::High;
@@ -1814,11 +1814,11 @@ mod tests {
     #[test]
     fn control_plane_pure_decision_does_not_consume_single_use_grant_or_audit() {
         let control = CrossPlaneControlPlane::new();
-        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.drive.download");
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.drive.download");
         grant.grant_type = GrantType::SingleUse;
         grant.remaining_uses = None;
         control.upsert_grant(grant);
-        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        let mut action = CrossPlaneAction::new("user:yi", "service.drive.download");
         action.identity_trust = IdentityTrust::Verified;
         action.risk = CrossPlaneRisk::High;
 
@@ -1878,43 +1878,40 @@ mod tests {
 
     #[test]
     fn dispatch_target_builds_ready_text_plan_from_channel_ref() {
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.source_channel = Some("channel://wechat/chat/source".to_string());
         action.session_id = Some("session-1".to_string());
-        action.target_ref = Some("channel://feishu/user/open-id/thread/chat-id".to_string());
+        action.target_ref = Some("channel://chat/user/open-id/thread/chat-id".to_string());
         action.resource_ref = Some("text://hello runtime".to_string());
 
-        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("chat"), None)
             .expect("dispatchable action should produce a target contract");
 
         assert!(target.ready);
-        assert_eq!(target.platform.as_deref(), Some("feishu"));
+        assert_eq!(target.platform.as_deref(), Some("chat"));
         assert_eq!(target.operation.as_deref(), Some("send_text"));
-        assert_eq!(
-            target.session_key.as_deref(),
-            Some("feishu:open-id:chat-id")
-        );
+        assert_eq!(target.session_key.as_deref(), Some("chat:open-id:chat-id"));
         let outbound = target
             .outbound_message
             .as_ref()
             .expect("ready target should include outbound message");
-        assert_eq!(outbound.session_key, "feishu:open-id:chat-id");
+        assert_eq!(outbound.session_key, "chat:open-id:chat-id");
         assert_eq!(outbound.text, "hello runtime");
         assert_eq!(outbound.payload_kind, "text");
         assert_eq!(outbound.payload_ref, "hello runtime");
         assert_eq!(
             outbound.metadata["requested_capability"],
-            "channel.feishu.send_text"
+            "channel.chat.send_text"
         );
     }
 
     #[test]
     fn dispatch_target_builds_ready_media_plan_without_text_smuggling() {
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_image");
-        action.target_ref = Some("channel://feishu/chat/open-chat".to_string());
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_image");
+        action.target_ref = Some("channel://chat/chat/open-chat".to_string());
         action.resource_ref = Some("image://https://example.test/diagram.png".to_string());
 
-        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("chat"), None)
             .expect("dispatchable image action should produce a target contract");
 
         assert!(target.ready);
@@ -1928,11 +1925,11 @@ mod tests {
 
     #[test]
     fn dispatch_target_builds_ready_file_plan_with_file_name() {
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_file");
-        action.target_ref = Some("channel://feishu/chat/open-chat".to_string());
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_file");
+        action.target_ref = Some("channel://chat/chat/open-chat".to_string());
         action.resource_ref = Some("file:///tmp/runtime-report.pdf".to_string());
 
-        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("chat"), None)
             .expect("dispatchable file action should produce a target contract");
 
         assert!(target.ready);
@@ -1944,10 +1941,10 @@ mod tests {
 
     #[test]
     fn dispatch_target_reports_missing_target_without_panicking() {
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.resource_ref = Some("text://hello runtime".to_string());
 
-        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("chat"), None)
             .expect("dispatchable capability still produces diagnostics");
 
         assert!(!target.ready);
@@ -1959,13 +1956,13 @@ mod tests {
 
     #[test]
     fn execution_receipt_roundtrips_typed_dispatch_target() {
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.identity_trust = IdentityTrust::Verified;
-        action.target_ref = Some("feishu:open-id".to_string());
+        action.target_ref = Some("chat:open-id".to_string());
         action.resource_ref = Some("text://persist me".to_string());
         let decision =
             CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).decide(&action, now());
-        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None);
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("chat"), None);
         let receipt = CrossPlaneExecutionReceipt::new(
             Some("idem-1".to_string()),
             "dry_run",
@@ -1978,9 +1975,9 @@ mod tests {
         )
         .with_dispatch_target(target)
         .with_dispatch_outcome(Some(CrossPlaneDispatchOutcome::sent(
-            "feishu",
+            "chat",
             "send_text",
-            "feishu:open-id",
+            "chat:open-id",
             Some("om-test".to_string()),
         )));
 
@@ -1992,7 +1989,7 @@ mod tests {
                 .dispatch_target
                 .as_ref()
                 .and_then(|target| target.session_key.as_deref()),
-            Some("feishu:open-id")
+            Some("chat:open-id")
         );
         assert_eq!(
             decoded
@@ -2033,9 +2030,9 @@ mod tests {
     #[test]
     fn control_plane_upserts_revokes_and_audits() {
         let control = CrossPlaneControlPlane::new();
-        let binding = CrossPlaneIdentityBinding::verified("user:yi", "channel://feishu/user/u1");
+        let binding = CrossPlaneIdentityBinding::verified("user:yi", "channel://chat/user/u1");
         let binding_id = binding.id.clone();
-        let grant = CrossPlaneGrant::persistent("user:yi", "channel.feishu.send_text");
+        let grant = CrossPlaneGrant::persistent("user:yi", "channel.chat.send_text");
         let grant_id = grant.id.clone();
 
         control.upsert_identity(binding);
@@ -2043,7 +2040,7 @@ mod tests {
         assert_eq!(control.list_identities().len(), 1);
         assert_eq!(control.list_grants().len(), 1);
 
-        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.identity_trust = IdentityTrust::Verified;
         let decision = control.decide_and_audit(action, now());
 
@@ -2088,7 +2085,7 @@ mod tests {
     fn control_plane_audit_is_bounded_to_recent_records() {
         let control = CrossPlaneControlPlane::new();
         for idx in 0..(MAX_CROSS_PLANE_AUDIT_RECORDS + 3) {
-            let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+            let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
             action.session_id = Some(format!("session-{idx}"));
             control.record_audit(CrossPlaneAuditRecord::new(
                 action,

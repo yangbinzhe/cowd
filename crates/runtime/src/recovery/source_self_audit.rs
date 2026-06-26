@@ -37,7 +37,7 @@ impl RuntimeSourceSelfAudit {
     pub fn audit_repo(repo_root: impl AsRef<Path>) -> SourceSelfAuditReport {
         let repo_root = repo_root.as_ref();
         let checks = vec![
-            runtime_does_not_depend_on_channel(repo_root),
+            runtime_has_no_surface_sdk_dependency(repo_root),
             gateway_owns_surface_boundary(repo_root),
             runtime_host_uses_runtime_service(repo_root),
             growth_routes_are_observable(repo_root),
@@ -57,19 +57,19 @@ impl RuntimeSourceSelfAudit {
     }
 }
 
-fn runtime_does_not_depend_on_channel(repo_root: &Path) -> SourceSelfAuditCheck {
+fn runtime_has_no_surface_sdk_dependency(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/runtime/Cargo.toml");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
         !source.contains("channel = ") && !source.contains("channel-adapters")
     });
     check(
-        "runtime.no_channel_dependency",
+        "runtime.no_surface_sdk_dependency",
         "runtime",
         passed,
-        "runtime must not depend on channel crates",
+        "runtime must not depend on external surface SDK crates",
         vec![path],
-        "remove channel/channel-adapters dependencies from crates/runtime/Cargo.toml and route external traffic through Gateway Surface services",
+        "remove external surface SDK dependencies from crates/runtime/Cargo.toml and route external traffic through Gateway Surface services",
     )
 }
 
@@ -198,7 +198,7 @@ mod tests {
         assert!(report
             .checks
             .iter()
-            .any(|check| check.id == "runtime.no_channel_dependency"));
+            .any(|check| check.id == "runtime.no_surface_sdk_dependency"));
         assert!(report
             .checks
             .iter()

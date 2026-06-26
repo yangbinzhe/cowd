@@ -1535,7 +1535,7 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
     assert!(
         runtime_lib.contains("pub mod source_self_audit")
             && runtime_lib.contains("RuntimeSourceSelfAudit")
-            && runtime_audit.contains("runtime.no_channel_dependency")
+            && runtime_audit.contains("runtime.no_surface_sdk_dependency")
             && runtime_audit.contains("gateway.owns_surface_boundary")
             && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
             && runtime_audit.contains("harness_eval.repair_hints"),

@@ -767,7 +767,7 @@ pub struct GatewayConfig {
 /// Configuration for a single inbound platform adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformConfig {
-    /// Discriminator: `"api_server"`, `"email"`, `"feishu"`, `"wecom"`, etc.
+    /// Discriminator: `"api_server"`, `"email"`, `"chat"`, `"wecom"`, etc.
     pub platform_type: String,
     pub enabled: bool,
     /// Platform-specific JSON blob (opaque to the runtime core).

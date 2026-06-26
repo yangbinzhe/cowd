@@ -387,10 +387,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let code = manager.generate_code("feishu", "user123").await.unwrap();
+        let code = manager.generate_code("chat", "user123").await.unwrap();
 
         let (channel, verified_ref) = manager.verify_code(&code).await.unwrap();
-        assert_eq!(channel, "feishu");
+        assert_eq!(channel, "chat");
         assert_eq!(verified_ref, "user123");
     }
 
@@ -408,7 +408,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let code = manager.generate_code("feishu", "user456").await.unwrap();
+        let code = manager.generate_code("chat", "user456").await.unwrap();
 
         // First verification succeeds
         let _ = manager.verify_code(&code).await.unwrap();
@@ -423,10 +423,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = PairingManager::new(dir.path().to_path_buf());
 
-        let _ = manager.generate_code("feishu", "user789").await.unwrap();
+        let _ = manager.generate_code("chat", "user789").await.unwrap();
 
         // Second generation should be rate limited
-        let result = manager.generate_code("feishu", "user789").await;
+        let result = manager.generate_code("chat", "user789").await;
         assert!(result.is_err());
         if let Err(PairingError::RateLimited { remaining_secs }) = result {
             assert!(remaining_secs > 0);
