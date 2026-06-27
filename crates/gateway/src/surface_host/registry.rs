@@ -224,6 +224,14 @@ impl SurfaceHost {
         self.get(id).is_some_and(|surface| surface.entry.is_some())
     }
 
+    pub(super) fn config_for(&self, id: &str) -> Option<serde_json::Value> {
+        self.configs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&normalize_surface_id(id))
+            .cloned()
+    }
+
     pub(super) fn runtime_for_discovered(
         &self,
         id: &str,

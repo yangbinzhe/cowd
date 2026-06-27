@@ -9,9 +9,9 @@ use surface::{
     SurfaceLifecycle, SurfaceRuntimeError, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus,
     SurfaceSupervisorAction, SurfaceSupervisorEvent,
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use super::types::ManagedSurfaceProcess;
 use super::{frame_id, managed_actions, mark_surface_seen, push_supervisor_event, SurfaceHost};
@@ -177,8 +177,74 @@ impl SurfaceHost {
         if let Some(existing) = processes.get(&surface.id) {
             return Ok(existing.clone());
         }
-        processes.insert(surface.id, process.clone());
+        processes.insert(surface.id.clone(), process.clone());
+        drop(processes);
+        if let Err(error) = self
+            .configure_managed_surface(surface.clone(), process.clone())
+            .await
+        {
+            self.managed.lock().await.remove(&surface.id);
+            return Err(error);
+        }
         Ok(process)
+    }
+
+    async fn configure_managed_surface(
+        &self,
+        surface: SurfaceDescriptor,
+        process: Arc<ManagedSurfaceProcess>,
+    ) -> Result<(), SurfaceError> {
+        let Some(config) = self.config_for(&surface.id) else {
+            return Ok(());
+        };
+        let frame = SurfaceFrame::Configure {
+            id: SurfaceFrame::new_id(),
+            surface: surface.id.clone(),
+            config,
+        };
+        let request_id = frame_id(&frame).ok_or_else(|| SurfaceError::Invocation {
+            surface: surface.id.clone(),
+            reason: "managed surface configure frame missing id".to_string(),
+        })?;
+        let (sender, receiver) = oneshot::channel();
+        process
+            .pending
+            .lock()
+            .await
+            .insert(request_id.clone(), sender);
+        let encoded = frame.encode_jsonl()?;
+        let write_result: Result<(), std::io::Error> = {
+            let mut stdin = process.stdin.lock().await;
+            if let Err(error) = stdin.write_all(encoded.as_bytes()).await {
+                Err(error)
+            } else {
+                stdin.flush().await
+            }
+        };
+        if let Err(error) = write_result {
+            process.pending.lock().await.remove(&request_id);
+            return Err(SurfaceError::Invocation {
+                surface: surface.id,
+                reason: format!("failed to write managed configure request: {error}"),
+            });
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), receiver)
+            .await
+            .map_err(|_| SurfaceError::Invocation {
+                surface: surface.id.clone(),
+                reason: "managed surface configure timed out".to_string(),
+            })?
+            .map_err(|_| SurfaceError::Invocation {
+                surface: surface.id.clone(),
+                reason: "managed surface configure channel closed".to_string(),
+            })?;
+        if matches!(response, SurfaceFrame::Ok { .. }) {
+            return Ok(());
+        }
+        Err(SurfaceError::Invocation {
+            surface: surface.id,
+            reason: format!("surface configure failed: {response:?}"),
+        })
     }
 }
 

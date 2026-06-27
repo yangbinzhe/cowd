@@ -783,6 +783,7 @@ impl SurfaceOperationResult {
 #[must_use]
 pub fn normalize_surface_id(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
+        "lark" => "feishu".to_string(),
         "wechat" | "wechat_ilink" => "wechat-ilink".to_string(),
         other => other.replace('_', "-"),
     }
@@ -839,6 +840,7 @@ mod tests {
     fn normalizes_legacy_wechat_ids_without_channel_runtime() {
         assert_eq!(normalize_surface_id("wechat_ilink"), "wechat-ilink");
         assert_eq!(normalize_surface_id("WeChat"), "wechat-ilink");
+        assert_eq!(normalize_surface_id("lark"), "feishu");
     }
 
     #[test]

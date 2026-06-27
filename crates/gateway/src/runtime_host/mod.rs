@@ -292,6 +292,7 @@ pub struct RuntimeHostConfig {
     pub http_addr: String,
     pub memory_config: Option<MemoryConfig>,
     pub surface_configs: Vec<SurfaceManifest>,
+    pub surface_runtime_configs: BTreeMap<String, serde_json::Value>,
     pub runtime_config: Option<serde_json::Value>,
     pub webui_dir: Option<PathBuf>,
     pub cors_origins: Vec<String>,
@@ -585,7 +586,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     emit_startup_diagnostics(&startup_diagnostics);
 
-    let surface_host = Arc::new(crate::surface_host::SurfaceHost::default_for(&approval_dir));
+    let surface_host = Arc::new(crate::surface_host::SurfaceHost::default_for_with_configs(
+        &approval_dir,
+        config.surface_runtime_configs.clone(),
+    ));
     if let Some(webui_dir) = static_webui.configured_path.as_deref() {
         if static_webui.available {
             surface_host.register_webui_static_resource(webui_dir);
@@ -752,6 +756,7 @@ mod tests {
             http_addr: "0.0.0.0:8642".into(),
             memory_config: None,
             surface_configs: vec![],
+            surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec![],
@@ -822,6 +827,7 @@ mod tests {
             http_addr: "127.0.0.1:9000".into(),
             memory_config: None,
             surface_configs: vec![],
+            surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec!["http://localhost:3000".into()],
@@ -839,6 +845,7 @@ mod tests {
             http_addr: "0.0.0.0:8642".into(),
             memory_config: Some(mem_cfg),
             surface_configs: vec![],
+            surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
             webui_dir: None,
             cors_origins: vec![],
@@ -907,6 +914,7 @@ mod tests {
             http_addr: "127.0.0.1:9864".into(),
             memory_config: Some(MemoryConfig::default()),
             surface_configs: vec![surface],
+            surface_runtime_configs: BTreeMap::new(),
             runtime_config: Some(serde_json::json!({"model": "test-model"})),
             webui_dir: Some(webui_dir.clone()),
             cors_origins: vec!["http://localhost:3000".into()],

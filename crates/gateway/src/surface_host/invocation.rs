@@ -208,7 +208,7 @@ impl SurfaceHost {
             })?
     }
 
-    async fn invoke_managed(
+    pub(super) async fn invoke_managed(
         &self,
         surface: SurfaceDescriptor,
         frame: SurfaceFrame,

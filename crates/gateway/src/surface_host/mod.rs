@@ -29,6 +29,7 @@ use types::ManagedSurfaceProcess;
 pub(crate) struct SurfaceHost {
     registry: Arc<RwLock<BTreeMap<String, SurfaceDescriptor>>>,
     runtime: Arc<RwLock<BTreeMap<String, SurfaceRuntimeSnapshot>>>,
+    configs: Arc<RwLock<BTreeMap<String, serde_json::Value>>>,
     roots: Vec<PathBuf>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
@@ -37,9 +38,17 @@ pub(crate) struct SurfaceHost {
 
 impl SurfaceHost {
     pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
+        Self::with_configs(roots, BTreeMap::new())
+    }
+
+    pub(crate) fn with_configs(
+        roots: Vec<PathBuf>,
+        configs: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
         let host = Self {
             registry: Arc::new(RwLock::new(BTreeMap::new())),
             runtime: Arc::new(RwLock::new(BTreeMap::new())),
+            configs: Arc::new(RwLock::new(configs)),
             roots,
             managed: Arc::new(AsyncMutex::new(HashMap::new())),
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -50,6 +59,13 @@ impl SurfaceHost {
     }
 
     pub(crate) fn default_for(config_home: &Path) -> Self {
+        Self::default_for_with_configs(config_home, BTreeMap::new())
+    }
+
+    pub(crate) fn default_for_with_configs(
+        config_home: &Path,
+        configs: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
         let install_root = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
@@ -59,7 +75,7 @@ impl SurfaceHost {
             roots.push(root);
         }
         roots.push(config_home.join("surfaces"));
-        Self::new(roots)
+        Self::with_configs(roots, configs)
     }
 }
 

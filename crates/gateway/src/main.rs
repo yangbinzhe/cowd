@@ -413,6 +413,37 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
         .collect()
 }
 
+fn build_surface_runtime_configs(
+    gw: &runtime::GatewayConfig,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    if !gw.enabled {
+        return std::collections::BTreeMap::new();
+    }
+    gw.platforms
+        .iter()
+        .filter(|p| p.enabled && p.platform_type != "api_server")
+        .map(|p| {
+            let id = surface::normalize_surface_id(&p.platform_type);
+            let mut config = p
+                .extra
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "platformType" | "platform_type" | "type" | "enabled"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), json_value_to_serde(value)))
+                .collect::<serde_json::Map<_, _>>();
+            config.insert(
+                "platform_type".to_string(),
+                serde_json::Value::String(p.platform_type.clone()),
+            );
+            (id, serde_json::Value::Object(config))
+        })
+        .collect()
+}
+
 /// Convert `runtime::JsonValue` → `serde_json::Value`.
 fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     match v {
@@ -707,6 +738,7 @@ fn run_gateway_action(
                 .unwrap_or(8642);
             let memory_config = build_memory_config(runtime_config.memory(), &cwd);
             let surface_configs = build_surface_configs(runtime_config.gateway());
+            let surface_runtime_configs = build_surface_runtime_configs(runtime_config.gateway());
             let runtime_config_json = runtime_config.as_json().as_object().map(|obj| {
                 serde_json::Value::Object(
                     obj.iter()
@@ -733,6 +765,7 @@ fn run_gateway_action(
                 http_addr: format!("{effective_host}:{effective_port}"),
                 memory_config,
                 surface_configs,
+                surface_runtime_configs,
                 runtime_config: runtime_config_json,
                 webui_dir: runtime_config.gateway().webui_dir.clone(),
                 cors_origins,
