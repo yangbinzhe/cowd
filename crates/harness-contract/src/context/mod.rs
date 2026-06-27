@@ -1,5 +1,6 @@
 //! Context epoch and prompt assembly for Cowd AI work kernel.
 
+pub use crate::core::EvidenceRef;
 use crate::core::{AiKernelError, AiKernelResult, KernelRef};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,7 @@ pub enum ContextSourceKind {
     UserRequest,
     Conversation,
     Memory,
+    Knowledge,
     Task,
     ToolTrace,
     Workspace,
@@ -180,6 +182,384 @@ pub struct PromptSection {
     pub token_estimate: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextArtifactKind {
+    UserRequest,
+    ToolRawOutput,
+    ToolSummary,
+    AgentSummary,
+    Decision,
+    MemoryCandidate,
+    CompactionSummary,
+    VerificationEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRetentionPolicy {
+    Ephemeral,
+    RetainForTurn,
+    RetainForSession,
+    Durable,
+    MemoryCandidate,
+    DropAfterCompaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextArtifact {
+    pub id: String,
+    pub kind: ContextArtifactKind,
+    pub retention: ContextRetentionPolicy,
+    pub summary: String,
+    pub content: Option<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub token_estimate: u64,
+}
+
+impl ContextArtifact {
+    #[must_use]
+    pub fn new(
+        kind: ContextArtifactKind,
+        retention: ContextRetentionPolicy,
+        summary: impl Into<String>,
+    ) -> Self {
+        let summary = summary.into();
+        Self {
+            id: format!("ctx-artifact-{}", uuid::Uuid::new_v4()),
+            kind,
+            retention,
+            token_estimate: estimate_tokens(&summary),
+            summary,
+            content: None,
+            evidence_refs: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_content(mut self, content: impl Into<String>) -> Self {
+        let content = content.into();
+        self.token_estimate = self
+            .token_estimate
+            .saturating_add(estimate_tokens(&content));
+        self.content = Some(content);
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence_ref(mut self, evidence_ref: EvidenceRef) -> Self {
+        self.evidence_refs.push(evidence_ref);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolObservation {
+    pub tool_name: String,
+    pub invocation_id: String,
+    pub raw_ref: EvidenceRef,
+    pub model_summary: String,
+    pub artifacts: Vec<ContextArtifact>,
+    pub token_estimate: u64,
+}
+
+impl ToolObservation {
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        invocation_id: impl Into<String>,
+        raw_ref: EvidenceRef,
+        model_summary: impl Into<String>,
+    ) -> Self {
+        let model_summary = model_summary.into();
+        Self {
+            tool_name: tool_name.into(),
+            invocation_id: invocation_id.into(),
+            raw_ref,
+            token_estimate: estimate_tokens(&model_summary),
+            model_summary,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ContextArtifact) -> Self {
+        self.token_estimate = self.token_estimate.saturating_add(artifact.token_estimate);
+        self.artifacts.push(artifact);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReturnPacketV2 {
+    pub parent_session_id: String,
+    pub child_agent_id: String,
+    pub result_summary: String,
+    pub observations: Vec<ToolObservation>,
+    pub artifacts: Vec<ContextArtifact>,
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub decisions: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub memory_candidates: Vec<String>,
+    pub next_actions: Vec<String>,
+    pub failed: bool,
+    pub token_estimate: u64,
+}
+
+impl AgentReturnPacketV2 {
+    #[must_use]
+    pub fn new(
+        parent_session_id: impl Into<String>,
+        child_agent_id: impl Into<String>,
+        result_summary: impl Into<String>,
+    ) -> Self {
+        let result_summary = result_summary.into();
+        Self {
+            parent_session_id: parent_session_id.into(),
+            child_agent_id: child_agent_id.into(),
+            token_estimate: estimate_tokens(&result_summary),
+            result_summary,
+            observations: Vec::new(),
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            decisions: Vec::new(),
+            conflicts: Vec::new(),
+            memory_candidates: Vec::new(),
+            next_actions: Vec::new(),
+            failed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_observation(mut self, observation: ToolObservation) -> Self {
+        self.token_estimate = self
+            .token_estimate
+            .saturating_add(observation.token_estimate);
+        self.evidence_refs.push(observation.raw_ref.clone());
+        self.observations.push(observation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ContextArtifact) -> Self {
+        self.token_estimate = self.token_estimate.saturating_add(artifact.token_estimate);
+        self.artifacts.push(artifact);
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence_ref(mut self, evidence_ref: EvidenceRef) -> Self {
+        self.evidence_refs.push(evidence_ref);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPressureState {
+    pub profile: String,
+    pub max_tokens: u64,
+    pub used_tokens: u64,
+    pub reserved_tokens: u64,
+    pub remaining_tokens: u64,
+    pub pressure_percent: u8,
+    pub compaction_recommended: bool,
+}
+
+impl ContextPressureState {
+    #[must_use]
+    pub fn new(profile: impl Into<String>, max_tokens: u64, used_tokens: u64) -> Self {
+        let remaining_tokens = max_tokens.saturating_sub(used_tokens);
+        let pressure_percent = if max_tokens == 0 {
+            100
+        } else {
+            ((used_tokens.saturating_mul(100)) / max_tokens).min(100) as u8
+        };
+        Self {
+            profile: profile.into(),
+            max_tokens,
+            used_tokens,
+            reserved_tokens: 0,
+            remaining_tokens,
+            pressure_percent,
+            compaction_recommended: pressure_percent >= 80,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reserved_tokens(mut self, reserved_tokens: u64) -> Self {
+        self.reserved_tokens = reserved_tokens;
+        self.remaining_tokens = self
+            .max_tokens
+            .saturating_sub(self.used_tokens.saturating_add(reserved_tokens));
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGovernanceDecision {
+    pub id: String,
+    pub pressure: ContextPressureState,
+    pub compact: bool,
+    pub retain_artifact_ids: Vec<String>,
+    pub drop_artifact_ids: Vec<String>,
+    pub estimated_tokens_to_reclaim: u64,
+    pub reason: String,
+}
+
+impl ContextGovernanceDecision {
+    #[must_use]
+    pub fn new(pressure: ContextPressureState, reason: impl Into<String>) -> Self {
+        let compact = pressure.compaction_recommended;
+        Self {
+            id: format!("ctx-governance-{}", uuid::Uuid::new_v4()),
+            pressure,
+            compact,
+            retain_artifact_ids: Vec::new(),
+            drop_artifact_ids: Vec::new(),
+            estimated_tokens_to_reclaim: 0,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn retain_artifact(mut self, artifact_id: impl Into<String>) -> Self {
+        self.retain_artifact_ids.push(artifact_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn drop_artifact(mut self, artifact_id: impl Into<String>, token_estimate: u64) -> Self {
+        self.drop_artifact_ids.push(artifact_id.into());
+        self.estimated_tokens_to_reclaim = self
+            .estimated_tokens_to_reclaim
+            .saturating_add(token_estimate);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionReceipt {
+    pub id: String,
+    pub decision_id: String,
+    pub retained_artifact_ids: Vec<String>,
+    pub dropped_artifact_ids: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub input_token_estimate: u64,
+    pub output_token_estimate: u64,
+}
+
+impl CompactionReceipt {
+    #[must_use]
+    pub fn new(
+        decision_id: impl Into<String>,
+        input_token_estimate: u64,
+        output_token_estimate: u64,
+    ) -> Self {
+        Self {
+            id: format!("ctx-compaction-{}", uuid::Uuid::new_v4()),
+            decision_id: decision_id.into(),
+            retained_artifact_ids: Vec::new(),
+            dropped_artifact_ids: Vec::new(),
+            evidence_refs: Vec::new(),
+            input_token_estimate,
+            output_token_estimate,
+        }
+    }
+
+    #[must_use]
+    pub fn with_evidence_ref(mut self, evidence_ref: EvidenceRef) -> Self {
+        self.evidence_refs.push(evidence_ref);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextTurnReport {
+    pub turn_id: String,
+    pub profile: String,
+    pub pressure: ContextPressureState,
+    pub input_token_estimate: u64,
+    pub output_token_estimate: u64,
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub observations: Vec<ToolObservation>,
+    pub governance_decision: Option<ContextGovernanceDecision>,
+    pub compaction_receipt: Option<CompactionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<crate::knowledge::KnowledgeTurnReport>,
+}
+
+impl ContextTurnReport {
+    #[must_use]
+    pub fn new(turn_id: impl Into<String>, pressure: ContextPressureState) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            profile: pressure.profile.clone(),
+            input_token_estimate: pressure.used_tokens,
+            output_token_estimate: 0,
+            pressure,
+            evidence_refs: Vec::new(),
+            observations: Vec::new(),
+            governance_decision: None,
+            compaction_receipt: None,
+            knowledge: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_output_token_estimate(mut self, output_token_estimate: u64) -> Self {
+        self.output_token_estimate = output_token_estimate;
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence_ref(mut self, evidence_ref: EvidenceRef) -> Self {
+        self.evidence_refs.push(evidence_ref);
+        self
+    }
+
+    #[must_use]
+    pub fn with_observation(mut self, observation: ToolObservation) -> Self {
+        self.evidence_refs.push(observation.raw_ref.clone());
+        self.observations.push(observation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_governance_decision(mut self, decision: ContextGovernanceDecision) -> Self {
+        self.governance_decision = Some(decision);
+        self
+    }
+
+    #[must_use]
+    pub fn with_compaction_receipt(mut self, receipt: CompactionReceipt) -> Self {
+        self.compaction_receipt = Some(receipt);
+        self
+    }
+
+    #[must_use]
+    pub fn with_knowledge(mut self, report: crate::knowledge::KnowledgeTurnReport) -> Self {
+        self.knowledge = Some(report);
+        self
+    }
+}
+
+impl EvidenceRef {
+    #[must_use]
+    pub fn new(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self(KernelRef::new(ref_type, id))
+    }
+
+    #[must_use]
+    pub fn durable(id: impl Into<String>) -> Self {
+        Self::new("durable_evidence", id)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.0.id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextEpochBuilder {
     identity: ContextIdentity,
@@ -300,11 +680,12 @@ fn source_priority(source: ContextSourceKind) -> u8 {
         ContextSourceKind::UserRequest => 2,
         ContextSourceKind::Task => 3,
         ContextSourceKind::Workspace => 4,
-        ContextSourceKind::Memory => 5,
-        ContextSourceKind::ToolTrace => 6,
-        ContextSourceKind::Conversation => 7,
-        ContextSourceKind::AgentPeer => 8,
-        ContextSourceKind::Handoff => 9,
+        ContextSourceKind::Knowledge => 5,
+        ContextSourceKind::Memory => 6,
+        ContextSourceKind::ToolTrace => 7,
+        ContextSourceKind::Conversation => 8,
+        ContextSourceKind::AgentPeer => 9,
+        ContextSourceKind::Handoff => 10,
     }
 }
 
@@ -398,5 +779,49 @@ mod tests {
         assert!(aligned.aligned);
         assert!(!drifted.aligned);
         assert_eq!(drifted.envelope_id, "envelope-2");
+    }
+
+    #[test]
+    fn tool_observation_has_durable_raw_ref_and_model_summary() {
+        let raw_ref = EvidenceRef::durable("tool-raw-1");
+        let observation = ToolObservation::new(
+            "exec_command",
+            "invocation-1",
+            raw_ref.clone(),
+            "cargo test completed successfully",
+        );
+
+        assert_eq!(observation.raw_ref, raw_ref);
+        assert_eq!(observation.raw_ref.0.ref_type, "durable_evidence");
+        assert_eq!(
+            observation.model_summary,
+            "cargo test completed successfully"
+        );
+        assert!(observation.token_estimate > 0);
+    }
+
+    #[test]
+    fn turn_report_records_pressure_profile_tokens_and_evidence_refs() {
+        let raw_ref = EvidenceRef::durable("tool-raw-2");
+        let pressure =
+            ContextPressureState::new("default", 10_000, 8_250).with_reserved_tokens(500);
+        let observation = ToolObservation::new(
+            "rg",
+            "invocation-2",
+            raw_ref.clone(),
+            "found matching context governance files",
+        );
+        let report = ContextTurnReport::new("turn-1", pressure.clone())
+            .with_output_token_estimate(320)
+            .with_observation(observation)
+            .with_evidence_ref(EvidenceRef::durable("report-evidence-1"));
+
+        assert_eq!(report.profile, "default");
+        assert_eq!(report.pressure, pressure);
+        assert_eq!(report.input_token_estimate, 8_250);
+        assert_eq!(report.output_token_estimate, 320);
+        assert_eq!(report.evidence_refs[0], raw_ref);
+        assert_eq!(report.evidence_refs[1].id(), "report-evidence-1");
+        assert!(report.pressure.compaction_recommended);
     }
 }

@@ -30,6 +30,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/memory/packet", get(memory_packet_handler))
         .route("/api/memory/links", get(memory_links_handler))
         .route("/api/memory/runtime", get(memory_runtime_handler))
+        .route("/api/memory/knowledge", get(memory_knowledge_handler))
+        .route(
+            "/api/memory/knowledge/health",
+            get(memory_knowledge_health_handler),
+        )
         .route("/api/memory/clusters", get(memory_clusters_handler))
         .route("/api/memory/lifecycle/:id", get(memory_lifecycle_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
@@ -123,6 +128,26 @@ async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
             "layers": empty_memory_layers(),
         }))
     }
+}
+
+async fn memory_knowledge_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.services.memory.knowledge_projection().await)
+}
+
+async fn memory_knowledge_health_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let projection = state.services.memory.knowledge_projection().await;
+    Json(serde_json::json!({
+        "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "degraded": projection.get("degraded").cloned().unwrap_or(serde_json::Value::Bool(true)),
+        "degraded_reason": projection.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "health": projection
+            .get("projection")
+            .and_then(|value| value.get("health"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    }))
 }
 
 async fn performance_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

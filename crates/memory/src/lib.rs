@@ -76,6 +76,7 @@ pub mod hot_reload;
 pub mod impact_analyzer;
 #[path = "kernel/kernel.rs"]
 pub mod kernel;
+pub mod knowledge;
 pub mod layers;
 #[path = "ops/legacy_jsonl.rs"]
 pub(crate) mod legacy_jsonl;
@@ -168,6 +169,11 @@ pub use kernel::{
     MemoryKernel, MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent,
     MemoryLink, MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive,
     MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
+};
+pub use knowledge::{
+    ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentContent,
+    DocumentIngestor, DocumentMetadata, IngestionResult, KnowledgeChunk, KnowledgeFabric,
+    KnowledgeFabricHealth, KnowledgeIngestionReceipt,
 };
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{

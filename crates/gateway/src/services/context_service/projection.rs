@@ -196,6 +196,7 @@ fn parse_context_source_kind(value: &str) -> Option<ContextSourceKind> {
         "runtimeheader" | "runtime_header" => Some(ContextSourceKind::RuntimeHeader),
         "conversation" => Some(ContextSourceKind::Conversation),
         "memory" => Some(ContextSourceKind::Memory),
+        "knowledge" => Some(ContextSourceKind::Knowledge),
         "task" => Some(ContextSourceKind::Task),
         "tooltrace" | "tool_trace" => Some(ContextSourceKind::ToolTrace),
         "workspace" => Some(ContextSourceKind::Workspace),
@@ -215,6 +216,15 @@ fn parse_context_profile(value: &str) -> Option<ContextProfile> {
         "review" => Some(ContextProfile::Review),
         "resume" => Some(ContextProfile::Resume),
         "cron" => Some(ContextProfile::Cron),
+        "surfacequickreply" | "surface_quick_reply" | "surface-quick-reply" | "quick_reply" => {
+            Some(ContextProfile::SurfaceQuickReply)
+        }
+        "surfacetaskintake" | "surface_task_intake" | "surface-task-intake" | "task_intake" => {
+            Some(ContextProfile::SurfaceTaskIntake)
+        }
+        "deepinvestigation" | "deep_investigation" | "deep-investigation" => {
+            Some(ContextProfile::DeepInvestigation)
+        }
         _ => None,
     }
 }

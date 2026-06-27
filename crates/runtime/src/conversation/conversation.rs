@@ -26,8 +26,12 @@ impl CancellationToken {
 }
 
 use futures::stream::Stream;
-use harness_contract::strategy::{
-    StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+use harness_contract::{
+    context::{
+        ContextGovernanceDecision, ContextPressureState, ContextTurnReport, EvidenceRef,
+        ToolObservation,
+    },
+    strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
 };
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
@@ -51,6 +55,7 @@ use crate::context_runtime::{
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
+use crate::knowledge_activation::KnowledgeActivationRuntime;
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
@@ -252,6 +257,7 @@ pub struct TurnSummary {
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
     pub ai_kernel_trace: RuntimeAiKernelTrace,
+    pub context_turn_report: ContextTurnReport,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -343,6 +349,13 @@ pub struct ConversationRuntime<C, T> {
     last_collaboration_result: std::sync::Mutex<Option<CollaborationContextResult>>,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// Governance observations produced by tool calls in the active turn.
+    turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
+    /// Latest context governance report emitted by a completed turn.
+    last_context_turn_report: std::sync::Mutex<Option<ContextTurnReport>>,
+    /// Knowledge activation report prepared from the active memory packet.
+    turn_knowledge_report:
+        std::sync::Mutex<Option<harness_contract::knowledge::KnowledgeTurnReport>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
     write_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Network tool concurrency (permits: 3).
@@ -524,6 +537,9 @@ where
             external_context_items: std::sync::Mutex::new(Vec::new()),
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
+            turn_tool_observations: std::sync::Mutex::new(Vec::new()),
+            last_context_turn_report: std::sync::Mutex::new(None),
+            turn_knowledge_report: std::sync::Mutex::new(None),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
             )),
@@ -565,6 +581,14 @@ where
     /// Return the latest context envelope assembled for an actual model turn.
     pub fn last_context_envelope(&self) -> Option<ContextEnvelope> {
         self.last_context_envelope
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Return the latest context governance report emitted by a completed turn.
+    pub fn last_context_turn_report(&self) -> Option<ContextTurnReport> {
+        self.last_context_turn_report
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
@@ -638,6 +662,25 @@ where
 
     fn tool_trace_context_items(&self) -> Vec<ContextItem> {
         self.tool_trace_context_items
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn clear_turn_tool_observations(&self) {
+        if let Ok(mut guard) = self.turn_tool_observations.lock() {
+            guard.clear();
+        }
+    }
+
+    fn push_turn_tool_observation(&self, observation: ToolObservation) {
+        if let Ok(mut guard) = self.turn_tool_observations.lock() {
+            guard.push(observation);
+        }
+    }
+
+    fn turn_tool_observations(&self) -> Vec<ToolObservation> {
+        self.turn_tool_observations
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
@@ -777,12 +820,115 @@ where
         });
     }
 
+    fn remember_context_turn_report(&self, report: ContextTurnReport) {
+        if let Ok(mut guard) = self.last_context_turn_report.lock() {
+            *guard = Some(report.clone());
+        }
+        self.persist_context_turn_report(report);
+    }
+
+    fn persist_context_turn_report(&self, report: ContextTurnReport) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "type": "ContextTurnReport",
+            "turn_id": report.turn_id,
+            "profile": report.profile,
+            "pressure": report.pressure,
+            "input_token_estimate": report.input_token_estimate,
+            "output_token_estimate": report.output_token_estimate,
+            "evidence_refs": report.evidence_refs,
+            "observations": report.observations,
+            "governance_decision": report.governance_decision,
+            "compaction_receipt": report.compaction_receipt,
+            "knowledge": report.knowledge,
+        });
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let sequence = match store.next_event_sequence(&session_id).await {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "context turn report sequence allocation failed");
+                    return;
+                }
+            };
+            let created_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let event = memory::SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "ContextTurnReport".to_string(),
+                event_json: payload.to_string(),
+                sequence,
+                created_at_ms,
+            };
+            if let Err(error) = store.append_event(&event).await {
+                tracing::warn!(%error, session_id, sequence, "context turn report append failed");
+            }
+        });
+    }
+
     fn context_budget_tokens(&self) -> u64 {
         if self.model_context_window > 0 {
             u64::from(self.model_context_window)
         } else {
             8_000
         }
+    }
+
+    fn build_context_turn_report(
+        &self,
+        turn_id: &str,
+        usage: TokenUsage,
+        auto_compaction: Option<AutoCompactionEvent>,
+    ) -> ContextTurnReport {
+        let used_tokens = estimate_session_tokens(&self.session()) as u64;
+        let pressure = ContextPressureState::new(
+            format!("{:?}", self.context_profile()),
+            self.context_budget_tokens(),
+            used_tokens,
+        )
+        .with_reserved_tokens(u64::from(usage.output_tokens));
+        let mut decision = ContextGovernanceDecision::new(
+            pressure.clone(),
+            if pressure.compaction_recommended {
+                "context pressure exceeded governance threshold"
+            } else {
+                "context pressure within governance budget"
+            },
+        );
+        if let Some(compaction) = auto_compaction {
+            decision.compact = true;
+            decision.estimated_tokens_to_reclaim = compaction.removed_message_count as u64;
+        }
+        let mut report = ContextTurnReport::new(turn_id.to_string(), pressure)
+            .with_output_token_estimate(u64::from(usage.output_tokens))
+            .with_governance_decision(decision);
+        for observation in self.turn_tool_observations() {
+            report = report.with_observation(observation);
+        }
+        if let Some(knowledge) = self.take_turn_knowledge_report() {
+            report = report.with_knowledge(knowledge);
+        }
+        report
+    }
+
+    fn set_turn_knowledge_report(&self, report: harness_contract::knowledge::KnowledgeTurnReport) {
+        if let Ok(mut guard) = self.turn_knowledge_report.lock() {
+            *guard = Some(report);
+        }
+    }
+
+    fn take_turn_knowledge_report(
+        &self,
+    ) -> Option<harness_contract::knowledge::KnowledgeTurnReport> {
+        self.turn_knowledge_report
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     fn build_context_envelope(
@@ -1386,6 +1532,8 @@ where
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
+        self.clear_turn_tool_observations();
+        let _ = self.take_turn_knowledge_report();
         let strategy_input = self.strategy_input_for_turn(&user_input);
         let mut runtime_harness = RuntimeAiKernel::begin_turn_with_strategy_input(
             self.session().session_id.clone(),
@@ -2274,14 +2422,22 @@ where
         }
         self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
         self.record_strategy_experience(&ai_kernel_trace);
+        let usage = self.usage_tracker.cumulative_usage();
+        let context_turn_report = self.build_context_turn_report(
+            &ai_kernel_trace.harness_receipt.id,
+            usage,
+            auto_compaction,
+        );
+        self.remember_context_turn_report(context_turn_report.clone());
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
             prompt_cache_events,
             iterations,
-            usage: self.usage_tracker.cumulative_usage(),
+            usage,
             auto_compaction,
             ai_kernel_trace,
+            context_turn_report,
         };
         self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
@@ -2561,8 +2717,6 @@ where
                     combined.push_str("\n");
                     combined.push_str(msg);
                 }
-                self.maybe_index_tool_output(tool_use_id, tool_name, &combined);
-                let truncated = self.tool_orchestrator.truncate_result(&combined);
                 let completed_record = if is_error {
                     invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
@@ -2577,10 +2731,27 @@ where
                         DEFAULT_OUTPUT_REF_MIN_LINES,
                     )
                 };
+                self.maybe_index_tool_output(tool_use_id, tool_name, &combined);
+                let raw_ref = self.record_tool_raw_evidence(
+                    tool_use_id,
+                    tool_name,
+                    &completed_record.input_hash,
+                    &combined,
+                    is_error,
+                    elapsed_ms,
+                );
+                let model_summary =
+                    self.tool_model_summary(tool_name, &combined, is_error, &raw_ref);
+                self.push_turn_tool_observation(ToolObservation::new(
+                    tool_name.to_string(),
+                    completed_record.invocation_id.clone(),
+                    raw_ref,
+                    model_summary.clone(),
+                ));
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
-                    truncated,
+                    model_summary,
                     is_error,
                 );
                 self.session
@@ -3101,6 +3272,12 @@ where
                         context_item
                     })
                     .collect::<Vec<_>>();
+                let knowledge_activation = KnowledgeActivationRuntime::new().activate_from_packet(
+                    &session_id,
+                    user_input,
+                    &format!("{:?}", self.context_profile()),
+                    &packet,
+                );
                 let omissions = packet
                     .omitted
                     .iter()
@@ -3110,6 +3287,13 @@ where
                         token_estimate: 0,
                     })
                     .collect::<Vec<_>>();
+                let mut dynamic_items = dynamic_items;
+                if let Some(activation) = knowledge_activation {
+                    dynamic_items.extend(activation.items);
+                    context.push('\n');
+                    context.push_str(&activation.prompt_fragment);
+                    self.set_turn_knowledge_report(activation.report);
+                }
                 let envelope =
                     self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
                 let prompt = Self::provider_prompt_from_envelope(
@@ -3292,6 +3476,85 @@ where
                 "indexed oversized tool output"
             );
         }
+    }
+
+    fn record_tool_raw_evidence(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        output: &str,
+        is_error: bool,
+        duration_ms: u64,
+    ) -> EvidenceRef {
+        let evidence_id = format!("tool-raw-{}-{}", tool_use_id, uuid::Uuid::new_v4());
+        let Some(ref store) = self.session_store else {
+            return EvidenceRef::new("tool", evidence_id);
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "type": "ToolObservationRaw",
+            "evidence_id": evidence_id,
+            "session_id": session_id,
+            "tool_call_id": tool_use_id,
+            "tool_name": tool_name,
+            "input_hash": input_hash,
+            "is_error": is_error,
+            "duration_ms": duration_ms,
+            "line_count": output.lines().count(),
+            "byte_count": output.len(),
+            "raw": output,
+        });
+        let store = Arc::clone(store);
+        let event_evidence_id = evidence_id.clone();
+        tokio::spawn(async move {
+            let sequence = match store.next_event_sequence(&session_id).await {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "tool raw evidence sequence allocation failed");
+                    return;
+                }
+            };
+            let created_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let event = memory::SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "ToolObservationRaw".to_string(),
+                event_json: payload.to_string(),
+                sequence,
+                created_at_ms,
+            };
+            if let Err(error) = store.append_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    evidence_id = event_evidence_id,
+                    "tool raw evidence append failed"
+                );
+            }
+        });
+        EvidenceRef::new("tool", evidence_id)
+    }
+
+    fn tool_model_summary(
+        &self,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+        raw_ref: &EvidenceRef,
+    ) -> String {
+        let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        let max_chars = if is_error { 1_200 } else { 900 };
+        let preview = preview_chars(&collapsed, max_chars);
+        format!(
+            "Tool `{}` {}. Raw evidence ref: {}. Summary: {}",
+            tool_name,
+            if is_error { "failed" } else { "completed" },
+            format!("tool://{}", raw_ref.id()),
+            preview
+        )
     }
 
     fn start_tool_invocation_record(
@@ -5229,6 +5492,50 @@ mod tests {
                 ContentBlock::Text { text }
                     if text.contains("I cannot finalize this as a completed answer yet")
             )));
+    }
+
+    #[test]
+    fn context_turn_report_includes_active_knowledge_activation_report() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        runtime.set_turn_knowledge_report(harness_contract::knowledge::KnowledgeTurnReport {
+            activation_plan_id: Some("knowledge-plan-test".to_string()),
+            active_pack_ids: vec!["pack-domain-default".to_string()],
+            blocked_namespaces: vec!["project:irrelevant not relevant to intent".to_string()],
+            compliance_warnings: Vec::new(),
+            evidence_refs: vec![harness_contract::core::KernelRef::new(
+                "knowledge_chunk",
+                "chunk-1",
+            )],
+            usage_signals: Vec::new(),
+        });
+
+        let report = runtime.build_context_turn_report(
+            "turn-1",
+            TokenUsage {
+                input_tokens: 128,
+                output_tokens: 32,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            None,
+        );
+
+        let knowledge = report.knowledge.expect("knowledge report is attached");
+        assert_eq!(
+            knowledge.activation_plan_id.as_deref(),
+            Some("knowledge-plan-test")
+        );
+        assert_eq!(knowledge.active_pack_ids, vec!["pack-domain-default"]);
+        assert_eq!(knowledge.blocked_namespaces.len(), 1);
+        assert_eq!(knowledge.evidence_refs[0].ref_type, "knowledge_chunk");
     }
 
     struct EvidenceBackedCollaboration;

@@ -29,8 +29,6 @@ pub mod config_validate;
 pub mod control_plane;
 #[path = "conversation/conversation.rs"]
 mod conversation;
-#[path = "reality_bridge/doc_ingestion.rs"]
-pub mod doc_ingestion;
 #[path = "infrastructure/error.rs"]
 pub mod error;
 #[path = "tooling/file_ops.rs"]
@@ -61,6 +59,8 @@ pub mod context_runtime;
 pub mod effect;
 #[path = "infrastructure/execution_outcome.rs"]
 pub mod execution_outcome;
+#[path = "context/knowledge_activation.rs"]
+pub mod knowledge_activation;
 #[path = "infrastructure/lane_events.rs"]
 mod lane_events;
 #[path = "infrastructure/lifecycle_hooks.rs"]
@@ -334,10 +334,6 @@ pub use cross_plane_policy::{
     CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
     CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity,
     CrossPlaneSummary, GrantType, IdentityTrust, PolicyDecisionKind,
-};
-pub use doc_ingestion::{
-    ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,
-    DocumentMetadata, IngestionResult,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,

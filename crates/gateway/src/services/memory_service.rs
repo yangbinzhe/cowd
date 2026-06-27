@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use memory::types::{MemoryEntry, MemoryId};
+use harness_contract::knowledge::{
+    KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+};
+use memory::types::{MemoryEntry, MemoryId, MemoryLayer};
 use memory::{MemoryContextPacket, MemoryKernel, MemoryTurnContext, RotAlert};
 
 use super::{GatewayMemoryManager, ServiceEnvelope};
@@ -314,6 +317,61 @@ impl MemoryService {
         }
     }
 
+    pub(crate) async fn knowledge_projection(&self) -> serde_json::Value {
+        let Some(_mgr) = self.manager() else {
+            return serde_json::json!({
+                "enabled": false,
+                "kind": "memory.knowledge_fabric",
+                "degraded": true,
+                "degraded_reason": "memory not configured",
+                "projection": null,
+            });
+        };
+        let entries = match self.list_all_entries().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return serde_json::json!({
+                    "enabled": true,
+                    "kind": "memory.knowledge_fabric",
+                    "degraded": true,
+                    "degraded_reason": error,
+                    "projection": null,
+                });
+            }
+        };
+        let fabric = memory::KnowledgeFabric::new();
+        let mut ingested = 0usize;
+        for entry in entries.into_iter().filter(is_knowledge_memory_entry) {
+            let namespace = knowledge_namespace_for_entry(&entry);
+            let activation_policy = knowledge_activation_policy_for_entry(&entry);
+            let governance_level = knowledge_governance_for_entry(&entry);
+            fabric.ingest_document(
+                namespace,
+                activation_policy,
+                governance_level,
+                memory::DocumentContent {
+                    title: entry.title,
+                    body: entry.content,
+                    source: Some(format!("memory:{}", entry.id)),
+                    author: entry.source_agent,
+                    created_at: Some(entry.created_at.to_rfc3339()),
+                    modified_at: Some(entry.updated_at.to_rfc3339()),
+                    language: None,
+                },
+            );
+            ingested += 1;
+        }
+        serde_json::json!({
+            "enabled": true,
+            "kind": "memory.knowledge_fabric",
+            "degraded": false,
+            "degraded_reason": null,
+            "source": "memory.entries",
+            "ingested_entry_count": ingested,
+            "projection": fabric.projection(),
+        })
+    }
+
     pub(crate) async fn clusters_projection(&self, limit: usize) -> serde_json::Value {
         let Some(mgr) = self.manager() else {
             return serde_json::json!({
@@ -360,6 +418,143 @@ impl MemoryService {
             "id": id,
             "events": events,
         }))
+    }
+}
+
+fn is_knowledge_memory_entry(entry: &MemoryEntry) -> bool {
+    matches!(
+        entry.layer,
+        MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4
+    ) || entry.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "knowledge"
+                | "knowledge_base"
+                | "policy"
+                | "standard"
+                | "procedure"
+                | "architecture"
+                | "domain"
+                | "default"
+                | "global"
+        )
+    })
+}
+
+fn knowledge_namespace_for_entry(entry: &MemoryEntry) -> KnowledgeNamespace {
+    if entry
+        .tags
+        .iter()
+        .any(|tag| tag == "global" || tag == "shared")
+    {
+        KnowledgeNamespace::SharedLibrary("global".to_string())
+    } else {
+        match &entry.scope {
+            memory::MemoryScope::Project(project) => KnowledgeNamespace::Project(project.clone()),
+            memory::MemoryScope::Global => KnowledgeNamespace::SharedLibrary("global".to_string()),
+            memory::MemoryScope::Session(session) => KnowledgeNamespace::Corpus(session.clone()),
+            memory::MemoryScope::Agent(agent) => KnowledgeNamespace::Corpus(agent.clone()),
+        }
+    }
+}
+
+fn knowledge_activation_policy_for_entry(entry: &MemoryEntry) -> KnowledgeActivationPolicy {
+    if entry
+        .tags
+        .iter()
+        .any(|tag| tag == "default" || tag == "global")
+    {
+        KnowledgeActivationPolicy::DefaultForDomain
+    } else if matches!(entry.layer, MemoryLayer::L2) {
+        KnowledgeActivationPolicy::DefaultForProjectGroup
+    } else {
+        KnowledgeActivationPolicy::OnDemand
+    }
+}
+
+fn knowledge_governance_for_entry(entry: &MemoryEntry) -> KnowledgeGovernanceLevel {
+    let text = format!("{} {}", entry.title, entry.content).to_ascii_lowercase();
+    if text.contains("must not") || text.contains("禁止") || text.contains("不得") {
+        KnowledgeGovernanceLevel::Blocking
+    } else if text.contains("must")
+        || text.contains("required")
+        || text.contains("必须")
+        || text.contains("应该")
+    {
+        KnowledgeGovernanceLevel::Required
+    } else {
+        KnowledgeGovernanceLevel::Advisory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use memory::types::{AgentVisibility, MemoryCategory, MemorySource, Priority};
+
+    fn memory_entry(
+        layer: MemoryLayer,
+        tags: Vec<String>,
+        scope: memory::MemoryScope,
+        content: &str,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer,
+            category: MemoryCategory::Reference,
+            priority: Priority::High,
+            source: MemorySource::Import,
+            title: "Knowledge fixture".to_string(),
+            content: content.to_string(),
+            embedding: None,
+            tags,
+            relations: Vec::new(),
+            confidence: 0.9,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed_at: None,
+            scope,
+            session_id: None,
+            source_agent: Some("gateway-test".to_string()),
+            visibility: AgentVisibility::Shared,
+        }
+    }
+
+    #[test]
+    fn knowledge_helpers_keep_global_and_project_scopes_distinct() {
+        let project = memory_entry(
+            MemoryLayer::L3,
+            vec!["knowledge".to_string()],
+            memory::MemoryScope::Project("cowd".to_string()),
+            "must retain evidence",
+        );
+        let global = memory_entry(
+            MemoryLayer::L0,
+            vec!["global".to_string(), "default".to_string()],
+            memory::MemoryScope::Global,
+            "must follow user principle",
+        );
+
+        assert!(is_knowledge_memory_entry(&project));
+        assert_eq!(
+            knowledge_namespace_for_entry(&project),
+            KnowledgeNamespace::Project("cowd".to_string())
+        );
+        assert_eq!(
+            knowledge_namespace_for_entry(&global),
+            KnowledgeNamespace::SharedLibrary("global".to_string())
+        );
+        assert_eq!(
+            knowledge_activation_policy_for_entry(&global),
+            KnowledgeActivationPolicy::DefaultForDomain
+        );
+        assert_eq!(
+            knowledge_governance_for_entry(&project),
+            KnowledgeGovernanceLevel::Required
+        );
     }
 }
 

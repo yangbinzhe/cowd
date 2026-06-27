@@ -10,6 +10,7 @@ pub mod context;
 pub mod core;
 pub mod growth;
 pub mod harness;
+pub mod knowledge;
 pub mod policy;
 pub mod strategy;
 pub mod task;

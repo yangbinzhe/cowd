@@ -76,6 +76,7 @@ impl RealityService {
         audit: &AuditService,
     ) -> RealityStatusProjection {
         let memory_status = memory.status_projection().await;
+        let knowledge_status = memory.knowledge_projection().await;
         let matrix_health = matrix_health_value(matrix, config_home);
         let growth_events = growth
             .durable_event_log(config_home)
@@ -102,6 +103,13 @@ impl RealityService {
                     "writes": false,
                 },
                 "memory": engine_summary("memory", &memory.status(), memory_status),
+                "knowledge_fabric": {
+                    "status": status_string(&knowledge_status),
+                    "role": "Universal knowledge corpus governance, canon packs, activation policy, compliance warnings, and evidence routing over Memory.",
+                    "writes": false,
+                    "api": "/api/memory/knowledge",
+                    "projection": knowledge_status,
+                },
                 "matrix": engine_summary("matrix", &matrix.health(), matrix_health),
                 "growth": {
                     "status": "ready",
@@ -135,6 +143,7 @@ impl RealityService {
         audit: &AuditService,
     ) -> RealityStaticProjection {
         let memory_status = memory.status_projection().await;
+        let knowledge_status = memory.knowledge_projection().await;
         let matrix_health = matrix_health_value(matrix, config_home);
         serde_json::json!({
             "kind": "reality.static",
@@ -157,6 +166,14 @@ impl RealityService {
                     "status": status_string(&memory_status),
                     "writes": true,
                     "api": "/api/memory/*",
+                },
+                {
+                    "id": "knowledge-fabric",
+                    "label": "Knowledge Fabric",
+                    "role": "Default/shared/project corpus governance, canon rules, activation, conflicts, and compliance evidence derived from Memory.",
+                    "status": status_string(&knowledge_status),
+                    "writes": false,
+                    "api": "/api/memory/knowledge",
                 },
                 {
                     "id": "matrix",
@@ -210,6 +227,15 @@ impl RealityService {
                     "api": ["/api/memory/status", "/api/memory/layers", "/api/memory/search", "/api/memory/maintenance", "/api/memory/packet"],
                     "owner": "gateway.memory",
                     "mode": "read-write"
+                },
+                {
+                    "id": "knowledge-fabric",
+                    "label": "Knowledge Fabric",
+                    "scope": "Shared knowledge packs, project corpora, canon rules, compliance warnings, and activation evidence.",
+                    "route": "/reality?section=knowledge-fabric",
+                    "api": ["/api/memory/knowledge", "/api/memory/knowledge/health"],
+                    "owner": "gateway.memory",
+                    "mode": "read"
                 },
                 {
                     "id": "matrix",

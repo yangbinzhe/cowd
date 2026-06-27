@@ -174,6 +174,84 @@ pub struct ComplexHarnessScenarioReport {
     pub results: Vec<ComplexScenarioResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeFabricEvalReport {
+    pub kind: String,
+    pub passed: bool,
+    pub active_pack_count: usize,
+    pub blocked_namespace_count: usize,
+    pub conflict_count: usize,
+    pub evidence_count: usize,
+    pub notes: Vec<String>,
+}
+
+#[must_use]
+pub fn evaluate_knowledge_fabric_context_governance() -> KnowledgeFabricEvalReport {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::{DocumentContent, KnowledgeFabric};
+
+    let fabric = KnowledgeFabric::new();
+    let default_pack = fabric.ingest_document(
+        KnowledgeNamespace::SharedLibrary("supply-chain".to_string()),
+        KnowledgeActivationPolicy::DefaultForDomain,
+        KnowledgeGovernanceLevel::Required,
+        DocumentContent::new(
+            "Supply Chain Default Procedure",
+            "must preserve supplier evidence\nStep 1. identify shortage\nStep 2. review recovery path",
+        ),
+    );
+    let irrelevant_pack = fabric.ingest_document(
+        KnowledgeNamespace::Project("unrelated-crm".to_string()),
+        KnowledgeActivationPolicy::DefaultForProjectGroup,
+        KnowledgeGovernanceLevel::Required,
+        DocumentContent::new("CRM Rules", "must reconcile customer renewal ledger"),
+    );
+    let conflict_pack = fabric.ingest_document(
+        KnowledgeNamespace::SharedLibrary("supply-chain".to_string()),
+        KnowledgeActivationPolicy::DefaultForDomain,
+        KnowledgeGovernanceLevel::Blocking,
+        DocumentContent::new(
+            "Supplier Evidence Conflict",
+            "must keep recovery evidence\nmust not keep recovery evidence",
+        ),
+    );
+
+    let (plan, canon, warnings) = fabric.activate(
+        "eval-session",
+        "supply chain shortage recovery evidence",
+        "DeepInvestigation",
+        Some("cowd"),
+    );
+    let active_pack_count = plan.active_pack_ids.len();
+    let blocked_namespace_count = plan.blocked_namespaces.len();
+    let conflict_count = conflict_pack.conflicts.len();
+    let evidence_count = plan.evidence_refs.len();
+    let passed = plan.active_pack_ids.contains(&default_pack.pack.pack_id)
+        && !plan.active_pack_ids.contains(&irrelevant_pack.pack.pack_id)
+        && active_pack_count >= 1
+        && blocked_namespace_count >= 1
+        && conflict_count >= 1
+        && evidence_count >= 1
+        && !canon.is_empty()
+        && !warnings.is_empty();
+
+    KnowledgeFabricEvalReport {
+        kind: "knowledge_fabric_context_governance".to_string(),
+        passed,
+        active_pack_count,
+        blocked_namespace_count,
+        conflict_count,
+        evidence_count,
+        notes: vec![
+            format!("active_packs={:?}", plan.active_pack_ids),
+            format!("blocked_namespaces={:?}", plan.blocked_namespaces),
+            format!("warnings={}", warnings.len()),
+        ],
+    }
+}
+
 #[must_use]
 pub fn generate_complex_harness_scenarios() -> Vec<ComplexHarnessScenario> {
     use ComplexScenarioKind::{
@@ -1635,7 +1713,7 @@ mod tests {
         };
         let scenario_report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
         let report = StableAiHealthReport::from_fake_eval(
-            "0.9.396",
+            env!("CARGO_PKG_VERSION"),
             "fake_provider",
             None,
             false,
@@ -1674,6 +1752,17 @@ mod tests {
                     .iter()
                     .any(|evidence| evidence.contains("peer"))
         }));
+    }
+
+    #[test]
+    fn knowledge_fabric_evaluation_covers_namespace_conflict_and_activation() {
+        let report = evaluate_knowledge_fabric_context_governance();
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.active_pack_count >= 1);
+        assert!(report.blocked_namespace_count >= 1);
+        assert!(report.conflict_count >= 1);
+        assert!(report.evidence_count >= 1);
     }
 
     #[test]

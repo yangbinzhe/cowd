@@ -105,6 +105,12 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().inject_resume_context(packet);
     }
 
+    pub(crate) fn last_context_turn_report(
+        &self,
+    ) -> Option<harness_contract::context::ContextTurnReport> {
+        self.runtime_ref().last_context_turn_report()
+    }
+
     pub(crate) async fn run_turn_async(
         &mut self,
         content: &str,

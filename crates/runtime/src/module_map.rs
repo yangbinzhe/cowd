@@ -128,7 +128,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("context_profiler", Context, "runtime", false),
         RuntimeModuleDescriptor::public("context_runtime", Context, "runtime", true),
         RuntimeModuleDescriptor::public("intent_planner", Context, "harness-contract", false),
-        RuntimeModuleDescriptor::public("doc_ingestion", RealityBridge, "runtime", false),
+        RuntimeModuleDescriptor::public("knowledge_activation", Context, "runtime", true),
         RuntimeModuleDescriptor::public("skill_activation", RealityBridge, "runtime", false),
         RuntimeModuleDescriptor::public("skill_dependency", RealityBridge, "runtime", false),
         RuntimeModuleDescriptor::public("skill_memory", RealityBridge, "runtime", true),

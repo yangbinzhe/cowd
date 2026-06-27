@@ -7,6 +7,7 @@ use surface::{SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
 
 use crate::api_routes::AppState;
+use crate::runtime_service::RuntimeTurnOptions;
 
 const SURFACE_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -109,7 +110,15 @@ async fn handle_surface_message(
         .as_ref()
         .ok_or_else(|| "runtime service unavailable".to_string())?;
     let execution = match runtime_service
-        .run_turn_with_timeout(&session_id, None, content, SURFACE_TURN_TIMEOUT)
+        .run_turn_with_options(
+            &session_id,
+            None,
+            content.clone(),
+            SURFACE_TURN_TIMEOUT,
+            RuntimeTurnOptions {
+                profile: surface_context_profile(&content),
+            },
+        )
         .await
     {
         Ok(execution) => execution,
@@ -148,6 +157,7 @@ async fn handle_surface_message(
                 "surface": surface.clone(),
                 "message_id": message_id.clone(),
                 "turn_id": execution.receipt.turn_id,
+                "context_turn_report": execution.summary.context_turn_report,
                 "response_preview": response_text.chars().take(240).collect::<String>(),
             }),
         )
@@ -206,6 +216,34 @@ async fn handle_surface_message(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn surface_context_profile(content: &str) -> runtime::ContextProfile {
+    let normalized = content.to_ascii_lowercase();
+    let deep_markers = [
+        "深度",
+        "分析",
+        "调研",
+        "重构",
+        "修改",
+        "测试",
+        "执行",
+        "代码",
+        "debug",
+        "review",
+        "refactor",
+        "test",
+        "implement",
+        "investigate",
+    ];
+    if deep_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        runtime::ContextProfile::DeepInvestigation
+    } else {
+        runtime::ContextProfile::SurfaceQuickReply
+    }
 }
 
 async fn surface_session_lock(

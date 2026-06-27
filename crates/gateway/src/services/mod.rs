@@ -561,8 +561,12 @@ impl MemoryService {
         self.envelope("query")
     }
 
+    pub(crate) fn knowledge(&self) -> ServiceEnvelope {
+        self.envelope("knowledge")
+    }
+
     fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.status(), self.list(), self.query()]
+        vec![self.status(), self.list(), self.query(), self.knowledge()]
     }
 }
 

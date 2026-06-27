@@ -12,6 +12,10 @@ pub const AI_TOOL_TRANSACTION_RESULT_FACT: &str = "ai_tool_transaction_result";
 pub const AI_WORKGRAPH_QUALITY_FACT: &str = "ai_workgraph_quality";
 pub const AI_GROWTH_SIGNAL_FACT: &str = "ai_growth_signal";
 pub const AI_EVAL_RESULT_FACT: &str = "ai_eval_result";
+pub const KNOWLEDGE_CANON_RULE_FACT: &str = "knowledge_canon_rule";
+pub const KNOWLEDGE_PROCESS_STEP_FACT: &str = "knowledge_process_step";
+pub const KNOWLEDGE_CONSTRAINT_FACT: &str = "knowledge_constraint";
+pub const KNOWLEDGE_CONFLICT_FACT: &str = "knowledge_conflict";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatrixFact {
@@ -306,5 +310,37 @@ mod fact_kernel_bridge_tests {
         assert_eq!(record.id.as_str(), "fact-3");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].fact.id, record.id);
+    }
+
+    #[test]
+    fn knowledge_fact_types_are_first_class_matrix_contracts() {
+        let fact_types = [
+            KNOWLEDGE_CANON_RULE_FACT,
+            KNOWLEDGE_PROCESS_STEP_FACT,
+            KNOWLEDGE_CONSTRAINT_FACT,
+            KNOWLEDGE_CONFLICT_FACT,
+        ];
+        assert!(fact_types
+            .iter()
+            .all(|fact_type| fact_type.starts_with("knowledge_")));
+
+        let fact = MatrixFact::from_input(MatrixFactInput {
+            fact_id: Some("knowledge-rule-1".to_string()),
+            snapshot_id: Some("knowledge-pack-1".to_string()),
+            fact_type: KNOWLEDGE_CANON_RULE_FACT.to_string(),
+            entity_refs: vec!["knowledge:pack:knowledge-pack-1".to_string()],
+            metric_key: None,
+            dimensions: serde_json::json!({"governance": "required"}),
+            measures: serde_json::json!({"rule": "must retain evidence"}),
+            event_time: Some(Utc::now()),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("knowledge://canon/rule-1".to_string()),
+            confidence: Some(0.96),
+            raw_hash: Some("sha256:knowledge-rule".to_string()),
+        });
+
+        assert_eq!(fact.fact_type, KNOWLEDGE_CANON_RULE_FACT);
+        assert_eq!(fact.entity_refs[0], "knowledge:pack:knowledge-pack-1");
     }
 }

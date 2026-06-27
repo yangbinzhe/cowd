@@ -214,6 +214,7 @@ impl<'a> RuntimeTurnSink<'a> {
     ) -> serde_json::Value {
         let summary = execution.summary;
         let turn_id = execution.receipt.turn_id.to_string();
+        let context_turn_report = summary.context_turn_report.clone();
         let final_text = summary
             .assistant_messages
             .last()
@@ -275,6 +276,7 @@ impl<'a> RuntimeTurnSink<'a> {
             "turn_id": &turn_id,
             "response": final_text,
             "iterations": summary.iterations,
+            "context_turn_report": context_turn_report,
         });
         self.event_bus
             .broadcast(session_id, &sse_data.to_string())
@@ -305,6 +307,7 @@ impl<'a> RuntimeTurnSink<'a> {
             "status": "complete",
             "response": final_text,
             "iterations": summary.iterations,
+            "context_turn_report": context_turn_report,
         })
     }
 

@@ -562,9 +562,12 @@ fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     match profile {
         ContextProfile::SoloGoal | ContextProfile::YoloGoal => ContextMode::PlanExecute,
         ContextProfile::SubAgent | ContextProfile::Collaboration => ContextMode::SubAgent,
-        ContextProfile::Review => ContextMode::Review,
+        ContextProfile::Review | ContextProfile::DeepInvestigation => ContextMode::Review,
         ContextProfile::Resume => ContextMode::Resume,
-        ContextProfile::MainTurn | ContextProfile::Cron => ContextMode::MainTurn,
+        ContextProfile::MainTurn
+        | ContextProfile::Cron
+        | ContextProfile::SurfaceQuickReply
+        | ContextProfile::SurfaceTaskIntake => ContextMode::MainTurn,
     }
 }
 

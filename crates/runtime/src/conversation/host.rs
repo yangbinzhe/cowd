@@ -181,6 +181,10 @@ where
         self.runtime_ref().last_context_envelope()
     }
 
+    pub fn last_context_turn_report(&self) -> Option<harness_contract::context::ContextTurnReport> {
+        self.runtime_ref().last_context_turn_report()
+    }
+
     pub fn take_collaboration_result(&self) -> Option<CollaborationContextResult> {
         self.runtime_ref().take_collaboration_result()
     }

@@ -10,10 +10,10 @@ use fact_kernel::{
 use harness_contract::core::TaskRisk;
 use harness_contract::strategy::{decide_strategy, StrategyInput};
 use harness_eval::{
-    evaluate_complex_harness_scenarios, harness_capability_coverage_report,
-    stable_ai_scenario_matrix, ComplexHarnessScenarioReport, E2eScenarioKind,
-    E2eScenarioMatrixItem, ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec,
-    ScenarioSuite, ScenarioSuiteReport, StableAiHealthReport,
+    evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
+    harness_capability_coverage_report, stable_ai_scenario_matrix, ComplexHarnessScenarioReport,
+    E2eScenarioKind, E2eScenarioMatrixItem, ScenarioCheck, ScenarioCheckKind, ScenarioObservation,
+    ScenarioSpec, ScenarioSuite, ScenarioSuiteReport, StableAiHealthReport,
 };
 use runtime::{
     global_mission_runtime, global_session_relation_graph, global_steward_runtime_service,
@@ -317,6 +317,17 @@ fn run_quick() -> MissionHarnessEvalReport {
     trace.record_runtime_action("deterministic_core_loop", "quick runtime loop completed");
     let fake_provider_result = fake_provider_scenario_report();
     let coverage = harness_capability_coverage_report();
+    let knowledge_fabric = evaluate_knowledge_fabric_context_governance();
+    scenarios.push(knowledge_fabric_capability(&knowledge_fabric));
+    trace.record_runtime_action(
+        "knowledge_fabric.evaluate",
+        format!(
+            "active_packs={}, blocked_namespaces={}, conflicts={}",
+            knowledge_fabric.active_pack_count,
+            knowledge_fabric.blocked_namespace_count,
+            knowledge_fabric.conflict_count
+        ),
+    );
     scenarios.push(CapabilityResult {
         capability: "runtime_event_replay",
         status: "passed",
@@ -366,6 +377,17 @@ fn run_full() -> MissionHarnessEvalReport {
     trace.record_runtime_action("gateway.probe", gateway.1.clone());
     let fake_provider_result = fake_provider_scenario_report();
     let coverage = harness_capability_coverage_report();
+    let knowledge_fabric = evaluate_knowledge_fabric_context_governance();
+    scenarios.push(knowledge_fabric_capability(&knowledge_fabric));
+    trace.record_runtime_action(
+        "knowledge_fabric.evaluate",
+        format!(
+            "active_packs={}, blocked_namespaces={}, conflicts={}",
+            knowledge_fabric.active_pack_count,
+            knowledge_fabric.blocked_namespace_count,
+            knowledge_fabric.conflict_count
+        ),
+    );
     scenarios.push(CapabilityResult {
         capability: "gateway_contract_surface",
         status: if gateway.0 { "passed" } else { "degraded" },
@@ -477,6 +499,17 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         ),
     );
     scenarios.push(complex_scenario_capability(&complex_scenarios));
+    let knowledge_fabric = evaluate_knowledge_fabric_context_governance();
+    trace.record_runtime_action(
+        "knowledge_fabric.evaluate",
+        format!(
+            "active_packs={}, blocked_namespaces={}, conflicts={}",
+            knowledge_fabric.active_pack_count,
+            knowledge_fabric.blocked_namespace_count,
+            knowledge_fabric.conflict_count
+        ),
+    );
+    scenarios.push(knowledge_fabric_capability(&knowledge_fabric));
     let mut tool_call_details = Vec::new();
     let real_tool_scenarios = run_real_tool_deep_scenarios(&mut trace, &mut tool_call_details);
     scenarios.extend(real_tool_scenario_capabilities(&real_tool_scenarios));
@@ -618,6 +651,23 @@ fn complex_scenario_capability(report: &ComplexHarnessScenarioReport) -> Capabil
         ),
         notes: "generated complex topics, solved them, reviewed acceptance checks, and scored harness readiness"
             .to_string(),
+    }
+}
+
+fn knowledge_fabric_capability(
+    report: &harness_eval::KnowledgeFabricEvalReport,
+) -> CapabilityResult {
+    CapabilityResult {
+        capability: "knowledge_fabric_context_governance",
+        status: if report.passed { "passed" } else { "failed" },
+        evidence: format!(
+            "active_packs={}; blocked_namespaces={}; conflicts={}; evidence_refs={}",
+            report.active_pack_count,
+            report.blocked_namespace_count,
+            report.conflict_count,
+            report.evidence_count
+        ),
+        notes: report.notes.join("; "),
     }
 }
 
@@ -3008,14 +3058,15 @@ fn write_stable_ai_report(
     root: &std::path::Path,
     report: &StableAiHealthReport,
 ) -> Result<(), String> {
-    let json_path = root.join("stable-ai-health-report-v0.9.396.json");
-    let md_path = root.join("stable-ai-health-report-v0.9.396.md");
+    let version = env!("CARGO_PKG_VERSION");
+    let json_path = root.join(format!("stable-ai-health-report-v{version}.json"));
+    let md_path = root.join(format!("stable-ai-health-report-v{version}.md"));
     std::fs::write(
         &json_path,
         serde_json::to_string_pretty(report).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    let mut markdown = String::from("# Stable AI Health Report v0.9.396\n\n");
+    let mut markdown = format!("# Stable AI Health Report v{version}\n\n");
     markdown.push_str(&format!(
         "- status: {}\n- provider: {}\n- model: {}\n- real_provider_enabled: {}\n- real_provider_reason: {}\n- fake_provider_scenarios: {}/{}\n- coverage: {}/{}\n- gateway_smoke: {}\n- surface_smoke: {}\n- recovery_evidence: {}\n\n",
         report.status,
@@ -3068,7 +3119,7 @@ fn current_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("v0.9.396-{seconds}")
+    format!("v{}-{seconds}", env!("CARGO_PKG_VERSION"))
 }
 
 fn now_ms_u128() -> u128 {

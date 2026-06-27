@@ -9338,8 +9338,17 @@ providers:
         assert_eq!(json["mode_coverage"]["all_stable_heads_reusable"], true);
         assert_eq!(
             json["mode_coverage"]["entries"].as_array().unwrap().len(),
-            8
+            11
         );
+        let profiles = json["mode_coverage"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["profile"].as_str())
+            .collect::<Vec<_>>();
+        assert!(profiles.contains(&"SurfaceQuickReply"));
+        assert!(profiles.contains(&"SurfaceTaskIntake"));
+        assert!(profiles.contains(&"DeepInvestigation"));
     }
 
     #[tokio::test]

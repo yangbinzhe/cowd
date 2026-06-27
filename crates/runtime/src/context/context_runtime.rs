@@ -19,6 +19,9 @@ pub enum ContextMode {
     Review,
     Resume,
     Cron,
+    SurfaceQuickReply,
+    SurfaceTaskIntake,
+    DeepInvestigation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +34,9 @@ pub enum ContextProfile {
     Review,
     Resume,
     Cron,
+    SurfaceQuickReply,
+    SurfaceTaskIntake,
+    DeepInvestigation,
 }
 
 impl From<ContextMode> for ContextProfile {
@@ -44,6 +50,9 @@ impl From<ContextMode> for ContextProfile {
             ContextMode::Review => Self::Review,
             ContextMode::Resume => Self::Resume,
             ContextMode::Cron => Self::Cron,
+            ContextMode::SurfaceQuickReply => Self::SurfaceQuickReply,
+            ContextMode::SurfaceTaskIntake => Self::SurfaceTaskIntake,
+            ContextMode::DeepInvestigation => Self::DeepInvestigation,
         }
     }
 }
@@ -95,6 +104,7 @@ pub enum ContextSourceKind {
     RuntimeHeader,
     Conversation,
     Memory,
+    Knowledge,
     Task,
     ToolTrace,
     Workspace,
@@ -527,6 +537,9 @@ impl ContextRuntimeKernel {
             ContextProfile::Review => ContextMode::Review,
             ContextProfile::Resume => ContextMode::Resume,
             ContextProfile::Cron => ContextMode::Cron,
+            ContextProfile::SurfaceQuickReply => ContextMode::SurfaceQuickReply,
+            ContextProfile::SurfaceTaskIntake => ContextMode::SurfaceTaskIntake,
+            ContextProfile::DeepInvestigation => ContextMode::DeepInvestigation,
         }
     }
 
@@ -540,6 +553,9 @@ impl ContextRuntimeKernel {
             ContextProfile::Review,
             ContextProfile::Resume,
             ContextProfile::Cron,
+            ContextProfile::SurfaceQuickReply,
+            ContextProfile::SurfaceTaskIntake,
+            ContextProfile::DeepInvestigation,
         ]
     }
 
@@ -1059,6 +1075,13 @@ impl ContextRuntimeKernel {
                     95,
                 ),
                 context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_200),
+                    pct(2_000),
+                    82,
+                ),
+                context_lease(
                     ContextSourceKind::Memory,
                     pct(1_000),
                     pct(2_000),
@@ -1083,6 +1106,13 @@ impl ContextRuntimeKernel {
                     pct(1_500),
                     pct(2_500),
                     85,
+                ),
+                context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_200),
+                    pct(2_000),
+                    82,
                 ),
                 context_lease(
                     ContextSourceKind::Memory,
@@ -1123,6 +1153,13 @@ impl ContextRuntimeKernel {
                     85,
                 ),
                 context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    88,
+                ),
+                context_lease(
                     ContextSourceKind::Memory,
                     pct(500),
                     pct(1_500),
@@ -1154,6 +1191,13 @@ impl ContextRuntimeKernel {
                     90,
                 ),
                 context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_200),
+                    pct(2_000),
+                    84,
+                ),
+                context_lease(
                     ContextSourceKind::Memory,
                     pct(500),
                     pct(1_500),
@@ -1178,6 +1222,13 @@ impl ContextRuntimeKernel {
                     90,
                 ),
                 context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_200),
+                    pct(2_000),
+                    84,
+                ),
+                context_lease(
                     ContextSourceKind::Memory,
                     pct(500),
                     pct(1_500),
@@ -1187,6 +1238,73 @@ impl ContextRuntimeKernel {
                 context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
                 context_lease(ContextSourceKind::Workspace, 0, pct(1_000), pct(1_500), 65),
             ],
+            ContextProfile::SurfaceQuickReply => vec![
+                context_lease(ContextSourceKind::Conversation, 0, pct(800), pct(1_200), 95),
+                context_lease(ContextSourceKind::Memory, 0, pct(700), pct(1_000), 85),
+                context_lease(ContextSourceKind::Knowledge, 0, pct(400), pct(700), 78),
+                context_lease(ContextSourceKind::Task, 0, pct(500), pct(800), 75),
+                context_lease(ContextSourceKind::ToolTrace, 0, pct(400), pct(600), 60),
+                context_lease(ContextSourceKind::Workspace, 0, pct(300), pct(500), 40),
+                context_lease(ContextSourceKind::AgentPeer, 0, pct(200), pct(300), 30),
+            ],
+            ContextProfile::SurfaceTaskIntake => vec![
+                context_lease(
+                    ContextSourceKind::Conversation,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    90,
+                ),
+                context_lease(ContextSourceKind::Memory, 0, pct(1_000), pct(1_500), 80),
+                context_lease(ContextSourceKind::Knowledge, 0, pct(1_000), pct(1_500), 82),
+                context_lease(ContextSourceKind::ToolTrace, 0, pct(700), pct(1_000), 60),
+                context_lease(ContextSourceKind::Workspace, 0, pct(700), pct(1_000), 55),
+            ],
+            ContextProfile::DeepInvestigation => vec![
+                context_lease(
+                    ContextSourceKind::ToolTrace,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    100,
+                ),
+                context_lease(
+                    ContextSourceKind::Workspace,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    90,
+                ),
+                context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(2_000),
+                    pct(3_000),
+                    92,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    80,
+                ),
+                context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 65),
+            ],
             ContextProfile::Cron | ContextProfile::MainTurn => vec![
                 context_lease(
                     ContextSourceKind::Conversation,
@@ -1194,6 +1312,13 @@ impl ContextRuntimeKernel {
                     pct(2_500),
                     pct(3_500),
                     95,
+                ),
+                context_lease(
+                    ContextSourceKind::Knowledge,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    88,
                 ),
                 context_lease(
                     ContextSourceKind::Memory,

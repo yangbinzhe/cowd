@@ -26,6 +26,15 @@ impl ContextService {
             Ok(self
                 .resolve_tool_evidence(session, reference, session_id)
                 .await)
+        } else if let Some(knowledge_ref) = reference.strip_prefix("knowledge://") {
+            Ok(serde_json::json!({
+                "ref": reference,
+                "kind": "knowledge",
+                "available": true,
+                "knowledge_ref": knowledge_ref,
+                "reason": "knowledge evidence is derived from memory knowledge fabric projection; inspect /api/memory/knowledge for canon and pack details",
+                "projection_api": "/api/memory/knowledge",
+            }))
         } else if reference.starts_with("service://") || reference.starts_with("mcp://") {
             Ok(self.resolve_resource_evidence(connector, workspace_root, reference))
         } else if reference.starts_with("agent://") {
@@ -146,6 +155,34 @@ impl ContextService {
             .strip_prefix("tool://")
             .and_then(|tail| tail.split('/').next())
             .unwrap_or_default();
+        if let Ok(Some((_, raw_events))) = session
+            .stored_events_by_type_page(session_id, "ToolObservationRaw", 0, 1000)
+            .await
+        {
+            if let Some(raw_match) = raw_events.into_iter().find_map(|event| {
+                let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
+                let evidence_matches = payload
+                    .get("evidence_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|id| id == tool_id);
+                evidence_matches.then(|| {
+                    serde_json::json!({
+                        "type": event.event_type,
+                        "sequence": event.sequence,
+                        "created_at_ms": event.created_at_ms,
+                        "payload": payload,
+                    })
+                })
+            }) {
+                return serde_json::json!({
+                    "ref": reference,
+                    "kind": "tool",
+                    "available": true,
+                    "session_id": session_id,
+                    "events": [raw_match],
+                });
+            }
+        }
         let Some((_, events)) = session
             .stored_events_page(session_id, 0, 500)
             .await
@@ -169,6 +206,11 @@ impl ContextService {
                     .is_some_and(|id| id == tool_id)
                     || payload
                         .get("tool_use_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|id| id == tool_id);
+                let id_matches = id_matches
+                    || payload
+                        .get("evidence_id")
                         .and_then(|value| value.as_str())
                         .is_some_and(|id| id == tool_id);
                 id_matches.then(|| {

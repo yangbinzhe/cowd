@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use harness_contract::context::{
+    AgentReturnPacketV2, ContextArtifact, ContextArtifactKind, ContextRetentionPolicy, EvidenceRef,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::{AgentContextLease, AgentReturnRequirement, ContextSourceKind};
@@ -388,6 +391,52 @@ impl SubAgentResult {
             next_actions: prefixed_lines(output, &["next:", "todo:", "action:"]),
             failed: !self.completed_normally,
         }
+    }
+
+    pub fn to_agent_return_packet_v2(
+        &self,
+        parent_session_id: impl Into<String>,
+        child_agent_id: impl Into<String>,
+    ) -> AgentReturnPacketV2 {
+        let parent_session_id = parent_session_id.into();
+        let child_agent_id = child_agent_id.into();
+        let output = self.output.trim();
+        let mut packet = AgentReturnPacketV2::new(
+            parent_session_id,
+            child_agent_id.clone(),
+            preview_text(output, 700),
+        )
+        .with_evidence_ref(EvidenceRef::new(
+            "agent",
+            format!("agent://{child_agent_id}"),
+        ))
+        .with_artifact(
+            ContextArtifact::new(
+                ContextArtifactKind::AgentSummary,
+                ContextRetentionPolicy::RetainForSession,
+                format!(
+                    "sub_agent_result tools={} tokens={} memory_writes={} denied={} completed={}",
+                    self.tool_call_count,
+                    self.tokens_used,
+                    self.memory_write_attempts,
+                    self.memory_writes_denied,
+                    self.completed_normally
+                ),
+            )
+            .with_evidence_ref(EvidenceRef::new(
+                "agent",
+                format!("agent://{child_agent_id}"),
+            )),
+        );
+        packet.decisions = prefixed_lines(output, &["decision:", "decided:", "conclusion:"]);
+        packet.conflicts = prefixed_lines(output, &["conflict:", "risk:", "blocked:"]);
+        packet.memory_candidates = prefixed_lines(output, &["memory:", "remember:"]);
+        packet.next_actions = prefixed_lines(output, &["next:", "todo:", "action:"]);
+        packet.failed = !self.completed_normally;
+        if !self.completed_normally && packet.conflicts.is_empty() {
+            packet.conflicts.push(preview_text(output, 240));
+        }
+        packet
     }
 
     pub fn to_context_item(
@@ -1146,6 +1195,41 @@ mod tests {
         assert_eq!(packet.memory_candidates, vec!["JSONL is deprecated"]);
         assert_eq!(packet.next_actions, vec!["add migration UI"]);
         assert!(packet.evidence.iter().any(|line| line.contains("tools=3")));
+    }
+
+    #[test]
+    fn sub_agent_result_converts_to_context_return_packet_v2() {
+        let result = SubAgentResult {
+            output: "Decision: use runtime session owner\nMemory: gateway only projects sessions\nNext: wire surface status\nConflict: stale sidecar session map".to_string(),
+            tool_call_count: 5,
+            tokens_used: 4096,
+            memory_write_attempts: 2,
+            completed_normally: true,
+            ..SubAgentResult::default()
+        };
+
+        let packet = result.to_agent_return_packet_v2("parent-session", "planner");
+
+        assert_eq!(packet.parent_session_id, "parent-session");
+        assert_eq!(packet.child_agent_id, "planner");
+        assert!(!packet.failed);
+        assert_eq!(packet.decisions, vec!["use runtime session owner"]);
+        assert_eq!(
+            packet.memory_candidates,
+            vec!["gateway only projects sessions"]
+        );
+        assert_eq!(packet.next_actions, vec!["wire surface status"]);
+        assert_eq!(packet.conflicts, vec!["stale sidecar session map"]);
+        assert!(packet
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.0.ref_type == "agent"));
+        assert_eq!(packet.artifacts.len(), 1);
+        assert_eq!(
+            packet.artifacts[0].kind,
+            harness_contract::context::ContextArtifactKind::AgentSummary
+        );
+        assert!(packet.artifacts[0].summary.contains("tools=5"));
     }
 
     #[test]

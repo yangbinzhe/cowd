@@ -5,8 +5,8 @@ use memory::{
     MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, RuntimeEvent, RuntimeEventScope,
     RuntimeRef, UnifiedSessionStore,
 };
+use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
 use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
-use runtime::doc_ingestion::{DocumentCategory, DocumentContent, DocumentIngestor};
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {

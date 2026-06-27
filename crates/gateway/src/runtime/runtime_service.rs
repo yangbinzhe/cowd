@@ -50,6 +50,19 @@ pub(crate) struct RuntimeTurnExecution {
     pub(crate) receipt: TurnReceipt,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuntimeTurnOptions {
+    pub(crate) profile: runtime::ContextProfile,
+}
+
+impl Default for RuntimeTurnOptions {
+    fn default() -> Self {
+        Self {
+            profile: runtime::ContextProfile::MainTurn,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<ActiveSessions>,
@@ -319,6 +332,24 @@ impl RuntimeService {
         content: String,
         turn_timeout: Duration,
     ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
+        self.run_turn_with_options(
+            session_id,
+            task_id,
+            content,
+            turn_timeout,
+            RuntimeTurnOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_turn_with_options(
+        &self,
+        session_id: &str,
+        task_id: Option<String>,
+        content: String,
+        turn_timeout: Duration,
+        options: RuntimeTurnOptions,
+    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
@@ -329,6 +360,7 @@ impl RuntimeService {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
                 let mut runtime_guard = runtime_entry.lock().await;
+                runtime_guard.set_context_profile(options.profile);
                 timeout(
                     turn_timeout,
                     runtime_guard
@@ -342,7 +374,12 @@ impl RuntimeService {
 
         match turn_result {
             Ok(Ok(summary)) => {
-                let receipt = self.finish_turn(&turn_id, TurnStatus::Completed, None);
+                let mut receipt = self.finish_turn(&turn_id, TurnStatus::Completed, None);
+                receipt.context_report_id = Some(summary.context_turn_report.turn_id.clone());
+                self.turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(turn_id.to_string(), receipt.clone());
                 Ok(RuntimeTurnExecution { summary, receipt })
             }
             Ok(Err(error)) => {
@@ -416,6 +453,7 @@ impl RuntimeService {
                 session_id: None,
                 task_id: None,
                 events: Vec::new(),
+                context_report_id: None,
                 completed_at: None,
             });
 
@@ -658,6 +696,15 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
         runtime_guard.last_context_envelope()
+    }
+
+    pub(crate) async fn last_context_turn_report(
+        &self,
+        session_id: &str,
+    ) -> Option<harness_contract::context::ContextTurnReport> {
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.last_context_turn_report()
     }
 
     pub(crate) async fn take_collaboration_result(

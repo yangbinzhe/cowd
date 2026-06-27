@@ -99,6 +99,8 @@ pub struct TurnReceipt {
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub events: Vec<TurnEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_report_id: Option<String>,
     pub completed_at: Option<DateTime<Utc>>,
 }
 
@@ -111,6 +113,7 @@ impl TurnReceipt {
             session_id: input.session_id.clone(),
             task_id: input.task_id.clone(),
             events: Vec::new(),
+            context_report_id: None,
             completed_at: None,
         }
     }
