@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use surface::{
-    SurfaceActionRequest, SurfaceOperationResult, SurfaceRegistrySnapshot, SurfaceRuntimeSnapshot,
-    SurfaceSendRequest, SurfaceSupervisorEvent,
+    SurfaceActionRequest, SurfaceFrame, SurfaceOperationResult, SurfaceRegistrySnapshot,
+    SurfaceRuntimeSnapshot, SurfaceSendRequest, SurfaceSupervisorEvent,
 };
+use tokio::sync::broadcast;
 
 use crate::surface_host::{
     SurfaceHost, SurfaceHostHealth, SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile,
@@ -129,6 +130,10 @@ impl SurfaceService {
 
     pub(crate) async fn events(&self, surface: &str) -> Vec<surface::SurfaceFrame> {
         self.host.events(surface).await
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SurfaceFrame> {
+        self.host.subscribe_events()
     }
 
     pub(crate) async fn supervisor_events(&self, surface: &str) -> Vec<SurfaceSupervisorEvent> {

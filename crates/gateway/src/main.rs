@@ -69,6 +69,7 @@ mod skill_static;
 #[path = "core/suggestions.rs"]
 mod suggestions;
 mod surface_host;
+mod surface_ingress;
 #[path = "kernel/task_kernel.rs"]
 mod task_kernel;
 

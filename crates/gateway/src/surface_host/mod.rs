@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use surface::{SurfaceDescriptor, SurfaceRuntimeSnapshot, SurfaceSupervisorEvent};
-use tokio::sync::Mutex as AsyncMutex;
+use surface::{SurfaceDescriptor, SurfaceFrame, SurfaceRuntimeSnapshot, SurfaceSupervisorEvent};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 mod invocation;
 mod ledger;
@@ -33,6 +33,7 @@ pub(crate) struct SurfaceHost {
     roots: Vec<PathBuf>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
+    event_tx: broadcast::Sender<SurfaceFrame>,
     monitor_started: Arc<RwLock<bool>>,
 }
 
@@ -45,6 +46,7 @@ impl SurfaceHost {
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
     ) -> Self {
+        let (event_tx, _) = broadcast::channel(1024);
         let host = Self {
             registry: Arc::new(RwLock::new(BTreeMap::new())),
             runtime: Arc::new(RwLock::new(BTreeMap::new())),
@@ -52,6 +54,7 @@ impl SurfaceHost {
             roots,
             managed: Arc::new(AsyncMutex::new(HashMap::new())),
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
+            event_tx,
             monitor_started: Arc::new(RwLock::new(false)),
         };
         host.register_builtin_surfaces();
@@ -76,6 +79,10 @@ impl SurfaceHost {
         }
         roots.push(config_home.join("surfaces"));
         Self::with_configs(roots, configs)
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SurfaceFrame> {
+        self.event_tx.subscribe()
     }
 }
 

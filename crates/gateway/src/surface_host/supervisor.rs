@@ -11,7 +11,7 @@ use surface::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use super::types::ManagedSurfaceProcess;
 use super::{frame_id, managed_actions, mark_surface_seen, push_supervisor_event, SurfaceHost};
@@ -159,6 +159,7 @@ impl SurfaceHost {
             self.runtime.clone(),
             self.ledger.clone(),
             self.managed.clone(),
+            self.event_tx.clone(),
         )
         .await
         {
@@ -253,6 +254,7 @@ async fn start_managed_process(
     runtime: Arc<RwLock<BTreeMap<String, SurfaceRuntimeSnapshot>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
+    event_tx: broadcast::Sender<SurfaceFrame>,
 ) -> Result<ManagedSurfaceProcess, SurfaceError> {
     let surface_id = surface.id.clone();
     let entry = surface
@@ -303,6 +305,7 @@ async fn start_managed_process(
     let reader_runtime = runtime.clone();
     let reader_ledger = ledger.clone();
     let reader_surface = surface_id.clone();
+    let reader_event_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -318,10 +321,11 @@ async fn start_managed_process(
             }
             if matches!(frame, SurfaceFrame::Event { .. }) {
                 let mut events = reader_events.lock().await;
-                events.push_back(frame);
+                events.push_back(frame.clone());
                 while events.len() > 200 {
                     events.pop_front();
                 }
+                let _ = reader_event_tx.send(frame);
             }
         }
         push_supervisor_event(
