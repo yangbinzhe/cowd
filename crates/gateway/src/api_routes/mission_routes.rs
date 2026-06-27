@@ -16,6 +16,7 @@ use crate::services::{
     StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
     SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
+use memory::SessionRecord;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -617,25 +618,8 @@ async fn consume_mission_session_command_as_turn(
             "runtime service unavailable",
         ));
     };
-    if !runtime_service.has_active_session(&session_id) {
-        let failed = runtime::global_mission_runtime()
-            .fail_session_command(
-                &session_id,
-                &command_id,
-                "runtime session is not active for mission command execution",
-            )
-            .ok();
-        return Ok(Json(serde_json::json!({
-            "envelope": state.services.mission.session_control_contract(),
-            "ok": false,
-            "mode": body.mode,
-            "actor_id": body.actor_id,
-            "reason": body.reason,
-            "error": "runtime session is not active for mission command execution",
-            "command": failed,
-            "mission": runtime::global_mission_runtime().projection(),
-        })));
-    }
+    let session_runtime =
+        ensure_active_runtime_session_for_mission_command(&state, &session_id).await?;
     let current = runtime::global_mission_runtime()
         .get_session_command(&command_id)
         .ok_or_else(|| {
@@ -686,6 +670,7 @@ async fn consume_mission_session_command_as_turn(
                     })),
                 },
                 "result_ref": result_ref,
+                "session_runtime": session_runtime,
                 "mission": runtime::global_mission_runtime().projection(),
             })))
         }
@@ -702,9 +687,162 @@ async fn consume_mission_session_command_as_turn(
                 "reason": body.reason,
                 "error": message,
                 "command": command,
+                "session_runtime": session_runtime,
                 "mission": runtime::global_mission_runtime().projection(),
             })))
         }
+    }
+}
+
+async fn ensure_active_runtime_session_for_mission_command(
+    state: &AppState,
+    session_id: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    if runtime_service.has_active_session(session_id) {
+        return Ok(serde_json::json!({
+            "session_id": session_id,
+            "active": true,
+            "created": false,
+            "source": "existing_runtime",
+        }));
+    }
+
+    let model = default_mission_session_model(state);
+    let mut session = runtime::Session::new();
+    session.session_id = session_id.to_string();
+    session.model = Some(model.clone());
+    let runtime = if let Some(store) = state.services.session.unified_store() {
+        crate::runtime_factory::create_runtime_entry_with_session_store(
+            store,
+            session,
+            session_id,
+            model.clone(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    } else {
+        crate::runtime_factory::create_runtime_entry(
+            session,
+            session_id,
+            model.clone(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    }
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build runtime session for mission command: {error}"),
+        )
+    })?;
+
+    runtime_service
+        .register_runtime(session_id.to_string(), runtime)
+        .map_err(|error| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to register runtime session for mission command: {error}"),
+            )
+        })?;
+
+    if state.services.session.has_unified_store()
+        && state
+            .services
+            .session
+            .stored_session(session_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let record = mission_runtime_session_record(session_id, Some(model.clone()));
+        state
+            .services
+            .session
+            .upsert_stored_session(&record)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist mission runtime session: {error}"),
+                )
+            })?;
+    }
+
+    let _ = state
+        .services
+        .session
+        .append_timeline_event(
+            session_id,
+            "MissionSessionRuntimeActivated",
+            serde_json::json!({
+                "type": "MissionSessionRuntimeActivated",
+                "session_id": session_id,
+                "model": model,
+                "source": "mission_command_start_turn",
+            }),
+        )
+        .await;
+
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "active": true,
+        "created": true,
+        "source": "mission_command_start_turn",
+        "model": model,
+    }))
+}
+
+fn default_mission_session_model(state: &AppState) -> String {
+    state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .ok()
+        .and_then(|config| config.model().map(str::to_string))
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+}
+
+fn mission_runtime_session_record(session_id: &str, model: Option<String>) -> SessionRecord {
+    let now = chrono::Utc::now().to_rfc3339();
+    SessionRecord {
+        session_id: session_id.to_string(),
+        platform: "mission_control".to_string(),
+        chat_id: session_id.to_string(),
+        user_id: None,
+        model,
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: 0,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(
+            serde_json::json!({
+                "title": format!("Mission {}", session_id.chars().take(8).collect::<String>()),
+                "source": "mission_command_start_turn",
+            })
+            .to_string(),
+        ),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: "active".to_string(),
     }
 }
 
