@@ -72,6 +72,13 @@ pub struct SurfaceSummary {
     pub capability_count: u64,
     pub route_count: u64,
     pub resource_count: u64,
+    pub active: bool,
+    pub pid: Option<u64>,
+    pub consecutive_failures: u64,
+    pub restart_count: u64,
+    pub circuit_open: bool,
+    pub next_retry_at: Option<String>,
+    pub last_error: Option<String>,
     pub entry: Option<String>,
     pub diagnostics: Vec<String>,
 }
@@ -83,6 +90,10 @@ pub struct SurfaceHealthSummary {
     pub external_surface_count: u64,
     pub route_count: u64,
     pub resource_count: u64,
+    pub ready_count: u64,
+    pub degraded_count: u64,
+    pub failed_count: u64,
+    pub circuit_open_count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -754,7 +765,38 @@ impl RuntimeControlSnapshot {
                         .map(|surface| surface.resource_count)
                         .sum()
                 }),
+            ready_count: host
+                .get("ready_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            degraded_count: host
+                .get("degraded_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            failed_count: host
+                .get("failed_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            circuit_open_count: host
+                .get("circuit_open_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
         });
+        if let Some(runtime) = value.get("runtime").and_then(serde_json::Value::as_array) {
+            for item in runtime {
+                let Some(surface_id) = item.get("surface").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if let Some(surface) = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|surface| surface.id == surface_id)
+                {
+                    apply_surface_runtime(surface, item);
+                }
+            }
+        }
     }
 
     pub fn ingest_surface_events(&mut self, surface: &str, value: &serde_json::Value) {
@@ -768,6 +810,16 @@ impl RuntimeControlSnapshot {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if let Some(supervisor_events) = value
+            .get("supervisor_events")
+            .and_then(serde_json::Value::as_array)
+        {
+            events.extend(
+                supervisor_events
+                    .iter()
+                    .filter_map(|item| surface_event_summary_from_json(surface, item)),
+            );
+        }
         self.surface_events.append(&mut events);
         self.surface_events.truncate(24);
     }
@@ -1248,6 +1300,13 @@ fn surface_summary_from_json(value: &serde_json::Value) -> Option<SurfaceSummary
         capability_count: capabilities,
         route_count: routes,
         resource_count: resources,
+        active: false,
+        pid: None,
+        consecutive_failures: 0,
+        restart_count: 0,
+        circuit_open: false,
+        next_retry_at: None,
+        last_error: None,
         entry: value
             .get("entry")
             .and_then(serde_json::Value::as_str)
@@ -1267,6 +1326,37 @@ fn surface_summary_from_json(value: &serde_json::Value) -> Option<SurfaceSummary
     })
 }
 
+fn apply_surface_runtime(surface: &mut SurfaceSummary, value: &serde_json::Value) {
+    if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+        surface.status = status.to_string();
+    }
+    surface.active = value
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(surface.active);
+    surface.pid = value.get("pid").and_then(serde_json::Value::as_u64);
+    surface.consecutive_failures = value
+        .get("consecutive_failures")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    surface.restart_count = value
+        .get("restart_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    surface.circuit_open = value
+        .get("circuit_open")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_default();
+    surface.next_retry_at = value
+        .get("next_retry_at")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    surface.last_error = value
+        .pointer("/last_error/message")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+}
+
 fn surface_event_summary_from_json(
     fallback_surface: &str,
     value: &serde_json::Value,
@@ -1274,6 +1364,7 @@ fn surface_event_summary_from_json(
     let event_type = value
         .get("type")
         .or_else(|| value.get("event"))
+        .or_else(|| value.get("status"))
         .and_then(serde_json::Value::as_str)?;
     let surface = value
         .get("surface")

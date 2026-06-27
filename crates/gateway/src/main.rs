@@ -404,6 +404,7 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 health: surface::SurfaceHealthSpec {
                     mode: surface::SurfaceHealthMode::Jsonl,
                     interval_ms: 30_000,
+                    ..Default::default()
                 },
                 config_schema: serde_json::json!({ "required": required }),
                 default_enabled: p.enabled,

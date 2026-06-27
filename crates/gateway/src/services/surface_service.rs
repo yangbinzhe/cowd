@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use surface::{
-    SurfaceActionRequest, SurfaceOperationResult, SurfaceRegistrySnapshot, SurfaceSendRequest,
+    SurfaceActionRequest, SurfaceOperationResult, SurfaceRegistrySnapshot, SurfaceRuntimeSnapshot,
+    SurfaceSendRequest, SurfaceSupervisorEvent,
 };
 
 use crate::surface_host::{
@@ -51,6 +52,14 @@ impl SurfaceService {
 
     pub(crate) fn health(&self) -> SurfaceHostHealth {
         self.host.health()
+    }
+
+    pub(crate) fn runtime_snapshots(&self) -> Vec<SurfaceRuntimeSnapshot> {
+        self.host.runtime_snapshots()
+    }
+
+    pub(crate) fn runtime_snapshot(&self, id: &str) -> Option<SurfaceRuntimeSnapshot> {
+        self.host.runtime_snapshot(id)
     }
 
     pub(crate) fn has_surface(&self, id: &str) -> bool {
@@ -120,5 +129,49 @@ impl SurfaceService {
 
     pub(crate) async fn events(&self, surface: &str) -> Vec<surface::SurfaceFrame> {
         self.host.events(surface).await
+    }
+
+    pub(crate) async fn supervisor_events(&self, surface: &str) -> Vec<SurfaceSupervisorEvent> {
+        self.host.supervisor_events(surface).await
+    }
+
+    pub(crate) async fn start_surface(
+        &self,
+        surface: &str,
+    ) -> Result<SurfaceRuntimeSnapshot, String> {
+        self.host
+            .start_surface(surface)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn stop_surface(
+        &self,
+        surface: &str,
+    ) -> Result<SurfaceRuntimeSnapshot, String> {
+        self.host
+            .stop_surface(surface)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn restart_surface(
+        &self,
+        surface: &str,
+    ) -> Result<SurfaceRuntimeSnapshot, String> {
+        self.host
+            .restart_surface(surface)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn repair_surface(
+        &self,
+        surface: &str,
+    ) -> Result<SurfaceRuntimeSnapshot, String> {
+        self.host
+            .repair_surface(surface)
+            .await
+            .map_err(|error| error.to_string())
     }
 }

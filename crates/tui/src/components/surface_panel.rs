@@ -91,6 +91,19 @@ impl Component for SurfacePanel {
             ),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "ready {} degraded {} failed {} circuit {}",
+                    health.map(|item| item.ready_count).unwrap_or(0),
+                    health.map(|item| item.degraded_count).unwrap_or(0),
+                    health.map(|item| item.failed_count).unwrap_or(0),
+                    health.map(|item| item.circuit_open_count).unwrap_or(0),
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("Next: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 surface_next_action(&self.surfaces, health),
@@ -137,8 +150,14 @@ impl Component for SurfacePanel {
                     ),
                     Span::styled(
                         format!(
-                            " caps {} routes {} res {}",
-                            surface.capability_count, surface.route_count, surface.resource_count
+                            " fail {} restart {} circuit {}",
+                            surface.consecutive_failures,
+                            surface.restart_count,
+                            if surface.circuit_open {
+                                "open"
+                            } else {
+                                "closed"
+                            }
                         ),
                         Style::default().fg(Color::DarkGray),
                     ),
@@ -162,6 +181,36 @@ impl Component for SurfacePanel {
                 Span::styled("  Lifecycle: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(surface.lifecycle.clone(), Style::default().fg(Color::White)),
             ]));
+            lines.push(Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "active={} pid={} failures={} restarts={} circuit={}",
+                        surface.active,
+                        surface
+                            .pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        surface.consecutive_failures,
+                        surface.restart_count,
+                        if surface.circuit_open {
+                            "open"
+                        } else {
+                            "closed"
+                        }
+                    ),
+                    status_style(&surface.status),
+                ),
+            ]));
+            if let Some(error) = &surface.last_error {
+                lines.push(Line::from(vec![
+                    Span::styled("Error: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        compact(error, area.width.saturating_sub(10) as usize),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
+            }
             let diag = surface.diagnostics.first().cloned().unwrap_or_else(|| {
                 if surface.entry.is_some() {
                     "managed by Gateway sidecar contract".to_string()
@@ -244,7 +293,8 @@ fn status_style(status: &str) -> Style {
     match status {
         "builtin" | "ready" | "discovered" => Style::default().fg(Color::Green),
         "disabled" => Style::default().fg(Color::DarkGray),
-        "unavailable" | "error" => Style::default().fg(Color::Red),
+        "unavailable" | "error" | "failed" | "circuit-open" => Style::default().fg(Color::Red),
+        "degraded" | "restarting" | "starting" => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::Yellow),
     }
 }
@@ -276,10 +326,13 @@ fn surface_next_action(
     if health.is_some_and(|item| item.status == "error" || item.status == "offline") {
         return "inspect Gateway surface host health";
     }
+    if surfaces.iter().any(|surface| surface.circuit_open) {
+        return "repair circuit-open surfaces after fixing sidecar credentials";
+    }
     if surfaces.iter().any(|surface| {
         matches!(
             surface.status.as_str(),
-            "unavailable" | "error" | "disabled"
+            "unavailable" | "error" | "failed" | "degraded" | "disabled"
         )
     }) {
         return "open selected surface diagnostics";
@@ -320,6 +373,7 @@ mod tests {
             external_surface_count: 1,
             route_count: 1,
             resource_count: 1,
+            ..Default::default()
         });
         app.gateway_surfaces = vec![
             SurfaceSummary {
@@ -334,6 +388,7 @@ mod tests {
                 resource_count: 0,
                 entry: None,
                 diagnostics: Vec::new(),
+                ..Default::default()
             },
             SurfaceSummary {
                 id: "webui".to_string(),
@@ -347,6 +402,7 @@ mod tests {
                 resource_count: 1,
                 entry: None,
                 diagnostics: vec!["static assets registered".to_string()],
+                ..Default::default()
             },
         ];
 

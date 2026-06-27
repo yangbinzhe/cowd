@@ -23,8 +23,17 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/surfaces/:id/resources",
             get(get_surface_resources_handler),
         )
+        .route("/api/surfaces/:id/status", get(get_surface_status_handler))
         .route("/api/surfaces/:id/health", get(get_surface_health_handler))
+        .route(
+            "/api/surfaces/:id/health-check",
+            post(post_surface_health_check_handler),
+        )
         .route("/api/surfaces/:id/events", get(get_surface_events_handler))
+        .route("/api/surfaces/:id/start", post(start_surface_handler))
+        .route("/api/surfaces/:id/stop", post(stop_surface_handler))
+        .route("/api/surfaces/:id/restart", post(restart_surface_handler))
+        .route("/api/surfaces/:id/repair", post(repair_surface_handler))
         .route("/api/surfaces/:id/send", post(send_surface_handler))
         .route("/api/surfaces/:id/action", post(action_surface_handler))
         .route("/s/:surface/*path", get(surface_static_handler))
@@ -62,10 +71,11 @@ async fn surface_health_handler(AxumState(state): AxumState<Arc<AppState>>) -> i
     let snapshot = state.services.surface.snapshot();
     Json(serde_json::json!({
         "kind": "surface.health",
-        "status": "ready",
+        "status": state.services.surface.health().status,
         "surface_count": snapshot.surfaces.len(),
         "host": state.services.surface.health(),
         "registry": snapshot,
+        "runtime": state.services.surface.runtime_snapshots(),
     }))
 }
 
@@ -133,6 +143,100 @@ async fn get_surface_health_handler(
     Ok(Json(result))
 }
 
+async fn get_surface_status_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let normalized = surface::normalize_surface_id(&id);
+    let runtime = state
+        .services
+        .surface
+        .runtime_snapshot(&normalized)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("surface `{id}` not found")))?;
+    let events = state.services.surface.supervisor_events(&normalized).await;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.status",
+        "surface": normalized,
+        "runtime": runtime,
+        "events": events,
+    })))
+}
+
+async fn post_surface_health_check_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    get_surface_health_handler(AxumState(state), Path(id)).await
+}
+
+async fn start_surface_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .surface
+        .start_surface(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.supervisor.start",
+        "surface": surface::normalize_surface_id(&id),
+        "runtime": runtime,
+    })))
+}
+
+async fn stop_surface_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .surface
+        .stop_surface(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.supervisor.stop",
+        "surface": surface::normalize_surface_id(&id),
+        "runtime": runtime,
+    })))
+}
+
+async fn restart_surface_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .surface
+        .restart_surface(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.supervisor.restart",
+        "surface": surface::normalize_surface_id(&id),
+        "runtime": runtime,
+    })))
+}
+
+async fn repair_surface_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .surface
+        .repair_surface(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.supervisor.repair",
+        "surface": surface::normalize_surface_id(&id),
+        "runtime": runtime,
+    })))
+}
+
 async fn get_surface_events_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -144,10 +248,12 @@ async fn get_surface_events_handler(
         ));
     }
     let events = state.services.surface.events(&id).await;
+    let supervisor_events = state.services.surface.supervisor_events(&id).await;
     Ok(Json(serde_json::json!({
         "kind": "surface.events",
         "surface": surface::normalize_surface_id(&id),
         "events": events,
+        "supervisor_events": supervisor_events,
     })))
 }
 

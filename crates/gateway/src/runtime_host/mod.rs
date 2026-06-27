@@ -592,6 +592,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     }
     let surface_discovery = surface_host.discover();
+    surface_host.start_monitor();
     tracing::info!(
         discovered = surface_discovery.discovered,
         failures = surface_discovery.failures.len(),
@@ -897,6 +898,7 @@ mod tests {
             health: surface::SurfaceHealthSpec {
                 mode: surface::SurfaceHealthMode::Jsonl,
                 interval_ms: 30_000,
+                ..Default::default()
             },
             config_schema: serde_json::json!({"required": ["app_id", "app_secret"]}),
             default_enabled: true,

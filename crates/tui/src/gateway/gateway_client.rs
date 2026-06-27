@@ -727,9 +727,33 @@ impl GatewayApiClient {
             .await
     }
 
+    pub async fn surface_status(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/status", url_encode(id)))
+            .await
+    }
+
     pub async fn surface_health(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/surfaces/{}/health", url_encode(id)))
             .await
+    }
+
+    pub async fn surface_health_check(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/health-check", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn surface_repair(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/repair", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn surface_events(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {

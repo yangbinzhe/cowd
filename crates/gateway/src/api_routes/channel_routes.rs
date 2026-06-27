@@ -18,6 +18,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/platforms", get(list_platforms_handler))
         .route("/api/platforms/:name", get(get_platform_handler))
+        .route("/api/channels", get(list_channels_handler))
+        .route(
+            "/api/channels/:name/status",
+            get(get_channel_status_handler),
+        )
+        .route("/api/channels/:name/repair", post(repair_channel_handler))
         .route(
             "/api/channels/wechat-ilink/accounts",
             get(wechat_ilink_accounts_handler),
@@ -81,6 +87,80 @@ async fn get_platform_handler(
         "readiness": matched,
         "sessions": []
     }))
+}
+
+async fn list_channels_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let platforms = configured_platforms(state.config.as_ref());
+    let runtimes = state.services.surface.runtime_snapshots();
+    let channels = platforms
+        .into_iter()
+        .map(|platform| {
+            let runtime = runtimes
+                .iter()
+                .find(|runtime| {
+                    runtime.surface == platform.platform_type || runtime.surface == platform.name
+                })
+                .cloned();
+            serde_json::json!({
+                "channel": platform.platform_type,
+                "name": platform.name,
+                "configuration_status": platform.status,
+                "configured": platform.configured,
+                "enabled": platform.enabled,
+                "credential_present": platform.credential_present,
+                "missing_required": platform.missing_required,
+                "capabilities": platform.capabilities,
+                "runtime": runtime,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "kind": "channel.registry",
+        "channels": channels,
+        "runtime": runtimes,
+    }))
+}
+
+async fn get_channel_status_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let channel = surface::channel::normalize_channel(&name);
+    let platforms = configured_platforms(state.config.as_ref());
+    let platform = platforms
+        .into_iter()
+        .find(|platform| platform.platform_type == channel || platform.name == channel);
+    let runtime = state.services.surface.runtime_snapshot(&channel);
+    if platform.is_none() && runtime.is_none() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("channel `{name}` not found"),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "channel.status",
+        "channel": channel,
+        "configuration": platform,
+        "runtime": runtime,
+    })))
+}
+
+async fn repair_channel_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let channel = surface::channel::normalize_channel(&name);
+    let runtime = state
+        .services
+        .surface
+        .repair_surface(&channel)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "channel.repair",
+        "channel": channel,
+        "runtime": runtime,
+    })))
 }
 
 pub(super) fn configured_platforms(config: Option<&serde_json::Value>) -> Vec<PlatformReadiness> {
@@ -154,7 +234,7 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
     let status = if !enabled {
         "disabled"
     } else if configured {
-        "ready"
+        "configured"
     } else {
         "degraded"
     };

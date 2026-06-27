@@ -113,6 +113,10 @@ pub struct SurfaceHealthSpec {
     pub mode: SurfaceHealthMode,
     #[serde(default = "default_health_interval_ms")]
     pub interval_ms: u64,
+    #[serde(default = "default_health_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub repair: SurfaceRepairPolicy,
 }
 
 fn default_health_mode() -> SurfaceHealthMode {
@@ -123,11 +127,247 @@ fn default_health_interval_ms() -> u64 {
     30_000
 }
 
+fn default_health_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for SurfaceHealthSpec {
     fn default() -> Self {
         Self {
             mode: default_health_mode(),
             interval_ms: default_health_interval_ms(),
+            timeout_ms: default_health_timeout_ms(),
+            repair: SurfaceRepairPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceRuntimeStatus {
+    Builtin,
+    Discovered,
+    Starting,
+    Ready,
+    Degraded,
+    Restarting,
+    Unavailable,
+    Disabled,
+    Failed,
+    CircuitOpen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceFailureKind {
+    ManifestInvalid,
+    EntryMissing,
+    SpawnFailed,
+    ProcessExited,
+    HealthTimeout,
+    ProtocolError,
+    AuthError,
+    NetworkError,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceSupervisorAction {
+    Start,
+    Stop,
+    Restart,
+    Repair,
+    HealthCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceRepairPolicy {
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_restart_limit")]
+    pub restart_limit: u32,
+    #[serde(default = "default_restart_window_ms")]
+    pub restart_window_ms: u64,
+    #[serde(default = "default_backoff_initial_ms")]
+    pub backoff_initial_ms: u64,
+    #[serde(default = "default_backoff_max_ms")]
+    pub backoff_max_ms: u64,
+    #[serde(default = "default_circuit_half_open_after_ms")]
+    pub circuit_half_open_after_ms: u64,
+}
+
+fn default_failure_threshold() -> u32 {
+    3
+}
+
+fn default_restart_limit() -> u32 {
+    3
+}
+
+fn default_restart_window_ms() -> u64 {
+    600_000
+}
+
+fn default_backoff_initial_ms() -> u64 {
+    1_000
+}
+
+fn default_backoff_max_ms() -> u64 {
+    60_000
+}
+
+fn default_circuit_half_open_after_ms() -> u64 {
+    300_000
+}
+
+impl Default for SurfaceRepairPolicy {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_failure_threshold(),
+            restart_limit: default_restart_limit(),
+            restart_window_ms: default_restart_window_ms(),
+            backoff_initial_ms: default_backoff_initial_ms(),
+            backoff_max_ms: default_backoff_max_ms(),
+            circuit_half_open_after_ms: default_circuit_half_open_after_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceRuntimeError {
+    pub kind: SurfaceFailureKind,
+    pub message: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl SurfaceRuntimeError {
+    #[must_use]
+    pub fn new(kind: SurfaceFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            occurred_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceRuntimeSnapshot {
+    pub surface: String,
+    pub status: SurfaceRuntimeStatus,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub restart_count: u32,
+    pub circuit_open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<SurfaceRuntimeError>,
+    #[serde(default)]
+    pub available_actions: Vec<SurfaceSupervisorAction>,
+}
+
+impl SurfaceRuntimeSnapshot {
+    #[must_use]
+    pub fn builtin(surface: impl AsRef<str>) -> Self {
+        Self {
+            surface: normalize_surface_id(surface.as_ref()),
+            status: SurfaceRuntimeStatus::Builtin,
+            active: true,
+            pid: None,
+            started_at: None,
+            last_seen_at: Some(Utc::now()),
+            last_health_at: Some(Utc::now()),
+            latency_ms: Some(0),
+            consecutive_failures: 0,
+            restart_count: 0,
+            circuit_open: false,
+            next_retry_at: None,
+            last_error: None,
+            available_actions: vec![SurfaceSupervisorAction::HealthCheck],
+        }
+    }
+
+    #[must_use]
+    pub fn discovered(surface: impl AsRef<str>, lifecycle: SurfaceLifecycle) -> Self {
+        let actions = match lifecycle {
+            SurfaceLifecycle::Builtin => vec![SurfaceSupervisorAction::HealthCheck],
+            SurfaceLifecycle::OneShot => vec![SurfaceSupervisorAction::HealthCheck],
+            SurfaceLifecycle::Managed => vec![
+                SurfaceSupervisorAction::Start,
+                SurfaceSupervisorAction::HealthCheck,
+                SurfaceSupervisorAction::Repair,
+            ],
+        };
+        Self {
+            surface: normalize_surface_id(surface.as_ref()),
+            status: SurfaceRuntimeStatus::Discovered,
+            active: false,
+            pid: None,
+            started_at: None,
+            last_seen_at: None,
+            last_health_at: None,
+            latency_ms: None,
+            consecutive_failures: 0,
+            restart_count: 0,
+            circuit_open: false,
+            next_retry_at: None,
+            last_error: None,
+            available_actions: actions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceSupervisorEvent {
+    pub surface: String,
+    pub status: SurfaceRuntimeStatus,
+    pub message: String,
+    pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SurfaceRuntimeError>,
+}
+
+impl SurfaceSupervisorEvent {
+    #[must_use]
+    pub fn new(
+        surface: impl AsRef<str>,
+        status: SurfaceRuntimeStatus,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            surface: normalize_surface_id(surface.as_ref()),
+            status,
+            message: message.into(),
+            timestamp: Utc::now(),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn error(
+        surface: impl AsRef<str>,
+        status: SurfaceRuntimeStatus,
+        error: SurfaceRuntimeError,
+    ) -> Self {
+        Self {
+            surface: normalize_surface_id(surface.as_ref()),
+            status,
+            message: error.message.clone(),
+            timestamp: Utc::now(),
+            error: Some(error),
         }
     }
 }
@@ -631,6 +871,36 @@ mod tests {
         assert_eq!(descriptor.routes.len(), 1);
         assert_eq!(descriptor.resources.len(), 1);
         assert_eq!(descriptor.health.mode, SurfaceHealthMode::Jsonl);
+    }
+
+    #[test]
+    fn health_spec_defaults_bound_repair_retries() {
+        let spec = SurfaceHealthSpec::default();
+        assert_eq!(spec.timeout_ms, 5_000);
+        assert_eq!(spec.repair.failure_threshold, 3);
+        assert_eq!(spec.repair.restart_limit, 3);
+        assert_eq!(spec.repair.backoff_max_ms, 60_000);
+    }
+
+    #[test]
+    fn runtime_snapshot_round_trips_with_circuit_state() {
+        let mut snapshot = SurfaceRuntimeSnapshot::discovered("feishu", SurfaceLifecycle::Managed);
+        snapshot.status = SurfaceRuntimeStatus::CircuitOpen;
+        snapshot.circuit_open = true;
+        snapshot.last_error = Some(SurfaceRuntimeError::new(
+            SurfaceFailureKind::HealthTimeout,
+            "health timeout",
+        ));
+
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: SurfaceRuntimeSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.surface, "feishu");
+        assert_eq!(decoded.status, SurfaceRuntimeStatus::CircuitOpen);
+        assert!(decoded.circuit_open);
+        assert_eq!(
+            decoded.last_error.unwrap().kind,
+            SurfaceFailureKind::HealthTimeout
+        );
     }
 
     #[test]

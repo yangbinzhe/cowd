@@ -535,7 +535,7 @@ async fn evaluate_action_readiness(
         blockers.push(format!("policy:{}", decision.reason));
     }
     if let Some(readiness) = &platform_readiness {
-        if readiness.status != "ready" {
+        if !matches!(readiness.status, "ready" | "configured") {
             blockers.push(format!("platform:{}:{}", readiness.name, readiness.status));
         }
     } else if let Some(target) = &target_platform {

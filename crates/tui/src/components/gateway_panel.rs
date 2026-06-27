@@ -1517,6 +1517,7 @@ mod tests {
             resource_count: 1,
             entry: None,
             diagnostics: Vec::new(),
+            ..Default::default()
         }];
         panel.surface_health = Some(crate::runtime_control_store::SurfaceHealthSummary {
             status: "ready".to_string(),
@@ -1524,6 +1525,7 @@ mod tests {
             external_surface_count: 0,
             route_count: 0,
             resource_count: 1,
+            ..Default::default()
         });
         panel.set_execution_receipts(vec![GatewayExecutionReceipt {
             status: "planned".to_string(),

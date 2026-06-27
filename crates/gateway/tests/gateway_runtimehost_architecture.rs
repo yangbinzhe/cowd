@@ -1365,10 +1365,16 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
     for required in [
         "pub async fn surface_registry",
         "pub async fn surface_health_summary",
+        "pub async fn surface_status",
+        "pub async fn surface_health_check",
+        "pub async fn surface_repair",
         "pub async fn surface_events",
         "pub async fn surface_send",
         "pub async fn surface_action",
         "/api/surfaces",
+        "/api/surfaces/{}/status",
+        "/api/surfaces/{}/health-check",
+        "/api/surfaces/{}/repair",
         "/api/surfaces/{}/send",
         "/api/surfaces/{}/action",
     ] {
