@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
 
+use futures::StreamExt;
 use provider::{
     max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
@@ -22,7 +23,6 @@ struct ProviderEntry {
 }
 
 pub struct ProviderRuntimeClient {
-    runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     tool_definitions: Vec<ToolDefinition>,
     reasoning_effort: Option<String>,
@@ -55,10 +55,6 @@ impl ProviderRuntimeClient {
         }
         chain.dedup_by(|a, b| a.model == b.model);
         Ok(Self {
-            runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?,
             chain,
             tool_definitions,
             reasoning_effort: None,
@@ -146,15 +142,18 @@ impl ApiClient for ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
-        match self.stream_collect_inner(request) {
-            Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
-            Err(error) => Box::pin(futures::stream::iter(std::iter::once(Err(error)))),
-        }
+        let events = async move {
+            match self.stream_collect_inner(request).await {
+                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            }
+        };
+        Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
     }
 }
 
 impl ProviderRuntimeClient {
-    fn stream_collect_inner(
+    async fn stream_collect_inner(
         &mut self,
         request: ApiRequest,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -163,7 +162,6 @@ impl ProviderRuntimeClient {
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.tool_definitions.is_empty()).then_some(ToolChoice::Auto);
 
-        let runtime = &self.runtime;
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
@@ -179,12 +177,13 @@ impl ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(
+            let attempt = stream_with_provider(
                 &entry.client,
                 &message_request,
                 self.emit_output,
                 self.stream_callback.clone(),
-            ));
+            )
+            .await;
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {

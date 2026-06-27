@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ const SURFACE_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
     let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let session_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
     tokio::spawn(async move {
         loop {
             let frame = match rx.recv().await {
@@ -36,8 +37,11 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
             }
             let state = state.clone();
             let seen = seen.clone();
+            let session_locks = session_locks.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_surface_message(state, seen, surface, payload).await {
+                if let Err(error) =
+                    handle_surface_message(state, seen, session_locks, surface, payload).await
+                {
                     tracing::warn!(error = %error, "surface ingress message handling failed");
                 }
             });
@@ -48,6 +52,7 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
 async fn handle_surface_message(
     state: Arc<AppState>,
     seen: Arc<Mutex<HashSet<String>>>,
+    session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     surface: String,
     payload: serde_json::Value,
 ) -> Result<(), String> {
@@ -68,6 +73,8 @@ async fn handle_surface_message(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "surface message has no text content".to_string())?;
     let session_id = surface_session_id(&surface, &payload);
+    let session_lock = surface_session_lock(&session_locks, &session_id).await;
+    let _session_guard = session_lock.lock().await;
     let user_id = payload_string(&payload, "user_id");
     let thread_id = payload_string(&payload, "thread_id");
     let metadata = payload
@@ -101,10 +108,28 @@ async fn handle_surface_message(
         .runtime
         .as_ref()
         .ok_or_else(|| "runtime service unavailable".to_string())?;
-    let execution = runtime_service
+    let execution = match runtime_service
         .run_turn_with_timeout(&session_id, None, content, SURFACE_TURN_TIMEOUT)
         .await
-        .map_err(|error| error.message())?;
+    {
+        Ok(execution) => execution,
+        Err(error) => {
+            let message = error.message();
+            append_surface_timeline_event(
+                &state,
+                &session_id,
+                "SurfaceMessageProcessingFailed",
+                serde_json::json!({
+                    "type": "SurfaceMessageProcessingFailed",
+                    "surface": surface.clone(),
+                    "message_id": message_id.clone(),
+                    "error": message,
+                }),
+            )
+            .await?;
+            return Err(message);
+        }
+    };
     if let Some(snapshot) = runtime_service.session_snapshot(&session_id).await {
         runtime_service
             .sync_session_snapshot(&session_id, &snapshot)
@@ -120,8 +145,8 @@ async fn handle_surface_message(
             "SurfaceMessageProcessed",
             serde_json::json!({
                 "type": "SurfaceMessageProcessed",
-                "surface": surface,
-                "message_id": message_id,
+                "surface": surface.clone(),
+                "message_id": message_id.clone(),
                 "turn_id": execution.receipt.turn_id,
                 "response_preview": response_text.chars().take(240).collect::<String>(),
             }),
@@ -136,22 +161,35 @@ async fn handle_surface_message(
         .or(thread_id.clone())
         .or(user_id.clone())
         .unwrap_or_else(|| session_id.clone());
-    let outbound = state
-        .services
-        .surface
-        .send(SurfaceSendRequest {
-            surface: surface.clone(),
-            recipient,
-            thread: thread_id,
-            text: response_text,
-            metadata: serde_json::json!({
-                "reply_to": message_id,
-                "source_session_id": session_id,
-                "source": "surface_ingress_dispatcher",
-            }),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+    let outbound_request = SurfaceSendRequest {
+        surface: surface.clone(),
+        recipient,
+        thread: thread_id,
+        text: response_text,
+        metadata: serde_json::json!({
+            "reply_to": message_id,
+            "source_session_id": session_id,
+            "source": "surface_ingress_dispatcher",
+        }),
+    };
+    let outbound = match state.services.surface.send(outbound_request).await {
+        Ok(outbound) => outbound,
+        Err(error) => {
+            append_surface_timeline_event(
+                &state,
+                &session_id,
+                "SurfaceMessageReplyFailed",
+                serde_json::json!({
+                    "type": "SurfaceMessageReplyFailed",
+                    "surface": surface.clone(),
+                    "message_id": message_id.clone(),
+                    "error": error,
+                }),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     state
         .services
         .session
@@ -160,7 +198,7 @@ async fn handle_surface_message(
             "SurfaceMessageReplied",
             serde_json::json!({
                 "type": "SurfaceMessageReplied",
-                "surface": surface,
+                "surface": surface.clone(),
                 "message_id": message_id,
                 "outbound": outbound,
             }),
@@ -168,6 +206,32 @@ async fn handle_surface_message(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn surface_session_lock(
+    session_locks: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    session_id: &str,
+) -> Arc<Mutex<()>> {
+    let mut locks = session_locks.lock().await;
+    locks
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn append_surface_timeline_event(
+    state: &AppState,
+    session_id: &str,
+    event_type: &'static str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    state
+        .services
+        .session
+        .append_timeline_event(session_id, event_type, payload)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn ensure_surface_runtime_session(
