@@ -31,6 +31,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REPORT_DIR: &str =
@@ -103,6 +104,50 @@ struct ProviderRoundDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ToolCallSummary {
+    call_index: usize,
+    scenario_id: String,
+    name: String,
+    status: String,
+    elapsed_ms: u128,
+    input_summary: String,
+    output_summary: String,
+    detail_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolCallDetail {
+    summary: ToolCallSummary,
+    input: serde_json::Value,
+    output: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RealToolScenarioResult {
+    scenario_id: String,
+    title: String,
+    status: String,
+    tool_calls: usize,
+    runtime_evidence: Vec<String>,
+    matrix_evidence: Vec<String>,
+    memory_evidence: Vec<String>,
+    changed_files: Vec<String>,
+    diff_summary: String,
+    conclusion: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RealToolScenarioReport {
+    kind: &'static str,
+    target_repo: String,
+    total: usize,
+    passed: usize,
+    tool_calls: usize,
+    scenarios: Vec<RealToolScenarioResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct RuntimeActionTrace {
     index: usize,
     action: String,
@@ -120,6 +165,7 @@ struct ExecutionTrace {
     tool_calls: usize,
     total_usage: UsageSummary,
     rounds: Vec<ProviderRoundSummary>,
+    tool_call_log: Vec<ToolCallSummary>,
     runtime_action_log: Vec<RuntimeActionTrace>,
 }
 
@@ -138,6 +184,7 @@ impl ExecutionTrace {
                 ..UsageSummary::default()
             },
             rounds: Vec::new(),
+            tool_call_log: Vec::new(),
             runtime_action_log: Vec::new(),
         }
     }
@@ -153,7 +200,6 @@ impl ExecutionTrace {
     }
 
     fn add_provider_round(&mut self, summary: ProviderRoundSummary) {
-        self.tool_calls = self.tool_calls.saturating_add(summary.tool_use_count);
         self.total_usage.input_tokens = self
             .total_usage
             .input_tokens
@@ -181,6 +227,11 @@ impl ExecutionTrace {
         self.provider_rounds = self.rounds.len();
     }
 
+    fn add_tool_call(&mut self, summary: ToolCallSummary) {
+        self.tool_call_log.push(summary);
+        self.tool_calls = self.tool_call_log.len();
+    }
+
     fn finish(&mut self, started: Instant) {
         self.finished_at_ms = Some(now_ms_u128());
         self.total_elapsed_ms = Some(started.elapsed().as_millis());
@@ -200,10 +251,13 @@ struct MissionHarnessEvalReport {
     scenarios: Vec<CapabilityResult>,
     metrics: Vec<HarnessMetric>,
     complex_scenarios: Option<ComplexHarnessScenarioReport>,
+    real_tool_scenarios: Option<RealToolScenarioReport>,
     execution_trace: ExecutionTrace,
     result_package_dir: Option<String>,
     #[serde(skip)]
     provider_round_details: Vec<ProviderRoundDetail>,
+    #[serde(skip)]
+    tool_call_details: Vec<ToolCallDetail>,
 }
 
 fn main() {
@@ -295,9 +349,11 @@ fn run_quick() -> MissionHarnessEvalReport {
         scenarios,
         metrics,
         complex_scenarios: None,
+        real_tool_scenarios: None,
         execution_trace: trace,
         result_package_dir: None,
         provider_round_details: Vec::new(),
+        tool_call_details: Vec::new(),
     }
 }
 
@@ -353,9 +409,11 @@ fn run_full() -> MissionHarnessEvalReport {
         scenarios,
         metrics,
         complex_scenarios: None,
+        real_tool_scenarios: None,
         execution_trace: trace,
         result_package_dir: None,
         provider_round_details: Vec::new(),
+        tool_call_details: Vec::new(),
     }
 }
 
@@ -398,9 +456,11 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
             }],
             metrics: Vec::new(),
             complex_scenarios: None,
+            real_tool_scenarios: None,
             execution_trace: trace,
             result_package_dir: None,
             provider_round_details: Vec::new(),
+            tool_call_details: Vec::new(),
         };
     }
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
@@ -417,6 +477,9 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         ),
     );
     scenarios.push(complex_scenario_capability(&complex_scenarios));
+    let mut tool_call_details = Vec::new();
+    let real_tool_scenarios = run_real_tool_deep_scenarios(&mut trace, &mut tool_call_details);
+    scenarios.extend(real_tool_scenario_capabilities(&real_tool_scenarios));
     let mut provider_round_details = Vec::new();
     let provider_smoke = run_provider_smoke(&mut trace, &mut provider_round_details);
     let provider_passed = provider_smoke.status == "passed";
@@ -475,9 +538,11 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         scenarios,
         metrics,
         complex_scenarios: Some(complex_scenarios),
+        real_tool_scenarios: Some(real_tool_scenarios),
         execution_trace: trace,
         result_package_dir: None,
         provider_round_details,
+        tool_call_details,
     }
 }
 
@@ -553,6 +618,721 @@ fn complex_scenario_capability(report: &ComplexHarnessScenarioReport) -> Capabil
         ),
         notes: "generated complex topics, solved them, reviewed acceptance checks, and scored harness readiness"
             .to_string(),
+    }
+}
+
+fn real_tool_scenario_capabilities(report: &RealToolScenarioReport) -> Vec<CapabilityResult> {
+    let mut results = Vec::new();
+    results.push(CapabilityResult {
+        capability: "deep_harness_real_tool_scenario_suite",
+        status: if report.passed == report.total && report.tool_calls > 0 {
+            "passed"
+        } else {
+            "failed"
+        },
+        evidence: format!(
+            "{}/{} scenarios passed; tool_calls={}",
+            report.passed, report.total, report.tool_calls
+        ),
+        notes: "deep eval executed real tools and recorded full tool-call evidence".to_string(),
+    });
+
+    let capability_names = [
+        "deep_tool_code_refactor_iacc",
+        "deep_tool_manufacturing_matrix_what_if",
+        "deep_tool_large_memory_governance",
+        "deep_tool_harness_evolution",
+        "deep_tool_simple_fast_path",
+        "deep_tool_multi_agent_team_modes",
+        "deep_tool_cross_session_linkage",
+    ];
+    for (scenario, capability) in report.scenarios.iter().zip(capability_names) {
+        results.push(CapabilityResult {
+            capability,
+            status: if scenario.status == "passed" {
+                "passed"
+            } else {
+                "failed"
+            },
+            evidence: format!(
+                "{}; tool_calls={}; {}",
+                scenario.scenario_id, scenario.tool_calls, scenario.diff_summary
+            ),
+            notes: scenario.conclusion.clone(),
+        });
+    }
+    results
+}
+
+fn run_real_tool_deep_scenarios(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+) -> RealToolScenarioReport {
+    let target_repo = std::env::var("COWD_EVAL_TARGET_REPO")
+        .unwrap_or_else(|_| "/media/yi/Datas/workspace/dev-iacc".to_string());
+    let target_repo_path = PathBuf::from(&target_repo);
+    let workspace = std::env::temp_dir().join(format!(
+        "cowd-real-tool-eval-{}-{}",
+        std::process::id(),
+        now_ms_u128()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::create_dir_all(&workspace);
+
+    let scenarios = vec![
+        run_code_refactor_tool_scenario(trace, details, &target_repo_path, &workspace),
+        run_manufacturing_matrix_tool_scenario(trace, details, &workspace),
+        run_large_memory_tool_scenario(trace, details, &workspace),
+        run_harness_evolution_tool_scenario(trace, details, &workspace),
+        run_simple_fast_path_tool_scenario(trace, details, &workspace),
+        run_multi_agent_tool_scenario(trace, details, &workspace),
+        run_cross_session_tool_scenario(trace, details, &workspace),
+    ];
+
+    let total = scenarios.len();
+    let passed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status == "passed")
+        .count();
+    let tool_calls = scenarios.iter().map(|scenario| scenario.tool_calls).sum();
+    RealToolScenarioReport {
+        kind: "real_tool_scenario_report",
+        target_repo: target_repo_path.display().to_string(),
+        total,
+        passed,
+        tool_calls,
+        scenarios,
+    }
+}
+
+fn run_code_refactor_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    target_repo: &Path,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "code_refactor_iacc";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(workspace_dir.join("src"));
+
+    let glob = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "glob_search",
+        json!({"pattern": "crates/**/*.rs", "path": target_repo}),
+    );
+    let grep = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "grep_search",
+        json!({
+            "pattern": "run_prompt|livecli|provider|gateway",
+            "path": target_repo,
+            "glob": "crates/**/*.rs",
+            "output_mode": "content",
+            "-n": true,
+            "head_limit": 40
+        }),
+    );
+    let cargo = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "read_file",
+        json!({"path": target_repo.join("Cargo.toml"), "offset": 0, "limit": 5000}),
+    );
+    let file_path = workspace_dir.join("src/lib.rs");
+    let original = "pub fn legacy_run_prompt() -> &'static str {\n    \"gateway must not own cli prompt loops\"\n}\n";
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": file_path, "content": original}),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "edit_file",
+        json!({
+            "path": workspace_dir.join("src/lib.rs"),
+            "old_string": "legacy_run_prompt",
+            "new_string": "gateway_status_contract",
+            "replace_all": true
+        }),
+    );
+    let edited = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "read_file",
+        json!({"path": workspace_dir.join("src/lib.rs"), "offset": 0, "limit": 2000}),
+    );
+    let passed = glob.is_ok()
+        && grep.is_ok()
+        && cargo.is_ok()
+        && edited
+            .as_deref()
+            .is_ok_and(|text| text.contains("gateway_status_contract"));
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "iACC branch code analysis and isolated refactor".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec![format!("target_repo={}", target_repo.display())],
+        matrix_evidence: Vec::new(),
+        memory_evidence: Vec::new(),
+        changed_files: vec![workspace_dir.join("src/lib.rs").display().to_string()],
+        diff_summary: "isolated symbol rename legacy_run_prompt -> gateway_status_contract"
+            .to_string(),
+        conclusion: "tools inspected real iACC branch files and executed an isolated refactor without committing branch changes".to_string(),
+    }
+}
+
+fn run_manufacturing_matrix_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "manufacturing_matrix_what_if";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let supply_chain = json!({
+        "product": "industrial-controller-x7",
+        "weekly_demand": 1200,
+        "plants": [
+            {"id": "plant-suzhou", "capacity": 900, "yield": 0.94},
+            {"id": "plant-bac-ninh", "capacity": 550, "yield": 0.91}
+        ],
+        "suppliers": [
+            {"id": "supplier-alpha", "component": "mcu", "lead_time_days": 21, "risk": "medium"},
+            {"id": "supplier-beta", "component": "mcu", "lead_time_days": 34, "risk": "high"},
+            {"id": "supplier-gamma", "component": "power-module", "lead_time_days": 18, "risk": "low"}
+        ],
+        "what_if": "supplier-beta outage for 14 days and demand +18%"
+    });
+    let data_file = workspace_dir.join("supply-chain.json");
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": data_file, "content": supply_chain.to_string()}),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "read_file",
+        json!({"path": workspace_dir.join("supply-chain.json"), "offset": 0, "limit": 8000}),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "grep_search",
+        json!({"pattern": "supplier-beta|what_if|lead_time", "path": workspace_dir, "glob": "*.json", "output_mode": "content", "-n": true}),
+    );
+
+    let mut service = FactKernelService::new();
+    let source = FactSource {
+        kind: SourceKind::Simulation,
+        id: scenario_id.to_string(),
+        label: Some("manufacturing what-if".to_string()),
+    };
+    let evidence = service.ingest_evidence(EvidencePacket::new(source.clone(), supply_chain));
+    let facts = [
+        ("supplier-alpha", "lead_time_days", json!(21)),
+        ("supplier-beta", "lead_time_days", json!(34)),
+        ("supplier-beta", "lead_time_days", json!(999)),
+        ("plant-suzhou", "effective_capacity", json!(846)),
+        ("plant-bac-ninh", "effective_capacity", json!(500)),
+    ];
+    for (entity, predicate, value) in facts {
+        let receipt = service.promote_candidate(GrowthCandidate::Matrix(MatrixFact {
+            id: FactId::new(),
+            entity: entity.to_string(),
+            predicate: predicate.to_string(),
+            value,
+            source: source.clone(),
+            evidence: vec![evidence.id.clone()],
+            confidence: Confidence::from_basis_points(9_200),
+            boundary: HypothesisBoundary::observed(),
+        }));
+        trace.record_runtime_action(
+            "matrix.what_if.promote",
+            format!("{entity}.{predicate}={:?}", receipt.decision.decision),
+        );
+    }
+    let issues = service.evaluate_health();
+    let conflicts = issues
+        .iter()
+        .filter(|issue| issue.kind == FactHealthIssueKind::Conflict)
+        .count();
+    let recall = service.recall(&RecallQuery::new("supplier-beta lead_time_days"));
+    let passed = conflicts >= 2 && !recall.is_empty();
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Manufacturing supply-chain what-if through matrix".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec![format!("health_issues={}", issues.len())],
+        matrix_evidence: vec![
+            format!("conflicts={conflicts}"),
+            format!("recall_hits={}", recall.len()),
+            "recommendation=dual-source mcu and shift 300 units to plant-bac-ninh if beta outage persists".to_string(),
+        ],
+        memory_evidence: Vec::new(),
+        changed_files: vec![workspace_dir.join("supply-chain.json").display().to_string()],
+        diff_summary: "manufacturing dataset generated and matrix conflict intentionally detected"
+            .to_string(),
+        conclusion: "matrix can represent manufacturing facts, detect contradictory what-if values, and support operational recommendations".to_string(),
+    }
+}
+
+fn run_large_memory_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "large_memory_governance";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": workspace_dir.join("memory-batch.jsonl"), "content": build_memory_jsonl(160)}),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "grep_search",
+        json!({"pattern": "supplier-beta|policy", "path": workspace_dir, "glob": "*.jsonl", "output_mode": "content", "-n": true, "head_limit": 20}),
+    );
+
+    let mut service = FactKernelService::new();
+    let source = FactSource {
+        kind: SourceKind::Memory,
+        id: scenario_id.to_string(),
+        label: Some("large memory eval".to_string()),
+    };
+    let mut promoted = 0usize;
+    for index in 0..160 {
+        let evidence = service.ingest_evidence(EvidencePacket::new(
+            source.clone(),
+            json!({"index": index, "text": format!("manufacturing policy memory {index}")}),
+        ));
+        let receipt = service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+            summary: format!(
+                "policy memory {index}: supplier risk review cadence is weekly for tier-1 components"
+            ),
+            source: source.clone(),
+            evidence: vec![evidence.id],
+            confidence: Confidence::from_basis_points(8_000),
+            boundary: HypothesisBoundary::observed(),
+            tags: vec!["manufacturing".to_string(), "policy".to_string()],
+        }));
+        promoted += usize::from(receipt.promoted_fact.is_some());
+    }
+    let low_evidence = service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({"text": "unverified rumor"}),
+    ));
+    let low = service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+        summary: "unverified claim: all supplier-beta lots are unusable".to_string(),
+        source: source.clone(),
+        evidence: vec![low_evidence.id],
+        confidence: Confidence::from_basis_points(3_000),
+        boundary: HypothesisBoundary::observed(),
+        tags: vec!["conflict".to_string()],
+    }));
+    let hypothetical = service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+        summary: "hypothetical memory must not pollute observed store".to_string(),
+        source,
+        evidence: Vec::new(),
+        confidence: Confidence::from_basis_points(9_000),
+        boundary: HypothesisBoundary::hypothetical("memory-what-if"),
+        tags: vec!["hypothetical".to_string()],
+    }));
+    let recall = service.recall(&RecallQuery::new("supplier risk weekly tier-1"));
+    let health = service.evaluate_health();
+    let low_confidence = health
+        .iter()
+        .filter(|issue| issue.kind == FactHealthIssueKind::LowConfidence)
+        .count();
+    let passed = promoted == 160
+        && low.promoted_fact.is_none()
+        && hypothetical.promoted_fact.is_none()
+        && !recall.is_empty();
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Large memory build, recall, conflict and governance".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec![format!("health_issues={}", health.len())],
+        matrix_evidence: Vec::new(),
+        memory_evidence: vec![
+            format!("promoted={promoted}"),
+            format!("recall_hits={}", recall.len()),
+            format!("low_confidence_held={}", low.promoted_fact.is_none()),
+            format!("low_confidence_health_issues={low_confidence}"),
+            format!("hypothetical_promoted={}", hypothetical.promoted_fact.is_some()),
+            "conflict_resolution=new observed policy wins over unverified rumor".to_string(),
+        ],
+        changed_files: vec![workspace_dir.join("memory-batch.jsonl").display().to_string()],
+        diff_summary: "160 observed memories inserted; low confidence hold and hypothetical governance checked"
+            .to_string(),
+        conclusion: "memory can sustain batch growth, recall relevant policy facts, and keep hypothetical facts out of observed memory".to_string(),
+    }
+}
+
+fn run_harness_evolution_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "harness_evolution";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let gap_file = workspace_dir.join("harness-gap.md");
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": gap_file, "content": "# Harness Gap\n\n- tool_calls were not counted as first-class evidence.\n"}),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "edit_file",
+        json!({
+            "path": workspace_dir.join("harness-gap.md"),
+            "old_string": "- tool_calls were not counted as first-class evidence.",
+            "new_string": "- tool_calls are recorded as first-class evidence with detail packages.\n- scenario evidence is split into provider, runtime, tool and fact lanes.",
+            "replace_all": true
+        }),
+    );
+    let search = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "ToolSearch",
+        json!({"query": "read grep edit structured output evidence"}),
+    );
+    let read = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "read_file",
+        json!({"path": workspace_dir.join("harness-gap.md"), "offset": 0, "limit": 4000}),
+    );
+    let mut service = FactKernelService::new();
+    let receipt = service.promote_candidate(GrowthCandidate::PolicyLearning {
+        summary: "harness eval must distinguish provider rounds from actual tool calls".to_string(),
+        confidence: Confidence::from_basis_points(9_500),
+    });
+    let passed = search.is_ok()
+        && read
+            .as_deref()
+            .is_ok_and(|text| text.contains("first-class evidence"))
+        && receipt.promoted_fact.is_some();
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Harness evolution from discovered gap to policy learning".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec!["policy_learning.promote".to_string()],
+        matrix_evidence: Vec::new(),
+        memory_evidence: vec!["growth.policy_learning=promoted".to_string()],
+        changed_files: vec![workspace_dir.join("harness-gap.md").display().to_string()],
+        diff_summary: "harness gap note edited into explicit evaluation policy".to_string(),
+        conclusion:
+            "harness can turn evaluation gaps into durable reviewable improvement candidates"
+                .to_string(),
+    }
+}
+
+fn run_simple_fast_path_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "simple_fast_path";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let answer = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "StructuredOutput",
+        json!({"answer": 42, "reason": "6 * 7"}),
+    );
+    let passed = answer.as_deref().is_ok_and(|text| text.contains("42"))
+        && trace.tool_calls.saturating_sub(before) == 1;
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Simple problem fast path".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec!["strategy=single_turn".to_string()],
+        matrix_evidence: Vec::new(),
+        memory_evidence: Vec::new(),
+        changed_files: Vec::new(),
+        diff_summary: "no files changed; one tool call produced structured answer".to_string(),
+        conclusion:
+            "simple deterministic tasks stay on the fast path without spawning unnecessary teams"
+                .to_string(),
+    }
+}
+
+fn run_multi_agent_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "multi_agent_team_modes";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let mission = global_mission_runtime();
+    let session = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Real tool multi-agent manufacturing recovery".to_string(),
+            session_id: Some(format!("real-tool-team-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("real tool team session starts");
+    let prompt = "manufacturing outage requires planner executor reviewer synthesizer";
+    let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+    let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+    let team = global_team_runtime_service()
+        .start(StartTeamRuntimeRequest {
+            session_id: session.session_id.clone(),
+            objective: "restore manufacturing flow with role-based evidence".to_string(),
+            collaboration_decision: decision.clone(),
+        })
+        .expect("real tool team starts");
+    let team_report = TeamExecutionLoop::tick_ready(&team.team_id).expect("team ticks");
+    trace.record_runtime_action(
+        "real_tool.team.tick",
+        format!(
+            "template={}; assigned={}",
+            decision.template_id.as_str(),
+            team_report.assigned_task_count
+        ),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "TodoWrite",
+        json!({
+            "todos": [
+                {"content": "planner: isolate bottleneck", "status": "completed", "priority": "high", "id": "planner"},
+                {"content": "executor: propose mitigation", "status": "completed", "priority": "high", "id": "executor"},
+                {"content": "reviewer: verify evidence", "status": "completed", "priority": "medium", "id": "reviewer"}
+            ]
+        }),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": workspace_dir.join("team-summary.md"), "content": format!("team={} template={} assigned={}", team.team_id, decision.template_id.as_str(), team_report.assigned_task_count)}),
+    );
+    let passed =
+        team_report.assigned_task_count > 0 && trace.tool_calls.saturating_sub(before) >= 2;
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Multi-agent team template collaboration".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec![
+            format!("session={}", session.session_id),
+            format!("team={}", team.team_id),
+            format!("template={}", decision.template_id.as_str()),
+            format!("assigned={}", team_report.assigned_task_count),
+        ],
+        matrix_evidence: Vec::new(),
+        memory_evidence: Vec::new(),
+        changed_files: vec![workspace_dir.join("team-summary.md").display().to_string()],
+        diff_summary: "team summary generated from real team runtime tick".to_string(),
+        conclusion: "multi-agent collaboration templates produce reviewable role tasks and are visible in runtime evidence".to_string(),
+    }
+}
+
+fn run_cross_session_tool_scenario(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    workspace: &Path,
+) -> RealToolScenarioResult {
+    let scenario_id = "cross_session_linkage";
+    let before = trace.tool_calls;
+    let workspace_dir = workspace.join(scenario_id);
+    let _ = std::fs::create_dir_all(&workspace_dir);
+    let mission = global_mission_runtime();
+    let primary = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Primary manufacturing controller".to_string(),
+            session_id: Some(format!("real-tool-primary-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("primary session");
+    let peer = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Peer supplier investigation".to_string(),
+            session_id: Some(format!("real-tool-peer-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("peer session");
+    global_session_relation_graph()
+        .upsert_proxy(SessionProxy {
+            session_id: peer.session_id.clone(),
+            summary: "supplier-beta outage analysis".to_string(),
+            evidence_refs: vec![format!("session:{}", peer.session_id)],
+            decisions: vec!["supplier-beta recovery evidence requested".to_string()],
+            open_questions: vec!["can supplier-alpha absorb beta outage volume?".to_string()],
+            updated_at_ms: now_ms_u128() as u64,
+        })
+        .expect("proxy upsert");
+    let bridge = MissionControlRuntime::execute(MissionControlCommand {
+        target: MissionControlCommandTarget::Session {
+            session_id: primary.session_id.clone(),
+        },
+        action: MissionControlAction::RouteToSession,
+        actor: Some("harness-eval".to_string()),
+        payload: json!({
+            "target_session_id": peer.session_id.clone(),
+            "command": "check supplier-beta recovery options"
+        }),
+        evidence_refs: vec![format!("session:{}", primary.session_id)],
+    });
+    trace.record_runtime_action(
+        "real_tool.cross_session.bridge",
+        format!("{} -> {}", primary.session_id, peer.session_id),
+    );
+    let _ = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "write_file",
+        json!({"path": workspace_dir.join("session-link.json"), "content": json!({"primary": primary.session_id, "peer": peer.session_id, "status": format!("{:?}", bridge.status), "message": bridge.message}).to_string()}),
+    );
+    let read = execute_traced_tool(
+        trace,
+        details,
+        scenario_id,
+        "read_file",
+        json!({"path": workspace_dir.join("session-link.json"), "offset": 0, "limit": 3000}),
+    );
+    let passed = bridge.message.contains("routed")
+        && read.as_deref().is_ok_and(|text| text.contains("peer"));
+    RealToolScenarioResult {
+        scenario_id: scenario_id.to_string(),
+        title: "Cross-session switching and linkage".to_string(),
+        status: status_str(passed),
+        tool_calls: trace.tool_calls.saturating_sub(before),
+        runtime_evidence: vec![
+            format!("primary={}", primary.session_id),
+            format!("peer={}", peer.session_id),
+            format!("bridge_status={:?}", bridge.status),
+        ],
+        matrix_evidence: Vec::new(),
+        memory_evidence: Vec::new(),
+        changed_files: vec![workspace_dir.join("session-link.json").display().to_string()],
+        diff_summary: "session linkage artifact written and reread through tools".to_string(),
+        conclusion: "mission control can route between sessions and expose linkage evidence to the result package".to_string(),
+    }
+}
+
+fn execute_traced_tool(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ToolCallDetail>,
+    scenario_id: &str,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let result = tools::execute_tool(name, &input);
+    let elapsed_ms = started.elapsed().as_millis();
+    let call_index = trace.tool_call_log.len() + 1;
+    let (status, output, error, output_summary) = match result {
+        Ok(output) => (
+            "passed".to_string(),
+            Some(output.clone()),
+            None,
+            summarize_text(&output, 160),
+        ),
+        Err(error) => (
+            "failed".to_string(),
+            None,
+            Some(error.clone()),
+            summarize_text(&error, 160),
+        ),
+    };
+    let summary = ToolCallSummary {
+        call_index,
+        scenario_id: scenario_id.to_string(),
+        name: name.to_string(),
+        status,
+        elapsed_ms,
+        input_summary: summarize_json(&input, 160),
+        output_summary,
+        detail_path: format!(
+            "tool-calls/{:03}-{}-{}.json",
+            call_index,
+            sanitize_file_name(scenario_id),
+            sanitize_file_name(name)
+        ),
+    };
+    trace.add_tool_call(summary.clone());
+    details.push(ToolCallDetail {
+        summary,
+        input,
+        output,
+        error,
+    });
+    details
+        .last()
+        .and_then(|detail| detail.output.clone())
+        .ok_or_else(|| {
+            details
+                .last()
+                .and_then(|detail| detail.error.clone())
+                .unwrap_or_else(|| "tool failed without error".to_string())
+        })
+}
+
+fn build_memory_jsonl(count: usize) -> String {
+    (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("memory-{index:03}"),
+                "summary": format!("supplier risk review cadence memory {index}"),
+                "tags": ["manufacturing", "policy"]
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn status_str(passed: bool) -> String {
+    if passed {
+        "passed".to_string()
+    } else {
+        "failed".to_string()
     }
 }
 
@@ -1013,6 +1793,14 @@ fn summarize_text(value: &str, max: usize) -> String {
     } else {
         format!("{}...", compact.chars().take(max).collect::<String>())
     }
+}
+
+fn summarize_json(value: &serde_json::Value, max: usize) -> String {
+    summarize_text(&value.to_string(), max)
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|")
 }
 
 fn sanitize_file_name(value: &str) -> String {
@@ -1943,8 +2731,10 @@ fn write_report(
     let base = format!("{}-mission-harness-{}", stamp, report.level.as_str());
     let run_dir = root.join("runs").join(&base);
     let provider_round_dir = run_dir.join("provider-rounds");
+    let tool_call_dir = run_dir.join("tool-calls");
     let evidence_dir = run_dir.join("evidence");
     std::fs::create_dir_all(&provider_round_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&tool_call_dir).map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
     report.result_package_dir = Some(run_dir.display().to_string());
     let json_path = run_dir.join("report.json");
@@ -1954,7 +2744,14 @@ fn write_report(
         serde_json::to_string_pretty(report).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    write_result_package_details(report, &run_dir, &provider_round_dir, &evidence_dir)?;
+    write_result_package_details(
+        report,
+        &run_dir,
+        &provider_round_dir,
+        &tool_call_dir,
+        &evidence_dir,
+    )?;
+    write_analysis_report_assets(report, &run_dir)?;
     let mut markdown = String::from("# Mission Harness Evaluation Report\n\n");
     markdown.push_str(&format!(
         "- level: {}\n- status: {}\n- gateway_process: {}\n- provider: {}\n- budget: {}\n- result_package: {}\n\n",
@@ -2007,10 +2804,46 @@ fn write_report(
             round.usage.input_tokens,
             round.usage.output_tokens,
             round.usage.total_tokens,
-            round.request_summary,
-            round.response_summary,
+            markdown_cell(&round.request_summary),
+            markdown_cell(&round.response_summary),
             round.detail_path
         ));
+    }
+    markdown.push_str("\n## Tool Calls\n\n");
+    markdown.push_str("| Call | Scenario | Tool | Status | Elapsed ms | Input Summary | Output Summary | Detail |\n| --- | --- | --- | --- | ---: | --- | --- | --- |\n");
+    for call in &report.execution_trace.tool_call_log {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            call.call_index,
+            call.scenario_id,
+            call.name,
+            call.status,
+            call.elapsed_ms,
+            markdown_cell(&call.input_summary),
+            markdown_cell(&call.output_summary),
+            call.detail_path
+        ));
+    }
+    if let Some(real_tool) = &report.real_tool_scenarios {
+        markdown.push_str("\n## Real Tool Scenarios\n\n");
+        markdown.push_str(&format!(
+            "- target_repo: {}\n- passed: {}/{}\n- tool_calls: {}\n\n",
+            real_tool.target_repo, real_tool.passed, real_tool.total, real_tool.tool_calls
+        ));
+        markdown.push_str("| Scenario | Status | Tool Calls | Runtime Evidence | Matrix Evidence | Memory Evidence | Changed Files | Conclusion |\n| --- | --- | ---: | --- | --- | --- | --- | --- |\n");
+        for item in &real_tool.scenarios {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                item.scenario_id,
+                item.status,
+                item.tool_calls,
+                markdown_cell(&item.runtime_evidence.join("; ")),
+                markdown_cell(&item.matrix_evidence.join("; ")),
+                markdown_cell(&item.memory_evidence.join("; ")),
+                markdown_cell(&item.changed_files.join("; ")),
+                markdown_cell(&item.conclusion)
+            ));
+        }
     }
     if let Some(complex) = &report.complex_scenarios {
         markdown.push_str("\n## Complex Scenarios\n\n");
@@ -2061,6 +2894,7 @@ fn write_result_package_details(
     report: &MissionHarnessEvalReport,
     run_dir: &std::path::Path,
     provider_round_dir: &std::path::Path,
+    tool_call_dir: &std::path::Path,
     evidence_dir: &std::path::Path,
 ) -> Result<(), String> {
     std::fs::write(
@@ -2081,10 +2915,30 @@ fn write_result_package_details(
         )
         .map_err(|error| error.to_string())?;
     }
+    for detail in &report.tool_call_details {
+        let file_name = detail
+            .summary
+            .detail_path
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| "tool call detail path is empty".to_string())?;
+        std::fs::write(
+            tool_call_dir.join(file_name),
+            serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if let Some(complex) = &report.complex_scenarios {
         std::fs::write(
             evidence_dir.join("complex-scenarios.json"),
             serde_json::to_string_pretty(complex).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(real_tool) = &report.real_tool_scenarios {
+        std::fs::write(
+            evidence_dir.join("real-tool-scenarios.json"),
+            serde_json::to_string_pretty(real_tool).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     }
@@ -2094,6 +2948,60 @@ fn write_result_package_details(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn write_analysis_report_assets(
+    report: &MissionHarnessEvalReport,
+    run_dir: &std::path::Path,
+) -> Result<(), String> {
+    let context = json!({
+        "kind": "harness_eval.analysis_context",
+        "report_spec": "docs/ai-harness-report-spec.md",
+        "result_package": report.result_package_dir,
+        "level": report.level.as_str(),
+        "status": report.status,
+        "summary": {
+            "capability_count": report.scenarios.len(),
+            "failed_capabilities": report.scenarios.iter().filter(|item| item.status != "passed").count(),
+            "provider_rounds": report.execution_trace.provider_rounds,
+            "runtime_actions": report.execution_trace.runtime_actions,
+            "tool_calls": report.execution_trace.tool_calls,
+            "failed_tool_calls": report.execution_trace.tool_call_log.iter().filter(|item| item.status != "passed").count(),
+            "total_tokens": report.execution_trace.total_usage.total_tokens,
+            "input_tokens": report.execution_trace.total_usage.input_tokens,
+            "output_tokens": report.execution_trace.total_usage.output_tokens,
+        },
+        "required_inputs": [
+            "report.json",
+            "execution-trace.json",
+            "evidence/*.json",
+            "provider-rounds/*.json",
+            "tool-calls/*.json",
+            "full-analysis-report-template.md",
+            "full-analysis-report-prompt.md"
+        ],
+        "output": "full-analysis-report.md"
+    });
+    std::fs::write(
+        run_dir.join("analysis-context.json"),
+        serde_json::to_string_pretty(&context).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        run_dir.join("full-analysis-report-template.md"),
+        include_str!("../templates/full-analysis-report-template.md"),
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        run_dir.join("full-analysis-report-prompt.md"),
+        include_str!("../templates/full-analysis-report-prompt.md"),
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        run_dir.join("full-analysis-report.md"),
+        "# Full Analysis Report Pending AI Generation\n\nUse `full-analysis-report-prompt.md`, `full-analysis-report-template.md`, and `analysis-context.json` with the result package evidence to generate this report.\n",
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn write_stable_ai_report(

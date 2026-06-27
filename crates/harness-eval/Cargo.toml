@@ -11,6 +11,7 @@ harness-contract = { path = "../harness-contract" }
 runtime = { path = "../runtime" }
 serde.workspace = true
 serde_json.workspace = true
+tools = { path = "../tools" }
 uuid.workspace = true
 
 [lints]

@@ -18,6 +18,14 @@ scripts/validate.sh changed-crates
 scripts/validate.sh full-regression
 ```
 
+AI Harness 深度评测和场景化评测的报告输出必须遵守
+[AI Harness Report Specification](../../docs/ai-harness-report-spec.md)。摘要
+`report.md` 不能作为完整报告；结果包必须包含自动生成的报告生成资产
+`analysis-context.json`、`full-analysis-report-template.md` 和
+`full-analysis-report-prompt.md`。最终 `full-analysis-report.md` 由 AI reviewer
+基于证据包生成，并必须暴露局部工具失败、provider 轮次、runtime action、
+matrix/memory/session 证据和证据索引。
+
 ## 核心原则
 
 - 稳定内核合同留在 Rust unit/contract tests。

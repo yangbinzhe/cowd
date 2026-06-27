@@ -28,6 +28,14 @@ Outputs:
 - `target/ai-harness-health/lanes.tsv`
 - one log file per lane under `target/ai-harness-health/`
 
+Deep and scenario-style harness reports must follow
+[`ai-harness-report-spec.md`](ai-harness-report-spec.md). A compact
+`report.md` is only an index. The evaluator must produce the structured
+evidence plus `analysis-context.json`, `full-analysis-report-template.md`, and
+`full-analysis-report-prompt.md`; an AI reviewer then generates
+`full-analysis-report.md` with the full analysis, local failures,
+tool/provider evidence, runtime action interpretation, and evidence index.
+
 Default lanes:
 
 - `format-and-whitespace`
@@ -148,6 +156,8 @@ Outputs:
 A capability is not considered complete unless its lane is represented in
 `latest.json`, has a reproducible command, and records evidence logs. Live lanes
 must also state the model, provider, probe count, and token usage in the log.
+Deep harness result packages must also satisfy the report-completeness rules in
+[`ai-harness-report-spec.md`](ai-harness-report-spec.md).
 
 ## Current Baseline
 

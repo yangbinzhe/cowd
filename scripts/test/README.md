@@ -90,3 +90,16 @@ scripts/test/full-regression.sh
 - live provider、LLM judge、视觉交互、人工探索测试不进入默认门禁，除非被明确提升为发布门禁。
 - 架构重构必须有源码扫描或架构测试作为硬门禁，不能只依赖“能编译”。
 
+## AI Harness 报告规范
+
+深度评测、真实 provider 评测、场景化评测的结果包必须遵守
+[docs/ai-harness-report-spec.md](../../docs/ai-harness-report-spec.md)：
+
+- `report.md` 只是摘要入口。
+- `analysis-context.json`、`full-analysis-report-template.md`、
+  `full-analysis-report-prompt.md` 是报告生成契约，必须由评测器自动生成。
+- `full-analysis-report.md` 是 AI reviewer 基于证据包生成的人工审查完整分析报告。
+- `report.json`、`execution-trace.json`、`provider-rounds/`、`tool-calls/`、
+  `evidence/` 是可追溯证据包。
+- 即使总体状态为 passed，局部工具失败、降级行为、未证明内容也必须写入
+  `full-analysis-report.md`。
