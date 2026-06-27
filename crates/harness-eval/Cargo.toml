@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+fact-kernel = { path = "../fact-kernel" }
 harness-contract = { path = "../harness-contract" }
 runtime = { path = "../runtime" }
 serde.workspace = true

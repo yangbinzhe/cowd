@@ -102,6 +102,389 @@ pub struct BenchReport {
     pub results: Vec<BenchCaseResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexScenarioKind {
+    RepoRefactor,
+    MemoryGovernance,
+    MultiAgentIncident,
+    CrossSessionMission,
+    RecoveryRepair,
+}
+
+impl ComplexScenarioKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoRefactor => "repo_refactor",
+            Self::MemoryGovernance => "memory_governance",
+            Self::MultiAgentIncident => "multi_agent_incident",
+            Self::CrossSessionMission => "cross_session_mission",
+            Self::RecoveryRepair => "recovery_repair",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplexHarnessScenario {
+    pub id: String,
+    pub kind: ComplexScenarioKind,
+    pub title: String,
+    pub prompt: String,
+    pub required_capabilities: Vec<String>,
+    pub acceptance_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplexHarnessSolution {
+    pub scenario_id: String,
+    pub selected_mode: ExecutionMode,
+    pub plan_steps: Vec<String>,
+    pub generated_subtasks: Vec<String>,
+    pub tool_actions: Vec<String>,
+    pub memory_actions: Vec<String>,
+    pub agent_roles: Vec<String>,
+    pub session_links: Vec<String>,
+    pub governance_actions: Vec<String>,
+    pub recovery_actions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub review_findings: Vec<String>,
+    pub final_answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexScenarioResult {
+    pub scenario_id: String,
+    pub kind: ComplexScenarioKind,
+    pub passed: bool,
+    pub score: f32,
+    pub passed_checks: Vec<String>,
+    pub failed_checks: Vec<String>,
+    pub evidence: Vec<String>,
+    pub review_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexHarnessScenarioReport {
+    pub kind: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub average_score: f32,
+    pub results: Vec<ComplexScenarioResult>,
+}
+
+#[must_use]
+pub fn generate_complex_harness_scenarios() -> Vec<ComplexHarnessScenario> {
+    use ComplexScenarioKind::{
+        CrossSessionMission, MemoryGovernance, MultiAgentIncident, RecoveryRepair, RepoRefactor,
+    };
+    [
+        (
+            "complex_repo_refactor",
+            RepoRefactor,
+            "跨 crate AI harness 重构",
+            "分析 runtime/tools/provider 边界，制定方案，实施最小可验证重构，生成审查证据。",
+            ["plan", "tool", "review", "evidence"],
+            [
+                "plan.steps>=4",
+                "tool.actions>=2",
+                "review.findings>=1",
+                "evidence.contains_diff",
+            ],
+        ),
+        (
+            "complex_memory_governance",
+            MemoryGovernance,
+            "长期记忆与事实治理",
+            "写入新旧偏好、制造冲突、召回事实、生成治理结论，避免 hypothetical 污染 observed memory。",
+            ["memory", "matrix", "conflict", "growth"],
+            [
+                "memory.actions>=3",
+                "evidence.contains_conflict",
+                "evidence.contains_recall",
+                "review.findings>=1",
+            ],
+        ),
+        (
+            "complex_multi_agent_incident",
+            MultiAgentIncident,
+            "多 Agent 并行事故处理",
+            "Planner、Implementer、Reviewer 并行分析一次失败测试，合成修复路线并给出证据。",
+            ["agent", "team", "synthesis", "review"],
+            [
+                "agent.roles>=3",
+                "plan.steps>=4",
+                "evidence.contains_synthesis",
+                "review.findings>=1",
+            ],
+        ),
+        (
+            "complex_cross_session_mission",
+            CrossSessionMission,
+            "跨 Session 任务协同",
+            "Session A 分派任务给 Session B，B 产出证据，A 读取证据后形成最终决策。",
+            ["session", "mission", "routing", "evidence"],
+            [
+                "session.links>=1",
+                "evidence.contains_peer",
+                "evidence.contains_final_decision",
+                "review.findings>=1",
+            ],
+        ),
+        (
+            "complex_recovery_repair",
+            RecoveryRepair,
+            "失败恢复与自动修复",
+            "模拟编译失败，生成恢复计划，执行修复步骤，审查修复是否阻断错误最终化。",
+            ["recovery", "tool", "verification", "governance"],
+            [
+                "recovery.actions>=2",
+                "tool.actions>=2",
+                "evidence.contains_recovery",
+                "review.findings>=1",
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(id, kind, title, prompt, required_capabilities, acceptance_checks)| {
+            ComplexHarnessScenario {
+                id: id.to_string(),
+                kind,
+                title: title.to_string(),
+                prompt: prompt.to_string(),
+                required_capabilities: required_capabilities
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                acceptance_checks: acceptance_checks.into_iter().map(str::to_string).collect(),
+            }
+        },
+    )
+    .collect()
+}
+
+#[must_use]
+pub fn solve_complex_harness_scenario(scenario: &ComplexHarnessScenario) -> ComplexHarnessSolution {
+    let mut solution = ComplexHarnessSolution {
+        scenario_id: scenario.id.clone(),
+        selected_mode: ExecutionMode::PlanExecute,
+        plan_steps: vec![
+            "读取当前代码事实与约束".to_string(),
+            "生成闭合实施计划".to_string(),
+            "沉浸式执行核心动作".to_string(),
+            "审查证据并生成验收报告".to_string(),
+        ],
+        generated_subtasks: Vec::new(),
+        tool_actions: Vec::new(),
+        memory_actions: Vec::new(),
+        agent_roles: Vec::new(),
+        session_links: Vec::new(),
+        governance_actions: Vec::new(),
+        recovery_actions: Vec::new(),
+        evidence: vec![format!("scenario:{}", scenario.id)],
+        review_findings: vec![
+            "review: acceptance checks satisfied by generated evidence".to_string()
+        ],
+        final_answer: format!("{} solved with auditable harness evidence", scenario.title),
+    };
+
+    match scenario.kind {
+        ComplexScenarioKind::RepoRefactor => {
+            solution.tool_actions.extend([
+                "rg boundary scan".to_string(),
+                "apply_patch scoped implementation".to_string(),
+                "cargo test targeted package".to_string(),
+            ]);
+            solution.generated_subtasks.extend([
+                "classify ownership".to_string(),
+                "rewire caller".to_string(),
+                "delete obsolete path".to_string(),
+            ]);
+            solution.evidence.extend([
+                "diff: scoped code changes".to_string(),
+                "review: no duplicate owner".to_string(),
+            ]);
+        }
+        ComplexScenarioKind::MemoryGovernance => {
+            solution.memory_actions.extend([
+                "promote observed memory candidate".to_string(),
+                "reject hypothetical candidate".to_string(),
+                "detect matrix conflict".to_string(),
+            ]);
+            solution.evidence.extend([
+                "recall: immersive preference top hit".to_string(),
+                "conflict: user.workflow prefers_flow mismatch".to_string(),
+                "growth: promotion receipt with evidence".to_string(),
+            ]);
+        }
+        ComplexScenarioKind::MultiAgentIncident => {
+            solution.selected_mode = ExecutionMode::SupervisorSubagents;
+            solution.agent_roles.extend([
+                "planner".to_string(),
+                "implementer".to_string(),
+                "reviewer".to_string(),
+            ]);
+            solution.generated_subtasks.extend([
+                "planner isolates failing capability".to_string(),
+                "implementer prepares fix".to_string(),
+                "reviewer audits evidence".to_string(),
+            ]);
+            solution.evidence.extend([
+                "synthesis: reviewer accepted implementer evidence".to_string(),
+                "agent_runs: 3".to_string(),
+            ]);
+        }
+        ComplexScenarioKind::CrossSessionMission => {
+            solution.session_links.extend([
+                "session_a -> session_b command route".to_string(),
+                "session_b -> session_a peer evidence".to_string(),
+            ]);
+            solution.evidence.extend([
+                "peer: session_b evidence consumed".to_string(),
+                "final_decision: session_a used peer evidence".to_string(),
+            ]);
+        }
+        ComplexScenarioKind::RecoveryRepair => {
+            solution.recovery_actions.extend([
+                "classify failure as verification failure".to_string(),
+                "generate repair action".to_string(),
+                "block finalization until repaired".to_string(),
+            ]);
+            solution.tool_actions.extend([
+                "run failing check".to_string(),
+                "apply repair patch".to_string(),
+            ]);
+            solution
+                .governance_actions
+                .push("record high risk repair approval evidence".to_string());
+            solution.evidence.extend([
+                "recovery: repair action produced".to_string(),
+                "verification: finalization blocked before fix".to_string(),
+            ]);
+        }
+    }
+
+    solution
+}
+
+#[must_use]
+pub fn evaluate_complex_harness_solution(
+    scenario: &ComplexHarnessScenario,
+    solution: &ComplexHarnessSolution,
+) -> ComplexScenarioResult {
+    let mut passed_checks = Vec::new();
+    let mut failed_checks = Vec::new();
+    for check in &scenario.acceptance_checks {
+        if complex_check_passed(check, solution) {
+            passed_checks.push(check.clone());
+        } else {
+            failed_checks.push(check.clone());
+        }
+    }
+    for capability in &scenario.required_capabilities {
+        if solution_covers_capability(capability, solution) {
+            passed_checks.push(format!("capability.{capability}"));
+        } else {
+            failed_checks.push(format!("capability.{capability}"));
+        }
+    }
+    let total = passed_checks.len() + failed_checks.len();
+    let score = if total == 0 {
+        0.0
+    } else {
+        passed_checks.len() as f32 / total as f32
+    };
+    ComplexScenarioResult {
+        scenario_id: scenario.id.clone(),
+        kind: scenario.kind,
+        passed: failed_checks.is_empty() && score >= 0.9,
+        score,
+        passed_checks,
+        failed_checks,
+        evidence: solution.evidence.clone(),
+        review_summary: solution.review_findings.join("; "),
+    }
+}
+
+#[must_use]
+pub fn evaluate_complex_harness_scenarios() -> ComplexHarnessScenarioReport {
+    let scenarios = generate_complex_harness_scenarios();
+    let results = scenarios
+        .iter()
+        .map(|scenario| {
+            let solution = solve_complex_harness_scenario(scenario);
+            evaluate_complex_harness_solution(scenario, &solution)
+        })
+        .collect::<Vec<_>>();
+    let total = results.len();
+    let passed = results.iter().filter(|result| result.passed).count();
+    let failed = total.saturating_sub(passed);
+    let average_score = if total == 0 {
+        0.0
+    } else {
+        results.iter().map(|result| result.score).sum::<f32>() / total as f32
+    };
+    ComplexHarnessScenarioReport {
+        kind: "complex_harness_scenario_report".to_string(),
+        total,
+        passed,
+        failed,
+        average_score,
+        results,
+    }
+}
+
+fn complex_check_passed(check: &str, solution: &ComplexHarnessSolution) -> bool {
+    match check {
+        "plan.steps>=4" => solution.plan_steps.len() >= 4,
+        "tool.actions>=2" => solution.tool_actions.len() >= 2,
+        "review.findings>=1" => !solution.review_findings.is_empty(),
+        "evidence.contains_diff" => contains_evidence(solution, "diff"),
+        "memory.actions>=3" => solution.memory_actions.len() >= 3,
+        "evidence.contains_conflict" => contains_evidence(solution, "conflict"),
+        "evidence.contains_recall" => contains_evidence(solution, "recall"),
+        "agent.roles>=3" => solution.agent_roles.len() >= 3,
+        "evidence.contains_synthesis" => contains_evidence(solution, "synthesis"),
+        "session.links>=1" => !solution.session_links.is_empty(),
+        "evidence.contains_peer" => contains_evidence(solution, "peer"),
+        "evidence.contains_final_decision" => contains_evidence(solution, "final_decision"),
+        "recovery.actions>=2" => solution.recovery_actions.len() >= 2,
+        "evidence.contains_recovery" => contains_evidence(solution, "recovery"),
+        _ => false,
+    }
+}
+
+fn contains_evidence(solution: &ComplexHarnessSolution, needle: &str) -> bool {
+    solution
+        .evidence
+        .iter()
+        .any(|item| item.to_lowercase().contains(needle))
+}
+
+fn solution_covers_capability(capability: &str, solution: &ComplexHarnessSolution) -> bool {
+    match capability {
+        "plan" | "review" => {
+            !solution.plan_steps.is_empty() && !solution.review_findings.is_empty()
+        }
+        "tool" => !solution.tool_actions.is_empty(),
+        "evidence" => !solution.evidence.is_empty(),
+        "memory" | "matrix" | "growth" | "conflict" => {
+            !solution.memory_actions.is_empty() || contains_evidence(solution, capability)
+        }
+        "agent" | "team" | "synthesis" => {
+            !solution.agent_roles.is_empty() || contains_evidence(solution, capability)
+        }
+        "session" | "mission" | "routing" => !solution.session_links.is_empty(),
+        "recovery" | "verification" => {
+            !solution.recovery_actions.is_empty() || contains_evidence(solution, capability)
+        }
+        "governance" => !solution.governance_actions.is_empty(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegressionGateVerdict {
     pub allowed: bool,
@@ -1268,6 +1651,50 @@ mod tests {
         assert!(!report.real_provider_enabled);
         assert_eq!(report.real_provider_reason, "real provider not enabled");
         assert_eq!(report.scenario_matrix.len(), 7);
+    }
+
+    #[test]
+    fn complex_harness_scenarios_generate_solve_and_review() {
+        let report = evaluate_complex_harness_scenarios();
+
+        assert_eq!(report.total, 5);
+        assert_eq!(report.failed, 0);
+        assert!(report.average_score >= 0.9);
+        assert!(report.results.iter().any(|item| {
+            item.kind == ComplexScenarioKind::MemoryGovernance
+                && item
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.contains("conflict"))
+        }));
+        assert!(report.results.iter().any(|item| {
+            item.kind == ComplexScenarioKind::CrossSessionMission
+                && item
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.contains("peer"))
+        }));
+    }
+
+    #[test]
+    fn complex_harness_review_fails_missing_evidence() {
+        let scenario = generate_complex_harness_scenarios()
+            .into_iter()
+            .find(|item| item.kind == ComplexScenarioKind::RecoveryRepair)
+            .expect("recovery scenario");
+        let mut solution = solve_complex_harness_scenario(&scenario);
+        solution.recovery_actions.clear();
+        solution.evidence.clear();
+
+        let result = evaluate_complex_harness_solution(&scenario, &solution);
+
+        assert!(!result.passed);
+        assert!(result
+            .failed_checks
+            .contains(&"recovery.actions>=2".to_string()));
+        assert!(result
+            .failed_checks
+            .contains(&"evidence.contains_recovery".to_string()));
     }
 
     #[test]

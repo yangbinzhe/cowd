@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +113,7 @@ where
                 }
             }
         }
+        issues.extend(detect_matrix_conflicts(&facts));
 
         issues
     }
@@ -156,6 +159,64 @@ where
                 Some(fact)
             }
         }
+    }
+}
+
+fn detect_matrix_conflicts(facts: &[FactRecord]) -> Vec<FactHealthIssue> {
+    let mut grouped: BTreeMap<(String, String), Vec<&FactRecord>> = BTreeMap::new();
+    for fact in facts
+        .iter()
+        .filter(|fact| fact.fact_type.starts_with("matrix."))
+    {
+        if let Some((entity, predicate, _value)) = parse_matrix_statement(&fact.statement) {
+            grouped
+                .entry((entity.to_string(), predicate.to_string()))
+                .or_default()
+                .push(fact);
+        }
+    }
+
+    let mut issues = Vec::new();
+    for ((entity, predicate), facts) in grouped {
+        let mut values = BTreeMap::new();
+        for fact in facts {
+            let Some((_entity, _predicate, value)) = parse_matrix_statement(&fact.statement) else {
+                continue;
+            };
+            values
+                .entry(value.to_string())
+                .or_insert_with(Vec::new)
+                .push(fact.id.clone());
+        }
+        if values.len() <= 1 {
+            continue;
+        }
+        let detail = format!(
+            "conflicting matrix values for {entity}.{predicate}: {}",
+            values.keys().cloned().collect::<Vec<_>>().join(" vs ")
+        );
+        for ids in values.values() {
+            for id in ids {
+                issues.push(FactHealthIssue {
+                    fact_id: Some(id.clone()),
+                    kind: FactHealthIssueKind::Conflict,
+                    detail: detail.clone(),
+                });
+            }
+        }
+    }
+    issues
+}
+
+fn parse_matrix_statement(statement: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = statement.splitn(3, ' ');
+    let entity = parts.next()?.trim();
+    let predicate = parts.next()?.trim();
+    let value = parts.next()?.trim();
+    if entity.is_empty() || predicate.is_empty() || value.is_empty() {
+        None
+    } else {
+        Some((entity, predicate, value))
     }
 }
 
@@ -265,5 +326,39 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].fact_id, Some(stored.id));
         assert_eq!(issues[0].kind, FactHealthIssueKind::MissingEvidence);
+    }
+
+    #[test]
+    fn health_reports_conflicting_matrix_values() {
+        let mut service = FactKernelService::new();
+        let evidence = service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 1})));
+
+        for (id, value) in [
+            ("matrix-pref-immersive", json!("immersive_then_review")),
+            ("matrix-pref-pause", json!("pause_each_step")),
+        ] {
+            let receipt = service.promote_candidate(GrowthCandidate::Matrix(MatrixFact {
+                id: FactId::from_string(id),
+                entity: "user.workflow".to_string(),
+                predicate: "prefers_flow".to_string(),
+                value,
+                source: source(),
+                evidence: vec![evidence.id.clone()],
+                confidence: Confidence::from_basis_points(8_500),
+                boundary: HypothesisBoundary::observed(),
+            }));
+            assert_eq!(receipt.decision.decision, PromotionDecision::Promote);
+        }
+
+        let conflicts = service
+            .evaluate_health()
+            .into_iter()
+            .filter(|issue| issue.kind == FactHealthIssueKind::Conflict)
+            .collect::<Vec<_>>();
+
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts
+            .iter()
+            .all(|issue| issue.detail.contains("user.workflow.prefers_flow")));
     }
 }

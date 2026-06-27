@@ -1,7 +1,17 @@
+use fact_kernel::{
+    core::{Confidence, EvidencePacket, FactId, FactSource, SourceKind},
+    growth::{GrowthCandidate, PromotionDecision},
+    health::FactHealthIssueKind,
+    hypothesis::HypothesisBoundary,
+    matrix::MatrixFact,
+    memory::{MemoryCandidate, RecallQuery},
+    FactKernelService,
+};
 use harness_contract::core::TaskRisk;
 use harness_contract::strategy::{decide_strategy, StrategyInput};
 use harness_eval::{
-    harness_capability_coverage_report, stable_ai_scenario_matrix, E2eScenarioKind,
+    evaluate_complex_harness_scenarios, harness_capability_coverage_report,
+    stable_ai_scenario_matrix, ComplexHarnessScenarioReport, E2eScenarioKind,
     E2eScenarioMatrixItem, ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec,
     ScenarioSuite, ScenarioSuiteReport, StableAiHealthReport,
 };
@@ -18,9 +28,10 @@ use runtime::{
     TeamExecutionLoop, TickStewardRuntimeRequest, DEFAULT_AGENT_MODEL,
 };
 use serde::Serialize;
+use serde_json::json;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REPORT_DIR: &str =
     "/media/yi/Datas/workspace/plan/0626-AI稳定准确运行闭环补强/reports";
@@ -52,6 +63,131 @@ struct CapabilityResult {
 }
 
 #[derive(Debug, Serialize)]
+struct HarnessMetric {
+    name: &'static str,
+    value: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct UsageSummary {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+    total_tokens: u32,
+    usage_source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderRoundSummary {
+    round_index: usize,
+    name: String,
+    model: String,
+    status: String,
+    elapsed_ms: u128,
+    usage: UsageSummary,
+    text_delta_count: usize,
+    tool_use_count: usize,
+    request_summary: String,
+    response_summary: String,
+    detail_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderRoundDetail {
+    summary: ProviderRoundSummary,
+    request: serde_json::Value,
+    events: Vec<serde_json::Value>,
+    response_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeActionTrace {
+    index: usize,
+    action: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionTrace {
+    kind: &'static str,
+    started_at_ms: u128,
+    finished_at_ms: Option<u128>,
+    total_elapsed_ms: Option<u128>,
+    provider_rounds: usize,
+    runtime_actions: usize,
+    tool_calls: usize,
+    total_usage: UsageSummary,
+    rounds: Vec<ProviderRoundSummary>,
+    runtime_action_log: Vec<RuntimeActionTrace>,
+}
+
+impl ExecutionTrace {
+    fn start() -> Self {
+        Self {
+            kind: "harness_eval.execution_trace",
+            started_at_ms: now_ms_u128(),
+            finished_at_ms: None,
+            total_elapsed_ms: None,
+            provider_rounds: 0,
+            runtime_actions: 0,
+            tool_calls: 0,
+            total_usage: UsageSummary {
+                usage_source: "unavailable".to_string(),
+                ..UsageSummary::default()
+            },
+            rounds: Vec::new(),
+            runtime_action_log: Vec::new(),
+        }
+    }
+
+    fn record_runtime_action(&mut self, action: impl Into<String>, evidence: impl Into<String>) {
+        let index = self.runtime_action_log.len() + 1;
+        self.runtime_action_log.push(RuntimeActionTrace {
+            index,
+            action: action.into(),
+            evidence: evidence.into(),
+        });
+        self.runtime_actions = self.runtime_action_log.len();
+    }
+
+    fn add_provider_round(&mut self, summary: ProviderRoundSummary) {
+        self.tool_calls = self.tool_calls.saturating_add(summary.tool_use_count);
+        self.total_usage.input_tokens = self
+            .total_usage
+            .input_tokens
+            .saturating_add(summary.usage.input_tokens);
+        self.total_usage.output_tokens = self
+            .total_usage
+            .output_tokens
+            .saturating_add(summary.usage.output_tokens);
+        self.total_usage.cache_creation_input_tokens = self
+            .total_usage
+            .cache_creation_input_tokens
+            .saturating_add(summary.usage.cache_creation_input_tokens);
+        self.total_usage.cache_read_input_tokens = self
+            .total_usage
+            .cache_read_input_tokens
+            .saturating_add(summary.usage.cache_read_input_tokens);
+        self.total_usage.total_tokens = self
+            .total_usage
+            .total_tokens
+            .saturating_add(summary.usage.total_tokens);
+        if summary.usage.usage_source == "provider_event" {
+            self.total_usage.usage_source = "provider_event".to_string();
+        }
+        self.rounds.push(summary);
+        self.provider_rounds = self.rounds.len();
+    }
+
+    fn finish(&mut self, started: Instant) {
+        self.finished_at_ms = Some(now_ms_u128());
+        self.total_elapsed_ms = Some(started.elapsed().as_millis());
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct MissionHarnessEvalReport {
     kind: &'static str,
     level: EvalLevel,
@@ -62,6 +198,12 @@ struct MissionHarnessEvalReport {
     scenario_matrix: Vec<E2eScenarioMatrixItem>,
     stable_ai: StableAiHealthReport,
     scenarios: Vec<CapabilityResult>,
+    metrics: Vec<HarnessMetric>,
+    complex_scenarios: Option<ComplexHarnessScenarioReport>,
+    execution_trace: ExecutionTrace,
+    result_package_dir: Option<String>,
+    #[serde(skip)]
+    provider_round_details: Vec<ProviderRoundDetail>,
 }
 
 fn main() {
@@ -86,12 +228,12 @@ fn main() {
     let provider = option_value(&args, "--provider");
     let budget = option_value(&args, "--budget").or_else(|| Some("low".to_string()));
 
-    let report = match level {
+    let mut report = match level {
         EvalLevel::Quick => run_quick(),
         EvalLevel::Full => run_full(),
         EvalLevel::Deep => run_deep(provider.clone(), budget.clone()),
     };
-    let (json_path, md_path) = write_report(&report).unwrap_or_else(|error| {
+    let (json_path, md_path) = write_report(&mut report).unwrap_or_else(|error| {
         eprintln!("failed to write report: {error}");
         std::process::exit(1);
     });
@@ -115,7 +257,10 @@ fn option_value(args: &[String], key: &str) -> Option<String> {
 }
 
 fn run_quick() -> MissionHarnessEvalReport {
+    let started = Instant::now();
+    let mut trace = ExecutionTrace::start();
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
+    trace.record_runtime_action("deterministic_core_loop", "quick runtime loop completed");
     let fake_provider_result = fake_provider_scenario_report();
     let coverage = harness_capability_coverage_report();
     scenarios.push(CapabilityResult {
@@ -136,6 +281,8 @@ fn run_quick() -> MissionHarnessEvalReport {
         "webui/tui smoke delegated to quick.sh and surface gates",
         "runtime recovery executor produced deterministic report",
     );
+    let metrics = build_harness_metrics(&scenarios, &stable_ai);
+    trace.finish(started);
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Quick,
@@ -146,12 +293,21 @@ fn run_quick() -> MissionHarnessEvalReport {
         scenario_matrix: stable_ai_scenario_matrix(),
         stable_ai,
         scenarios,
+        metrics,
+        complex_scenarios: None,
+        execution_trace: trace,
+        result_package_dir: None,
+        provider_round_details: Vec::new(),
     }
 }
 
 fn run_full() -> MissionHarnessEvalReport {
+    let started = Instant::now();
+    let mut trace = ExecutionTrace::start();
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
+    trace.record_runtime_action("deterministic_core_loop", "full runtime loop completed");
     let gateway = probe_gateway_contract();
+    trace.record_runtime_action("gateway.probe", gateway.1.clone());
     let fake_provider_result = fake_provider_scenario_report();
     let coverage = harness_capability_coverage_report();
     scenarios.push(CapabilityResult {
@@ -183,6 +339,8 @@ fn run_full() -> MissionHarnessEvalReport {
         "webui/tui smoke delegated to surface and scenario gates",
         replay_evidence,
     );
+    let metrics = build_harness_metrics(&scenarios, &stable_ai);
+    trace.finish(started);
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Full,
@@ -193,10 +351,17 @@ fn run_full() -> MissionHarnessEvalReport {
         scenario_matrix: stable_ai_scenario_matrix(),
         stable_ai,
         scenarios,
+        metrics,
+        complex_scenarios: None,
+        execution_trace: trace,
+        result_package_dir: None,
+        provider_round_details: Vec::new(),
     }
 }
 
 fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessEvalReport {
+    let started = Instant::now();
+    let mut trace = ExecutionTrace::start();
     if provider.as_deref() != Some("configured") {
         let stable_ai = StableAiHealthReport::from_fake_eval(
             env!("CARGO_PKG_VERSION"),
@@ -215,6 +380,7 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
             "webui/tui smoke delegated to final health lanes",
             "recovery not run because provider gate stopped deep eval",
         );
+        trace.finish(started);
         return MissionHarnessEvalReport {
             kind: "mission_harness.eval_report",
             level: EvalLevel::Deep,
@@ -230,15 +396,41 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
                 evidence: "pass --provider configured to allow real provider use".to_string(),
                 notes: "budget guard prevented token use".to_string(),
             }],
+            metrics: Vec::new(),
+            complex_scenarios: None,
+            execution_trace: trace,
+            result_package_dir: None,
+            provider_round_details: Vec::new(),
         };
     }
     let (mut scenarios, replay_evidence) = run_deterministic_core_loop();
+    trace.record_runtime_action("deterministic_core_loop", "deep runtime loop completed");
+    scenarios.extend(run_deep_harness_scenarios(&mut trace));
     let gateway = probe_gateway_contract();
-    let provider_smoke = run_provider_smoke();
+    trace.record_runtime_action("gateway.probe", gateway.1.clone());
+    let complex_scenarios = evaluate_complex_harness_scenarios();
+    trace.record_runtime_action(
+        "complex_scenarios.evaluate",
+        format!(
+            "{}/{} passed",
+            complex_scenarios.passed, complex_scenarios.total
+        ),
+    );
+    scenarios.push(complex_scenario_capability(&complex_scenarios));
+    let mut provider_round_details = Vec::new();
+    let provider_smoke = run_provider_smoke(&mut trace, &mut provider_round_details);
     let provider_passed = provider_smoke.status == "passed";
     let model =
         std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
     scenarios.push(provider_smoke);
+    scenarios.push(run_provider_structured_reasoning(
+        &mut trace,
+        &mut provider_round_details,
+    ));
+    scenarios.push(run_provider_cross_session_dialogue(
+        &mut trace,
+        &mut provider_round_details,
+    ));
     scenarios.push(CapabilityResult {
         capability: "gateway_contract_surface",
         status: if gateway.0 { "passed" } else { "degraded" },
@@ -264,6 +456,8 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         "webui/tui smoke delegated to final health lanes",
         replay_evidence,
     );
+    let metrics = build_harness_metrics(&scenarios, &stable_ai);
+    trace.finish(started);
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Deep,
@@ -279,11 +473,20 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         scenario_matrix: stable_ai_scenario_matrix(),
         stable_ai,
         scenarios,
+        metrics,
+        complex_scenarios: Some(complex_scenarios),
+        execution_trace: trace,
+        result_package_dir: None,
+        provider_round_details,
     }
 }
 
-fn run_provider_smoke() -> CapabilityResult {
-    let model = "deepseek-v4-flash";
+fn run_provider_smoke(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ProviderRoundDetail>,
+) -> CapabilityResult {
+    let model =
+        std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
     let mut client = match ProviderRuntimeClient::new(model.to_string(), Vec::new()) {
         Ok(client) => client,
         Err(error) => {
@@ -306,17 +509,11 @@ fn run_provider_smoke() -> CapabilityResult {
             }],
             usage: None,
         }],
-        model: model.to_string(),
+        model: model.clone(),
     };
-    match client.stream_collect(request) {
-        Ok(events) => {
-            let text = events
-                .iter()
-                .filter_map(|event| match event {
-                    AssistantEvent::TextDelta(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
+    match collect_measured_provider_text(&mut client, "deep_provider_eval", request, trace, details)
+    {
+        Ok(text) => {
             if text.trim().is_empty() {
                 CapabilityResult {
                     capability: "deep_provider_eval",
@@ -336,10 +533,980 @@ fn run_provider_smoke() -> CapabilityResult {
         Err(error) => CapabilityResult {
             capability: "deep_provider_eval",
             status: "failed",
-            evidence: abbreviate(&error.to_string(), 180),
+            evidence: abbreviate(&error, 180),
             notes: "real provider call failed; inspect provider credentials/network".to_string(),
         },
     }
+}
+
+fn complex_scenario_capability(report: &ComplexHarnessScenarioReport) -> CapabilityResult {
+    CapabilityResult {
+        capability: "deep_harness_complex_scenario_suite",
+        status: if report.failed == 0 && report.average_score >= 0.9 {
+            "passed"
+        } else {
+            "failed"
+        },
+        evidence: format!(
+            "passed={}/{}; average_score={:.2}",
+            report.passed, report.total, report.average_score
+        ),
+        notes: "generated complex topics, solved them, reviewed acceptance checks, and scored harness readiness"
+            .to_string(),
+    }
+}
+
+fn run_provider_structured_reasoning(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ProviderRoundDetail>,
+) -> CapabilityResult {
+    let model =
+        std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+    let mut client = match ProviderRuntimeClient::new(model.clone(), Vec::new()) {
+        Ok(client) => client,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_provider_structured_reasoning",
+                status: "failed",
+                evidence: format!("provider client unavailable: {}", abbreviate(&error, 180)),
+                notes: "structured real-model harness scenario did not start".to_string(),
+            };
+        }
+    };
+    let request = ApiRequest {
+        system_prompt: vec![
+            concat!(
+                "You are a strict AI harness evaluator. ",
+                "Return only minified JSON with keys memory_summary, conflict_decision, team_synthesis. ",
+                "No markdown, no code fences, no explanation."
+            )
+            .to_string(),
+        ],
+        messages: vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: concat!(
+                    "Facts: user prefers immersive implementation followed by unified review. ",
+                    "Conflicting older fact: user wants to stop after every tiny edit. ",
+                    "Team: planner, implementer, reviewer must coordinate using evidence. ",
+                    "Return JSON. memory_summary must mention immersive. ",
+                    "conflict_decision must be newer_preference_wins. ",
+                    "team_synthesis must mention evidence."
+                )
+                .to_string(),
+            }],
+            usage: None,
+        }],
+        model,
+    };
+    match collect_measured_provider_text(
+        &mut client,
+        "deep_harness_provider_structured_reasoning",
+        request,
+        trace,
+        details,
+    ) {
+        Ok(text) => {
+            let Some(json_text) = extract_json_object(&text) else {
+                return CapabilityResult {
+                    capability: "deep_harness_provider_structured_reasoning",
+                    status: "failed",
+                    evidence: abbreviate(text.trim(), 180),
+                    notes: "real model did not return a JSON object".to_string(),
+                };
+            };
+            match serde_json::from_str::<serde_json::Value>(json_text) {
+                Ok(value) => {
+                    let memory_ok = value
+                        .get("memory_summary")
+                        .and_then(|item| item.as_str())
+                        .is_some_and(|item| item.to_lowercase().contains("immersive"));
+                    let conflict_ok = value
+                        .get("conflict_decision")
+                        .and_then(|item| item.as_str())
+                        == Some("newer_preference_wins");
+                    let synthesis_ok = value
+                        .get("team_synthesis")
+                        .and_then(|item| item.as_str())
+                        .is_some_and(|item| item.to_lowercase().contains("evidence"));
+                    let passed = memory_ok && conflict_ok && synthesis_ok;
+                    CapabilityResult {
+                        capability: "deep_harness_provider_structured_reasoning",
+                        status: if passed { "passed" } else { "failed" },
+                        evidence: format!(
+                            "memory_ok={memory_ok}; conflict_ok={conflict_ok}; synthesis_ok={synthesis_ok}"
+                        ),
+                        notes: "real model completed bounded memory/conflict/team synthesis reasoning contract"
+                            .to_string(),
+                    }
+                }
+                Err(error) => CapabilityResult {
+                    capability: "deep_harness_provider_structured_reasoning",
+                    status: "failed",
+                    evidence: format!(
+                        "json parse failed: {error}; text={}",
+                        abbreviate(json_text, 120)
+                    ),
+                    notes: "real model output did not satisfy structured JSON contract".to_string(),
+                },
+            }
+        }
+        Err(error) => CapabilityResult {
+            capability: "deep_harness_provider_structured_reasoning",
+            status: "failed",
+            evidence: abbreviate(&error, 180),
+            notes: "real provider structured reasoning call failed".to_string(),
+        },
+    }
+}
+
+fn run_provider_cross_session_dialogue(
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ProviderRoundDetail>,
+) -> CapabilityResult {
+    let model =
+        std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+    let mut client = match ProviderRuntimeClient::new(model.clone(), Vec::new()) {
+        Ok(client) => client,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_cross_session_provider_dialogue",
+                status: "failed",
+                evidence: format!("provider client unavailable: {}", abbreviate(&error, 180)),
+                notes: "cross-session provider dialogue did not start".to_string(),
+            };
+        }
+    };
+
+    let session_b_request = ApiRequest {
+        system_prompt: vec![concat!(
+            "You are Session B in a cross-session harness test. ",
+            "Return only minified JSON with keys session_id and evidence_summary."
+        )
+        .to_string()],
+        messages: vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: concat!(
+                    "Inspect this peer task: identify whether old preference 'pause each step' ",
+                    "conflicts with current preference 'immersive then review'. ",
+                    "session_id must be session_b. evidence_summary must mention conflict and immersive."
+                )
+                .to_string(),
+            }],
+            usage: None,
+        }],
+        model: model.clone(),
+    };
+    let session_b_text = match collect_measured_provider_text(
+        &mut client,
+        "deep_harness_cross_session_session_b",
+        session_b_request,
+        trace,
+        details,
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_cross_session_provider_dialogue",
+                status: "failed",
+                evidence: abbreviate(&error, 180),
+                notes: "session B provider turn failed".to_string(),
+            };
+        }
+    };
+    let Some(session_b_json) = extract_json_object(&session_b_text) else {
+        return CapabilityResult {
+            capability: "deep_harness_cross_session_provider_dialogue",
+            status: "failed",
+            evidence: abbreviate(&session_b_text, 180),
+            notes: "session B did not return JSON evidence".to_string(),
+        };
+    };
+    let session_b_value = match serde_json::from_str::<serde_json::Value>(session_b_json) {
+        Ok(value) => value,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_cross_session_provider_dialogue",
+                status: "failed",
+                evidence: format!("session B JSON parse failed: {error}"),
+                notes: "session B evidence was not machine-checkable".to_string(),
+            };
+        }
+    };
+    let b_evidence = session_b_value
+        .get("evidence_summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let session_a_request = ApiRequest {
+        system_prompt: vec![concat!(
+            "You are Session A supervising a peer Session B. ",
+            "Return only minified JSON with keys session_id, used_peer_evidence, final_decision."
+        )
+        .to_string()],
+        messages: vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: format!(
+                    "Session B evidence: {b_evidence}. session_id must be session_a. used_peer_evidence must be true. final_decision must mention immersive."
+                ),
+            }],
+            usage: None,
+        }],
+        model,
+    };
+    let session_a_text = match collect_measured_provider_text(
+        &mut client,
+        "deep_harness_cross_session_session_a",
+        session_a_request,
+        trace,
+        details,
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_cross_session_provider_dialogue",
+                status: "failed",
+                evidence: abbreviate(&error, 180),
+                notes: "session A provider turn failed".to_string(),
+            };
+        }
+    };
+    let Some(session_a_json) = extract_json_object(&session_a_text) else {
+        return CapabilityResult {
+            capability: "deep_harness_cross_session_provider_dialogue",
+            status: "failed",
+            evidence: abbreviate(&session_a_text, 180),
+            notes: "session A did not return JSON synthesis".to_string(),
+        };
+    };
+    let session_a_value = match serde_json::from_str::<serde_json::Value>(session_a_json) {
+        Ok(value) => value,
+        Err(error) => {
+            return CapabilityResult {
+                capability: "deep_harness_cross_session_provider_dialogue",
+                status: "failed",
+                evidence: format!("session A JSON parse failed: {error}"),
+                notes: "session A synthesis was not machine-checkable".to_string(),
+            };
+        }
+    };
+    let b_ok = session_b_value
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        == Some("session_b")
+        && b_evidence.to_lowercase().contains("conflict")
+        && b_evidence.to_lowercase().contains("immersive");
+    let a_ok = session_a_value
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        == Some("session_a")
+        && session_a_value
+            .get("used_peer_evidence")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && session_a_value
+            .get("final_decision")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.to_lowercase().contains("immersive"));
+
+    CapabilityResult {
+        capability: "deep_harness_cross_session_provider_dialogue",
+        status: if b_ok && a_ok { "passed" } else { "failed" },
+        evidence: format!("session_b_ok={b_ok}; session_a_ok={a_ok}"),
+        notes: "real model executed bounded Session B evidence turn and Session A synthesis turn"
+            .to_string(),
+    }
+}
+
+fn collect_measured_provider_text(
+    client: &mut ProviderRuntimeClient,
+    name: &str,
+    request: ApiRequest,
+    trace: &mut ExecutionTrace,
+    details: &mut Vec<ProviderRoundDetail>,
+) -> Result<String, String> {
+    let round_index = trace.rounds.len() + 1;
+    let model = request.model.clone();
+    let request_json = request_to_json(&request);
+    let request_summary = summarize_request(&request);
+    let started = Instant::now();
+    let events = client
+        .stream_collect(request)
+        .map_err(|error| error.to_string())?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let response_text = events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let text_delta_count = events
+        .iter()
+        .filter(|event| matches!(event, AssistantEvent::TextDelta(_)))
+        .count();
+    let tool_use_count = events
+        .iter()
+        .filter(|event| matches!(event, AssistantEvent::ToolUse { .. }))
+        .count();
+    let usage = summarize_usage(&events);
+    let detail_name = format!("{round_index:03}-{}.json", sanitize_file_name(name));
+    let summary = ProviderRoundSummary {
+        round_index,
+        name: name.to_string(),
+        model,
+        status: "passed".to_string(),
+        elapsed_ms,
+        usage,
+        text_delta_count,
+        tool_use_count,
+        request_summary,
+        response_summary: summarize_text(&response_text, 180),
+        detail_path: format!("provider-rounds/{detail_name}"),
+    };
+    let detail = ProviderRoundDetail {
+        summary: summary.clone(),
+        request: request_json,
+        events: events.iter().map(assistant_event_to_json).collect(),
+        response_text: response_text.clone(),
+    };
+    trace.add_provider_round(summary);
+    details.push(detail);
+    Ok(response_text)
+}
+
+fn summarize_usage(events: &[AssistantEvent]) -> UsageSummary {
+    let mut summary = UsageSummary {
+        usage_source: "unavailable".to_string(),
+        ..UsageSummary::default()
+    };
+    for event in events {
+        if let AssistantEvent::Usage(usage) = event {
+            summary.input_tokens = summary.input_tokens.saturating_add(usage.input_tokens);
+            summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
+            summary.cache_creation_input_tokens = summary
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens);
+            summary.cache_read_input_tokens = summary
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens);
+            summary.total_tokens = summary.total_tokens.saturating_add(usage.total_tokens());
+            summary.usage_source = "provider_event".to_string();
+        }
+    }
+    summary
+}
+
+fn request_to_json(request: &ApiRequest) -> serde_json::Value {
+    json!({
+        "model": request.model,
+        "system_prompt": request.system_prompt,
+        "messages": request.messages.iter().map(message_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn message_to_json(message: &ConversationMessage) -> serde_json::Value {
+    json!({
+        "role": format!("{:?}", message.role).to_lowercase(),
+        "blocks": message.blocks.iter().map(content_block_to_json).collect::<Vec<_>>(),
+        "usage": message.usage.map(|usage| json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "total_tokens": usage.total_tokens(),
+        })),
+    })
+}
+
+fn content_block_to_json(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => json!({"type": "thinking", "thinking": thinking, "signature": signature}),
+        ContentBlock::ToolUse { id, name, input } => {
+            json!({"type": "tool_use", "id": id, "name": name, "input": input})
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+            ..
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "output": output,
+            "is_error": is_error,
+        }),
+    }
+}
+
+fn assistant_event_to_json(event: &AssistantEvent) -> serde_json::Value {
+    match event {
+        AssistantEvent::TextDelta(text) => json!({"type": "text_delta", "text": text}),
+        AssistantEvent::ThinkingDelta(text) => json!({"type": "thinking_delta", "text": text}),
+        AssistantEvent::SignatureDelta(text) => json!({"type": "signature_delta", "text": text}),
+        AssistantEvent::ToolUse { id, name, input } => {
+            json!({"type": "tool_use", "id": id, "name": name, "input": input})
+        }
+        AssistantEvent::Usage(usage) => json!({
+            "type": "usage",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "total_tokens": usage.total_tokens(),
+        }),
+        AssistantEvent::PromptCache(event) => json!({
+            "type": "prompt_cache",
+            "unexpected": event.unexpected,
+            "reason": event.reason,
+            "previous_cache_read_input_tokens": event.previous_cache_read_input_tokens,
+            "current_cache_read_input_tokens": event.current_cache_read_input_tokens,
+            "token_drop": event.token_drop,
+        }),
+        AssistantEvent::MessageStop => json!({"type": "message_stop"}),
+        AssistantEvent::ToolStart { id, name, preview } => {
+            json!({"type": "tool_start", "id": id, "name": name, "preview": preview})
+        }
+        AssistantEvent::ToolProgress { id, name, progress } => {
+            json!({"type": "tool_progress", "id": id, "name": name, "progress": progress})
+        }
+        AssistantEvent::ToolComplete {
+            id,
+            name,
+            result_summary,
+            exit_code,
+        } => json!({
+            "type": "tool_complete",
+            "id": id,
+            "name": name,
+            "result_summary": result_summary,
+            "exit_code": exit_code,
+        }),
+    }
+}
+
+fn summarize_request(request: &ApiRequest) -> String {
+    let user_text = request
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    summarize_text(&user_text, 180)
+}
+
+fn summarize_text(value: &str, max: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max {
+        compact
+    } else {
+        format!("{}...", compact.chars().take(max).collect::<String>())
+    }
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end >= start).then_some(&text[start..=end])
+}
+
+fn run_deep_harness_scenarios(trace: &mut ExecutionTrace) -> Vec<CapabilityResult> {
+    let mut results = Vec::new();
+    results.extend(run_reality_memory_deep_scenarios(trace));
+    results.extend(run_collaboration_deep_scenarios(trace));
+    results
+}
+
+fn run_reality_memory_deep_scenarios(trace: &mut ExecutionTrace) -> Vec<CapabilityResult> {
+    let mut service = FactKernelService::new();
+    let source = FactSource {
+        kind: SourceKind::Runtime,
+        id: "harness-eval.deep".to_string(),
+        label: Some("deep harness eval".to_string()),
+    };
+
+    let memory_evidence = service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({
+            "session": "deep-harness",
+            "observation": "user prefers immersive implementation followed by unified review"
+        }),
+    ));
+    trace.record_runtime_action("fact.evidence.ingest", memory_evidence.id.as_str());
+    let memory_receipt = service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+        summary: "user prefers immersive implementation followed by unified review".to_string(),
+        source: source.clone(),
+        evidence: vec![memory_evidence.id.clone()],
+        confidence: Confidence::from_basis_points(8_900),
+        boundary: HypothesisBoundary::observed(),
+        tags: vec!["preference".to_string(), "workflow".to_string()],
+    }));
+    trace.record_runtime_action(
+        "fact.memory.promote",
+        format!("{:?}", memory_receipt.decision.decision),
+    );
+    let recall_hits = service.recall(&RecallQuery {
+        query: "immersive unified review".to_string(),
+        limit: 3,
+        include_hypothetical: false,
+    });
+    trace.record_runtime_action("fact.memory.recall", format!("hits={}", recall_hits.len()));
+    let memory_passed = memory_receipt.decision.decision == PromotionDecision::Promote
+        && memory_receipt.promoted_fact.is_some()
+        && recall_hits.iter().any(|hit| {
+            hit.fact
+                .statement
+                .contains("immersive implementation followed by unified review")
+        });
+
+    let hypothetical_receipt =
+        service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+            summary: "simulated user wants to pause after every tiny edit".to_string(),
+            source: source.clone(),
+            evidence: vec![memory_evidence.id.clone()],
+            confidence: Confidence::from_basis_points(9_500),
+            boundary: HypothesisBoundary::hypothetical("deep-harness-sim"),
+            tags: vec!["simulation".to_string()],
+        }));
+    trace.record_runtime_action(
+        "fact.memory.hypothetical",
+        format!("{:?}", hypothetical_receipt.decision.decision),
+    );
+    let low_confidence_evidence = service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({"observation": "weak signal about formatting preference"}),
+    ));
+    let low_confidence_receipt =
+        service.promote_candidate(GrowthCandidate::Memory(MemoryCandidate {
+            summary: "user might prefer verbose formatting for every report".to_string(),
+            source: source.clone(),
+            evidence: vec![low_confidence_evidence.id.clone()],
+            confidence: Confidence::from_basis_points(4_200),
+            boundary: HypothesisBoundary::observed(),
+            tags: vec!["weak_signal".to_string()],
+        }));
+    trace.record_runtime_action(
+        "fact.memory.low_confidence",
+        format!("{:?}", low_confidence_receipt.decision.decision),
+    );
+    let storage_policy_passed = hypothetical_receipt.decision.decision == PromotionDecision::Reject
+        && hypothetical_receipt.promoted_fact.is_none()
+        && low_confidence_receipt.decision.decision == PromotionDecision::Hold
+        && low_confidence_receipt.promoted_fact.is_none()
+        && service
+            .recall(&RecallQuery::new("simulated pause tiny edit"))
+            .is_empty();
+
+    let matrix_evidence = service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({"preference": "immersive"}),
+    ));
+    let conflict_a = MatrixFact {
+        id: FactId::from_string("deep-harness-pref-flow-a"),
+        entity: "user.workflow".to_string(),
+        predicate: "prefers_flow".to_string(),
+        value: json!("immersive_then_review"),
+        source: source.clone(),
+        evidence: vec![matrix_evidence.id.clone()],
+        confidence: Confidence::from_basis_points(8_800),
+        boundary: HypothesisBoundary::observed(),
+    };
+    let conflict_b_evidence = service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({"preference": "pause_each_step", "contradicts": "immersive"}),
+    ));
+    let conflict_b = MatrixFact {
+        id: FactId::from_string("deep-harness-pref-flow-b"),
+        entity: "user.workflow".to_string(),
+        predicate: "prefers_flow".to_string(),
+        value: json!("pause_each_step"),
+        source: source.clone(),
+        evidence: vec![conflict_b_evidence.id.clone()],
+        confidence: Confidence::from_basis_points(8_100),
+        boundary: HypothesisBoundary::observed(),
+    };
+    let matrix_a = service.promote_candidate(GrowthCandidate::Matrix(conflict_a.clone()));
+    let matrix_b = service.promote_candidate(GrowthCandidate::Matrix(conflict_b.clone()));
+    trace.record_runtime_action("fact.matrix.promote", "conflict pair promoted");
+    let conflict_issues = service
+        .evaluate_health()
+        .into_iter()
+        .filter(|issue| issue.kind == FactHealthIssueKind::Conflict)
+        .collect::<Vec<_>>();
+    trace.record_runtime_action(
+        "fact.health.conflict",
+        format!("issues={}", conflict_issues.len()),
+    );
+    let conflict_detected = conflict_issues.len() >= 2;
+
+    let mut growth_service = FactKernelService::new();
+    let growth_evidence = growth_service.ingest_evidence(EvidencePacket::new(
+        source.clone(),
+        json!({"gate": "deep_harness_growth"}),
+    ));
+    let growth_receipt = growth_service.promote_candidate(GrowthCandidate::Matrix(MatrixFact {
+        id: FactId::from_string("deep-harness-growth-gate"),
+        entity: "system.harness".to_string(),
+        predicate: "passes_deep_gate".to_string(),
+        value: json!(true),
+        source: source.clone(),
+        evidence: vec![growth_evidence.id.clone()],
+        confidence: Confidence::from_basis_points(8_700),
+        boundary: HypothesisBoundary::observed(),
+    }));
+    trace.record_runtime_action(
+        "fact.growth.promote",
+        format!("{:?}", growth_receipt.decision.decision),
+    );
+    let matrix_facts = growth_service.facts_by_type("matrix.passes_deep_gate", 10);
+    let growth_health_issues = growth_service.evaluate_health();
+    let growth_passed = growth_receipt.decision.decision == PromotionDecision::Promote
+        && matrix_b.decision.decision == PromotionDecision::Promote
+        && matrix_a.decision.decision == PromotionDecision::Promote
+        && matrix_facts.len() == 1
+        && growth_health_issues.is_empty();
+
+    vec![
+        CapabilityResult {
+            capability: "deep_harness_memory_store_recall",
+            status: if memory_passed { "passed" } else { "failed" },
+            evidence: format!(
+                "promoted={}; recall_hits={}; top={}",
+                memory_receipt.promoted_fact.is_some(),
+                recall_hits.len(),
+                recall_hits
+                    .first()
+                    .map(|hit| hit.fact.statement.as_str())
+                    .unwrap_or("none")
+            ),
+            notes: "observed memory candidate was promoted into fact kernel and recalled by query"
+                .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_memory_storage_policy",
+            status: if storage_policy_passed { "passed" } else { "failed" },
+            evidence: format!(
+                "hypothetical={:?}; low_confidence={:?}",
+                hypothetical_receipt.decision.decision, low_confidence_receipt.decision.decision
+            ),
+            notes: "hypothetical and weak signals remain reviewable instead of silently becoming durable facts"
+                .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_fact_conflict",
+            status: if conflict_detected { "passed" } else { "failed" },
+            evidence: format!(
+                "issues={}; {}:{} values {} vs {}",
+                conflict_issues.len(),
+                conflict_a.entity,
+                conflict_a.predicate,
+                conflict_a.value,
+                conflict_b.value
+            ),
+            notes: "fact kernel health reported contradictory observed matrix facts for governance review"
+                .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_growth_promotion",
+            status: if growth_passed { "passed" } else { "failed" },
+            evidence: format!(
+                "matrix_facts={}; health_issues={}",
+                matrix_facts.len(),
+                growth_health_issues.len()
+            ),
+            notes: "observed matrix growth candidates were promoted with evidence and remained health-clean"
+                .to_string(),
+        },
+    ]
+}
+
+fn run_collaboration_deep_scenarios(trace: &mut ExecutionTrace) -> Vec<CapabilityResult> {
+    let mission = global_mission_runtime();
+    let session_a = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Deep Harness primary session".to_string(),
+            session_id: Some(format!("deep-harness-a-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("deep harness session starts");
+    trace.record_runtime_action("mission.session.start", session_a.session_id.clone());
+    let strategy = decide_strategy(&StrategyInput::from_prompt(
+        "coordinate planner reviewer implementer for deep harness validation",
+    ));
+    let team = global_team_runtime_service()
+        .start(StartTeamRuntimeRequest {
+            session_id: session_a.session_id.clone(),
+            objective: "coordinate planner reviewer implementer for deep harness validation"
+                .to_string(),
+            collaboration_decision: CollaborationTemplateMatcher::default()
+                .decide("coordinate planner reviewer implementer", &strategy),
+        })
+        .expect("deep harness team starts");
+    trace.record_runtime_action("team.start", team.team_id.clone());
+    let team_report = TeamExecutionLoop::tick_ready(&team.team_id).expect("deep team tick");
+    trace.record_runtime_action(
+        "team.tick",
+        format!("assigned={}", team_report.assigned_task_count),
+    );
+    let multi_agent_passed =
+        team_report.assigned_task_count > 0 && !team_report.evidence.is_empty();
+
+    let session_b = mission
+        .start_session(StartMissionSessionRequest {
+            title: "Deep Harness peer session".to_string(),
+            session_id: Some(format!("deep-harness-b-{}", uuid::Uuid::new_v4())),
+        })
+        .expect("deep harness peer session starts");
+    trace.record_runtime_action("mission.session.start_peer", session_b.session_id.clone());
+    global_session_relation_graph()
+        .upsert_proxy(SessionProxy {
+            session_id: session_b.session_id.clone(),
+            summary: "deep harness peer session proxy".to_string(),
+            evidence_refs: vec![format!("team:{}", team.team_id)],
+            decisions: vec!["accept routed evidence inspection".to_string()],
+            open_questions: Vec::new(),
+            updated_at_ms: 0,
+        })
+        .expect("deep peer proxy");
+    trace.record_runtime_action("session.proxy.upsert", session_b.session_id.clone());
+    let bridge = SessionExecutionPlane::bridge(CrossSessionMessage {
+        from_session_id: session_a.session_id.clone(),
+        target_ref: format!("@{}", session_b.session_id),
+        command: "review peer evidence and report contradiction risks".to_string(),
+        actor: Some("deep_harness_eval".to_string()),
+        evidence_refs: vec![format!("team:{}", team.team_id)],
+    });
+    trace.record_runtime_action("session.bridge", bridge.status.clone());
+    let dispatch = SessionExecutionPlane::dispatch_pending(runtime::SessionExecutionPolicy {
+        max_commands: 20,
+        dispatch_mode: runtime::SessionDispatchMode::ControlDispatchComplete,
+        allow_background: true,
+    });
+    trace.record_runtime_action(
+        "session.dispatch",
+        format!("dispatched={}", dispatch.dispatched.len()),
+    );
+    let cross_session_passed = bridge.status == "routed"
+        && dispatch
+            .dispatched
+            .iter()
+            .any(|item| item.session_id == session_b.session_id);
+
+    let approval = runtime::GlobalApprovalQueue::new()
+        .submit(runtime::SubmitGlobalApprovalRequest {
+            source: ApprovalSource {
+                kind: ApprovalSourceKind::Session,
+                session_id: Some(session_a.session_id.clone()),
+                agent_id: None,
+                team_id: Some(team.team_id.clone()),
+                mission_id: Some("deep-harness".to_string()),
+            },
+            action: "write_memory_fact".to_string(),
+            summary: "promote durable workflow preference".to_string(),
+            risk: TaskRisk::High,
+            evidence_refs: vec![format!("session:{}", session_a.session_id)],
+            timeout_policy: ApprovalTimeoutPolicy::Pending,
+        })
+        .expect("deep approval submitted");
+    trace.record_runtime_action("approval.submit", approval.approval_id.clone());
+    let steward = global_steward_runtime_service()
+        .start(StartStewardRuntimeRequest {
+            mission_id: "deep-harness".to_string(),
+            root_session_id: Some(session_a.session_id.clone()),
+            profile_id: AutonomyProfileId::Stewarded,
+            objective: "govern deep harness memory promotion".to_string(),
+        })
+        .expect("deep steward starts");
+    trace.record_runtime_action("steward.start", steward.steward_id.clone());
+    let steward_decision = global_steward_runtime_service()
+        .tick(
+            &steward.steward_id,
+            TickStewardRuntimeRequest {
+                action: Some("review high risk memory promotion".to_string()),
+                summary: Some("require approval before durable preference write".to_string()),
+                risk: TaskRisk::High,
+                requested_tool: Some("memory.promote".to_string()),
+                ..TickStewardRuntimeRequest::default()
+            },
+        )
+        .expect("deep steward ticks");
+    trace.record_runtime_action("steward.tick", format!("{:?}", steward_decision.status));
+    let governance_passed = approval.risk == TaskRisk::High
+        && matches!(
+            steward_decision.status,
+            StewardActionStatus::Delegated
+                | StewardActionStatus::ApprovalSubmitted
+                | StewardActionStatus::Denied
+        );
+
+    let event_store = RuntimeEventStore::open_in_memory().expect("deep event store");
+    event_store
+        .append(RuntimeEventInput {
+            stream_id: format!("session:{}", session_a.session_id),
+            scope: RuntimeEventScope::SessionCommand,
+            kind: "deep_harness.failure_detected".to_string(),
+            status: Some("failed".to_string()),
+            actor: Some("deep_harness_eval".to_string()),
+            refs: Vec::new(),
+            payload: json!({"reason": "simulated verification failure"}),
+        })
+        .expect("deep event append");
+    trace.record_runtime_action("runtime_event.append", "deep_harness.failure_detected");
+    let replay = RuntimeEventReplayer::report(&event_store, 100).expect("deep replay");
+    let recovery = RecoveryExecutor::execute(100).expect("deep recovery");
+    trace.record_runtime_action(
+        "runtime_event.replay",
+        format!("events={}", replay.total_events),
+    );
+    trace.record_runtime_action(
+        "recovery.execute",
+        format!("actions={}", recovery.applied.len()),
+    );
+    let recovery_passed = replay.total_events > 0 && !recovery.applied.is_empty();
+
+    vec![
+        CapabilityResult {
+            capability: "deep_harness_multi_agent_dialogue",
+            status: if multi_agent_passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            evidence: format!(
+                "team={}; assigned={}; evidence_refs={}",
+                team.team_id,
+                team_report.assigned_task_count,
+                team_report.evidence.len()
+            ),
+            notes: "team execution loop created reviewable role tasks and evidence references"
+                .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_cross_session_dialogue",
+            status: if cross_session_passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            evidence: format!(
+                "bridge={}; dispatched={}",
+                bridge.status,
+                dispatch.dispatched.len()
+            ),
+            notes:
+                "primary session routed a command to peer session and execution plane completed it"
+                    .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_governance",
+            status: if governance_passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            evidence: format!(
+                "approval={}; steward={:?}",
+                approval.approval_id, steward_decision.status
+            ),
+            notes: "high-risk durable memory action entered approval and steward governance"
+                .to_string(),
+        },
+        CapabilityResult {
+            capability: "deep_harness_recovery_trace",
+            status: if recovery_passed { "passed" } else { "failed" },
+            evidence: format!(
+                "events={}; recovery_actions={}",
+                replay.total_events,
+                recovery.applied.len()
+            ),
+            notes:
+                "failure evidence was replayable and recovery executor produced auditable actions"
+                    .to_string(),
+        },
+    ]
+}
+
+fn build_harness_metrics(
+    scenarios: &[CapabilityResult],
+    stable_ai: &StableAiHealthReport,
+) -> Vec<HarnessMetric> {
+    let total = scenarios.len();
+    let passed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status == "passed")
+        .count();
+    let deep_total = scenarios
+        .iter()
+        .filter(|scenario| scenario.capability.starts_with("deep_harness"))
+        .count();
+    let deep_passed = scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.capability.starts_with("deep_harness") && scenario.status == "passed"
+        })
+        .count();
+    let provider_passed = scenarios
+        .iter()
+        .any(|scenario| scenario.capability == "deep_provider_eval" && scenario.status == "passed");
+    let gateway_passed = scenarios.iter().any(|scenario| {
+        scenario.capability == "gateway_contract_surface" && scenario.status == "passed"
+    });
+
+    vec![
+        HarnessMetric {
+            name: "scenario_pass_rate",
+            value: format!("{passed}/{total}"),
+            notes: "all capability rows that participated in this eval".to_string(),
+        },
+        HarnessMetric {
+            name: "deep_harness_pass_rate",
+            value: format!("{deep_passed}/{deep_total}"),
+            notes: "memory, growth, collaboration, governance, recovery deep harness rows"
+                .to_string(),
+        },
+        HarnessMetric {
+            name: "real_provider_gate",
+            value: provider_passed.to_string(),
+            notes: format!(
+                "real_provider_enabled={}; model={}",
+                stable_ai.real_provider_enabled,
+                stable_ai.model.as_deref().unwrap_or("none")
+            ),
+        },
+        HarnessMetric {
+            name: "gateway_contract_gate",
+            value: gateway_passed.to_string(),
+            notes: "live gateway /healthz contract status".to_string(),
+        },
+        HarnessMetric {
+            name: "runtime_capability_coverage",
+            value: format!("{}/{}", stable_ai.coverage.passed, stable_ai.coverage.total),
+            notes: "runtime module map required domain coverage".to_string(),
+        },
+    ]
 }
 
 fn fake_provider_scenario_report() -> ScenarioSuiteReport {
@@ -766,7 +1933,7 @@ fn abbreviate(value: &str, max: usize) -> String {
 }
 
 fn write_report(
-    report: &MissionHarnessEvalReport,
+    report: &mut MissionHarnessEvalReport,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let report_dir =
         std::env::var("COWD_AI_HARNESS_REPORT_DIR").unwrap_or_else(|_| DEFAULT_REPORT_DIR.into());
@@ -774,21 +1941,29 @@ fn write_report(
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let stamp = current_stamp();
     let base = format!("{}-mission-harness-{}", stamp, report.level.as_str());
-    let json_path = root.join(format!("{base}.json"));
-    let md_path = root.join(format!("{base}.md"));
+    let run_dir = root.join("runs").join(&base);
+    let provider_round_dir = run_dir.join("provider-rounds");
+    let evidence_dir = run_dir.join("evidence");
+    std::fs::create_dir_all(&provider_round_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
+    report.result_package_dir = Some(run_dir.display().to_string());
+    let json_path = run_dir.join("report.json");
+    let md_path = run_dir.join("report.md");
     std::fs::write(
         &json_path,
         serde_json::to_string_pretty(report).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    write_result_package_details(report, &run_dir, &provider_round_dir, &evidence_dir)?;
     let mut markdown = String::from("# Mission Harness Evaluation Report\n\n");
     markdown.push_str(&format!(
-        "- level: {}\n- status: {}\n- gateway_process: {}\n- provider: {}\n- budget: {}\n\n",
+        "- level: {}\n- status: {}\n- gateway_process: {}\n- provider: {}\n- budget: {}\n- result_package: {}\n\n",
         report.level.as_str(),
         report.status,
         report.gateway_process,
         report.provider.as_deref().unwrap_or("none"),
-        report.budget.as_deref().unwrap_or("none")
+        report.budget.as_deref().unwrap_or("none"),
+        report.result_package_dir.as_deref().unwrap_or("none")
     ));
     markdown.push_str("| Capability | Status | Evidence | Notes |\n| --- | --- | --- | --- |\n");
     for item in &report.scenarios {
@@ -796,6 +1971,71 @@ fn write_report(
             "| {} | {} | {} | {} |\n",
             item.capability, item.status, item.evidence, item.notes
         ));
+    }
+    markdown.push_str("\n## Metrics\n\n");
+    markdown.push_str("| Metric | Value | Notes |\n| --- | --- | --- |\n");
+    for item in &report.metrics {
+        markdown.push_str(&format!(
+            "| {} | {} | {} |\n",
+            item.name, item.value, item.notes
+        ));
+    }
+    markdown.push_str("\n## Execution Summary\n\n");
+    markdown.push_str(&format!(
+        "- total_elapsed_ms: {}\n- provider_rounds: {}\n- runtime_actions: {}\n- tool_calls: {}\n- total_tokens: {}\n- input_tokens: {}\n- output_tokens: {}\n- cache_write_tokens: {}\n- cache_read_tokens: {}\n- usage_source: {}\n\n",
+        report.execution_trace.total_elapsed_ms.unwrap_or_default(),
+        report.execution_trace.provider_rounds,
+        report.execution_trace.runtime_actions,
+        report.execution_trace.tool_calls,
+        report.execution_trace.total_usage.total_tokens,
+        report.execution_trace.total_usage.input_tokens,
+        report.execution_trace.total_usage.output_tokens,
+        report.execution_trace.total_usage.cache_creation_input_tokens,
+        report.execution_trace.total_usage.cache_read_input_tokens,
+        report.execution_trace.total_usage.usage_source,
+    ));
+    markdown.push_str("## Provider Rounds\n\n");
+    markdown.push_str("| Round | Name | Model | Status | Elapsed ms | Input | Output | Total | Request Summary | Response Summary | Detail |\n| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |\n");
+    for round in &report.execution_trace.rounds {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            round.round_index,
+            round.name,
+            round.model,
+            round.status,
+            round.elapsed_ms,
+            round.usage.input_tokens,
+            round.usage.output_tokens,
+            round.usage.total_tokens,
+            round.request_summary,
+            round.response_summary,
+            round.detail_path
+        ));
+    }
+    if let Some(complex) = &report.complex_scenarios {
+        markdown.push_str("\n## Complex Scenarios\n\n");
+        markdown.push_str(&format!(
+            "- passed: {}/{}\n- average_score: {:.2}\n\n",
+            complex.passed, complex.total, complex.average_score
+        ));
+        markdown.push_str(
+            "| Scenario | Kind | Passed | Score | Failed Checks | Review |\n| --- | --- | --- | ---: | --- | --- |\n",
+        );
+        for item in &complex.results {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {:.2} | {} | {} |\n",
+                item.scenario_id,
+                item.kind.as_str(),
+                item.passed,
+                item.score,
+                if item.failed_checks.is_empty() {
+                    "none".to_string()
+                } else {
+                    item.failed_checks.join(", ")
+                },
+                item.review_summary
+            ));
+        }
     }
     markdown.push_str("\n## Scenario Matrix\n\n");
     markdown.push_str("| Scenario | Kind | Fake Gate | Real Gate | Required Evidence |\n| --- | --- | --- | --- | --- |\n");
@@ -810,8 +2050,50 @@ fn write_report(
         ));
     }
     std::fs::write(&md_path, markdown).map_err(|error| error.to_string())?;
+    std::fs::copy(&json_path, root.join(format!("{base}.json")))
+        .map_err(|error| error.to_string())?;
+    std::fs::copy(&md_path, root.join(format!("{base}.md"))).map_err(|error| error.to_string())?;
     write_stable_ai_report(root, &report.stable_ai)?;
     Ok((json_path, md_path))
+}
+
+fn write_result_package_details(
+    report: &MissionHarnessEvalReport,
+    run_dir: &std::path::Path,
+    provider_round_dir: &std::path::Path,
+    evidence_dir: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::write(
+        run_dir.join("execution-trace.json"),
+        serde_json::to_string_pretty(&report.execution_trace).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    for detail in &report.provider_round_details {
+        let file_name = detail
+            .summary
+            .detail_path
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| "provider round detail path is empty".to_string())?;
+        std::fs::write(
+            provider_round_dir.join(file_name),
+            serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(complex) = &report.complex_scenarios {
+        std::fs::write(
+            evidence_dir.join("complex-scenarios.json"),
+            serde_json::to_string_pretty(complex).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        evidence_dir.join("stable-ai-health.json"),
+        serde_json::to_string_pretty(&report.stable_ai).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn write_stable_ai_report(
@@ -879,4 +2161,11 @@ fn current_stamp() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("v0.9.396-{seconds}")
+}
+
+fn now_ms_u128() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
