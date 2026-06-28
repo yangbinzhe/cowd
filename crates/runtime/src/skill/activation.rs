@@ -1,7 +1,23 @@
 //! Runtime event support for skill activation decisions.
 
+use harness_contract::skill::SkillInvocationEvidence;
 use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
+
+use super::CowdSkillStructuredDependency;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSkillCandidateSource {
+    Profile,
+    CapabilityRefFallback,
+}
+
+impl Default for RuntimeSkillCandidateSource {
+    fn default() -> Self {
+        Self::Profile
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSkillCandidate {
@@ -9,6 +25,8 @@ pub struct RuntimeSkillCandidate {
     pub score: u32,
     pub reasons: Vec<String>,
     pub path: Option<String>,
+    #[serde(default)]
+    pub source: RuntimeSkillCandidateSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +36,8 @@ pub struct SkillActivationRecord {
     pub query: String,
     pub selected: Option<String>,
     pub candidates: Vec<RuntimeSkillCandidate>,
+    pub invocation_evidence: Option<SkillInvocationEvidence>,
+    pub structured_dependencies: Vec<CowdSkillStructuredDependency>,
 }
 
 impl SkillActivationRecord {
@@ -28,14 +48,34 @@ impl SkillActivationRecord {
         query: impl Into<String>,
         candidates: Vec<RuntimeSkillCandidate>,
     ) -> Self {
-        let selected = candidates.first().map(|candidate| candidate.name.clone());
+        let selected = candidates
+            .iter()
+            .find(|candidate| candidate.source == RuntimeSkillCandidateSource::Profile)
+            .map(|candidate| candidate.name.clone());
         Self {
             session_id: session_id.into(),
             turn_index,
             query: query.into(),
             selected,
             candidates,
+            invocation_evidence: None,
+            structured_dependencies: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_invocation_evidence(mut self, evidence: Option<SkillInvocationEvidence>) -> Self {
+        self.invocation_evidence = evidence;
+        self
+    }
+
+    #[must_use]
+    pub fn with_structured_dependencies(
+        mut self,
+        dependencies: Vec<CowdSkillStructuredDependency>,
+    ) -> Self {
+        self.structured_dependencies = dependencies;
+        self
     }
 
     #[must_use]
@@ -45,6 +85,8 @@ impl SkillActivationRecord {
             "query": self.query,
             "selected": self.selected,
             "candidates": self.candidates,
+            "invocation_evidence": self.invocation_evidence,
+            "structured_dependencies": self.structured_dependencies,
         });
         let mut event = RuntimeEvent::new(
             self.session_id.clone(),
@@ -59,6 +101,20 @@ impl SkillActivationRecord {
                 ref_type: "skill".to_string(),
                 id: selected.clone(),
                 label: Some("selected".to_string()),
+            });
+        }
+        if let Some(evidence) = &self.invocation_evidence {
+            event.refs.push(RuntimeRef {
+                ref_type: "skill_invocation".to_string(),
+                id: evidence.skill_id.clone(),
+                label: Some(evidence.outcome.clone()),
+            });
+        }
+        for dependency in &self.structured_dependencies {
+            event.refs.push(RuntimeRef {
+                ref_type: "skill_dependency".to_string(),
+                id: format!("{}:{}", dependency.skill_id, dependency.domain),
+                label: Some(dependency.quality_gate.clone()),
             });
         }
         event
@@ -87,6 +143,7 @@ mod tests {
                 score: 12,
                 reasons: vec!["tags:1".to_string()],
                 path: Some("/tmp/release/SKILL.md".to_string()),
+                source: RuntimeSkillCandidateSource::Profile,
             }],
         );
 
@@ -97,6 +154,8 @@ mod tests {
         assert_eq!(event.scope, RuntimeEventScope::Context);
         assert_eq!(event.kind, "skill_candidates");
         assert_eq!(event.payload["selected"], "release");
+        assert!(event.payload.get("invocation_evidence").is_some());
+        assert!(event.payload["structured_dependencies"].is_array());
         assert_eq!(event.refs[0].ref_type, "skill");
         assert_eq!(event.refs[0].id, "release");
     }

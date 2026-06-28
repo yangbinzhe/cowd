@@ -31,6 +31,7 @@ use harness_contract::{
         ContextGovernanceDecision, ContextPressureState, ContextTurnReport, EvidenceRef,
         ToolObservation,
     },
+    skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
 };
 use memory::cognitive::CognitiveContextManager;
@@ -42,7 +43,9 @@ use serde_json::{Map, Value};
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
-use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
+use crate::agent_collaboration::{
+    CollaborationContextResult, CollaborationOps, MemoryPulseCandidate, MemoryPulseKind,
+};
 use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
@@ -60,7 +63,10 @@ use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy}
 use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
-use crate::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
+use crate::skill::{
+    memory_candidate_from_skill_activation, SkillActivationEngine, SkillActivationInput,
+    SkillActivationRecord, SkillMemoryPolicy,
+};
 use crate::tool_execution_plan::ToolExecutionPlan;
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
@@ -325,6 +331,11 @@ pub struct ConversationRuntime<C, T> {
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
     /// Type-erased collaboration orchestrator for multi-agent task dispatch.
     collaboration: Option<Arc<dyn CollaborationOps>>,
+    /// Skill capability profiles already inspected by the Skill asset layer and
+    /// visible to this runtime.
+    skill_profiles: Vec<SkillCapabilityProfile>,
+    /// Agent-scoped Skill visibility and adapter policy.
+    agent_skill_profile: AgentSkillProfile,
     /// Type-erased Joint Problem Solving pipeline for high-complexity tasks.
     jps_pipeline: Option<Arc<dyn JpsOps>>,
     /// When true, inject available peer agents from AgentDirectory into the system prompt.
@@ -526,6 +537,8 @@ where
             memory_callback: None,
             approval_gate: None,
             collaboration: None,
+            skill_profiles: Vec::new(),
+            agent_skill_profile: AgentSkillProfile::default(),
             jps_pipeline: None,
             inject_peer_context: true,
             effect_handler: None,
@@ -1117,6 +1130,23 @@ where
     #[must_use]
     pub fn with_collaboration(mut self, c: Arc<dyn CollaborationOps>) -> Self {
         self.collaboration = Some(c);
+        self
+    }
+
+    /// Provide Skill capability profiles already inspected by the Skill asset
+    /// layer. Runtime consumes these profiles during activation, but does not
+    /// inspect packages or own the registry.
+    #[must_use]
+    pub fn with_skill_profiles(mut self, profiles: Vec<SkillCapabilityProfile>) -> Self {
+        self.skill_profiles = profiles;
+        self
+    }
+
+    /// Configure the agent-scoped Skill visibility and adapter ceiling used by
+    /// runtime activation.
+    #[must_use]
+    pub fn with_agent_skill_profile(mut self, profile: AgentSkillProfile) -> Self {
+        self.agent_skill_profile = profile;
         self
     }
 
@@ -2299,36 +2329,50 @@ where
                 .unwrap_or_default();
 
             if self.should_use_collaboration(&last_user_msg) {
-                let skills: Vec<String> = Self::infer_required_capabilities(&last_user_msg);
-                if !skills.is_empty() {
-                    let activation = SkillActivationRecord::new(
-                        self.session().session_id.clone(),
-                        self.session().messages.len(),
-                        last_user_msg.clone(),
-                        skills
-                            .iter()
-                            .map(|skill| RuntimeSkillCandidate {
-                                name: skill.clone(),
-                                score: 5,
-                                reasons: vec!["runtime_keyword_inference".to_string()],
-                                path: None,
-                            })
-                            .collect(),
+                let capability_refs: Vec<String> =
+                    Self::infer_required_capabilities(&last_user_msg);
+                if !capability_refs.is_empty() {
+                    let activation_decision =
+                        SkillActivationEngine::activate(SkillActivationInput {
+                            session_id: self.session().session_id.clone(),
+                            turn_index: self.session().messages.len(),
+                            query: last_user_msg.clone(),
+                            capability_refs: capability_refs.clone(),
+                            available_profiles: self.skill_profiles.clone(),
+                            agent_profile: self.agent_skill_profile.clone(),
+                        });
+                    let activation = activation_decision.activation;
+                    let skill_memory_candidate = memory_candidate_from_skill_activation(
+                        &activation,
+                        &SkillMemoryPolicy::default(),
                     );
                     self.record_skill_activation_event(&activation, self.session().messages.len());
+                    if let Some(candidate) = &skill_memory_candidate {
+                        self.record_skill_memory_candidate_event(
+                            &activation,
+                            candidate,
+                            self.session().messages.len(),
+                        );
+                    }
                     let collab_clone = Arc::clone(collab);
                     let task = last_user_msg.clone();
-                    let skills_clone = skills.clone();
+                    let capability_refs_clone = capability_refs.clone();
                     let memory = self.memory_manager().cloned();
 
                     if let Some(collab_result) = collab_clone
-                        .run_with_context_boxed(&task, &skills_clone)
+                        .run_with_context_boxed(&task, &capability_refs_clone)
                         .await
                     {
                         let mut collab_result = collab_result;
+                        if let Some(candidate) = &skill_memory_candidate {
+                            collab_result.review_packet.maintenance_candidates.push(
+                                skill_memory_candidate_to_maintenance(&activation, candidate),
+                            );
+                        }
                         collab_result.work_graph = collab_result
                             .work_graph
-                            .with_session_id(self.session().session_id.clone());
+                            .with_session_id(self.session().session_id.clone())
+                            .with_review_packet(&collab_result.review_packet);
                         let synthesis = collab_result.synthesis.clone();
                         self.append_context_items_to_latest_envelope(
                             &task,
@@ -2337,7 +2381,7 @@ where
                         self.remember_collaboration_result(collab_result);
                         tracing::info!(
                             synthesis_len = synthesis.len(),
-                            skills = ?skills_clone,
+                            capability_refs = ?capability_refs_clone,
                             "Collaboration synthesis complete"
                         );
                         if let Some(mem) = memory {
@@ -3454,7 +3498,13 @@ where
             return;
         };
         let session_id = activation.session_id.clone();
-        let event = activation.to_runtime_event(sequence);
+        let mut event = activation.to_runtime_event(sequence);
+        if let Some(payload) = event.payload.as_object_mut() {
+            payload.insert(
+                "source".to_string(),
+                serde_json::json!("conversation_runtime.skill_activation"),
+            );
+        }
         let store = Arc::clone(store);
         tokio::spawn(async move {
             if let Err(error) = store.append_runtime_event(&event).await {
@@ -3463,6 +3513,52 @@ where
                     session_id,
                     sequence,
                     "skill activation runtime event append failed"
+                );
+            }
+        });
+    }
+
+    fn record_skill_memory_candidate_event(
+        &self,
+        activation: &SkillActivationRecord,
+        candidate: &MemoryPulseCandidate,
+        sequence: usize,
+    ) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "turn_index": activation.turn_index,
+            "query": activation.query,
+            "selected": activation.selected,
+            "candidate": candidate,
+            "source_event": "skill_candidates",
+            "source": "conversation_runtime.skill_memory_candidate",
+        });
+        let mut event = memory::RuntimeEvent::new(
+            activation.session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Context,
+            "skill_memory_candidate",
+            payload,
+            now_ms(),
+        );
+        if let Some(selected) = &activation.selected {
+            event.refs.push(memory::RuntimeRef {
+                ref_type: "skill".to_string(),
+                id: selected.clone(),
+                label: Some("memory_candidate_source".to_string()),
+            });
+        }
+        let session_id = activation.session_id.clone();
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "skill memory candidate runtime event append failed"
                 );
             }
         });
@@ -4237,6 +4333,68 @@ fn growth_maintenance_candidates(
         .collect()
 }
 
+fn skill_memory_candidate_to_maintenance(
+    activation: &SkillActivationRecord,
+    candidate: &MemoryPulseCandidate,
+) -> memory::MaintenanceCandidate {
+    let now = chrono::Utc::now();
+    let (kind, summary) = match candidate.kind {
+        MemoryPulseKind::Remember => (
+            memory::MaintenanceCandidateKind::RelationshipRefresh,
+            "Review skill activation gap",
+        ),
+        MemoryPulseKind::Refresh => (
+            memory::MaintenanceCandidateKind::RelationshipRefresh,
+            "Review skill activation memory refresh",
+        ),
+        MemoryPulseKind::Promote => (
+            memory::MaintenanceCandidateKind::AuthorityPromotion,
+            "Review skill activation promotion",
+        ),
+        MemoryPulseKind::Retire => (
+            memory::MaintenanceCandidateKind::Stale,
+            "Review skill activation retirement",
+        ),
+    };
+    let selected = activation
+        .selected
+        .as_deref()
+        .unwrap_or("no-skill-selected")
+        .to_string();
+    let confidence = activation
+        .candidates
+        .first()
+        .map(|candidate| (candidate.score as f32 / 16.0).clamp(0.25, 0.95))
+        .unwrap_or(0.35);
+    memory::MaintenanceCandidate {
+        id: format!("skill-memory-{}", uuid::Uuid::new_v4()),
+        kind,
+        status: memory::MaintenanceCandidateStatus::Open,
+        entry_ids: Vec::new(),
+        summary: format!(
+            "{summary}: selected={selected}; query={}",
+            truncate_for_runtime_candidate(&activation.query)
+        ),
+        reason: candidate.content.clone(),
+        confidence,
+        source: Some("runtime_skill".to_string()),
+        source_ref: Some(format!(
+            "session://{}/turn/{}/skill/{}",
+            activation.session_id, activation.turn_index, selected
+        )),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn truncate_for_runtime_candidate(value: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    value.chars().take(MAX_CHARS).collect::<String>()
+}
+
 type ToolHandler = Box<dyn Fn(&str) -> Result<String, ToolError> + Send + Sync>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
@@ -4388,6 +4546,11 @@ mod tests {
     use crate::SubAgentConfig;
     use crate::ToolError;
     use futures::stream::Stream;
+    use harness_contract::skill::{
+        AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
+        SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
+        SkillStructuredDependency,
+    };
     use model_protocol::telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
     use model_protocol::usage::TokenUsage;
     use std::fs;
@@ -4400,6 +4563,32 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_skill_profile(
+        skill_id: &str,
+        name: &str,
+        adapter: SkillAdapterKind,
+    ) -> SkillCapabilityProfile {
+        SkillCapabilityProfile {
+            skill_id: skill_id.to_string(),
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            source_root: "/tmp/cowd-skill".to_string(),
+            package_fingerprint: "test-fingerprint".to_string(),
+            kind: SkillKind::Document,
+            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+            adapters: vec![adapter],
+            risk_level: SkillRiskLevel::Low,
+            entrypoints: vec![SkillEntrypoint {
+                runtime: SkillDetectedRuntime::Markdown,
+                path: "SKILL.md".to_string(),
+                adapter,
+                command_hint: None,
+            }],
+            inspection_summary: vec!["release review planning".to_string()],
+            structured_dependencies: Vec::new(),
+        }
     }
 
     // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
@@ -5650,9 +5839,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn collaboration_turn_records_takeable_closed_loop_result() {
+    async fn collaboration_records_skill_invocation_evidence() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         let session = Session::new();
         let session_id = session.session_id.clone();
+        let now = "2026-06-28T00:00:00Z".to_string();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: session_id.clone(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "none".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let mut runtime = ConversationRuntime::new(
             session,
             MockApi,
@@ -5661,6 +5871,7 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
+        .with_session_store(Arc::clone(&store))
         .with_collaboration(Arc::new(EvidenceBackedCollaboration));
 
         runtime
@@ -5684,8 +5895,171 @@ mod tests {
             .flat_map(|task| task.evidence_refs.iter())
             .any(|evidence| evidence.starts_with("evidence://agent-run-reviewer/")));
 
+        for _ in 0..40 {
+            let events = store.get_events(&session_id, 0).await.unwrap();
+            if let Some(skill_event) = events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .find(|event| event.kind == "skill_candidates")
+            {
+                assert!(skill_event.payload.get("invocation_evidence").is_some());
+                assert_eq!(
+                    skill_event.payload["candidates"][0]["reasons"][0],
+                    "capability_ref_fallback"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let events = store.get_events(&session_id, 0).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .any(|event| event.kind == "skill_candidates"),
+            "collaboration turn must persist runtime skill activation event"
+        );
+
         assert!(runtime.take_collaboration_result().is_some());
         assert!(runtime.take_collaboration_result().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collaboration_records_profile_backed_skill_invocation_evidence() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let now = "2026-06-28T00:00:00Z".to_string();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: session_id.clone(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "none".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut profile = test_skill_profile(
+            "release-review",
+            "Release Review",
+            SkillAdapterKind::PromptOnly,
+        );
+        profile
+            .structured_dependencies
+            .push(SkillStructuredDependency {
+                domain: "release_engineering".to_string(),
+                required_fact_types: vec!["release.test_status".to_string()],
+                required_metric_keys: vec!["release_risk".to_string()],
+                required_evidence: vec!["test_report".to_string()],
+                quality_gate: "release_quality_gate".to_string(),
+            });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(Arc::clone(&store))
+        .with_collaboration(Arc::new(EvidenceBackedCollaboration))
+        .with_skill_profiles(vec![profile])
+        .with_agent_skill_profile(AgentSkillProfile {
+            adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+            ..AgentSkillProfile::default()
+        });
+
+        runtime
+            .run_turn_async(
+                "please review the release plan and implementation evidence",
+                &SharedPrompter::none(),
+            )
+            .await
+            .expect("turn should complete");
+
+        let result = runtime
+            .last_collaboration_result()
+            .expect("collaboration result should be recorded");
+        assert!(result
+            .review_packet
+            .maintenance_candidates
+            .iter()
+            .any(
+                |candidate| candidate.source.as_deref() == Some("runtime_skill")
+                    && candidate
+                        .source_ref
+                        .as_deref()
+                        .is_some_and(|reference| reference.contains("release-review"))
+            ));
+
+        for _ in 0..40 {
+            let events = store.get_events(&session_id, 0).await.unwrap();
+            let runtime_events = events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .collect::<Vec<_>>();
+            if let Some(skill_event) = runtime_events
+                .iter()
+                .find(|event| event.kind == "skill_candidates")
+            {
+                assert_eq!(
+                    skill_event.payload["source"],
+                    "conversation_runtime.skill_activation"
+                );
+                assert_eq!(skill_event.payload["selected"], "release-review");
+                assert_eq!(
+                    skill_event.payload["invocation_evidence"]["skill_id"],
+                    "release-review"
+                );
+                assert_eq!(
+                    skill_event.payload["invocation_evidence"]["outcome"],
+                    "selected_for_runtime"
+                );
+                assert!(skill_event
+                    .refs
+                    .iter()
+                    .any(|reference| reference.ref_type == "skill_invocation"
+                        && reference.id == "release-review"));
+                assert_eq!(
+                    skill_event.payload["structured_dependencies"][0]["domain"],
+                    "release_engineering"
+                );
+                assert!(skill_event
+                    .refs
+                    .iter()
+                    .any(|reference| reference.ref_type == "skill_dependency"
+                        && reference.id.contains("release-review")));
+                let memory_event = runtime_events
+                    .iter()
+                    .find(|event| {
+                        event.kind == "skill_memory_candidate"
+                            && event.payload["selected"] == "release-review"
+                    })
+                    .expect("skill memory candidate should be recorded");
+                assert_eq!(
+                    memory_event.payload["source"],
+                    "conversation_runtime.skill_memory_candidate"
+                );
+                assert_eq!(
+                    memory_event.payload["turn_index"],
+                    skill_event.payload["turn_index"]
+                );
+                assert!(skill_event.sequence <= memory_event.sequence);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("missing profile-backed skill activation event");
     }
 
     #[test]
@@ -5963,7 +6337,8 @@ mod tests {
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system prompt".to_string()],
-        );
+        )
+        .without_memory();
         let prompt = rt.prepare_reality_context("test query").await;
         // Without selected memories, stable head is followed by runtime header.
         assert_eq!(prompt.len(), 2);

@@ -1,10 +1,15 @@
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use harness_contract::skill::{AgentSkillProfile, SkillAdapterKind};
 use runtime::{PermissionMode, Session};
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
 use crate::runtime_bootstrap::RuntimeBootstrapState;
 use crate::runtime_entry::GatewayRuntimeEntry;
+use crate::services::runtime_skill_profiles_for_workspace;
 use crate::{
     filter_tool_specs, inject_auto_resume_context, permission_policy,
     session_db_resume_context_packet, workspace_context_item, AllowedToolSet,
@@ -105,6 +110,11 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let overrides = feature_config.model_context_windows();
     let model_ctx = runtime::model_context_window_with_overrides(&model, Some(&overrides));
     let workspace_item = workspace_context_item(&session, model_ctx);
+    let workspace_root = session
+        .workspace_root()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let skill_profiles = runtime_skill_profiles_for_workspace(&workspace_root);
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
     let subagent_model = model.clone();
     let subagent_tool_definitions = tool_definitions.clone();
@@ -131,6 +141,8 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             Box::new(GatewayHookProgressReporter) as Box<dyn runtime::HookProgressReporter>
         }),
         external_context_items: vec![workspace_item],
+        skill_profiles,
+        agent_skill_profile: default_runtime_agent_skill_profile(),
         enable_collaboration: true,
         subagent_model,
         subagent_tool_definitions,
@@ -145,6 +157,25 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         inject_auto_resume_context(&entry, session_resume_packet, session_id);
     entry.set_resume_context_loaded(resume_context_loaded);
     Ok(entry)
+}
+
+fn default_runtime_agent_skill_profile() -> AgentSkillProfile {
+    AgentSkillProfile {
+        adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+        ..AgentSkillProfile::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_agent_skill_profile_defaults_to_prompt_only() {
+        let profile = default_runtime_agent_skill_profile();
+
+        assert_eq!(profile.adapter_ceiling, vec![SkillAdapterKind::PromptOnly]);
+    }
 }
 
 struct GatewayHookProgressReporter;

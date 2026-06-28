@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -17,8 +17,6 @@ use matrix_core::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
-use runtime::skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
-use runtime::skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
 use runtime::surface_contract::CowdSurfaceParityContract;
 use serde::{Deserialize, Serialize};
 
@@ -230,7 +228,7 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
         structured_indexes_ready,
         structured_watermark_persistent,
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
-        memory_context_bridge_available: memory_context_bridge_smoke(),
+        memory_context_bridge_available: memory_context_bridge_available(state).await,
         graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(state),
     }
 }
@@ -260,21 +258,163 @@ async fn execution_outcome_timeline_available(state: &AppState) -> bool {
     false
 }
 
-fn memory_context_bridge_smoke() -> bool {
-    let activation = SkillActivationRecord::new(
-        "release-gate-smoke",
-        1,
-        "structured data bridge",
-        vec![RuntimeSkillCandidate {
-            name: "structured-data".to_string(),
-            score: 12,
-            reasons: vec!["release-gate".to_string()],
-            path: None,
-        }],
-    );
-    memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
-        .map(|candidate| candidate.content.contains("source=skill_activation"))
-        .unwrap_or(false)
+async fn memory_context_bridge_available(state: &AppState) -> bool {
+    let Some(store) = state.services.session.unified_store() else {
+        return false;
+    };
+    let Ok(sessions) = store.list_sessions().await else {
+        return false;
+    };
+    for session in sessions.into_iter().take(50) {
+        let mut from_sequence = 0;
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            let Ok(page) = store
+                .timeline_events_page(&session.session_id, from_sequence, 100)
+                .await
+            else {
+                break;
+            };
+            events.extend(page.events);
+            if !page.has_more {
+                break;
+            }
+            from_sequence = page.next_seq.unwrap_or(from_sequence + 100);
+        }
+        if runtime_skill_memory_bridge_session(&events) {
+            return true;
+        }
+    }
+    false
+}
+
+fn runtime_skill_memory_bridge_session(events: &[memory::RuntimeEvent]) -> bool {
+    let invocations = events
+        .iter()
+        .filter_map(runtime_skill_invocation)
+        .collect::<BTreeSet<_>>();
+    if invocations.is_empty() {
+        return false;
+    }
+
+    events.iter().any(|event| {
+        runtime_skill_memory_candidate(event)
+            .map(|candidate| {
+                invocations.iter().any(|invocation| {
+                    invocation.skill_id == candidate.skill_id
+                        && invocation.turn_index == candidate.turn_index
+                        && invocation.sequence <= candidate.sequence
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RuntimeSkillBridgeKey {
+    skill_id: String,
+    turn_index: u64,
+    sequence: usize,
+}
+
+fn runtime_skill_invocation(event: &memory::RuntimeEvent) -> Option<RuntimeSkillBridgeKey> {
+    if event.kind != "skill_candidates" {
+        return None;
+    }
+    if event.payload.get("source").and_then(|value| value.as_str())
+        != Some("conversation_runtime.skill_activation")
+    {
+        return None;
+    }
+    let turn_index = event
+        .payload
+        .get("turn_index")
+        .and_then(|value| value.as_u64())?;
+    let selected = event
+        .payload
+        .get("selected")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let evidence = event.payload.get("invocation_evidence")?;
+    if evidence.get("outcome").and_then(|value| value.as_str()) != Some("selected_for_runtime") {
+        return None;
+    }
+    let evidence_skill = evidence
+        .get("skill_id")
+        .and_then(|skill_id| skill_id.as_str())
+        .filter(|skill_id| !skill_id.trim().is_empty())
+        .map(str::trim)?;
+    if evidence_skill != selected {
+        return None;
+    }
+    let has_invocation_ref = event
+        .refs
+        .iter()
+        .any(|reference| reference.ref_type == "skill_invocation" && reference.id == selected);
+    if !has_invocation_ref {
+        return None;
+    }
+    Some(RuntimeSkillBridgeKey {
+        skill_id: selected.to_string(),
+        turn_index,
+        sequence: event.sequence,
+    })
+}
+
+fn runtime_skill_memory_candidate(event: &memory::RuntimeEvent) -> Option<RuntimeSkillBridgeKey> {
+    if event.kind != "skill_memory_candidate" {
+        return None;
+    }
+    if event.payload.get("source").and_then(|value| value.as_str())
+        != Some("conversation_runtime.skill_memory_candidate")
+    {
+        return None;
+    }
+    if event
+        .payload
+        .get("source_event")
+        .and_then(|value| value.as_str())
+        != Some("skill_candidates")
+    {
+        return None;
+    }
+    let turn_index = event
+        .payload
+        .get("turn_index")
+        .and_then(|value| value.as_u64())?;
+    let selected = event
+        .payload
+        .get("selected")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let has_selected_ref = event
+        .refs
+        .iter()
+        .any(|reference| reference.ref_type == "skill" && reference.id == selected);
+    if !has_selected_ref {
+        return None;
+    }
+    let source_is_runtime_skill = event
+        .payload
+        .get("candidate")
+        .and_then(|candidate| {
+            candidate
+                .get("content")
+                .or_else(|| candidate.get("reason"))
+                .and_then(|value| value.as_str())
+        })
+        .map(|value| value.contains("source=runtime_skill"))
+        .unwrap_or(false);
+    if !source_is_runtime_skill {
+        return None;
+    }
+    Some(RuntimeSkillBridgeKey {
+        skill_id: selected.to_string(),
+        turn_index,
+        sequence: event.sequence,
+    })
 }
 
 fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
@@ -301,6 +441,85 @@ fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
             .source_refs
             .iter()
             .any(|source| source.reference == "structured-fact:release-gate-smoke")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill_activation_event(sequence: usize, source: &str) -> memory::RuntimeEvent {
+        let mut event = memory::RuntimeEvent::new(
+            "session-1",
+            sequence,
+            memory::RuntimeEventScope::Context,
+            "skill_candidates",
+            serde_json::json!({
+                "source": source,
+                "turn_index": 7,
+                "selected": "release-review",
+                "invocation_evidence": {
+                    "skill_id": "release-review",
+                    "outcome": "selected_for_runtime"
+                }
+            }),
+            sequence as u64,
+        );
+        event.refs.push(memory::RuntimeRef {
+            ref_type: "skill_invocation".to_string(),
+            id: "release-review".to_string(),
+            label: Some("selected_for_runtime".to_string()),
+        });
+        event
+    }
+
+    fn skill_memory_event(sequence: usize, source: &str) -> memory::RuntimeEvent {
+        let mut event = memory::RuntimeEvent::new(
+            "session-1",
+            sequence,
+            memory::RuntimeEventScope::Context,
+            "skill_memory_candidate",
+            serde_json::json!({
+                "source": source,
+                "turn_index": 7,
+                "selected": "release-review",
+                "source_event": "skill_candidates",
+                "candidate": {
+                    "content": "skill selected for task; source=runtime_skill; selected=release-review"
+                }
+            }),
+            sequence as u64,
+        );
+        event.refs.push(memory::RuntimeRef {
+            ref_type: "skill".to_string(),
+            id: "release-review".to_string(),
+            label: Some("memory_candidate_source".to_string()),
+        });
+        event
+    }
+
+    #[test]
+    fn release_gate_skill_bridge_requires_conversation_runtime_sources() {
+        let activation = skill_activation_event(1, "manual.skill_activation");
+        let memory = skill_memory_event(2, "conversation_runtime.skill_memory_candidate");
+
+        assert!(!runtime_skill_memory_bridge_session(&[activation, memory]));
+    }
+
+    #[test]
+    fn release_gate_skill_bridge_requires_activation_before_memory_candidate() {
+        let activation = skill_activation_event(3, "conversation_runtime.skill_activation");
+        let memory = skill_memory_event(2, "conversation_runtime.skill_memory_candidate");
+
+        assert!(!runtime_skill_memory_bridge_session(&[memory, activation]));
+    }
+
+    #[test]
+    fn release_gate_skill_bridge_accepts_paired_conversation_runtime_events() {
+        let activation = skill_activation_event(1, "conversation_runtime.skill_activation");
+        let memory = skill_memory_event(2, "conversation_runtime.skill_memory_candidate");
+
+        assert!(runtime_skill_memory_bridge_session(&[activation, memory]));
+    }
 }
 
 fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {

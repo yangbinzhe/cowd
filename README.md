@@ -321,7 +321,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 ### 5.4 Skills
 
-Skills API 分三层：Catalog、Projection、Action。
+Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只负责发现、投影、文件查看和治理评估；具体领域的 Skill 执行由上层应用路由承接，例如 MFG 的运行能力在 `/api/apps/mfg/**` 下。
 
 | API | 用途 |
 |---|---|
@@ -330,10 +330,12 @@ Skills API 分三层：Catalog、Projection、Action。
 | `GET /api/skills/projection?surface=webui` | WebUI 投影 |
 | `GET /api/skills/projection?surface=tui` | TUI 投影 |
 | `GET /api/skills/projection?surface=cli` | CLI 投影 |
-| `POST /api/skills/:id/actions/validate` | 校验 skill manifest/evidence/tools/quality gate |
-| `POST /api/skills/:id/actions/plan` | 生成 skill plan |
-| `POST /api/skills/:id/actions/run` | 执行 skill |
-| `GET /api/skills/runs` | 最近 skill run |
+| `GET /api/skills/:id/files` | 技能文件列表 |
+| `GET /api/skills/:id/files/raw` | 技能文件内容 |
+| `POST /api/skills/maintenance/evaluate` | 技能维护与演进建议 |
+| `POST /api/apps/mfg/incidents/:id/skills/plan` | MFG 应用层技能规划 |
+| `POST /api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 应用层技能执行 |
+| `GET /api/apps/mfg/incidents/:id/skills` | MFG 事件技能运行记录 |
 
 ### 5.5 Tools
 

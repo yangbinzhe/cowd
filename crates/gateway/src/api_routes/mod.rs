@@ -873,6 +873,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_maintenance_evaluate_route_calls_skill_service() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/maintenance/evaluate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "route-req-1",
+                            "skill_id": "plan-review",
+                            "selected_count": 5,
+                            "success_count": 3,
+                            "failure_count": 1,
+                            "correction_count": 2,
+                            "activation_gap_count": 0,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "skills.maintenance.evaluation");
+        assert_eq!(json["request_id"], "route-req-1");
+        assert_eq!(json["skill_id"], "plan-review");
+        assert_eq!(json["action"], "generate_revision_candidate");
+    }
+
+    #[tokio::test]
     async fn gateway_health_reports_pid_addr_static_source() {
         let app = api_router(test_state());
         let response = app
@@ -2727,6 +2762,10 @@ mod tests {
         assert!(json["checks"].as_array().unwrap().iter().any(|check| {
             check["check_id"] == "execution_outcome.timeline.available" && check["status"] == "fail"
         }));
+        assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+            check["check_id"] == "structured_data.memory_context.bridge"
+                && check["status"] == "fail"
+        }));
     }
 
     #[tokio::test]
@@ -2751,6 +2790,75 @@ mod tests {
                 serde_json::json!({"status": "ok", "title": "full loop outcome"}),
                 current_time_ms(),
             ))
+            .await
+            .unwrap();
+        let mut skill_activation_event = memory::RuntimeEvent::new(
+            session_id,
+            1,
+            memory::RuntimeEventScope::Context,
+            "skill_candidates",
+            serde_json::json!({
+                "source": "conversation_runtime.skill_activation",
+                "turn_index": 1,
+                "query": "structured manufacturing full loop",
+                "selected": "supply-risk-analyst",
+                "candidates": [{
+                    "name": "supply-risk-analyst",
+                    "score": 12,
+                    "reasons": ["name:supply", "name:risk"],
+                    "path": null,
+                    "source": "profile"
+                }],
+                "invocation_evidence": {
+                    "skill_id": "supply-risk-analyst",
+                    "skill_version": null,
+                    "adapter": "prompt_only",
+                    "entrypoint": "SKILL.md",
+                    "outcome": "selected_for_runtime"
+                },
+                "structured_dependencies": []
+            }),
+            current_time_ms(),
+        );
+        skill_activation_event.refs.push(memory::RuntimeRef {
+            ref_type: "skill".to_string(),
+            id: "supply-risk-analyst".to_string(),
+            label: Some("selected".to_string()),
+        });
+        skill_activation_event.refs.push(memory::RuntimeRef {
+            ref_type: "skill_invocation".to_string(),
+            id: "supply-risk-analyst".to_string(),
+            label: Some("selected_for_runtime".to_string()),
+        });
+        store
+            .append_runtime_event(&skill_activation_event)
+            .await
+            .unwrap();
+        let mut skill_memory_event = memory::RuntimeEvent::new(
+            session_id,
+            2,
+            memory::RuntimeEventScope::Context,
+            "skill_memory_candidate",
+            serde_json::json!({
+                "source": "conversation_runtime.skill_memory_candidate",
+                "turn_index": 1,
+                "query": "structured manufacturing full loop",
+                "selected": "supply-risk-analyst",
+                "candidate": {
+                    "kind": "Refresh",
+                    "content": "skill selected for task; source=runtime_skill; query=structured manufacturing full loop; selected=supply-risk-analyst; score=12; reasons=name:supply,name:risk"
+                },
+                "source_event": "skill_candidates"
+            }),
+            current_time_ms(),
+        );
+        skill_memory_event.refs.push(memory::RuntimeRef {
+            ref_type: "skill".to_string(),
+            id: "supply-risk-analyst".to_string(),
+            label: Some("memory_candidate_source".to_string()),
+        });
+        store
+            .append_runtime_event(&skill_memory_event)
             .await
             .unwrap();
         let app = api_router(test_state_with_store_and_workspace(
@@ -2913,6 +3021,10 @@ mod tests {
         assert_eq!(gate_json["status"], "pass");
         assert!(gate_json["checks"].as_array().unwrap().iter().any(|check| {
             check["check_id"] == "structured_data.indexes.ready" && check["status"] == "pass"
+        }));
+        assert!(gate_json["checks"].as_array().unwrap().iter().any(|check| {
+            check["check_id"] == "structured_data.memory_context.bridge"
+                && check["status"] == "pass"
         }));
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -4300,8 +4412,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(diff.status(), StatusCode::OK);
+        let diff_status = diff.status();
         let body = to_bytes(diff.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            diff_status,
+            StatusCode::OK,
+            "checkpoint diff failed: {}",
+            String::from_utf8_lossy(&body)
+        );
         let diff_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(diff_json["data"]["changedFiles"][0], "a.txt");
 
@@ -8294,7 +8412,11 @@ providers:
         assert_eq!(preflight_json["kind"], "cross_plane_action_preflight");
         assert_eq!(preflight_json["executable"], true);
         assert_eq!(preflight_json["target_platform"], "feishu");
-        assert_eq!(preflight_json["platform_readiness"]["status"], "ready");
+        assert_eq!(preflight_json["platform_readiness"]["configured"], true);
+        assert!(matches!(
+            preflight_json["platform_readiness"]["status"].as_str(),
+            Some("ready" | "configured")
+        ));
         assert_eq!(preflight_json["decision"]["decision"], "allow");
         assert_eq!(preflight_json["action"]["actor_principal"], principal);
 

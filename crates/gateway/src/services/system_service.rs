@@ -9,11 +9,22 @@ use runtime::{
     ConfigLoader, JsonValue, RuntimeConfig, ToolSafetyCategory,
 };
 use serde::Serialize;
-use tools::{GlobalToolRegistry, ToolDefinition};
+use tools::{
+    checkpoint::{
+        checkpoint_create_in, checkpoint_diff_in, checkpoint_list_in, checkpoint_restore_in,
+        CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
+    },
+    tool_cache::invalidate_tool_cache,
+    GlobalToolRegistry, ToolDefinition,
+};
 
 use super::SystemService;
 
 static TOOL_CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn process_cwd_lock() -> &'static Mutex<()> {
+    TOOL_CWD_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolOperationReceipt {
@@ -68,11 +79,8 @@ impl SystemService {
     ) -> Result<ToolOperationReceipt, String> {
         let mode = mode.into();
         let risk = risk.into();
-        let output = self.with_workspace_root(workspace_root, || {
-            registry
-                .execute(tool_name, &input)
-                .map_err(|error| error.to_string())
-        })?;
+        let output =
+            self.execute_tool_with_workspace(registry, workspace_root, tool_name, input)?;
         let data = serde_json::from_str::<serde_json::Value>(&output)
             .unwrap_or_else(|_| serde_json::json!({ "text": output }));
         let changed_refs = changed_refs_for_tool(tool_name, &data);
@@ -189,6 +197,55 @@ impl SystemService {
         value
     }
 
+    fn execute_tool_with_workspace(
+        &self,
+        registry: &GlobalToolRegistry,
+        workspace_root: &Path,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        match tool_name {
+            "checkpoint_create" => {
+                let input = serde_json::from_value::<CheckpointCreateInput>(input)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(
+                    &checkpoint_create_in(workspace_root, input)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            }
+            "checkpoint_list" => serde_json::to_string_pretty(
+                &checkpoint_list_in(workspace_root).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
+            "checkpoint_diff" => {
+                let input = serde_json::from_value::<CheckpointDiffInput>(input)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(
+                    &checkpoint_diff_in(workspace_root, input)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            }
+            "checkpoint_restore" => {
+                let input = serde_json::from_value::<CheckpointRestoreInput>(input)
+                    .map_err(|error| error.to_string())?;
+                let output = serde_json::to_string_pretty(
+                    &checkpoint_restore_in(workspace_root, input)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                invalidate_tool_cache();
+                Ok(output)
+            }
+            _ => self.with_workspace_root(workspace_root, || {
+                registry
+                    .execute(tool_name, &input)
+                    .map_err(|error| error.to_string())
+            }),
+        }
+    }
+
     pub(crate) fn validate_tool_input_paths(
         &self,
         workspace_root: &Path,
@@ -216,8 +273,7 @@ impl SystemService {
         workspace_root: &Path,
         action: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let lock = TOOL_CWD_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock
+        let _guard = process_cwd_lock()
             .lock()
             .map_err(|error| format!("failed to lock tool workspace root guard: {error}"))?;
         let previous = std::env::current_dir().map_err(|error| error.to_string())?;

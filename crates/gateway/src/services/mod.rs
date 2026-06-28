@@ -58,8 +58,10 @@ pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
     SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
+pub(crate) use skill_service::profile_provider::runtime_skill_profiles_for_workspace;
 pub(crate) use skill_service::{
-    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
+    SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest, SkillProjectionQuery,
+    SkillServiceError,
 };
 pub(crate) use slash_controller::SlashController;
 pub(crate) use surface_service::SurfaceService;
@@ -68,6 +70,11 @@ pub(crate) use task_service::TaskService;
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
 pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixSqliteRepositoryError;
 pub(crate) type RuntimeContextBoundary = runtime::ContextRuntimeKernel;
+
+#[allow(dead_code)]
+pub(crate) fn process_cwd_lock() -> &'static Mutex<()> {
+    system_service::process_cwd_lock()
+}
 
 #[derive(Clone)]
 pub(crate) struct ContextService {

@@ -18,6 +18,7 @@ pub enum RuntimeDomain {
     RealityBridge,
     Configuration,
     Infrastructure,
+    Skill,
 }
 
 impl RuntimeDomain {
@@ -39,6 +40,7 @@ impl RuntimeDomain {
             Self::RealityBridge => "reality_bridge",
             Self::Configuration => "configuration",
             Self::Infrastructure => "infrastructure",
+            Self::Skill => "skill",
         }
     }
 }
@@ -73,7 +75,7 @@ impl RuntimeModuleDescriptor {
 pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
     use RuntimeDomain::{
         Agent, Approval, Configuration, Context, Conversation, Infrastructure, Mission, Policy,
-        Provider, RealityBridge, Recovery, Session, Steward, Team, Tooling,
+        Provider, RealityBridge, Recovery, Session, Skill, Steward, Team, Tooling,
     };
     vec![
         RuntimeModuleDescriptor::public("conversation", Conversation, "runtime", true),
@@ -129,9 +131,8 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("context_runtime", Context, "runtime", true),
         RuntimeModuleDescriptor::public("intent_planner", Context, "harness-contract", false),
         RuntimeModuleDescriptor::public("knowledge_activation", Context, "runtime", true),
-        RuntimeModuleDescriptor::public("skill_activation", RealityBridge, "runtime", false),
-        RuntimeModuleDescriptor::public("skill_dependency", RealityBridge, "runtime", false),
-        RuntimeModuleDescriptor::public("skill_memory", RealityBridge, "runtime", true),
+        RuntimeModuleDescriptor::public("knowledge_compliance", Context, "runtime", false),
+        RuntimeModuleDescriptor::public("skill", Skill, "runtime", true),
         RuntimeModuleDescriptor::public("structured_data", RealityBridge, "runtime", false),
         RuntimeModuleDescriptor::public("recovery", Recovery, "runtime", true),
         RuntimeModuleDescriptor::public("recovery_recipes", Recovery, "runtime", false),

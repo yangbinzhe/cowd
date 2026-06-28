@@ -91,6 +91,18 @@ pub struct SkillInspectionReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillStructuredDependency {
+    pub domain: String,
+    #[serde(default)]
+    pub required_fact_types: Vec<String>,
+    #[serde(default)]
+    pub required_metric_keys: Vec<String>,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
+    pub quality_gate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillCapabilityProfile {
     pub skill_id: String,
     pub name: String,
@@ -103,9 +115,11 @@ pub struct SkillCapabilityProfile {
     pub risk_level: SkillRiskLevel,
     pub entrypoints: Vec<SkillEntrypoint>,
     pub inspection_summary: Vec<String>,
+    #[serde(default)]
+    pub structured_dependencies: Vec<SkillStructuredDependency>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentSkillProfile {
     pub baseline_skill_refs: Vec<String>,
     pub template_skill_refs: Vec<String>,

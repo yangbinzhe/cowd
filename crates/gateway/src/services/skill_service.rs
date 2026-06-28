@@ -1,15 +1,16 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{fs, path::Path};
 
 use crate::command::slash::SkillSlashDispatch;
-use app_mfg::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill, skill_agent_node_id,
-};
 use serde::Deserialize;
-use skill::{SkillManager, SkillViewInput};
+use skill::{
+    evaluate_skill_maintenance, SkillMaintenanceAction, SkillManager, SkillUsageSignal,
+    SkillViewInput,
+};
 
 use super::{ServiceEnvelope, SkillService};
 
 mod local_command;
+pub(crate) mod profile_provider;
 mod projection;
 use local_command::{
     classify_static_skill_command, discover_skill_root_paths, help_path_from_args, install_skill,
@@ -18,11 +19,11 @@ use local_command::{
     render_skills_report_json, render_skills_usage, render_skills_usage_json,
 };
 use projection::{
-    activation_projection, collect_skill_catalog, filter_scope, find_catalog_item, find_mfg_skill,
+    activation_projection, collect_skill_catalog, filter_scope, find_catalog_item,
     list_skill_files, local_skill_root, mfg_virtual_files, mfg_virtual_skill_markdown,
     normalize_surface, projection_actions, projection_capabilities, projection_diagnostics,
-    projection_facets, required_incident_id, safe_skill_file_path, SkillProjection,
-    SkillProjectionGovernance, SkillProjectionQueue,
+    projection_facets, safe_skill_file_path, SkillProjection, SkillProjectionGovernance,
+    SkillProjectionQueue,
 };
 #[derive(Debug, Deserialize)]
 pub(crate) struct SkillCatalogQuery {
@@ -39,15 +40,20 @@ pub(crate) struct SkillProjectionQuery {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct SkillActionRequest {
+pub(crate) struct SkillMaintenanceEvaluateRequest {
     #[serde(default)]
     pub(crate) request_id: Option<String>,
+    pub(crate) skill_id: String,
     #[serde(default)]
-    pub(crate) session_id: Option<String>,
+    pub(crate) selected_count: u32,
     #[serde(default)]
-    pub(crate) incident_id: Option<String>,
+    pub(crate) success_count: u32,
     #[serde(default)]
-    pub(crate) limit: Option<usize>,
+    pub(crate) failure_count: u32,
+    #[serde(default)]
+    pub(crate) correction_count: u32,
+    #[serde(default)]
+    pub(crate) activation_gap_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +315,36 @@ impl SkillService {
         .map_err(|error| SkillServiceError::Internal(error.to_string()))?)
     }
 
+    pub(crate) fn maintenance_evaluate(
+        &self,
+        request: SkillMaintenanceEvaluateRequest,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let skill_id = request.skill_id.trim();
+        if skill_id.is_empty() {
+            return Err(SkillServiceError::BadRequest(
+                "skill_id is required".to_string(),
+            ));
+        }
+        let signal = SkillUsageSignal {
+            skill_id: skill_id.to_string(),
+            selected_count: request.selected_count,
+            success_count: request.success_count,
+            failure_count: request.failure_count,
+            correction_count: request.correction_count,
+            activation_gap_count: request.activation_gap_count,
+        };
+        let action = evaluate_skill_maintenance(&signal);
+        Ok(serde_json::json!({
+            "kind": "skills.maintenance.evaluation",
+            "schema_version": 1,
+            "request_id": request.request_id,
+            "skill_id": signal.skill_id,
+            "usage_signal": signal,
+            "action": maintenance_action_wire(&action),
+            "reason": maintenance_action_reason(&action),
+        }))
+    }
+
     pub(crate) fn detail(
         &self,
         workspace_root: &Path,
@@ -384,161 +420,25 @@ impl SkillService {
             "content": content,
         }))
     }
+}
 
-    pub(crate) fn validate(
-        &self,
-        workspace_root: &Path,
-        id: &str,
-        request: SkillActionRequest,
-    ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
-        let validation = match item.scope.as_str() {
-            "mfg" => {
-                let skill = find_mfg_skill(&item.name).ok_or_else(|| {
-                    SkillServiceError::NotFound("MFG skill not found".to_string())
-                })?;
-                serde_json::json!({
-                    "status": "pass",
-                    "scope": "mfg",
-                    "skill_id": skill.skill_id,
-                    "checks": [
-                        {"id":"manifest.present","status":"pass"},
-                        {"id":"evidence.required","status": if skill.required_evidence.is_empty() {"warn"} else {"pass"}},
-                        {"id":"tools.declared","status": if skill.tools.is_empty() {"warn"} else {"pass"}},
-                        {"id":"quality_gate.present","status": if skill.quality_gate.is_empty() {"warn"} else {"pass"}}
-                    ],
-                    "required_evidence": skill.required_evidence,
-                    "tools": skill.tools,
-                    "quality_gate": skill.quality_gate,
-                })
-            }
-            _ => serde_json::json!({
-                "status": "unsupported",
-                "scope": item.scope,
-                "reason": "unsupported_for_local_skill",
-                "path": item.path,
-            }),
-        };
-        Ok(serde_json::json!({
-            "kind": "skills.action.validate",
-            "schema_version": 1,
-            "request_id": request.request_id,
-            "session_id": request.session_id,
-            "skill": item,
-            "validation": validation,
-        }))
+fn maintenance_action_wire(action: &SkillMaintenanceAction) -> &'static str {
+    match action {
+        SkillMaintenanceAction::KeepActive => "keep_active",
+        SkillMaintenanceAction::GenerateRevisionCandidate => "generate_revision_candidate",
+        SkillMaintenanceAction::Deprecate => "deprecate",
+        SkillMaintenanceAction::Archive => "archive",
     }
+}
 
-    pub(crate) fn plan(
-        &self,
-        workspace_root: &Path,
-        config_home: &Path,
-        mfg: &super::MfgService,
-        id: &str,
-        request: SkillActionRequest,
-    ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
-        if item.scope != "mfg" {
-            return Ok(serde_json::json!({
-                "kind": "skills.action.plan",
-                "schema_version": 1,
-                "request_id": request.request_id,
-                "session_id": request.session_id,
-                "skill": item,
-                "status": "unsupported",
-                "reason": "unsupported_for_local_skill",
-            }));
+fn maintenance_action_reason(action: &SkillMaintenanceAction) -> &'static str {
+    match action {
+        SkillMaintenanceAction::KeepActive => "usage_signal_healthy",
+        SkillMaintenanceAction::GenerateRevisionCandidate => {
+            "usage_signal_needs_revision_candidate"
         }
-        let incident_id = required_incident_id(&request)?;
-        let context = mfg
-            .incident_context(config_home, &incident_id)
-            .map_err(|error| SkillServiceError::Internal(error.to_string()))?
-            .ok_or_else(|| SkillServiceError::NotFound("MFG incident not found".to_string()))?;
-        let mut plan = plan_server_manufacturing_skills(
-            &context.incident,
-            context.analysis.as_ref(),
-            context.packet.as_ref(),
-            request.limit.unwrap_or(3).clamp(1, 8),
-        );
-        if let Some(skill) = find_mfg_skill(&item.name) {
-            if !plan
-                .selected_skills
-                .iter()
-                .any(|selected| selected.skill_id == skill.skill_id)
-            {
-                plan.selected_skills.insert(0, skill);
-                plan.selected_skills
-                    .truncate(request.limit.unwrap_or(3).clamp(1, 8));
-                plan.evidence_requirements = plan
-                    .selected_skills
-                    .iter()
-                    .flat_map(|skill| skill.required_evidence.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                plan.planned_agent_nodes = plan
-                    .selected_skills
-                    .iter()
-                    .map(|skill| skill_agent_node_id(&skill.skill_id))
-                    .collect();
-            }
-        }
-        Ok(serde_json::json!({
-            "kind": "skills.action.plan",
-            "schema_version": 1,
-            "request_id": request.request_id,
-            "session_id": request.session_id,
-            "skill": item,
-            "incident_id": context.incident.incident_id,
-            "plan": plan,
-        }))
-    }
-
-    pub(crate) fn run(
-        &self,
-        workspace_root: &Path,
-        config_home: &Path,
-        mfg: &super::MfgService,
-        id: &str,
-        request: SkillActionRequest,
-    ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
-        if item.scope != "mfg" {
-            return Ok(serde_json::json!({
-                "kind": "skills.action.run",
-                "schema_version": 1,
-                "request_id": request.request_id,
-                "session_id": request.session_id,
-                "skill": item,
-                "status": "unsupported",
-                "reason": "unsupported_for_local_skill",
-            }));
-        }
-        let incident_id = required_incident_id(&request)?;
-        let context = mfg
-            .incident_context(config_home, &incident_id)
-            .map_err(|error| SkillServiceError::Internal(error.to_string()))?
-            .ok_or_else(|| SkillServiceError::NotFound("MFG incident not found".to_string()))?;
-        let skill = find_mfg_skill(&item.name)
-            .ok_or_else(|| SkillServiceError::NotFound("MFG skill not found".to_string()))?;
-        let run = run_server_manufacturing_skill(
-            &context.incident,
-            &skill,
-            context.analysis.as_ref(),
-            context.packet.as_ref(),
-        );
-        let run = mfg
-            .record_skill_run(config_home, &run)
-            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
-        Ok(serde_json::json!({
-            "kind": "skills.action.run",
-            "schema_version": 1,
-            "request_id": request.request_id,
-            "session_id": request.session_id,
-            "skill": item,
-            "incident_id": context.incident.incident_id,
-            "skill_run": run,
-        }))
+        SkillMaintenanceAction::Deprecate => "usage_signal_failed_without_success",
+        SkillMaintenanceAction::Archive => "usage_signal_unused",
     }
 }
 
@@ -615,6 +515,29 @@ mod tests {
         let file_error = resolve_skill_install_source(plain_file.to_str().unwrap(), &temp.root)
             .expect_err("non-markdown files are not installable");
         assert_eq!(file_error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn skill_maintenance_evaluate_recommends_revision_for_repeated_corrections() {
+        let service = SkillService::new();
+
+        let response = service
+            .maintenance_evaluate(SkillMaintenanceEvaluateRequest {
+                request_id: Some("req-1".to_string()),
+                skill_id: "plan-review".to_string(),
+                selected_count: 5,
+                success_count: 3,
+                failure_count: 1,
+                correction_count: 2,
+                activation_gap_count: 0,
+            })
+            .expect("maintenance evaluation should succeed");
+
+        assert_eq!(response["kind"], "skills.maintenance.evaluation");
+        assert_eq!(response["request_id"], "req-1");
+        assert_eq!(response["skill_id"], "plan-review");
+        assert_eq!(response["action"], "generate_revision_candidate");
+        assert_eq!(response["reason"], "usage_signal_needs_revision_candidate");
     }
 
     #[test]

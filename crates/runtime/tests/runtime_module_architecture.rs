@@ -27,6 +27,7 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         RuntimeDomain::Recovery,
         RuntimeDomain::Policy,
         RuntimeDomain::RealityBridge,
+        RuntimeDomain::Skill,
     ] {
         assert!(
             domains.contains(&required),
@@ -144,6 +145,7 @@ fn runtime_source_files_are_grouped_by_architecture_domain() {
         "reality_bridge",
         "recovery",
         "session",
+        "skill",
         "steward",
         "team",
         "tooling",

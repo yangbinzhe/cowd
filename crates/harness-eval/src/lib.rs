@@ -670,6 +670,22 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
         runtime::RuntimeDomain::Recovery,
         runtime::RuntimeDomain::Policy,
         runtime::RuntimeDomain::RealityBridge,
+        runtime::RuntimeDomain::Skill,
+    ];
+    let lifecycle_required_domains = [
+        runtime::RuntimeDomain::Conversation,
+        runtime::RuntimeDomain::Provider,
+        runtime::RuntimeDomain::Tooling,
+        runtime::RuntimeDomain::Mission,
+        runtime::RuntimeDomain::Session,
+        runtime::RuntimeDomain::Agent,
+        runtime::RuntimeDomain::Team,
+        runtime::RuntimeDomain::Steward,
+        runtime::RuntimeDomain::Approval,
+        runtime::RuntimeDomain::Context,
+        runtime::RuntimeDomain::Recovery,
+        runtime::RuntimeDomain::Policy,
+        runtime::RuntimeDomain::Skill,
     ];
     let items = required_domains
         .into_iter()
@@ -684,17 +700,27 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
                 .filter(|descriptor| descriptor.domain == domain && descriptor.lifecycle_owner)
                 .map(|descriptor| descriptor.module.to_string())
                 .collect::<Vec<_>>();
-            let passed = !present_modules.is_empty() && !lifecycle_modules.is_empty();
+            let requires_lifecycle_owner = lifecycle_required_domains.contains(&domain);
+            let passed = !present_modules.is_empty()
+                && (!requires_lifecycle_owner || !lifecycle_modules.is_empty());
+            let repair_hint = if requires_lifecycle_owner {
+                format!(
+                    "map runtime {} modules in runtime::module_map and mark at least one lifecycle owner",
+                    domain.as_str()
+                )
+            } else {
+                format!(
+                    "map runtime {} modules in runtime::module_map; lifecycle owner is not required for bridge-only domains",
+                    domain.as_str()
+                )
+            };
             HarnessCapabilityCoverageItem {
                 capability: domain.as_str().to_string(),
                 required: true,
                 present_modules,
                 lifecycle_modules,
                 passed,
-                repair_hint: format!(
-                    "map runtime {} modules in runtime::module_map and mark at least one lifecycle owner",
-                    domain.as_str()
-                ),
+                repair_hint,
             }
         })
         .collect::<Vec<_>>();

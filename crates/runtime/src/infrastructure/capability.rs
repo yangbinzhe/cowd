@@ -178,7 +178,7 @@ impl CowdCapabilityRegistry {
                     "cowd.skill.lifecycle",
                     "Skill Lifecycle",
                     CowdCapabilityKind::Skill,
-                    "runtime::skill_activation",
+                    "runtime::skill",
                     "Skill activation, memory, governance and execution lifecycle.",
                     &["read:skill", "write:skill"],
                 ),

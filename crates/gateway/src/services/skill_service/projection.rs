@@ -7,7 +7,7 @@ use app_mfg::{server_manufacturing_skill_pack, MfgSkillManifest};
 use serde::Serialize;
 use skill::{profile_skill_package, SkillInfo, SkillRegistry, SkillRouter};
 
-use super::{SkillActionRequest, SkillServiceError};
+use super::SkillServiceError;
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct SkillCatalogItem {
@@ -112,23 +112,6 @@ pub(super) fn find_catalog_item(
         .into_iter()
         .find(|item| item.id == id || item.name.eq_ignore_ascii_case(id))
         .ok_or_else(|| SkillServiceError::NotFound("skill not found".to_string()))
-}
-
-pub(super) fn find_mfg_skill(skill_id: &str) -> Option<MfgSkillManifest> {
-    server_manufacturing_skill_pack()
-        .into_iter()
-        .find(|skill| skill.skill_id.eq_ignore_ascii_case(skill_id))
-}
-
-pub(super) fn required_incident_id(
-    request: &SkillActionRequest,
-) -> Result<String, SkillServiceError> {
-    request
-        .incident_id
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .ok_or_else(|| SkillServiceError::BadRequest("incident_id is required".to_string()))
 }
 
 fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
@@ -375,20 +358,18 @@ pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
         "tui" => vec![
             "catalog.read",
             "skill.view",
-            "skill.validate",
-            "skill.plan",
-            "skill.run",
-            "run.watch",
+            "skill.profile",
+            "skill.import",
+            "skill.maintenance.evaluate",
             "evidence.summary",
             "governance.queue",
         ],
         _ => vec![
             "catalog.read",
             "skill.view",
-            "skill.validate",
-            "skill.plan",
-            "skill.run",
-            "run.watch",
+            "skill.profile",
+            "skill.import",
+            "skill.maintenance.evaluate",
             "evidence.timeline",
             "evidence.diff",
             "governance.bulk",
@@ -407,8 +388,14 @@ pub(super) fn projection_actions(surface: &str) -> Vec<SkillAction> {
             mutation: false,
         },
         SkillAction {
-            id: "validate",
-            label: "Validate",
+            id: "profile",
+            label: "Profile",
+            surface: "webui,tui",
+            mutation: false,
+        },
+        SkillAction {
+            id: "inspect",
+            label: "Inspect",
             surface: "webui,tui",
             mutation: false,
         },
@@ -416,20 +403,14 @@ pub(super) fn projection_actions(surface: &str) -> Vec<SkillAction> {
     if surface != "cli" {
         actions.extend([
             SkillAction {
-                id: "plan",
-                label: "Plan",
-                surface: "webui,tui",
-                mutation: false,
-            },
-            SkillAction {
-                id: "run",
-                label: "Run",
+                id: "import",
+                label: "Import",
                 surface: "webui,tui",
                 mutation: true,
             },
             SkillAction {
-                id: "watch",
-                label: "Watch",
+                id: "maintenance_evaluate",
+                label: "Maintenance",
                 surface: "webui,tui",
                 mutation: false,
             },
@@ -563,5 +544,28 @@ mod tests {
             .any(|entry| entry["path"] == "SKILL.md"));
 
         fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[test]
+    fn generic_projection_exposes_governance_not_execution_actions() {
+        let webui_capabilities = projection_capabilities("webui");
+        assert!(webui_capabilities.contains(&"skill.profile"));
+        assert!(webui_capabilities.contains(&"skill.maintenance.evaluate"));
+        assert!(!webui_capabilities.contains(&"skill.validate"));
+        assert!(!webui_capabilities.contains(&"skill.plan"));
+        assert!(!webui_capabilities.contains(&"skill.run"));
+        assert!(!webui_capabilities.contains(&"run.watch"));
+
+        let action_ids = projection_actions("webui")
+            .iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        assert!(action_ids.contains(&"view"));
+        assert!(action_ids.contains(&"profile"));
+        assert!(action_ids.contains(&"maintenance_evaluate"));
+        assert!(!action_ids.contains(&"validate"));
+        assert!(!action_ids.contains(&"plan"));
+        assert!(!action_ids.contains(&"run"));
+        assert!(!action_ids.contains(&"watch"));
     }
 }

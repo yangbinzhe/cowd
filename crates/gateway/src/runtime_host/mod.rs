@@ -632,7 +632,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
-    crate::surface_ingress::spawn_surface_ingress_dispatcher(app_state.clone());
+    crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)
     let app = {

@@ -8,6 +8,7 @@ use crate::{
     PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket,
     RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor, TurnSummary,
 };
+use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
@@ -39,6 +40,8 @@ where
     pub session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     pub hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     pub external_context_items: Vec<ContextItem>,
+    pub skill_profiles: Vec<SkillCapabilityProfile>,
+    pub agent_skill_profile: AgentSkillProfile,
     pub enable_collaboration: bool,
     pub subagent_model: String,
     pub subagent_tool_definitions: Vec<ProviderToolDefinition>,
@@ -64,7 +67,9 @@ where
             config.system_prompt,
             &config.feature_config,
         )
-        .with_model_context_window(model_context_window);
+        .with_model_context_window(model_context_window)
+        .with_skill_profiles(config.skill_profiles)
+        .with_agent_skill_profile(config.agent_skill_profile);
 
         if let Some(store) = config.session_store {
             runtime = runtime.with_session_store(store);

@@ -8,7 +8,7 @@ use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::agent_reputation::ReputationManager;
 use serde::{Deserialize, Serialize};
 
-use crate::skill_activation::SkillActivationRecord;
+use crate::skill::SkillActivationRecord;
 
 // ── TeamDiscoveryProtocol ──────────────────────────────────────────────────────
 
@@ -148,7 +148,7 @@ impl TeamDiscoveryProtocol {
         &self,
         activation: &SkillActivationRecord,
     ) -> Option<DiscoveredTeam> {
-        let required = skill_names_from_activation(activation);
+        let required = capability_refs_from_activation(activation);
         if required.is_empty() {
             return None;
         }
@@ -272,7 +272,7 @@ impl Default for TeamDiscoveryProtocol {
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
-fn skill_names_from_activation(activation: &SkillActivationRecord) -> Vec<String> {
+fn capability_refs_from_activation(activation: &SkillActivationRecord) -> Vec<String> {
     let mut capabilities = Vec::new();
     if let Some(selected) = &activation.selected {
         capabilities.push(selected.clone());
@@ -426,15 +426,16 @@ mod tests {
         );
         register_test_agent("td_skill_debug", vec!["debug".into()], None);
 
-        let activation = crate::skill_activation::SkillActivationRecord::new(
+        let activation = crate::skill::SkillActivationRecord::new(
             "session-skill",
             1,
             "prepare a release",
-            vec![crate::skill_activation::RuntimeSkillCandidate {
+            vec![crate::skill::RuntimeSkillCandidate {
                 name: "release".to_string(),
                 score: 10,
                 reasons: vec!["tags:1".to_string()],
                 path: None,
+                source: crate::skill::activation::RuntimeSkillCandidateSource::Profile,
             }],
         );
         let proto = TeamDiscoveryProtocol::new();

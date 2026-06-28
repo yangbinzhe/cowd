@@ -481,19 +481,25 @@ impl CommandPalette {
             }
         }
 
-        if snapshot
+        if let Some(docs_provider) = snapshot
             .connector_capabilities
             .iter()
-            .any(|capability| capability.capability_id == "service.local.docs.read")
+            .find(|capability| capability.capability_id == "service.local.docs.read")
+            .map(|capability| capability.provider.as_str())
         {
+            let docs_label = connector_docs_label(docs_provider);
             self.all_commands.push(CommandEntry::dynamic(
-                "Local Docs Dry Run",
-                "Use connector console contract for a non-destructive service read",
+                format!("{docs_label} Dry Run"),
+                format!(
+                    "Use {docs_provider} connector console contract for a non-destructive service read"
+                ),
                 Action::Execute("/cross-plane".into()),
             ));
             self.all_commands.push(CommandEntry::dynamic(
-                "Local Docs Commit",
-                "Commit a governed connector service read and persist the resource ref",
+                format!("{docs_label} Commit"),
+                format!(
+                    "Commit a governed {docs_provider} connector service read and persist the resource ref"
+                ),
                 Action::Execute("/cross-plane".into()),
             ));
         }
@@ -1018,6 +1024,33 @@ impl CommandPalette {
 
         let list = List::new(items);
         frame.render_widget(list, area);
+    }
+}
+
+fn connector_docs_label(provider: &str) -> String {
+    let provider = provider.trim();
+    let title = if provider.is_empty() {
+        "Local".to_string()
+    } else {
+        provider
+            .split(['-', '_', '.'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase())
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if title.to_ascii_lowercase().contains("docs") {
+        title
+    } else {
+        format!("{title} Docs")
     }
 }
 

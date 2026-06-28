@@ -30,6 +30,17 @@ pub struct CowdReleaseGateRuntimeEvidence {
 
 impl CowdReleaseGateRuntimeEvidence {
     #[must_use]
+    pub fn missing() -> Self {
+        Self {
+            structured_indexes_ready: false,
+            structured_watermark_persistent: false,
+            execution_outcome_timeline_available: false,
+            memory_context_bridge_available: false,
+            graph_skill_quality_contracts_available: false,
+        }
+    }
+
+    #[must_use]
     pub fn static_contracts() -> Self {
         Self {
             structured_indexes_ready: true,
@@ -44,7 +55,7 @@ impl CowdReleaseGateRuntimeEvidence {
 impl CowdReleaseGateReport {
     #[must_use]
     pub fn evaluate() -> Self {
-        Self::evaluate_static()
+        Self::evaluate_with(CowdReleaseGateRuntimeEvidence::missing())
     }
 
     #[must_use]
@@ -131,8 +142,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn release_gate_passes_for_current_core_contracts() {
+    fn release_gate_default_evaluate_fails_without_runtime_evidence() {
         let report = CowdReleaseGateReport::evaluate();
+
+        assert_eq!(report.gate_id, "cowd.release_gate.v1");
+        assert_eq!(report.status, "fail");
+        assert!(report.checks.iter().any(|check| check.check_id
+            == "structured_data.memory_context.bridge"
+            && check.status == "fail"));
+    }
+
+    #[test]
+    fn release_gate_static_contracts_can_be_evaluated_explicitly() {
+        let report = CowdReleaseGateReport::evaluate_static();
 
         assert_eq!(report.gate_id, "cowd.release_gate.v1");
         assert_eq!(report.status, "pass");

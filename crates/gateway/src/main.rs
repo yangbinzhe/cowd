@@ -69,7 +69,6 @@ mod skill_static;
 #[path = "core/suggestions.rs"]
 mod suggestions;
 mod surface_host;
-mod surface_ingress;
 #[path = "kernel/task_kernel.rs"]
 mod task_kernel;
 
@@ -7516,8 +7515,7 @@ UU conflicted.rs",
     }
 
     fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::services::process_cwd_lock()
     }
 
     fn temp_workspace(label: &str) -> PathBuf {

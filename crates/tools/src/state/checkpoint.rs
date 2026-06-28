@@ -52,11 +52,19 @@ pub struct CheckpointDiffOutput {
 
 pub fn checkpoint_create(input: CheckpointCreateInput) -> io::Result<CheckpointSummary> {
     let root = std::env::current_dir()?;
+    checkpoint_create_in(&root, input)
+}
+
+pub fn checkpoint_create_in(
+    root: impl AsRef<Path>,
+    input: CheckpointCreateInput,
+) -> io::Result<CheckpointSummary> {
+    let root = root.as_ref();
     let id = checkpoint_id();
-    let checkpoint_dir = checkpoints_root(&root).join(&id);
+    let checkpoint_dir = checkpoints_root(root).join(&id);
     fs::create_dir_all(&checkpoint_dir)?;
-    copy_dir(&root, &checkpoint_dir)?;
-    let manifest = build_manifest(&root)?;
+    copy_dir(root, &checkpoint_dir)?;
+    let manifest = build_manifest(root)?;
     write_manifest(&checkpoint_dir, &manifest)?;
     if let Some(label) = &input.label {
         fs::write(checkpoint_dir.join(".label"), label)?;
@@ -70,7 +78,12 @@ pub fn checkpoint_create(input: CheckpointCreateInput) -> io::Result<CheckpointS
 
 pub fn checkpoint_list() -> io::Result<CheckpointListOutput> {
     let root = std::env::current_dir()?;
-    let dir = checkpoints_root(&root);
+    checkpoint_list_in(&root)
+}
+
+pub fn checkpoint_list_in(root: impl AsRef<Path>) -> io::Result<CheckpointListOutput> {
+    let root = root.as_ref();
+    let dir = checkpoints_root(root);
     let mut checkpoints = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -96,7 +109,15 @@ pub fn checkpoint_list() -> io::Result<CheckpointListOutput> {
 
 pub fn checkpoint_diff(input: CheckpointDiffInput) -> io::Result<CheckpointDiffOutput> {
     let root = std::env::current_dir()?;
-    let checkpoint = checkpoints_root(&root).join(&input.id);
+    checkpoint_diff_in(&root, input)
+}
+
+pub fn checkpoint_diff_in(
+    root: impl AsRef<Path>,
+    input: CheckpointDiffInput,
+) -> io::Result<CheckpointDiffOutput> {
+    let root = root.as_ref();
+    let checkpoint = checkpoints_root(root).join(&input.id);
     if !checkpoint.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -104,7 +125,7 @@ pub fn checkpoint_diff(input: CheckpointDiffInput) -> io::Result<CheckpointDiffO
         ));
     }
     let manifest = read_manifest(&checkpoint).or_else(|_| build_manifest(&checkpoint))?;
-    let current_manifest = build_manifest(&root)?;
+    let current_manifest = build_manifest(root)?;
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     let mut added = Vec::new();
@@ -138,7 +159,15 @@ pub fn checkpoint_diff(input: CheckpointDiffInput) -> io::Result<CheckpointDiffO
 
 pub fn checkpoint_restore(input: CheckpointRestoreInput) -> io::Result<CheckpointSummary> {
     let root = std::env::current_dir()?;
-    let checkpoint = checkpoints_root(&root).join(&input.id);
+    checkpoint_restore_in(&root, input)
+}
+
+pub fn checkpoint_restore_in(
+    root: impl AsRef<Path>,
+    input: CheckpointRestoreInput,
+) -> io::Result<CheckpointSummary> {
+    let root = root.as_ref();
+    let checkpoint = checkpoints_root(root).join(&input.id);
     if !checkpoint.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -146,22 +175,22 @@ pub fn checkpoint_restore(input: CheckpointRestoreInput) -> io::Result<Checkpoin
         ));
     }
     let manifest = read_manifest(&checkpoint).or_else(|_| build_manifest(&checkpoint))?;
-    let backup_dir = restore_backup_dir(&root);
+    let backup_dir = restore_backup_dir(root);
     if backup_dir.exists() {
         let _ = fs::remove_dir_all(&backup_dir);
     }
     fs::create_dir_all(&backup_dir)?;
-    copy_dir(&root, &backup_dir)?;
+    copy_dir(root, &backup_dir)?;
     let backup_manifest = build_manifest(&backup_dir)?;
 
     let restore_result = (|| -> io::Result<()> {
-        remove_files_not_in_manifest(&root, &manifest.files)?;
-        copy_dir(&checkpoint, &root)
+        remove_files_not_in_manifest(root, &manifest.files)?;
+        copy_dir(&checkpoint, root)
     })();
 
     if let Err(error) = restore_result {
-        let _ = remove_files_not_in_manifest(&root, &backup_manifest.files);
-        let _ = copy_dir(&backup_dir, &root);
+        let _ = remove_files_not_in_manifest(root, &backup_manifest.files);
+        let _ = copy_dir(&backup_dir, root);
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error);
     }

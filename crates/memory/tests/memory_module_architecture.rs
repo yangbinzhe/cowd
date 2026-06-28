@@ -33,6 +33,7 @@ fn memory_source_files_are_grouped_by_architecture_domain() {
         "graph",
         "ingestion",
         "kernel",
+        "knowledge",
         "layers",
         "lifecycle",
         "ops",
@@ -52,7 +53,7 @@ fn memory_public_modules_have_explicit_physical_paths_when_moved() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let lib_rs = fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read memory lib.rs");
     let path_by_module = parse_path_attrs(&lib_rs);
-    let directory_modules = ["compression", "layers", "search", "store"]
+    let directory_modules = ["compression", "knowledge", "layers", "search", "store"]
         .into_iter()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();

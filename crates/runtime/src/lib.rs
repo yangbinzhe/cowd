@@ -183,13 +183,8 @@ pub mod session_execution;
 pub mod session_lifecycle;
 #[path = "session/session_relation_graph.rs"]
 pub mod session_relation_graph;
+#[path = "skill/mod.rs"]
 pub mod skill;
-#[path = "reality_bridge/skill_activation.rs"]
-pub mod skill_activation;
-#[path = "reality_bridge/skill_dependency.rs"]
-pub mod skill_dependency;
-#[path = "reality_bridge/skill_memory.rs"]
-pub mod skill_memory;
 #[path = "recovery/source_self_audit.rs"]
 pub mod source_self_audit;
 #[path = "conversation/sse.rs"]
@@ -480,8 +475,10 @@ pub use session_relation_graph::{
     global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
     SessionRelationKind, SessionRouteCommand, SessionRouteReceipt,
 };
-pub use skill_activation::{RuntimeSkillCandidate, SkillActivationRecord};
-pub use skill_memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
+pub use skill::{
+    memory_candidate_from_skill_activation, RuntimeSkillCandidate, SkillActivationRecord,
+    SkillMemoryPolicy,
+};
 pub use source_self_audit::{
     RuntimeSourceSelfAudit, SourceRepairAction, SourceSelfAuditCheck, SourceSelfAuditReport,
 };

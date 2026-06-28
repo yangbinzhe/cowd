@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use surface::{SurfaceDescriptor, SurfaceFrame, SurfaceRuntimeSnapshot, SurfaceSupervisorEvent};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
+mod ingress;
 mod invocation;
 mod ledger;
 mod monitor;
@@ -14,6 +15,7 @@ mod static_assets;
 mod supervisor;
 mod types;
 
+pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,
     SurfaceRouteSummary, SurfaceStaticFile,

@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime, SkillEntrypoint,
     SkillInspectionReport, SkillKind, SkillLifecycleStatus, SkillRiskLevel, SkillRiskSignal,
+    SkillStructuredDependency,
 };
 
 pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionReport> {
     let source_root = package_root(root);
     let mut files = Vec::new();
-    collect_files(&source_root, &source_root, &mut files, 0)?;
+    let mut skipped_dirs = Vec::new();
+    collect_files(&source_root, &source_root, &mut files, &mut skipped_dirs, 0)?;
     files.sort();
 
     let mut runtimes = BTreeSet::new();
@@ -51,7 +53,10 @@ pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionRepo
         });
     }
 
-    if files.iter().any(|file| file == "Dockerfile") {
+    if files.iter().any(|file| {
+        let lower = file.to_ascii_lowercase();
+        lower == "dockerfile" || lower.ends_with("/dockerfile")
+    }) {
         risk_signals.push(SkillRiskSignal {
             level: SkillRiskLevel::High,
             kind: "container_build".to_string(),
@@ -59,11 +64,25 @@ pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionRepo
         });
     }
 
-    if files
-        .iter()
-        .any(|file| file == "node_modules" || file.starts_with("node_modules/"))
-    {
-        blocked_reasons.push("node_modules is not inspected as package source".to_string());
+    for skipped in skipped_dirs {
+        match skipped.kind {
+            SkippedDirectoryKind::HeavyDependency | SkippedDirectoryKind::BuildArtifact => {
+                blocked_reasons.push(format!(
+                    "{} is not inspected as package source",
+                    skipped.path
+                ));
+                risk_signals.push(SkillRiskSignal {
+                    level: SkillRiskLevel::Medium,
+                    kind: skipped.kind.risk_kind().to_string(),
+                    evidence: skipped.path,
+                });
+            }
+            SkippedDirectoryKind::Hidden => risk_signals.push(SkillRiskSignal {
+                level: SkillRiskLevel::Medium,
+                kind: skipped.kind.risk_kind().to_string(),
+                evidence: skipped.path,
+            }),
+        }
     }
 
     Ok(SkillInspectionReport {
@@ -117,6 +136,7 @@ pub fn profile_skill_package(
         risk_level,
         entrypoints: inspection.entrypoints.clone(),
         inspection_summary: inspection_summary(&inspection),
+        structured_dependencies: structured_dependencies_from_skill_md(&source_root)?,
     })
 }
 
@@ -132,6 +152,7 @@ fn collect_files(
     root: &Path,
     dir: &Path,
     files: &mut Vec<String>,
+    skipped_dirs: &mut Vec<SkippedDirectory>,
     depth: usize,
 ) -> std::io::Result<()> {
     if depth > 4 || files.len() >= 512 {
@@ -140,9 +161,6 @@ fn collect_files(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(".git") || name == "target" || name == "node_modules" {
-            continue;
-        }
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
@@ -150,13 +168,63 @@ fn collect_files(
             .to_string_lossy()
             .replace('\\', "/");
         if path.is_dir() {
+            if name == "node_modules" {
+                skipped_dirs.push(SkippedDirectory::new(
+                    relative,
+                    SkippedDirectoryKind::HeavyDependency,
+                ));
+                continue;
+            }
+            if name == "target" {
+                skipped_dirs.push(SkippedDirectory::new(
+                    relative,
+                    SkippedDirectoryKind::BuildArtifact,
+                ));
+                continue;
+            }
+            if name.starts_with('.') {
+                skipped_dirs.push(SkippedDirectory::new(
+                    relative,
+                    SkippedDirectoryKind::Hidden,
+                ));
+                continue;
+            }
+        }
+        if path.is_dir() {
             files.push(relative.clone());
-            collect_files(root, &path, files, depth + 1)?;
+            collect_files(root, &path, files, skipped_dirs, depth + 1)?;
         } else if path.is_file() {
             files.push(relative);
         }
     }
     Ok(())
+}
+
+struct SkippedDirectory {
+    path: String,
+    kind: SkippedDirectoryKind,
+}
+
+impl SkippedDirectory {
+    fn new(path: String, kind: SkippedDirectoryKind) -> Self {
+        Self { path, kind }
+    }
+}
+
+enum SkippedDirectoryKind {
+    HeavyDependency,
+    BuildArtifact,
+    Hidden,
+}
+
+impl SkippedDirectoryKind {
+    fn risk_kind(&self) -> &'static str {
+        match self {
+            Self::HeavyDependency => "skipped_heavy_dependency_directory",
+            Self::BuildArtifact => "skipped_build_artifact_directory",
+            Self::Hidden => "skipped_hidden_directory",
+        }
+    }
 }
 
 fn detect_file(
@@ -213,6 +281,15 @@ fn detect_file(
             SkillAdapterKind::SandboxExec,
             Some("cargo test or cargo run".to_string()),
         ),
+        "makefile" => add_entrypoint(
+            runtimes,
+            adapters,
+            entrypoints,
+            SkillDetectedRuntime::Shell,
+            file,
+            SkillAdapterKind::SandboxExec,
+            Some("make".to_string()),
+        ),
         "index.html" => add_entrypoint(
             runtimes,
             adapters,
@@ -231,12 +308,37 @@ fn detect_file(
             SkillAdapterKind::McpServer,
             None,
         ),
-        "dockerfile" => {
-            runtimes.insert(SkillDetectedRuntime::Docker);
-            adapters.insert(SkillAdapterKind::SidecarService);
-        }
+        "dockerfile" => add_entrypoint(
+            runtimes,
+            adapters,
+            entrypoints,
+            SkillDetectedRuntime::Docker,
+            file,
+            SkillAdapterKind::SidecarService,
+            Some("docker build .".to_string()),
+        ),
         _ => {
-            if lower.ends_with(".py") {
+            if lower.ends_with("/makefile") {
+                add_entrypoint(
+                    runtimes,
+                    adapters,
+                    entrypoints,
+                    SkillDetectedRuntime::Shell,
+                    file,
+                    SkillAdapterKind::SandboxExec,
+                    Some("make".to_string()),
+                );
+            } else if lower.ends_with("/dockerfile") {
+                add_entrypoint(
+                    runtimes,
+                    adapters,
+                    entrypoints,
+                    SkillDetectedRuntime::Docker,
+                    file,
+                    SkillAdapterKind::SidecarService,
+                    Some("docker build .".to_string()),
+                );
+            } else if lower.ends_with(".py") {
                 add_entrypoint(
                     runtimes,
                     adapters,
@@ -369,6 +471,96 @@ fn inspection_summary(inspection: &SkillInspectionReport) -> Vec<String> {
     ]
 }
 
+fn structured_dependencies_from_skill_md(
+    source_root: &Path,
+) -> std::io::Result<Vec<SkillStructuredDependency>> {
+    let skill_md = source_root.join("SKILL.md");
+    if !skill_md.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(skill_md)?;
+    let Some((frontmatter, _)) = extract_frontmatter(&raw) else {
+        return Ok(Vec::new());
+    };
+    let value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(parse_structured_dependencies(&value))
+}
+
+fn extract_frontmatter(contents: &str) -> Option<(&str, &str)> {
+    let rest = contents.strip_prefix("---\n")?;
+    let marker = "\n---";
+    let end = rest.find(marker)?;
+    let frontmatter = &rest[..end];
+    let body = &rest[end + marker.len()..];
+    Some((frontmatter, body.trim_start_matches('\n')))
+}
+
+fn parse_structured_dependencies(value: &serde_yaml::Value) -> Vec<SkillStructuredDependency> {
+    let mut dependencies = dependency_array(value, "structured_dependencies");
+    if let Some(cowd) = value.get("cowd").and_then(serde_yaml::Value::as_mapping) {
+        dependencies.extend(dependency_array_from_map(cowd, "structured_dependencies"));
+    }
+    dependencies
+}
+
+fn dependency_array(value: &serde_yaml::Value, key: &str) -> Vec<SkillStructuredDependency> {
+    value
+        .get(key)
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|items| parse_dependency_sequence(items))
+        .unwrap_or_default()
+}
+
+fn dependency_array_from_map(
+    map: &serde_yaml::Mapping,
+    key: &str,
+) -> Vec<SkillStructuredDependency> {
+    map.get(&serde_yaml::Value::String(key.to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|items| parse_dependency_sequence(items))
+        .unwrap_or_default()
+}
+
+fn parse_dependency_sequence(items: &[serde_yaml::Value]) -> Vec<SkillStructuredDependency> {
+    items
+        .iter()
+        .filter_map(|item| item.as_mapping())
+        .filter_map(|map| {
+            let domain = yaml_string(map, "domain")?;
+            let quality_gate = yaml_string(map, "quality_gate")
+                .unwrap_or_else(|| "skill_dependency_declared".to_string());
+            Some(SkillStructuredDependency {
+                domain,
+                required_fact_types: yaml_string_list(map, "required_fact_types"),
+                required_metric_keys: yaml_string_list(map, "required_metric_keys"),
+                required_evidence: yaml_string_list(map, "required_evidence"),
+                quality_gate,
+            })
+        })
+        .collect()
+}
+
+fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    map.get(&serde_yaml::Value::String(key.to_string()))
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    map.get(&serde_yaml::Value::String(key.to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn stable_skill_id(name: &str) -> String {
     name.trim()
         .to_ascii_lowercase()
@@ -392,9 +584,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cowd-skill-inspect-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("scripts")).expect("create root");
+        fs::create_dir_all(root.join("docker")).expect("docker dir");
+        fs::create_dir_all(root.join("node_modules")).expect("node modules");
+        fs::create_dir_all(root.join("target")).expect("target dir");
+        fs::create_dir_all(root.join(".cache")).expect("hidden cache");
         fs::write(root.join("SKILL.md"), "# Demo").expect("skill");
         fs::write(root.join("pyproject.toml"), "[project]\nname='demo'").expect("pyproject");
         fs::write(root.join("index.html"), "<main>demo</main>").expect("html");
+        fs::write(root.join("Makefile"), "test:\n\ttrue\n").expect("makefile");
+        fs::write(root.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
+        fs::write(root.join("scripts").join("Makefile"), "test:\n\ttrue\n")
+            .expect("nested makefile");
+        fs::write(root.join("docker").join("Dockerfile"), "FROM scratch\n")
+            .expect("nested dockerfile");
         fs::write(root.join("scripts").join("check.py"), "print('ok')").expect("py");
 
         let report = inspect_skill_package(&root).expect("inspect");
@@ -407,16 +609,91 @@ mod tests {
         assert!(report
             .recommended_adapters
             .contains(&SkillAdapterKind::BrowserStatic));
+        assert!(report
+            .recommended_adapters
+            .contains(&SkillAdapterKind::SidecarService));
+        assert!(report
+            .entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.path == "Makefile"
+                && entrypoint.adapter == SkillAdapterKind::SandboxExec));
+        assert!(report
+            .entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.path == "Dockerfile"
+                && entrypoint.adapter == SkillAdapterKind::SidecarService));
+        assert!(report
+            .entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.path == "scripts/Makefile"
+                && entrypoint.adapter == SkillAdapterKind::SandboxExec));
+        assert!(report
+            .entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.path == "docker/Dockerfile"
+                && entrypoint.adapter == SkillAdapterKind::SidecarService));
+        assert!(report
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("node_modules")));
+        assert!(report
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("target")));
+        assert!(report
+            .risk_signals
+            .iter()
+            .any(|signal| signal.kind == "skipped_build_artifact_directory"
+                && signal.evidence == "target"));
+        assert!(
+            report
+                .risk_signals
+                .iter()
+                .any(|signal| signal.kind == "skipped_hidden_directory"
+                    && signal.evidence == ".cache")
+        );
 
         let profile =
             profile_skill_package(&root, "Demo Skill", Some("1.0.0".to_string())).expect("profile");
         assert_eq!(profile.skill_id, "demo-skill");
-        assert_eq!(
-            profile.lifecycle_status,
-            SkillLifecycleStatus::UsableRuntime
-        );
-        assert_eq!(profile.risk_level, SkillRiskLevel::Low);
+        assert_eq!(profile.lifecycle_status, SkillLifecycleStatus::Blocked);
+        assert_eq!(profile.risk_level, SkillRiskLevel::High);
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn skill_profile_extracts_structured_dependencies_from_frontmatter() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-skill-dependency-profile-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            root.join("SKILL.md"),
+            r#"---
+name: supply-risk
+description: Analyze supply risk
+structured_dependencies:
+  - domain: supply_chain
+    required_fact_types: [supplier.lead_time]
+    required_metric_keys: [shortage_risk]
+    required_evidence: [recent_supplier_signal]
+    quality_gate: evidence_quality_gate
+---
+# Supply Risk
+"#,
+        )
+        .expect("skill");
+
+        let profile = profile_skill_package(&root, "Supply Risk", None).expect("profile");
+
+        assert_eq!(profile.structured_dependencies.len(), 1);
+        assert_eq!(profile.structured_dependencies[0].domain, "supply_chain");
+        assert!(profile.structured_dependencies[0]
+            .required_fact_types
+            .contains(&"supplier.lead_time".to_string()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

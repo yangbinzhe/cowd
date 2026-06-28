@@ -608,7 +608,7 @@ impl SkillsPanel {
                 format!("{total} skills | j↓ k↑ select | Enter toggle | e enable | d disable | / search | Tab category")
             } else {
                 format!(
-                    "{total} unified skills | j↓ k↑ select | v validate | p plan | r run | w watch | / search"
+                    "{total} unified skills | j↓ k↑ select | v view | p profile | r review | / search"
                 )
             };
             lines.push(Line::from(Span::styled(
@@ -704,7 +704,7 @@ impl SkillsPanel {
         // Keyboard hint bar
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "/ search  j↓ k↑  Tab category  Enter toggle  v validate  p plan  r run  w watch",
+            "/ search  j↓ k↑  Tab category  Enter toggle  v view  p profile  r review",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -818,19 +818,15 @@ impl SkillsPanel {
                 EventResult::Consumed
             }
             KeyCode::Char('v') => {
-                self.report_selected_action("validate");
+                self.report_selected_action("view");
                 EventResult::Consumed
             }
             KeyCode::Char('p') => {
-                self.report_selected_action("plan");
+                self.report_selected_action("profile");
                 EventResult::Consumed
             }
             KeyCode::Char('r') => {
-                self.report_selected_action("run");
-                EventResult::Consumed
-            }
-            KeyCode::Char('w') => {
-                self.report_selected_action("watch");
+                self.report_selected_action("maintenance");
                 EventResult::Consumed
             }
             KeyCode::Char('e') => {
@@ -863,10 +859,7 @@ impl SkillsPanel {
             return;
         };
         if supported {
-            self.set_status(&format!(
-                "{} {action}: unified action ready; incident id required for plan/run",
-                name
-            ));
+            self.set_status(&format!("{name} {action}: unified governance action ready"));
         } else {
             self.set_status(&format!("{name} does not support {action}"));
         }
@@ -924,11 +917,11 @@ fn entry_action_hints(entry: &SkillDisplayEntry) -> Vec<&'static str> {
     if entry.source.eq_ignore_ascii_case("mfg")
         || entry.tags.iter().any(|tag| tag.eq_ignore_ascii_case("mfg"))
     {
-        vec!["view", "validate", "plan", "run", "watch"]
+        vec!["view", "profile", "govern", "maintenance"]
     } else if entry.category.eq_ignore_ascii_case("local")
         || entry.risk.eq_ignore_ascii_case("operator_review")
     {
-        vec!["view", "import"]
+        vec!["view", "import", "inspect", "maintenance"]
     } else {
         vec!["view"]
     }
@@ -1141,11 +1134,33 @@ mod tests {
         let mut panel = SkillsPanel::from_app(&app);
         let lines = render_panel(&mut panel, 92, 12);
         let joined = lines.join("\n");
-        assert!(joined.contains("actions: view · validate · plan · run · watch"));
+        assert!(joined.contains("actions: view · profile · govern · maintenance"));
     }
 
     #[test]
-    fn local_entries_report_run_as_unsupported() {
+    fn local_entries_report_legacy_run_as_unsupported() {
+        let mut app = App::new("test-model", "test-session");
+        app.skill_list = vec![SkillSummary {
+            name: "release".to_string(),
+            description: "Prepare release".to_string(),
+            installed: true,
+            category: "local".to_string(),
+            source: "Project".to_string(),
+            status: "ready".to_string(),
+            risk: "operator_review".to_string(),
+            tags: vec!["git".to_string()],
+        }];
+        let mut panel = SkillsPanel::from_app(&app);
+        panel.selected_index = Some(0);
+        panel.report_selected_action("run");
+        assert_eq!(
+            panel.status_message.as_deref(),
+            Some("release does not support run")
+        );
+    }
+
+    #[test]
+    fn local_entries_report_maintenance_review_as_supported() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
             name: "release".to_string(),
@@ -1167,7 +1182,7 @@ mod tests {
         assert!(result.is_consumed());
         assert_eq!(
             panel.status_message.as_deref(),
-            Some("release does not support run")
+            Some("release maintenance: unified governance action ready")
         );
     }
 

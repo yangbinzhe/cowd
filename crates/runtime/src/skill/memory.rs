@@ -1,7 +1,8 @@
 //! Skill activation signals that can be reviewed by the memory layer.
 
+use super::activation::RuntimeSkillCandidateSource;
+use super::SkillActivationRecord;
 use crate::agent_collaboration::{MemoryPulseCandidate, MemoryPulseKind};
-use crate::skill_activation::SkillActivationRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillMemoryPolicy {
@@ -31,18 +32,21 @@ pub fn memory_candidate_from_skill_activation(
         return Some(MemoryPulseCandidate {
             kind: MemoryPulseKind::Remember,
             content: format!(
-                "skill activation gap; source=skill_activation; query={}; no matching skill candidates",
+                "skill activation gap; source=runtime_skill; query={}; no matching skill candidates",
                 activation.query
             ),
         });
     }
 
-    let selected = activation.candidates.first()?;
+    let selected_name = activation.selected.as_ref()?;
+    let selected = activation.candidates.iter().find(|candidate| {
+        candidate.name == *selected_name && candidate.source == RuntimeSkillCandidateSource::Profile
+    })?;
     if policy.capture_low_confidence && selected.score <= policy.low_confidence_score {
         return Some(MemoryPulseCandidate {
             kind: MemoryPulseKind::Refresh,
             content: format!(
-                "low confidence skill activation; source=skill_activation; query={}; selected={}; score={}; reasons={}",
+                "low confidence skill activation; source=runtime_skill; query={}; selected={}; score={}; reasons={}",
                 activation.query,
                 selected.name,
                 selected.score,
@@ -55,7 +59,7 @@ pub fn memory_candidate_from_skill_activation(
         return Some(MemoryPulseCandidate {
             kind: MemoryPulseKind::Refresh,
             content: format!(
-                "skill selected for task; source=skill_activation; query={}; selected={}; score={}; reasons={}",
+                "skill selected for task; source=runtime_skill; query={}; selected={}; score={}; reasons={}",
                 activation.query,
                 selected.name,
                 selected.score,
@@ -69,11 +73,11 @@ pub fn memory_candidate_from_skill_activation(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RuntimeSkillCandidate;
     use super::*;
-    use crate::skill_activation::RuntimeSkillCandidate;
 
     #[test]
-    fn no_match_creates_memory_gap_candidate() {
+    fn skill_memory_no_match_creates_memory_gap_candidate() {
         let activation = SkillActivationRecord::new("s1", 1, "unknown workflow", Vec::new());
 
         let candidate =
@@ -85,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_skill_creates_refresh_candidate() {
+    fn skill_memory_selected_skill_creates_refresh_candidate() {
         let activation = SkillActivationRecord::new(
             "s1",
             1,
@@ -95,6 +99,7 @@ mod tests {
                 score: 12,
                 reasons: vec!["tags:1".to_string()],
                 path: None,
+                source: RuntimeSkillCandidateSource::Profile,
             }],
         );
 
@@ -104,5 +109,26 @@ mod tests {
 
         assert_eq!(candidate.kind, MemoryPulseKind::Refresh);
         assert!(candidate.content.contains("selected=release"));
+    }
+
+    #[test]
+    fn skill_memory_ignores_capability_ref_fallback_candidates() {
+        let activation = SkillActivationRecord::new(
+            "s1",
+            1,
+            "review rust warnings",
+            vec![RuntimeSkillCandidate {
+                name: "review".to_string(),
+                score: 5,
+                reasons: vec!["capability_ref_fallback".to_string()],
+                path: None,
+                source: RuntimeSkillCandidateSource::CapabilityRefFallback,
+            }],
+        );
+
+        let candidate =
+            memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default());
+
+        assert!(candidate.is_none());
     }
 }

@@ -127,7 +127,8 @@ printf '%s' "$webui_projection_json" | rg -q '"name":"release"'
 
 tui_projection_json="$(curl -fsS "$BASE_URL/api/skills/projection?surface=tui")"
 printf '%s' "$tui_projection_json" | rg -q '"surface":"tui"'
-printf '%s' "$tui_projection_json" | rg -q '"run.watch"'
+printf '%s' "$tui_projection_json" | rg -q '"skill.maintenance.evaluate"'
+printf '%s' "$tui_projection_json" | rg -vq '"run.watch"'
 
 cli_projection_json="$(curl -fsS "$BASE_URL/api/skills/projection?surface=cli")"
 printf '%s' "$cli_projection_json" | rg -q '"surface":"cli"'
@@ -159,28 +160,17 @@ incident_id="$(printf '%s' "$incident_json" | python3 -c 'import json,sys; print
 
 curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/analyze" -X POST | rg -q '"kind":"mfg.operational_analysis"'
 
-validate_json="$(curl -fsS "$BASE_URL/api/skills/mfg:supply-risk-analyst/actions/validate" \
+plan_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/plan" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"skill-surface-validate","session_id":"session-skill-surface"}')"
-printf '%s' "$validate_json" | rg -q '"kind":"skills.action.validate"'
-printf '%s' "$validate_json" | rg -q '"status":"pass"'
-
-plan_json="$(curl -fsS "$BASE_URL/api/skills/mfg:supply-risk-analyst/actions/plan" \
-  -H 'content-type: application/json' \
-  -d '{"request_id":"skill-surface-plan","session_id":"session-skill-surface","incident_id":"'"$incident_id"'","limit":3}')"
-printf '%s' "$plan_json" | rg -q '"kind":"skills.action.plan"'
+  -d '{"request_id":"skill-surface-plan","session_id":"session-skill-surface","limit":3}')"
+printf '%s' "$plan_json" | rg -q '"kind":"mfg.skill.plan"'
 printf '%s' "$plan_json" | rg -q '"supply-risk-analyst"'
 
-run_json="$(curl -fsS "$BASE_URL/api/skills/mfg:supply-risk-analyst/actions/run" \
+run_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/supply-risk-analyst/run" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"skill-surface-run","session_id":"session-skill-surface","incident_id":"'"$incident_id"'"}')"
-printf '%s' "$run_json" | rg -q '"kind":"skills.action.run"'
+  -d '{"request_id":"skill-surface-run","session_id":"session-skill-surface"}')"
+printf '%s' "$run_json" | rg -q '"kind":"mfg.skill.run"'
 skill_run_id="$(printf '%s' "$run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["skill_run"]["execution_id"])')"
 
-curl -fsS "$BASE_URL/api/skills/runs" | rg -q '"kind":"skills.runs"'
-curl -fsS "$BASE_URL/api/skills/runs/$skill_run_id" | rg -q '"kind":"skills.run"'
-
-local_validate_json="$(curl -fsS "$BASE_URL/api/skills/local:release/actions/validate" \
-  -H 'content-type: application/json' \
-  -d '{"request_id":"skill-surface-local-validate","session_id":"session-skill-surface"}')"
-printf '%s' "$local_validate_json" | rg -q '"unsupported_for_local_skill"'
+curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills" | rg -q '"kind":"mfg.skill.run_list"'
+curl -fsS "$BASE_URL/api/apps/mfg/skill-runs/$skill_run_id" | rg -q '"kind":"mfg.skill.run"'
