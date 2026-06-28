@@ -81,6 +81,10 @@ pub struct GatewayPanel {
     pub connector_degraded_reasons: Vec<String>,
     /// Global runtime/control degradation reasons.
     pub degraded_reasons: Vec<String>,
+    /// Last Gateway action status from operator shortcuts.
+    pub action_status: Option<String>,
+    /// Last Gateway action receipt summary.
+    pub action_receipt: Option<String>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -116,6 +120,8 @@ impl GatewayPanel {
             connector_resources: Vec::new(),
             connector_degraded_reasons: Vec::new(),
             degraded_reasons: Vec::new(),
+            action_status: None,
+            action_receipt: None,
             scroll_offset: 0,
         }
     }
@@ -203,6 +209,19 @@ impl GatewayPanel {
         self.connector_degraded_reasons = reasons;
     }
 
+    pub fn record_action_result(&mut self, label: &str, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                self.action_status = Some(format!("{label} succeeded"));
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.action_status = Some(format!("{label} failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
     // ── Rendering helpers ────────────────────────────────────────
 
     /// Build the title string for the block border.
@@ -268,9 +287,21 @@ impl Component for GatewayPanel {
             status,
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop  / connector actions",
+            "Keys: r refresh  h health  s start/stop  c consume  C cancel  y retry  t steward tick",
             Style::default().fg(Color::DarkGray),
         )));
+        if let Some(status) = &self.action_status {
+            lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(status.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        if let Some(receipt) = &self.action_receipt {
+            lines.push(Line::from(vec![
+                Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(receipt.clone(), Style::default().fg(Color::Green)),
+            ]));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "─ Operator Summary ─",
@@ -1073,7 +1104,7 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k scroll  PgUp/PgDn page  r refresh  h health  s start/stop  / connector actions",
+            "Keys: j/k scroll  PgUp/PgDn page  c consume  C cancel  y retry  t steward tick",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1152,6 +1183,19 @@ fn compact_text(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     output.push_str("...");
     output
+}
+
+fn gateway_receipt_summary(receipt: &serde_json::Value) -> String {
+    let kind = receipt
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("gateway.receipt");
+    let status = receipt
+        .get("status")
+        .or_else(|| receipt.get("ok"))
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "recorded".to_string());
+    format!("{kind} status={status}")
 }
 
 // ── Tests ────────────────────────────────────────────────────────

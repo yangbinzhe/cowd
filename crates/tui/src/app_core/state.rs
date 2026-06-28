@@ -1453,6 +1453,9 @@ impl TuiState {
 
         // 1.5. Agent team panel focus trap: route j/k/Up/Down/Tab to panel
         if self.agent_team_panel.visible {
+            if self.handle_agent_team_action(&event) {
+                return true;
+            }
             match event.code {
                 KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down => {
                     self.agent_team_panel.handle_key(&event);
@@ -2159,8 +2162,9 @@ impl TuiState {
                 }
             }
             FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => {
-                if self.skills_panel.handle_event(&event)
-                    == crate::components::EventResult::Consumed
+                if self.handle_skills_panel_action(&event)
+                    || self.skills_panel.handle_event(&event)
+                        == crate::components::EventResult::Consumed
                 {
                     self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Skills));
                     true
@@ -2221,14 +2225,296 @@ impl TuiState {
             TAB_TODO => self.todo_panel.handle_event(&event),
             TAB_FILES => self.file_tree.handle_event(&event),
             TAB_SESSIONS => self.session_sidebar.handle_event(&event),
-            TAB_SURFACES => self.surface_panel.handle_event(&event),
-            TAB_GATEWAY => self.gateway_panel.handle_event(&event),
+            TAB_SURFACES => {
+                if self.handle_surface_panel_action(&event) {
+                    crate::components::EventResult::Consumed
+                } else {
+                    self.surface_panel.handle_event(&event)
+                }
+            }
+            TAB_GATEWAY => {
+                if self.handle_gateway_panel_action(&event) {
+                    crate::components::EventResult::Consumed
+                } else {
+                    self.gateway_panel.handle_event(&event)
+                }
+            }
             _ => crate::components::EventResult::NotConsumed,
         } == crate::components::EventResult::Consumed;
         if consumed {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    fn handle_agent_team_action(&mut self, key: &KeyEvent) -> bool {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        let action = match key.code {
+            KeyCode::Char('i') => "input",
+            KeyCode::Char('!') => "interrupt",
+            KeyCode::Char('X') => "shutdown",
+            _ => return false,
+        };
+        let Some(agent_id) = self.agent_team_panel.selected_agent_id_owned() else {
+            self.agent_team_panel
+                .record_action_result(action, Err("Select an agent first".to_string()));
+            return true;
+        };
+        let payload = serde_json::json!({
+            "source": "tui.agent_team_panel",
+            "session_id": self.app.session_id,
+            "message": "TUI operator control action"
+        });
+        let result = match action {
+            "input" => run_gateway_api_blocking(move |client| async move {
+                client.runtime_agent_input(&agent_id, payload).await
+            }),
+            "interrupt" => run_gateway_api_blocking(move |client| async move {
+                client.runtime_agent_interrupt(&agent_id, payload).await
+            }),
+            "shutdown" => run_gateway_api_blocking(move |client| async move {
+                client.runtime_agent_shutdown(&agent_id, payload).await
+            }),
+            _ => unreachable!(),
+        };
+        self.agent_team_panel
+            .record_action_result(&format!("agent.{action}"), result);
+        true
+    }
+
+    fn handle_gateway_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('c') => {
+                let result = self.run_mission_command_action("consume");
+                self.gateway_panel
+                    .record_action_result("mission.command.consume", result);
+                true
+            }
+            KeyCode::Char('C') => {
+                let result = self.run_mission_command_action("cancel");
+                self.gateway_panel
+                    .record_action_result("mission.command.cancel", result);
+                true
+            }
+            KeyCode::Char('y') => {
+                let result = self.run_mission_command_action("retry");
+                self.gateway_panel
+                    .record_action_result("mission.command.retry", result);
+                true
+            }
+            KeyCode::Char('t') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client
+                        .tick_mission_steward_scheduler(serde_json::json!({
+                            "source": "tui.gateway_panel",
+                            "mode": "tick"
+                        }))
+                        .await
+                });
+                self.gateway_panel
+                    .record_action_result("mission.team.tick", result);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn run_mission_command_action(&mut self, action: &str) -> Result<serde_json::Value, String> {
+        let session_id = self
+            .app
+            .gateway_mission_control
+            .as_ref()
+            .and_then(|mission| {
+                mission.active_session_id.clone().or_else(|| {
+                    mission
+                        .sessions
+                        .first()
+                        .map(|session| session.session_id.clone())
+                })
+            })
+            .ok_or_else(|| "No active mission session".to_string())?;
+        let inbox_session = session_id.clone();
+        let inbox = run_gateway_api_blocking(move |client| async move {
+            client.mission_session_inbox(&inbox_session).await
+        })?;
+        let command_id = first_command_id(&inbox)
+            .ok_or_else(|| "No mission command id found in active inbox".to_string())?;
+        match action {
+            "consume" => run_gateway_api_blocking(move |client| async move {
+                client
+                    .consume_mission_session_command(&session_id, &command_id, "operator")
+                    .await
+            }),
+            "cancel" => run_gateway_api_blocking(move |client| async move {
+                client
+                    .cancel_mission_session_command(&session_id, &command_id)
+                    .await
+            }),
+            "retry" => run_gateway_api_blocking(move |client| async move {
+                client
+                    .retry_mission_session_command(&session_id, &command_id)
+                    .await
+            }),
+            _ => Err(format!("unsupported mission command action: {action}")),
+        }
+    }
+
+    fn handle_surface_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        let Some(surface_id) = self.surface_panel.selected_surface_id_owned() else {
+            self.surface_panel.set_status("No selected surface");
+            return matches!(
+                key.code,
+                KeyCode::Char('h')
+                    | KeyCode::Char('s')
+                    | KeyCode::Char('x')
+                    | KeyCode::Char('r')
+                    | KeyCode::Char('R')
+                    | KeyCode::Char('m')
+                    | KeyCode::Char('a')
+            );
+        };
+        match key.code {
+            KeyCode::Char('h') => {
+                let label = format!("surface.health_check:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_health_check(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('s') => {
+                let label = format!("surface.start:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_start(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('x') => {
+                if !self.surface_panel.require_confirmation("surface.stop", "x") {
+                    return true;
+                }
+                let label = format!("surface.stop:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_stop(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('r') => {
+                if !self
+                    .surface_panel
+                    .require_confirmation("surface.restart", "r")
+                {
+                    return true;
+                }
+                let label = format!("surface.restart:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_restart(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('R') => {
+                let label = format!("surface.repair:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_repair(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('m') => {
+                let label = format!("surface.send:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client
+                            .surface_send(
+                                &surface_id,
+                                "tui:operator",
+                                None,
+                                "TUI operator ping",
+                                serde_json::json!({"source": "tui.surface_panel"}),
+                            )
+                            .await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('a') => {
+                let label = format!("surface.action:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client
+                            .surface_action(
+                                &surface_id,
+                                "diagnose",
+                                serde_json::json!({"source": "tui.surface_panel"}),
+                            )
+                            .await
+                    }),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_skills_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        let action = match key.code {
+            KeyCode::Char('v') => "validate",
+            KeyCode::Char('p') => "plan",
+            KeyCode::Char('r') => "run",
+            _ => return false,
+        };
+        let Some(skill_id) = self.skills_panel.selected_skill_name() else {
+            self.skills_panel
+                .record_action_result(action, Err("Select a skill first".to_string()));
+            return true;
+        };
+        let session_id = self.app.session_id.clone();
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "reason": "tui skill panel action",
+        });
+        self.skills_panel.record_action_result(
+            action,
+            run_gateway_api_blocking(move |client| async move {
+                client.skill_action(&skill_id, action, payload).await
+            }),
+        );
+        true
     }
 
     fn handle_tool_ops_action(&mut self, event: &crossterm::event::Event) -> bool {
@@ -3853,6 +4139,28 @@ where
             .map_err(|_| "Gateway API worker panicked".to_string())?
     } else {
         run()
+    }
+}
+
+fn first_command_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(command_id) = map
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+            {
+                return Some(command_id.to_string());
+            }
+            for key in ["commands", "items", "session_commands", "inbox"] {
+                if let Some(found) = map.get(key).and_then(first_command_id) {
+                    return Some(found);
+                }
+            }
+            map.values().find_map(first_command_id)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(first_command_id),
+        _ => None,
     }
 }
 

@@ -1,5 +1,7 @@
 #[path = "rendering/accessibility.rs"]
 pub mod accessibility;
+#[path = "app_core/action_coverage.rs"]
+pub mod action_coverage;
 #[path = "rendering/animation.rs"]
 pub mod animation;
 #[path = "app_core/app.rs"]

@@ -748,6 +748,30 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn surface_start(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/start", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn surface_stop(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/stop", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn surface_restart(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/restart", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn surface_repair(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/surfaces/{}/repair", url_encode(id)),
@@ -793,6 +817,32 @@ impl GatewayApiClient {
                 "action": action,
                 "payload": payload,
             }),
+        )
+        .await
+    }
+
+    pub async fn skill_runs(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/skills/runs").await
+    }
+
+    pub async fn skill_run_detail(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/skills/runs/{}", url_encode(id)))
+            .await
+    }
+
+    pub async fn skill_action(
+        &self,
+        id: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/skills/{}/actions/{}",
+                url_encode(id),
+                url_encode(action)
+            ),
+            payload,
         )
         .await
     }
@@ -1363,6 +1413,12 @@ mod tests {
             "connector_capabilities",
             "connector_service_tools",
             "execute_connector_service",
+            "surface_start",
+            "surface_stop",
+            "surface_restart",
+            "skill_runs",
+            "skill_run_detail",
+            "skill_action",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
             "cross_plane_policy_simulate",
@@ -1382,7 +1438,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 81);
+        assert_eq!(migrated.len(), 87);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));

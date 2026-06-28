@@ -233,6 +233,8 @@ pub struct SkillsPanel {
     pub scroll_offset: u16,
     /// Status message to display (auto-clears).
     status_message: Option<String>,
+    /// Last Gateway skill action receipt.
+    last_receipt: Option<serde_json::Value>,
     /// Tick counter for auto-clearing status messages.
     status_ticks: u32,
     /// Whether to use built-in definitions (true when App.skill_list is empty).
@@ -271,6 +273,7 @@ impl SkillsPanel {
             view_mode: ViewMode::List,
             scroll_offset: 0,
             status_message: None,
+            last_receipt: None,
             status_ticks: 0,
             using_builtins: true,
             category_cycle_started: false,
@@ -531,6 +534,29 @@ impl SkillsPanel {
         self.status_ticks = 0;
     }
 
+    pub fn selected_skill_name(&self) -> Option<String> {
+        let idx = self.selected_index?;
+        let filtered = self.filtered_entries();
+        filtered.get(idx).map(|entry| entry.name.clone())
+    }
+
+    pub fn record_action_result(
+        &mut self,
+        action: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        match result {
+            Ok(payload) => {
+                self.last_receipt = Some(payload);
+                self.set_status(&format!("skill {action}: receipt recorded"));
+            }
+            Err(error) => {
+                self.last_receipt = None;
+                self.set_status(&format!("skill {action} failed: {error}"));
+            }
+        }
+    }
+
     // ── Rendering ────────────────────────────────────────────────────
 
     fn build_title(&self) -> String {
@@ -607,9 +633,7 @@ impl SkillsPanel {
             let status_label = if self.using_builtins {
                 format!("{total} skills | j↓ k↑ select | Enter toggle | e enable | d disable | / search | Tab category")
             } else {
-                format!(
-                    "{total} unified skills | j↓ k↑ select | v view | p profile | r review | / search"
-                )
+                format!("{total} unified skills | j↓ k↑ select | v validate | p plan | r run | / search")
             };
             lines.push(Line::from(Span::styled(
                 status_label,
@@ -704,9 +728,18 @@ impl SkillsPanel {
         // Keyboard hint bar
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "/ search  j↓ k↑  Tab category  Enter toggle  v view  p profile  r review",
+            "/ search  j↓ k↑  Tab category  Enter toggle  v validate  p plan  r run",
             Style::default().fg(Color::DarkGray),
         )));
+        if let Some(receipt) = &self.last_receipt {
+            lines.push(Line::from(vec![
+                Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    skill_receipt_summary(receipt),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        }
 
         let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
@@ -818,15 +851,15 @@ impl SkillsPanel {
                 EventResult::Consumed
             }
             KeyCode::Char('v') => {
-                self.report_selected_action("view");
+                self.report_selected_action("validate");
                 EventResult::Consumed
             }
             KeyCode::Char('p') => {
-                self.report_selected_action("profile");
+                self.report_selected_action("plan");
                 EventResult::Consumed
             }
             KeyCode::Char('r') => {
-                self.report_selected_action("maintenance");
+                self.report_selected_action("run");
                 EventResult::Consumed
             }
             KeyCode::Char('e') => {
@@ -917,14 +950,36 @@ fn entry_action_hints(entry: &SkillDisplayEntry) -> Vec<&'static str> {
     if entry.source.eq_ignore_ascii_case("mfg")
         || entry.tags.iter().any(|tag| tag.eq_ignore_ascii_case("mfg"))
     {
-        vec!["view", "profile", "govern", "maintenance"]
+        vec!["view", "validate", "plan", "run", "maintenance"]
     } else if entry.category.eq_ignore_ascii_case("local")
         || entry.risk.eq_ignore_ascii_case("operator_review")
     {
-        vec!["view", "import", "inspect", "maintenance"]
+        vec!["view", "validate", "plan", "run", "inspect", "maintenance"]
     } else {
-        vec!["view"]
+        vec!["view", "validate", "plan"]
     }
+}
+
+fn skill_receipt_summary(receipt: &serde_json::Value) -> String {
+    let run_id = receipt
+        .pointer("/run/run_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            receipt
+                .pointer("/receipt/run_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("unknown");
+    let status = receipt
+        .pointer("/receipt/status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            receipt
+                .pointer("/run/status")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("recorded");
+    format!("{run_id} status={status}")
 }
 
 // ── Default impl ────────────────────────────────────────────────────
@@ -1134,11 +1189,11 @@ mod tests {
         let mut panel = SkillsPanel::from_app(&app);
         let lines = render_panel(&mut panel, 92, 12);
         let joined = lines.join("\n");
-        assert!(joined.contains("actions: view · profile · govern · maintenance"));
+        assert!(joined.contains("actions: view · validate · plan · run · maintenance"));
     }
 
     #[test]
-    fn local_entries_report_legacy_run_as_unsupported() {
+    fn local_entries_report_run_as_supported() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
             name: "release".to_string(),
@@ -1155,12 +1210,12 @@ mod tests {
         panel.report_selected_action("run");
         assert_eq!(
             panel.status_message.as_deref(),
-            Some("release does not support run")
+            Some("release run: unified governance action ready")
         );
     }
 
     #[test]
-    fn local_entries_report_maintenance_review_as_supported() {
+    fn local_entries_key_r_triggers_run() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
             name: "release".to_string(),
@@ -1182,7 +1237,7 @@ mod tests {
         assert!(result.is_consumed());
         assert_eq!(
             panel.status_message.as_deref(),
-            Some("release maintenance: unified governance action ready")
+            Some("release run: unified governance action ready")
         );
     }
 

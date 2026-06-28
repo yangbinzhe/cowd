@@ -82,6 +82,10 @@ pub struct AgentTeamPanel {
     pub workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
     /// Delegated task summaries from the current App state.
     pub delegate_tasks: Vec<DelegateTask>,
+    /// Last operator action status.
+    pub last_action_status: Option<String>,
+    /// Last Gateway receipt summary.
+    pub last_action_receipt: Option<String>,
 }
 
 impl AgentTeamPanel {
@@ -96,6 +100,8 @@ impl AgentTeamPanel {
             detail_idx: None,
             workgraph_summary: None,
             delegate_tasks: Vec::new(),
+            last_action_status: None,
+            last_action_receipt: None,
         }
     }
 
@@ -166,6 +172,24 @@ impl AgentTeamPanel {
             None
         } else {
             Some(&self.agents[self.selected_idx])
+        }
+    }
+
+    #[must_use]
+    pub fn selected_agent_id_owned(&self) -> Option<String> {
+        self.selected_agent().map(|agent| agent.agent_id.clone())
+    }
+
+    pub fn record_action_result(&mut self, label: &str, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                self.last_action_status = Some(format!("{label} succeeded"));
+                self.last_action_receipt = Some(agent_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.last_action_status = Some(format!("{label} failed: {error}"));
+                self.last_action_receipt = None;
+            }
         }
     }
 
@@ -544,9 +568,21 @@ impl Component for AgentTeamPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "j↓ k↑  Enter detail  Tab toggle  g top  G bottom  Esc hide",
+            "j↓ k↑  Enter detail  i input  ! interrupt  X shutdown  Tab toggle  Esc hide",
             Style::default().fg(Color::DarkGray),
         )));
+        if let Some(status) = &self.last_action_status {
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(status.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        if let Some(receipt) = &self.last_action_receipt {
+            lines.push(Line::from(vec![
+                Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(receipt.clone(), Style::default().fg(Color::Green)),
+            ]));
+        }
 
         let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
@@ -642,6 +678,19 @@ fn preview(text: &str, max_chars: usize) -> String {
         .collect::<String>();
     out.push_str("...");
     out
+}
+
+fn agent_receipt_summary(receipt: &serde_json::Value) -> String {
+    let kind = receipt
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("agent.receipt");
+    let status = receipt
+        .get("status")
+        .or_else(|| receipt.get("ok"))
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "recorded".to_string());
+    format!("{kind} status={status}")
 }
 
 // ── Tests ────────────────────────────────────────────────────────

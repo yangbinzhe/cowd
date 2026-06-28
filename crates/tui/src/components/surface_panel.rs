@@ -17,6 +17,9 @@ pub struct SurfacePanel {
     health: Option<SurfaceHealthSummary>,
     events: Vec<SurfaceEventSummary>,
     selected: usize,
+    last_status: Option<String>,
+    last_receipt: Option<serde_json::Value>,
+    pending_confirm: Option<&'static str>,
 }
 
 impl SurfacePanel {
@@ -26,6 +29,9 @@ impl SurfacePanel {
             health: None,
             events: Vec::new(),
             selected: 0,
+            last_status: None,
+            last_receipt: None,
+            pending_confirm: None,
         }
     }
 
@@ -42,6 +48,38 @@ impl SurfacePanel {
         self.surfaces
             .get(self.selected)
             .map(|surface| surface.id.as_str())
+    }
+
+    pub fn selected_surface_id_owned(&self) -> Option<String> {
+        self.selected_surface_id().map(str::to_string)
+    }
+
+    pub fn require_confirmation(&mut self, action_id: &'static str, key_hint: &str) -> bool {
+        if self.pending_confirm == Some(action_id) {
+            self.pending_confirm = None;
+            return true;
+        }
+        self.pending_confirm = Some(action_id);
+        self.last_status = Some(format!("Press {key_hint} again to confirm {action_id}"));
+        false
+    }
+
+    pub fn record_action_result(&mut self, label: &str, result: Result<serde_json::Value, String>) {
+        self.pending_confirm = None;
+        match result {
+            Ok(payload) => {
+                self.last_status = Some(format!("{label} succeeded"));
+                self.last_receipt = Some(payload);
+            }
+            Err(error) => {
+                self.last_status = Some(format!("{label} failed: {error}"));
+                self.last_receipt = None;
+            }
+        }
+    }
+
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.last_status = Some(status.into());
     }
 
     pub fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
@@ -111,9 +149,30 @@ impl Component for SurfacePanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k select  refresh by running /surfaces",
+            "Keys: j/k select  h health  s start  x stop  r restart  R repair  m send  a action",
             Style::default().fg(Color::DarkGray),
         )));
+        if let Some(status) = &self.last_status {
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    compact(status, area.width.saturating_sub(10) as usize),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+        if let Some(receipt) = &self.last_receipt {
+            lines.push(Line::from(vec![
+                Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    compact(
+                        &receipt_summary(receipt),
+                        area.width.saturating_sub(11) as usize,
+                    ),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        }
         lines.push(Line::raw(""));
 
         if self.surfaces.is_empty() {
@@ -355,6 +414,19 @@ fn compact(value: &str, max: usize) -> String {
                 .collect::<String>()
         )
     }
+}
+
+fn receipt_summary(receipt: &serde_json::Value) -> String {
+    let kind = receipt
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("receipt");
+    let status = receipt
+        .get("status")
+        .or_else(|| receipt.get("ok"))
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "recorded".to_string());
+    format!("{kind} status={status}")
 }
 
 #[cfg(test)]
