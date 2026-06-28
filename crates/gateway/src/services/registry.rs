@@ -50,6 +50,7 @@ impl GatewayServices {
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
+            harness_eval: HarnessEvalService::new(),
             provider: ProviderService::new(),
             reality: RealityService::new(),
             growth: GrowthService::new(),
@@ -129,6 +130,7 @@ impl GatewayServices {
             self.tool.label,
             self.system.label,
             self.audit.label,
+            self.harness_eval.label,
             self.provider.label,
             self.reality.label,
             self.growth.label,
@@ -154,6 +156,7 @@ impl GatewayServices {
         contracts.extend(self.tool.contracts());
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
+        contracts.extend(self.harness_eval.contracts());
         contracts.extend(self.provider.contracts());
         contracts.extend(self.reality.contracts());
         contracts.extend(self.growth.contracts());
@@ -211,6 +214,10 @@ impl GatewayServices {
             ("audit", "approval_projection"),
             ("audit", "audit_projection"),
             ("audit", "risk_gate_projection"),
+            ("harness_eval", "reports"),
+            ("harness_eval", "latest_report"),
+            ("harness_eval", "runs"),
+            ("harness_eval", "run_start"),
             ("provider", "config_projection"),
             ("provider", "model_routing"),
             ("reality", "status"),

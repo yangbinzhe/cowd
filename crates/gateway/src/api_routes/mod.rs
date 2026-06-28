@@ -57,6 +57,7 @@ mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
 mod growth_routes;
+mod harness_eval_routes;
 mod matrix_outcomes;
 mod matrix_routes;
 pub(crate) mod memory_routes;
@@ -239,6 +240,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
         .merge(growth_routes::router())
+        .merge(harness_eval_routes::router())
         .merge(matrix_routes::router())
         .merge(mfg_routes::router())
         .merge(mission_routes::router())
@@ -968,6 +970,73 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn harness_eval_routes_create_smoke_run_and_report_latest() {
+        let workspace = test_temp_dir("harness-eval-route-workspace");
+        let report_dir = test_temp_dir("harness-eval-route-reports");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({ "eval_report_dir": report_dir }),
+            None,
+            workspace.clone(),
+        ));
+
+        let run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/harness-eval/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "level": "quick",
+                            "budget": "low",
+                            "allow_real_model": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(run.status(), StatusCode::OK);
+        let run_body = to_bytes(run.into_body(), usize::MAX).await.unwrap();
+        let run_json: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
+        assert_eq!(run_json["kind"], "harness_eval.run");
+        assert_eq!(run_json["run"]["status"], "completed");
+
+        let latest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/harness-eval/reports/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.status(), StatusCode::OK);
+        let latest_body = to_bytes(latest.into_body(), usize::MAX).await.unwrap();
+        let latest_json: serde_json::Value = serde_json::from_slice(&latest_body).unwrap();
+        assert_eq!(latest_json["kind"], "harness_eval.latest_report");
+        assert_eq!(latest_json["report"]["status"], "passed");
+
+        let scenarios = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/harness-eval/scenarios")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scenarios.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(report_dir);
     }
 
     #[tokio::test]

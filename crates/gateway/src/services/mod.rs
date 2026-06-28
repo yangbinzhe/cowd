@@ -17,6 +17,7 @@ mod context_service;
 mod cross_plane_service;
 mod error;
 mod growth_service;
+mod harness_eval_service;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
@@ -38,6 +39,7 @@ pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use growth_service::growth_storage_migrations;
+pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{
@@ -201,6 +203,12 @@ impl SystemService {
 
 #[derive(Clone)]
 pub(crate) struct AuditService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+#[derive(Clone)]
+pub(crate) struct HarnessEvalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
 }
@@ -479,6 +487,7 @@ pub(crate) struct GatewayServices {
     pub(crate) tool: ToolService,
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
+    pub(crate) harness_eval: HarnessEvalService,
     pub(crate) provider: ProviderService,
     pub(crate) reality: RealityService,
     pub(crate) growth: GrowthService,
@@ -725,6 +734,7 @@ mod tests {
                 "tool",
                 "system",
                 "audit",
+                "harness_eval",
                 "provider",
                 "reality",
                 "growth",
@@ -760,6 +770,10 @@ mod tests {
         assert_eq!(
             services.audit.risk_gate_projection_contract().operation,
             "risk_gate_projection"
+        );
+        assert_eq!(
+            services.harness_eval.envelope("reports").operation,
+            "reports"
         );
         assert_eq!(
             services.provider.config_projection_contract().operation,

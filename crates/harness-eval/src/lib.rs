@@ -3,6 +3,20 @@
 use harness_contract::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
 
+mod report;
+mod report_store;
+mod runner;
+
+pub use report::{
+    CapabilityResult, ExecutionTrace, HarnessEvalLevel, HarnessEvalReportDetail,
+    HarnessEvalReportSummary, HarnessEvalRunRecord, HarnessEvalRunRequest, HarnessEvalRunStatus,
+    HarnessEvalUsageSummary, HarnessMetric, MissionHarnessEvalReport, ProviderRoundDetail,
+    ProviderRoundSummary, RealToolScenarioReport, RealToolScenarioResult, ToolCallDetail,
+    ToolCallSummary, UsageSummary,
+};
+pub use report_store::{default_report_root, HarnessEvalReportStore};
+pub use runner::{run_eval, HarnessEvalRunnerOptions};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchCaseKind {

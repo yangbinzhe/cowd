@@ -85,6 +85,10 @@ pub struct GatewayPanel {
     pub action_status: Option<String>,
     /// Last Gateway action receipt summary.
     pub action_receipt: Option<String>,
+    /// Latest harness eval status observed through Gateway.
+    pub harness_eval_status: Option<String>,
+    /// Latest harness eval compact summary for terminal operators.
+    pub harness_eval_summary: Option<String>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -122,6 +126,8 @@ impl GatewayPanel {
             degraded_reasons: Vec::new(),
             action_status: None,
             action_receipt: None,
+            harness_eval_status: None,
+            harness_eval_summary: None,
             scroll_offset: 0,
         }
     }
@@ -222,6 +228,44 @@ impl GatewayPanel {
         }
     }
 
+    pub fn record_harness_eval_latest(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                let report = payload.get("report").unwrap_or(&serde_json::Value::Null);
+                let status = report
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| payload.get("status").and_then(serde_json::Value::as_str))
+                    .unwrap_or("empty")
+                    .to_string();
+                let level = report
+                    .get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-");
+                let tokens = report
+                    .get("total_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let tools = report
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                self.harness_eval_status = Some(status.clone());
+                self.harness_eval_summary = Some(format!(
+                    "level={level} status={status} tokens={tokens} tools={tools}"
+                ));
+                self.action_status = Some("harness_eval.latest succeeded".to_string());
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.harness_eval_status = Some("unavailable".to_string());
+                self.harness_eval_summary = Some(error.clone());
+                self.action_status = Some(format!("harness_eval.latest failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
     // ── Rendering helpers ────────────────────────────────────────
 
     /// Build the title string for the block border.
@@ -287,7 +331,7 @@ impl Component for GatewayPanel {
             status,
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop  c consume  C cancel  y retry  t steward tick",
+            "Keys: r refresh  h health  s start/stop  e eval  E smoke",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.action_status {
@@ -300,6 +344,18 @@ impl Component for GatewayPanel {
             lines.push(Line::from(vec![
                 Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(receipt.clone(), Style::default().fg(Color::Green)),
+            ]));
+        }
+        if let Some(summary) = &self.harness_eval_summary {
+            let color = match self.harness_eval_status.as_deref() {
+                Some("passed" | "completed") => Color::Green,
+                Some("failed" | "gated") => Color::Yellow,
+                Some("empty") | None => Color::DarkGray,
+                _ => Color::Cyan,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("HarnessEval: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(color)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1104,7 +1160,7 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k scroll  PgUp/PgDn page  c consume  C cancel  y retry  t steward tick",
+            "Keys: j/k scroll  PgUp/PgDn page  e eval  E smoke  c consume  C cancel  y retry  t steward tick",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1158,6 +1214,7 @@ impl Component for GatewayPanel {
             }
             KeyCode::Char('r') => EventResult::Consumed, // refresh
             KeyCode::Char('h') => EventResult::Consumed, // health check
+            KeyCode::Char('e') | KeyCode::Char('E') => EventResult::Consumed, // harness eval
             KeyCode::Char('s') => EventResult::Consumed, // start/stop
             _ => EventResult::NotConsumed,
         }

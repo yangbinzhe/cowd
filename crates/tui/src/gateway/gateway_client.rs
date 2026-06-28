@@ -847,6 +847,28 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn harness_eval_latest_report(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/harness-eval/reports/latest").await
+    }
+
+    pub async fn harness_eval_reports(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/harness-eval/reports").await
+    }
+
+    pub async fn harness_eval_run_smoke(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/harness-eval/runs",
+            serde_json::json!({
+                "level": "quick",
+                "budget": "low",
+                "actor": "tui.gateway_panel",
+                "objective": "operator requested harness eval smoke",
+                "allow_real_model": false
+            }),
+        )
+        .await
+    }
+
     pub async fn connector_service_tools(
         &self,
         service: &str,
@@ -1419,6 +1441,9 @@ mod tests {
             "skill_runs",
             "skill_run_detail",
             "skill_action",
+            "harness_eval_latest_report",
+            "harness_eval_reports",
+            "harness_eval_run_smoke",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
             "cross_plane_policy_simulate",
@@ -1438,7 +1463,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 87);
+        assert_eq!(migrated.len(), 90);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));

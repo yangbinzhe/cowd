@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
+harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
 model-protocol = { path = "../model-protocol" }
 storage = { path = "../storage" }

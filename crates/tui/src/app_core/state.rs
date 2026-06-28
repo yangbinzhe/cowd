@@ -2310,6 +2310,21 @@ impl TuiState {
                     .record_action_result("mission.command.retry", result);
                 true
             }
+            KeyCode::Char('e') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.harness_eval_latest_report().await
+                });
+                self.gateway_panel.record_harness_eval_latest(result);
+                true
+            }
+            KeyCode::Char('E') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.harness_eval_run_smoke().await
+                });
+                self.gateway_panel
+                    .record_action_result("harness_eval.run_smoke", result);
+                true
+            }
             KeyCode::Char('t') => {
                 let result = run_gateway_api_blocking(move |client| async move {
                     client

@@ -147,6 +147,22 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         state_dispatch: "tick_mission_steward_scheduler",
         receipt_marker: "GatewayPanel",
     },
+    TuiActionCoverage {
+        action_id: "harness_eval.latest",
+        gateway_route: "/api/harness-eval/reports/latest",
+        client_method: "harness_eval_latest_report",
+        panel_key: "e eval",
+        state_dispatch: "harness_eval_latest_report",
+        receipt_marker: "record_harness_eval_latest",
+    },
+    TuiActionCoverage {
+        action_id: "harness_eval.run_smoke",
+        gateway_route: "/api/harness-eval/runs",
+        client_method: "harness_eval_run_smoke",
+        panel_key: "E smoke",
+        state_dispatch: "harness_eval_run_smoke",
+        receipt_marker: "record_action_result",
+    },
 ];
 
 pub fn action_coverage_summary() -> Vec<&'static str> {
@@ -170,6 +186,8 @@ mod tests {
     const SKILL_ROUTES: &str = include_str!("../../../gateway/src/api_routes/skill_routes.rs");
     const RUNTIME_ROUTES: &str = include_str!("../../../gateway/src/api_routes/runtime_routes.rs");
     const MISSION_ROUTES: &str = include_str!("../../../gateway/src/api_routes/mission_routes.rs");
+    const HARNESS_EVAL_ROUTES: &str =
+        include_str!("../../../gateway/src/api_routes/harness_eval_routes.rs");
 
     #[test]
     fn action_coverage_has_expected_core_actions() {
@@ -181,13 +199,20 @@ mod tests {
         assert!(ids.contains(&"skill.run"));
         assert!(ids.contains(&"mission.session_command.consume"));
         assert!(ids.contains(&"agent.interrupt"));
-        assert!(ids.len() >= 17);
+        assert!(ids.contains(&"harness_eval.run_smoke"));
+        assert!(ids.len() >= 19);
     }
 
     #[test]
     fn action_coverage_links_routes_client_panels_and_state_dispatch() {
-        let route_sources =
-            [SURFACE_ROUTES, SKILL_ROUTES, RUNTIME_ROUTES, MISSION_ROUTES].join("\n");
+        let route_sources = [
+            SURFACE_ROUTES,
+            SKILL_ROUTES,
+            RUNTIME_ROUTES,
+            MISSION_ROUTES,
+            HARNESS_EVAL_ROUTES,
+        ]
+        .join("\n");
         let panel_sources =
             [SURFACE_PANEL, SKILLS_PANEL, GATEWAY_PANEL, AGENT_TEAM_PANEL].join("\n");
         for action in REQUIRED_ACTIONS {
@@ -230,6 +255,57 @@ mod tests {
             assert!(
                 panel_sources.contains(action.receipt_marker)
                     || STATE.contains(action.receipt_marker),
+                "{} receipt marker missing: {}",
+                action.action_id,
+                action.receipt_marker
+            );
+        }
+    }
+
+    #[test]
+    fn harness_eval_action_coverage_links_gateway_routes_and_tui_dispatch() {
+        let route_sources = HARNESS_EVAL_ROUTES;
+        let client_source = GATEWAY_CLIENT;
+        let panel_source = GATEWAY_PANEL;
+        let state_source = STATE;
+
+        for action in REQUIRED_ACTIONS
+            .iter()
+            .filter(|action| action.action_id.starts_with("harness_eval."))
+        {
+            let route_fragments = action
+                .gateway_route
+                .split('/')
+                .filter(|part| !part.is_empty() && !part.starts_with(':'))
+                .collect::<Vec<_>>();
+            assert!(
+                route_fragments
+                    .iter()
+                    .all(|fragment| route_sources.contains(fragment)),
+                "{} route missing: {}",
+                action.action_id,
+                action.gateway_route
+            );
+            assert!(
+                client_source.contains(action.client_method),
+                "{} client method missing: {}",
+                action.action_id,
+                action.client_method
+            );
+            assert!(
+                panel_source.contains(action.panel_key),
+                "{} panel key hint missing: {}",
+                action.action_id,
+                action.panel_key
+            );
+            assert!(
+                state_source.contains(action.state_dispatch),
+                "{} state dispatch missing: {}",
+                action.action_id,
+                action.state_dispatch
+            );
+            assert!(
+                panel_source.contains(action.receipt_marker),
                 "{} receipt marker missing: {}",
                 action.action_id,
                 action.receipt_marker
