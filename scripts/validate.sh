@@ -202,7 +202,7 @@ run_full_regression() {
 run_contract() {
   run_step cargo_fmt cargo fmt --all --check
   run_step cargo_check_workspace cargo check --workspace --all-targets
-  for pkg in approval cli connector fact-kernel harness-contract harness-eval matrix-core model-protocol plugins provider session skill-service storage surface tools; do
+  for pkg in approval cli connector fact-kernel harness-contract harness-eval matrix-core model-protocol plugins provider session skill storage surface tools; do
     run_step "cargo_test_$pkg" cargo test -p "$pkg" --all-targets
   done
   run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture

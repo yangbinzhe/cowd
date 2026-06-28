@@ -11,7 +11,7 @@ map_crate() {
   case "$path" in
     crates/matrix/core/*) echo "matrix-core" ;;
     crates/matrix/repository/*) echo "matrix-repository" ;;
-    crates/skill/service/*) echo "skill-service" ;;
+    crates/skill/service/*) echo "skill" ;;
     crates/*/*)
       local name
       name="$(printf '%s\n' "$path" | cut -d/ -f2)"
@@ -93,4 +93,3 @@ for package in $packages; do
       ;;
   esac
 done
-

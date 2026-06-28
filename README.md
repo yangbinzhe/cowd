@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.409`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.414`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -226,8 +226,16 @@ Gateway 按 manifest 提供：
 | `GET /api/surfaces/:id/events` | managed sidecar event buffer |
 | `GET /api/surfaces/:id/routes` | surface route 摘要 |
 | `GET /api/surfaces/:id/resources` | surface static resource 摘要 |
+| `GET /api/surfaces/:id/inbox` | 持久 inbound 消息账本 |
+| `GET /api/surfaces/:id/outbox` | 持久 outbound 投递账本 |
+| `GET /api/surfaces/:id/deliveries` | surface delivery event 账本 |
+| `POST /api/surfaces/:id/inbox/:message_id/replay` | 重放 inbound 消息，复用 ingress/runtime 链路 |
+| `POST /api/surfaces/:id/outbox/:delivery_id/retry` | 重试失败或待重试 outbound delivery |
+| `POST /api/surfaces/:id/outbox/:delivery_id/dead-letter` | 将 outbound delivery 移入 DLQ |
 | `GET /s/:surface/*path` | surface 静态资源转发 |
 | `GET|POST /surface-callback/:surface/*path` | callback/webhook 转发 |
+
+Surface 可靠消息层由 Gateway `SurfaceHost` 持有。inbound 先写持久 inbox 再进入 runtime，outbound 先写 outbox 再投递 sidecar；失败会进入 `retry_scheduled` 或 `dead_letter`，重试有 `max_attempts` 与 backoff，不依赖 sidecar 内部重试作为唯一可靠性来源。Runtime 仍不持有 surface/channel SDK。
 
 ### 4.3 WebUI
 
@@ -271,6 +279,22 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 - 顶部状态条展示 Gateway/session、turn 状态、display mode、context/memory/reality evidence 摘要。
 - `Control Deck` 聚合 Gateway、Runtime readiness、session、lease、task、approval、surface、Reality Core、Fact Flow 和 degraded signal。
 - TUI 不直接读取 runtime/channel/provider/store，不越过 Gateway 查内部表。
+- Surface 面板提供轻量可靠消息操作：`i/o/v` 查看 inbox/outbox/delivery events，`p/d/D` 执行 replay/retry/DLQ。
+
+### 4.5 Harness Eval 服务化
+
+`crates/harness-eval` 不再只是离线 CLI 报告。报告 DTO、store 和 runner 已成为 library API，Gateway 通过 `/api/harness-eval/*` 暴露评测报告、场景矩阵和 smoke run：
+
+| API | 用途 |
+|---|---|
+| `GET /api/harness-eval/reports` | 历史评测报告列表 |
+| `GET /api/harness-eval/reports/latest` | 最新评测健康摘要 |
+| `GET /api/harness-eval/reports/:id` | 单份评测报告详情 |
+| `GET /api/harness-eval/scenarios` | stable AI 场景矩阵 |
+| `GET /api/harness-eval/runs` | 评测 run 历史 |
+| `POST /api/harness-eval/runs` | 触发 quick/full deterministic smoke run |
+
+默认 Gateway/WebUI/TUI 只触发无真实 provider token 消耗的 deterministic smoke。deep/real model 路径必须显式授权，防止评测面板误耗 token。
 
 常用终端快捷键：
 
@@ -467,7 +491,7 @@ gateway
   -> provider / model-protocol / mcp
   -> memory / fact-kernel / matrix-core / matrix-repository
   -> approval / session / harness-contract
-  -> skill-service / plugins
+  -> skill / plugins
   -> connector / surface
   -> app-mfg
 
@@ -481,7 +505,7 @@ runtime
 
 tools
   -> harness-contract
-  -> mcp / plugins / skill-service
+  -> mcp / plugins / skill
   -> no runtime/provider dependency
 
 fact-kernel
@@ -606,8 +630,9 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
-- Harness Eval 已具备 quick/full/deep 三层验证报告，并在 quick/full/deep 公共 deterministic loop 中验证 runtime capability domains 覆盖情况。
-- 版本标签：`v0.9.409`。
+- Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
+- SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
+- 版本标签：`v0.9.414`。
 
 ### 11.2 是否达到当前阶段目标
 
@@ -634,7 +659,7 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Steward 目前具备 tick 和 ledger，但长期托管执行还需要后台循环、预算、策略退避、审批超时、失败降级和汇报生成的完整服务化。
 - Team Execution 目前能派发任务和记录证据，但还需要真实并行 agent 执行、角色依赖阻塞、最终 synthesis、review gate、人类插手、agent 间互阅输出的强闭环。
 - Mission Control 的自然语言控制还没有完全成为一等能力。现在 API/命令底座存在，但“用户在一个高级视窗里用自然语言管理全部 session/agent/team/steward”的体验还需要 WebUI/TUI 继续上层实现。
-- Harness Eval 已能证明核心链路健康，但测试矩阵还缺少长时间压测、并发 session、真实 sidecar、持久化重启、故障注入、权限审批超时、跨 surface 多入口投递等场景。
+- Harness Eval 与 Surface 可靠消息层已能证明核心链路健康和投递可恢复，但测试矩阵还缺少长时间压测、并发 session、大量真实 sidecar、故障注入、权限审批超时、跨 surface 多入口投递等场景。
 
 ### 11.4 下一步演进原则
 
