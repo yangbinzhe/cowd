@@ -1,6 +1,7 @@
 pub mod generation;
 pub mod inspect;
 pub mod maintenance;
+pub mod run;
 pub mod skill_manifest;
 pub mod skill_registry;
 pub mod skill_router;
@@ -10,6 +11,10 @@ pub mod skill_tools;
 pub use generation::{generate_skill_draft, SkillGenerationContext, SkillGenerationTrigger};
 pub use inspect::{inspect_skill_package, profile_skill_package};
 pub use maintenance::{evaluate_skill_maintenance, SkillMaintenanceAction, SkillUsageSignal};
+pub use run::{
+    SkillActionKind, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord,
+    SkillRunStatus,
+};
 pub use skill_manifest::{
     check_prerequisites, get_config_vars, get_related_skills, get_skill_description,
     get_skill_name, get_tags, matches_platform, parse_skill_content, parse_skill_file, Platform,

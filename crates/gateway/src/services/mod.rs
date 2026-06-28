@@ -60,8 +60,8 @@ pub(crate) use session_service::{
 };
 pub(crate) use skill_service::profile_provider::runtime_skill_profiles_for_workspace;
 pub(crate) use skill_service::{
-    SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest, SkillProjectionQuery,
-    SkillServiceError,
+    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
+    SkillProjectionQuery, SkillServiceError,
 };
 pub(crate) use slash_controller::SlashController;
 pub(crate) use surface_service::SurfaceService;

@@ -359,8 +359,12 @@ pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
             "catalog.read",
             "skill.view",
             "skill.profile",
+            "skill.validate",
+            "skill.plan",
+            "skill.run",
             "skill.import",
             "skill.maintenance.evaluate",
+            "run.watch",
             "evidence.summary",
             "governance.queue",
         ],
@@ -368,8 +372,12 @@ pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
             "catalog.read",
             "skill.view",
             "skill.profile",
+            "skill.validate",
+            "skill.plan",
+            "skill.run",
             "skill.import",
             "skill.maintenance.evaluate",
+            "run.watch",
             "evidence.timeline",
             "evidence.diff",
             "governance.bulk",
@@ -402,6 +410,24 @@ pub(super) fn projection_actions(surface: &str) -> Vec<SkillAction> {
     ];
     if surface != "cli" {
         actions.extend([
+            SkillAction {
+                id: "validate",
+                label: "Validate",
+                surface: "webui,tui",
+                mutation: false,
+            },
+            SkillAction {
+                id: "plan",
+                label: "Plan",
+                surface: "webui,tui",
+                mutation: false,
+            },
+            SkillAction {
+                id: "run",
+                label: "Run",
+                surface: "webui,tui",
+                mutation: true,
+            },
             SkillAction {
                 id: "import",
                 label: "Import",
@@ -547,14 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn generic_projection_exposes_governance_not_execution_actions() {
+    fn generic_projection_exposes_readiness_backed_skill_actions() {
         let webui_capabilities = projection_capabilities("webui");
         assert!(webui_capabilities.contains(&"skill.profile"));
         assert!(webui_capabilities.contains(&"skill.maintenance.evaluate"));
-        assert!(!webui_capabilities.contains(&"skill.validate"));
-        assert!(!webui_capabilities.contains(&"skill.plan"));
-        assert!(!webui_capabilities.contains(&"skill.run"));
-        assert!(!webui_capabilities.contains(&"run.watch"));
+        assert!(webui_capabilities.contains(&"skill.validate"));
+        assert!(webui_capabilities.contains(&"skill.plan"));
+        assert!(webui_capabilities.contains(&"skill.run"));
+        assert!(webui_capabilities.contains(&"run.watch"));
 
         let action_ids = projection_actions("webui")
             .iter()
@@ -563,9 +589,9 @@ mod tests {
         assert!(action_ids.contains(&"view"));
         assert!(action_ids.contains(&"profile"));
         assert!(action_ids.contains(&"maintenance_evaluate"));
-        assert!(!action_ids.contains(&"validate"));
-        assert!(!action_ids.contains(&"plan"));
-        assert!(!action_ids.contains(&"run"));
+        assert!(action_ids.contains(&"validate"));
+        assert!(action_ids.contains(&"plan"));
+        assert!(action_ids.contains(&"run"));
         assert!(!action_ids.contains(&"watch"));
     }
 }

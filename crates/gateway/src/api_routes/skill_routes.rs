@@ -9,9 +9,10 @@ use axum::{
 };
 
 use crate::services::{
-    SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest, SkillProjectionQuery,
-    SkillServiceError,
+    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
+    SkillProjectionQuery, SkillServiceError,
 };
+use skill::SkillActionKind;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -19,9 +20,23 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/skills/catalog", get(skills_catalog_handler))
         .route("/api/skills/projection", get(skills_projection_handler))
+        .route("/api/skills/runs", get(skill_runs_handler))
+        .route("/api/skills/runs/:id", get(skill_run_detail_handler))
         .route(
             "/api/skills/maintenance/evaluate",
             post(skill_maintenance_evaluate_handler),
+        )
+        .route(
+            "/api/skills/:id/actions/validate",
+            post(skill_action_validate_handler),
+        )
+        .route(
+            "/api/skills/:id/actions/plan",
+            post(skill_action_plan_handler),
+        )
+        .route(
+            "/api/skills/:id/actions/run",
+            post(skill_action_run_handler),
         )
         .route("/api/skills/:id/files", get(skill_files_handler))
         .route("/api/skills/:id/files/raw", get(skill_file_raw_handler))
@@ -52,6 +67,29 @@ async fn skills_projection_handler(
         .map_err(skill_error)
 }
 
+async fn skill_runs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .skill
+        .runs(&state.config_home)
+        .map(Json)
+        .map_err(skill_error)
+}
+
+async fn skill_run_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .skill
+        .run_detail(&state.config_home, &id)
+        .map(Json)
+        .map_err(skill_error)
+}
+
 async fn skill_maintenance_evaluate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<SkillMaintenanceEvaluateRequest>,
@@ -60,6 +98,50 @@ async fn skill_maintenance_evaluate_handler(
         .services
         .skill
         .maintenance_evaluate(request)
+        .map(Json)
+        .map_err(skill_error)
+}
+
+async fn skill_action_validate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    skill_action_handler(state, id, SkillActionKind::Validate, request)
+}
+
+async fn skill_action_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    skill_action_handler(state, id, SkillActionKind::Plan, request)
+}
+
+async fn skill_action_run_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    skill_action_handler(state, id, SkillActionKind::Run, request)
+}
+
+fn skill_action_handler(
+    state: Arc<AppState>,
+    id: String,
+    action: SkillActionKind,
+    request: SkillActionRequest,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .skill
+        .run_action(
+            &state.workspace_root,
+            &state.config_home,
+            &id,
+            action,
+            request,
+        )
         .map(Json)
         .map_err(skill_error)
 }

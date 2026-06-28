@@ -67,6 +67,7 @@ mod mission_routes;
 mod profile_routes;
 mod public_routes;
 mod reality_routes;
+pub(crate) mod route_manifest;
 mod runtime_routes;
 mod session_routes;
 mod skill_routes;
@@ -905,6 +906,68 @@ mod tests {
         assert_eq!(json["request_id"], "route-req-1");
         assert_eq!(json["skill_id"], "plan-review");
         assert_eq!(json["action"], "generate_revision_candidate");
+    }
+
+    #[tokio::test]
+    async fn skill_lifecycle_routes_create_and_list_real_runs() {
+        let workspace = test_temp_dir("skill-lifecycle-workspace");
+        let config_home = test_temp_dir("skill-lifecycle-config");
+        let skill_root = workspace.join(".cowd").join("skills").join("route-demo");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: route-demo\ndescription: Route demo\n---\n# Route Demo\n",
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+        let validate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/local:route-demo/actions/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_id": "route-test"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(validate.status(), StatusCode::OK);
+        let validate_body = to_bytes(validate.into_body(), usize::MAX).await.unwrap();
+        let validate_json: serde_json::Value = serde_json::from_slice(&validate_body).unwrap();
+        assert_eq!(validate_json["kind"], "skills.action.receipt");
+        assert_eq!(validate_json["receipt"]["status"], "succeeded");
+        let run_id = validate_json["run"]["run_id"].as_str().unwrap();
+
+        let runs = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/skills/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runs.status(), StatusCode::OK);
+        let runs_body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
+        let runs_json: serde_json::Value = serde_json::from_slice(&runs_body).unwrap();
+        assert_eq!(runs_json["kind"], "skills.runs");
+        assert!(runs_json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run_id"] == run_id));
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]

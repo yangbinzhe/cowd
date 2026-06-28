@@ -1,10 +1,17 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    hash::{Hash, Hasher},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::command::slash::SkillSlashDispatch;
+use chrono::Utc;
 use serde::Deserialize;
 use skill::{
-    evaluate_skill_maintenance, SkillMaintenanceAction, SkillManager, SkillUsageSignal,
-    SkillViewInput,
+    evaluate_skill_maintenance, inspect_skill_package, SkillActionKind, SkillMaintenanceAction,
+    SkillManager, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord, SkillRunStatus,
+    SkillUsageSignal, SkillViewInput,
 };
 
 use super::{ServiceEnvelope, SkillService};
@@ -12,6 +19,7 @@ use super::{ServiceEnvelope, SkillService};
 mod local_command;
 pub(crate) mod profile_provider;
 mod projection;
+mod run_store;
 use local_command::{
     classify_static_skill_command, discover_skill_root_paths, help_path_from_args, install_skill,
     is_help_arg, local_skill_summaries, normalize_optional_args, render_skill_install_report,
@@ -60,6 +68,18 @@ pub(crate) struct SkillMaintenanceEvaluateRequest {
 pub(crate) struct SkillFileQuery {
     #[serde(default)]
     pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SkillActionRequest {
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) objective: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -299,8 +319,8 @@ impl SkillService {
             actions: projection_actions(&surface),
             facets: projection_facets(&items),
             queue: SkillProjectionQueue {
-                source: "mfg.skill_runs",
-                run_list_endpoint: "/api/apps/mfg/incidents/:incident_id/skills",
+                source: "gateway.skill_runs",
+                run_list_endpoint: "/api/skills/runs",
                 supports_watch: surface != "cli",
             },
             governance: SkillProjectionGovernance {
@@ -342,6 +362,93 @@ impl SkillService {
             "usage_signal": signal,
             "action": maintenance_action_wire(&action),
             "reason": maintenance_action_reason(&action),
+        }))
+    }
+
+    pub(crate) fn runs(&self, config_home: &Path) -> Result<serde_json::Value, SkillServiceError> {
+        let items = run_store::load_runs(config_home)?;
+        Ok(serde_json::json!({
+            "kind": "skills.runs",
+            "schema_version": 1,
+            "store": "gateway.skill.runs.jsonl",
+            "count": items.len(),
+            "items": items,
+        }))
+    }
+
+    pub(crate) fn run_detail(
+        &self,
+        config_home: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let run = run_store::find_run(config_home, run_id)?;
+        Ok(serde_json::json!({
+            "kind": "skills.run.detail",
+            "schema_version": 1,
+            "run": run,
+        }))
+    }
+
+    pub(crate) fn run_action(
+        &self,
+        workspace_root: &Path,
+        config_home: &Path,
+        id: &str,
+        action: SkillActionKind,
+        request: SkillActionRequest,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let item = find_catalog_item(workspace_root, id)?;
+        let now = Utc::now().to_rfc3339();
+        let run_id = skill_run_id(&item.id, action);
+        let inspection = inspect_skill_item(&item);
+        let (inspection, inspection_error) = match inspection {
+            Ok(inspection) => (inspection, None),
+            Err(error) => (None, Some(error.message())),
+        };
+        let plan = skill_run_plan(&item, action, inspection.as_ref(), &request);
+        let blocked_reasons = skill_action_blockers(
+            &item,
+            action,
+            inspection.as_ref(),
+            inspection_error.as_deref(),
+        );
+        let status = if inspection_error.is_some() {
+            SkillRunStatus::Failed
+        } else if blocked_reasons.is_empty() {
+            SkillRunStatus::Succeeded
+        } else {
+            SkillRunStatus::Rejected
+        };
+        let receipt = SkillRunReceipt {
+            run_id: run_id.clone(),
+            skill_id: item.id.clone(),
+            action,
+            status,
+            reason: skill_action_reason(action, status, inspection_error.as_deref()),
+            risk_level: item.risk.clone(),
+            blocked_reasons,
+            tool_permission_summary: tool_permission_summary(&item, action, status),
+            evidence: skill_run_evidence(&item, inspection.as_ref(), request.payload.as_ref()),
+        };
+        let record = SkillRunRecord {
+            run_id: run_id.clone(),
+            skill_id: item.id.clone(),
+            action,
+            status,
+            created_at: now.clone(),
+            updated_at: now,
+            session_id: request.session_id,
+            inspection,
+            plan: Some(plan),
+            receipt: Some(receipt.clone()),
+            error: inspection_error,
+        };
+        run_store::append_run(config_home, &record)?;
+        Ok(serde_json::json!({
+            "kind": "skills.action.receipt",
+            "schema_version": 1,
+            "run": record,
+            "receipt": receipt,
         }))
     }
 
@@ -420,6 +527,203 @@ impl SkillService {
             "content": content,
         }))
     }
+}
+
+fn skill_run_id(skill_id: &str, action: SkillActionKind) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    skill_id.hash(&mut hasher);
+    action.as_str().hash(&mut hasher);
+    millis.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    format!("skillrun-{millis}-{:08x}", hasher.finish() as u32)
+}
+
+fn inspect_skill_item(
+    item: &projection::SkillCatalogItem,
+) -> Result<Option<harness_contract::skill::SkillInspectionReport>, SkillServiceError> {
+    if item.scope == "mfg" {
+        return Ok(None);
+    }
+    let root = local_skill_root(item)?;
+    inspect_skill_package(&root)
+        .map(Some)
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))
+}
+
+fn skill_run_plan(
+    item: &projection::SkillCatalogItem,
+    action: SkillActionKind,
+    inspection: Option<&harness_contract::skill::SkillInspectionReport>,
+    request: &SkillActionRequest,
+) -> SkillRunPlan {
+    let mut steps = vec![
+        format!("resolve skill `{}` from gateway catalog", item.id),
+        "inspect package structure and risk signals".to_string(),
+        "summarize required tool permissions before side effects".to_string(),
+    ];
+    if matches!(action, SkillActionKind::Run) {
+        steps.push(
+            "hand execution intent to tools permission gate before any script/runtime action"
+                .to_string(),
+        );
+    }
+    if let Some(objective) = request
+        .objective
+        .as_deref()
+        .filter(|item| !item.trim().is_empty())
+    {
+        steps.push(format!("apply caller objective: {}", objective.trim()));
+    }
+    if let Some(reason) = request
+        .reason
+        .as_deref()
+        .filter(|item| !item.trim().is_empty())
+    {
+        steps.push(format!("record operator reason: {}", reason.trim()));
+    }
+
+    let mut required_tools = item.tools.clone();
+    if required_tools.is_empty()
+        && inspection.is_some_and(|report| !report.entrypoints.is_empty())
+        && matches!(action, SkillActionKind::Run)
+    {
+        required_tools.push("tools.permission_gate".to_string());
+    }
+
+    SkillRunPlan {
+        summary: format!(
+            "{} skill `{}` through Gateway skill lifecycle",
+            action.as_str(),
+            item.id
+        ),
+        steps,
+        required_tools,
+        expected_side_effects: if matches!(action, SkillActionKind::Run) {
+            vec!["no direct side effect before tools permission approval".to_string()]
+        } else {
+            vec!["none".to_string()]
+        },
+    }
+}
+
+fn skill_action_blockers(
+    item: &projection::SkillCatalogItem,
+    action: SkillActionKind,
+    inspection: Option<&harness_contract::skill::SkillInspectionReport>,
+    inspection_error: Option<&str>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if let Some(error) = inspection_error {
+        blockers.push(format!("inspection_failed: {error}"));
+    }
+    if let Some(report) = inspection {
+        blockers.extend(report.blocked_reasons.clone());
+        if matches!(action, SkillActionKind::Run)
+            && report.recommended_adapters.iter().any(|adapter| {
+                !matches!(
+                    adapter,
+                    harness_contract::skill::SkillAdapterKind::PromptOnly
+                        | harness_contract::skill::SkillAdapterKind::ToolGuided
+                )
+            })
+        {
+            blockers.push(
+                "runtime execution requires an installed tools adapter and explicit permission"
+                    .to_string(),
+            );
+        }
+    }
+    if matches!(action, SkillActionKind::Run) && matches!(item.risk.as_str(), "high" | "critical") {
+        blockers.push("high risk skill run requires explicit approval/tool gate".to_string());
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+fn skill_action_reason(
+    action: SkillActionKind,
+    status: SkillRunStatus,
+    inspection_error: Option<&str>,
+) -> String {
+    if let Some(error) = inspection_error {
+        return format!("inspection failed before {}: {error}", action.as_str());
+    }
+    match (action, status) {
+        (SkillActionKind::Validate, SkillRunStatus::Succeeded) => {
+            "skill package validated and governance receipt recorded".to_string()
+        }
+        (SkillActionKind::Plan, SkillRunStatus::Succeeded) => {
+            "skill execution plan generated without side effects".to_string()
+        }
+        (SkillActionKind::Run, SkillRunStatus::Succeeded) => {
+            "skill run intent accepted without direct script execution".to_string()
+        }
+        (_, SkillRunStatus::Rejected) => {
+            "skill action rejected until required tool permission or adapter is available"
+                .to_string()
+        }
+        (_, SkillRunStatus::Failed) => "skill action failed".to_string(),
+        (_, SkillRunStatus::Queued | SkillRunStatus::Running) => "skill action pending".to_string(),
+    }
+}
+
+fn tool_permission_summary(
+    item: &projection::SkillCatalogItem,
+    action: SkillActionKind,
+    status: SkillRunStatus,
+) -> String {
+    if !matches!(action, SkillActionKind::Run) {
+        return "no tool execution requested".to_string();
+    }
+    if status == SkillRunStatus::Rejected {
+        return "direct execution blocked; tools permission gate must approve runtime adapter"
+            .to_string();
+    }
+    if item.tools.is_empty() {
+        "prompt-only skill activation recorded; no tool invocation was executed".to_string()
+    } else {
+        format!(
+            "tool intent recorded for permission gate: {}",
+            item.tools.join(", ")
+        )
+    }
+}
+
+fn skill_run_evidence(
+    item: &projection::SkillCatalogItem,
+    inspection: Option<&harness_contract::skill::SkillInspectionReport>,
+    payload: Option<&serde_json::Value>,
+) -> Vec<SkillRunEvidence> {
+    let mut evidence = vec![SkillRunEvidence {
+        kind: "skill.catalog".to_string(),
+        summary: format!("resolved `{}` from {} scope", item.id, item.scope),
+        refs: item.path.clone().into_iter().collect(),
+    }];
+    if let Some(report) = inspection {
+        evidence.push(SkillRunEvidence {
+            kind: "skill.inspection".to_string(),
+            summary: format!(
+                "{} files, {} entrypoints, {} risk signals",
+                report.detected_files.len(),
+                report.entrypoints.len(),
+                report.risk_signals.len()
+            ),
+            refs: report.detected_files.iter().take(12).cloned().collect(),
+        });
+    }
+    if payload.is_some() {
+        evidence.push(SkillRunEvidence {
+            kind: "skill.request.payload".to_string(),
+            summary: "caller supplied action payload".to_string(),
+            refs: Vec::new(),
+        });
+    }
+    evidence
 }
 
 fn maintenance_action_wire(action: &SkillMaintenanceAction) -> &'static str {

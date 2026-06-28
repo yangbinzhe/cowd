@@ -26,6 +26,9 @@ pub struct CowdReleaseGateRuntimeEvidence {
     pub execution_outcome_timeline_available: bool,
     pub memory_context_bridge_available: bool,
     pub graph_skill_quality_contracts_available: bool,
+    pub gateway_route_manifest_available: bool,
+    pub frontend_api_matrix_ready: bool,
+    pub surface_version_compatible: bool,
 }
 
 impl CowdReleaseGateRuntimeEvidence {
@@ -37,6 +40,9 @@ impl CowdReleaseGateRuntimeEvidence {
             execution_outcome_timeline_available: false,
             memory_context_bridge_available: false,
             graph_skill_quality_contracts_available: false,
+            gateway_route_manifest_available: false,
+            frontend_api_matrix_ready: false,
+            surface_version_compatible: false,
         }
     }
 
@@ -48,6 +54,9 @@ impl CowdReleaseGateRuntimeEvidence {
             execution_outcome_timeline_available: true,
             memory_context_bridge_available: true,
             graph_skill_quality_contracts_available: true,
+            gateway_route_manifest_available: true,
+            frontend_api_matrix_ready: true,
+            surface_version_compatible: true,
         }
     }
 }
@@ -112,6 +121,21 @@ impl CowdReleaseGateReport {
                 "graph_skill_quality.contracts",
                 evidence.graph_skill_quality_contracts_available,
                 "Graph, skill dependency and quality gate contracts consume structured refs.",
+            ),
+            check(
+                "gateway.route_manifest.available",
+                evidence.gateway_route_manifest_available,
+                "Gateway route manifest is machine-readable and implementation-backed.",
+            ),
+            check(
+                "frontend.api_matrix.ready",
+                evidence.frontend_api_matrix_ready,
+                "WebUI API matrix gate is available for UI-called backend route checks.",
+            ),
+            check(
+                "surface.version.compatible",
+                evidence.surface_version_compatible,
+                "Surface repository version compatibility gate is available.",
             ),
         ];
         let status = if checks.iter().all(|check| check.status == "pass") {
@@ -181,6 +205,9 @@ mod tests {
             execution_outcome_timeline_available: false,
             memory_context_bridge_available: false,
             graph_skill_quality_contracts_available: false,
+            gateway_route_manifest_available: false,
+            frontend_api_matrix_ready: false,
+            surface_version_compatible: false,
         });
 
         assert_eq!(report.status, "fail");
@@ -190,5 +217,9 @@ mod tests {
         assert!(report.checks.iter().any(|check| check.check_id
             == "execution_outcome.timeline.available"
             && check.status == "fail"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.check_id == "frontend.api_matrix.ready" && check.status == "fail"));
     }
 }

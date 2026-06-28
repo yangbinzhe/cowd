@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::GatewayMatrixRepositoryError;
 
+use super::route_manifest::gateway_route_manifest;
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -30,6 +31,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/cowd/projection", get(projection_handler))
         .route("/api/cowd/surfaces", get(surfaces_handler))
         .route("/api/cowd/release-gate", get(release_gate_handler))
+        .route("/api/gateway/route-manifest", get(route_manifest_handler))
         .route(
             "/api/cowd/structured/sources",
             get(structured_sources_handler),
@@ -80,6 +82,16 @@ async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
     Json(CowdReleaseGateReport::evaluate_with(
         release_gate_runtime_evidence(&state).await,
     ))
+}
+
+async fn route_manifest_handler() -> impl IntoResponse {
+    let routes = gateway_route_manifest();
+    Json(serde_json::json!({
+        "kind": "gateway.route_manifest",
+        "schema_version": 1,
+        "route_count": routes.len(),
+        "routes": routes,
+    }))
 }
 
 async fn structured_sources_handler(
@@ -230,7 +242,36 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
         memory_context_bridge_available: memory_context_bridge_available(state).await,
         graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(state),
+        gateway_route_manifest_available: gateway_route_manifest_available(),
+        frontend_api_matrix_ready: frontend_api_matrix_ready(),
+        surface_version_compatible: surface_version_compatible(),
     }
+}
+
+fn gateway_route_manifest_available() -> bool {
+    let routes = gateway_route_manifest();
+    let pairs = routes
+        .iter()
+        .map(|entry| (entry.method, entry.path.as_str()))
+        .collect::<BTreeSet<_>>();
+    !routes.is_empty()
+        && pairs.len() == routes.len()
+        && routes
+            .iter()
+            .any(|entry| entry.method == "GET" && entry.path == "/api/gateway/route-manifest")
+        && routes
+            .iter()
+            .any(|entry| entry.method == "GET" && entry.path == "/api/skills/runs")
+}
+
+fn frontend_api_matrix_ready() -> bool {
+    let root = std::path::Path::new("../cowd-surface/surfaces/webui/scripts/api-matrix.mjs");
+    std::env::var_os("COWD_SKIP_FRONTEND_GATE").is_some() || root.is_file()
+}
+
+fn surface_version_compatible() -> bool {
+    let root = std::path::Path::new("../cowd-surface/scripts/surface-version-gate.mjs");
+    std::env::var_os("COWD_SKIP_SURFACE_VERSION_GATE").is_some() || root.is_file()
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {
