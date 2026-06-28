@@ -1485,6 +1485,73 @@ pub struct StableAiHealthReport {
     pub gateway_smoke: String,
     pub surface_smoke: String,
     pub recovery_evidence: String,
+    pub real_capability_result: Option<RealCapabilityGateReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealCapabilityGate {
+    pub name: String,
+    pub status: String,
+    pub required: bool,
+    pub evidence: String,
+}
+
+impl RealCapabilityGate {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        passed: bool,
+        required: bool,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: if passed { "passed" } else { "failed" }.to_string(),
+            required,
+            evidence: evidence.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealCapabilityGateReport {
+    pub kind: String,
+    pub status: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub provider_rounds: usize,
+    pub tool_calls: usize,
+    pub total_tokens: u32,
+    pub gates: Vec<RealCapabilityGate>,
+}
+
+impl RealCapabilityGateReport {
+    #[must_use]
+    pub fn new(
+        gates: Vec<RealCapabilityGate>,
+        provider_rounds: usize,
+        tool_calls: usize,
+        total_tokens: u32,
+    ) -> Self {
+        let total = gates.len();
+        let passed = gates.iter().filter(|gate| gate.status == "passed").count();
+        let failed = gates
+            .iter()
+            .filter(|gate| gate.required && gate.status != "passed")
+            .count();
+        Self {
+            kind: "cowd.real_capability_gate_report".to_string(),
+            status: if failed == 0 { "passed" } else { "failed" }.to_string(),
+            total,
+            passed,
+            failed,
+            provider_rounds,
+            tool_calls,
+            total_tokens,
+            gates,
+        }
+    }
 }
 
 impl StableAiHealthReport {
@@ -1521,6 +1588,43 @@ impl StableAiHealthReport {
             gateway_smoke: gateway_smoke.into(),
             surface_smoke: surface_smoke.into(),
             recovery_evidence: recovery_evidence.into(),
+            real_capability_result: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_real_eval(
+        version: impl Into<String>,
+        provider: impl Into<String>,
+        model: Option<String>,
+        real_provider_reason: impl Into<String>,
+        fake_provider_result: ScenarioSuiteReport,
+        coverage: HarnessCapabilityCoverageReport,
+        gateway_smoke: impl Into<String>,
+        surface_smoke: impl Into<String>,
+        recovery_evidence: impl Into<String>,
+        real_capability_result: RealCapabilityGateReport,
+    ) -> Self {
+        let status = if real_capability_result.failed == 0 && coverage.failed == 0 {
+            "passed"
+        } else {
+            "failed"
+        };
+        Self {
+            kind: "cowd.stable_ai_health_report".to_string(),
+            version: version.into(),
+            status: status.to_string(),
+            provider: provider.into(),
+            model,
+            real_provider_enabled: true,
+            real_provider_reason: real_provider_reason.into(),
+            scenario_matrix: stable_ai_scenario_matrix(),
+            fake_provider_result,
+            coverage,
+            gateway_smoke: gateway_smoke.into(),
+            surface_smoke: surface_smoke.into(),
+            recovery_evidence: recovery_evidence.into(),
+            real_capability_result: Some(real_capability_result),
         }
     }
 }
@@ -1755,6 +1859,104 @@ mod tests {
         assert!(!report.real_provider_enabled);
         assert_eq!(report.real_provider_reason, "real provider not enabled");
         assert_eq!(report.scenario_matrix.len(), 7);
+    }
+
+    #[test]
+    fn real_eval_status_is_decided_by_real_gates_not_fake_baseline() {
+        let fake_failed = ScenarioSuiteReport {
+            total: 1,
+            passed: 0,
+            failed: 1,
+            average_score: 0.0,
+            verdicts: Vec::new(),
+        };
+        let real = RealCapabilityGateReport::new(
+            vec![RealCapabilityGate::new(
+                "real_provider_smoke",
+                true,
+                true,
+                "provider returned OK",
+            )],
+            1,
+            3,
+            120,
+        );
+
+        let report = StableAiHealthReport::from_real_eval(
+            env!("CARGO_PKG_VERSION"),
+            "configured",
+            Some("deepseek-v4-flash".to_string()),
+            "real provider explicitly enabled",
+            fake_failed,
+            passing_coverage_report(),
+            "gateway ok",
+            "surface delegated",
+            "recovery ok",
+            real,
+        );
+
+        assert_eq!(report.status, "passed");
+        assert!(report.real_provider_enabled);
+        assert_eq!(
+            report.real_capability_result.as_ref().unwrap().status,
+            "passed"
+        );
+        assert_eq!(report.fake_provider_result.failed, 1);
+    }
+
+    #[test]
+    fn real_eval_fails_when_required_real_gate_fails() {
+        let fake_passed = ScenarioSuiteReport {
+            total: 1,
+            passed: 1,
+            failed: 0,
+            average_score: 1.0,
+            verdicts: Vec::new(),
+        };
+        let real = RealCapabilityGateReport::new(
+            vec![RealCapabilityGate::new(
+                "real_tool_scenarios",
+                false,
+                true,
+                "tool_calls=0",
+            )],
+            1,
+            0,
+            100,
+        );
+
+        let report = StableAiHealthReport::from_real_eval(
+            env!("CARGO_PKG_VERSION"),
+            "configured",
+            Some("deepseek-v4-flash".to_string()),
+            "real provider explicitly enabled",
+            fake_passed,
+            passing_coverage_report(),
+            "gateway ok",
+            "surface delegated",
+            "recovery ok",
+            real,
+        );
+
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.real_capability_result.as_ref().unwrap().failed, 1);
+    }
+
+    fn passing_coverage_report() -> HarnessCapabilityCoverageReport {
+        HarnessCapabilityCoverageReport {
+            kind: "harness_capability_coverage".to_string(),
+            total: 1,
+            passed: 1,
+            failed: 0,
+            items: vec![HarnessCapabilityCoverageItem {
+                capability: "runtime".to_string(),
+                required: true,
+                present_modules: vec!["runtime".to_string()],
+                lifecycle_modules: Vec::new(),
+                passed: true,
+                repair_hint: "none".to_string(),
+            }],
+        }
     }
 
     #[test]

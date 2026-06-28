@@ -12,8 +12,9 @@ use harness_contract::strategy::{decide_strategy, StrategyInput};
 use harness_eval::{
     evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
     harness_capability_coverage_report, stable_ai_scenario_matrix, ComplexHarnessScenarioReport,
-    E2eScenarioKind, E2eScenarioMatrixItem, ScenarioCheck, ScenarioCheckKind, ScenarioObservation,
-    ScenarioSpec, ScenarioSuite, ScenarioSuiteReport, StableAiHealthReport,
+    E2eScenarioKind, E2eScenarioMatrixItem, RealCapabilityGate, RealCapabilityGateReport,
+    ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+    ScenarioSuiteReport, StableAiHealthReport,
 };
 use runtime::{
     global_mission_runtime, global_session_relation_graph, global_steward_runtime_service,
@@ -539,30 +540,33 @@ fn run_deep(provider: Option<String>, budget: Option<String>) -> MissionHarnessE
         evidence: replay_evidence.clone(),
         notes: "deep preflight recovery report generated".to_string(),
     });
-    let all_scenarios_passed = scenarios.iter().all(|item| item.status == "passed");
-    let stable_ai = StableAiHealthReport::from_fake_eval(
+    let real_capability_result = build_real_capability_gate_report(
+        &scenarios,
+        &complex_scenarios,
+        &real_tool_scenarios,
+        &trace,
+        provider_passed,
+        gateway.0,
+    );
+    let stable_ai = StableAiHealthReport::from_real_eval(
         env!("CARGO_PKG_VERSION"),
         "configured",
         Some(model),
-        true,
         "real provider explicitly enabled",
         fake_provider_scenario_report(),
         harness_capability_coverage_report(),
         gateway.1.clone(),
         "webui/tui smoke delegated to final health lanes",
         replay_evidence,
+        real_capability_result,
     );
     let metrics = build_harness_metrics(&scenarios, &stable_ai);
     trace.finish(started);
+    let status = stable_ai.status.clone();
     MissionHarnessEvalReport {
         kind: "mission_harness.eval_report",
         level: EvalLevel::Deep,
-        status: if provider_passed && gateway.0 && all_scenarios_passed {
-            "passed"
-        } else {
-            "failed"
-        }
-        .to_string(),
+        status,
         provider,
         budget,
         gateway_process: gateway.0,
@@ -2313,6 +2317,12 @@ fn build_harness_metrics(
         scenario.capability == "gateway_contract_surface" && scenario.status == "passed"
     });
 
+    let real_gate = stable_ai
+        .real_capability_result
+        .as_ref()
+        .map(|report| format!("{}/{}", report.passed, report.total))
+        .unwrap_or_else(|| "not_applicable".to_string());
+
     vec![
         HarnessMetric {
             name: "scenario_pass_rate",
@@ -2344,7 +2354,173 @@ fn build_harness_metrics(
             value: format!("{}/{}", stable_ai.coverage.passed, stable_ai.coverage.total),
             notes: "runtime module map required domain coverage".to_string(),
         },
+        HarnessMetric {
+            name: "real_capability_gate",
+            value: real_gate,
+            notes:
+                "deep eval authoritative gate; fake provider remains deterministic baseline only"
+                    .to_string(),
+        },
     ]
+}
+
+fn build_real_capability_gate_report(
+    scenarios: &[CapabilityResult],
+    complex_scenarios: &ComplexHarnessScenarioReport,
+    real_tool_scenarios: &RealToolScenarioReport,
+    trace: &ExecutionTrace,
+    provider_passed: bool,
+    gateway_passed: bool,
+) -> RealCapabilityGateReport {
+    let deep_total = scenarios
+        .iter()
+        .filter(|scenario| scenario.capability.starts_with("deep_harness"))
+        .count();
+    let deep_passed = scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.capability.starts_with("deep_harness") && scenario.status == "passed"
+        })
+        .count();
+    let all_capability_rows_passed = scenarios.iter().all(|scenario| scenario.status == "passed");
+    let real_tool_passed = real_tool_scenarios.passed == real_tool_scenarios.total
+        && real_tool_scenarios.tool_calls > 0;
+    let complex_passed = complex_scenarios.failed == 0 && complex_scenarios.average_score >= 0.9;
+    let structured_reasoning_passed =
+        capability_passed(scenarios, "deep_harness_provider_structured_reasoning");
+    let cross_session_provider_passed =
+        capability_passed(scenarios, "deep_harness_cross_session_provider_dialogue");
+    let knowledge_fabric_passed =
+        capability_passed(scenarios, "knowledge_fabric_context_governance");
+    let recovery_passed = capability_passed(scenarios, "runtime_recovery_report");
+
+    RealCapabilityGateReport::new(
+        vec![
+            RealCapabilityGate::new(
+                "real_provider_smoke",
+                provider_passed,
+                true,
+                capability_evidence(scenarios, "deep_provider_eval"),
+            ),
+            RealCapabilityGate::new(
+                "provider_structured_reasoning",
+                structured_reasoning_passed,
+                true,
+                capability_evidence(scenarios, "deep_harness_provider_structured_reasoning"),
+            ),
+            RealCapabilityGate::new(
+                "provider_cross_session_dialogue",
+                cross_session_provider_passed,
+                true,
+                capability_evidence(scenarios, "deep_harness_cross_session_provider_dialogue"),
+            ),
+            RealCapabilityGate::new(
+                "deep_harness_capabilities",
+                deep_total > 0 && deep_total == deep_passed,
+                true,
+                format!("{deep_passed}/{deep_total} deep_harness rows passed"),
+            ),
+            RealCapabilityGate::new(
+                "real_tool_scenarios",
+                real_tool_passed,
+                true,
+                format!(
+                    "{}/{} real tool scenarios passed; tool_calls={}",
+                    real_tool_scenarios.passed,
+                    real_tool_scenarios.total,
+                    real_tool_scenarios.tool_calls
+                ),
+            ),
+            RealCapabilityGate::new(
+                "complex_scenarios",
+                complex_passed,
+                true,
+                format!(
+                    "{}/{} complex scenarios passed; average_score={:.2}",
+                    complex_scenarios.passed,
+                    complex_scenarios.total,
+                    complex_scenarios.average_score
+                ),
+            ),
+            RealCapabilityGate::new(
+                "knowledge_fabric_context_governance",
+                knowledge_fabric_passed,
+                true,
+                capability_evidence(scenarios, "knowledge_fabric_context_governance"),
+            ),
+            RealCapabilityGate::new(
+                "gateway_contract_surface",
+                gateway_passed,
+                true,
+                capability_evidence(scenarios, "gateway_contract_surface"),
+            ),
+            RealCapabilityGate::new(
+                "runtime_recovery_report",
+                recovery_passed,
+                true,
+                capability_evidence(scenarios, "runtime_recovery_report"),
+            ),
+            RealCapabilityGate::new(
+                "provider_round_evidence",
+                trace.provider_rounds > 0,
+                true,
+                format!(
+                    "provider_rounds={}; total_tokens={}; usage_source={}",
+                    trace.provider_rounds,
+                    trace.total_usage.total_tokens,
+                    trace.total_usage.usage_source
+                ),
+            ),
+            RealCapabilityGate::new(
+                "tool_call_evidence",
+                trace.tool_calls > 0,
+                true,
+                format!("tool_calls={}", trace.tool_calls),
+            ),
+            RealCapabilityGate::new(
+                "all_capability_rows",
+                all_capability_rows_passed,
+                true,
+                failed_capability_evidence(scenarios),
+            ),
+        ],
+        trace.provider_rounds,
+        trace.tool_calls,
+        trace.total_usage.total_tokens,
+    )
+}
+
+fn capability_passed(scenarios: &[CapabilityResult], capability: &str) -> bool {
+    scenarios
+        .iter()
+        .any(|scenario| scenario.capability == capability && scenario.status == "passed")
+}
+
+fn capability_evidence(scenarios: &[CapabilityResult], capability: &str) -> String {
+    scenarios
+        .iter()
+        .find(|scenario| scenario.capability == capability)
+        .map(|scenario| {
+            format!(
+                "status={}; evidence={}",
+                scenario.status,
+                abbreviate(&scenario.evidence, 180)
+            )
+        })
+        .unwrap_or_else(|| "capability row missing".to_string())
+}
+
+fn failed_capability_evidence(scenarios: &[CapabilityResult]) -> String {
+    let failed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status != "passed")
+        .map(|scenario| format!("{}={}", scenario.capability, scenario.status))
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        "all capability rows passed".to_string()
+    } else {
+        failed.join("; ")
+    }
 }
 
 fn fake_provider_scenario_report() -> ScenarioSuiteReport {
@@ -3068,7 +3244,7 @@ fn write_stable_ai_report(
     .map_err(|error| error.to_string())?;
     let mut markdown = format!("# Stable AI Health Report v{version}\n\n");
     markdown.push_str(&format!(
-        "- status: {}\n- provider: {}\n- model: {}\n- real_provider_enabled: {}\n- real_provider_reason: {}\n- fake_provider_scenarios: {}/{}\n- coverage: {}/{}\n- gateway_smoke: {}\n- surface_smoke: {}\n- recovery_evidence: {}\n\n",
+        "- status: {}\n- provider: {}\n- model: {}\n- real_provider_enabled: {}\n- real_provider_reason: {}\n- fake_provider_scenarios: {}/{} (deterministic baseline)\n- coverage: {}/{}\n- gateway_smoke: {}\n- surface_smoke: {}\n- recovery_evidence: {}\n\n",
         report.status,
         report.provider,
         report.model.as_deref().unwrap_or("none"),
@@ -3082,6 +3258,30 @@ fn write_stable_ai_report(
         report.surface_smoke,
         report.recovery_evidence,
     ));
+    if let Some(real) = &report.real_capability_result {
+        markdown.push_str("## Real Capability Gates\n\n");
+        markdown.push_str(&format!(
+            "- status: {}\n- passed: {}/{}\n- required_failed: {}\n- provider_rounds: {}\n- tool_calls: {}\n- total_tokens: {}\n\n",
+            real.status,
+            real.passed,
+            real.total,
+            real.failed,
+            real.provider_rounds,
+            real.tool_calls,
+            real.total_tokens
+        ));
+        markdown.push_str("| Gate | Required | Status | Evidence |\n| --- | --- | --- | --- |\n");
+        for gate in &real.gates {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                gate.name,
+                gate.required,
+                gate.status,
+                markdown_cell(&gate.evidence)
+            ));
+        }
+        markdown.push('\n');
+    }
     markdown.push_str("## Scenario Matrix\n\n");
     markdown.push_str(
         "| Scenario | Kind | Required Evidence | Fake | Real |\n| --- | --- | --- | --- | --- |\n",
@@ -3097,6 +3297,9 @@ fn write_stable_ai_report(
         ));
     }
     markdown.push_str("\n## Fake Provider Verdicts\n\n");
+    markdown.push_str(
+        "This lane is deterministic regression evidence. Deep eval health is decided by real capability gates when present.\n\n",
+    );
     markdown
         .push_str("| Scenario | Passed | Score | Failed Checks |\n| --- | --- | ---: | --- |\n");
     for verdict in &report.fake_provider_result.verdicts {
