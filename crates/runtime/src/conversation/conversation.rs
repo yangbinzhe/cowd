@@ -136,6 +136,12 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
     preview
 }
 
+fn knowledge_hard_gate_active(system_prompt: &[String]) -> bool {
+    system_prompt
+        .iter()
+        .any(|fragment| fragment.contains("<hard_gate action=\"block\">"))
+}
+
 /// Streaming API contract. Implementors produce AssistantEvents lazily.
 /// Consumers poll the stream and process each event as it arrives.
 ///
@@ -1571,7 +1577,12 @@ where
             ));
         self.record_runtime_policy_decision(&complexity, user_sequence);
 
-        let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
+        let mut effective_system_prompt = self.prepare_reality_context(&user_input).await;
+        if knowledge_hard_gate_active(&effective_system_prompt) {
+            let error = RuntimeError::new("knowledge compliance hard gate blocked turn");
+            self.record_turn_failed(0, &error);
+            return Err(error);
+        }
 
         // A2: Inject available peer agents from AgentDirectory into the system prompt.
         if self.inject_peer_context {
@@ -1631,7 +1642,13 @@ where
                             });
                         }
                     }
-                    effective_system_prompt = self.prepare_memory_context(&user_input).await;
+                    effective_system_prompt = self.prepare_reality_context(&user_input).await;
+                    if knowledge_hard_gate_active(&effective_system_prompt) {
+                        let error =
+                            RuntimeError::new("knowledge compliance hard gate blocked turn");
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
                 }
             }
             if self.model_context_window > 0 {
@@ -3028,7 +3045,7 @@ where
     ///
     /// Returns a clone of `self.system_prompt` when memory is disabled so the
     /// hot path has zero cost.
-    async fn prepare_memory_context(&self, user_input: &str) -> Vec<String> {
+    async fn prepare_reality_context(&self, user_input: &str) -> Vec<String> {
         let _perf_start = std::time::Instant::now();
 
         // P5.2: Global invalidation (file changes, max age).
@@ -3333,7 +3350,7 @@ where
         let kernel = MemoryKernel::new(Arc::clone(mgr));
 
         // Convert session messages to memory's Message type for post-turn extraction.
-        // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
+        // DESIGN: Tool blocks are excluded (same rationale as prepare_reality_context).
         let mem_messages: Vec<MemMessage> = self
             .session
             .read()
@@ -5725,7 +5742,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
-        let _ = rt.prepare_memory_context("query").await;
+        let _ = rt.prepare_reality_context("query").await;
         let _ = rt.run_memory_post_turn().await;
     }
 
@@ -5739,7 +5756,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["test prompt".to_string()],
         );
-        let result = rt.prepare_memory_context("test").await;
+        let result = rt.prepare_reality_context("test").await;
         assert_eq!(result[0], "test prompt");
         assert!(
             result
@@ -5760,7 +5777,7 @@ mod tests {
             vec!["stable system".to_string()],
         )
         .without_memory();
-        let prompt = rt.prepare_memory_context("remember this").await;
+        let prompt = rt.prepare_reality_context("remember this").await;
         let envelope = rt
             .last_context_envelope()
             .expect("context envelope should be recorded");
@@ -5798,7 +5815,7 @@ mod tests {
             source: ResumeContextSource::Mixed,
         });
 
-        let prompt = rt.prepare_memory_context("resume").await;
+        let prompt = rt.prepare_reality_context("resume").await;
         let envelope = rt
             .last_context_envelope()
             .expect("context envelope should be recorded");
@@ -5832,7 +5849,7 @@ mod tests {
         );
         rt.remember_tool_trace_from_message(&tool_result);
 
-        let prompt = rt.prepare_memory_context("next turn").await;
+        let prompt = rt.prepare_reality_context("next turn").await;
         let envelope = rt
             .last_context_envelope()
             .expect("context envelope should be recorded");
@@ -5856,7 +5873,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["base prompt".to_string()],
         );
-        let prompt = rt.prepare_memory_context("hello").await;
+        let prompt = rt.prepare_reality_context("hello").await;
         assert!(prompt.len() >= 1, "should have at least system prompt");
     }
 
@@ -5895,7 +5912,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
-        let prompt = rt.prepare_memory_context("test").await;
+        let prompt = rt.prepare_reality_context("test").await;
         assert!(prompt.len() >= 1);
         // Without memory manager, should still return system prompt
         assert!(prompt[0] == "system" || prompt[0].starts_with("system"));
@@ -5926,8 +5943,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["base".to_string()],
         );
-        // Verify that prepare_memory_context doesn't panic with empty session
-        let result = rt.prepare_memory_context("any query").await;
+        // Verify that prepare_reality_context doesn't panic with empty session
+        let result = rt.prepare_reality_context("any query").await;
         assert!(
             !result.is_empty(),
             "should return at least the system prompt"
@@ -5947,7 +5964,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system prompt".to_string()],
         );
-        let prompt = rt.prepare_memory_context("test query").await;
+        let prompt = rt.prepare_reality_context("test query").await;
         // Without selected memories, stable head is followed by runtime header.
         assert_eq!(prompt.len(), 2);
         assert!(prompt[1].contains("profile:MainTurn"));
@@ -6002,14 +6019,14 @@ mod tests {
 
     // ── T2: active session tracking ────────────────────────────
 
-    /// Integration test: verify that `prepare_memory_context` and
+    /// Integration test: verify that `prepare_reality_context` and
     /// `run_memory_post_turn` both call `set_active_session` on the
     /// memory manager before operating.
     ///
     /// Requires tempfile + memory DB, so marked `#[ignore]` for CI.
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_memory_context_sets_active_session() {
+    async fn prepare_reality_context_sets_active_session() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
         let blob_dir = tmp.path().join("blobs");
@@ -6039,15 +6056,15 @@ mod tests {
         )
         .with_memory_manager(mgr.clone());
 
-        // Act — prepare_memory_context should set the active session
-        let _ = rt.prepare_memory_context("test query").await;
+        // Act — prepare_reality_context should set the active session
+        let _ = rt.prepare_reality_context("test query").await;
 
         // Assert — verify the memory manager recorded the session
         let active = mgr.active_session_id();
         assert_eq!(
             active,
             Some(session_id),
-            "active_session should be set after prepare_memory_context"
+            "active_session should be set after prepare_reality_context"
         );
     }
 }

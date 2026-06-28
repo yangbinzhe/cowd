@@ -61,6 +61,8 @@ pub mod effect;
 pub mod execution_outcome;
 #[path = "context/knowledge_activation.rs"]
 pub mod knowledge_activation;
+#[path = "context/knowledge_compliance.rs"]
+pub mod knowledge_compliance;
 #[path = "infrastructure/lane_events.rs"]
 mod lane_events;
 #[path = "infrastructure/lifecycle_hooks.rs"]

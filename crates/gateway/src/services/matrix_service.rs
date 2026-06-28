@@ -4,10 +4,11 @@ use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
     MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlaneHealth,
     MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
-    MatrixEntity, MatrixEntityConflictDecision, MatrixEntityMatchCandidate, MatrixEvidencePacket,
-    MatrixFact, MatrixImpactTrace, MatrixMetricAttentionPlan, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricState,
-    MatrixQualityGateDecision, MatrixRelation, MatrixSourceDeltaPlan, MatrixSourcePack,
+    MatrixEntity, MatrixEntityConflictDecision, MatrixEntityInput, MatrixEntityMatchCandidate,
+    MatrixEvidencePacket, MatrixFact, MatrixFactInput, MatrixImpactTrace,
+    MatrixMetricAttentionPlan, MatrixMetricDefinition, MatrixMetricDependency, MatrixMetricLineage,
+    MatrixMetricSnapshot, MatrixMetricState, MatrixQualityGateDecision, MatrixRelation,
+    MatrixRelationInput, MatrixSourceDeltaPlan, MatrixSourceFactMapping, MatrixSourcePack,
     MatrixSourcePackValidation,
 };
 use matrix_repository::{MatrixHealth, MatrixRepository};
@@ -408,6 +409,105 @@ impl MatrixService {
             .insert_ai_harness_evidence_packet(packet)
     }
 
+    pub(crate) fn ingest_knowledge_bridge(
+        &self,
+        config_home: impl AsRef<Path>,
+        input: memory::KnowledgeMatrixBridgeInput,
+    ) -> Result<Vec<MatrixAttentionItem>, GatewayMatrixRepositoryError> {
+        let repository = self.sqlite_repository(config_home)?;
+        let source_pack = MatrixSourcePack {
+            source_pack_id: input.source_pack_id.clone(),
+            source_name: input.source_name.clone(),
+            owner: "memory.knowledge_fabric".to_string(),
+            access_mode: "internal_bridge".to_string(),
+            refresh_mode: "on_knowledge_pack_update".to_string(),
+            entity_mappings: Vec::new(),
+            fact_mappings: input
+                .facts
+                .iter()
+                .map(|fact| MatrixSourceFactMapping {
+                    source_table: "knowledge_canon".to_string(),
+                    fact_type: fact.fact_type.clone(),
+                    metric_key: fact.fact_type.clone(),
+                    entity_ref_fields: vec!["pack_id".to_string()],
+                    measure_fields: vec!["confidence".to_string()],
+                    dedup_key: fact.fact_id.clone(),
+                    delta_signature: fact.source_ref.clone(),
+                })
+                .collect(),
+            reconciliation_rules: vec!["knowledge_fabric_is_source_of_truth".to_string()],
+            quality_rules: vec!["evidence_ref_required".to_string()],
+            freshness_sla: Some("on_update".to_string()),
+            security_policy: Some("gateway_read_projection_only".to_string()),
+            metadata: serde_json::json!({
+                "kind": "knowledge_matrix_bridge",
+                "pack_id": input.pack_id,
+            }),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        repository.upsert_source_pack(source_pack)?;
+
+        let pack_entity = MatrixEntity::from_input(MatrixEntityInput {
+            entity_id: Some(input.pack_id.clone()),
+            entity_type: "knowledge_pack".to_string(),
+            canonical_key: input.pack_id.clone(),
+            display_name: Some(input.source_name.clone()),
+            source_keys: Vec::new(),
+            attributes: serde_json::json!({"source_pack_id": input.source_pack_id}),
+            confidence: Some(1.0),
+        });
+        repository.upsert_entity(&pack_entity)?;
+        for fact in &input.facts {
+            let fact_entity = MatrixEntity::from_input(MatrixEntityInput {
+                entity_id: Some(fact.fact_id.clone()),
+                entity_type: fact.fact_type.clone(),
+                canonical_key: fact.fact_id.clone(),
+                display_name: Some(fact.summary.clone()),
+                source_keys: Vec::new(),
+                attributes: serde_json::json!({"source_ref": fact.source_ref}),
+                confidence: Some(fact.confidence),
+            });
+            repository.upsert_entity(&fact_entity)?;
+        }
+
+        for relation in input.relations {
+            let matrix_relation = MatrixRelation::from_input(MatrixRelationInput {
+                relation_id: Some(relation.relation_id),
+                relation_type: relation.relation_type,
+                from_entity_id: relation.from_ref,
+                to_entity_id: relation.to_ref,
+                attributes: serde_json::json!({"source": "knowledge_fabric"}),
+                confidence: Some(relation.confidence),
+            });
+            repository.upsert_relation(&matrix_relation)?;
+        }
+
+        let mut attention = Vec::new();
+        for fact in input.facts {
+            let matrix_fact = MatrixFact::from_input(MatrixFactInput {
+                fact_id: Some(fact.fact_id),
+                snapshot_id: Some(input.source_pack_id.clone()),
+                fact_type: fact.fact_type,
+                entity_refs: vec![input.pack_id.clone()],
+                metric_key: Some("knowledge_fabric".to_string()),
+                dimensions: serde_json::json!({
+                    "summary": fact.summary,
+                    "evidence_refs": fact.evidence_refs,
+                }),
+                measures: serde_json::json!({"confidence": fact.confidence}),
+                event_time: Some(chrono::Utc::now()),
+                valid_from: None,
+                valid_to: None,
+                source_ref: Some(fact.source_ref),
+                confidence: Some(fact.confidence),
+                raw_hash: None,
+            });
+            attention.push(repository.ingest_fact(&matrix_fact)?);
+        }
+        Ok(attention)
+    }
+
     pub(crate) fn get_evidence_packet(
         &self,
         config_home: impl AsRef<Path>,
@@ -461,5 +561,51 @@ impl MatrixService {
             self.structured_projection(),
             self.repository(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::{DocumentContent, KnowledgeFabric};
+
+    #[test]
+    fn knowledge_matrix_bridge_writes_source_pack_and_facts() {
+        let config_home = std::env::temp_dir().join(format!(
+            "cowd-knowledge-matrix-bridge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let fabric = KnowledgeFabric::new();
+        let receipt = fabric.ingest_document(
+            KnowledgeNamespace::Domain("architecture".to_string()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Required,
+            DocumentContent::new(
+                "Architecture Matrix Rules",
+                "must write knowledge rules to matrix\nStep 1. bridge canon",
+            ),
+        );
+        let bridge = fabric
+            .matrix_bridge_for_pack(&receipt.pack.pack_id)
+            .expect("bridge input");
+        let service = MatrixService::new();
+        let attention = service
+            .ingest_knowledge_bridge(&config_home, bridge)
+            .expect("bridge ingest");
+
+        assert!(!attention.is_empty());
+        assert!(!service
+            .list_source_packs(&config_home, 10)
+            .expect("source packs")
+            .is_empty());
+        assert!(service
+            .list_facts(&config_home, 10)
+            .expect("facts")
+            .iter()
+            .any(|fact| fact.fact_type.starts_with("knowledge_")));
+        let _ = std::fs::remove_dir_all(config_home);
     }
 }

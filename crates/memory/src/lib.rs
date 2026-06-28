@@ -171,9 +171,13 @@ pub use kernel::{
     MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
 };
 pub use knowledge::{
-    ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentContent,
-    DocumentIngestor, DocumentMetadata, IngestionResult, KnowledgeChunk, KnowledgeFabric,
-    KnowledgeFabricHealth, KnowledgeIngestionReceipt,
+    ActivationGovernor, CanonExtractor, ClassificationResult, ConflictGovernor, ConflictStrategy,
+    DocumentCategory, DocumentClassifier, DocumentContent, DocumentIngestor, DocumentMetadata,
+    InMemoryKnowledgeStore, IngestionResult, KnowledgeChunk, KnowledgeFabric,
+    KnowledgeFabricHealth, KnowledgeGraphBuilder, KnowledgeIngestionReceipt,
+    KnowledgeIngestionService, KnowledgeMatrixBridgeFact, KnowledgeMatrixBridgeInput,
+    KnowledgeMatrixBridgeRelation, KnowledgeNamespaceSearchResult, KnowledgeSnapshot,
+    KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore, UsageFeedbackLoop,
 };
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{

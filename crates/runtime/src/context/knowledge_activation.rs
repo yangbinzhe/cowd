@@ -6,12 +6,14 @@ use memory::{DocumentContent, KnowledgeFabric, MemoryContextPacket, MemoryPacket
 use crate::context_runtime::{
     ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility,
 };
+use crate::knowledge_compliance::{KnowledgeComplianceDecision, KnowledgeComplianceRuntime};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeKnowledgeActivation {
     pub items: Vec<ContextItem>,
     pub prompt_fragment: String,
     pub report: KnowledgeTurnReport,
+    pub compliance_decision: KnowledgeComplianceDecision,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,22 +96,34 @@ impl KnowledgeActivationRuntime {
             ));
             items.push(item);
         }
-        if !warnings.is_empty() {
+        let compliance_decision = KnowledgeComplianceRuntime::new().decide(warnings);
+        if !compliance_decision.warnings.is_empty() {
             fragment.push_str("  <knowledge_compliance>\n");
-            for warning in &warnings {
+            for warning in &compliance_decision.warnings {
                 fragment.push_str(&format!(
                     "    <warning level=\"{:?}\" pack=\"{}\">{}</warning>\n",
                     warning.level, warning.pack_id, warning.summary
                 ));
             }
+            if !compliance_decision.allows_execution() {
+                fragment.push_str("    <hard_gate action=\"block\">\n");
+                for reason in &compliance_decision.hard_gate_reasons {
+                    fragment.push_str(&format!("      <reason>{reason}</reason>\n"));
+                }
+                fragment.push_str("    </hard_gate>\n");
+            }
             fragment.push_str("  </knowledge_compliance>\n");
         }
         fragment.push_str("</knowledge_context>");
 
+        let report = self
+            .fabric
+            .turn_report(&plan, compliance_decision.warnings.clone());
         Some(RuntimeKnowledgeActivation {
             items,
             prompt_fragment: fragment,
-            report: self.fabric.turn_report(&plan, warnings),
+            report,
+            compliance_decision,
         })
     }
 }
@@ -268,5 +282,28 @@ mod tests {
         assert!(KnowledgeActivationRuntime::new()
             .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
             .is_none());
+    }
+
+    #[test]
+    fn runtime_knowledge_activation_marks_blocking_rules_as_hard_gate() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Safety policy must stop without approval",
+                MemoryLayer::L3,
+                MemoryPacketRole::Conflict,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+        };
+
+        let activation = KnowledgeActivationRuntime::new()
+            .activate_from_packet("s1", "safety policy approval", "DeepInvestigation", &packet)
+            .expect("blocking knowledge should activate");
+
+        assert!(activation
+            .prompt_fragment
+            .contains("<hard_gate action=\"block\">"));
+        assert!(!activation.compliance_decision.allows_execution());
     }
 }

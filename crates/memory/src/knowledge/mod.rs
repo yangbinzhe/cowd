@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -16,7 +17,9 @@ use harness_contract::knowledge::{
     KnowledgeGovernanceLevel, KnowledgeNamespace, KnowledgeObjectState, KnowledgePack,
     KnowledgePackKind, KnowledgeTurnReport, KnowledgeUsageSignal,
 };
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentContent {
@@ -133,6 +136,58 @@ pub struct KnowledgeIngestionReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeSnapshot {
+    pub corpus: Vec<KnowledgeCorpus>,
+    pub packs: Vec<KnowledgePack>,
+    pub canon: Vec<KnowledgeCanonPack>,
+    pub conflicts: Vec<KnowledgeConflictRecord>,
+    pub chunks: Vec<KnowledgeChunk>,
+    pub usage: Vec<KnowledgeUsageSignal>,
+}
+
+impl KnowledgeSnapshot {
+    #[must_use]
+    pub fn health(&self) -> KnowledgeFabricHealth {
+        KnowledgeFabricHealth {
+            corpus_count: self.corpus.len(),
+            pack_count: self.packs.len(),
+            canon_count: self.canon.len(),
+            conflict_count: self.conflicts.len(),
+            unresolved_conflict_count: self
+                .conflicts
+                .iter()
+                .filter(|conflict| conflict.decision.is_none())
+                .count(),
+            usage_signal_count: self.usage.len(),
+            active_pack_count: self
+                .packs
+                .iter()
+                .filter(|pack| pack.state == KnowledgeObjectState::Active)
+                .count(),
+            quarantined_pack_count: self
+                .packs
+                .iter()
+                .filter(|pack| pack.state == KnowledgeObjectState::Quarantined)
+                .count(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum KnowledgeStoreError {
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub trait KnowledgeStore: Send + Sync {
+    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError>;
+    fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError>;
+    fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeChunk {
     pub chunk_id: String,
     pub corpus_id: String,
@@ -155,6 +210,43 @@ pub struct KnowledgeFabricHealth {
     pub quarantined_pack_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeNamespaceSearchResult {
+    pub namespace: KnowledgeNamespace,
+    pub query: String,
+    pub packs: Vec<KnowledgePack>,
+    pub canon: Vec<KnowledgeCanonPack>,
+    pub blocked_namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeMatrixBridgeFact {
+    pub fact_id: String,
+    pub fact_type: String,
+    pub summary: String,
+    pub source_ref: String,
+    pub confidence: f32,
+    pub evidence_refs: Vec<KernelRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeMatrixBridgeRelation {
+    pub relation_id: String,
+    pub relation_type: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeMatrixBridgeInput {
+    pub source_pack_id: String,
+    pub source_name: String,
+    pub pack_id: String,
+    pub facts: Vec<KnowledgeMatrixBridgeFact>,
+    pub relations: Vec<KnowledgeMatrixBridgeRelation>,
+}
+
 #[derive(Debug, Default)]
 struct KnowledgeFabricState {
     corpus: BTreeMap<String, KnowledgeCorpus>,
@@ -165,15 +257,67 @@ struct KnowledgeFabricState {
     usage: Vec<KnowledgeUsageSignal>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct KnowledgeFabric {
     state: Arc<RwLock<KnowledgeFabricState>>,
+    store: Option<Arc<dyn KnowledgeStore>>,
 }
 
 impl KnowledgeFabric {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_store(store: Arc<dyn KnowledgeStore>) -> Self {
+        let fabric = Self {
+            state: Arc::new(RwLock::new(KnowledgeFabricState::default())),
+            store: Some(store),
+        };
+        fabric.reload_from_store();
+        fabric
+    }
+
+    pub fn reload_from_store(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = store.snapshot() else {
+            return;
+        };
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = KnowledgeFabricState {
+            corpus: snapshot
+                .corpus
+                .into_iter()
+                .map(|item| (item.corpus_id.clone(), item))
+                .collect(),
+            packs: snapshot
+                .packs
+                .into_iter()
+                .map(|item| (item.pack_id.clone(), item))
+                .collect(),
+            canon: snapshot
+                .canon
+                .into_iter()
+                .map(|item| (item.canon_id.clone(), item))
+                .collect(),
+            conflicts: snapshot
+                .conflicts
+                .into_iter()
+                .map(|item| (item.conflict_id.clone(), item))
+                .collect(),
+            chunks: snapshot
+                .chunks
+                .into_iter()
+                .map(|item| (item.chunk_id.clone(), item))
+                .collect(),
+            usage: snapshot.usage,
+        };
     }
 
     pub fn ingest_document(
@@ -183,7 +327,7 @@ impl KnowledgeFabric {
         governance_level: KnowledgeGovernanceLevel,
         content: DocumentContent,
     ) -> KnowledgeIngestionReceipt {
-        let classification = DocumentClassifier::new().classify(&content);
+        let classification = KnowledgeIngestionService::new().classify(&content);
         let now = Utc::now();
         let corpus_id = format!(
             "corpus-{}",
@@ -217,14 +361,14 @@ impl KnowledgeFabric {
             "pack-{}",
             stable_hash(&format!("{}:{}", namespace.key(), content.title))
         );
-        let canon = build_canon_pack(
+        let canon = CanonExtractor::new().extract(
             &pack_id,
             &classification,
             &content,
             &chunks,
             governance_level,
         );
-        let conflicts = detect_conflicts(&pack_id, &canon);
+        let conflicts = ConflictGovernor::new().detect(&pack_id, &canon);
         let state = if conflicts.is_empty() {
             KnowledgeObjectState::Active
         } else {
@@ -240,7 +384,12 @@ impl KnowledgeFabric {
             source_corpus_refs: vec![corpus_id.clone()],
             canon_pack_ref: Some(canon.canon_id.clone()),
             graph_ref: Some(format!("knowledge-graph:{pack_id}")),
-            matrix_refs: knowledge_matrix_refs(&pack_id, &canon),
+            matrix_refs: KnowledgeGraphBuilder::new()
+                .build_bridge(&pack_id, &classification.metadata.title, &canon)
+                .facts
+                .iter()
+                .map(|fact| KernelRef::new("matrix_fact", fact.fact_id.clone()))
+                .collect(),
             memory_refs: vec![KernelRef::new(
                 "memory",
                 format!("knowledge-pack:{pack_id}"),
@@ -271,18 +420,121 @@ impl KnowledgeFabric {
                 .conflicts
                 .insert(conflict.conflict_id.clone(), conflict.clone());
         }
-        KnowledgeIngestionReceipt {
+        let mut receipt = KnowledgeIngestionReceipt {
             corpus,
             pack,
             canon,
             conflicts,
             chunks,
             warnings: classification.reasoning,
+        };
+        if let Some(store) = self.store.as_ref() {
+            if let Err(err) = store.save_receipt(&receipt) {
+                receipt
+                    .warnings
+                    .push(format!("knowledge store persist failed: {err}"));
+            }
         }
+        receipt
     }
 
     #[must_use]
     pub fn activate(
+        &self,
+        session_id: &str,
+        intent: &str,
+        profile: &str,
+        project_id: Option<&str>,
+    ) -> (
+        KnowledgeActivationPlan,
+        Vec<KnowledgeCanonPack>,
+        Vec<KnowledgeComplianceWarning>,
+    ) {
+        ActivationGovernor::new().activate(self, session_id, intent, profile, project_id)
+    }
+
+    #[must_use]
+    pub fn search_namespace(
+        &self,
+        namespace: &KnowledgeNamespace,
+        query: &str,
+    ) -> KnowledgeNamespaceSearchResult {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let query_lc = query.to_ascii_lowercase();
+        let mut packs = Vec::new();
+        let mut canon = Vec::new();
+        let mut blocked_namespaces = Vec::new();
+        for pack in state.packs.values() {
+            if &pack.namespace != namespace {
+                blocked_namespaces.push(format!(
+                    "{} outside requested namespace",
+                    pack.namespace.key()
+                ));
+                continue;
+            }
+            let haystack = format!(
+                "{} {}",
+                pack.name.to_ascii_lowercase(),
+                pack.namespace.key()
+            );
+            if query_lc
+                .split_whitespace()
+                .any(|term| term.len() >= 3 && haystack.contains(term))
+                || query_lc.trim().is_empty()
+            {
+                packs.push(pack.clone());
+                if let Some(canon_pack) = pack
+                    .canon_pack_ref
+                    .as_ref()
+                    .and_then(|id| state.canon.get(id))
+                {
+                    canon.push(canon_pack.clone());
+                }
+            }
+        }
+        KnowledgeNamespaceSearchResult {
+            namespace: namespace.clone(),
+            query: query.to_string(),
+            packs,
+            canon,
+            blocked_namespaces,
+        }
+    }
+
+    #[must_use]
+    pub fn matrix_bridge_for_pack(&self, pack_id: &str) -> Option<KnowledgeMatrixBridgeInput> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pack = state.packs.get(pack_id)?;
+        let canon = pack
+            .canon_pack_ref
+            .as_ref()
+            .and_then(|canon_id| state.canon.get(canon_id))?;
+        Some(KnowledgeGraphBuilder::new().build_bridge(pack_id, &pack.name, canon))
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> KnowledgeSnapshot {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        KnowledgeSnapshot {
+            corpus: state.corpus.values().cloned().collect(),
+            packs: state.packs.values().cloned().collect(),
+            canon: state.canon.values().cloned().collect(),
+            conflicts: state.conflicts.values().cloned().collect(),
+            chunks: state.chunks.values().cloned().collect(),
+            usage: state.usage.clone(),
+        }
+    }
+
+    fn activate_inner(
         &self,
         session_id: &str,
         intent: &str,
@@ -386,7 +638,8 @@ impl KnowledgeFabric {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .usage
-            .push(signal);
+            .push(signal.clone());
+        UsageFeedbackLoop::new().record(self.store.as_deref(), &signal);
     }
 
     #[must_use]
@@ -419,6 +672,427 @@ impl KnowledgeFabric {
             "canon": state.canon.values().collect::<Vec<_>>(),
             "conflicts": state.conflicts.values().collect::<Vec<_>>(),
             "usage_signal_count": state.usage.len(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeIngestionService {
+    classifier: DocumentClassifier,
+}
+
+impl KnowledgeIngestionService {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            classifier: DocumentClassifier::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn classify(&self, content: &DocumentContent) -> ClassificationResult {
+        self.classifier.classify(content)
+    }
+
+    #[must_use]
+    pub fn ingest_collection(
+        &self,
+        fabric: &KnowledgeFabric,
+        namespace: KnowledgeNamespace,
+        activation_policy: KnowledgeActivationPolicy,
+        governance_level: KnowledgeGovernanceLevel,
+        documents: Vec<DocumentContent>,
+    ) -> Vec<KnowledgeIngestionReceipt> {
+        documents
+            .into_iter()
+            .map(|document| {
+                fabric.ingest_document(
+                    namespace.clone(),
+                    activation_policy,
+                    governance_level,
+                    document,
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CanonExtractor;
+
+impl CanonExtractor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub fn extract(
+        &self,
+        pack_id: &str,
+        classification: &ClassificationResult,
+        content: &DocumentContent,
+        chunks: &[KnowledgeChunk],
+        governance_level: KnowledgeGovernanceLevel,
+    ) -> KnowledgeCanonPack {
+        build_canon_pack(pack_id, classification, content, chunks, governance_level)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConflictGovernor;
+
+impl ConflictGovernor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub fn detect(
+        &self,
+        pack_id: &str,
+        canon: &KnowledgeCanonPack,
+    ) -> Vec<KnowledgeConflictRecord> {
+        detect_conflicts(pack_id, canon)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeGraphBuilder;
+
+impl KnowledgeGraphBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub fn build_bridge(
+        &self,
+        pack_id: &str,
+        pack_name: &str,
+        canon: &KnowledgeCanonPack,
+    ) -> KnowledgeMatrixBridgeInput {
+        let source_pack_id = format!("knowledge-source-{pack_id}");
+        let mut facts = Vec::new();
+        let mut relations = Vec::new();
+        for rule in &canon.rules {
+            let fact_type = match rule.governance_level {
+                KnowledgeGovernanceLevel::Advisory => "knowledge_canon_rule",
+                KnowledgeGovernanceLevel::Required => "knowledge_constraint",
+                KnowledgeGovernanceLevel::Blocking => "knowledge_constraint",
+            };
+            let fact_id = format!("knowledge-rule:{pack_id}:{}", rule.rule_id);
+            facts.push(KnowledgeMatrixBridgeFact {
+                fact_id: fact_id.clone(),
+                fact_type: fact_type.to_string(),
+                summary: rule.summary.clone(),
+                source_ref: source_pack_id.clone(),
+                confidence: match rule.governance_level {
+                    KnowledgeGovernanceLevel::Advisory => 0.74,
+                    KnowledgeGovernanceLevel::Required => 0.88,
+                    KnowledgeGovernanceLevel::Blocking => 0.95,
+                },
+                evidence_refs: rule.evidence_refs.clone(),
+            });
+            relations.push(KnowledgeMatrixBridgeRelation {
+                relation_id: format!("knowledge-pack-rule:{pack_id}:{}", rule.rule_id),
+                relation_type: "pack_contains_rule".to_string(),
+                from_ref: pack_id.to_string(),
+                to_ref: fact_id,
+                confidence: 0.9,
+            });
+        }
+        for (idx, procedure) in canon.procedures.iter().enumerate() {
+            facts.push(KnowledgeMatrixBridgeFact {
+                fact_id: format!("knowledge-procedure:{pack_id}:{idx}"),
+                fact_type: "knowledge_process_step".to_string(),
+                summary: procedure.clone(),
+                source_ref: source_pack_id.clone(),
+                confidence: 0.8,
+                evidence_refs: canon.evidence_refs.clone(),
+            });
+        }
+        KnowledgeMatrixBridgeInput {
+            source_pack_id,
+            source_name: format!("Knowledge Fabric: {pack_name}"),
+            pack_id: pack_id.to_string(),
+            facts,
+            relations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ActivationGovernor;
+
+impl ActivationGovernor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub fn activate(
+        &self,
+        fabric: &KnowledgeFabric,
+        session_id: &str,
+        intent: &str,
+        profile: &str,
+        project_id: Option<&str>,
+    ) -> (
+        KnowledgeActivationPlan,
+        Vec<KnowledgeCanonPack>,
+        Vec<KnowledgeComplianceWarning>,
+    ) {
+        fabric.activate_inner(session_id, intent, profile, project_id)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageFeedbackLoop;
+
+impl UsageFeedbackLoop {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn record(&self, store: Option<&dyn KnowledgeStore>, signal: &KnowledgeUsageSignal) {
+        if let Some(store) = store {
+            let _ = store.record_usage(signal);
+        }
+    }
+}
+
+impl std::fmt::Debug for KnowledgeFabric {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KnowledgeFabric")
+            .field("has_store", &self.store.is_some())
+            .field("health", &self.snapshot().health())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryKnowledgeStore {
+    state: Arc<RwLock<KnowledgeFabricState>>,
+}
+
+impl InMemoryKnowledgeStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl KnowledgeStore for InMemoryKnowledgeStore {
+    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .corpus
+            .insert(receipt.corpus.corpus_id.clone(), receipt.corpus.clone());
+        state
+            .packs
+            .insert(receipt.pack.pack_id.clone(), receipt.pack.clone());
+        state
+            .canon
+            .insert(receipt.canon.canon_id.clone(), receipt.canon.clone());
+        for chunk in &receipt.chunks {
+            state.chunks.insert(chunk.chunk_id.clone(), chunk.clone());
+        }
+        for conflict in &receipt.conflicts {
+            state
+                .conflicts
+                .insert(conflict.conflict_id.clone(), conflict.clone());
+        }
+        Ok(())
+    }
+
+    fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage
+            .push(signal.clone());
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(KnowledgeSnapshot {
+            corpus: state.corpus.values().cloned().collect(),
+            packs: state.packs.values().cloned().collect(),
+            canon: state.canon.values().cloned().collect(),
+            conflicts: state.conflicts.values().cloned().collect(),
+            chunks: state.chunks.values().cloned().collect(),
+            usage: state.usage.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteKnowledgeStore {
+    db_path: Arc<std::path::PathBuf>,
+}
+
+impl SqliteKnowledgeStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, KnowledgeStoreError> {
+        let store = Self {
+            db_path: Arc::new(path.as_ref().to_path_buf()),
+        };
+        store.ensure_schema()?;
+        Ok(store)
+    }
+
+    fn connection(&self) -> Result<Connection, KnowledgeStoreError> {
+        Ok(Connection::open(self.db_path.as_path())?)
+    }
+
+    fn ensure_schema(&self) -> Result<(), KnowledgeStoreError> {
+        let conn = self.connection()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS knowledge_corpus (
+                corpus_id TEXT PRIMARY KEY,
+                namespace_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS knowledge_pack (
+                pack_id TEXT PRIMARY KEY,
+                namespace_key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS knowledge_canon (
+                canon_id TEXT PRIMARY KEY,
+                pack_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS knowledge_conflict (
+                conflict_id TEXT PRIMARY KEY,
+                pack_id TEXT,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                detected_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS knowledge_chunk (
+                chunk_id TEXT PRIMARY KEY,
+                corpus_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS knowledge_usage (
+                signal_id TEXT PRIMARY KEY,
+                pack_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+}
+
+impl KnowledgeStore for SqliteKnowledgeStore {
+    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_corpus (corpus_id, namespace_key, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.corpus.corpus_id,
+                receipt.corpus.namespace.key(),
+                serde_json::to_string(&receipt.corpus)?,
+                receipt.corpus.updated_at.to_rfc3339(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_pack (pack_id, namespace_key, state, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                receipt.pack.pack_id,
+                receipt.pack.namespace.key(),
+                format!("{:?}", receipt.pack.state),
+                serde_json::to_string(&receipt.pack)?,
+                receipt.pack.updated_at.to_rfc3339(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_canon (canon_id, pack_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.canon.canon_id,
+                receipt.canon.pack_id,
+                serde_json::to_string(&receipt.canon)?,
+                receipt.canon.updated_at.to_rfc3339(),
+            ],
+        )?;
+        for conflict in &receipt.conflicts {
+            conn.execute(
+                "INSERT OR REPLACE INTO knowledge_conflict (conflict_id, pack_id, state, payload_json, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    conflict.conflict_id,
+                    conflict.pack_id,
+                    format!("{:?}", conflict.state),
+                    serde_json::to_string(conflict)?,
+                    conflict.detected_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        for chunk in &receipt.chunks {
+            conn.execute(
+                "INSERT OR REPLACE INTO knowledge_chunk (chunk_id, corpus_id, payload_json) VALUES (?1, ?2, ?3)",
+                params![chunk.chunk_id, chunk.corpus_id, serde_json::to_string(chunk)?],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_usage (signal_id, pack_id, session_id, payload_json, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                signal.signal_id,
+                signal.pack_id,
+                signal.session_id,
+                serde_json::to_string(signal)?,
+                signal.occurred_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+        fn load_json<T: for<'de> Deserialize<'de>>(
+            conn: &Connection,
+            table: &str,
+        ) -> Result<Vec<T>, KnowledgeStoreError> {
+            let mut stmt = conn.prepare(&format!("SELECT payload_json FROM {table}"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(serde_json::from_str(&row?)?);
+            }
+            Ok(values)
+        }
+        let conn = self.connection()?;
+        Ok(KnowledgeSnapshot {
+            corpus: load_json(&conn, "knowledge_corpus")?,
+            packs: load_json(&conn, "knowledge_pack")?,
+            canon: load_json(&conn, "knowledge_canon")?,
+            conflicts: load_json(&conn, "knowledge_conflict")?,
+            chunks: load_json(&conn, "knowledge_chunk")?,
+            usage: load_json(&conn, "knowledge_usage")?,
         })
     }
 }
@@ -747,19 +1421,6 @@ fn detect_conflicts(pack_id: &str, canon: &KnowledgeCanonPack) -> Vec<KnowledgeC
     conflicts
 }
 
-fn knowledge_matrix_refs(pack_id: &str, canon: &KnowledgeCanonPack) -> Vec<KernelRef> {
-    canon
-        .rules
-        .iter()
-        .map(|rule| {
-            KernelRef::new(
-                "matrix_fact",
-                format!("knowledge-rule:{pack_id}:{}", rule.rule_id),
-            )
-        })
-        .collect()
-}
-
 fn activation_fits(pack: &KnowledgePack, intent_lc: &str, project_id: Option<&str>) -> bool {
     match &pack.activation_policy {
         KnowledgeActivationPolicy::ExplicitOnly => false,
@@ -1000,5 +1661,66 @@ mod tests {
                 .unwrap_or_default(),
             receipt.conflicts.len() as u64
         );
+    }
+
+    #[test]
+    fn sqlite_knowledge_store_persists_corpus_pack_canon_conflict_and_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteKnowledgeStore::open(dir.path().join("knowledge.db")).unwrap());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = fabric.ingest_document(
+            KnowledgeNamespace::SharedLibrary("quality".to_string()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Blocking,
+            DocumentContent::new(
+                "Quality Blocking Rules",
+                "must keep inspection evidence\nmust not keep inspection evidence",
+            ),
+        );
+        fabric.record_usage(KnowledgeUsageSignal {
+            signal_id: "usage-1".to_string(),
+            session_id: "s1".to_string(),
+            pack_id: receipt.pack.pack_id.clone(),
+            action: "selected".to_string(),
+            summary: "selected during test".to_string(),
+            score_delta_bp: 5,
+            occurred_at: Utc::now(),
+        });
+
+        let reloaded = KnowledgeFabric::with_store(store);
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.corpus.len(), 1);
+        assert_eq!(snapshot.packs.len(), 1);
+        assert_eq!(snapshot.canon.len(), 1);
+        assert_eq!(snapshot.conflicts.len(), receipt.conflicts.len());
+        assert_eq!(snapshot.usage.len(), 1);
+    }
+
+    #[test]
+    fn namespace_search_and_governors_are_real_runtime_services() {
+        let fabric = KnowledgeFabric::new();
+        let receipts = KnowledgeIngestionService::new().ingest_collection(
+            &fabric,
+            KnowledgeNamespace::Domain("manufacturing".to_string()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Required,
+            vec![DocumentContent::new(
+                "Manufacturing Process",
+                "must validate demand before sourcing\nStep 1. validate demand",
+            )],
+        );
+        let search = fabric.search_namespace(
+            &KnowledgeNamespace::Domain("manufacturing".to_string()),
+            "manufacturing demand",
+        );
+        assert_eq!(search.packs.len(), 1);
+        let bridge = fabric
+            .matrix_bridge_for_pack(&receipts[0].pack.pack_id)
+            .expect("matrix bridge");
+        assert!(!bridge.facts.is_empty());
+        assert!(bridge
+            .facts
+            .iter()
+            .any(|fact| fact.fact_type == "knowledge_constraint"));
     }
 }
