@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use memory::SessionRecord;
+use sha2::{Digest, Sha256};
 use surface::{SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
 
@@ -13,7 +14,6 @@ const SURFACE_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
-    let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
     let session_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
     tokio::spawn(async move {
         loop {
@@ -37,11 +37,10 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
                 continue;
             }
             let state = state.clone();
-            let seen = seen.clone();
             let session_locks = session_locks.clone();
             tokio::spawn(async move {
                 if let Err(error) =
-                    handle_surface_message(state, seen, session_locks, surface, payload).await
+                    handle_surface_message(state, session_locks, surface, payload).await
                 {
                     tracing::warn!(error = %error, "surface ingress message handling failed");
                 }
@@ -52,22 +51,13 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
 
 async fn handle_surface_message(
     state: Arc<AppState>,
-    seen: Arc<Mutex<HashSet<String>>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     surface: String,
     payload: serde_json::Value,
 ) -> Result<(), String> {
     let message_id = payload_string(&payload, "message_id")
         .or_else(|| payload_string(&payload, "id"))
-        .unwrap_or_else(|| format!("surface-message-{}", uuid::Uuid::new_v4()));
-    let dedupe_key = format!("{surface}:{message_id}");
-    {
-        let mut seen = seen.lock().await;
-        if !seen.insert(dedupe_key.clone()) {
-            tracing::info!(%surface, %message_id, "surface message ignored as duplicate");
-            return Ok(());
-        }
-    }
+        .unwrap_or_else(|| payload_fingerprint_id(&surface, &payload));
 
     let content = payload_string(&payload, "text")
         .or_else(|| payload_string(&payload, "content"))
@@ -82,6 +72,27 @@ async fn handle_surface_message(
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let inbox = state.services.surface.record_inbox_received(
+        &surface,
+        &message_id,
+        &payload,
+        &session_id,
+        thread_id.clone(),
+        user_id.clone(),
+    )?;
+    if inbox.duplicate {
+        tracing::info!(
+            %surface,
+            %message_id,
+            status = %inbox.record.status,
+            "surface message ignored as durable duplicate"
+        );
+        return Ok(());
+    }
+    state
+        .services
+        .surface
+        .mark_inbox_processing(&inbox.record.idempotency_key)?;
     ensure_surface_runtime_session(&state, &surface, &session_id, user_id.as_deref(), &metadata)
         .await?;
 
@@ -136,6 +147,10 @@ async fn handle_surface_message(
                 }),
             )
             .await?;
+            state
+                .services
+                .surface
+                .mark_inbox_failed(&inbox.record.idempotency_key, message.clone())?;
             return Err(message);
         }
     };
@@ -163,6 +178,10 @@ async fn handle_surface_message(
         )
         .await
         .map_err(|error| error.to_string())?;
+    state.services.surface.mark_inbox_processed(
+        &inbox.record.idempotency_key,
+        Some(execution.receipt.turn_id.to_string()),
+    )?;
 
     if response_text.trim().is_empty() {
         return Ok(());
@@ -433,6 +452,18 @@ fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn payload_fingerprint_id(surface: &str, payload: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(surface.as_bytes());
+    hasher.update(b":");
+    hasher.update(
+        serde_json::to_string(payload)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    format!("generated:{:x}", hasher.finalize())
+}
+
 fn final_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -488,5 +519,26 @@ mod tests {
         });
 
         assert_eq!(surface_reply_recipient(&payload).as_deref(), Some("chat-a"));
+    }
+
+    #[test]
+    fn surface_ingress_durable_idempotency_key_normalizes_surface_aliases() {
+        assert_eq!(
+            crate::surface_host::message_store::inbound_idempotency_key("lark", "msg-1"),
+            "feishu:msg-1"
+        );
+    }
+
+    #[test]
+    fn surface_ingress_fallback_message_id_is_stable_for_same_payload() {
+        let payload = serde_json::json!({
+            "text": "hello",
+            "user_id": "user-a",
+            "metadata": {"chat_id": "chat-a"}
+        });
+        assert_eq!(
+            payload_fingerprint_id("feishu", &payload),
+            payload_fingerprint_id("feishu", &payload)
+        );
     }
 }

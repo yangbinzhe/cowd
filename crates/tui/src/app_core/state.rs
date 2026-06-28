@@ -2400,6 +2400,12 @@ impl TuiState {
                     | KeyCode::Char('R')
                     | KeyCode::Char('m')
                     | KeyCode::Char('a')
+                    | KeyCode::Char('i')
+                    | KeyCode::Char('o')
+                    | KeyCode::Char('v')
+                    | KeyCode::Char('p')
+                    | KeyCode::Char('d')
+                    | KeyCode::Char('D')
             );
         };
         match key.code {
@@ -2490,6 +2496,90 @@ impl TuiState {
                                 &surface_id,
                                 "diagnose",
                                 serde_json::json!({"source": "tui.surface_panel"}),
+                            )
+                            .await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('i') => {
+                let label = format!("surface.inbox:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_inbox(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('o') => {
+                let label = format!("surface.outbox:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_outbox(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('v') => {
+                let label = format!("surface.deliveries:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_deliveries(&surface_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('p') => {
+                let label = format!("surface.inbox.replay:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        let inbox = client.surface_inbox(&surface_id).await?;
+                        let message_id = first_surface_message_id(&inbox).ok_or_else(|| {
+                            crate::gateway_client::GatewayApiError::Url(
+                                "No inbox message id found".to_string(),
+                            )
+                        })?;
+                        client.surface_replay_inbox(&surface_id, &message_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('d') => {
+                let label = format!("surface.outbox.retry:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        let outbox = client.surface_outbox(&surface_id).await?;
+                        let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
+                            crate::gateway_client::GatewayApiError::Url(
+                                "No retryable delivery id found".to_string(),
+                            )
+                        })?;
+                        client.surface_retry_outbox(&surface_id, &delivery_id).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('D') => {
+                let label = format!("surface.outbox.dead_letter:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        let outbox = client.surface_outbox(&surface_id).await?;
+                        let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
+                            crate::gateway_client::GatewayApiError::Url(
+                                "No delivery id found".to_string(),
+                            )
+                        })?;
+                        client
+                            .surface_dead_letter_outbox(
+                                &surface_id,
+                                &delivery_id,
+                                "operator moved delivery from TUI",
                             )
                             .await
                     }),
@@ -4175,6 +4265,56 @@ fn first_command_id(value: &serde_json::Value) -> Option<String> {
             map.values().find_map(first_command_id)
         }
         serde_json::Value::Array(items) => items.iter().find_map(first_command_id),
+        _ => None,
+    }
+}
+
+fn first_surface_message_id(value: &serde_json::Value) -> Option<String> {
+    first_string_field(
+        value,
+        &["message_id", "id"],
+        &["inbox", "messages", "items"],
+    )
+}
+
+fn first_surface_delivery_id(value: &serde_json::Value) -> Option<String> {
+    first_string_field(
+        value,
+        &["delivery_id"],
+        &["outbox", "dead_letters", "items"],
+    )
+}
+
+fn first_string_field(
+    value: &serde_json::Value,
+    fields: &[&str],
+    containers: &[&str],
+) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for field in fields {
+                if let Some(value) = map
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|item| !item.trim().is_empty())
+                {
+                    return Some(value.to_string());
+                }
+            }
+            for container in containers {
+                if let Some(found) = map
+                    .get(*container)
+                    .and_then(|value| first_string_field(value, fields, containers))
+                {
+                    return Some(found);
+                }
+            }
+            map.values()
+                .find_map(|value| first_string_field(value, fields, containers))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|value| first_string_field(value, fields, containers)),
         _ => None,
     }
 }

@@ -7,7 +7,9 @@ use surface::{
 use tokio::sync::broadcast;
 
 use crate::surface_host::{
-    SurfaceHost, SurfaceHostHealth, SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile,
+    SurfaceDeliveryEvent, SurfaceHost, SurfaceHostHealth, SurfaceInboxReceipt, SurfaceInboxRecord,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceResourceSummary, SurfaceRouteSummary,
+    SurfaceStaticFile,
 };
 
 use super::{service_envelope, ServiceEnvelope};
@@ -93,6 +95,88 @@ impl SurfaceService {
             .send(request)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn record_inbox_received(
+        &self,
+        surface: &str,
+        message_id: &str,
+        payload: &serde_json::Value,
+        runtime_session_id: &str,
+        thread_id: Option<String>,
+        sender_id: Option<String>,
+    ) -> Result<SurfaceInboxReceipt, String> {
+        self.host.record_inbox_received(
+            surface,
+            message_id,
+            payload,
+            runtime_session_id,
+            thread_id,
+            sender_id,
+        )
+    }
+
+    pub(crate) fn mark_inbox_processing(&self, idempotency_key: &str) -> Result<(), String> {
+        self.host.mark_inbox_processing(idempotency_key)
+    }
+
+    pub(crate) fn mark_inbox_processed(
+        &self,
+        idempotency_key: &str,
+        runtime_turn_id: Option<String>,
+    ) -> Result<(), String> {
+        self.host
+            .mark_inbox_processed(idempotency_key, runtime_turn_id)
+    }
+
+    pub(crate) fn mark_inbox_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        self.host.mark_inbox_failed(idempotency_key, error)
+    }
+
+    pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
+        self.host.inbox(surface)
+    }
+
+    pub(crate) fn outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+        self.host.outbox(surface)
+    }
+
+    pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
+        self.host.delivery_events(surface)
+    }
+
+    pub(crate) fn message_snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+        self.host.message_snapshot(surface)
+    }
+
+    pub(crate) fn replay_inbox_message(
+        &self,
+        surface: &str,
+        message_id: &str,
+    ) -> Result<SurfaceInboxRecord, String> {
+        self.host.replay_inbox_message(surface, message_id)
+    }
+
+    pub(crate) async fn retry_outbox_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<SurfaceOperationResult, String> {
+        self.host
+            .retry_outbox_delivery(delivery_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn dead_letter_outbox_delivery(
+        &self,
+        delivery_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<SurfaceOutboxRecord, String> {
+        self.host.dead_letter_outbox_delivery(delivery_id, reason)
     }
 
     pub(crate) async fn action(

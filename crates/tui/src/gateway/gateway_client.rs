@@ -785,6 +785,70 @@ impl GatewayApiClient {
             .await
     }
 
+    pub async fn surface_inbox(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/inbox", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_outbox(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/outbox", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_deliveries(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/deliveries", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_replay_inbox(
+        &self,
+        id: &str,
+        message_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/surfaces/{}/inbox/{}/replay",
+                url_encode(id),
+                url_encode(message_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn surface_retry_outbox(
+        &self,
+        id: &str,
+        delivery_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/surfaces/{}/outbox/{}/retry",
+                url_encode(id),
+                url_encode(delivery_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn surface_dead_letter_outbox(
+        &self,
+        id: &str,
+        delivery_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/surfaces/{}/outbox/{}/dead-letter",
+                url_encode(id),
+                url_encode(delivery_id)
+            ),
+            serde_json::json!({ "reason": reason }),
+        )
+        .await
+    }
+
     pub async fn surface_send(
         &self,
         id: &str,
@@ -1438,6 +1502,12 @@ mod tests {
             "surface_start",
             "surface_stop",
             "surface_restart",
+            "surface_inbox",
+            "surface_outbox",
+            "surface_deliveries",
+            "surface_replay_inbox",
+            "surface_retry_outbox",
+            "surface_dead_letter_outbox",
             "skill_runs",
             "skill_run_detail",
             "skill_action",
@@ -1463,7 +1533,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 90);
+        assert_eq!(migrated.len(), 96);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));

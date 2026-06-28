@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 mod ingress;
 mod invocation;
 mod ledger;
+mod message_store;
 mod monitor;
 mod registry;
 mod repair;
@@ -16,6 +17,10 @@ mod supervisor;
 mod types;
 
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
+pub(crate) use message_store::{
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
+    SurfaceMessageStore, SurfaceOutboxRecord,
+};
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,
     SurfaceRouteSummary, SurfaceStaticFile,
@@ -35,6 +40,7 @@ pub(crate) struct SurfaceHost {
     roots: Vec<PathBuf>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
+    messages: Arc<SurfaceMessageStore>,
     event_tx: broadcast::Sender<SurfaceFrame>,
     monitor_started: Arc<RwLock<bool>>,
 }
@@ -48,6 +54,22 @@ impl SurfaceHost {
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
     ) -> Self {
+        let message_root = roots
+            .first()
+            .map(|root| root.join(".cowd-surface-messages"))
+            .unwrap_or_else(|| SurfaceMessageStore::default_root(Path::new(".")));
+        Self::with_configs_and_message_store(
+            roots,
+            configs,
+            Arc::new(SurfaceMessageStore::new(message_root)),
+        )
+    }
+
+    fn with_configs_and_message_store(
+        roots: Vec<PathBuf>,
+        configs: BTreeMap<String, serde_json::Value>,
+        messages: Arc<SurfaceMessageStore>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         let host = Self {
             registry: Arc::new(RwLock::new(BTreeMap::new())),
@@ -56,6 +78,7 @@ impl SurfaceHost {
             roots,
             managed: Arc::new(AsyncMutex::new(HashMap::new())),
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
+            messages,
             event_tx,
             monitor_started: Arc::new(RwLock::new(false)),
         };
@@ -80,11 +103,21 @@ impl SurfaceHost {
             roots.push(root);
         }
         roots.push(config_home.join("surfaces"));
-        Self::with_configs(roots, configs)
+        Self::with_configs_and_message_store(
+            roots,
+            configs,
+            Arc::new(SurfaceMessageStore::new(SurfaceMessageStore::default_root(
+                config_home,
+            ))),
+        )
     }
 
     pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SurfaceFrame> {
         self.event_tx.subscribe()
+    }
+
+    pub(crate) fn message_store_root(&self) -> &Path {
+        self.messages.root()
     }
 }
 

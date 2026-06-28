@@ -19,6 +19,127 @@ impl SurfaceHost {
         &self,
         request: SurfaceSendRequest,
     ) -> Result<SurfaceOperationResult, SurfaceError> {
+        let source_session_id = request
+            .metadata
+            .get("source_session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let reply_to_message_id = request
+            .metadata
+            .get("reply_to")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let delivery = self
+            .messages
+            .queue_outbox(&request, source_session_id, reply_to_message_id)
+            .map_err(|error| SurfaceError::Invocation {
+                surface: request.surface.clone(),
+                reason: error,
+            })?;
+        if delivery.status == "sent" {
+            return Ok(SurfaceOperationResult::ok(
+                &delivery.surface,
+                serde_json::json!({
+                    "status": "sent",
+                    "delivery_id": delivery.delivery_id,
+                    "idempotent": true,
+                }),
+            ));
+        }
+        self.deliver_outbox(&delivery.delivery_id).await
+    }
+
+    pub(crate) async fn retry_outbox_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<SurfaceOperationResult, SurfaceError> {
+        let delivery = self
+            .messages
+            .mark_delivery_replayed(delivery_id)
+            .map_err(|error| SurfaceError::Invocation {
+                surface: "unknown".to_string(),
+                reason: error,
+            })?;
+        self.deliver_outbox(&delivery.delivery_id).await
+    }
+
+    pub(crate) fn dead_letter_outbox_delivery(
+        &self,
+        delivery_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<crate::surface_host::SurfaceOutboxRecord, String> {
+        self.messages.mark_delivery_dead_letter(delivery_id, reason)
+    }
+
+    async fn deliver_outbox(
+        &self,
+        delivery_id: &str,
+    ) -> Result<SurfaceOperationResult, SurfaceError> {
+        let delivery = self
+            .messages
+            .get_outbox_by_delivery(delivery_id)
+            .ok_or_else(|| SurfaceError::Invocation {
+                surface: "unknown".to_string(),
+                reason: format!("surface delivery `{delivery_id}` not found"),
+            })?;
+        let request = serde_json::from_value::<SurfaceSendRequest>(delivery.request_json.clone())
+            .map_err(|error| SurfaceError::Invocation {
+            surface: delivery.surface.clone(),
+            reason: format!("invalid surface outbox request: {error}"),
+        })?;
+        self.messages
+            .mark_delivery_sending(delivery_id)
+            .map_err(|error| SurfaceError::Invocation {
+                surface: delivery.surface.clone(),
+                reason: error,
+            })?;
+        match self.send_direct(request).await {
+            Ok(result) if result.error.is_none() => {
+                self.messages
+                    .mark_delivery_sent(delivery_id, &result)
+                    .map_err(|error| SurfaceError::Invocation {
+                        surface: result.surface.clone(),
+                        reason: error,
+                    })?;
+                Ok(result)
+            }
+            Ok(result) => {
+                let message = result
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "surface send returned error".to_string());
+                let retryable = result
+                    .error
+                    .as_ref()
+                    .map(|error| is_retryable_surface_error(&error.code))
+                    .unwrap_or(true);
+                self.messages
+                    .mark_delivery_failed(delivery_id, message, retryable)
+                    .map_err(|error| SurfaceError::Invocation {
+                        surface: result.surface.clone(),
+                        reason: error,
+                    })?;
+                Ok(result)
+            }
+            Err(error) => {
+                let surface = delivery.surface.clone();
+                let message = error.to_string();
+                let _ = self
+                    .messages
+                    .mark_delivery_failed(delivery_id, message.clone(), true);
+                Err(SurfaceError::Invocation {
+                    surface,
+                    reason: message,
+                })
+            }
+        }
+    }
+
+    async fn send_direct(
+        &self,
+        request: SurfaceSendRequest,
+    ) -> Result<SurfaceOperationResult, SurfaceError> {
         let Some(surface) = self.get(&request.surface) else {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         };
@@ -251,6 +372,13 @@ impl SurfaceHost {
                 reason: "managed surface response channel closed".to_string(),
             })
     }
+}
+
+fn is_retryable_surface_error(code: &str) -> bool {
+    !matches!(
+        code,
+        "surface_unavailable" | "surface_route_not_found" | "surface_unsupported"
+    )
 }
 
 fn invoke_sidecar(

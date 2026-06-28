@@ -27,6 +27,7 @@ impl SurfaceHost {
     }
 
     async fn monitor_tick(&self) {
+        self.retry_due_deliveries().await;
         let surfaces = self.snapshot().surfaces;
         for surface in surfaces {
             if surface.lifecycle != SurfaceLifecycle::Managed {
@@ -55,6 +56,20 @@ impl SurfaceHost {
                 .unwrap_or(surface.entry.is_some());
             if due {
                 let _ = self.check_surface_health(&surface.id).await;
+            }
+        }
+    }
+
+    async fn retry_due_deliveries(&self) {
+        for delivery in self.messages.due_retry_deliveries() {
+            let delivery_id = delivery.delivery_id.clone();
+            if let Err(error) = self.retry_outbox_delivery(&delivery_id).await {
+                tracing::warn!(
+                    surface = %delivery.surface,
+                    delivery_id = %delivery_id,
+                    error = %error,
+                    "surface outbox retry failed"
+                );
             }
         }
     }

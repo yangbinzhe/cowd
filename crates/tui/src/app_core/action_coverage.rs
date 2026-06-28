@@ -68,6 +68,54 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         receipt_marker: "record_action_result",
     },
     TuiActionCoverage {
+        action_id: "surface.inbox",
+        gateway_route: "/api/surfaces/:id/inbox",
+        client_method: "surface_inbox",
+        panel_key: "i inbox",
+        state_dispatch: "surface_inbox",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.outbox",
+        gateway_route: "/api/surfaces/:id/outbox",
+        client_method: "surface_outbox",
+        panel_key: "o outbox",
+        state_dispatch: "surface_outbox",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.deliveries",
+        gateway_route: "/api/surfaces/:id/deliveries",
+        client_method: "surface_deliveries",
+        panel_key: "v deliveries",
+        state_dispatch: "surface_deliveries",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.inbox.replay",
+        gateway_route: "/api/surfaces/:id/inbox/:message_id/replay",
+        client_method: "surface_replay_inbox",
+        panel_key: "p replay",
+        state_dispatch: "surface_replay_inbox",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.outbox.retry",
+        gateway_route: "/api/surfaces/:id/outbox/:delivery_id/retry",
+        client_method: "surface_retry_outbox",
+        panel_key: "d retry",
+        state_dispatch: "surface_retry_outbox",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.outbox.dead_letter",
+        gateway_route: "/api/surfaces/:id/outbox/:delivery_id/dead-letter",
+        client_method: "surface_dead_letter_outbox",
+        panel_key: "D dlq",
+        state_dispatch: "surface_dead_letter_outbox",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
         action_id: "skill.validate",
         gateway_route: "/api/skills/:id/actions/validate",
         client_method: "skill_action",
@@ -195,6 +243,7 @@ mod tests {
 
         assert!(ids.contains(&"surface.start"));
         assert!(ids.contains(&"surface.stop"));
+        assert!(ids.contains(&"surface.outbox.retry"));
         assert!(ids.contains(&"skill.validate"));
         assert!(ids.contains(&"skill.run"));
         assert!(ids.contains(&"mission.session_command.consume"));

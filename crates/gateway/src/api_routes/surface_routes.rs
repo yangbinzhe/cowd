@@ -36,6 +36,24 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/surfaces/:id/repair", post(repair_surface_handler))
         .route("/api/surfaces/:id/send", post(send_surface_handler))
         .route("/api/surfaces/:id/action", post(action_surface_handler))
+        .route("/api/surfaces/:id/inbox", get(get_surface_inbox_handler))
+        .route("/api/surfaces/:id/outbox", get(get_surface_outbox_handler))
+        .route(
+            "/api/surfaces/:id/deliveries",
+            get(get_surface_deliveries_handler),
+        )
+        .route(
+            "/api/surfaces/:id/inbox/:message_id/replay",
+            post(replay_surface_inbox_handler),
+        )
+        .route(
+            "/api/surfaces/:id/outbox/:delivery_id/retry",
+            post(retry_surface_outbox_handler),
+        )
+        .route(
+            "/api/surfaces/:id/outbox/:delivery_id/dead-letter",
+            post(dead_letter_surface_outbox_handler),
+        )
         .route("/s/:surface/*path", get(surface_static_handler))
         .route(
             "/surface-callback/:surface/*path",
@@ -58,6 +76,16 @@ struct SurfaceActionBody {
     action: String,
     #[serde(default)]
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeadLetterBody {
+    #[serde(default = "default_dead_letter_reason")]
+    reason: String,
+}
+
+fn default_dead_letter_reason() -> String {
+    "operator moved delivery to dead letter".to_string()
 }
 
 async fn list_surfaces_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -293,6 +321,145 @@ async fn action_surface_handler(
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
     Ok(Json(result))
+}
+
+async fn get_surface_inbox_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let surface = surface::normalize_surface_id(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "surface.inbox",
+        "surface": surface,
+        "inbox": state.services.surface.inbox(&id),
+        "snapshot": state.services.surface.message_snapshot(&id),
+    })))
+}
+
+async fn get_surface_outbox_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let surface = surface::normalize_surface_id(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "surface.outbox",
+        "surface": surface,
+        "outbox": state.services.surface.outbox(&id),
+        "dead_letters": state.services.surface.message_snapshot(&id).dead_letters,
+    })))
+}
+
+async fn get_surface_deliveries_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let surface = surface::normalize_surface_id(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "surface.deliveries",
+        "surface": surface,
+        "deliveries": state.services.surface.delivery_events(&id),
+    })))
+}
+
+async fn replay_surface_inbox_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, message_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let record = state
+        .services
+        .surface
+        .replay_inbox_message(&id, &message_id)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.inbox.replay",
+        "surface": surface::normalize_surface_id(&id),
+        "message_id": message_id,
+        "record": record,
+        "status": "queued",
+    })))
+}
+
+async fn retry_surface_outbox_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, delivery_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    ensure_surface_delivery(&state, &id, &delivery_id)?;
+    let result = state
+        .services
+        .surface
+        .retry_outbox_delivery(&delivery_id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.outbox.retry",
+        "surface": surface::normalize_surface_id(&id),
+        "delivery_id": delivery_id,
+        "result": result,
+    })))
+}
+
+async fn dead_letter_surface_outbox_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, delivery_id)): Path<(String, String)>,
+    Json(body): Json<DeadLetterBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    ensure_surface_delivery(&state, &id, &delivery_id)?;
+    let record = state
+        .services
+        .surface
+        .dead_letter_outbox_delivery(&delivery_id, body.reason)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.outbox.dead_letter",
+        "surface": surface::normalize_surface_id(&id),
+        "delivery_id": delivery_id,
+        "record": record,
+    })))
+}
+
+fn ensure_surface_delivery(
+    state: &AppState,
+    id: &str,
+    delivery_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let normalized = surface::normalize_surface_id(id);
+    let belongs_to_surface = state
+        .services
+        .surface
+        .outbox(&normalized)
+        .iter()
+        .any(|record| record.delivery_id == delivery_id);
+    if !belongs_to_surface {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface delivery `{normalized}/{delivery_id}` not found"),
+        ));
+    }
+    Ok(())
 }
 
 async fn surface_static_handler(

@@ -149,7 +149,7 @@ impl Component for SurfacePanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k select  h health  s start  x stop  r restart  R repair  m send  a action",
+            "Keys: j/k  h health  s start  x stop  r restart  R repair  m send  a action  i inbox  o outbox  v deliveries  p replay  d retry  D dlq",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.last_status {

@@ -9,6 +9,10 @@ use surface::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{managed_actions, SurfaceHost};
+use super::{
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
+    SurfaceOutboxRecord,
+};
 
 impl SurfaceHost {
     pub(crate) async fn events(&self, surface: &str) -> Vec<SurfaceFrame> {
@@ -28,6 +32,103 @@ impl SurfaceHost {
             .get(&surface)
             .map(|events| events.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn record_inbox_received(
+        &self,
+        surface: &str,
+        message_id: &str,
+        payload: &serde_json::Value,
+        runtime_session_id: &str,
+        thread_id: Option<String>,
+        sender_id: Option<String>,
+    ) -> Result<SurfaceInboxReceipt, String> {
+        self.messages.record_inbox_received(
+            surface,
+            message_id,
+            payload,
+            runtime_session_id,
+            thread_id,
+            sender_id,
+        )
+    }
+
+    pub(crate) fn mark_inbox_processing(&self, idempotency_key: &str) -> Result<(), String> {
+        self.messages.mark_inbox_processing(idempotency_key)
+    }
+
+    pub(crate) fn mark_inbox_processed(
+        &self,
+        idempotency_key: &str,
+        runtime_turn_id: Option<String>,
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_processed(idempotency_key, runtime_turn_id)
+    }
+
+    pub(crate) fn mark_inbox_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        self.messages.mark_inbox_failed(idempotency_key, error)
+    }
+
+    pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
+        self.messages.list_inbox(surface)
+    }
+
+    pub(crate) fn outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+        self.messages.list_outbox(surface)
+    }
+
+    pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
+        self.messages.list_delivery_events(surface)
+    }
+
+    pub(crate) fn message_snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+        self.messages.snapshot(surface)
+    }
+
+    pub(crate) fn replay_inbox_message(
+        &self,
+        surface: &str,
+        message_id: &str,
+    ) -> Result<SurfaceInboxRecord, String> {
+        let surface = normalize_surface_id(surface);
+        let record = self
+            .messages
+            .get_inbox_message(&surface, message_id)
+            .ok_or_else(|| format!("surface inbox `{surface}/{message_id}` not found"))?;
+        let replay_message_id = format!("{}:replay:{}", record.message_id, uuid::Uuid::new_v4());
+        let mut payload = record.payload_json.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "message_id".to_string(),
+                serde_json::Value::String(replay_message_id),
+            );
+            let metadata = object
+                .entry("metadata".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.insert(
+                    "replayed_from_message_id".to_string(),
+                    serde_json::Value::String(record.message_id.clone()),
+                );
+                metadata.insert(
+                    "replay_source".to_string(),
+                    serde_json::Value::String("gateway.surface_inbox".to_string()),
+                );
+            }
+        }
+        self.event_tx
+            .send(SurfaceFrame::Event {
+                surface,
+                event: "message.received".to_string(),
+                payload,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(record)
     }
 
     pub(super) async fn set_runtime(&self, snapshot: SurfaceRuntimeSnapshot) {
