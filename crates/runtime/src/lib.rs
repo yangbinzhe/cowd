@@ -55,8 +55,6 @@ pub use json::JsonValue;
 pub mod context_profiler;
 #[path = "context/context_runtime.rs"]
 pub mod context_runtime;
-#[path = "infrastructure/effect.rs"]
-pub mod effect;
 #[path = "infrastructure/execution_outcome.rs"]
 pub mod execution_outcome;
 #[path = "context/knowledge_activation.rs"]

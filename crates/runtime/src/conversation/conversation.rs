@@ -340,8 +340,6 @@ pub struct ConversationRuntime<C, T> {
     jps_pipeline: Option<Arc<dyn JpsOps>>,
     /// When true, inject available peer agents from AgentDirectory into the system prompt.
     inject_peer_context: bool,
-    /// P2-10: Optional EffectHandler for side-effect recording / mocking.
-    effect_handler: Option<Arc<dyn crate::effect::EffectHandler>>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
     project_phase: String,
     /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
@@ -541,7 +539,6 @@ where
             agent_skill_profile: AgentSkillProfile::default(),
             jps_pipeline: None,
             inject_peer_context: true,
-            effect_handler: None,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(
                 crate::gates::GateEvaluator::new().with_default_gates(),
@@ -1159,19 +1156,6 @@ where
     #[must_use]
     pub fn with_runtime_control_policy(mut self, policy: RuntimeControlPolicy) -> Self {
         self.runtime_control_policy = policy;
-        self
-    }
-
-    /// P2-10: Register an EffectHandler for side-effect tracking.
-    ///
-    /// # Safety
-    /// The callback MUST NOT capture an `Arc` to the `ConversationRuntime`
-    /// itself, as this would create a reference cycle and leak memory.
-    /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
-    /// they need to reference the runtime.
-    #[must_use]
-    pub fn with_effect_handler(mut self, handler: Arc<dyn crate::effect::EffectHandler>) -> Self {
-        self.effect_handler = Some(handler);
         self
     }
 
@@ -1985,7 +1969,6 @@ where
             {
                 use crate::execution_scheduler::schedule_tool_requests;
                 use crate::tool_dispatch::ToolRequest;
-                use futures::stream::{FuturesUnordered, StreamExt};
 
                 let mut requests: Vec<ToolRequest> = pending_tool_uses
                     .iter()
@@ -2004,162 +1987,22 @@ where
                 self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
                 let tool_schedule = schedule_tool_requests(&requests);
                 self.record_tool_schedule(&tool_schedule, &requests, self.session().messages.len());
-                let read_indices = tool_schedule.parallel_read_indices();
-                let rest_indices = tool_schedule.remaining_indices();
 
                 let mut result_map: std::collections::HashMap<
                     String,
                     (ConversationMessage, Option<String>),
                 > = std::collections::HashMap::new();
 
-                // T7: Wave-based execution for tools with dependency relationships
-                let wave_task_indices: Vec<usize> = requests
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, req)| {
-                        std::env::var("COWD_ENABLE_LEGACY_WAVE_READONLY")
-                            .ok()
-                            .as_deref()
-                            == Some("1")
-                            && !req.depends_on.is_empty()
-                            && crate::tool_orchestrator::ToolSafetyRegistry::global()
-                                .classify(&req.tool_name)
-                                == crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-
-                let (read_indices, rest_indices) = if !wave_task_indices.is_empty() {
-                    let wave_set: std::collections::HashSet<usize> =
-                        wave_task_indices.iter().cloned().collect();
-                    let mut wave = crate::wave::WaveOrchestrator::new()
-                        .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
-
-                    for &idx in &wave_task_indices {
-                        let task = self.detect_wave_task(&requests[idx]).unwrap();
-                        wave.add_task(task);
-                    }
-                    wave.build_waves()
-                        .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
-
-                    let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
-                    let wave_results = wave
-                        .execute(wave_exec)
-                        .await
-                        .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
-
-                    for wresult in wave_results {
-                        for tres in wresult.task_results {
-                            let tid = tres.task_id.0.clone();
-                            let req = requests.iter().find(|r| r.tool_use_id == tid);
-                            let tool_name_str =
-                                req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
-                            let output = tres
-                                .output
-                                .clone()
-                                .unwrap_or_else(|| tres.error.clone().unwrap_or_default());
-                            let is_error = !tres.success;
-                            let msg = ConversationMessage::tool_result(
-                                tid.clone(),
-                                tool_name_str.clone(),
-                                output,
-                                is_error,
-                            );
-                            self.session
-                                .write()
-                                .await
-                                .push_message(msg.clone())
-                                .map_err(|e| RuntimeError::new(e.to_string()))?;
-                            self.dual_write_message(
-                                &msg,
-                                self.session().messages.len().wrapping_sub(1),
-                            );
-                            let inject = self.turn_callback.as_ref().and_then(|cb| {
-                                let out = tres.output.as_deref().unwrap_or("");
-                                (cb.on_tool_result)(&tool_name_str, out)
-                            });
-                            result_map.insert(tid, (msg, inject));
-                        }
-                    }
-
-                    // Filter wave tasks out of read/rest indices for remaining dispatch
-                    let read: Vec<usize> = read_indices
-                        .into_iter()
-                        .filter(|i| !wave_set.contains(i))
-                        .collect();
-                    let rest: Vec<usize> = rest_indices
-                        .into_iter()
-                        .filter(|i| !wave_set.contains(i))
-                        .collect();
-                    (read, rest)
-                } else {
-                    (read_indices, rest_indices)
-                };
-
-                if !read_indices.is_empty() {
-                    let mut futs = FuturesUnordered::new();
-                    for &idx in &read_indices {
-                        let (ref tid, ref tname, ref tinput) = pending_tool_uses[idx];
-                        futs.push(
-                            self.execute_single_tool(tid, tname, tinput, prompter, iterations),
-                        );
-                    }
-                    while let Some(result) = futs.next().await {
-                        let msg = result?;
-                        let (msg_id, tool_name_str) = extract_tool_info(&msg);
-                        let inject = if let Some(ref cb) = self.turn_callback {
-                            let output = msg
-                                .blocks
-                                .first()
-                                .and_then(|b| match b {
-                                    ContentBlock::ToolResult { output, .. } => {
-                                        Some(output.as_str())
-                                    }
-                                    _ => None,
-                                })
-                                .unwrap_or("");
-                            (cb.on_tool_result)(&tool_name_str, output)
-                        } else {
-                            None
-                        };
-                        result_map.insert(msg_id, (msg, inject));
-                    }
-                }
-
-                for &idx in &rest_indices {
-                    let (ref tool_use_id, ref tool_name, ref input) = pending_tool_uses[idx];
-                    let sem = match self.tool_orchestrator.classify(tool_name) {
-                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => {
-                            &self.write_semaphore
-                        }
-                        crate::tool_orchestrator::ToolSafetyCategory::Network => {
-                            &self.network_semaphore
-                        }
-                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
-                            &self.destructive_semaphore
-                        }
-                        _ => &self.default_semaphore,
-                    };
-                    let _permit = sem.acquire().await.unwrap();
-                    let result_msg = self
-                        .execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
-                        .await?;
-                    drop(_permit);
-                    let inject = if let Some(ref cb) = self.turn_callback {
-                        let output = result_msg
-                            .blocks
-                            .first()
-                            .and_then(|b| match b {
-                                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
-                                _ => None,
-                            })
-                            .unwrap_or("");
-                        (cb.on_tool_result)(tool_name, output)
-                    } else {
-                        None
-                    };
-                    let (msg_id, _) = extract_tool_info(&result_msg);
-                    result_map.insert(msg_id, (result_msg, inject));
+                for batch in &tool_schedule.batches {
+                    self.execute_tool_schedule_batch(
+                        batch,
+                        &requests,
+                        &pending_tool_uses,
+                        prompter,
+                        iterations,
+                        &mut result_map,
+                    )
+                    .await?;
                 }
 
                 for id in &ordered_ids {
@@ -2675,63 +2518,44 @@ where
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
                 }
 
-                // P2-10: EffectHandler interceptor — use mock result if available
-                let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
-                    let r = handler.handle(crate::effect::Effect::ExecuteTool(
-                        tool_name.to_string(),
-                        effective_input.clone(),
-                    ));
-                    if r.success {
-                        Some(r.data)
-                    } else {
-                        None
-                    }
-                });
-
                 let start = Instant::now();
-                let (output, mut is_error, mut failure_kind) = if let Some(mock_output) =
-                    effect_mock
+                let tool_exec = Arc::clone(&self.tool_executor);
+                let tname = tool_name.to_string();
+                let tname_for_err = tname.clone();
+                let tinput = effective_input.clone();
+                // Per-tool timeout: check registry for per-tool override or category default,
+                // then cap with the global self.tool_timeout if set.
+                let registry_timeout = Duration::from_secs(
+                    crate::tool_orchestrator::ToolSafetyRegistry::global()
+                        .get_timeout_secs(tool_name),
+                );
+                let tool_timeout = self
+                    .tool_timeout
+                    .map_or(registry_timeout, |t| t.min(registry_timeout));
+                let (output, mut is_error, mut failure_kind) = match tokio::time::timeout(
+                    tool_timeout,
+                    tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
+                )
+                .await
                 {
-                    (mock_output, false, None)
-                } else {
-                    let tool_exec = Arc::clone(&self.tool_executor);
-                    let tname = tool_name.to_string();
-                    let tname_for_err = tname.clone();
-                    let tinput = effective_input.clone();
-                    // Per-tool timeout: check registry for per-tool override or category default,
-                    // then cap with the global self.tool_timeout if set.
-                    let registry_timeout = Duration::from_secs(
-                        crate::tool_orchestrator::ToolSafetyRegistry::global()
-                            .get_timeout_secs(tool_name),
-                    );
-                    let tool_timeout = self
-                        .tool_timeout
-                        .map_or(registry_timeout, |t| t.min(registry_timeout));
-                    match tokio::time::timeout(
-                        tool_timeout,
-                        tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Ok(output))) => (output, false, None),
-                        Ok(Ok(Err(error))) => (
-                            error.to_string(),
+                    Ok(Ok(Ok(output))) => (output, false, None),
+                    Ok(Ok(Err(error))) => (
+                        error.to_string(),
+                        true,
+                        Some(ToolFailureKind::ExecutionError),
+                    ),
+                    Ok(Err(join_error)) => (
+                        format!("tool execution panicked: {join_error}"),
+                        true,
+                        Some(ToolFailureKind::Panic),
+                    ),
+                    Err(_elapsed) => {
+                        tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
+                        (
+                            format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
                             true,
-                            Some(ToolFailureKind::ExecutionError),
-                        ),
-                        Ok(Err(join_error)) => (
-                            format!("tool execution panicked: {join_error}"),
-                            true,
-                            Some(ToolFailureKind::Panic),
-                        ),
-                        Err(_elapsed) => {
-                            tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
-                            (
-                                format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
-                                true,
-                                Some(ToolFailureKind::Timeout),
-                            )
-                        }
+                            Some(ToolFailureKind::Timeout),
+                        )
                     }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -2862,6 +2686,344 @@ where
                 Ok(denied)
             }
         }
+    }
+
+    async fn execute_tool_schedule_batch(
+        &self,
+        batch: &crate::execution_scheduler::ExecutionBatch,
+        requests: &[crate::tool_dispatch::ToolRequest],
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
+    ) -> Result<(), RuntimeError> {
+        match batch.mode {
+            crate::execution_scheduler::ExecutionBatchMode::Wave => {
+                if self
+                    .execute_legacy_wave_batch_if_enabled(batch, requests, result_map)
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.execute_tool_indices_serial_into_map(
+                    &batch.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    true,
+                    result_map,
+                )
+                .await
+            }
+            crate::execution_scheduler::ExecutionBatchMode::ParallelRead => {
+                self.execute_tool_indices_concurrently_into_map(
+                    &batch.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    batch.max_concurrency,
+                    false,
+                    result_map,
+                )
+                .await
+            }
+            crate::execution_scheduler::ExecutionBatchMode::LimitedNetwork => {
+                self.execute_tool_indices_concurrently_into_map(
+                    &batch.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    batch.max_concurrency,
+                    true,
+                    result_map,
+                )
+                .await
+            }
+            crate::execution_scheduler::ExecutionBatchMode::LimitedWrite => {
+                self.execute_write_scope_groups_into_map(
+                    batch,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    result_map,
+                )
+                .await
+            }
+            crate::execution_scheduler::ExecutionBatchMode::SerialDestructive => {
+                self.execute_tool_indices_serial_into_map(
+                    &batch.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    true,
+                    result_map,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn execute_tool_indices_concurrently_into_map(
+        &self,
+        indices: &[usize],
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        max_concurrency: usize,
+        acquire_category_permit: bool,
+        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
+    ) -> Result<(), RuntimeError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let limit = bounded_tool_concurrency(max_concurrency, indices.len());
+        for chunk in indices.chunks(limit) {
+            let mut futures = FuturesUnordered::new();
+            for &idx in chunk {
+                futures.push(self.execute_tool_index_collect(
+                    idx,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    acquire_category_permit,
+                ));
+            }
+            while let Some(result) = futures.next().await {
+                let (id, message) = result?;
+                result_map.insert(id, message);
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_write_scope_groups_into_map(
+        &self,
+        batch: &crate::execution_scheduler::ExecutionBatch,
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
+    ) -> Result<(), RuntimeError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        if batch.scope_groups.is_empty() {
+            return self
+                .execute_tool_indices_concurrently_into_map(
+                    &batch.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    batch.max_concurrency,
+                    true,
+                    result_map,
+                )
+                .await;
+        }
+
+        let limit = bounded_tool_concurrency(batch.max_concurrency, batch.scope_groups.len());
+        for chunk in batch.scope_groups.chunks(limit) {
+            let mut futures = FuturesUnordered::new();
+            for group in chunk {
+                futures.push(self.execute_tool_indices_serial_collect(
+                    &group.indices,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    true,
+                ));
+            }
+            while let Some(result) = futures.next().await {
+                for (id, message) in result? {
+                    result_map.insert(id, message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_tool_indices_serial_into_map(
+        &self,
+        indices: &[usize],
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        acquire_category_permit: bool,
+        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
+    ) -> Result<(), RuntimeError> {
+        for (id, message) in self
+            .execute_tool_indices_serial_collect(
+                indices,
+                pending_tool_uses,
+                prompter,
+                iterations,
+                acquire_category_permit,
+            )
+            .await?
+        {
+            result_map.insert(id, message);
+        }
+        Ok(())
+    }
+
+    async fn execute_tool_indices_serial_collect(
+        &self,
+        indices: &[usize],
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        acquire_category_permit: bool,
+    ) -> Result<Vec<(String, (ConversationMessage, Option<String>))>, RuntimeError> {
+        let mut results = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            results.push(
+                self.execute_tool_index_collect(
+                    idx,
+                    pending_tool_uses,
+                    prompter,
+                    iterations,
+                    acquire_category_permit,
+                )
+                .await?,
+            );
+        }
+        Ok(results)
+    }
+
+    async fn execute_tool_index_collect(
+        &self,
+        idx: usize,
+        pending_tool_uses: &[(String, String, String)],
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        acquire_category_permit: bool,
+    ) -> Result<(String, (ConversationMessage, Option<String>)), RuntimeError> {
+        let Some((tool_use_id, tool_name, input)) = pending_tool_uses.get(idx) else {
+            return Err(RuntimeError::new(format!(
+                "tool schedule referenced missing tool index {idx}"
+            )));
+        };
+
+        let result_msg = if acquire_category_permit {
+            let sem = self.tool_category_semaphore(tool_name);
+            let _permit = sem.acquire().await.map_err(|error| {
+                RuntimeError::new(format!("tool category semaphore closed: {error}"))
+            })?;
+            self.execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
+                .await?
+        } else {
+            self.execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
+                .await?
+        };
+        Ok(self.collect_tool_result_message(result_msg))
+    }
+
+    fn collect_tool_result_message(
+        &self,
+        result_msg: ConversationMessage,
+    ) -> (String, (ConversationMessage, Option<String>)) {
+        let (msg_id, tool_name) = extract_tool_info(&result_msg);
+        let inject = self.turn_callback.as_ref().and_then(|callback| {
+            let output = result_msg
+                .blocks
+                .first()
+                .and_then(|block| match block {
+                    ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            (callback.on_tool_result)(&tool_name, output)
+        });
+        (msg_id, (result_msg, inject))
+    }
+
+    fn tool_category_semaphore(&self, tool_name: &str) -> &Semaphore {
+        match self.tool_orchestrator.classify(tool_name) {
+            crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
+            crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
+            crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
+                &self.destructive_semaphore
+            }
+            crate::tool_orchestrator::ToolSafetyCategory::ReadOnly => &self.default_semaphore,
+        }
+    }
+
+    async fn execute_legacy_wave_batch_if_enabled(
+        &self,
+        batch: &crate::execution_scheduler::ExecutionBatch,
+        requests: &[crate::tool_dispatch::ToolRequest],
+        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
+    ) -> Result<bool, RuntimeError> {
+        if std::env::var("COWD_ENABLE_LEGACY_WAVE_READONLY")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Ok(false);
+        }
+        let registry = crate::tool_orchestrator::ToolSafetyRegistry::global();
+        if !batch.indices.iter().all(|idx| {
+            requests
+                .get(*idx)
+                .map(|request| {
+                    !request.depends_on.is_empty()
+                        && registry.classify(&request.tool_name)
+                            == crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
+                })
+                .unwrap_or(false)
+        }) {
+            return Ok(false);
+        }
+
+        let mut wave = crate::wave::WaveOrchestrator::new()
+            .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
+        for &idx in &batch.indices {
+            let Some(request) = requests.get(idx) else {
+                return Err(RuntimeError::new(format!(
+                    "wave batch referenced missing tool index {idx}"
+                )));
+            };
+            let Some(task) = self.detect_wave_task(request) else {
+                return Ok(false);
+            };
+            wave.add_task(task);
+        }
+        wave.build_waves()
+            .map_err(|error: crate::wave::WaveError| RuntimeError::new(error.to_string()))?;
+
+        let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
+        let wave_results = wave
+            .execute(wave_exec)
+            .await
+            .map_err(|error: crate::wave::WaveError| RuntimeError::new(error.to_string()))?;
+
+        for wave_result in wave_results {
+            for tool_result in wave_result.task_results {
+                let tool_use_id = tool_result.task_id.0.clone();
+                let tool_name = requests
+                    .iter()
+                    .find(|request| request.tool_use_id == tool_use_id)
+                    .map_or("unknown", |request| request.tool_name.as_str())
+                    .to_string();
+                let output = tool_result
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| tool_result.error.clone().unwrap_or_default());
+                let result_msg = ConversationMessage::tool_result(
+                    tool_use_id.clone(),
+                    tool_name,
+                    output,
+                    !tool_result.success,
+                );
+                self.session
+                    .write()
+                    .await
+                    .push_message(result_msg.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(&result_msg, self.session().messages.len().wrapping_sub(1));
+                let (id, message) = self.collect_tool_result_message(result_msg);
+                result_map.insert(id, message);
+            }
+        }
+        Ok(true)
     }
 
     /// T7: Detect whether a [`ToolRequest`] should be executed via wave orchestration.
@@ -4188,6 +4350,17 @@ fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
     }
 }
 
+fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize {
+    if item_count == 0 {
+        return 1;
+    }
+    if max_concurrency == usize::MAX {
+        item_count.max(1)
+    } else {
+        max_concurrency.max(1).min(item_count)
+    }
+}
+
 fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
     messages
         .iter()
@@ -4557,8 +4730,9 @@ mod tests {
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4675,6 +4849,88 @@ mod tests {
                 _ => unreachable!("extra API call"),
             };
             wrap(events)
+        }
+    }
+
+    struct MultiToolApiClient {
+        call_count: usize,
+        tool_uses: Vec<(String, String, String)>,
+    }
+
+    impl MultiToolApiClient {
+        fn new(tool_uses: Vec<(&str, &str, &str)>) -> Self {
+            Self {
+                call_count: 0,
+                tool_uses: tool_uses
+                    .into_iter()
+                    .map(|(id, name, input)| (id.to_string(), name.to_string(), input.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl ApiClient for MultiToolApiClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            use futures::stream;
+            self.call_count += 1;
+            let events = match self.call_count {
+                1 => {
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::User));
+                    let mut events = vec![AssistantEvent::TextDelta(
+                        "I will inspect in parallel.".to_string(),
+                    )];
+                    for (id, name, input) in self.tool_uses.clone() {
+                        events.push(AssistantEvent::ToolUse { id, name, input });
+                    }
+                    events.push(AssistantEvent::MessageStop);
+                    events
+                }
+                2 => {
+                    let tool_message_count = request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == MessageRole::Tool)
+                        .count();
+                    assert!(
+                        tool_message_count >= self.tool_uses.len(),
+                        "second provider request should include every tool result"
+                    );
+                    vec![
+                        AssistantEvent::TextDelta("Done.".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]
+                }
+                _ => unreachable!("extra API call"),
+            };
+            Box::pin(stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+
+    struct PromptAllowAll;
+
+    impl PermissionPrompter for PromptAllowAll {
+        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+            PermissionPromptDecision::Allow
+        }
+    }
+
+    fn tracked_tool_handler(
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        delay: Duration,
+    ) -> impl Fn(&str) -> Result<String, ToolError> + Send + Sync + 'static {
+        move |input| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(format!("ok:{input}"))
         }
     }
 
@@ -4811,6 +5067,137 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn conversation_runs_limited_network_tools_concurrently() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tool_executor = StaticToolExecutor::new()
+            .register(
+                "WebSearch",
+                tracked_tool_handler(
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Duration::from_millis(80),
+                ),
+            )
+            .register(
+                "WebFetch",
+                tracked_tool_handler(
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Duration::from_millis(80),
+                ),
+            );
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MultiToolApiClient::new(vec![
+                ("net-1", "WebSearch", r#"{"query":"rust"}"#),
+                ("net-2", "WebFetch", r#"{"url":"https://example.test"}"#),
+            ]),
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_turn_async(
+                "inspect web evidence",
+                &SharedPrompter::new(Box::new(PromptAllowAll)),
+            ))
+            .expect("network tools should execute");
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            2,
+            "network batch should run with limited parallelism instead of serial rest loop"
+        );
+    }
+
+    #[test]
+    fn conversation_serializes_write_tools_with_same_scope() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tool_executor = StaticToolExecutor::new().register(
+            "write_file",
+            tracked_tool_handler(
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                Duration::from_millis(60),
+            ),
+        );
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MultiToolApiClient::new(vec![
+                (
+                    "write-1",
+                    "write_file",
+                    r#"{"path":"shared.txt","content":"a"}"#,
+                ),
+                (
+                    "write-2",
+                    "write_file",
+                    r#"{"path":"shared.txt","content":"b"}"#,
+                ),
+            ]),
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_turn_async(
+                "write the same file twice",
+                &SharedPrompter::new(Box::new(PromptAllowAll)),
+            ))
+            .expect("write tools should execute");
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "same-scope write tools must stay serial to avoid file races"
+        );
+    }
+
+    #[test]
+    fn conversation_runs_write_tools_for_different_scopes_concurrently() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tool_executor = StaticToolExecutor::new().register(
+            "write_file",
+            tracked_tool_handler(
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                Duration::from_millis(60),
+            ),
+        );
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MultiToolApiClient::new(vec![
+                ("write-1", "write_file", r#"{"path":"a.txt","content":"a"}"#),
+                ("write-2", "write_file", r#"{"path":"b.txt","content":"b"}"#),
+            ]),
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_turn_async(
+                "write two independent files",
+                &SharedPrompter::new(Box::new(PromptAllowAll)),
+            ))
+            .expect("independent write tools should execute");
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            2,
+            "different write scopes should run concurrently under the write limit"
+        );
     }
 
     #[test]
