@@ -9,7 +9,6 @@ publish.workspace = true
 futures = "0.3"
 harness-contract = { path = "../harness-contract" }
 base64 = "0.22"
-skill-service = { path = "../skill/service" }
 flate2 = "1"
 glob = "0.3"
 mcp = { path = "../mcp" }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::command::slash::SkillSlashDispatch;
-use skill_service::{SkillRegistry, SkillRegistryRootKind, SkillViewOutput};
+use skill::{SkillRegistry, SkillRegistryRootKind, SkillViewOutput};
 
 #[derive(Debug, Clone)]
 pub(super) struct LocalSkillSummary {

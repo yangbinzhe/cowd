@@ -5,7 +5,7 @@ use std::{
 
 use app_mfg::{server_manufacturing_skill_pack, MfgSkillManifest};
 use serde::Serialize;
-use skill_service::{SkillInfo, SkillRegistry, SkillRouter};
+use skill::{profile_skill_package, SkillInfo, SkillRegistry, SkillRouter};
 
 use super::{SkillActionRequest, SkillServiceError};
 
@@ -23,6 +23,7 @@ pub(super) struct SkillCatalogItem {
     pub(super) tools: Vec<String>,
     pub(super) required_evidence: Vec<String>,
     pub(super) capabilities: Vec<String>,
+    pub(super) profile: Option<serde_json::Value>,
     pub(super) path: Option<String>,
     pub(super) shadowed_by: Option<String>,
 }
@@ -147,17 +148,32 @@ fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
         source: "app_mfg.server_manufacturing".to_string(),
         domain: Some(skill.domain),
         status: "ready".to_string(),
-        risk,
+        risk: risk.clone(),
         tags,
         tools: skill.tools,
         required_evidence: skill.required_evidence,
         capabilities,
+        profile: Some(serde_json::json!({
+            "kind": "domain",
+            "lifecycle_status": "usable_runtime",
+            "adapters": ["tool_guided"],
+            "risk_level": risk,
+            "owner": "app_mfg"
+        })),
         path: None,
         shadowed_by: None,
     }
 }
 
 fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
+    let root = if skill.path.is_file() {
+        skill.path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        skill.path.clone()
+    };
+    let profile = profile_skill_package(&root, &skill.name, None)
+        .ok()
+        .and_then(|profile| serde_json::to_value(profile).ok());
     SkillCatalogItem {
         id: format!("local:{}", skill.name),
         name: skill.name,
@@ -175,6 +191,7 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
         tools: Vec::new(),
         required_evidence: Vec::new(),
         capabilities: skill.related_skills,
+        profile,
         path: Some(skill.path.display().to_string()),
         shadowed_by: skill.shadowed_by.map(|source| format!("{source:?}")),
     }
@@ -488,5 +505,63 @@ pub(super) fn activation_projection(
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.contains(&value) {
         values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!(
+            "cowd-gateway-skill-projection-{name}-{millis}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp workspace");
+        root
+    }
+
+    #[test]
+    fn local_skill_catalog_item_projects_inspection_profile() {
+        let workspace = temp_workspace("profile");
+        let skill_root = workspace.join(".cowd").join("skills").join("profile-demo");
+        fs::create_dir_all(&skill_root).expect("create skill root");
+        fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: profile-demo\ndescription: Profile demo\n---\n# Profile Demo\n",
+        )
+        .expect("write skill");
+        fs::write(
+            skill_root.join("pyproject.toml"),
+            "[project]\nname='profile-demo'\n",
+        )
+        .expect("write pyproject");
+
+        let items = collect_skill_catalog(&workspace).expect("catalog");
+        let item = items
+            .iter()
+            .find(|item| item.id == "local:profile-demo")
+            .expect("local profile skill");
+        let profile = item.profile.as_ref().expect("profile is projected");
+
+        assert_eq!(profile["skill_id"], "profile-demo");
+        assert_eq!(profile["lifecycle_status"], "usable_runtime");
+        assert!(profile["adapters"]
+            .as_array()
+            .expect("adapters")
+            .iter()
+            .any(|adapter| adapter == "sandbox_exec"));
+        assert!(profile["entrypoints"]
+            .as_array()
+            .expect("entrypoints")
+            .iter()
+            .any(|entry| entry["path"] == "SKILL.md"));
+
+        fs::remove_dir_all(workspace).expect("cleanup");
     }
 }

@@ -16,6 +16,7 @@ use crate::skill_manifest::{
     get_skill_name, get_tags, matches_platform, parse_skill_file, PrerequisitesCheck,
     SkillConfigVar,
 };
+use crate::{generate_skill_draft, SkillGenerationContext, SkillGenerationTrigger};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -768,15 +769,18 @@ impl SkillManager {
         let error_count = input.error_count.unwrap_or(0);
         let user_corrections = input.user_corrections.unwrap_or(0);
 
-        // Determine generation triggers with priority
-        let triggers = analyze_generation_triggers(
-            &task_description,
+        let context = SkillGenerationContext {
+            task_description: task_description.clone(),
             tool_call_count,
             error_count,
             user_corrections,
-        );
+            accepted_plan_refs: Vec::new(),
+            test_report_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+        };
+        let draft = generate_skill_draft(input.name.clone(), context);
 
-        if !triggers.should_generate {
+        if !draft.should_generate {
             return SkillGenerateOutput {
                 success: false,
                 name: String::new(),
@@ -789,17 +793,14 @@ impl SkillManager {
                 ),
             };
         }
-
-        // Log the trigger that caused generation
-        let trigger_reason = triggers.primary_reason();
-
-        // Generate skill content based on context
-        let name = input
-            .name
-            .clone()
-            .unwrap_or_else(|| generate_skill_name(&task_description));
-
-        let content = generate_skill_content(&name, &task_description, &triggers);
+        let trigger_reason = draft
+            .triggers
+            .first()
+            .copied()
+            .unwrap_or(SkillGenerationTrigger::ExplicitTaskDescription)
+            .as_str();
+        let name = draft.name;
+        let content = draft.content;
 
         // Optionally save the skill
         let path = if let Some(install_root) = self.roots.first() {
@@ -839,275 +840,6 @@ impl SkillManager {
             ),
         }
     }
-}
-
-/// Analysis result for skill generation triggers
-#[derive(Debug, Clone)]
-struct GenerationTriggers {
-    /// Whether generation should proceed
-    should_generate: bool,
-    /// Tool call count trigger
-    tool_call_trigger: bool,
-    /// Error count trigger
-    error_trigger: bool,
-    /// User correction trigger
-    correction_trigger: bool,
-    /// Task description trigger
-    description_trigger: bool,
-    /// Context complexity score (0-100)
-    complexity_score: usize,
-}
-
-impl GenerationTriggers {
-    /// Get the primary reason for generation
-    fn primary_reason(&self) -> &'static str {
-        if self.description_trigger {
-            "task_description"
-        } else if self.correction_trigger {
-            "user_corrections"
-        } else if self.error_trigger {
-            "error_count"
-        } else if self.tool_call_trigger {
-            "tool_call_count"
-        } else {
-            "complexity"
-        }
-    }
-}
-
-/// Analyze whether skill generation should be triggered
-fn analyze_generation_triggers(
-    task_description: &str,
-    tool_call_count: usize,
-    error_count: usize,
-    user_corrections: usize,
-) -> GenerationTriggers {
-    // Explicit triggers
-    let tool_call_trigger = tool_call_count >= 10; // High complexity threshold
-    let error_trigger = error_count >= 2; // Repeated errors suggest need for automation
-    let correction_trigger = user_corrections >= 1; // User corrections indicate manual process
-    let description_trigger = !task_description.is_empty();
-
-    // Calculate complexity score based on multiple factors
-    let mut complexity_score = 0;
-
-    // Tool call complexity (max 30 points)
-    complexity_score += (tool_call_count.min(30) * 30) / 30;
-
-    // Error pattern (max 20 points)
-    complexity_score += (error_count.min(4) * 20) / 4;
-
-    // User correction rate (max 20 points)
-    complexity_score += (user_corrections.min(4) * 20) / 4;
-
-    // Description richness (max 30 points)
-    if !task_description.is_empty() {
-        let word_count = task_description.split_whitespace().count();
-        complexity_score += (word_count.min(30) * 30) / 30;
-    }
-
-    // Determine if generation should proceed
-    let should_generate = tool_call_trigger
-        || error_trigger
-        || correction_trigger
-        || description_trigger
-        || complexity_score >= 40;
-
-    GenerationTriggers {
-        should_generate,
-        tool_call_trigger,
-        error_trigger,
-        correction_trigger,
-        description_trigger,
-        complexity_score,
-    }
-}
-
-/// Generate comprehensive skill content from context
-fn generate_skill_content(
-    name: &str,
-    task_description: &str,
-    triggers: &GenerationTriggers,
-) -> String {
-    // Parse task description for key information
-    let use_cases = extract_use_cases(task_description);
-    let procedures = extract_procedures(task_description);
-    let prerequisites = extract_prerequisites(task_description);
-
-    // Build skill content
-    let mut content = format!(
-        r#"# {}
-
-{}
-
-## Trigger Analysis
-- Complexity Score: {}/100
-- Tool Calls: {}
-- Errors: {}
-- User Corrections: {}
-
-## When to Use
-{}
-"#,
-        name,
-        if task_description.is_empty() {
-            "Auto-generated skill from task context."
-        } else {
-            task_description
-        },
-        triggers.complexity_score,
-        if triggers.tool_call_trigger {
-            "high"
-        } else {
-            "normal"
-        },
-        if triggers.error_trigger {
-            "repeated"
-        } else {
-            "none"
-        },
-        if triggers.correction_trigger {
-            "detected"
-        } else {
-            "none"
-        },
-        use_cases,
-    );
-
-    // Add prerequisites if detected
-    if !prerequisites.is_empty() {
-        content.push_str("## Prerequisites\n");
-        for prereq in prerequisites {
-            content.push_str(&format!("- {}\n", prereq));
-        }
-        content.push('\n');
-    }
-
-    // Add procedures
-    content.push_str("## Procedures\n");
-    if procedures.is_empty() {
-        content.push_str("1. Analyze the task requirements\n");
-        content.push_str("2. Plan the approach\n");
-        content.push_str("3. Execute the steps\n");
-        content.push_str("4. Verify the results\n");
-    } else {
-        for (i, proc) in procedures.iter().enumerate() {
-            content.push_str(&format!("{}. {}\n", i + 1, proc));
-        }
-    }
-    content.push('\n');
-
-    // Add tips based on triggers
-    content.push_str("## Tips\n");
-    if triggers.error_trigger {
-        content.push_str("- Common pitfalls have been addressed in procedures\n");
-    }
-    if triggers.correction_trigger {
-        content.push_str("- This workflow was refined based on user feedback\n");
-    }
-    content.push_str("- Always verify results after completion\n");
-    content.push_str("- Check prerequisites before starting\n");
-
-    content
-}
-
-/// Extract potential use cases from task description
-fn extract_use_cases(description: &str) -> String {
-    if description.is_empty() {
-        return "When you need to automate this type of task".to_string();
-    }
-
-    let keywords = vec![
-        "deploy",
-        "build",
-        "test",
-        "create",
-        "manage",
-        "monitor",
-        "backup",
-        "restore",
-        "analyze",
-        "generate",
-        "process",
-        "convert",
-        "migrate",
-        "configure",
-        "install",
-        "setup",
-    ];
-
-    let desc_lower = description.to_lowercase();
-    let words: Vec<&str> = desc_lower.split_whitespace().collect();
-    let mut matched = Vec::new();
-
-    for keyword in keywords {
-        if words.iter().any(|w| w.contains(keyword)) {
-            matched.push(keyword);
-        }
-    }
-
-    if matched.is_empty() {
-        format!(
-            "When working with: {}",
-            description
-                .split_whitespace()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    } else {
-        format!(
-            "When you need to {} (detected from context)",
-            matched.join(", ")
-        )
-    }
-}
-
-/// Extract procedures from task description
-fn extract_procedures(description: &str) -> Vec<String> {
-    // Look for numbered items or step indicators in description
-    let mut procedures = Vec::new();
-
-    // Check for explicit steps
-    for line in description.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(|c: char| c.is_numeric() && trimmed.contains('.')) {
-            procedures.push(
-                trimmed
-                    .chars()
-                    .skip_while(|c| c.is_numeric() || *c == '.' || c.is_whitespace())
-                    .collect(),
-            );
-        }
-    }
-
-    procedures
-}
-
-/// Extract prerequisites from task description
-fn extract_prerequisites(description: &str) -> Vec<String> {
-    let prereq_keywords = vec!["require", "need", "must have", "prerequisite"];
-
-    let mut prerequisites = Vec::new();
-    let lower = description.to_lowercase();
-
-    for keyword in prereq_keywords {
-        if lower.contains(keyword) {
-            // Extract the sentence containing the keyword
-            for sentence in description.split(|c: char| c == '.' || c == ';') {
-                if sentence.to_lowercase().contains(keyword) {
-                    let trimmed = sentence.trim();
-                    if !trimmed.is_empty() && trimmed.len() < 100 {
-                        prerequisites.push(trimmed.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // Limit to 3 most relevant prerequisites
-    prerequisites.truncate(3);
-    prerequisites
 }
 
 // Helper functions
@@ -1201,23 +933,6 @@ fn get_platforms(parsed: &crate::skill_manifest::ParsedSkill) -> Vec<String> {
     Vec::new()
 }
 
-pub(crate) fn generate_skill_name(description: &str) -> String {
-    let words: Vec<&str> = description.split_whitespace().take(3).collect();
-    let base = if words.is_empty() {
-        "generated-skill".to_string()
-    } else {
-        words.join("-").to_lowercase()
-    };
-
-    // Add timestamp to avoid conflicts
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    format!("{}-{}", base, timestamp % 10000)
-}
-
 mod tests {
     #[allow(unused_imports)]
     use super::*;
@@ -1229,12 +944,5 @@ mod tests {
 
         let long = "a".repeat(100);
         assert!(truncate_content(&long, 50).contains("[truncated]"));
-    }
-
-    #[test]
-    fn test_generate_skill_name() {
-        let name = generate_skill_name("Deploy to Kubernetes cluster");
-        assert!(name.contains("deploy"));
-        assert!(name.contains("kubernetes"));
     }
 }

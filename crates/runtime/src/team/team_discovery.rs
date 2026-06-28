@@ -81,16 +81,16 @@ impl TeamDiscoveryProtocol {
 
     // ── discover_team ──────────────────────────────────────────────────────
 
-    /// Discover agents whose capabilities match `required_skills`, ranked by a
-    /// composite score: skill-overlap count * (1 + reputation composite / 10).
+    /// Discover agents whose capabilities match `required_capabilities`, ranked by a
+    /// composite score: capability-overlap count * (1 + reputation composite / 10).
     ///
     /// Returns agents sorted highest-score first.
     pub fn discover_team(
         &self,
         _task_description: &str,
-        required_skills: &[String],
+        required_capabilities: &[String],
     ) -> Vec<AgentInfo> {
-        let candidates = AgentDirectory::global().discover(required_skills);
+        let candidates = AgentDirectory::global().discover(required_capabilities);
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -98,17 +98,17 @@ impl TeamDiscoveryProtocol {
         let mut scored: Vec<_> = candidates
             .into_iter()
             .map(|a| {
-                let skill_count = a
+                let capability_count = a
                     .capabilities
                     .iter()
-                    .filter(|c| required_skills.contains(c))
+                    .filter(|c| required_capabilities.contains(c))
                     .count() as f64;
                 let rep_bonus = a
                     .reputation
                     .as_ref()
                     .map(|r| r.composite() / 10.0)
                     .unwrap_or(0.0);
-                let score = skill_count * (1.0 + rep_bonus);
+                let score = capability_count * (1.0 + rep_bonus);
                 (score, a)
             })
             .collect();
@@ -124,9 +124,9 @@ impl TeamDiscoveryProtocol {
     pub fn auto_assemble(
         &self,
         task_description: &str,
-        required_skills: &[String],
+        required_capabilities: &[String],
     ) -> Option<DiscoveredTeam> {
-        let ranked = self.discover_team(task_description, required_skills);
+        let ranked = self.discover_team(task_description, required_capabilities);
         if ranked.is_empty() {
             return None;
         }
@@ -273,17 +273,17 @@ impl Default for TeamDiscoveryProtocol {
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 fn skill_names_from_activation(activation: &SkillActivationRecord) -> Vec<String> {
-    let mut skills = Vec::new();
+    let mut capabilities = Vec::new();
     if let Some(selected) = &activation.selected {
-        skills.push(selected.clone());
+        capabilities.push(selected.clone());
     }
     for candidate in &activation.candidates {
-        if candidate.score < 2 || skills.contains(&candidate.name) {
+        if candidate.score < 2 || capabilities.contains(&candidate.name) {
             continue;
         }
-        skills.push(candidate.name.clone());
+        capabilities.push(candidate.name.clone());
     }
-    skills
+    capabilities
 }
 
 fn now_millis() -> u64 {
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_skills_returns_no_agents() {
+    fn empty_capabilities_returns_no_agents() {
         let proto = TeamDiscoveryProtocol::new();
         let ranked = proto.discover_team("anything", &[]);
         assert!(ranked.is_empty());

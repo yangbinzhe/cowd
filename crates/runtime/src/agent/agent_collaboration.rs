@@ -35,7 +35,7 @@ use memory::{
 pub struct SubTask {
     pub id: String,
     pub description: String,
-    pub required_skills: Vec<String>,
+    pub required_capabilities: Vec<String>,
     pub depends_on: Vec<String>,
 }
 
@@ -44,7 +44,7 @@ pub struct SubTask {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollaborationTask {
     pub description: String,
-    pub required_skills: Vec<String>,
+    pub required_capabilities: Vec<String>,
     pub subtasks: Vec<SubTask>,
     pub review_criteria: Option<String>,
     pub collaboration_decision: Option<CollaborationDecision>,
@@ -307,18 +307,18 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     // ── decompose_task ─────────────────────────────────────────────────────
 
     /// Heuristic decomposition: identify phases by delimiter keywords and
-    /// assign required skills via keyword matching.
+    /// assign required capabilities via keyword matching.
     pub fn decompose_task(&self, task: &str) -> Vec<SubTask> {
         let phases = split_phases(task);
         phases
             .into_iter()
             .enumerate()
             .map(|(i, desc)| {
-                let skills = infer_skills(&desc);
+                let capabilities = infer_capabilities(&desc);
                 SubTask {
                     id: format!("subtask-{}", i + 1),
                     description: desc,
-                    required_skills: skills,
+                    required_capabilities: capabilities,
                     depends_on: Vec::new(),
                 }
             })
@@ -338,8 +338,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     // ── assemble_team ──────────────────────────────────────────────────────
 
-    /// Query the `TeamDiscoveryProtocol` for agents matching required skills,
-    /// ranked by skill-overlap * reputation composite.
+    /// Query the `TeamDiscoveryProtocol` for agents matching required capabilities,
+    /// ranked by capability-overlap * reputation composite.
     ///
     /// Falls back to the basic `AgentDirectory::discover()` if the discovery
     /// protocol produces no results but raw candidates exist.
@@ -349,7 +349,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         // Try reputation-aware discovery first.
         if let Some(discovered) = self
             .discovery
-            .auto_assemble(&task.description, &task.required_skills)
+            .auto_assemble(&task.description, &task.required_capabilities)
         {
             return Some(AgentTeam {
                 leader: discovered.leader,
@@ -358,7 +358,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         }
 
         // Fallback: simple AgentDirectory discovery.
-        let candidates = AgentDirectory::global().discover(&task.required_skills);
+        let candidates = AgentDirectory::global().discover(&task.required_capabilities);
         if candidates.is_empty() {
             return None;
         }
@@ -368,7 +368,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
                 let score = a
                     .capabilities
                     .iter()
-                    .filter(|c| task.required_skills.contains(c))
+                    .filter(|c| task.required_capabilities.contains(c))
                     .count();
                 (score, a)
             })
@@ -409,7 +409,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             }
             wave_task = wave_task.with_payload(serde_json::json!({
                 "description": st.description,
-                "skills": st.required_skills,
+                "capabilities": st.required_capabilities,
             }));
             orchestrator.add_task(wave_task);
         }
@@ -674,8 +674,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     /// End-to-end collaboration loop: decompose, assemble, dispatch,
     /// synthesize, finalize.
-    pub async fn run(&self, task: &str, required_skills: &[String]) -> Option<String> {
-        self.run_with_context(task, required_skills)
+    pub async fn run(&self, task: &str, required_capabilities: &[String]) -> Option<String> {
+        self.run_with_context(task, required_capabilities)
             .await
             .map(|result| result.synthesis)
     }
@@ -683,7 +683,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     pub async fn run_with_context(
         &self,
         task: &str,
-        required_skills: &[String],
+        required_capabilities: &[String],
     ) -> Option<CollaborationContextResult> {
         // 1. Decompose
         let subtasks = self.decompose_sequential(task);
@@ -694,7 +694,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         // 2. Assemble team
         let collab_task = CollaborationTask {
             description: task.to_string(),
-            required_skills: required_skills.to_vec(),
+            required_capabilities: required_capabilities.to_vec(),
             subtasks: subtasks.clone(),
             review_criteria: None,
             collaboration_decision: Some(collaboration_decision),
@@ -822,10 +822,10 @@ fn collapse_phases(phases: &mut Vec<String>, min_len: usize) {
     *phases = merged;
 }
 
-/// Infer required skills from a task description via keyword matching.
-fn infer_skills(desc: &str) -> Vec<String> {
+/// Infer required capabilities from a task description via keyword matching.
+fn infer_capabilities(desc: &str) -> Vec<String> {
     let desc_lower = desc.to_lowercase();
-    let mut skills: Vec<String> = Vec::new();
+    let mut capabilities: Vec<String> = Vec::new();
 
     let keyword_map: &[(&str, &[&str])] = &[
         ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
@@ -864,19 +864,19 @@ fn infer_skills(desc: &str) -> Vec<String> {
         ),
     ];
 
-    for (skill, keywords) in keyword_map {
+    for (capability, keywords) in keyword_map {
         for kw in *keywords {
             if desc_lower.contains(kw) {
-                skills.push(skill.to_string());
+                capabilities.push(capability.to_string());
                 break;
             }
         }
     }
 
-    if skills.is_empty() {
-        skills.push("general".to_string());
+    if capabilities.is_empty() {
+        capabilities.push("general".to_string());
     }
-    skills
+    capabilities
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -1138,7 +1138,7 @@ fn agent_task_traces_from_results(
                 parent_run_id: None,
                 agent_run_id: None,
                 role: subtask
-                    .and_then(|task| task.required_skills.first().cloned())
+                    .and_then(|task| task.required_capabilities.first().cloned())
                     .unwrap_or_else(|| "agent".to_string()),
                 objective: subtask
                     .map(|task| task.description.clone())
@@ -1176,12 +1176,12 @@ pub trait CollaborationOps: Send + Sync {
     fn run_boxed<'a>(
         &'a self,
         task: &'a str,
-        skills: &'a [String],
+        capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
     fn run_with_context_boxed<'a>(
         &'a self,
         task: &'a str,
-        skills: &'a [String],
+        capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
     fn decompose_task(&self, task: &str) -> Vec<SubTask>;
     fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
@@ -1191,16 +1191,16 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
     fn run_boxed<'a>(
         &'a self,
         task: &'a str,
-        skills: &'a [String],
+        capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
-        Box::pin(self.run(task, skills))
+        Box::pin(self.run(task, capabilities))
     }
     fn run_with_context_boxed<'a>(
         &'a self,
         task: &'a str,
-        skills: &'a [String],
+        capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
-        Box::pin(self.run_with_context(task, skills))
+        Box::pin(self.run_with_context(task, capabilities))
     }
     fn decompose_task(&self, task: &str) -> Vec<SubTask> {
         self.decompose_task(task)
@@ -1251,7 +1251,7 @@ mod tests {
         );
         for st in &subtasks {
             assert!(!st.description.is_empty());
-            assert!(!st.required_skills.is_empty());
+            assert!(!st.required_capabilities.is_empty());
         }
     }
 
@@ -1280,11 +1280,11 @@ mod tests {
     }
 
     #[test]
-    fn assemble_team_returns_none_for_unknown_skills() {
+    fn assemble_team_returns_none_for_unknown_capabilities() {
         let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let task = CollaborationTask {
             description: "do something obscure".to_string(),
-            required_skills: vec!["quantum-xeno-linguistics".to_string()],
+            required_capabilities: vec!["quantum-xeno-linguistics".to_string()],
             subtasks: vec![],
             review_criteria: None,
             collaboration_decision: None,
@@ -1313,7 +1313,7 @@ mod tests {
         let subtasks = vec![SubTask {
             id: "s1".to_string(),
             description: "analyze".to_string(),
-            required_skills: vec!["planning".to_string()],
+            required_capabilities: vec!["planning".to_string()],
             depends_on: vec![],
         }];
         let results = orch.dispatch_subtasks(&team, &subtasks).await;
@@ -1605,17 +1605,17 @@ Memory: lightweight spike has a live-memory pulse candidate"
     }
 
     #[test]
-    fn infer_skills_detects_rust() {
-        let skills = infer_skills("refactor the Rust module and write tests");
-        assert!(skills.contains(&"rust".to_string()));
-        assert!(skills.contains(&"refactoring".to_string()));
-        assert!(skills.contains(&"testing".to_string()));
+    fn infer_capabilities_detects_rust() {
+        let capabilities = infer_capabilities("refactor the Rust module and write tests");
+        assert!(capabilities.contains(&"rust".to_string()));
+        assert!(capabilities.contains(&"refactoring".to_string()));
+        assert!(capabilities.contains(&"testing".to_string()));
     }
 
     #[test]
-    fn infer_skills_falls_back_to_general() {
-        let skills = infer_skills("do something completely unrelated");
-        assert_eq!(skills, vec!["general".to_string()]);
+    fn infer_capabilities_falls_back_to_general() {
+        let capabilities = infer_capabilities("do something completely unrelated");
+        assert_eq!(capabilities, vec!["general".to_string()]);
     }
 
     #[tokio::test]

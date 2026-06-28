@@ -1,8 +1,9 @@
-//! Shared skill registry for CLI, TUI, and tool execution.
+//! Shared skill registry for Gateway projections, surfaces, and runtime skill
+//! selection.
 //!
 //! This keeps skill discovery and path resolution in one place. It is
 //! intentionally local-first: WebUI and remote hub concerns are out of scope for
-//! the CLI/runtime skill brain path.
+//! the local skill package path.
 
 use crate::skill_manifest::{
     get_related_skills, get_skill_description, get_skill_name, get_tags, matches_platform,

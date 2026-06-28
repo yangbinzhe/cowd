@@ -513,7 +513,7 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         let subtasks = collab.decompose_task(&prompt);
         let task = CollaborationTask {
             description: prompt.clone(),
-            required_skills: skills.clone(),
+            required_capabilities: skills.clone(),
             subtasks: subtasks.clone(),
             review_criteria: Some(
                 "Solutions must be concrete, feasible, and respect constraints".to_string(),
@@ -742,7 +742,7 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         let subtasks = collab.decompose_sequential(&prompt);
         let task = CollaborationTask {
             description: prompt.clone(),
-            required_skills: skills,
+            required_capabilities: skills,
             subtasks: subtasks.clone(),
             review_criteria: Some("Implementation must satisfy all success criteria".to_string()),
             collaboration_decision: None,

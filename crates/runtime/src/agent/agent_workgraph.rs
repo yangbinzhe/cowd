@@ -572,18 +572,18 @@ mod tests {
     fn agent_workgraph_builds_from_subtasks() {
         let task = CollaborationTask {
             description: "plan then implement".to_string(),
-            required_skills: vec!["rust".to_string()],
+            required_capabilities: vec!["rust".to_string()],
             subtasks: vec![
                 SubTask {
                     id: "plan".to_string(),
                     description: "make plan".to_string(),
-                    required_skills: vec!["design".to_string()],
+                    required_capabilities: vec!["design".to_string()],
                     depends_on: Vec::new(),
                 },
                 SubTask {
                     id: "implement".to_string(),
                     description: "write code".to_string(),
-                    required_skills: vec!["rust".to_string()],
+                    required_capabilities: vec!["rust".to_string()],
                     depends_on: vec!["plan".to_string()],
                 },
             ],
@@ -607,7 +607,7 @@ mod tests {
     fn agent_workgraph_binds_review_packet_and_runtime_refs() {
         let task = CollaborationTask {
             description: "review implementation".to_string(),
-            required_skills: vec!["review".to_string()],
+            required_capabilities: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
             collaboration_decision: None,
@@ -660,7 +660,7 @@ mod tests {
     fn agent_workgraph_marks_failed_agent_as_degraded_graph() {
         let task = CollaborationTask {
             description: "parallel work".to_string(),
-            required_skills: Vec::new(),
+            required_capabilities: Vec::new(),
             subtasks: Vec::new(),
             review_criteria: None,
             collaboration_decision: None,
@@ -698,11 +698,11 @@ mod tests {
     fn agent_workgraph_emits_planned_runtime_event() {
         let task = CollaborationTask {
             description: "parallel implementation".to_string(),
-            required_skills: vec!["rust".to_string()],
+            required_capabilities: vec!["rust".to_string()],
             subtasks: vec![SubTask {
                 id: "worker".to_string(),
                 description: "implement".to_string(),
-                required_skills: vec!["rust".to_string()],
+                required_capabilities: vec!["rust".to_string()],
                 depends_on: Vec::new(),
             }],
             review_criteria: None,
@@ -734,7 +734,7 @@ mod tests {
 
         let task = CollaborationTask {
             description: "review implementation".to_string(),
-            required_skills: vec!["review".to_string()],
+            required_capabilities: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
             collaboration_decision: None,

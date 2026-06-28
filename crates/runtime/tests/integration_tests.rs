@@ -530,7 +530,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
 
     let task = CollaborationTask {
         description: "Rust refactoring".into(),
-        required_skills: vec![rust_skill.into()],
+        required_capabilities: vec![rust_skill.into()],
         subtasks: vec![],
         review_criteria: None,
         collaboration_decision: None,

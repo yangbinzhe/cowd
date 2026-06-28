@@ -28,7 +28,7 @@ use ratatui::{
 pub struct SubTask {
     pub id: String,
     pub description: String,
-    pub required_skills: Vec<String>,
+    pub required_capabilities: Vec<String>,
     pub depends_on: Vec<String>,
 }
 
@@ -186,8 +186,8 @@ impl TaskDecompositionView {
             ]));
 
             // Skills line
-            if !sub.required_skills.is_empty() {
-                let skills_str = sub.required_skills.join(", ");
+            if !sub.required_capabilities.is_empty() {
+                let skills_str = sub.required_capabilities.join(", ");
                 lines.push(Line::from(vec![
                     Span::raw(format!("{indent}   ")),
                     Span::styled(
@@ -346,7 +346,7 @@ mod tests {
         SubTask {
             id: id.to_string(),
             description: desc.to_string(),
-            required_skills: skills.into_iter().map(String::from).collect(),
+            required_capabilities: skills.into_iter().map(String::from).collect(),
             depends_on: deps.into_iter().map(String::from).collect(),
         }
     }

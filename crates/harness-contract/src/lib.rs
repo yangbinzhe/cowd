@@ -12,6 +12,7 @@ pub mod growth;
 pub mod harness;
 pub mod knowledge;
 pub mod policy;
+pub mod skill;
 pub mod strategy;
 pub mod task;
 pub mod tool;

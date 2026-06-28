@@ -632,7 +632,7 @@ mod tests {
     fn reviewed_graph(packet: &CollaborationReviewPacket) -> AgentWorkGraph {
         let task = CollaborationTask {
             description: "review implementation".to_string(),
-            required_skills: vec!["review".to_string()],
+            required_capabilities: vec!["review".to_string()],
             subtasks: Vec::new(),
             review_criteria: None,
             collaboration_decision: None,

@@ -206,7 +206,6 @@ pub(crate) fn execute_tool_with_enforcer(
                 "AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."
             ))
         }
-        "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
@@ -1596,10 +1595,6 @@ fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
     to_pretty_json(execute_todo_write(input)?)
 }
 
-fn run_skill(input: SkillInput) -> Result<String, String> {
-    to_pretty_json(execute_skill(input)?)
-}
-
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
@@ -1872,12 +1867,6 @@ enum TodoStatus {
 }
 
 #[derive(Debug, Deserialize)]
-struct SkillInput {
-    skill: String,
-    args: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ToolSearchInput {
     query: String,
     max_results: Option<usize>,
@@ -2054,15 +2043,6 @@ struct TodoWriteOutput {
     new_todos: Vec<TodoItem>,
     #[serde(rename = "verificationNudgeNeeded")]
     verification_nudge_needed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SkillOutput {
-    skill: String,
-    path: String,
-    args: Option<String>,
-    description: Option<String>,
-    prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2621,20 +2601,6 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
     })
 }
 
-fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
-    let skill_path = resolve_skill_path(&input.skill)?;
-    let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
-    let description = parse_skill_description(&prompt);
-
-    Ok(SkillOutput {
-        skill: input.skill,
-        path: skill_path.display().to_string(),
-        args: input.args,
-        description,
-        prompt,
-    })
-}
-
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     if todos.is_empty() {
         return Err(String::from("todos must not be empty"));
@@ -2655,271 +2621,6 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(cwd.join(".cowd-todos.json"))
-}
-
-fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    match skill_service::SkillRegistry::discover(&cwd).resolve(skill) {
-        Ok(skill) => Ok(skill.path),
-        Err(_) => resolve_skill_path_from_compat_roots(skill),
-    }
-}
-
-fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBuf, String> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
-    if requested.is_empty() {
-        return Err(String::from("skill must not be empty"));
-    }
-
-    for root in skill_lookup_roots() {
-        if let Some(path) = resolve_skill_path_in_root(&root, requested) {
-            return Ok(path);
-        }
-    }
-
-    Err(format!("unknown skill: {requested}"))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillLookupOrigin {
-    SkillsDir,
-    LegacyCommandsDir,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SkillLookupRoot {
-    path: std::path::PathBuf,
-    origin: SkillLookupOrigin,
-}
-
-fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
-    let mut roots = Vec::new();
-
-    if let Ok(cwd) = std::env::current_dir() {
-        push_project_skill_lookup_roots(&mut roots, &cwd);
-    }
-
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
-    }
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
-    }
-    if let Ok(cowd_config_home) = std::env::var("COWD_CONFIG_HOME") {
-        let cowd_config_home = std::path::PathBuf::from(cowd_config_home);
-        push_skill_lookup_root(
-            &mut roots,
-            cowd_config_home.join("skills"),
-            SkillLookupOrigin::SkillsDir,
-        );
-        push_skill_lookup_root(
-            &mut roots,
-            cowd_config_home.join("skills").join("omc-learned"),
-            SkillLookupOrigin::SkillsDir,
-        );
-        push_skill_lookup_root(
-            &mut roots,
-            cowd_config_home.join("commands"),
-            SkillLookupOrigin::LegacyCommandsDir,
-        );
-    }
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.cowd/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.codex/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-
-    roots
-}
-
-fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
-    for ancestor in cwd.ancestors() {
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".cowd"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
-        // Migration: also discover skills from .claude if the directory exists
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
-    }
-}
-
-fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
-    push_prefixed_skill_lookup_roots(roots, &home.join(".cowd"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
-    // Migration: also discover skills from .claude if the directory exists
-    push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
-    push_skill_lookup_root(
-        roots,
-        home.join(".agents").join("skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        roots,
-        home.join(".config").join("opencode").join("skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    // Migration: discover omc-learned skills from .claude if present
-    push_skill_lookup_root(
-        roots,
-        home.join(".claude").join("skills").join("omc-learned"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    // Primary omc-learned location is now under .cowd
-    push_skill_lookup_root(
-        roots,
-        home.join(".cowd").join("skills").join("omc-learned"),
-        SkillLookupOrigin::SkillsDir,
-    );
-}
-
-fn push_prefixed_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, prefix: &std::path::Path) {
-    push_skill_lookup_root(roots, prefix.join("skills"), SkillLookupOrigin::SkillsDir);
-    push_skill_lookup_root(
-        roots,
-        prefix.join("commands"),
-        SkillLookupOrigin::LegacyCommandsDir,
-    );
-}
-
-fn push_skill_lookup_root(
-    roots: &mut Vec<SkillLookupRoot>,
-    path: std::path::PathBuf,
-    origin: SkillLookupOrigin,
-) {
-    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
-        roots.push(SkillLookupRoot { path, origin });
-    }
-}
-
-fn resolve_skill_path_in_root(
-    root: &SkillLookupRoot,
-    requested: &str,
-) -> Option<std::path::PathBuf> {
-    match root.origin {
-        SkillLookupOrigin::SkillsDir => resolve_skill_path_in_skills_dir(&root.path, requested),
-        SkillLookupOrigin::LegacyCommandsDir => {
-            resolve_skill_path_in_legacy_commands_dir(&root.path, requested)
-        }
-    }
-}
-
-fn resolve_skill_path_in_skills_dir(
-    root: &std::path::Path,
-    requested: &str,
-) -> Option<std::path::PathBuf> {
-    let direct = root.join(requested).join("SKILL.md");
-    if direct.is_file() {
-        return Some(direct);
-    }
-
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let skill_path = entry.path().join("SKILL.md");
-        if !skill_path.is_file() {
-            continue;
-        }
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(requested)
-            || skill_frontmatter_name_matches(&skill_path, requested)
-        {
-            return Some(skill_path);
-        }
-    }
-
-    None
-}
-
-fn resolve_skill_path_in_legacy_commands_dir(
-    root: &std::path::Path,
-    requested: &str,
-) -> Option<std::path::PathBuf> {
-    let direct_dir = root.join(requested).join("SKILL.md");
-    if direct_dir.is_file() {
-        return Some(direct_dir);
-    }
-
-    let direct_markdown = root.join(format!("{requested}.md"));
-    if direct_markdown.is_file() {
-        return Some(direct_markdown);
-    }
-
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let candidate_path = if path.is_dir() {
-            let skill_path = path.join("SKILL.md");
-            if !skill_path.is_file() {
-                continue;
-            }
-            skill_path
-        } else if path
-            .extension()
-            .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-        {
-            path
-        } else {
-            continue;
-        };
-
-        let matches_entry_name = candidate_path
-            .file_stem()
-            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
-            || entry
-                .file_name()
-                .to_string_lossy()
-                .trim_end_matches(".md")
-                .eq_ignore_ascii_case(requested);
-        if matches_entry_name || skill_frontmatter_name_matches(&candidate_path, requested) {
-            return Some(candidate_path);
-        }
-    }
-
-    None
-}
-
-fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| parse_skill_name(&contents))
-        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-}
-
-fn parse_skill_name(contents: &str) -> Option<String> {
-    parse_skill_frontmatter_value(contents, "name")
-}
-
-fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
-            let value = value
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4113,17 +3814,6 @@ fn make_cell_id(index: usize) -> String {
     format!("cell-{}", index + 1)
 }
 
-fn parse_skill_description(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("description:") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4269,7 +3959,6 @@ mod tests {
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"WebSearch"));
         assert!(names.contains(&"TodoWrite"));
-        assert!(names.contains(&"Skill"));
         assert!(names.contains(&"ToolSearch"));
         assert!(names.contains(&"NotebookEdit"));
         assert!(names.contains(&"Sleep"));
@@ -4679,406 +4368,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let home = temp_path("skills-home");
-        let skill_dir = home.join(".agents").join("skills").join("help");
-        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "# help\n\nGuide on using oh-my-codex plugin\n",
-        )
-        .expect("skill file should exist");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
-
-        let result = execute_tool(
-            "Skill",
-            &json!({
-                "skill": "help",
-                "args": "overview"
-            }),
-        )
-        .expect("Skill should succeed");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-        assert!(output["prompt"]
-            .as_str()
-            .expect("prompt")
-            .contains("Guide on using oh-my-codex plugin"));
-
-        let dollar_result = execute_tool(
-            "Skill",
-            &json!({
-                "skill": "$help"
-            }),
-        )
-        .expect("Skill should accept $skill invocation form");
-        let dollar_output: serde_json::Value =
-            serde_json::from_str(&dollar_result).expect("valid json");
-        assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        fs::remove_dir_all(home).expect("temp home should clean up");
-    }
-
-    #[test]
-    fn skill_resolves_project_local_skills_and_legacy_commands() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("project-skills");
-        let skill_dir = root.join(".cowd").join("skills").join("plan");
-        let command_dir = root.join(".cowd").join("commands");
-        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
-        fs::create_dir_all(&command_dir).expect("command dir should exist");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: plan\ndescription: Project planning guidance\n---\n\n# plan\n",
-        )
-        .expect("skill file should exist");
-        fs::write(
-            command_dir.join("handoff.md"),
-            "---\nname: handoff\ndescription: Legacy handoff guidance\n---\n\n# handoff\n",
-        )
-        .expect("command file should exist");
-
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
-            .expect("project-local skill should resolve");
-        let skill_output: serde_json::Value =
-            serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/skills/plan/SKILL.md"));
-
-        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
-            .expect("legacy command should resolve");
-        let command_output: serde_json::Value =
-            serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/commands/handoff.md"));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        fs::remove_dir_all(root).expect("temp project should clean up");
-    }
-
-    #[test]
-    fn skill_loads_project_local_claude_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("project-skills");
-        let home = root.join("home");
-        let workspace = root.join("workspace");
-        let nested = workspace.join("nested");
-        let skill_dir = workspace.join(".claude").join("skills").join("trace");
-        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
-        fs::create_dir_all(&nested).expect("nested cwd should exist");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: trace\ndescription: Project-local trace helper\n---\n# trace\n",
-        )
-        .expect("skill file should exist");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("COWD_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
-
-        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
-            .expect("project-local skill should resolve");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
-        assert_eq!(output["description"], "Project-local trace helper");
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
-    fn skill_loads_project_local_omc_and_agents_skill_prompts() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("project-omc-skills");
-        let home = root.join("home");
-        let workspace = root.join("workspace");
-        let nested = workspace.join("nested");
-        let omc_skill_dir = workspace.join(".cowd").join("skills").join("hud");
-        let agents_skill_dir = workspace.join(".agents").join("skills").join("trace");
-        fs::create_dir_all(&omc_skill_dir).expect("omc skill dir should exist");
-        fs::create_dir_all(&agents_skill_dir).expect("agents skill dir should exist");
-        fs::create_dir_all(&nested).expect("nested cwd should exist");
-        fs::write(
-            omc_skill_dir.join("SKILL.md"),
-            "---\nname: hud\ndescription: Project-local OMC HUD helper\n---\n# hud\n",
-        )
-        .expect("omc skill file should exist");
-        fs::write(
-            agents_skill_dir.join("SKILL.md"),
-            "---\nname: trace\ndescription: Project-local agents compatibility helper\n---\n# trace\n",
-        )
-        .expect("agents skill file should exist");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("COWD_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
-
-        let omc_result =
-            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
-        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
-            .expect("agents skill should resolve");
-
-        let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
-        let agents_output: serde_json::Value =
-            serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/skills/hud/SKILL.md"));
-        assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
-        assert_eq!(
-            agents_output["description"],
-            "Project-local agents compatibility helper"
-        );
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
-    fn skill_loads_learned_skill_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("claude-config-learned-skill");
-        let home = root.join("home");
-        let claude_config_dir = root.join("claude-config");
-        let learned_skill_dir = claude_config_dir
-            .join("skills")
-            .join("omc-learned")
-            .join("learned");
-        fs::create_dir_all(&learned_skill_dir).expect("learned skill dir should exist");
-        fs::write(
-            learned_skill_dir.join("SKILL.md"),
-            "---\nname: learned\ndescription: Learned OMC skill\n---\n# learned\n",
-        )
-        .expect("learned skill file should exist");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_claude_config_dir = std::env::var("COWD_CONFIG_HOME").ok();
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("COWD_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::set_var("COWD_CONFIG_HOME", &claude_config_dir);
-
-        let result = execute_tool("Skill", &json!({ "skill": "learned" }))
-            .expect("learned skill should resolve");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
-        assert_eq!(output["description"], "Learned OMC skill");
-
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        match original_claude_config_dir {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
-    fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("claude-config-direct-skill");
-        let home = root.join("home");
-        let claude_config_dir = root.join("claude-config");
-        let skill_dir = claude_config_dir.join("skills").join("statusline");
-        let command_dir = claude_config_dir.join("commands");
-        fs::create_dir_all(&skill_dir).expect("direct skill dir should exist");
-        fs::create_dir_all(&command_dir).expect("command dir should exist");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: statusline\ndescription: Claude config skill\n---\n# statusline\n",
-        )
-        .expect("direct skill file should exist");
-        fs::write(
-            command_dir.join("doctor-check.md"),
-            "---\nname: doctor-check\ndescription: Claude config command\n---\n# doctor-check\n",
-        )
-        .expect("direct command file should exist");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_claude_config_dir = std::env::var("COWD_CONFIG_HOME").ok();
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("COWD_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::set_var("COWD_CONFIG_HOME", &claude_config_dir);
-
-        let direct_skill =
-            execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
-        let direct_skill_output: serde_json::Value =
-            serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
-        assert_eq!(direct_skill_output["description"], "Claude config skill");
-
-        let legacy_command =
-            execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
-        let legacy_command_output: serde_json::Value =
-            serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
-        assert_eq!(
-            legacy_command_output["description"],
-            "Claude config command"
-        );
-
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        match original_claude_config_dir {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
-    fn skill_loads_project_local_legacy_command_markdown() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let root = temp_path("project-legacy-command");
-        let home = root.join("home");
-        let workspace = root.join("workspace");
-        let nested = workspace.join("nested");
-        let command_dir = workspace.join(".claude").join("commands");
-        fs::create_dir_all(&command_dir).expect("legacy command dir should exist");
-        fs::create_dir_all(&nested).expect("nested cwd should exist");
-        fs::write(
-            command_dir.join("team.md"),
-            "---\nname: team\ndescription: Legacy team workflow\n---\n# team\n",
-        )
-        .expect("legacy command file should exist");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("COWD_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
-
-        let result = execute_tool("Skill", &json!({ "skill": "team" }))
-            .expect("legacy command markdown should resolve");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
-        assert_eq!(output["description"], "Legacy team workflow");
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
             "ToolSearch",
@@ -5089,12 +4378,17 @@ mod tests {
         let matches = keyword_output["matches"].as_array().expect("matches");
         assert!(matches.iter().any(|value| value == "WebSearch"));
 
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:Skill,ToolSearch"}))
-            .expect("ToolSearch should succeed");
+        let selected = execute_tool(
+            "ToolSearch",
+            &json!({"query": "select:WebSearch,ToolSearch"}),
+        )
+        .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
-        assert_eq!(selected_output["matches"][0], "Skill");
-        assert_eq!(selected_output["matches"][1], "ToolSearch");
+        let selected_matches = selected_output["matches"].as_array().expect("matches");
+        assert_eq!(selected_matches.len(), 2);
+        assert!(selected_matches.iter().any(|value| value == "WebSearch"));
+        assert!(selected_matches.iter().any(|value| value == "ToolSearch"));
 
         let removed = execute_tool("ToolSearch", &json!({"query": "select:Agent,WorkerCreate"}))
             .expect("ToolSearch should ignore removed control-plane tools");

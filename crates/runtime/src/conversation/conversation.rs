@@ -1312,7 +1312,7 @@ where
     }
 
     /// Infer required capability keywords from a task description.
-    fn infer_required_skills(user_message: &str) -> Vec<String> {
+    fn infer_required_capabilities(user_message: &str) -> Vec<String> {
         let lower = user_message.to_lowercase();
         let keyword_map: &[(&str, &[&str])] = &[
             ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
@@ -2299,7 +2299,7 @@ where
                 .unwrap_or_default();
 
             if self.should_use_collaboration(&last_user_msg) {
-                let skills: Vec<String> = Self::infer_required_skills(&last_user_msg);
+                let skills: Vec<String> = Self::infer_required_capabilities(&last_user_msg);
                 if !skills.is_empty() {
                     let activation = SkillActivationRecord::new(
                         self.session().session_id.clone(),
@@ -5579,11 +5579,11 @@ mod tests {
             Box::pin(async move {
                 let collaboration_task = CollaborationTask {
                     description: task.to_string(),
-                    required_skills: skills.to_vec(),
+                    required_capabilities: skills.to_vec(),
                     subtasks: vec![SubTask {
                         id: "review-implementation-output".to_string(),
                         description: "review implementation output against evidence".to_string(),
-                        required_skills: vec!["review".to_string()],
+                        required_capabilities: vec!["review".to_string()],
                         depends_on: Vec::new(),
                     }],
                     review_criteria: None,

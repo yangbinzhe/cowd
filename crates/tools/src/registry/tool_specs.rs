@@ -511,20 +511,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "Skill",
-            description: "Load a local skill definition and its instructions.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill": { "type": "string" },
-                    "args": { "type": "string" }
-                },
-                "required": ["skill"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "ToolSearch",
             description: "Search for deferred or specialized tools by exact name or keywords.",
             input_schema: json!({

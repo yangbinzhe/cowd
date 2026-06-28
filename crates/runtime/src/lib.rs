@@ -183,6 +183,7 @@ pub mod session_execution;
 pub mod session_lifecycle;
 #[path = "session/session_relation_graph.rs"]
 pub mod session_relation_graph;
+pub mod skill;
 #[path = "reality_bridge/skill_activation.rs"]
 pub mod skill_activation;
 #[path = "reality_bridge/skill_dependency.rs"]

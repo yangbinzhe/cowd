@@ -5,7 +5,7 @@ use app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill, skill_agent_node_id,
 };
 use serde::Deserialize;
-use skill_service::{SkillManager, SkillViewInput};
+use skill::{SkillManager, SkillViewInput};
 
 use super::{ServiceEnvelope, SkillService};
 
@@ -562,7 +562,7 @@ mod tests {
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/tmp")
                 .join(format!(
-                    "gateway-skill-service-{name}-{}-{nonce}",
+                    "gateway-skill-{name}-{}-{nonce}",
                     std::process::id()
                 ));
             fs::create_dir_all(&root).expect("temp tree should be created");
