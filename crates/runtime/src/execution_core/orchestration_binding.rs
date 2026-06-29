@@ -17,5 +17,5 @@ pub fn runtime_orchestration_actions() -> Vec<&'static str> {
 
 #[must_use]
 pub fn runtime_orchestration_action_guidance() -> &'static str {
-    "Use runtime_orchestrate for controlled runtime planning/execution; pass session_id when requesting a real TeamRuntime."
+    "Use runtime_orchestrate for controlled runtime planning/execution; gateway/API sessions auto-bind session_id for real TeamRuntime requests, while detached/offline calls must pass session_id explicitly."
 }

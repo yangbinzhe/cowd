@@ -365,7 +365,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "policy_gates"]
+                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],
@@ -384,7 +384,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "intent": { "type": "string" },
                     "session_id": {
                         "type": "string",
-                        "description": "Required for request_team when the model wants runtime to start a real TeamRuntime attached to a session."
+                        "description": "Optional in gateway/API sessions because Cowd auto-binds the active session_id. Required only for detached/offline runtime_orchestrate calls."
                     },
                     "action": {
                         "type": "string",
@@ -541,5 +541,8 @@ mod tests {
             ToolPermissionMode::ReadOnly
         );
         assert_eq!(capability_tool.input_schema["required"][0], "intent");
+        assert!(capability_tool.input_schema["properties"]["detail"]["enum"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "budget_controls")));
     }
 }

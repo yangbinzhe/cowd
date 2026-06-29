@@ -177,6 +177,7 @@ pub fn runtime_capabilities_response_with_detail(
     let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
     let detail_value = detail.unwrap_or("summary");
     let backend_capabilities = backend_capabilities(detail_value, intent);
+    let action_plane = runtime_action_plane(&execution_decision.recommended_actions);
     json!({
         "type": "runtime_capabilities",
         "manifest": manifest,
@@ -192,6 +193,7 @@ pub fn runtime_capabilities_response_with_detail(
             "actions": runtime_orchestration_actions(),
             "recommendation": execution_decision.recommended_actions
         },
+        "action_plane": action_plane,
         "budget_controls": runtime_budget_controls(profile),
         "strategy": {
             "prefer_batch_readonly": true,
@@ -207,6 +209,58 @@ pub fn runtime_capabilities_response_with_detail(
             "rewoo_candidate": rewoo_plan,
             "tool_dag_candidate": tool_dag,
         }
+    })
+}
+
+fn runtime_action_plane<T: Serialize>(recommended_actions: &[T]) -> Value {
+    json!({
+        "recommended_next_tool": "runtime_orchestrate",
+        "can_execute_now": true,
+        "session_id_bound": "gateway_api_sessions_auto_bind_session_id",
+        "required_args": {
+            "runtime_capabilities": ["intent"],
+            "runtime_orchestrate": ["intent", "action"],
+        },
+        "expected_events": [
+            "RuntimeRun",
+            "RunModelTelemetry",
+            "ToolStart",
+            "ToolComplete",
+            "TurnComplete"
+        ],
+        "recipes": [
+            {
+                "name": "plan_then_execute_team",
+                "when": "complex work has independent domains, reviewers, or parallel evidence needs",
+                "steps": [
+                    {"tool": "runtime_capabilities", "args": {"detail": "team_templates"}},
+                    {"tool": "runtime_orchestrate", "args": {"action": "request_team"}, "session_id": "auto_bound_by_gateway"}
+                ]
+            },
+            {
+                "name": "parallel_readonly_evidence",
+                "when": "several read-only facts can be gathered independently",
+                "steps": [
+                    {"tool": "runtime_orchestrate", "args": {"action": "request_parallel_tools"}},
+                    {"tool": "tool_batch_readonly", "args": "execute returned independent reads when available"}
+                ]
+            },
+            {
+                "name": "rewoo_evidence_plan",
+                "when": "the task needs explicit evidence variables before synthesis",
+                "steps": [
+                    {"tool": "runtime_orchestrate", "args": {"action": "request_rewoo_evidence"}}
+                ]
+            },
+            {
+                "name": "reflexion_on_stall",
+                "when": "tool path repeats, evidence novelty drops, or answer quality is blocked",
+                "steps": [
+                    {"tool": "runtime_orchestrate", "args": {"action": "request_reflexion_retry"}}
+                ]
+            }
+        ],
+        "recommended_actions": recommended_actions,
     })
 }
 
@@ -380,6 +434,11 @@ mod tests {
         assert!(response["runtime_orchestrate"]["available"]
             .as_bool()
             .unwrap_or(false));
+        assert_eq!(
+            response["action_plane"]["recommended_next_tool"],
+            "runtime_orchestrate"
+        );
+        assert!(response["action_plane"]["recipes"].is_array());
         assert!(response["execution_decision"]["recommended_mode"].is_string());
         assert!(response["budget_controls"]["turn"]["max_iterations"].is_object());
         assert!(

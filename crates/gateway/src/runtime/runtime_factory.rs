@@ -119,14 +119,18 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
     let capability_item =
         runtime_capability_context_item(&tool_definitions, allowed_tools.as_ref(), model_ctx);
+    let runtime_session_id = session.session_id.clone();
     let subagent_model = model.clone();
     let subagent_tool_definitions = tool_definitions.clone();
-    let tool_executor = std::sync::Arc::new(GatewayToolExecutor::new(
-        allowed_tools.clone(),
-        emit_output,
-        tool_registry.clone(),
-        mcp_state.clone(),
-    ));
+    let tool_executor = std::sync::Arc::new(
+        GatewayToolExecutor::new(
+            allowed_tools.clone(),
+            emit_output,
+            tool_registry.clone(),
+            mcp_state.clone(),
+        )
+        .with_runtime_session_id(runtime_session_id),
+    );
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,
         model: model.clone(),

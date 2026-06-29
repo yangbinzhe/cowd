@@ -44,6 +44,7 @@ pub(crate) struct GatewayToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GatewayToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    runtime_session_id: Option<String>,
 }
 
 impl GatewayToolExecutor {
@@ -58,7 +59,17 @@ impl GatewayToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            runtime_session_id: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_session_id(mut self, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        if !session_id.is_empty() {
+            self.runtime_session_id = Some(session_id);
+        }
+        self
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -104,6 +115,21 @@ impl GatewayToolExecutor {
             .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == "runtime_orchestrate" {
+            let mut value = value;
+            if let Some(session_id) = &self.runtime_session_id {
+                if let Some(object) = value.as_object_mut() {
+                    let missing_session = object
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty);
+                    if missing_session {
+                        object.insert(
+                            "session_id".to_string(),
+                            serde_json::Value::String(session_id.clone()),
+                        );
+                    }
+                }
+            }
             return serde_json::to_string_pretty(&runtime::runtime_orchestration_response(value))
                 .map_err(|error| ToolError::new(error.to_string()));
         }
@@ -254,5 +280,39 @@ mod tests {
 
         assert!(output.contains("runtime-orch-"));
         assert!(output.contains("plan_only"));
+    }
+
+    #[test]
+    fn runtime_orchestrate_auto_binds_gateway_session_for_team_requests() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_orchestrate".to_string(),
+                description: Some("runtime orchestration".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": { "type": "string" },
+                        "action": { "type": "string" }
+                    },
+                    "required": ["intent"],
+                    "additionalProperties": true
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None)
+            .with_runtime_session_id("gateway-session-v26");
+
+        let output = executor
+            .execute(
+                "runtime_orchestrate",
+                r#"{"intent":"需要多 Agent 协同审查架构","action":"request_team"}"#,
+            )
+            .expect("gateway-bound runtime orchestrate should execute without explicit session_id");
+
+        assert!(output.contains("\"status\": \"running\""), "{output}");
+        assert!(output.contains("\"type\": \"team_runtime\""), "{output}");
+        assert!(output.contains("gateway-session-v26"), "{output}");
+        assert!(!output.contains("missing_session_id_for_team_runtime"));
     }
 }
