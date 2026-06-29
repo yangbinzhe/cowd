@@ -145,6 +145,14 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub fn max_iterations(&self) -> usize {
+        self.runtime_ref().max_iterations()
+    }
+
+    pub fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.runtime_mut().set_max_iterations(max_iterations);
+    }
+
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }

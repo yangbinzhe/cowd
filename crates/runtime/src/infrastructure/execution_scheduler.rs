@@ -269,6 +269,22 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_treats_runtime_capabilities_as_parallel_readonly() {
+        let schedule = schedule_tool_requests(&[
+            request(
+                "cap-1",
+                "runtime_capabilities",
+                r#"{"intent":"检查 README 是否反映最新架构"}"#,
+            ),
+            request("read-1", "read_file", r#"{"path":"README.md"}"#),
+        ]);
+
+        assert_eq!(schedule.batches.len(), 1);
+        assert_eq!(schedule.batches[0].mode, ExecutionBatchMode::ParallelRead);
+        assert_eq!(schedule.batches[0].indices, vec![0, 1]);
+    }
+
+    #[test]
     fn schedule_runtime_event_refs_all_tools() {
         let requests = vec![
             request("read-1", "read_file", r#"{"path":"README.md"}"#),

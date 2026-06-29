@@ -15,6 +15,7 @@ pub enum RuntimeDomain {
     Context,
     Recovery,
     Policy,
+    ExecutionCore,
     RealityBridge,
     Configuration,
     Infrastructure,
@@ -37,6 +38,7 @@ impl RuntimeDomain {
             Self::Context => "context",
             Self::Recovery => "recovery",
             Self::Policy => "policy",
+            Self::ExecutionCore => "execution_core",
             Self::RealityBridge => "reality_bridge",
             Self::Configuration => "configuration",
             Self::Infrastructure => "infrastructure",
@@ -74,15 +76,18 @@ impl RuntimeModuleDescriptor {
 #[must_use]
 pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
     use RuntimeDomain::{
-        Agent, Approval, Configuration, Context, Conversation, Infrastructure, Mission, Policy,
-        Provider, RealityBridge, Recovery, Session, Skill, Steward, Team, Tooling,
+        Agent, Approval, Configuration, Context, Conversation, ExecutionCore, Infrastructure,
+        Mission, Policy, Provider, RealityBridge, Recovery, Session, Skill, Steward, Team, Tooling,
     };
     vec![
         RuntimeModuleDescriptor::public("conversation", Conversation, "runtime", true),
+        RuntimeModuleDescriptor::public("turn_supervisor", Conversation, "runtime", false),
         RuntimeModuleDescriptor::public("host", Conversation, "runtime", true),
         RuntimeModuleDescriptor::public("cowd_event", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("runtime_control", Infrastructure, "runtime", true),
         RuntimeModuleDescriptor::public("runtime_harness", Infrastructure, "runtime", true),
+        RuntimeModuleDescriptor::public("execution_core", ExecutionCore, "runtime", true),
+        RuntimeModuleDescriptor::public("orchestration", ExecutionCore, "runtime", true),
         RuntimeModuleDescriptor::public("control_plane", Infrastructure, "runtime", true),
         RuntimeModuleDescriptor::public("provider_runtime_client", Provider, "runtime", true),
         RuntimeModuleDescriptor::public("provider_registry", Provider, "runtime", false),
@@ -129,6 +134,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("context_fanout", Context, "runtime", false),
         RuntimeModuleDescriptor::public("context_profiler", Context, "runtime", false),
         RuntimeModuleDescriptor::public("context_runtime", Context, "runtime", true),
+        RuntimeModuleDescriptor::public("evidence_planner", Context, "runtime", false),
         RuntimeModuleDescriptor::public("intent_planner", Context, "harness-contract", false),
         RuntimeModuleDescriptor::public("knowledge_activation", Context, "runtime", true),
         RuntimeModuleDescriptor::public("knowledge_compliance", Context, "runtime", false),
@@ -149,6 +155,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("config_validate", Configuration, "runtime", false),
         RuntimeModuleDescriptor::public("profile", Configuration, "runtime", false),
         RuntimeModuleDescriptor::public("capability", Infrastructure, "runtime", false),
+        RuntimeModuleDescriptor::public("capability_manifest", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("checkpoint", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("execution_outcome", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("execution_scheduler", Infrastructure, "runtime", false),

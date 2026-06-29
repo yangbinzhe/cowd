@@ -219,14 +219,14 @@ fn runtime_spec_for(team: &TeamRuntimeSnapshot) -> CollaborationTemplateRuntimeS
             .collect(),
         CollaborationTemplateId::DebateConsensus => vec![
             TeamExecutionDependency {
-                from_role_id: "pro".to_string(),
-                to_role_id: "judge".to_string(),
-                reason: "pro argument feeds judging".to_string(),
+                from_role_id: "proposer".to_string(),
+                to_role_id: "arbiter".to_string(),
+                reason: "proposer argument feeds arbitration".to_string(),
             },
             TeamExecutionDependency {
-                from_role_id: "con".to_string(),
-                to_role_id: "judge".to_string(),
-                reason: "con argument feeds judging".to_string(),
+                from_role_id: "skeptic".to_string(),
+                to_role_id: "arbiter".to_string(),
+                reason: "skeptic critique feeds arbitration".to_string(),
             },
         ],
         _ => roles

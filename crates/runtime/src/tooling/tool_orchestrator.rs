@@ -96,6 +96,8 @@ impl ToolSafetyCategory {
             | "question"
             | "ask_user_question"
             | "tool_search"
+            | "runtime_capabilities"
+            | "runtime_orchestrate"
             | "list_mcp_resources"
             | "read_mcp_resource" => Self::ReadOnly,
 
@@ -194,6 +196,8 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "todowrite" => "todo_write".to_string(),
         "askuserquestion" => "ask_user_question".to_string(),
         "toolsearch" => "tool_search".to_string(),
+        "runtimecapabilities" => "runtime_capabilities".to_string(),
+        "runtimeorchestrate" => "runtime_orchestrate".to_string(),
         "listmcpresources" => "list_mcp_resources".to_string(),
         "readmcpresource" => "read_mcp_resource".to_string(),
         "mcpauth" => "mcp_auth".to_string(),
@@ -851,5 +855,22 @@ mod tests {
             restore.cache_policy,
             ToolCachePolicy::GlobalInvalidatingWrite
         );
+    }
+
+    #[test]
+    fn runtime_capabilities_is_readonly_runtime_query() {
+        let direct = ToolSafetyCategory::from_tool_name("runtime_capabilities");
+        let alias = ToolSafetyCategory::from_tool_name("RuntimeCapabilities");
+        let registry = ToolSafetyRegistry::builtin();
+        let profile = tool_execution_profile("runtime_capabilities");
+
+        assert_eq!(direct, ToolSafetyCategory::ReadOnly);
+        assert_eq!(alias, ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            registry.classify("runtime_capabilities"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(profile.safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(profile.max_concurrency, usize::MAX);
     }
 }

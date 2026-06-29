@@ -1,0 +1,337 @@
+//! Runtime capability manifest and prompt primer.
+//!
+//! The manifest makes Cowd's higher-level harness affordances visible to the
+//! model without coupling tool implementations back into runtime.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::collaboration_template::CollaborationTemplateCatalog;
+use crate::context_runtime::ContextProfile;
+use crate::evidence_planner::{plan_evidence, EvidencePlan};
+use crate::execution_core::{
+    build_runtime_execution_decision, execution_mode_catalog_response, rewoo_plan_for_intent,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapability {
+    pub id: String,
+    pub summary: String,
+    pub recommended_tools: Vec<String>,
+    pub when_to_use: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapabilityManifest {
+    pub name: String,
+    pub capabilities: Vec<RuntimeCapability>,
+}
+
+impl RuntimeCapabilityManifest {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            name: "cowd-runtime-capabilities".to_string(),
+            capabilities: vec![
+                capability(
+                    "batch_readonly_evidence",
+                    "Batch read-only evidence gathering with ordered results.",
+                    &[
+                        "workspace_snapshot",
+                        "read_many",
+                        "grep_many",
+                        "glob_many",
+                        "tool_batch_readonly",
+                    ],
+                    &[
+                        "Use for README, docs, source review, bug investigation, release checks, and any task that needs several independent read-only facts.",
+                        "Prefer this over repeated read_file calls on the same file.",
+                    ],
+                ),
+                capability(
+                    "parallel_tool_scheduler",
+                    "Runtime can schedule model-requested tool calls by safety class: parallel read-only, limited network/write, serial destructive.",
+                    &["tool_batch_readonly", "read_many", "grep_many"],
+                    &[
+                        "Use by requesting multiple independent read-only tool calls in one turn.",
+                        "Keep write/destructive calls separate and permission-aware.",
+                    ],
+                ),
+                capability(
+                    "evidence_planning",
+                    "Runtime can recommend an evidence acquisition mode and a compact tool plan for the current task.",
+                    &["runtime_capabilities", "ToolSearch"],
+                    &[
+                        "Use when unsure whether to full-read, batch-read, search, summarize, or delegate.",
+                        "Use before deep source/document review to avoid slow range-by-range reading.",
+                    ],
+                ),
+                capability(
+                    "agent_collaboration",
+                    "Runtime owns subagent, team, collaboration, mission/session, and verification affordances for complex tasks; these are orchestration affordances, not always direct provider tools.",
+                    &["runtime_capabilities"],
+                    &[
+                        "Use when independent domains can be explored in parallel.",
+                        "When no direct callable team tool is present, structure the plan so runtime/gateway orchestration or the user can attach the right collaborators.",
+                    ],
+                ),
+                capability(
+                    "runtime_orchestration",
+                    "Model-visible runtime control-plane for plan_only, teams, subagents, verification, ReWOO, Tool DAG, deliberation, reflexion, risk gates, and session links.",
+                    &["runtime_capabilities", "runtime_orchestrate"],
+                    &[
+                        "Use plan_only before complex implementation, architecture, or multi-agent work.",
+                        "Use request_team/request_parallel_tools/request_rewoo_evidence/request_deliberation/request_reflexion_retry when the task clearly benefits from higher-order runtime execution.",
+                    ],
+                ),
+                capability(
+                    "tool_trace_and_evidence",
+                    "Tool calls are recorded as summaries plus raw evidence references so the model can reason from evidence without flooding context.",
+                    &["runtime_capabilities"],
+                    &[
+                        "Use evidence refs and summaries instead of repeatedly rereading large outputs.",
+                        "When evidence is enough, answer with checked facts and remaining risks.",
+                    ],
+                ),
+                capability(
+                    "surface_stage_reply",
+                    "External surfaces need visible staged progress; long-running turns should produce an evidence-backed partial answer instead of silence.",
+                    &["runtime_capabilities"],
+                    &[
+                        "Use for Feishu, WebUI, TUI, or any surface where user-visible latency matters.",
+                        "If time or evidence is insufficient, report checked evidence, current judgment, and next steps.",
+                    ],
+                ),
+            ],
+        }
+    }
+}
+
+#[must_use]
+pub fn runtime_capability_primer() -> String {
+    let manifest = RuntimeCapabilityManifest::current();
+    let mut lines = vec![
+        "# Runtime capability awareness".to_string(),
+        "You run inside Cowd AI Harness. You are not limited to naive one-tool-at-a-time ReAct."
+            .to_string(),
+        "Actively choose the most efficient available runtime capability for the task.".to_string(),
+        String::new(),
+        "Core capabilities:".to_string(),
+    ];
+
+    for capability in &manifest.capabilities {
+        lines.push(format!("- `{}`: {}", capability.id, capability.summary));
+    }
+
+    lines.extend([
+        String::new(),
+        "Operational guidance:".to_string(),
+        "- For README/docs/code review, prefer `workspace_snapshot`, `git diff` evidence, `read_many`, `grep_many`, or `tool_batch_readonly` before repeated `read_file`.".to_string(),
+        "- For independent read-only facts, request them together so the runtime can batch or parallelize them.".to_string(),
+        "- Distinguish model-callable tools from runtime-owned affordances: subagent/team/mission collaboration may be orchestrated by runtime even when it is not exposed as a direct tool.".to_string(),
+        "- For complex architecture or validation work, shape the task so runtime-owned collaboration can be used when independent evidence domains exist.".to_string(),
+        "- If a path becomes slow or repetitive, switch strategy: batch evidence, narrow scope, delegate, or give an evidence-backed staged answer.".to_string(),
+        "- Use `runtime_capabilities` when you need a compact recommendation for available runtime affordances.".to_string(),
+        "- Use `runtime_capabilities` with detail=`execution_modes`, `team_templates`, `agent_catalog`, or `orchestration_options` when deciding how to solve complex work.".to_string(),
+        format!("- {}", runtime_orchestration_action_guidance()),
+    ]);
+
+    lines.join("\n")
+}
+
+#[must_use]
+pub fn runtime_capabilities_response(
+    intent: &str,
+    surface: Option<&str>,
+    profile: Option<&str>,
+) -> Value {
+    runtime_capabilities_response_with_detail(intent, surface, profile, None)
+}
+
+#[must_use]
+pub fn runtime_capabilities_response_with_detail(
+    intent: &str,
+    surface: Option<&str>,
+    profile: Option<&str>,
+    detail: Option<&str>,
+) -> Value {
+    let manifest = RuntimeCapabilityManifest::current();
+    let evidence_plan: EvidencePlan = plan_evidence(intent);
+    let execution_decision =
+        build_runtime_execution_decision(intent, profile.and_then(parse_context_profile));
+    let rewoo_plan = rewoo_plan_for_intent(intent);
+    let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
+    let detail_value = detail.unwrap_or("summary");
+    let backend_capabilities = backend_capabilities(detail_value, intent);
+    json!({
+        "type": "runtime_capabilities",
+        "manifest": manifest,
+        "intent": intent,
+        "surface": surface,
+        "profile": profile,
+        "detail": detail_value,
+        "evidence_plan": evidence_plan,
+        "execution_decision": execution_decision,
+        "backend_capabilities": backend_capabilities,
+        "runtime_orchestrate": {
+            "available": true,
+            "actions": runtime_orchestration_actions(),
+            "recommendation": execution_decision.recommended_actions
+        },
+        "strategy": {
+            "prefer_batch_readonly": true,
+            "prefer_full_or_batch_read_for_small_docs": true,
+            "model_callable_tools": ["workspace_snapshot", "read_many", "grep_many", "glob_many", "tool_batch_readonly", "runtime_capabilities", "runtime_orchestrate", "ToolSearch"],
+            "runtime_owned_affordances": ["execution_modes", "rewoo_evidence", "tool_dag", "subagent", "team", "mission", "session", "verification", "deliberation", "reflexion"],
+            "use_or_request_subagents_for_independent_domains": true,
+            "avoid_repeated_overlapping_reads": true,
+            "fallback_when_stalled": "switch execution mode through runtime_orchestrate plan_only/request_reflexion_retry or answer with checked evidence, current judgment, remaining risks, and next best step"
+        },
+        "advanced_execution": {
+            "rewoo_candidate": rewoo_plan,
+            "tool_dag_candidate": tool_dag,
+        }
+    })
+}
+
+fn backend_capabilities(detail: &str, intent: &str) -> Value {
+    let templates = CollaborationTemplateCatalog::built_in()
+        .templates()
+        .iter()
+        .map(|template| {
+            json!({
+                "id": template.template_id.as_str(),
+                "name": template.label,
+                "agent_roles": template.agent_roles.iter().map(|role| json!({
+                    "role_id": role.role_id,
+                    "responsibility": role.responsibility,
+                    "allowed_tools": role.allowed_tools,
+                    "evidence_duties": role.evidence_duties,
+                })).collect::<Vec<_>>(),
+                "max_parallelism": template.max_parallelism,
+                "review_contract": template.review_contract,
+                "merge_contract": template.merge_contract,
+                "human_approval_points": template.human_approval_points,
+            })
+        })
+        .collect::<Vec<_>>();
+    match detail {
+        "execution_modes" => execution_mode_catalog_response(),
+        "team_templates" => json!({ "collaboration_templates": templates }),
+        "agent_catalog" => json!({
+            "role_intents": ["planner", "researcher", "executor", "reviewer", "merger", "memory_curator", "human"],
+            "execution_profiles": [
+                {"role": "planner", "tool_mode": "read_only", "purpose": "plan and decompose"},
+                {"role": "researcher", "tool_mode": "read_only", "purpose": "parallel evidence gathering"},
+                {"role": "executor", "tool_mode": "write_workspace", "purpose": "apply bounded changes"},
+                {"role": "reviewer", "tool_mode": "read_only", "purpose": "independent verification"}
+            ]
+        }),
+        "orchestration_options" => json!({
+            "decision": build_runtime_execution_decision(intent, None),
+            "execution_modes": execution_mode_catalog_response(),
+            "collaboration_templates": templates,
+        }),
+        "policy_gates" => json!({
+            "risk": ["risk_gate", "human_confirm"],
+            "parallelism": "runtime validator caps max_parallel_agents",
+            "writes": "write/destructive actions require permission and scheduler gating"
+        }),
+        _ => json!({
+            "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/policy_gates for concrete runtime affordances.",
+            "execution_modes": execution_mode_catalog_response()["execution_modes"],
+            "collaboration_template_count": templates.len(),
+        }),
+    }
+}
+
+fn parse_context_profile(value: &str) -> Option<ContextProfile> {
+    match value {
+        "MainTurn" | "main_turn" | "default" => Some(ContextProfile::MainTurn),
+        "SoloGoal" | "solo_goal" => Some(ContextProfile::SoloGoal),
+        "YoloGoal" | "yolo_goal" => Some(ContextProfile::YoloGoal),
+        "SubAgent" | "sub_agent" => Some(ContextProfile::SubAgent),
+        "Collaboration" | "collaboration" => Some(ContextProfile::Collaboration),
+        "Review" | "review" => Some(ContextProfile::Review),
+        "Resume" | "resume" => Some(ContextProfile::Resume),
+        "Cron" | "cron" => Some(ContextProfile::Cron),
+        "SurfaceQuickReply" | "surface_quick_reply" => Some(ContextProfile::SurfaceQuickReply),
+        "SurfaceTaskIntake" | "surface_task_intake" => Some(ContextProfile::SurfaceTaskIntake),
+        "DeepInvestigation" | "deep_investigation" | "deep" => {
+            Some(ContextProfile::DeepInvestigation)
+        }
+        _ => None,
+    }
+}
+
+fn capability(
+    id: &str,
+    summary: &str,
+    recommended_tools: &[&str],
+    when_to_use: &[&str],
+) -> RuntimeCapability {
+    RuntimeCapability {
+        id: id.to_string(),
+        summary: summary.to_string(),
+        recommended_tools: recommended_tools
+            .iter()
+            .map(|item| item.to_string())
+            .collect(),
+        when_to_use: when_to_use.iter().map(|item| item.to_string()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primer_exposes_batch_and_agent_capabilities() {
+        let primer = runtime_capability_primer();
+
+        assert!(primer.contains("read_many"));
+        assert!(primer.contains("tool_batch_readonly"));
+        assert!(primer.contains("subagent, team"));
+        assert!(primer.contains("runtime-owned"));
+        assert!(primer.contains("runtime_capabilities"));
+    }
+
+    #[test]
+    fn capabilities_response_contains_evidence_plan() {
+        let response = runtime_capabilities_response(
+            "检查 README 是否反映最新架构",
+            Some("feishu"),
+            Some("DeepInvestigation"),
+        );
+
+        assert_eq!(response["type"], "runtime_capabilities");
+        assert_eq!(response["surface"], "feishu");
+        assert!(response["evidence_plan"]["recommended_calls"].is_array());
+        assert!(response["runtime_orchestrate"]["available"]
+            .as_bool()
+            .unwrap_or(false));
+        assert!(response["execution_decision"]["recommended_mode"].is_string());
+    }
+
+    #[test]
+    fn capabilities_response_exposes_execution_modes_and_templates() {
+        let modes = runtime_capabilities_response_with_detail(
+            "全盘架构分析",
+            None,
+            None,
+            Some("execution_modes"),
+        );
+        assert!(modes["backend_capabilities"]["execution_modes"].is_array());
+
+        let templates = runtime_capabilities_response_with_detail(
+            "需要多 Agent 协同实现并审查",
+            None,
+            None,
+            Some("team_templates"),
+        );
+        assert!(templates["backend_capabilities"]["collaboration_templates"]
+            .as_array()
+            .is_some_and(|items| items.len() >= 7));
+    }
+}

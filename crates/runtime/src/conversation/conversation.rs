@@ -578,6 +578,19 @@ where
     }
 
     #[must_use]
+    pub fn max_iterations(&self) -> usize {
+        self.max_iterations
+    }
+
+    /// Update the maximum model/tool loop iterations for subsequent turns.
+    ///
+    /// Gateway uses this to apply surface-specific execution budgets without
+    /// rebuilding the whole runtime session.
+    pub fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.max_iterations = max_iterations;
+    }
+
+    #[must_use]
     pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = Some(timeout);
         self
@@ -693,6 +706,23 @@ where
         if let Ok(mut guard) = self.turn_tool_observations.lock() {
             guard.push(observation);
         }
+    }
+
+    fn push_runtime_context_observation(
+        &self,
+        tool_name: impl Into<String>,
+        invocation_id: impl Into<String>,
+        summary: impl Into<String>,
+    ) {
+        let tool_name = tool_name.into();
+        let invocation_id = invocation_id.into();
+        let evidence_id = format!("{}:{invocation_id}", self.session().session_id);
+        self.push_turn_tool_observation(ToolObservation::new(
+            tool_name,
+            invocation_id,
+            EvidenceRef::new("runtime", evidence_id),
+            summary,
+        ));
     }
 
     fn turn_tool_observations(&self) -> Vec<ToolObservation> {
@@ -1591,7 +1621,44 @@ where
             ));
         self.record_runtime_policy_decision(&complexity, user_sequence);
 
+        let evidence_plan = crate::evidence_planner::plan_evidence(&user_input);
+        let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
+        let execution_decision = crate::execution_core::build_runtime_execution_decision(
+            &user_input,
+            Some(self.context_profile()),
+        );
+        let execution_decision_guidance =
+            crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
+        self.record_context_event(
+            "evidence_plan",
+            "runtime",
+            &format!("{:?}: {}", evidence_plan.mode, evidence_plan.reason),
+            7,
+        );
+        self.push_runtime_context_observation(
+            "runtime.evidence_plan",
+            format!("evidence-plan-{user_sequence}"),
+            format!("{:?}: {}", evidence_plan.mode, evidence_plan.reason),
+        );
+        self.record_context_event(
+            "execution_decision",
+            "runtime",
+            &format!(
+                "{}: {:?}",
+                execution_decision.recommended_mode.as_str(),
+                execution_decision.recommended_actions
+            ),
+            8,
+        );
+        self.push_runtime_context_observation(
+            "runtime.execution_decision",
+            format!("execution-decision-{user_sequence}"),
+            execution_decision_guidance.clone(),
+        );
+
         let mut effective_system_prompt = self.prepare_reality_context(&user_input).await;
+        effective_system_prompt.push(evidence_plan_guidance.clone());
+        effective_system_prompt.push(execution_decision_guidance);
         if knowledge_hard_gate_active(&effective_system_prompt) {
             let error = RuntimeError::new("knowledge compliance hard gate blocked turn");
             self.record_turn_failed(0, &error);
@@ -1625,6 +1692,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut turn_supervisor = crate::turn_supervisor::TurnSupervisor::new();
 
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
@@ -1657,6 +1725,7 @@ where
                         }
                     }
                     effective_system_prompt = self.prepare_reality_context(&user_input).await;
+                    effective_system_prompt.push(evidence_plan_guidance.clone());
                     if knowledge_hard_gate_active(&effective_system_prompt) {
                         let error =
                             RuntimeError::new("knowledge compliance hard gate blocked turn");
@@ -2024,6 +2093,59 @@ where
                             &format!("{}: {}", tool_name_str, ""),
                             5,
                         );
+                        if let Some((output, is_error)) = msg.blocks.first().and_then(|block| {
+                            if let ContentBlock::ToolResult {
+                                output, is_error, ..
+                            } = block
+                            {
+                                Some((output.as_str(), *is_error))
+                            } else {
+                                None
+                            }
+                        }) {
+                            let (supervisor_tool_name, supervisor_input) = pending_tool_uses
+                                .iter()
+                                .find(|(pending_id, _, _)| pending_id == id)
+                                .map(|(_, name, input)| (name.as_str(), input.as_str()))
+                                .unwrap_or((tool_name_str, "{}"));
+                            let (observation, decision) = turn_supervisor.observe_tool_result(
+                                supervisor_tool_name,
+                                supervisor_input,
+                                output,
+                                is_error,
+                            );
+                            if decision.should_inject() {
+                                if let Some(prompt) = decision.prompt() {
+                                    effective_system_prompt.push(format!(
+                                        "\n## Runtime supervisor guidance\n{prompt}"
+                                    ));
+                                }
+                                self.record_context_event(
+                                    "turn_supervisor",
+                                    "runtime",
+                                    decision.reason().unwrap_or(decision.kind()),
+                                    8,
+                                );
+                                self.push_runtime_context_observation(
+                                    "runtime.turn_supervisor",
+                                    format!(
+                                        "turn-supervisor-{}-{}",
+                                        self.session().messages.len(),
+                                        observation.fingerprint.input_hash
+                                    ),
+                                    format!(
+                                        "{}: {}",
+                                        decision.kind(),
+                                        decision.reason().unwrap_or("runtime supervisor guidance")
+                                    ),
+                                );
+                                self.record_turn_supervisor_decision(
+                                    &observation,
+                                    &decision,
+                                    self.session().messages.len(),
+                                );
+                            }
+                        }
                         if let Some(new_input) = inject {
                             callback_inject = Some(new_input);
                         }
@@ -2044,6 +2166,14 @@ where
                 );
                 continue; // continue loop with injected input
             }
+
+            // A model turn that requested tools is not complete until the model
+            // sees the resulting `tool_result` messages and synthesizes the
+            // next assistant response. Keep post-turn maintenance after the
+            // final no-tool assistant message so runtime supervisor guidance,
+            // tool evidence, and callback-injected context all have a chance to
+            // influence the answer.
+            continue;
         }
 
         let auto_compaction = self.maybe_auto_compact().await;
@@ -2151,7 +2281,8 @@ where
             }
         }
 
-        // A4: Trigger multi-agent collaboration for complex tasks.
+        // Runtime-owned fallback synthesis path for complex tasks when the model did not
+        // explicitly request orchestration during the turn.
         if let Some(ref collab) = self.collaboration {
             let last_user_msg = self
                 .session()
@@ -3899,6 +4030,52 @@ where
         self.append_tool_runtime_events(sequence, "tool.schedule.created", vec![event]);
     }
 
+    fn record_turn_supervisor_decision(
+        &self,
+        observation: &crate::turn_supervisor::ToolProgressObservation,
+        decision: &crate::turn_supervisor::SupervisorDecision,
+        sequence: usize,
+    ) {
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "decision": decision.kind(),
+            "reason": decision.reason(),
+            "tool": {
+                "name": &observation.fingerprint.tool_name,
+                "target": &observation.fingerprint.target,
+                "range": observation.fingerprint.range,
+                "input_hash": observation.fingerprint.input_hash,
+                "output_hash": observation.fingerprint.output_hash,
+                "is_error": observation.is_error,
+            },
+            "prompt_injected": decision.prompt(),
+            "source": "conversation_runtime.turn_supervisor",
+        });
+        let mut event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Policy,
+            "runtime.turn_supervisor.decision",
+            payload,
+            now_ms(),
+        );
+        event.status = Some(decision.kind().to_string());
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(error) = store.append_runtime_event(&event).await {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    sequence,
+                    "turn supervisor runtime event append failed"
+                );
+            }
+        });
+    }
+
     fn record_ai_kernel_trace_event(&self, trace: &RuntimeAiKernelTrace, sequence: usize) {
         let Some(ref store) = self.session_store else {
             return;
@@ -5004,6 +5181,24 @@ mod tests {
     }
 
     #[test]
+    fn max_iterations_accessor_tracks_runtime_budget_updates() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let original = runtime.max_iterations();
+        runtime.set_max_iterations(8);
+        assert_eq!(runtime.max_iterations(), 8);
+        runtime.set_max_iterations(original);
+        assert_eq!(runtime.max_iterations(), original);
+    }
+
+    #[test]
     fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
         let api_client = ScriptedApiClient { call_count: 0 };
         let tool_executor = StaticToolExecutor::new().register("add", |input| {
@@ -6085,6 +6280,115 @@ mod tests {
                 ContentBlock::Text { text }
                     if text.contains("I cannot finalize this as a completed answer yet")
             )));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_turn_report_includes_runtime_evidence_plan_observation() {
+        #[derive(Clone)]
+        struct TextApi;
+        impl ApiClient for TextApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                to_stream(vec![
+                    AssistantEvent::TextDelta("checked".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TextApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let summary = runtime
+            .run_turn_async("检查 README 是否反映最新架构", &SharedPrompter::none())
+            .await
+            .expect("turn should complete");
+
+        assert!(
+            summary
+                .context_turn_report
+                .observations
+                .iter()
+                .any(
+                    |observation| observation.tool_name == "runtime.evidence_plan"
+                        && observation.model_summary.contains("SmallEvidence")
+                ),
+            "{:#?}",
+            summary.context_turn_report.observations
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_real_tool_summaries_trigger_supervisor_guidance() {
+        #[derive(Clone)]
+        struct RepeatingToolApi {
+            call_count: usize,
+        }
+        impl ApiClient for RepeatingToolApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                self.call_count += 1;
+                if self.call_count == 1 {
+                    let mut events = Vec::new();
+                    for idx in 0..4 {
+                        events.push(AssistantEvent::ToolUse {
+                            id: format!("tool-{idx}"),
+                            name: "read_file".to_string(),
+                            input: r#"{"path":"README.md","offset":0,"limit":80}"#.to_string(),
+                        });
+                    }
+                    events.push(AssistantEvent::MessageStop);
+                    return to_stream(events);
+                }
+                assert!(
+                    request
+                        .system_prompt
+                        .iter()
+                        .any(|section| section.contains("Runtime supervisor guidance")),
+                    "second provider request should contain supervisor guidance"
+                );
+                to_stream(vec![
+                    AssistantEvent::TextDelta("staged answer".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RepeatingToolApi { call_count: 0 },
+            StaticToolExecutor::new()
+                .register("read_file", |_input| Ok("same README evidence".to_string())),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let summary = runtime
+            .run_turn_async("反复检查 README", &SharedPrompter::none())
+            .await
+            .expect("turn should complete after supervisor guidance");
+
+        assert!(summary
+            .context_turn_report
+            .observations
+            .iter()
+            .any(
+                |observation| observation.tool_name == "runtime.turn_supervisor"
+                    && observation.model_summary.contains("nudge")
+            ));
     }
 
     #[test]

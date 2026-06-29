@@ -148,6 +148,7 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
+        sections.push(crate::capability_manifest::runtime_capability_primer());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
@@ -686,6 +687,17 @@ mod tests {
             display_context_path(Path::new("/tmp/project/.cowd/CLAUDE.md")),
             "CLAUDE.md"
         );
+    }
+
+    #[test]
+    fn prompt_includes_runtime_capability_primer() {
+        let rendered = SystemPromptBuilder::new().render();
+
+        assert!(rendered.contains("Runtime capability awareness"));
+        assert!(rendered.contains("tool_batch_readonly"));
+        assert!(rendered.contains("subagent, team"));
+        assert!(rendered.contains("runtime-owned"));
+        assert!(rendered.contains("runtime_capabilities"));
     }
 
     #[test]

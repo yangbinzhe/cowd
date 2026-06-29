@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.414`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.415`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -237,6 +237,30 @@ Gateway 按 manifest 提供：
 
 Surface 可靠消息层由 Gateway `SurfaceHost` 持有。inbound 先写持久 inbox 再进入 runtime，outbound 先写 outbox 再投递 sidecar；失败会进入 `retry_scheduled` 或 `dead_letter`，重试有 `max_attempts` 与 backoff，不依赖 sidecar 内部重试作为唯一可靠性来源。Runtime 仍不持有 surface/channel SDK。
 
+可靠消息状态不是简单的“是否收到”。当前语义如下：
+
+| 对象 | 状态 | 含义 |
+|---|---|---|
+| inbox | `received` | Gateway 已持久化 inbound，还未交给 runtime。 |
+| inbox | `processing` | runtime turn 正在处理该消息。 |
+| inbox | `processed` | runtime 已完成，但还没有进入外部回复终态；通常只作为极短暂中间态或无回复终态。 |
+| inbox | `replying` | 已生成回复，正在投递 outbox。 |
+| inbox | `replied` | outbound 已经成功投递，消息处理闭环完成。 |
+| inbox | `failure_notifying` | runtime 已失败，Gateway 正在通过 outbox 投递可见失败通知。 |
+| inbox | `failed_notified` | runtime 失败已通过 surface 通知用户，失败原因保留在 `last_error`。 |
+| inbox | `reply_retry_scheduled` | 回复投递失败但仍有重试计划。 |
+| inbox | `reply_failed` | 回复进入失败终态或 DLQ。 |
+| inbox | `failed` | runtime 处理失败。 |
+| outbox | `queued` / `sending` / `retry_scheduled` | 投递中或等待重试。 |
+| outbox | `sent` | 已投递成功。 |
+| outbox | `dead_letter` | 已进入死信队列，需要人工处理或重放。 |
+
+`SurfaceMessageSnapshot` 会同时返回 `active_inbox`、`terminal_inbox`、`active_outbox` 和 `dead_letters`。WebUI/TUI 不应再用全部 inbox/outbox 数量代表“工作中”，而应读取 active 集合或按上述状态白名单降级计算。
+
+飞书 surface 使用 WebSocket 接收消息。收到用户消息后 sidecar 会在原消息上设置 `Typing` reaction 表示处理中；Gateway 在 runtime 完成、回复成功、空回复或失败时都会通过 `message.processing_complete` / `message.processing_failed` action 通知 sidecar 清理或替换该 reaction。Feishu reply 发送路径也会在成功/失败时兜底清理，避免已经回复的消息仍残留“工作中”状态。
+
+外部 surface 的 runtime turn 不再只有一个硬超时。Gateway 会根据消息内容选择 `SurfaceQuickReply` 或 `DeepInvestigation` 策略，并给每个策略同时设置总耗时和最大模型/工具迭代轮次。README、文档核查、代码检查、调研、测试、重构等消息会进入深度策略；普通短消息走快速策略。若 runtime 超时、超过迭代预算或执行失败，Gateway 不会只把 inbox 标成 `failed` 后沉默，而会通过同一套可靠 outbox 投递一条用户可见的失败通知，并把 inbox 推进到 `failed_notified`。这样 Feishu、未来邮件/企微/微信等 surface 都能避免“消息已处理失败但用户端没有任何回复”的黑洞。
+
 ### 4.3 WebUI
 
 WebUI 不在 core 仓库。它位于：
@@ -256,6 +280,8 @@ gateway:
 ```
 
 如果未配置 `gateway.webui_dir`，或者目录没有 `index.html`，Gateway 仍应健康启动，并在根路由返回 health/status，而不是失败退出。
+
+WebUI 作为静态 surface 也可以通过 `surface.json` 被 Gateway 发现。构建产物必须包含 `dist/index.html`，这样根路由和 `/s/webui/*` 的 SPA fallback 都能工作；`dist/index.dev.html` 只是开发入口，不应作为 Gateway fallback 的唯一入口。
 
 ### 4.4 TUI
 
@@ -632,7 +658,10 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 - Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
-- 版本标签：`v0.9.414`。
+- SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
+- Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
+- WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
+- 版本标签：`v0.9.415`。
 
 ### 11.2 是否达到当前阶段目标
 

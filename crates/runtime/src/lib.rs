@@ -19,6 +19,8 @@ mod bootstrap;
 pub mod branch_lock;
 #[path = "infrastructure/capability.rs"]
 pub mod capability;
+#[path = "infrastructure/capability_manifest.rs"]
+pub mod capability_manifest;
 #[path = "conversation/compact.rs"]
 mod compact;
 #[path = "infrastructure/config.rs"]
@@ -145,6 +147,9 @@ pub mod cowd_event;
 pub mod cross_plane_policy;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
+#[path = "context/evidence_planner.rs"]
+pub mod evidence_planner;
+pub mod execution_core;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
 #[path = "agent/intent_planner.rs"]
@@ -155,6 +160,7 @@ pub mod joint_problem_solving;
 pub mod lane_completion;
 #[path = "infrastructure/mutation_plan.rs"]
 pub mod mutation_plan;
+pub mod orchestration;
 #[path = "agent/pairing.rs"]
 pub mod pairing;
 #[path = "infrastructure/profile.rs"]
@@ -234,6 +240,8 @@ pub mod tool_memory;
 pub mod tool_orchestrator;
 #[path = "policy/trust_resolver.rs"]
 pub mod trust_resolver;
+#[path = "conversation/turn_supervisor.rs"]
+pub mod turn_supervisor;
 #[path = "provider/usage.rs"]
 mod usage;
 #[path = "infrastructure/worker_boot.rs"]
@@ -285,6 +293,10 @@ pub use autonomy_profile::{
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
+pub use capability_manifest::{
+    runtime_capabilities_response, runtime_capabilities_response_with_detail,
+    runtime_capability_primer, RuntimeCapability, RuntimeCapabilityManifest,
+};
 pub use checkpoint::{
     checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
     CheckpointDiffInput, CheckpointDiffOutput, CheckpointListOutput, CheckpointRestoreInput,
@@ -330,6 +342,20 @@ pub use cross_plane_policy::{
     CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
     CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity,
     CrossPlaneSummary, GrantType, IdentityTrust, PolicyDecisionKind,
+};
+pub use evidence_planner::{
+    evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
+};
+pub use execution_core::{
+    build_runtime_execution_decision, execution_mode_catalog_response, rewoo_plan_for_intent,
+    runtime_execution_guidance_prompt, runtime_orchestration_action_guidance,
+    runtime_orchestration_actions, tool_dag_from_rewoo, DeliberationMode, DeliberationPlan,
+    ExecutionModeCatalog, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
+    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
+    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionBinding,
+    RuntimeExecutionDecision, RuntimeExecutionModeCandidate, RuntimeExecutionModeSpec,
+    RuntimeExecutionReportSpec, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
+    ToolDagTask,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -407,6 +433,11 @@ pub use module_map::{
 pub use mutation_plan::{
     apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
     MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
+};
+pub use orchestration::{
+    handle_runtime_orchestration_request, plan_runtime_collaboration_decision,
+    runtime_orchestration_response, RuntimeOrchestrationAction, RuntimeOrchestrationDecision,
+    RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
@@ -531,6 +562,10 @@ pub use tool_orchestrator::{
     tool_execution_profile, ToolCachePolicy, ToolExecutionProfile, ToolSafetyCategory,
 };
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+pub use turn_supervisor::{
+    fingerprint_tool_call, SupervisorDecision, ToolCallFingerprint, ToolProgressObservation,
+    TurnSupervisor,
+};
 pub use usage::{pricing_for_model, UsageTracker};
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,

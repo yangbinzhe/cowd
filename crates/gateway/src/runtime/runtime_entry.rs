@@ -101,6 +101,14 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub(crate) fn max_iterations(&self) -> usize {
+        self.runtime_ref().max_iterations()
+    }
+
+    pub(crate) fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.runtime_mut().set_max_iterations(max_iterations);
+    }
+
     pub(crate) fn inject_resume_context(&self, packet: runtime::ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }

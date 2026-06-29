@@ -72,7 +72,10 @@ pub(crate) struct SurfaceMessageSnapshot {
     pub kind: &'static str,
     pub surface: String,
     pub inbox: Vec<SurfaceInboxRecord>,
+    pub active_inbox: Vec<SurfaceInboxRecord>,
+    pub terminal_inbox: Vec<SurfaceInboxRecord>,
     pub outbox: Vec<SurfaceOutboxRecord>,
+    pub active_outbox: Vec<SurfaceOutboxRecord>,
     pub deliveries: Vec<SurfaceDeliveryEvent>,
     pub dead_letters: Vec<SurfaceOutboxRecord>,
 }
@@ -186,6 +189,18 @@ impl SurfaceMessageStore {
         self.update_inbox_status(idempotency_key, "processed", runtime_turn_id, None)
     }
 
+    pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
+        self.update_inbox_status(idempotency_key, "replied", None, None)
+    }
+
+    pub(crate) fn mark_inbox_reply_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        self.update_inbox_status(idempotency_key, "reply_failed", None, Some(error.into()))
+    }
+
     pub(crate) fn mark_inbox_failed(
         &self,
         idempotency_key: &str,
@@ -258,13 +273,23 @@ impl SurfaceMessageStore {
         &self,
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
-        self.update_outbox_by_delivery(delivery_id, |record| {
+        let updated = self.update_outbox_by_delivery(delivery_id, |record| {
             record.status = "sending".to_string();
             record.attempts = record.attempts.saturating_add(1);
             record.updated_at_ms = now_ms();
             record.next_retry_at_ms = None;
             record.last_error = None;
-        })
+        })?;
+        if let Some(reply_to) = updated.reply_to_message_id.as_deref() {
+            let status = if outbox_is_failure_notice(&updated) {
+                "failure_notifying"
+            } else {
+                "replying"
+            };
+            let error = outbox_failure_reason(&updated);
+            let _ = self.mark_inbox_status_by_message_id(&updated.surface, reply_to, status, error);
+        }
+        Ok(updated)
     }
 
     pub(crate) fn mark_delivery_sent(
@@ -289,6 +314,14 @@ impl SurfaceMessageStore {
             detail_json: serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
             created_at_ms: now_ms(),
         })?;
+        if let Some(reply_to) = updated.reply_to_message_id.as_deref() {
+            let (status, error) = if outbox_is_failure_notice(&updated) {
+                ("failed_notified", outbox_failure_reason(&updated))
+            } else {
+                ("replied", None)
+            };
+            let _ = self.mark_inbox_status_by_message_id(&updated.surface, reply_to, status, error);
+        }
         Ok(updated)
     }
 
@@ -329,6 +362,19 @@ impl SurfaceMessageStore {
             }),
             created_at_ms: now_ms(),
         })?;
+        if let Some(reply_to) = updated.reply_to_message_id.as_deref() {
+            let inbox_status = if updated.status == "dead_letter" {
+                "reply_failed"
+            } else {
+                "reply_retry_scheduled"
+            };
+            let _ = self.mark_inbox_status_by_message_id(
+                &updated.surface,
+                reply_to,
+                inbox_status,
+                updated.last_error.clone(),
+            );
+        }
         Ok(updated)
     }
 
@@ -357,6 +403,19 @@ impl SurfaceMessageStore {
             }),
             created_at_ms: now_ms(),
         })?;
+        if let Some(reply_to) = updated.reply_to_message_id.as_deref() {
+            let inbox_status = if updated.status == "dead_letter" {
+                "reply_failed"
+            } else {
+                "reply_retry_scheduled"
+            };
+            let _ = self.mark_inbox_status_by_message_id(
+                &updated.surface,
+                reply_to,
+                inbox_status,
+                updated.last_error.clone(),
+            );
+        }
         Ok(updated)
     }
 
@@ -479,6 +538,21 @@ impl SurfaceMessageStore {
         let surface = normalize_surface_id(surface);
         let inbox = self.list_inbox(&surface);
         let outbox = self.list_outbox(&surface);
+        let active_inbox = inbox
+            .iter()
+            .filter(|record| is_active_inbox_status(&record.status))
+            .cloned()
+            .collect();
+        let terminal_inbox = inbox
+            .iter()
+            .filter(|record| !is_active_inbox_status(&record.status))
+            .cloned()
+            .collect();
+        let active_outbox = outbox
+            .iter()
+            .filter(|record| is_active_outbox_status(&record.status))
+            .cloned()
+            .collect();
         let dead_letters = outbox
             .iter()
             .filter(|record| record.status == "dead_letter")
@@ -488,7 +562,10 @@ impl SurfaceMessageStore {
             kind: "surface.message_snapshot",
             surface: surface.clone(),
             inbox,
+            active_inbox,
+            terminal_inbox,
             outbox,
+            active_outbox,
             deliveries: self.list_delivery_events(&surface),
             dead_letters,
         }
@@ -528,6 +605,49 @@ impl SurfaceMessageStore {
             }),
             created_at_ms: now_ms(),
         })
+    }
+
+    fn mark_inbox_status_by_message_id(
+        &self,
+        surface: &str,
+        message_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        let surface = normalize_surface_id(surface);
+        let mut state = self.lock_state()?;
+        let Some(key) = state.inbox.iter().find_map(|(key, record)| {
+            (record.surface == surface && record.message_id == message_id).then(|| key.clone())
+        }) else {
+            return Ok(None);
+        };
+        let record = state
+            .inbox
+            .get_mut(&key)
+            .ok_or_else(|| format!("surface inbox `{surface}/{message_id}` not found"))?;
+        if record.status == status && record.last_error == error {
+            return Ok(Some(record.clone()));
+        }
+        record.status = status.to_string();
+        record.updated_at_ms = now_ms();
+        record.last_error = error;
+        let record = record.clone();
+        self.append_record(INBOX_FILE, &record)?;
+        drop(state);
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface.clone(),
+            delivery_id: None,
+            message_id: Some(record.message_id.clone()),
+            kind: format!("inbox.{status}"),
+            status: status.to_string(),
+            detail_json: serde_json::json!({
+                "runtime_turn_id": record.runtime_turn_id,
+                "last_error": record.last_error,
+            }),
+            created_at_ms: now_ms(),
+        })?;
+        Ok(Some(record))
     }
 
     fn update_outbox_by_delivery(
@@ -596,7 +716,7 @@ fn outbound_idempotency_key(
 }
 
 fn load_state(root: &Path) -> Result<SurfaceMessageState, String> {
-    Ok(SurfaceMessageState {
+    let mut state = SurfaceMessageState {
         inbox: read_latest(root.join(INBOX_FILE), |record: &SurfaceInboxRecord| {
             record.idempotency_key.clone()
         })?,
@@ -606,7 +726,71 @@ fn load_state(root: &Path) -> Result<SurfaceMessageState, String> {
         events: read_latest(root.join(EVENT_FILE), |record: &SurfaceDeliveryEvent| {
             record.event_id.clone()
         })?,
-    })
+    };
+    reconcile_inbox_with_outbox(&mut state);
+    Ok(state)
+}
+
+fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
+    for inbox in state.inbox.values_mut() {
+        let related = state.outbox.values().filter(|outbox| {
+            outbox.surface == inbox.surface
+                && outbox
+                    .reply_to_message_id
+                    .as_deref()
+                    .is_some_and(|message_id| message_id == inbox.message_id)
+        });
+        let mut sent = None;
+        let mut failed = None;
+        let mut active = None;
+        for outbox in related {
+            match outbox.status.as_str() {
+                "sent" => sent = Some(outbox),
+                "dead_letter" => failed = Some(outbox),
+                "queued" | "sending" | "retry_scheduled" => active = Some(outbox),
+                _ => {}
+            }
+        }
+        if let Some(outbox) = sent {
+            inbox.status = if outbox_is_failure_notice(outbox) {
+                "failed_notified"
+            } else {
+                "replied"
+            }
+            .to_string();
+            inbox.updated_at_ms = inbox.updated_at_ms.max(outbox.updated_at_ms);
+            inbox.last_error = outbox_failure_reason(outbox);
+        } else if let Some(outbox) = failed {
+            inbox.status = "reply_failed".to_string();
+            inbox.updated_at_ms = inbox.updated_at_ms.max(outbox.updated_at_ms);
+            inbox.last_error = outbox.last_error.clone();
+        } else if let Some(outbox) = active {
+            inbox.status = if outbox.status == "retry_scheduled" {
+                "reply_retry_scheduled"
+            } else if outbox_is_failure_notice(outbox) {
+                "failure_notifying"
+            } else {
+                "replying"
+            }
+            .to_string();
+            inbox.updated_at_ms = inbox.updated_at_ms.max(outbox.updated_at_ms);
+            inbox.last_error = outbox
+                .last_error
+                .clone()
+                .or_else(|| outbox_failure_reason(outbox));
+        }
+    }
+}
+
+fn is_active_inbox_status(status: &str) -> bool {
+    matches!(
+        status,
+        "received" | "processing" | "replying" | "failure_notifying" | "reply_retry_scheduled"
+    )
+}
+
+fn is_active_outbox_status(status: &str) -> bool {
+    matches!(status, "queued" | "sending" | "retry_scheduled")
 }
 
 fn read_latest<T>(
@@ -673,6 +857,25 @@ fn summarize_text(value: &str, limit: usize) -> String {
                 .collect::<String>()
         )
     }
+}
+
+fn outbox_is_failure_notice(record: &SurfaceOutboxRecord) -> bool {
+    record
+        .request_json
+        .get("metadata")
+        .and_then(|metadata| metadata.get("failure_notice"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn outbox_failure_reason(record: &SurfaceOutboxRecord) -> Option<String> {
+    record
+        .request_json
+        .get("metadata")
+        .and_then(|metadata| metadata.get("failure_reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -746,6 +949,139 @@ mod tests {
             .unwrap();
         assert_eq!(dead.status, "dead_letter");
         assert_eq!(store.snapshot("feishu").dead_letters.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_inbox_reaches_replied_after_reply_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-replied-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let inbox = store
+            .record_inbox_received(
+                "feishu",
+                "msg-1",
+                &serde_json::json!({"text": "hello"}),
+                "feishu:user:chat",
+                Some("chat".to_string()),
+                Some("user".to_string()),
+            )
+            .unwrap();
+        store
+            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .unwrap();
+        store
+            .mark_inbox_processed(&inbox.record.idempotency_key, Some("turn-1".to_string()))
+            .unwrap();
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "chat".to_string(),
+            thread: Some("chat".to_string()),
+            text: "reply".to_string(),
+            metadata: serde_json::json!({"reply_to": "msg-1"}),
+        };
+        let delivery = store
+            .queue_outbox(
+                &request,
+                Some("feishu:user:chat".to_string()),
+                Some("msg-1".to_string()),
+            )
+            .unwrap();
+        store.mark_delivery_sending(&delivery.delivery_id).unwrap();
+        store
+            .mark_delivery_sent(
+                &delivery.delivery_id,
+                &SurfaceOperationResult::ok(
+                    "feishu",
+                    serde_json::json!({"status": "sent", "message_id": "reply-1"}),
+                ),
+            )
+            .unwrap();
+
+        let snapshot = store.snapshot("feishu");
+        assert_eq!(snapshot.inbox[0].status, "replied");
+        assert!(snapshot.active_inbox.is_empty());
+        assert_eq!(snapshot.terminal_inbox.len(), 1);
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        assert_eq!(reloaded.snapshot("feishu").inbox[0].status, "replied");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_failure_notice_marks_inbox_failed_notified() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-failure-notice-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let inbox = store
+            .record_inbox_received(
+                "feishu",
+                "msg-1",
+                &serde_json::json!({"text": "inspect readme"}),
+                "feishu:user:chat",
+                Some("chat".to_string()),
+                Some("user".to_string()),
+            )
+            .unwrap();
+        store
+            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .unwrap();
+        store
+            .mark_inbox_failed(&inbox.record.idempotency_key, "turn timed out after 240s")
+            .unwrap();
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "chat".to_string(),
+            thread: Some("chat".to_string()),
+            text: "failed".to_string(),
+            metadata: serde_json::json!({
+                "reply_to": "msg-1",
+                "failure_notice": true,
+                "failure_reason": "turn timed out after 240s"
+            }),
+        };
+        let delivery = store
+            .queue_outbox(
+                &request,
+                Some("feishu:user:chat".to_string()),
+                Some("msg-1".to_string()),
+            )
+            .unwrap();
+        store.mark_delivery_sending(&delivery.delivery_id).unwrap();
+        assert_eq!(
+            store.snapshot("feishu").inbox[0].status,
+            "failure_notifying"
+        );
+        store
+            .mark_delivery_sent(
+                &delivery.delivery_id,
+                &SurfaceOperationResult::ok(
+                    "feishu",
+                    serde_json::json!({"status": "sent", "message_id": "reply-1"}),
+                ),
+            )
+            .unwrap();
+
+        let snapshot = store.snapshot("feishu");
+        assert_eq!(snapshot.inbox[0].status, "failed_notified");
+        assert_eq!(
+            snapshot.inbox[0].last_error.as_deref(),
+            Some("turn timed out after 240s")
+        );
+        assert!(snapshot.active_inbox.is_empty());
+        assert_eq!(snapshot.terminal_inbox.len(), 1);
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        assert_eq!(
+            reloaded.snapshot("feishu").inbox[0].status,
+            "failed_notified"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

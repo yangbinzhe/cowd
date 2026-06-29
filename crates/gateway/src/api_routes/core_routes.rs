@@ -265,13 +265,27 @@ fn gateway_route_manifest_available() -> bool {
 }
 
 fn frontend_api_matrix_ready() -> bool {
-    let root = std::path::Path::new("../cowd-surface/surfaces/webui/scripts/api-matrix.mjs");
-    std::env::var_os("COWD_SKIP_FRONTEND_GATE").is_some() || root.is_file()
+    std::env::var_os("COWD_SKIP_FRONTEND_GATE").is_some()
+        || surface_repo_file_exists("surfaces/webui/scripts/api-matrix.mjs")
 }
 
 fn surface_version_compatible() -> bool {
-    let root = std::path::Path::new("../cowd-surface/scripts/surface-version-gate.mjs");
-    std::env::var_os("COWD_SKIP_SURFACE_VERSION_GATE").is_some() || root.is_file()
+    std::env::var_os("COWD_SKIP_SURFACE_VERSION_GATE").is_some()
+        || surface_repo_file_exists("scripts/surface-version-gate.mjs")
+}
+
+fn surface_repo_file_exists(relative: &str) -> bool {
+    let relative = std::path::Path::new(relative);
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| manifest_dir.to_path_buf());
+    [
+        cwd.join("../cowd-surface").join(relative),
+        cwd.join("cowd-surface").join(relative),
+        manifest_dir.join("../../../cowd-surface").join(relative),
+        manifest_dir.join("../../cowd-surface").join(relative),
+    ]
+    .iter()
+    .any(|path| path.is_file())
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {

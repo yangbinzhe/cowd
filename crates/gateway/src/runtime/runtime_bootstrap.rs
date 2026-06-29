@@ -331,20 +331,99 @@ impl RuntimeMcpState {
 fn assemble_mcp_tool_state(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
+    let mut runtime_tools = runtime_capability_tool_definitions();
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
-        return Ok((None, Vec::new()));
+        return Ok((None, runtime_tools));
     };
 
-    let mut runtime_tools = discovery
-        .tools
-        .iter()
-        .map(mcp_runtime_tool_definition)
-        .collect::<Vec<_>>();
+    runtime_tools.extend(
+        discovery
+            .tools
+            .iter()
+            .map(mcp_runtime_tool_definition)
+            .collect::<Vec<_>>(),
+    );
     if !mcp_state.server_names().is_empty() {
         runtime_tools.extend(mcp_wrapper_tool_definitions());
     }
 
     Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
+    vec![
+        RuntimeToolDefinition {
+            name: "runtime_capabilities".to_string(),
+            description: Some(
+                "Return Cowd runtime capability guidance, execution modes, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string" },
+                    "surface": { "type": "string" },
+                    "profile": { "type": "string" },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "policy_gates"]
+                    }
+                },
+                "required": ["intent"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "runtime_orchestrate".to_string(),
+            description: Some(
+                "Submit a controlled runtime orchestration request. Use plan_only first for complex work; runtime validates policy, risk, budget, and permissions before execution.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string" },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Required for request_team when the model wants runtime to start a real TeamRuntime attached to a session."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "plan_only",
+                            "request_team",
+                            "request_subagent",
+                            "request_verification",
+                            "request_parallel_tools",
+                            "request_rewoo_evidence",
+                            "request_deliberation",
+                            "request_reflexion_retry",
+                            "request_background_review",
+                            "request_risk_gate",
+                            "request_session_link"
+                        ]
+                    },
+                    "reason": { "type": "string" },
+                    "template_hint": { "type": "string" },
+                    "capabilities": { "type": "array", "items": { "type": "string" } },
+                    "evidence_refs": { "type": "array", "items": { "type": "string" } },
+                    "surface": { "type": "string" },
+                    "constraints": {
+                        "type": "object",
+                        "properties": {
+                            "max_parallel_agents": { "type": "integer", "minimum": 1 },
+                            "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+                            "requires_write": { "type": "boolean" },
+                            "surface_latency_sensitive": { "type": "boolean" }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["intent"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+    ]
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -443,4 +522,24 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_capability_tool_is_always_registered_as_readonly() {
+        let tools = runtime_capability_tool_definitions();
+
+        let capability_tool = tools
+            .iter()
+            .find(|tool| tool.name == "runtime_capabilities")
+            .expect("runtime capability tool");
+        assert_eq!(
+            capability_tool.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        assert_eq!(capability_tool.input_schema["required"][0], "intent");
+    }
 }

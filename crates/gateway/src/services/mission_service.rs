@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use harness_contract::strategy::{decide_strategy, StrategyInput};
 use serde::{Deserialize, Serialize};
 
 use super::{service_envelope, MissionService, ServiceEnvelope};
@@ -544,9 +543,7 @@ impl MissionService {
         if request.objective.trim().is_empty() {
             return Err("team objective must not be empty".to_string());
         }
-        let strategy = decide_strategy(&StrategyInput::from_prompt(request.objective.clone()));
-        let decision =
-            runtime::CollaborationTemplateMatcher::default().decide(&request.objective, &strategy);
+        let decision = runtime::plan_runtime_collaboration_decision(&request.objective);
         let team = runtime::global_team_runtime_service().start_with_agent_spawner(
             runtime::StartTeamRuntimeRequest {
                 session_id: session_id.to_string(),

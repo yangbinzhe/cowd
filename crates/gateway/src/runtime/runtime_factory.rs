@@ -12,7 +12,8 @@ use crate::runtime_entry::GatewayRuntimeEntry;
 use crate::services::runtime_skill_profiles_for_workspace;
 use crate::{
     filter_tool_specs, inject_auto_resume_context, permission_policy,
-    session_db_resume_context_packet, workspace_context_item, AllowedToolSet,
+    runtime_capability_context_item, session_db_resume_context_packet, workspace_context_item,
+    AllowedToolSet,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -116,6 +117,8 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let skill_profiles = runtime_skill_profiles_for_workspace(&workspace_root);
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
+    let capability_item =
+        runtime_capability_context_item(&tool_definitions, allowed_tools.as_ref(), model_ctx);
     let subagent_model = model.clone();
     let subagent_tool_definitions = tool_definitions.clone();
     let tool_executor = std::sync::Arc::new(GatewayToolExecutor::new(
@@ -140,7 +143,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         hook_progress_reporter: emit_output.then(|| {
             Box::new(GatewayHookProgressReporter) as Box<dyn runtime::HookProgressReporter>
         }),
-        external_context_items: vec![workspace_item],
+        external_context_items: vec![workspace_item, capability_item],
         skill_profiles,
         agent_skill_profile: default_runtime_agent_skill_profile(),
         enable_collaboration: true,

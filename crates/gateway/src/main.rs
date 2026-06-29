@@ -3504,6 +3504,78 @@ pub(crate) fn workspace_context_item(session: &Session, model_ctx: u32) -> runti
     runtime::ContextRuntimeKernel::workspace_item(&packet)
 }
 
+pub(crate) fn runtime_capability_context_item(
+    tool_definitions: &[runtime::ProviderToolDefinition],
+    allowed_tools: Option<&AllowedToolSet>,
+    model_ctx: u32,
+) -> runtime::ContextItem {
+    let tool_names = tool_definitions
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let has_tool = |name: &str| tool_names.iter().any(|tool| *tool == name);
+    let batch_tools = [
+        "workspace_snapshot",
+        "read_many",
+        "grep_many",
+        "glob_many",
+        "tool_batch_readonly",
+    ]
+    .into_iter()
+    .filter(|name| has_tool(name))
+    .collect::<Vec<_>>();
+    let prepared_readonly_tools = tool_definitions
+        .iter()
+        .filter_map(|tool| {
+            let profile = runtime::tool_execution_profile(&tool.name);
+            profile
+                .prepared_readonly_supported
+                .then_some(tool.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let runtime_query = if has_tool("runtime_capabilities") {
+        "runtime_capabilities=available"
+    } else {
+        "runtime_capabilities=unavailable"
+    };
+    let allowed_state = allowed_tools.map_or_else(
+        || "allowed_tools=all available registry tools".to_string(),
+        |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
+    );
+    let content = format!(
+        "# Active runtime capability map\n\
+model_context_window={model_ctx}\n\
+available_tool_count={}\n\
+{allowed_state}\n\
+{runtime_query}\n\
+batch_readonly_tools={}\n\
+prepared_readonly_tools={}\n\
+Guidance: for independent read-only evidence, request multiple tool calls together or use tool_batch_readonly/read_many/grep_many when available; distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex architecture or validation work, shape the task so runtime orchestration can attach collaborators when available; when a path repeats, query runtime_capabilities or re-plan before continuing.",
+        tool_definitions.len(),
+        if batch_tools.is_empty() {
+            "none".to_string()
+        } else {
+            batch_tools.join(",")
+        },
+        if prepared_readonly_tools.is_empty() {
+            "none".to_string()
+        } else {
+            prepared_readonly_tools.join(",")
+        }
+    );
+    let mut item = runtime::ContextItem::new(
+        "runtime.capabilities.active",
+        runtime::ContextSourceKind::RuntimeHeader,
+        runtime::ContextRole::Orientation,
+        content,
+    );
+    item.authority = runtime::ContextAuthority::Derived;
+    item.visibility = runtime::ContextVisibility::Shared;
+    item.score = 0.95;
+    item.evidence = vec!["gateway.filtered_tool_registry".to_string()];
+    item
+}
+
 struct WorkspaceGitSnapshot {
     branch: Option<String>,
     touched_files: Vec<String>,
@@ -4626,17 +4698,17 @@ mod tests {
         render_memory_report, render_prompt_history_report, render_resume_usage,
         render_session_markdown, render_setup_json, render_setup_report, render_terminal_help,
         resolve_model_alias_with_config, resolve_session_reference, resolve_tui_model,
-        response_to_events, resume_supported_slash_commands, run_resume_command, session_db_path,
-        session_db_resume_context_packet, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
-        suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
-        sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
-        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
-        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
-        GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
-        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
-        STUB_COMMANDS,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        runtime_capability_context_item, session_db_path, session_db_resume_context_packet,
+        short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
+        strip_ansi_for_tui, suggestions::format_unknown_slash_command,
+        summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
+        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction,
+        GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
+        GatewayTaskSlashCommand, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic,
+        SessionHandle, SessionPromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
     };
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
@@ -6656,6 +6728,35 @@ mod tests {
             "default gateway build should not force code-index hot symbol extraction"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_capability_context_item_reflects_filtered_tools() {
+        let tools = vec![
+            runtime::ProviderToolDefinition {
+                name: "read_many".to_string(),
+                description: Some("read many".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            runtime::ProviderToolDefinition {
+                name: "tool_batch_readonly".to_string(),
+                description: Some("batch".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            runtime::ProviderToolDefinition {
+                name: "runtime_capabilities".to_string(),
+                description: Some("capabilities".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+        ];
+
+        let item = runtime_capability_context_item(&tools, None, 1_000_000);
+
+        assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
+        assert_eq!(item.role, runtime::ContextRole::Orientation);
+        assert!(item.content.contains("runtime_capabilities=available"));
+        assert!(item.content.contains("read_many"));
+        assert!(item.content.contains("tool_batch_readonly"));
     }
 
     #[test]

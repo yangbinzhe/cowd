@@ -3150,7 +3150,7 @@ mod tests {
         assert_eq!(gate.status(), StatusCode::OK);
         let body = to_bytes(gate.into_body(), usize::MAX).await.unwrap();
         let gate_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(gate_json["status"], "pass");
+        assert_eq!(gate_json["status"], "pass", "{gate_json:#}");
         assert!(gate_json["checks"].as_array().unwrap().iter().any(|check| {
             check["check_id"] == "structured_data.indexes.ready" && check["status"] == "pass"
         }));

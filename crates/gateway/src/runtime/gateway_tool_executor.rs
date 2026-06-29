@@ -31,6 +31,14 @@ struct ReadMcpResourceRequest {
     uri: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimeCapabilitiesRequest {
+    intent: String,
+    surface: Option<String>,
+    profile: Option<String>,
+    detail: Option<String>,
+}
+
 pub(crate) struct GatewayToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -82,6 +90,24 @@ impl GatewayToolExecutor {
         tool_name: &str,
         value: serde_json::Value,
     ) -> Result<String, ToolError> {
+        if tool_name == "runtime_capabilities" {
+            let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            return serde_json::to_string_pretty(
+                &runtime::runtime_capabilities_response_with_detail(
+                    &input.intent,
+                    input.surface.as_deref(),
+                    input.profile.as_deref(),
+                    input.detail.as_deref(),
+                ),
+            )
+            .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "runtime_orchestrate" {
+            return serde_json::to_string_pretty(&runtime::runtime_orchestration_response(value))
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
+
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
                 "runtime tool `{tool_name}` is unavailable without configured MCP servers"
@@ -157,5 +183,76 @@ impl ToolExecutor for GatewayToolExecutor {
                 Err(error)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tools::permissions::PermissionMode as ToolPermissionMode;
+    use tools::RuntimeToolDefinition;
+
+    #[test]
+    fn runtime_capabilities_executes_without_mcp_state() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_capabilities".to_string(),
+                description: Some("capability guidance".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": { "type": "string" }
+                    },
+                    "required": ["intent"],
+                    "additionalProperties": false
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+
+        let output = executor
+            .execute(
+                "runtime_capabilities",
+                r#"{"intent":"检查 README 是否反映最新架构"}"#,
+            )
+            .expect("runtime capabilities should execute without MCP");
+
+        assert!(output.contains("runtime_capabilities"));
+        assert!(output.contains("evidence_plan"));
+        assert!(output.contains("tool_batch_readonly"));
+        assert!(output.contains("runtime_orchestrate"));
+    }
+
+    #[test]
+    fn runtime_orchestrate_executes_without_mcp_state() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_orchestrate".to_string(),
+                description: Some("runtime orchestration".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": { "type": "string" },
+                        "action": { "type": "string" }
+                    },
+                    "required": ["intent"],
+                    "additionalProperties": true
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+
+        let output = executor
+            .execute(
+                "runtime_orchestrate",
+                r#"{"intent":"检查 README 是否反映最新架构","action":"plan_only"}"#,
+            )
+            .expect("runtime orchestrate should execute without MCP");
+
+        assert!(output.contains("runtime-orch-"));
+        assert!(output.contains("plan_only"));
     }
 }

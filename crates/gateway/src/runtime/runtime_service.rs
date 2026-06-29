@@ -53,13 +53,50 @@ pub(crate) struct RuntimeTurnExecution {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeTurnOptions {
     pub(crate) profile: runtime::ContextProfile,
+    pub(crate) max_iterations: Option<usize>,
 }
 
 impl Default for RuntimeTurnOptions {
     fn default() -> Self {
         Self {
             profile: runtime::ContextProfile::MainTurn,
+            max_iterations: None,
         }
+    }
+}
+
+trait RuntimeTurnBudgetTarget {
+    fn max_iterations(&self) -> usize;
+    fn set_max_iterations(&mut self, max_iterations: usize);
+}
+
+impl RuntimeTurnBudgetTarget for crate::runtime_entry::GatewayRuntimeEntry {
+    fn max_iterations(&self) -> usize {
+        self.max_iterations()
+    }
+
+    fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.set_max_iterations(max_iterations);
+    }
+}
+
+fn apply_scoped_max_iterations<T: RuntimeTurnBudgetTarget>(
+    runtime: &mut T,
+    max_iterations: Option<usize>,
+) -> Option<usize> {
+    let previous = max_iterations.map(|_| runtime.max_iterations());
+    if let Some(max_iterations) = max_iterations {
+        runtime.set_max_iterations(max_iterations);
+    }
+    previous
+}
+
+fn restore_scoped_max_iterations<T: RuntimeTurnBudgetTarget>(
+    runtime: &mut T,
+    previous: Option<usize>,
+) {
+    if let Some(previous) = previous {
+        runtime.set_max_iterations(previous);
     }
 }
 
@@ -361,12 +398,16 @@ impl RuntimeService {
             handle.block_on(async move {
                 let mut runtime_guard = runtime_entry.lock().await;
                 runtime_guard.set_context_profile(options.profile);
-                timeout(
+                let previous_max_iterations =
+                    apply_scoped_max_iterations(&mut *runtime_guard, options.max_iterations);
+                let result = timeout(
                     turn_timeout,
                     runtime_guard
                         .run_turn_async(&content, &runtime::permissions::SharedPrompter::none()),
                 )
-                .await
+                .await;
+                restore_scoped_max_iterations(&mut *runtime_guard, previous_max_iterations);
+                result
             })
         })
         .await
@@ -779,6 +820,36 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_max_iterations_restores_previous_runtime_budget() {
+        struct BudgetProbe {
+            max_iterations: usize,
+        }
+
+        impl RuntimeTurnBudgetTarget for BudgetProbe {
+            fn max_iterations(&self) -> usize {
+                self.max_iterations
+            }
+
+            fn set_max_iterations(&mut self, max_iterations: usize) {
+                self.max_iterations = max_iterations;
+            }
+        }
+
+        let mut probe = BudgetProbe { max_iterations: 64 };
+
+        let previous = apply_scoped_max_iterations(&mut probe, Some(8));
+        assert_eq!(previous, Some(64));
+        assert_eq!(probe.max_iterations(), 8);
+
+        restore_scoped_max_iterations(&mut probe, previous);
+        assert_eq!(probe.max_iterations(), 64);
+
+        let previous = apply_scoped_max_iterations(&mut probe, None);
+        assert_eq!(previous, None);
+        assert_eq!(probe.max_iterations(), 64);
+    }
 
     #[tokio::test]
     async fn runtime_service_status_does_not_initialize_model_provider() {

@@ -4,13 +4,23 @@ use std::time::Duration;
 
 use memory::SessionRecord;
 use sha2::{Digest, Sha256};
-use surface::{SurfaceFrame, SurfaceSendRequest};
+use surface::{SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
 
 use crate::api_routes::AppState;
 use crate::runtime_service::RuntimeTurnOptions;
 
-const SURFACE_TURN_TIMEOUT: Duration = Duration::from_secs(300);
+const SURFACE_QUICK_TURN_TIMEOUT: Duration = Duration::from_secs(90);
+const SURFACE_DEEP_TURN_TIMEOUT: Duration = Duration::from_secs(240);
+const SURFACE_QUICK_MAX_ITERATIONS: usize = 8;
+const SURFACE_DEEP_MAX_ITERATIONS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceTurnPolicy {
+    profile: runtime::ContextProfile,
+    timeout: Duration,
+    max_iterations: usize,
+}
 
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
@@ -120,14 +130,16 @@ async fn handle_surface_message(
         .runtime
         .as_ref()
         .ok_or_else(|| "runtime service unavailable".to_string())?;
+    let turn_policy = surface_turn_policy(&content);
     let execution = match runtime_service
         .run_turn_with_options(
             &session_id,
             None,
             content.clone(),
-            SURFACE_TURN_TIMEOUT,
+            turn_policy.timeout,
             RuntimeTurnOptions {
-                profile: surface_context_profile(&content),
+                profile: turn_policy.profile,
+                max_iterations: Some(turn_policy.max_iterations),
             },
         )
         .await
@@ -151,6 +163,23 @@ async fn handle_surface_message(
                 .services
                 .surface
                 .mark_inbox_failed(&inbox.record.idempotency_key, message.clone())?;
+            send_surface_failure_notice(
+                &state,
+                &surface,
+                &payload,
+                &session_id,
+                &message_id,
+                &message,
+            )
+            .await;
+            notify_surface_processing_lifecycle(
+                &state,
+                &surface,
+                "message.processing_failed",
+                &message_id,
+                Some(message.clone()),
+            )
+            .await;
             return Err(message);
         }
     };
@@ -184,6 +213,14 @@ async fn handle_surface_message(
     )?;
 
     if response_text.trim().is_empty() {
+        notify_surface_processing_lifecycle(
+            &state,
+            &surface,
+            "message.processing_complete",
+            &message_id,
+            None,
+        )
+        .await;
         return Ok(());
     }
     let recipient = surface_reply_recipient(&payload)
@@ -216,9 +253,62 @@ async fn handle_surface_message(
                 }),
             )
             .await?;
+            state
+                .services
+                .surface
+                .mark_inbox_reply_failed(&inbox.record.idempotency_key, error.clone())?;
+            notify_surface_processing_lifecycle(
+                &state,
+                &surface,
+                "message.processing_failed",
+                &message_id,
+                Some(error.clone()),
+            )
+            .await;
             return Err(error);
         }
     };
+    if let Some(error) = outbound.error.clone() {
+        append_surface_timeline_event(
+            &state,
+            &session_id,
+            "SurfaceMessageReplyFailed",
+            serde_json::json!({
+                "type": "SurfaceMessageReplyFailed",
+                "surface": surface.clone(),
+                "message_id": message_id.clone(),
+                "error": error.message.clone(),
+                "code": error.code.clone(),
+                "outbound": outbound,
+            }),
+        )
+        .await?;
+        state
+            .services
+            .surface
+            .mark_inbox_reply_failed(&inbox.record.idempotency_key, error.message.clone())?;
+        notify_surface_processing_lifecycle(
+            &state,
+            &surface,
+            "message.processing_failed",
+            &message_id,
+            Some(error.message.clone()),
+        )
+        .await;
+        return Err(error.message.clone());
+    }
+    state
+        .services
+        .surface
+        .mark_inbox_replied(&inbox.record.idempotency_key)?;
+    notify_surface_processing_lifecycle(
+        &state,
+        &surface,
+        "message.processing_complete",
+        &message_id,
+        None,
+    )
+    .await;
     state
         .services
         .session
@@ -237,6 +327,37 @@ async fn handle_surface_message(
     Ok(())
 }
 
+async fn notify_surface_processing_lifecycle(
+    state: &AppState,
+    surface: &str,
+    action: &str,
+    message_id: &str,
+    error: Option<String>,
+) {
+    let result = state
+        .services
+        .surface
+        .action(SurfaceActionRequest {
+            surface: surface.to_string(),
+            action: action.to_string(),
+            payload: serde_json::json!({
+                "message_id": message_id,
+                "error": error,
+                "source": "surface_ingress_dispatcher",
+            }),
+        })
+        .await;
+    if let Err(error) = result {
+        tracing::debug!(
+            %surface,
+            %action,
+            %message_id,
+            error = %error,
+            "surface processing lifecycle notification failed"
+        );
+    }
+}
+
 fn surface_context_profile(content: &str) -> runtime::ContextProfile {
     let normalized = content.to_ascii_lowercase();
     let deep_markers = [
@@ -248,7 +369,13 @@ fn surface_context_profile(content: &str) -> runtime::ContextProfile {
         "测试",
         "执行",
         "代码",
+        "检查",
+        "核查",
+        "确认",
+        "更新",
+        "文档",
         "debug",
+        "readme",
         "review",
         "refactor",
         "test",
@@ -263,6 +390,79 @@ fn surface_context_profile(content: &str) -> runtime::ContextProfile {
     } else {
         runtime::ContextProfile::SurfaceQuickReply
     }
+}
+
+fn surface_turn_policy(content: &str) -> SurfaceTurnPolicy {
+    let profile = surface_context_profile(content);
+    match profile {
+        runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy {
+            profile,
+            timeout: SURFACE_DEEP_TURN_TIMEOUT,
+            max_iterations: SURFACE_DEEP_MAX_ITERATIONS,
+        },
+        _ => SurfaceTurnPolicy {
+            profile,
+            timeout: SURFACE_QUICK_TURN_TIMEOUT,
+            max_iterations: SURFACE_QUICK_MAX_ITERATIONS,
+        },
+    }
+}
+
+async fn send_surface_failure_notice(
+    state: &AppState,
+    surface: &str,
+    payload: &serde_json::Value,
+    session_id: &str,
+    message_id: &str,
+    error: &str,
+) {
+    let recipient = surface_reply_recipient(payload)
+        .or_else(|| payload_string(payload, "thread_id"))
+        .or_else(|| payload_string(payload, "user_id"))
+        .unwrap_or_else(|| session_id.to_string());
+    let thread = payload_string(payload, "thread_id");
+    let result = state
+        .services
+        .surface
+        .send(SurfaceSendRequest {
+            surface: surface.to_string(),
+            recipient,
+            thread,
+            text: surface_failure_notice_text(error),
+            metadata: serde_json::json!({
+                "reply_to": message_id,
+                "source_session_id": session_id,
+                "source": "surface_ingress_dispatcher",
+                "failure_notice": true,
+                "failure_reason": error,
+            }),
+        })
+        .await;
+    match result {
+        Ok(outbound) if outbound.error.is_none() => {}
+        Ok(outbound) => {
+            tracing::warn!(
+                %surface,
+                %message_id,
+                error = ?outbound.error,
+                "surface failure notice returned operation error"
+            );
+        }
+        Err(send_error) => {
+            tracing::warn!(
+                %surface,
+                %message_id,
+                error = %send_error,
+                "surface failure notice delivery failed"
+            );
+        }
+    }
+}
+
+fn surface_failure_notice_text(error: &str) -> String {
+    format!(
+        "这条消息已经进入 Cowd，但本次 AI 处理没有在渠道执行预算内完成，因此没有生成完整结果。\n\n状态：已记录失败并清理处理中标记。\n原因：{error}\n\n你可以缩小问题范围后重发，或在 WebUI/TUI 中查看该 surface inbox 并执行重放。"
+    )
 }
 
 async fn surface_session_lock(
@@ -316,7 +516,7 @@ async fn ensure_surface_runtime_session(
             session,
             session_id,
             model.clone(),
-            vec![],
+            surface_system_prompt(surface),
             true,
             true,
             None,
@@ -329,7 +529,7 @@ async fn ensure_surface_runtime_session(
             session,
             session_id,
             model.clone(),
-            vec![],
+            surface_system_prompt(surface),
             true,
             true,
             None,
@@ -374,6 +574,15 @@ async fn ensure_surface_runtime_session(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn surface_system_prompt(surface: &str) -> Vec<String> {
+    vec![format!(
+        "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
+        如果任务需要读代码、检查 README、调研或测试，只检查足以支撑结论的关键证据；不要进行无边界穷举。\
+        如果当前 turn 的信息或时间不足，直接说明已检查内容、当前判断、剩余风险和建议下一步，而不是持续调用工具直到超时。\
+        外部 surface 的用户体验要求：宁可给出有证据的阶段性结论，也不能让用户长时间没有任何回复。"
+    )]
 }
 
 fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
@@ -540,5 +749,32 @@ mod tests {
             payload_fingerprint_id("feishu", &payload),
             payload_fingerprint_id("feishu", &payload)
         );
+    }
+
+    #[test]
+    fn readme_followup_uses_deep_surface_budget() {
+        let policy = surface_turn_policy("我已经更新，看是否最新的readme还有问题");
+
+        assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
+        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
+        assert_eq!(policy.timeout, SURFACE_DEEP_TURN_TIMEOUT);
+    }
+
+    #[test]
+    fn short_surface_message_uses_quick_budget() {
+        let policy = surface_turn_policy("你好");
+
+        assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
+        assert_eq!(policy.max_iterations, SURFACE_QUICK_MAX_ITERATIONS);
+        assert_eq!(policy.timeout, SURFACE_QUICK_TURN_TIMEOUT);
+    }
+
+    #[test]
+    fn surface_failure_notice_text_is_visible_and_actionable() {
+        let text = surface_failure_notice_text("turn timed out after 240s");
+
+        assert!(text.contains("已经进入 Cowd"));
+        assert!(text.contains("turn timed out after 240s"));
+        assert!(text.contains("重放"));
     }
 }

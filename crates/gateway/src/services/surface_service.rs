@@ -129,6 +129,18 @@ impl SurfaceService {
             .mark_inbox_processed(idempotency_key, runtime_turn_id)
     }
 
+    pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
+        self.host.mark_inbox_replied(idempotency_key)
+    }
+
+    pub(crate) fn mark_inbox_reply_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        self.host.mark_inbox_reply_failed(idempotency_key, error)
+    }
+
     pub(crate) fn mark_inbox_failed(
         &self,
         idempotency_key: &str,
