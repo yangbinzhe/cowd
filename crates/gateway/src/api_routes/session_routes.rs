@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -11,7 +11,9 @@ use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use serde::{Deserialize, Serialize};
 
 use super::{abort_active_turn, new_api_session_record, AppState, ErrorResponse};
-use crate::services::SessionUpdateRequest;
+use crate::services::{
+    SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -1016,18 +1018,117 @@ async fn get_session_stats_handler(
             }),
         )
     })?;
-    runtime_service
-        .active_session_stats(&id)
+    if let Some(stats) = runtime_service.active_session_stats(&id).await {
+        return Ok(Json(stats));
+    }
+    stored_session_stats_response(&state, &id).await
+}
+
+fn stored_session_duration_ms(record: &SessionRecord) -> u64 {
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&record.created_at) else {
+        return 0;
+    };
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&record.last_activity) else {
+        return 0;
+    };
+    updated
+        .signed_duration_since(created)
+        .num_milliseconds()
+        .max(0) as u64
+}
+
+fn token_count_from_usage(message: &memory::store::session::SessionMessage, key: &str) -> u32 {
+    message
+        .token_usage_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as u32)
+        })
+        .unwrap_or(0)
+}
+
+async fn stored_session_stats_response(
+    state: &AppState,
+    id: &str,
+) -> Result<Json<SessionStatsSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    let record = state
+        .services
+        .session
+        .stored_session(id)
         .await
-        .map(Json)
-        .ok_or_else(|| {
+        .map_err(|error| {
             (
-                StatusCode::NOT_FOUND,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("session {id} not found"),
+                    error: format!("failed to load stored session: {error}"),
                 }),
             )
-        })
+        })?;
+    let Some(record) = record else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {id} not found"),
+            }),
+        ));
+    };
+    let messages = state
+        .services
+        .session
+        .stored_messages(id, 0, 10_000)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load stored session messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let mut counts = SessionMessageCounts {
+        user: 0,
+        assistant: 0,
+        tool: 0,
+    };
+    let mut tool_usage: HashMap<String, usize> = HashMap::new();
+    let mut input_tokens = record.input_tokens.max(0) as u32;
+    let mut output_tokens = record.output_tokens.max(0) as u32;
+    for message in &messages {
+        match message.role.as_str() {
+            "user" => counts.user += 1,
+            "assistant" => counts.assistant += 1,
+            "tool" => counts.tool += 1,
+            _ => {}
+        }
+        if let Some(tool_name) = message.tool_name.as_ref().filter(|name| !name.is_empty()) {
+            *tool_usage.entry(tool_name.clone()).or_insert(0) += 1;
+        }
+        if input_tokens == 0 {
+            input_tokens =
+                input_tokens.saturating_add(token_count_from_usage(message, "input_tokens"));
+        }
+        if output_tokens == 0 {
+            output_tokens =
+                output_tokens.saturating_add(token_count_from_usage(message, "output_tokens"));
+        }
+    }
+    Ok(Json(SessionStatsSnapshot {
+        session_id: id.to_string(),
+        message_count: messages.len().max(record.message_count.max(0) as usize),
+        message_counts: counts,
+        tokens: SessionTokenCounts {
+            input: input_tokens,
+            output: output_tokens,
+            total: input_tokens.saturating_add(output_tokens),
+        },
+        tool_usage,
+        duration_ms: stored_session_duration_ms(&record),
+    }))
 }
 
 async fn update_session_handler(

@@ -321,6 +321,15 @@ impl<'a> RuntimeTurnSink<'a> {
         started_at_ms: u64,
     ) -> String {
         let error_msg = error.message();
+        if let Some(session_snapshot) = self.runtime_service.session_snapshot(session_id).await {
+            if let Err(e) = self
+                .runtime_service
+                .sync_session_snapshot(session_id, &session_snapshot)
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "failed to sync failed API session to SQLite");
+            }
+        }
         let context_envelope_id = self
             .runtime_service
             .last_context_envelope(session_id)
