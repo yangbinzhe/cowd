@@ -172,6 +172,9 @@ fn execute_team_request(
     }) {
         Ok(team) => {
             let team_id = team.team_id.clone();
+            let collaboration_run = global_team_runtime_service()
+                .collaboration_run(&team_id)
+                .ok();
             (
                 Some("running".to_string()),
                 json!({
@@ -179,6 +182,9 @@ fn execute_team_request(
                     "mode": mode.as_str(),
                     "status": "running",
                     "team": team,
+                    "collaboration_run": collaboration_run,
+                    "control_actions": ["inspect", "synthesis", "handoff", "cancel", "pause"],
+                    "expected_events": ["team.started", "team.input_appended", "team.handoff_requested", "team.cancelled"],
                     "event_refs": [format!("team:{team_id}")],
                 }),
             )

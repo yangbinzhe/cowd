@@ -156,5 +156,15 @@ mod tests {
         assert_eq!(result.status, "running");
         assert_eq!(result.execution["type"], "team_runtime");
         assert!(result.execution["team"]["team_id"].is_string());
+        assert_eq!(
+            result.execution["collaboration_run"]["kind"],
+            "runtime.collaboration_run"
+        );
+        assert!(result.execution["control_actions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "cancel")));
+        assert!(result.execution["event_refs"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
     }
 }
