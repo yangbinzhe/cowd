@@ -103,6 +103,15 @@ impl RuntimeCapabilityManifest {
                         "If time or evidence is insufficient, report checked evidence, current judgment, and next steps.",
                     ],
                 ),
+                capability(
+                    "context_memory_governance",
+                    "Runtime reconciles recalled memory and active knowledge against the current user turn before injecting them into context.",
+                    &["runtime_capabilities"],
+                    &[
+                        "Use when old user preferences, knowledge rules, or memory recalls appear to conflict with the current explicit instruction.",
+                        "Treat the current user turn as the deciding instruction for this turn; suppressed memories remain stored but should not steer this answer.",
+                    ],
+                ),
             ],
         }
     }
@@ -132,8 +141,12 @@ pub fn runtime_capability_primer() -> String {
         "- Distinguish model-callable tools from runtime-owned affordances: subagent/team/mission collaboration may be orchestrated by runtime even when it is not exposed as a direct tool.".to_string(),
         "- For complex architecture or validation work, shape the task so runtime-owned collaboration can be used when independent evidence domains exist.".to_string(),
         "- If a path becomes slow or repetitive, switch strategy: batch evidence, narrow scope, delegate, or give an evidence-backed staged answer.".to_string(),
+        "- Slow model output is acceptable when it keeps producing useful evidence; treat no-progress idle, repeated low-novelty tool paths, and missing synthesis as the signals to re-plan.".to_string(),
+        "- For long or expensive work, produce an early staged answer with checked facts, then continue with batched evidence and runtime orchestration instead of serial probing.".to_string(),
+        "- Prefer full-file or batched reads when the context window can hold the evidence; avoid artificial tiny range reads unless the target is genuinely large.".to_string(),
+        "- Current user instructions override conflicting recalled memory or knowledge rules for this turn; if a recalled preference conflicts with the explicit current request, suppress that memory and follow the current request.".to_string(),
         "- Use `runtime_capabilities` when you need a compact recommendation for available runtime affordances.".to_string(),
-        "- Use `runtime_capabilities` with detail=`execution_modes`, `team_templates`, `agent_catalog`, or `orchestration_options` when deciding how to solve complex work.".to_string(),
+        "- Use `runtime_capabilities` with detail=`execution_modes`, `team_templates`, `agent_catalog`, `orchestration_options`, or `budget_controls` when deciding how to solve complex work.".to_string(),
         format!("- {}", runtime_orchestration_action_guidance()),
     ]);
 
@@ -179,6 +192,7 @@ pub fn runtime_capabilities_response_with_detail(
             "actions": runtime_orchestration_actions(),
             "recommendation": execution_decision.recommended_actions
         },
+        "budget_controls": runtime_budget_controls(profile),
         "strategy": {
             "prefer_batch_readonly": true,
             "prefer_full_or_batch_read_for_small_docs": true,
@@ -186,6 +200,7 @@ pub fn runtime_capabilities_response_with_detail(
             "runtime_owned_affordances": ["execution_modes", "rewoo_evidence", "tool_dag", "subagent", "team", "mission", "session", "verification", "deliberation", "reflexion"],
             "use_or_request_subagents_for_independent_domains": true,
             "avoid_repeated_overlapping_reads": true,
+            "current_turn_overrides_conflicting_memory": true,
             "fallback_when_stalled": "switch execution mode through runtime_orchestrate plan_only/request_reflexion_retry or answer with checked evidence, current judgment, remaining risks, and next best step"
         },
         "advanced_execution": {
@@ -233,17 +248,67 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
             "execution_modes": execution_mode_catalog_response(),
             "collaboration_templates": templates,
         }),
+        "budget_controls" => runtime_budget_controls(None),
         "policy_gates" => json!({
             "risk": ["risk_gate", "human_confirm"],
             "parallelism": "runtime validator caps max_parallel_agents",
             "writes": "write/destructive actions require permission and scheduler gating"
         }),
         _ => json!({
-            "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/policy_gates for concrete runtime affordances.",
+            "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/budget_controls/policy_gates for concrete runtime affordances.",
             "execution_modes": execution_mode_catalog_response()["execution_modes"],
             "collaboration_template_count": templates.len(),
         }),
     }
+}
+
+fn runtime_budget_controls(profile: Option<&str>) -> Value {
+    json!({
+        "profile": profile.unwrap_or("auto"),
+        "turn": {
+            "adaptive_wall_clock_seconds": {
+                "direct_or_quick": 240,
+                "standard": 480,
+                "deep_or_yolo": 900
+            },
+            "stream_idle_seconds": {
+                "direct_or_quick": 240,
+                "standard": 360,
+                "deep_or_yolo": 600
+            },
+            "max_iterations": {
+                "direct_or_quick": 12,
+                "standard": 32,
+                "deep_or_yolo": 64
+            },
+            "partial_answer_preserved": true
+        },
+        "supervision": {
+            "slow_but_productive_output_allowed": true,
+            "low_novelty_tool_loop": "supervisor first asks for fallback synthesis; if ignored and tools continue, runtime stops the loop on the next iteration",
+            "preferred_recovery": ["batch_evidence", "narrow_scope", "delegate_independent_domains", "staged_answer_with_remaining_risks"]
+        },
+        "tools": {
+            "per_tool_timeout_registry": true,
+            "parallel_readonly_scheduler": true,
+            "serial_destructive_scheduler": true,
+            "large_result_policy": "summaries plus raw evidence refs; avoid reinjecting huge raw payloads into prompt context"
+        },
+        "subagents": {
+            "timeout_secs_supported": true,
+            "max_turns_supported": true,
+            "budget_tokens_supported": true,
+            "default_max_turns": 10,
+            "default_budget_tokens": 20000,
+            "peer_visibility_supported": true
+        },
+        "context_memory": {
+            "current_turn_overrides_conflicting_memory": true,
+            "suppressed_memory_stays_stored": true,
+            "suppression_scope": "current_turn_only",
+            "known_conflict_classes": ["tool_orchestration_ban", "required_tool_orchestration_rule", "code_evidence_count_rule", "defer_work_rule"]
+        }
+    })
 }
 
 fn parse_context_profile(value: &str) -> Option<ContextProfile> {
@@ -295,6 +360,10 @@ mod tests {
         assert!(primer.contains("subagent, team"));
         assert!(primer.contains("runtime-owned"));
         assert!(primer.contains("runtime_capabilities"));
+        assert!(primer.contains("Slow model output is acceptable"));
+        assert!(primer.contains("early staged answer"));
+        assert!(primer.contains("batched reads"));
+        assert!(primer.contains("Current user instructions override conflicting recalled memory"));
     }
 
     #[test]
@@ -312,6 +381,12 @@ mod tests {
             .as_bool()
             .unwrap_or(false));
         assert!(response["execution_decision"]["recommended_mode"].is_string());
+        assert!(response["budget_controls"]["turn"]["max_iterations"].is_object());
+        assert!(
+            response["strategy"]["current_turn_overrides_conflicting_memory"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -333,5 +408,18 @@ mod tests {
         assert!(templates["backend_capabilities"]["collaboration_templates"]
             .as_array()
             .is_some_and(|items| items.len() >= 7));
+
+        let budget = runtime_capabilities_response_with_detail(
+            "慢模型复杂分析",
+            Some("feishu"),
+            Some("DeepInvestigation"),
+            Some("budget_controls"),
+        );
+        assert!(budget["backend_capabilities"]["turn"]["adaptive_wall_clock_seconds"].is_object());
+        assert!(
+            budget["backend_capabilities"]["subagents"]["timeout_secs_supported"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 }

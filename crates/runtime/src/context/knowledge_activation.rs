@@ -1,7 +1,9 @@
 use harness_contract::knowledge::{
     KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace, KnowledgeTurnReport,
 };
-use memory::{DocumentContent, KnowledgeFabric, MemoryContextPacket, MemoryPacketRole};
+use memory::{
+    DocumentContent, KnowledgeFabric, MemoryContextPacket, MemoryPacketRole, OmittedMemory,
+};
 
 use crate::context_runtime::{
     ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility,
@@ -35,6 +37,7 @@ impl KnowledgeActivationRuntime {
         profile: &str,
         packet: &MemoryContextPacket,
     ) -> Option<RuntimeKnowledgeActivation> {
+        let packet = filter_packet_for_turn_intent(packet, intent);
         for item in &packet.selected {
             let Some(document) = document_from_memory_item(item) else {
                 continue;
@@ -126,6 +129,276 @@ impl KnowledgeActivationRuntime {
             compliance_decision,
         })
     }
+}
+
+#[must_use]
+pub fn filter_packet_for_turn_intent(
+    packet: &MemoryContextPacket,
+    intent: &str,
+) -> MemoryContextPacket {
+    let mut selected = Vec::with_capacity(packet.selected.len());
+    let mut omitted = packet.omitted.clone();
+
+    for item in &packet.selected {
+        if let Some(reason) = suppression_reason_for_turn_intent(item, intent) {
+            omitted.push(OmittedMemory {
+                id: item.atom.id,
+                title: item.atom.title.clone(),
+                reason,
+            });
+        } else {
+            selected.push(item.clone());
+        }
+    }
+
+    MemoryContextPacket {
+        selected,
+        omitted,
+        token_estimate: packet.token_estimate,
+        truncated: packet.truncated,
+    }
+}
+
+fn suppression_reason_for_turn_intent(
+    item: &memory::MemoryPacketItem,
+    intent: &str,
+) -> Option<String> {
+    let item_text = normalize_turn_text(&format!("{} {}", item.atom.title, item.reason));
+    let intent_text = normalize_turn_text(intent);
+
+    if turn_requests_tools_or_orchestration(&intent_text)
+        && memory_discourages_tools_or_orchestration(&item_text)
+    {
+        return Some(
+            "suppressed_for_current_turn: explicit user request requires tools or runtime orchestration"
+                .to_string(),
+        );
+    }
+
+    if turn_forbids_tools_or_orchestration(&intent_text)
+        && memory_requires_tools_or_orchestration(&item_text)
+    {
+        return Some(
+            "suppressed_for_current_turn: explicit user request forbids tools or runtime orchestration"
+                .to_string(),
+        );
+    }
+
+    if turn_caps_code_evidence_to_two(&intent_text)
+        && memory_requires_many_code_evidence_paths(&item_text)
+    {
+        return Some(
+            "suppressed_for_current_turn: explicit user request caps code evidence to two key points"
+                .to_string(),
+        );
+    }
+
+    if turn_demands_immediate_completion(&intent_text) && memory_pushes_work_to_later(&item_text) {
+        return Some(
+            "suppressed_for_current_turn: explicit user request forbids deferring the work"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn normalize_turn_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn turn_requests_tools_or_orchestration(intent: &str) -> bool {
+    contains_any(
+        intent,
+        &[
+            "runtime_capabilities",
+            "runtime_orchestrate",
+            "调用工具",
+            "使用工具",
+            "工具调用",
+            "真实调用",
+            "批量工具",
+            "工具批量",
+            "编排",
+            "多agent",
+            "多 agent",
+            "subagent",
+            "team",
+            "orchestration",
+            "use tools",
+            "call tools",
+        ],
+    )
+}
+
+fn memory_discourages_tools_or_orchestration(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "不要使用工具",
+            "不要调用工具",
+            "不使用工具",
+            "不用工具",
+            "避免工具",
+            "禁止工具",
+            "不要使用工具或编排",
+            "不要编排",
+            "不编排",
+            "避免编排",
+            "no tools",
+            "without tools",
+            "do not use tools",
+            "don't use tools",
+            "avoid tools",
+            "no orchestration",
+            "without orchestration",
+        ],
+    )
+}
+
+fn turn_forbids_tools_or_orchestration(intent: &str) -> bool {
+    contains_any(
+        intent,
+        &[
+            "不要使用工具",
+            "不要调用工具",
+            "不使用工具",
+            "不用工具",
+            "不要编排",
+            "不编排",
+            "纯文字回答",
+            "只回答正文",
+            "no tools",
+            "without tools",
+            "do not use tools",
+            "don't use tools",
+            "avoid tools",
+            "no orchestration",
+            "without orchestration",
+        ],
+    )
+}
+
+fn memory_requires_tools_or_orchestration(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "必须使用工具",
+            "必须调用工具",
+            "必须工具",
+            "必须编排",
+            "必须使用团队",
+            "必须多agent",
+            "必须多 agent",
+            "必须 subagent",
+            "must use tools",
+            "required tools",
+            "must orchestrate",
+            "must use team",
+            "must use subagent",
+        ],
+    )
+}
+
+fn turn_caps_code_evidence_to_two(intent: &str) -> bool {
+    let caps_to_two = contains_any(
+        intent,
+        &[
+            "最多两个",
+            "最多 2",
+            "不超过两个",
+            "不超过 2",
+            "两个以内",
+            "two key",
+            "at most two",
+            "no more than two",
+        ],
+    );
+    caps_to_two
+        && contains_any(
+            intent,
+            &[
+                "代码点",
+                "代码路径",
+                "关键代码",
+                "code point",
+                "code path",
+                "code references",
+            ],
+        )
+}
+
+fn memory_requires_many_code_evidence_paths(text: &str) -> bool {
+    let requires_many = contains_any(
+        text,
+        &[
+            "至少4",
+            "至少 4",
+            "至少四",
+            "四个",
+            "4个",
+            "4 个",
+            "at least 4",
+            "at least four",
+            "minimum 4",
+        ],
+    );
+    requires_many
+        && contains_any(
+            text,
+            &[
+                "代码",
+                "路径",
+                "引用",
+                "code",
+                "path",
+                "reference",
+                "evidence",
+            ],
+        )
+}
+
+fn turn_demands_immediate_completion(intent: &str) -> bool {
+    contains_any(
+        intent,
+        &[
+            "不要往后推",
+            "不要再往后推",
+            "不要推迟",
+            "不要延后",
+            "一次性",
+            "全部解决",
+            "全部做完",
+            "彻底完成",
+            "do not defer",
+            "finish now",
+        ],
+    )
+}
+
+fn memory_pushes_work_to_later(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "后续阶段",
+            "以后再",
+            "后续再",
+            "暂不处理",
+            "先不处理",
+            "下阶段",
+            "下一阶段",
+            "defer",
+            "later phase",
+            "future phase",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<DocumentContent> {
@@ -305,5 +578,104 @@ mod tests {
             .prompt_fragment
             .contains("<hard_gate action=\"block\">"));
         assert!(!activation.compliance_decision.allows_execution());
+    }
+
+    #[test]
+    fn runtime_memory_filter_suppresses_tool_conflict_for_current_turn() {
+        let packet = MemoryContextPacket {
+            selected: vec![
+                packet_item(
+                    "User preference: 不要使用工具或编排",
+                    MemoryLayer::L3,
+                    MemoryPacketRole::Warning,
+                ),
+                packet_item(
+                    "Architecture policy must retain evidence",
+                    MemoryLayer::L3,
+                    MemoryPacketRole::Supporting,
+                ),
+            ],
+            omitted: Vec::new(),
+            token_estimate: 256,
+            truncated: false,
+        };
+
+        let filtered =
+            filter_packet_for_turn_intent(&packet, "请先使用 runtime_capabilities 调用工具分析");
+
+        assert_eq!(filtered.selected.len(), 1);
+        assert_eq!(
+            filtered.selected[0].atom.title,
+            "Architecture policy must retain evidence"
+        );
+        assert_eq!(filtered.omitted.len(), 1);
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("explicit user request requires tools"));
+    }
+
+    #[test]
+    fn runtime_memory_filter_suppresses_required_tool_rule_when_current_turn_forbids_tools() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Workflow policy must use tools and must orchestrate",
+                MemoryLayer::L3,
+                MemoryPacketRole::Warning,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+        };
+
+        let filtered = filter_packet_for_turn_intent(&packet, "不要使用工具，纯文字回答");
+
+        assert!(filtered.selected.is_empty());
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("explicit user request forbids tools"));
+    }
+
+    #[test]
+    fn runtime_knowledge_activation_suppresses_conflicting_path_count_rule() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Review rule must cite 至少 4 个代码路径",
+                MemoryLayer::L3,
+                MemoryPacketRole::Warning,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+        };
+
+        assert!(KnowledgeActivationRuntime::new()
+            .activate_from_packet(
+                "s1",
+                "请最多两个关键代码点说明问题",
+                "DeepInvestigation",
+                &packet,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn runtime_memory_filter_suppresses_defer_rule_when_user_demands_completion() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Planning preference: 后续阶段再处理",
+                MemoryLayer::L3,
+                MemoryPacketRole::Supporting,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+        };
+
+        let filtered = filter_packet_for_turn_intent(&packet, "不要往后推，一次性全部解决");
+
+        assert!(filtered.selected.is_empty());
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("forbids deferring the work"));
     }
 }

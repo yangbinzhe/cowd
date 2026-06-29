@@ -78,6 +78,89 @@ use model_protocol::usage::TokenUsage;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_RUNTIME_MAX_ITERATIONS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamIdleClass {
+    Direct,
+    Standard,
+    Deep,
+}
+
+fn stream_idle_timeout_for_messages(messages: &[ConversationMessage]) -> Duration {
+    match classify_stream_idle_prompt(&latest_user_prompt_text(messages)) {
+        StreamIdleClass::Direct => Duration::from_secs(240),
+        StreamIdleClass::Standard => Duration::from_secs(360),
+        StreamIdleClass::Deep => Duration::from_secs(600),
+    }
+}
+
+fn classify_stream_idle_prompt(prompt: &str) -> StreamIdleClass {
+    let lower = prompt.to_lowercase();
+    let deep_markers = [
+        "deep",
+        "architecture",
+        "refactor",
+        "multi-agent",
+        "what if",
+        "scenario",
+        "simulation",
+        "matrix",
+        "memory",
+        "harness",
+        "沉浸式",
+        "深度",
+        "架构",
+        "重构",
+        "全量",
+        "全盘",
+        "复杂",
+        "多agent",
+        "多 agent",
+        "跨session",
+        "跨 session",
+        "记忆",
+        "矩阵",
+        "推演",
+        "测试",
+        "验证",
+        "真实模型",
+    ];
+    if prompt.chars().count() > 500
+        || prompt.lines().count() > 6
+        || deep_markers.iter().any(|marker| lower.contains(marker))
+    {
+        return StreamIdleClass::Deep;
+    }
+
+    let direct_markers = [
+        "what is", "explain", "status", "help", "解释", "列出", "总结", "简单", "快速",
+    ];
+    if prompt.chars().count() <= 160 && direct_markers.iter().any(|marker| lower.contains(marker)) {
+        return StreamIdleClass::Direct;
+    }
+
+    StreamIdleClass::Standard
+}
+
+fn latest_user_prompt_text(messages: &[ConversationMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, crate::session::MessageRole::User))
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,7 +577,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: usize::MAX,
+            max_iterations: DEFAULT_RUNTIME_MAX_ITERATIONS,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             cowd_bus: None,
@@ -1693,6 +1776,7 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut turn_supervisor = crate::turn_supervisor::TurnSupervisor::new();
+        let mut supervisor_final_answer_deadline: Option<usize> = None;
 
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
@@ -1771,6 +1855,7 @@ where
                         let mut req = request.clone();
                         req.model = model.to_string();
 
+                        let stream_idle_timeout = stream_idle_timeout_for_messages(&req.messages);
                         let mut stream = self.api_client.stream(req);
                         let mut model_current_text = String::new();
                         let mut model_thinking_text = String::new();
@@ -1785,19 +1870,21 @@ where
                             if self.cancellation_token.is_cancelled() {
                                 return Err(RuntimeError::new("conversation cancelled"));
                             }
-                            // T31: Enforce a 120-second timeout on each stream chunk.
-                            let next_event =
-                                match tokio::time::timeout(Duration::from_secs(120), stream.next())
-                                    .await
-                                {
-                                    Ok(Some(event)) => event,
-                                    Ok(None) => break,
-                                    Err(_) => {
-                                        return Err(RuntimeError::new(
-                                            "stream timed out after 120s",
-                                        ));
-                                    }
-                                };
+                            let next_event = match tokio::time::timeout(
+                                stream_idle_timeout,
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(event)) => event,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    return Err(RuntimeError::new(format!(
+                                        "stream idle timed out after {}s",
+                                        stream_idle_timeout.as_secs()
+                                    )));
+                                }
+                            };
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
@@ -2115,6 +2202,14 @@ where
                                 is_error,
                             );
                             if decision.should_inject() {
+                                if matches!(
+                                    decision,
+                                    crate::turn_supervisor::SupervisorDecision::FallbackAnswer { .. }
+                                ) && supervisor_final_answer_deadline.is_none()
+                                {
+                                    supervisor_final_answer_deadline =
+                                        Some(iterations.saturating_add(1));
+                                }
                                 if let Some(prompt) = decision.prompt() {
                                     effective_system_prompt.push(format!(
                                         "\n## Runtime supervisor guidance\n{prompt}"
@@ -2173,6 +2268,17 @@ where
             // final no-tool assistant message so runtime supervisor guidance,
             // tool evidence, and callback-injected context all have a chance to
             // influence the answer.
+            if supervisor_final_answer_deadline.is_some_and(|deadline| iterations >= deadline) {
+                let error = RuntimeError::new(
+                    "turn supervisor stopped repeated low-novelty tool loop after fallback guidance was ignored",
+                );
+                tracing::warn!(
+                    iterations,
+                    "turn supervisor stopped repeated low-novelty tool loop"
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             continue;
         }
 
@@ -3474,6 +3580,8 @@ where
             .await
         {
             Ok(packet) => {
+                let packet =
+                    crate::knowledge_activation::filter_packet_for_turn_intent(&packet, user_input);
                 if packet.selected.is_empty() {
                     tracing::debug!(entries = 0, "memory context packet prepared");
                     if let Some(cb) = &self.memory_callback {
@@ -4873,8 +4981,9 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        preview_chars, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
-        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+        preview_chars, stream_idle_timeout_for_messages, ApiClient, ApiRequest, AssistantEvent,
+        CognitiveContextManager, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, DEFAULT_RUNTIME_MAX_ITERATIONS,
     };
     use crate::agent_collaboration::{
         AgentTaskTrace, AgentTeam, CollaborationContextResult, CollaborationOps,
@@ -4914,6 +5023,27 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn stream_idle_timeout_policy_expands_for_complex_tasks() {
+        let direct = vec![ConversationMessage::user_text(
+            "解释一下这个函数有什么用".to_string(),
+        )];
+        let standard = vec![ConversationMessage::user_text(
+            "分析当前实现并给出修订建议".to_string(),
+        )];
+        let deep = vec![ConversationMessage::user_text(
+            "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告".to_string(),
+        )];
+
+        let direct_timeout = stream_idle_timeout_for_messages(&direct);
+        let standard_timeout = stream_idle_timeout_for_messages(&standard);
+        let deep_timeout = stream_idle_timeout_for_messages(&deep);
+
+        assert!(direct_timeout < standard_timeout);
+        assert!(standard_timeout < deep_timeout);
+        assert_eq!(deep_timeout, Duration::from_secs(600));
     }
 
     fn test_skill_profile(
@@ -5192,6 +5322,7 @@ mod tests {
         .without_memory();
 
         let original = runtime.max_iterations();
+        assert_eq!(original, DEFAULT_RUNTIME_MAX_ITERATIONS);
         runtime.set_max_iterations(8);
         assert_eq!(runtime.max_iterations(), 8);
         runtime.set_max_iterations(original);
@@ -6981,6 +7112,97 @@ mod tests {
         assert!(prompt.len() >= 1);
         // Without memory manager, should still return system prompt
         assert!(prompt[0] == "system" || prompt[0].starts_with("system"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_reality_context_suppresses_memory_conflicting_with_current_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("memory.db");
+        let blob_dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+
+        let mem_cfg = memory::config::MemoryConfig {
+            store: memory::config::StoreConfig {
+                sqlite_path: db_path,
+                blob_dir,
+                enable_vector_index: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
+        let now = chrono::Utc::now();
+        mgr.remember(memory::types::MemoryEntry {
+            id: memory::types::MemoryId::new_v4(),
+            layer: memory::types::MemoryLayer::L1,
+            category: memory::types::MemoryCategory::UserPreference,
+            priority: memory::types::Priority::High,
+            source: memory::types::MemorySource::UserExplicit,
+            title: "User preference: 不要使用工具或编排".to_string(),
+            content: "用户历史偏好：不要使用工具或编排。".to_string(),
+            embedding: None,
+            tags: vec!["preference".to_string()],
+            relations: Vec::new(),
+            confidence: 0.95,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope: memory::MemoryScope::Project("cowd-develop".to_string()),
+            session_id: None,
+            source_agent: None,
+            visibility: memory::types::AgentVisibility::Shared,
+        })
+        .await
+        .unwrap();
+        let loaded_l1 = mgr
+            .list_layer_full_entries(memory::types::MemoryLayer::L1)
+            .await
+            .unwrap();
+        assert!(loaded_l1
+            .iter()
+            .any(|entry| entry.title == "User preference: 不要使用工具或编排"));
+        let prepared = mgr
+            .prepare_context("请先使用 runtime_capabilities 调用工具分析", &[], None)
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .entries
+                .iter()
+                .any(|entry| entry.title == "User preference: 不要使用工具或编排"),
+            "prepared entries: {:?}",
+            prepared
+                .entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let rt = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_memory_manager(mgr);
+
+        let prompt = rt
+            .prepare_reality_context("请先使用 runtime_capabilities 调用工具分析")
+            .await
+            .join("\n");
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert!(envelope
+            .omitted
+            .iter()
+            .any(|omission| omission.reason.contains("suppressed_for_current_turn")));
+        assert!(!prompt.contains("<title>User preference: 不要使用工具或编排</title>"));
+        assert!(!prompt.contains("<knowledge_compliance>"));
     }
 
     #[test]

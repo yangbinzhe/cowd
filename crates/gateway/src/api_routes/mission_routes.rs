@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 
+use crate::runtime_service::RuntimeTurnOptions;
 use crate::services::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
@@ -20,7 +21,7 @@ use memory::SessionRecord;
 
 use super::{api_error, AppState, ErrorResponse};
 
-const MISSION_COMMAND_TURN_TIMEOUT: Duration = Duration::from_secs(300);
+const MISSION_COMMAND_WALL_CLOCK: Duration = Duration::from_secs(900);
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -644,7 +645,16 @@ async fn consume_mission_session_command_as_turn(
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     let prompt = running.command.clone();
     match runtime_service
-        .run_turn_with_timeout(&session_id, None, prompt, MISSION_COMMAND_TURN_TIMEOUT)
+        .run_turn_with_options(
+            &session_id,
+            None,
+            prompt,
+            MISSION_COMMAND_WALL_CLOCK,
+            RuntimeTurnOptions {
+                profile: runtime::ContextProfile::DeepInvestigation,
+                max_iterations: Some(64),
+            },
+        )
         .await
     {
         Ok(execution) => {

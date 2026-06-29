@@ -10,10 +10,10 @@ use tokio::sync::Mutex;
 use crate::api_routes::AppState;
 use crate::runtime_service::RuntimeTurnOptions;
 
-const SURFACE_QUICK_TURN_TIMEOUT: Duration = Duration::from_secs(90);
-const SURFACE_DEEP_TURN_TIMEOUT: Duration = Duration::from_secs(240);
-const SURFACE_QUICK_MAX_ITERATIONS: usize = 8;
-const SURFACE_DEEP_MAX_ITERATIONS: usize = 32;
+const SURFACE_QUICK_WALL_CLOCK: Duration = Duration::from_secs(240);
+const SURFACE_DEEP_WALL_CLOCK: Duration = Duration::from_secs(900);
+const SURFACE_QUICK_MAX_ITERATIONS: usize = 12;
+const SURFACE_DEEP_MAX_ITERATIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct SurfaceTurnPolicy {
@@ -397,12 +397,12 @@ fn surface_turn_policy(content: &str) -> SurfaceTurnPolicy {
     match profile {
         runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy {
             profile,
-            timeout: SURFACE_DEEP_TURN_TIMEOUT,
+            timeout: SURFACE_DEEP_WALL_CLOCK,
             max_iterations: SURFACE_DEEP_MAX_ITERATIONS,
         },
         _ => SurfaceTurnPolicy {
             profile,
-            timeout: SURFACE_QUICK_TURN_TIMEOUT,
+            timeout: SURFACE_QUICK_WALL_CLOCK,
             max_iterations: SURFACE_QUICK_MAX_ITERATIONS,
         },
     }
@@ -757,7 +757,7 @@ mod tests {
 
         assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
         assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_DEEP_TURN_TIMEOUT);
+        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]
@@ -766,7 +766,7 @@ mod tests {
 
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
         assert_eq!(policy.max_iterations, SURFACE_QUICK_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_QUICK_TURN_TIMEOUT);
+        assert_eq!(policy.timeout, SURFACE_QUICK_WALL_CLOCK);
     }
 
     #[test]

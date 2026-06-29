@@ -110,9 +110,30 @@ impl ActiveTurnControl {
 }
 
 static ACTIVE_TURN_CONTROLS: OnceLock<Mutex<HashMap<String, ActiveTurnControl>>> = OnceLock::new();
+static ACTIVE_TURN_PARTIALS: OnceLock<Mutex<HashMap<String, ActiveTurnPartial>>> = OnceLock::new();
+const ACTIVE_TURN_PARTIAL_MAX_CHARS: usize = 160_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveTurnPartial {
+    pub(crate) run_id: String,
+    pub(crate) text: String,
+    pub(crate) updated_at_ms: u64,
+    truncated: bool,
+}
 
 fn active_turn_controls() -> &'static Mutex<HashMap<String, ActiveTurnControl>> {
     ACTIVE_TURN_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_turn_partials() -> &'static Mutex<HashMap<String, ActiveTurnPartial>> {
+    ACTIVE_TURN_PARTIALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_turn_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn register_active_turn_control(
@@ -130,6 +151,75 @@ pub(crate) fn register_active_turn_control(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(session_id, control);
+}
+
+pub(crate) fn register_active_turn_partial(session_id: String, run_id: String) {
+    active_turn_partials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            session_id,
+            ActiveTurnPartial {
+                run_id,
+                text: String::new(),
+                updated_at_ms: active_turn_now_ms(),
+                truncated: false,
+            },
+        );
+}
+
+pub(crate) fn record_active_turn_text_delta(session_id: &str, run_id: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut partials = active_turn_partials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(partial) = partials
+        .get_mut(session_id)
+        .filter(|partial| partial.run_id == run_id)
+    else {
+        return;
+    };
+
+    let current_chars = partial.text.chars().count();
+    if current_chars < ACTIVE_TURN_PARTIAL_MAX_CHARS {
+        let remaining = ACTIVE_TURN_PARTIAL_MAX_CHARS.saturating_sub(current_chars);
+        partial.text.extend(text.chars().take(remaining));
+        if text.chars().count() > remaining && !partial.truncated {
+            partial
+                .text
+                .push_str("\n\n[partial output truncated by gateway buffer]");
+            partial.truncated = true;
+        }
+    } else if !partial.truncated {
+        partial
+            .text
+            .push_str("\n\n[partial output truncated by gateway buffer]");
+        partial.truncated = true;
+    }
+    partial.updated_at_ms = active_turn_now_ms();
+}
+
+pub(crate) fn take_active_turn_partial(
+    session_id: &str,
+    run_id: &str,
+) -> Option<ActiveTurnPartial> {
+    let mut partials = active_turn_partials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if partials
+        .get(session_id)
+        .is_some_and(|partial| partial.run_id == run_id)
+    {
+        partials.remove(session_id)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn discard_active_turn_partial(session_id: &str, run_id: &str) {
+    let _ = take_active_turn_partial(session_id, run_id);
 }
 
 pub(crate) fn clear_active_turn_control(session_id: &str, run_id: &str) {
@@ -5499,6 +5589,22 @@ mod tests {
 
         clear_active_turn_control(&session_id, &run_id);
         assert_eq!(abort_active_turn(&session_id), None);
+    }
+
+    #[test]
+    fn active_turn_partial_buffer_is_run_scoped_and_take_clears_it() {
+        let session_id = format!("partial-active-{}", uuid::Uuid::new_v4());
+        let run_id = "run-partial".to_string();
+
+        register_active_turn_partial(session_id.clone(), run_id.clone());
+        record_active_turn_text_delta(&session_id, "other-run", "ignored");
+        record_active_turn_text_delta(&session_id, &run_id, "hello ");
+        record_active_turn_text_delta(&session_id, &run_id, "world");
+
+        let partial = take_active_turn_partial(&session_id, &run_id).unwrap();
+        assert_eq!(partial.run_id, run_id);
+        assert_eq!(partial.text, "hello world");
+        assert!(take_active_turn_partial(&session_id, "run-partial").is_none());
     }
 
     #[tokio::test]

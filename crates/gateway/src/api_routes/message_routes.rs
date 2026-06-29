@@ -23,11 +23,17 @@ use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
-use crate::runtime_service::{RuntimeService, RuntimeTurnExecution, RuntimeTurnExecutionError};
+use crate::runtime_service::{
+    RuntimeService, RuntimeTurnExecution, RuntimeTurnExecutionError, RuntimeTurnOptions,
+};
 use crate::services::SessionService;
 use crate::task_kernel::TaskRecord;
 
-use super::{clear_active_turn_control, register_active_turn_control, AppState, ErrorResponse};
+use super::{
+    clear_active_turn_control, discard_active_turn_partial, record_active_turn_text_delta,
+    register_active_turn_control, register_active_turn_partial, take_active_turn_partial, AppState,
+    ErrorResponse,
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -58,6 +64,88 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnTimeoutClass {
+    Direct,
+    Standard,
+    Deep,
+}
+
+fn classify_turn_timeout_prompt(prompt: &str, profile: ContextProfile) -> TurnTimeoutClass {
+    if matches!(profile, ContextProfile::YoloGoal) {
+        return TurnTimeoutClass::Deep;
+    }
+
+    let lower = prompt.to_lowercase();
+    let deep_markers = [
+        "deep",
+        "architecture",
+        "refactor",
+        "multi-agent",
+        "what if",
+        "scenario",
+        "simulation",
+        "matrix",
+        "memory",
+        "harness",
+        "沉浸式",
+        "深度",
+        "架构",
+        "重构",
+        "全量",
+        "全盘",
+        "复杂",
+        "多agent",
+        "多 agent",
+        "跨session",
+        "跨 session",
+        "记忆",
+        "矩阵",
+        "推演",
+        "测试",
+        "验证",
+    ];
+    if prompt.chars().count() > 500
+        || prompt.lines().count() > 6
+        || deep_markers.iter().any(|marker| lower.contains(marker))
+    {
+        return TurnTimeoutClass::Deep;
+    }
+
+    let direct_markers = [
+        "what is",
+        "怎么写",
+        "解释",
+        "列出",
+        "总结",
+        "简单",
+        "快速",
+        "status",
+        "help",
+    ];
+    if prompt.chars().count() <= 160 && direct_markers.iter().any(|marker| lower.contains(marker)) {
+        return TurnTimeoutClass::Direct;
+    }
+
+    TurnTimeoutClass::Standard
+}
+
+fn turn_timeout_for_prompt(prompt: &str, profile: ContextProfile) -> Duration {
+    match classify_turn_timeout_prompt(prompt, profile) {
+        TurnTimeoutClass::Direct => Duration::from_secs(240),
+        TurnTimeoutClass::Standard => Duration::from_secs(480),
+        TurnTimeoutClass::Deep => Duration::from_secs(900),
+    }
+}
+
+fn turn_max_iterations_for_prompt(prompt: &str, profile: ContextProfile) -> usize {
+    match classify_turn_timeout_prompt(prompt, profile) {
+        TurnTimeoutClass::Direct => 12,
+        TurnTimeoutClass::Standard => 32,
+        TurnTimeoutClass::Deep => 64,
+    }
 }
 
 async fn append_session_timeline_event(
@@ -300,6 +388,7 @@ impl<'a> RuntimeTurnSink<'a> {
             ),
         )
         .await;
+        discard_active_turn_partial(session_id, run_id);
 
         serde_json::json!({
             "session_id": session_id,
@@ -336,15 +425,41 @@ impl<'a> RuntimeTurnSink<'a> {
             .last_context_envelope(session_id)
             .await
             .map(|envelope| envelope.id);
+        let partial = take_active_turn_partial(session_id, run_id)
+            .filter(|partial| !partial.text.trim().is_empty());
 
         let sse_data = serde_json::json!({
             "type": "TurnError",
             "session_id": session_id,
+            "run_id": run_id,
             "error": error_msg,
         });
         self.event_bus
             .broadcast(session_id, &sse_data.to_string())
             .await;
+        if let Some(partial) = partial {
+            let partial_text = partial.text;
+            let partial_char_count = partial_text.chars().count();
+            let partial_json = serde_json::json!({
+                "type": "PartialAnswer",
+                "session_id": session_id,
+                "run_id": run_id,
+                "reason": error_msg,
+                "content": partial_text,
+                "char_count": partial_char_count,
+                "updated_at_ms": partial.updated_at_ms,
+            });
+            self.event_bus
+                .broadcast(session_id, &partial_json.to_string())
+                .await;
+            append_session_timeline_event(
+                &self.state.services.session,
+                session_id,
+                "PartialAnswer",
+                partial_json,
+            )
+            .await;
+        }
         append_session_timeline_event(
             &self.state.services.session,
             session_id,
@@ -431,12 +546,13 @@ async fn send_message(
             while let Ok(event) = rx.recv().await {
                 match event {
                     runtime::CowdEvent::TextDelta { text } => {
+                        record_active_turn_text_delta(&sid, &active_run_id, &text);
                         eb.text_delta(&sid, &text).await;
                         append_session_timeline_event(
                             &session_service,
                             &sid,
                             "TextDelta",
-                            serde_json::json!({"type":"TextDelta","content":text}),
+                            serde_json::json!({"type":"TextDelta","run_id":active_run_id.clone(),"content":text}),
                         )
                         .await;
                     }
@@ -446,7 +562,7 @@ async fn send_message(
                             &session_service,
                             &sid,
                             "ThinkingDelta",
-                            serde_json::json!({"type":"ThinkingDelta","content":thinking}),
+                            serde_json::json!({"type":"ThinkingDelta","run_id":active_run_id.clone(),"content":thinking}),
                         )
                         .await;
                     }
@@ -456,7 +572,7 @@ async fn send_message(
                             &session_service,
                             &sid,
                             "ToolStart",
-                            serde_json::json!({"type":"ToolStart","id":id,"name":name,"preview":preview}),
+                            serde_json::json!({"type":"ToolStart","run_id":active_run_id.clone(),"id":id,"name":name,"preview":preview}),
                         )
                         .await;
                     }
@@ -466,7 +582,7 @@ async fn send_message(
                             &session_service,
                             &sid,
                             "ToolProgress",
-                            serde_json::json!({"type":"ToolProgress","id":id,"name":name,"progress":progress}),
+                            serde_json::json!({"type":"ToolProgress","run_id":active_run_id.clone(),"id":id,"name":name,"progress":progress}),
                         )
                         .await;
                     }
@@ -482,7 +598,7 @@ async fn send_message(
                             &session_service,
                             &sid,
                             "ToolComplete",
-                            serde_json::json!({"type":"ToolComplete","id":id,"name":name,"summary":summary,"exit_code":exit_code}),
+                            serde_json::json!({"type":"ToolComplete","run_id":active_run_id.clone(),"id":id,"name":name,"summary":summary,"exit_code":exit_code}),
                         )
                         .await;
                     }
@@ -490,19 +606,19 @@ async fn send_message(
                         assistant_text,
                         iterations,
                     } => {
-                        let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
+                        let json = serde_json::json!({"type":"TurnComplete","run_id":active_run_id.clone(),"text":assistant_text,"iterations":iterations});
                         eb.broadcast(&sid, &json.to_string()).await;
                         append_session_timeline_event(&session_service, &sid, "TurnComplete", json)
                             .await;
                     }
                     runtime::CowdEvent::TurnStarted => {
-                        let json = serde_json::json!({"type":"TurnStarted"});
+                        let json = serde_json::json!({"type":"TurnStarted","run_id":active_run_id.clone()});
                         eb.broadcast(&sid, &json.to_string()).await;
                         append_session_timeline_event(&session_service, &sid, "TurnStarted", json)
                             .await;
                     }
                     runtime::CowdEvent::TurnError { error } => {
-                        let json = serde_json::json!({"type":"TurnError","error":error});
+                        let json = serde_json::json!({"type":"TurnError","run_id":active_run_id.clone(),"error":error});
                         eb.broadcast(&sid, &json.to_string()).await;
                         append_session_timeline_event(&session_service, &sid, "TurnError", json)
                             .await;
@@ -550,9 +666,9 @@ async fn send_message(
             )
         })?;
 
-    const TURN_TIMEOUT: Duration = Duration::from_secs(300);
-
     let content = body.content;
+    let turn_timeout = turn_timeout_for_prompt(&content, run_profile);
+    let turn_max_iterations = turn_max_iterations_for_prompt(&content, run_profile);
     let cancellation_token = runtime::CancellationToken::new();
     let hook_abort_signal = runtime::HookAbortSignal::new();
     runtime_service
@@ -576,6 +692,7 @@ async fn send_message(
         cancellation_token,
         hook_abort_signal,
     );
+    register_active_turn_partial(session_id.clone(), run_id.clone());
     let (completion_tx, completion_rx) = oneshot::channel();
     let worker_state = state.clone();
     let worker_runtime_service = runtime_service.clone();
@@ -584,7 +701,16 @@ async fn send_message(
     let worker_run_id = run_id.clone();
     tokio::spawn(async move {
         let turn_result = worker_runtime_service
-            .run_turn_with_timeout(&worker_session_id, active_task_id, content, TURN_TIMEOUT)
+            .run_turn_with_options(
+                &worker_session_id,
+                active_task_id,
+                content,
+                turn_timeout,
+                RuntimeTurnOptions {
+                    profile: run_profile,
+                    max_iterations: Some(turn_max_iterations),
+                },
+            )
             .await;
         clear_active_turn_control(&worker_session_id, &worker_run_id);
         let turn_sink = RuntimeTurnSink {
@@ -811,4 +937,43 @@ async fn sse_stream_handler(
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_timeout_policy_expands_for_deep_tasks() {
+        let direct = turn_timeout_for_prompt("解释一下这个函数", ContextProfile::MainTurn);
+        let standard =
+            turn_timeout_for_prompt("帮我分析当前实现并给出建议", ContextProfile::MainTurn);
+        let deep = turn_timeout_for_prompt(
+            "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
+            ContextProfile::MainTurn,
+        );
+
+        assert!(direct < standard);
+        assert!(standard < deep);
+        assert_eq!(deep, Duration::from_secs(900));
+        assert_eq!(
+            turn_max_iterations_for_prompt("解释一下这个函数", ContextProfile::MainTurn),
+            12
+        );
+        assert_eq!(
+            turn_max_iterations_for_prompt(
+                "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
+                ContextProfile::MainTurn,
+            ),
+            64
+        );
+    }
+
+    #[test]
+    fn yolo_profile_uses_deep_turn_timeout() {
+        assert_eq!(
+            turn_timeout_for_prompt("继续执行", ContextProfile::YoloGoal),
+            Duration::from_secs(900)
+        );
+    }
 }
