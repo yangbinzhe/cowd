@@ -567,7 +567,10 @@ pub use turn_supervisor::{
     fingerprint_tool_call, SupervisorDecision, ToolCallFingerprint, ToolProgressObservation,
     TurnSupervisor,
 };
-pub use usage::{pricing_for_model, UsageTracker};
+pub use usage::{
+    pricing_for_model, ModelPerformanceRegistry, ModelPerformanceStats, ModelRouteCandidate,
+    ModelRouteDecision, ModelRouteIntent, UsageTracker,
+};
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,

@@ -72,7 +72,7 @@ use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::tool_ledger::{tool_event_idempotency_key, TurnToolLedger};
-use crate::usage::UsageTracker;
+use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 use model_protocol::usage::TokenUsage;
 
@@ -398,6 +398,7 @@ pub struct ConversationRuntime<C, T> {
     system_prompt: Vec<String>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
+    model_performance_registry: std::sync::Mutex<ModelPerformanceRegistry>,
     hook_runner: HookRunner,
     cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
@@ -595,6 +596,7 @@ where
             system_prompt,
             max_iterations: DEFAULT_RUNTIME_MAX_ITERATIONS,
             usage_tracker,
+            model_performance_registry: std::sync::Mutex::new(ModelPerformanceRegistry::new()),
             hook_runner: HookRunner::from_feature_config(feature_config),
             cowd_bus: None,
             turn_callback: None,
@@ -1856,12 +1858,7 @@ where
                 model: String::new(), // filled by fallback loop below
             };
 
-            let mut model_list: Vec<String> =
-                std::iter::once(self.model.as_deref().unwrap_or("").to_string())
-                    .chain(self.fallbacks.clone())
-                    .collect();
-            // dedup in case primary also appears in fallbacks
-            model_list.dedup();
+            let model_list = self.model_candidates_for_turn(&user_input);
 
             // Use the new Stream-based API — consume events as they arrive
             use futures::StreamExt;
@@ -2666,6 +2663,9 @@ where
             usage,
             auto_compaction,
         );
+        if let Ok(mut registry) = self.model_performance_registry.lock() {
+            registry.record_telemetry(&model_telemetry, None, false);
+        }
         self.remember_context_turn_report(context_turn_report.clone());
         let summary = TurnSummary {
             assistant_messages,
@@ -3405,6 +3405,47 @@ where
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
         estimate_session_tokens(&*self.session.blocking_read())
+    }
+
+    fn model_candidates_for_turn(&self, user_input: &str) -> Vec<String> {
+        let mut configured_models: Vec<String> =
+            std::iter::once(self.model.as_deref().unwrap_or("").to_string())
+                .chain(self.fallbacks.clone())
+                .collect();
+        if configured_models
+            .iter()
+            .any(|model| !model.trim().is_empty())
+        {
+            configured_models.retain(|model| !model.trim().is_empty());
+        }
+        configured_models.dedup();
+
+        let Ok(registry) = self.model_performance_registry.lock() else {
+            return configured_models;
+        };
+        let decision = registry.route(ModelRouteIntent::from_task(user_input), &configured_models);
+        let mut routed = Vec::with_capacity(configured_models.len());
+        if configured_models
+            .iter()
+            .any(|model| model == &decision.selected_model)
+        {
+            routed.push(decision.selected_model);
+        }
+        for candidate in decision.candidates {
+            if configured_models
+                .iter()
+                .any(|model| model == &candidate.model)
+                && !routed.iter().any(|model| model == &candidate.model)
+            {
+                routed.push(candidate.model);
+            }
+        }
+        for model in configured_models {
+            if !routed.iter().any(|known| known == &model) {
+                routed.push(model);
+            }
+        }
+        routed
     }
 
     #[must_use]
@@ -5467,6 +5508,77 @@ mod tests {
         assert_eq!(runtime.max_iterations(), 8);
         runtime.set_max_iterations(original);
         assert_eq!(runtime.max_iterations(), original);
+    }
+
+    #[test]
+    fn model_router_reorders_actual_turn_candidate_chain() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime.model = Some("balanced-model".to_string());
+        runtime.fallbacks = vec!["stepfun-fast".to_string(), "deepseek-depth".to_string()];
+
+        {
+            let mut registry = runtime
+                .model_performance_registry
+                .lock()
+                .expect("registry lock");
+            registry.record_telemetry(
+                &crate::cowd_event::RunModelTelemetry {
+                    model: Some("stepfun-fast".to_string()),
+                    models_used: vec!["stepfun-fast".to_string()],
+                    first_token_latency_ms: Some(160),
+                    active_stream_duration_ms: Some(1_000),
+                    wall_duration_ms: 1_200,
+                    output_chars: 1_000,
+                    output_chunks: 10,
+                    input_tokens: 400,
+                    output_tokens: 180,
+                    cache_create_tokens: 0,
+                    cache_read_tokens: 0,
+                    total_tokens: 580,
+                    usage_source: "provider".to_string(),
+                    chars_per_second: Some(1_000.0),
+                    tokens_per_second: Some(180.0),
+                },
+                Some(0.72),
+                false,
+            );
+            registry.record_telemetry(
+                &crate::cowd_event::RunModelTelemetry {
+                    model: Some("deepseek-depth".to_string()),
+                    models_used: vec!["deepseek-depth".to_string()],
+                    first_token_latency_ms: Some(950),
+                    active_stream_duration_ms: Some(4_000),
+                    wall_duration_ms: 5_000,
+                    output_chars: 4_000,
+                    output_chunks: 20,
+                    input_tokens: 900,
+                    output_tokens: 360,
+                    cache_create_tokens: 0,
+                    cache_read_tokens: 0,
+                    total_tokens: 1_260,
+                    usage_source: "provider".to_string(),
+                    chars_per_second: Some(1_000.0),
+                    tokens_per_second: Some(90.0),
+                },
+                Some(0.96),
+                false,
+            );
+        }
+
+        let quick = runtime.model_candidates_for_turn("快速回答这个简单问题");
+        let deep = runtime.model_candidates_for_turn("深度审计复杂架构方案");
+
+        assert_eq!(quick.first().map(String::as_str), Some("stepfun-fast"));
+        assert_eq!(deep.first().map(String::as_str), Some("deepseek-depth"));
+        assert!(quick.contains(&"balanced-model".to_string()));
+        assert!(deep.contains(&"balanced-model".to_string()));
     }
 
     #[test]

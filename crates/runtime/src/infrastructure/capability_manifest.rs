@@ -194,6 +194,7 @@ pub fn runtime_capabilities_response_with_detail(
             "recommendation": execution_decision.recommended_actions
         },
         "action_plane": action_plane,
+        "model_router": runtime_model_router_capability(),
         "budget_controls": runtime_budget_controls(profile),
         "strategy": {
             "prefer_batch_readonly": true,
@@ -302,6 +303,7 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
             "execution_modes": execution_mode_catalog_response(),
             "collaboration_templates": templates,
         }),
+        "model_router" => runtime_model_router_capability(),
         "budget_controls" => runtime_budget_controls(None),
         "policy_gates" => json!({
             "risk": ["risk_gate", "human_confirm"],
@@ -309,11 +311,35 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
             "writes": "write/destructive actions require permission and scheduler gating"
         }),
         _ => json!({
-            "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/budget_controls/policy_gates for concrete runtime affordances.",
+            "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/model_router/budget_controls/policy_gates for concrete runtime affordances.",
             "execution_modes": execution_mode_catalog_response()["execution_modes"],
             "collaboration_template_count": templates.len(),
         }),
     }
+}
+
+fn runtime_model_router_capability() -> Value {
+    json!({
+        "owner": "runtime.provider_usage",
+        "registry": "ModelPerformanceRegistry",
+        "decision": "ModelRouteDecision",
+        "intents": ["quick", "standard", "deep", "recovery"],
+        "signals": [
+            "first_token_latency_ms",
+            "tokens_per_second",
+            "usage_source",
+            "quality_score",
+            "failure_rate"
+        ],
+        "policies": {
+            "quick": "favor high throughput and low first-token latency for simple or interactive turns",
+            "standard": "balance speed, quality, and reliability for normal turns",
+            "deep": "favor quality and reliability for architecture, refactor, audit, and complex synthesis",
+            "recovery": "favor reliable models after stalled, failed, or repetitive execution"
+        },
+        "telemetry_source": "RunModelTelemetry",
+        "fallback_behavior": "cold-start configured models remain routable even before telemetry samples exist"
+    })
 }
 
 fn runtime_budget_controls(profile: Option<&str>) -> Value {
@@ -441,6 +467,13 @@ mod tests {
         assert!(response["action_plane"]["recipes"].is_array());
         assert!(response["execution_decision"]["recommended_mode"].is_string());
         assert!(response["budget_controls"]["turn"]["max_iterations"].is_object());
+        assert_eq!(
+            response["model_router"]["registry"],
+            "ModelPerformanceRegistry"
+        );
+        assert!(response["model_router"]["signals"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "tokens_per_second")));
         assert!(
             response["strategy"]["current_turn_overrides_conflicting_memory"]
                 .as_bool()
@@ -480,5 +513,19 @@ mod tests {
                 .as_bool()
                 .unwrap_or(false)
         );
+
+        let router = runtime_capabilities_response_with_detail(
+            "复杂任务需要选择合适模型",
+            None,
+            None,
+            Some("model_router"),
+        );
+        assert_eq!(
+            router["backend_capabilities"]["owner"],
+            "runtime.provider_usage"
+        );
+        assert!(router["backend_capabilities"]["intents"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "deep")));
     }
 }
