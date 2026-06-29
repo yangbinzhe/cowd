@@ -39,6 +39,11 @@ impl EvidenceId {
     }
 
     #[must_use]
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -128,6 +133,12 @@ pub struct FactRecord {
     pub id: FactId,
     pub fact_type: String,
     pub statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_key: Option<String>,
+    #[serde(default = "default_fact_status")]
+    pub status: String,
+    #[serde(default)]
+    pub relations: Vec<String>,
     pub confidence: Confidence,
     pub provenance: Vec<Provenance>,
     pub evidence: Vec<EvidenceId>,
@@ -143,6 +154,9 @@ impl FactRecord {
             id: FactId::new(),
             fact_type: fact_type.into(),
             statement: statement.into(),
+            scope_key: None,
+            status: "active".to_string(),
+            relations: Vec::new(),
             confidence: Confidence::default(),
             provenance: Vec::new(),
             evidence: Vec::new(),
@@ -150,4 +164,8 @@ impl FactRecord {
             updated_at: now,
         }
     }
+}
+
+fn default_fact_status() -> String {
+    "active".to_string()
 }

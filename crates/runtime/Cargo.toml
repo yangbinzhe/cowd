@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
+fact-kernel = { path = "../fact-kernel" }
 model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
 storage = { path = "../storage" }

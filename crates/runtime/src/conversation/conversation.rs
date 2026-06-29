@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fact_kernel::FactExtractionTokenUsage;
 use tokio::sync::{RwLock, Semaphore};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
@@ -64,6 +65,9 @@ use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
     ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
+};
+use crate::fact_extraction::{
+    FactExtractionRuntimeEvent, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
@@ -3707,7 +3711,24 @@ where
             None
         };
 
+        let fact_extraction_decision = RuntimeFactExtractionScheduler::default()
+            .decide(RuntimeFactExtractionTrigger::SessionCompaction);
+
         let mut receipt = checkpoint.as_ref().map(|checkpoint| {
+            let fact_extraction_event = FactExtractionRuntimeEvent::from_decision(
+                &fact_extraction_decision,
+                "memory-session-checkpoint:v1",
+                checkpoint.facts.len(),
+                checkpoint.source_range.raw_refs.len(),
+                FactExtractionTokenUsage {
+                    input_tokens: checkpoint.token_stats.before,
+                    output_tokens: checkpoint.token_stats.after,
+                    total_tokens: checkpoint
+                        .token_stats
+                        .before
+                        .saturating_add(checkpoint.token_stats.after),
+                },
+            );
             let mut receipt = CompactionReceipt::new(
                 "runtime_auto_compaction",
                 checkpoint.token_stats.before,
@@ -3716,10 +3737,21 @@ where
             .with_evidence_ref(EvidenceRef(
                 KernelRef::new("checkpoint", checkpoint.checkpoint_id.clone())
                     .with_label("semantic_compaction_checkpoint"),
+            ))
+            .with_evidence_ref(EvidenceRef(
+                KernelRef::new(
+                    "fact-extraction",
+                    fact_extraction_decision.mode.as_str().to_string(),
+                )
+                .with_label(fact_extraction_event.evidence_label()),
             ));
             receipt
                 .retained_artifact_ids
                 .push(format!("checkpoint:{}", checkpoint.checkpoint_id));
+            receipt.retained_artifact_ids.push(format!(
+                "fact-extraction:{}",
+                fact_extraction_decision.mode.as_str()
+            ));
             for evidence in &checkpoint.source_range.raw_refs {
                 receipt.evidence_refs.push(evidence.clone());
                 receipt
@@ -3735,10 +3767,30 @@ where
             let ctx = self.memory_turn_context("primary");
             let kernel = MemoryKernel::new(Arc::clone(mgr));
             match kernel.checkpoint_compaction(&ctx, checkpoint).await {
-                Ok(memory_ids) => {
-                    receipt_mut
-                        .retained_artifact_ids
-                        .extend(memory_ids.iter().map(|id| format!("memory:{id}")));
+                Ok(memory_receipt) => {
+                    receipt_mut.retained_artifact_ids.extend(
+                        memory_receipt
+                            .memory_ids
+                            .iter()
+                            .map(|id| format!("memory:{id}")),
+                    );
+                    receipt_mut.retained_artifact_ids.push(format!(
+                        "fact-review:{}",
+                        memory_receipt.fact_review.batch_id.as_str()
+                    ));
+                    receipt_mut.evidence_refs.push(EvidenceRef(
+                        KernelRef::new(
+                            "fact-review",
+                            memory_receipt.fact_review.batch_id.as_str().to_string(),
+                        )
+                        .with_label(format!(
+                            "promoted={} held={} rejected={} conflicts={}",
+                            memory_receipt.fact_review.promoted.len(),
+                            memory_receipt.fact_review.held.len(),
+                            memory_receipt.fact_review.rejected.len(),
+                            memory_receipt.fact_review.conflicts.len()
+                        )),
+                    ));
                 }
                 Err(error) => {
                     tracing::warn!(%error, "semantic compaction checkpoint persist degraded");

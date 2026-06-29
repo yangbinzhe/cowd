@@ -164,6 +164,7 @@ impl MemoryEntry {
             self.content.clone(),
         );
         record.id = FactId::from_string(format!("memory:{}", self.id));
+        record.scope_key = Some(memory_scope_fact_key(&self.scope));
         record.confidence = self.fact_confidence();
         record.provenance = vec![Provenance {
             source: self.fact_source(),
@@ -196,6 +197,16 @@ fn memory_category_fact_type(category: MemoryCategory) -> &'static str {
         MemoryCategory::Shared => "memory.shared",
         MemoryCategory::CompressedSummary => "memory.compressed_summary",
         MemoryCategory::ProjectKnowledge => "memory.project_knowledge",
+    }
+}
+
+fn memory_scope_fact_key(scope: &MemoryScope) -> String {
+    match scope {
+        MemoryScope::Global => "global".to_string(),
+        MemoryScope::Project(id) => format!("project:{id}"),
+        MemoryScope::Session(id) => format!("session:{id}"),
+        MemoryScope::Task(id) => format!("task:{id}"),
+        MemoryScope::Agent(id) => format!("agent:{id}"),
     }
 }
 

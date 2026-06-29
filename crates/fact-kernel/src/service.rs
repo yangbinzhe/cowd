@@ -4,12 +4,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{decide_candidate_promotion, BridgeDecision};
-use crate::core::{EvidencePacket, FactRecord, Provenance};
+use crate::candidate::{FactCandidate, FactCandidateRelation, FactCandidateRelationKind};
+use crate::core::{EvidencePacket, FactId, FactRecord, Provenance};
+use crate::extraction::FactExtractionBatch;
 use crate::growth::{GrowthCandidate, PromotionDecision};
 use crate::health::{FactHealthIssue, FactHealthIssueKind};
 use crate::hypothesis::FactReality;
 use crate::indexer::{FactIndex, FactSearchHit};
 use crate::memory::RecallQuery;
+use crate::review::{FactConflict, FactReviewDecision, FactReviewReceipt};
 use crate::store::{FactStore, InMemoryFactStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +92,20 @@ where
         }
     }
 
+    pub fn review_candidates(&mut self, batch: FactExtractionBatch) -> FactReviewReceipt {
+        let mut receipt = FactReviewReceipt::empty(batch.batch_id);
+
+        for candidate in batch.candidates {
+            let decision = self.review_single_candidate(candidate);
+            if let Some(conflict) = conflict_from_decision(&decision) {
+                receipt.conflicts.push(conflict);
+            }
+            receipt.push_decision(decision);
+        }
+
+        receipt
+    }
+
     #[must_use]
     pub fn evaluate_health(&self) -> Vec<FactHealthIssue> {
         let mut issues = Vec::new();
@@ -160,6 +177,123 @@ where
             }
         }
     }
+
+    fn review_single_candidate(&mut self, candidate: FactCandidate) -> FactReviewDecision {
+        if candidate.evidence.is_empty() {
+            return FactReviewDecision::hold(candidate, "fact candidate has no evidence");
+        }
+
+        if candidate.reality != FactReality::Observed && candidate.reality != FactReality::Inferred
+        {
+            return FactReviewDecision::reject(
+                candidate,
+                "hypothetical or simulated candidate cannot be promoted",
+            );
+        }
+
+        if let Some(existing) = self.find_duplicate_fact(&candidate) {
+            let relations = vec![FactCandidateRelation {
+                kind: FactCandidateRelationKind::Duplicates,
+                target: existing.id.as_str().to_string(),
+                reason: "candidate statement already exists in the same scope".to_string(),
+            }];
+            let mut decision = FactReviewDecision::hold(candidate, "duplicate fact candidate held");
+            decision.relations = relations;
+            return decision;
+        }
+
+        if let Some(existing) = self.find_conflicting_fact(&candidate) {
+            return FactReviewDecision::conflict(
+                candidate.clone(),
+                "candidate conflicts with active fact in the same scope and type",
+                vec![FactCandidateRelation {
+                    kind: FactCandidateRelationKind::ConflictsWith,
+                    target: existing.id.as_str().to_string(),
+                    reason: "same fact type and scope but different statement".to_string(),
+                }],
+            );
+        }
+
+        let fact = self.fact_from_review_candidate(&candidate);
+        let stored = self.upsert_fact(fact);
+        FactReviewDecision::promote(
+            candidate,
+            "observed candidate has evidence and passed conflict review",
+            stored,
+        )
+    }
+
+    fn fact_from_review_candidate(&self, candidate: &FactCandidate) -> FactRecord {
+        let mut fact = FactRecord::new(candidate.fact_type.clone(), candidate.statement.clone());
+        fact.id = FactId::from_string(format!("candidate:{}", candidate.candidate_id.as_str()));
+        fact.scope_key = Some(candidate.scope.key());
+        fact.confidence = candidate.confidence;
+        fact.evidence = candidate.evidence.clone();
+        fact.provenance.push(Provenance {
+            source: candidate.source.clone(),
+            observed_at: Utc::now(),
+            trace_id: Some(candidate.candidate_id.as_str().to_string()),
+        });
+        fact.relations = candidate
+            .relations
+            .iter()
+            .map(|relation| {
+                format!(
+                    "{:?}:{}:{}",
+                    relation.kind, relation.target, relation.reason
+                )
+            })
+            .collect();
+        fact
+    }
+
+    fn find_duplicate_fact(&self, candidate: &FactCandidate) -> Option<FactRecord> {
+        let scope_key = candidate.scope.key();
+        self.store.list_facts().into_iter().find(|fact| {
+            fact.status == "active"
+                && fact.fact_type == candidate.fact_type
+                && fact.scope_key.as_deref() == Some(scope_key.as_str())
+                && normalize_statement(&fact.statement) == normalize_statement(&candidate.statement)
+        })
+    }
+
+    fn find_conflicting_fact(&self, candidate: &FactCandidate) -> Option<FactRecord> {
+        if !fact_type_requires_unique_statement(&candidate.fact_type) {
+            return None;
+        }
+
+        let scope_key = candidate.scope.key();
+        self.store.list_facts().into_iter().find(|fact| {
+            fact.status == "active"
+                && fact.fact_type == candidate.fact_type
+                && fact.scope_key.as_deref() == Some(scope_key.as_str())
+                && normalize_statement(&fact.statement) != normalize_statement(&candidate.statement)
+        })
+    }
+}
+
+fn conflict_from_decision(decision: &FactReviewDecision) -> Option<FactConflict> {
+    decision
+        .relations
+        .iter()
+        .find(|relation| relation.kind == FactCandidateRelationKind::ConflictsWith)
+        .map(|relation| FactConflict {
+            candidate_id: decision.candidate.candidate_id.clone(),
+            existing_fact_id: FactId::from_string(relation.target.clone()),
+            reason: relation.reason.clone(),
+        })
+}
+
+fn normalize_statement(statement: &str) -> String {
+    statement
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn fact_type_requires_unique_statement(fact_type: &str) -> bool {
+    fact_type.starts_with("matrix.")
 }
 
 fn detect_matrix_conflicts(facts: &[FactRecord]) -> Vec<FactHealthIssue> {
@@ -225,12 +359,15 @@ mod tests {
     use serde_json::json;
 
     use super::FactKernelService;
+    use crate::candidate::{ExtractionMethod, FactCandidate, FactScope};
     use crate::core::{Confidence, EvidencePacket, FactId, FactRecord, FactSource, SourceKind};
+    use crate::extraction::{FactExtractionBatch, FactExtractionTrigger};
     use crate::growth::{GrowthCandidate, PromotionDecision};
     use crate::health::FactHealthIssueKind;
-    use crate::hypothesis::HypothesisBoundary;
+    use crate::hypothesis::{FactReality, HypothesisBoundary};
     use crate::matrix::MatrixFact;
     use crate::memory::{MemoryCandidate, RecallQuery};
+    use crate::review::FactReviewDecisionKind;
 
     fn source() -> FactSource {
         FactSource {
@@ -360,5 +497,115 @@ mod tests {
         assert!(conflicts
             .iter()
             .all(|issue| issue.detail.contains("user.workflow.prefers_flow")));
+    }
+
+    fn review_candidate(statement: &str) -> FactCandidate {
+        FactCandidate::observed(
+            "memory.preference",
+            statement,
+            FactScope::Task("task-a".to_string()),
+            source(),
+        )
+        .with_method(ExtractionMethod::Checkpoint, "test-extractor:v1")
+        .with_confidence(Confidence::from_basis_points(8_500))
+    }
+
+    fn matrix_review_candidate(statement: &str) -> FactCandidate {
+        FactCandidate::observed(
+            "matrix.prefers_flow",
+            statement,
+            FactScope::Task("task-a".to_string()),
+            source(),
+        )
+        .with_method(ExtractionMethod::Checkpoint, "test-extractor:v1")
+        .with_confidence(Confidence::from_basis_points(8_500))
+    }
+
+    #[test]
+    fn review_holds_candidate_without_evidence() {
+        let mut service = FactKernelService::new();
+        let batch = FactExtractionBatch::new(
+            FactExtractionTrigger::SessionCompaction,
+            vec![review_candidate("user prefers Chinese reports")],
+        );
+
+        let receipt = service.review_candidates(batch);
+
+        assert_eq!(receipt.promoted.len(), 0);
+        assert_eq!(receipt.held.len(), 1);
+        assert_eq!(receipt.held[0].decision, FactReviewDecisionKind::Hold);
+        assert!(service
+            .recall(&RecallQuery::new("Chinese reports"))
+            .is_empty());
+    }
+
+    #[test]
+    fn review_rejects_hypothetical_candidate_even_with_evidence() {
+        let mut service = FactKernelService::new();
+        let evidence = service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 1})));
+        let candidate = review_candidate("hypothetical future preference")
+            .with_evidence(vec![evidence.id])
+            .with_reality(FactReality::Hypothetical);
+        let batch = FactExtractionBatch::new(FactExtractionTrigger::Manual, vec![candidate]);
+
+        let receipt = service.review_candidates(batch);
+
+        assert_eq!(receipt.promoted.len(), 0);
+        assert_eq!(receipt.rejected.len(), 1);
+        assert_eq!(receipt.rejected[0].decision, FactReviewDecisionKind::Reject);
+    }
+
+    #[test]
+    fn review_promotes_observed_candidate_with_evidence() {
+        let mut service = FactKernelService::new();
+        let evidence = service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 1})));
+        let candidate =
+            review_candidate("user prefers Chinese reports").with_evidence(vec![evidence.id]);
+        let batch =
+            FactExtractionBatch::new(FactExtractionTrigger::SessionCompaction, vec![candidate]);
+
+        let receipt = service.review_candidates(batch);
+
+        assert_eq!(receipt.promoted.len(), 1);
+        assert_eq!(receipt.held.len(), 0);
+        assert_eq!(
+            receipt.promoted[0].decision,
+            FactReviewDecisionKind::Promote
+        );
+        assert_eq!(
+            service.recall(&RecallQuery::new("Chinese reports")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn review_holds_conflicting_candidate_in_same_scope() {
+        let mut service = FactKernelService::new();
+        let first_evidence =
+            service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 1})));
+        let first = matrix_review_candidate("user.workflow prefers_flow immersive_then_review")
+            .with_evidence(vec![first_evidence.id]);
+        let first_receipt = service.review_candidates(FactExtractionBatch::new(
+            FactExtractionTrigger::SessionCompaction,
+            vec![first],
+        ));
+        assert_eq!(first_receipt.promoted.len(), 1);
+
+        let second_evidence =
+            service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 2})));
+        let second = matrix_review_candidate("user.workflow prefers_flow pause_each_step")
+            .with_evidence(vec![second_evidence.id]);
+        let second_receipt = service.review_candidates(FactExtractionBatch::new(
+            FactExtractionTrigger::SessionCompaction,
+            vec![second],
+        ));
+
+        assert_eq!(second_receipt.promoted.len(), 0);
+        assert_eq!(second_receipt.held.len(), 1);
+        assert_eq!(second_receipt.conflicts.len(), 1);
+        assert_eq!(
+            second_receipt.decisions[0].decision,
+            FactReviewDecisionKind::Conflict
+        );
     }
 }

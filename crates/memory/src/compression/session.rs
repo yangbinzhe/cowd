@@ -12,8 +12,13 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use fact_kernel::{
+    Confidence, EvidenceId, ExtractionMethod, FactCandidate, FactCandidateId, FactExtractionBatch,
+    FactExtractionTokenUsage, FactExtractionTrigger, FactScope, FactSource, SourceKind,
+};
 use harness_contract::core::EvidenceRef;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     compression::{llm_summarizer::LlmSummarizer, Result},
@@ -138,6 +143,34 @@ pub enum CheckpointFactKind {
     Summary,
 }
 
+impl CheckpointFactKind {
+    #[must_use]
+    pub fn fact_type(&self) -> &'static str {
+        match self {
+            Self::Decision => "memory.decision",
+            Self::Constraint => "memory.project_convention",
+            Self::PendingWork | Self::CodeChange => "memory.project_knowledge",
+            Self::Preference => "memory.user_preference",
+            Self::ToolEvidence | Self::CriticalContext => "memory.reference",
+            Self::Summary => "memory.compressed_summary",
+        }
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Constraint => "constraint",
+            Self::PendingWork => "pending-work",
+            Self::Preference => "preference",
+            Self::CodeChange => "code-change",
+            Self::ToolEvidence => "tool-evidence",
+            Self::CriticalContext => "critical-context",
+            Self::Summary => "session-summary",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCheckpointBuildContext {
     pub checkpoint_id: String,
@@ -217,6 +250,130 @@ pub struct SessionSemanticCheckpoint {
     pub token_stats: CheckpointTokenStats,
     pub source_range: CompactionSourceRange,
     pub facts: Vec<SessionCheckpointFact>,
+}
+
+impl SessionSemanticCheckpoint {
+    #[must_use]
+    pub fn fact_candidate_id(&self, fact_index: usize) -> FactCandidateId {
+        FactCandidateId::from_string(format!(
+            "checkpoint:{}:fact:{}",
+            self.checkpoint_id, fact_index
+        ))
+    }
+
+    #[must_use]
+    pub fn fact_candidate_id_key(&self, fact_index: usize) -> String {
+        self.fact_candidate_id(fact_index).as_str().to_string()
+    }
+
+    #[must_use]
+    pub fn to_fact_extraction_batch(&self) -> FactExtractionBatch {
+        let source_evidence = self
+            .source_range
+            .raw_refs
+            .iter()
+            .map(evidence_id_from_ref)
+            .collect::<Vec<_>>();
+        let candidates = self
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| fact.to_fact_candidate(self, index))
+            .collect::<Vec<_>>();
+
+        FactExtractionBatch::new(FactExtractionTrigger::SessionCompaction, candidates)
+            .with_session_id(Some(self.session_id.clone()))
+            .with_project_id(self.project_id.clone())
+            .with_task_id(self.task_id.clone())
+            .with_team_id(self.team_id.clone())
+            .with_source_evidence(source_evidence)
+            .with_token_usage(FactExtractionTokenUsage {
+                input_tokens: self.token_stats.before,
+                output_tokens: self.token_stats.after,
+                total_tokens: self
+                    .token_stats
+                    .before
+                    .saturating_add(self.token_stats.after),
+            })
+    }
+
+    fn fact_scope(&self) -> FactScope {
+        if let Some(task_id) = &self.task_id {
+            FactScope::Task(task_id.clone())
+        } else if !self.session_id.trim().is_empty() {
+            FactScope::Session(self.session_id.clone())
+        } else if let Some(project_id) = &self.project_id {
+            FactScope::Project(project_id.clone())
+        } else {
+            FactScope::Global
+        }
+    }
+}
+
+impl SessionCheckpointFact {
+    #[must_use]
+    pub fn to_fact_candidate(
+        &self,
+        checkpoint: &SessionSemanticCheckpoint,
+        fact_index: usize,
+    ) -> FactCandidate {
+        let evidence = self
+            .evidence_refs
+            .iter()
+            .map(evidence_id_from_ref)
+            .collect::<Vec<_>>();
+        let mut tags = self.tags.clone();
+        tags.push(format!("checkpoint-kind:{}", self.kind.tag()));
+        if let Some(project_id) = &checkpoint.project_id {
+            tags.push(format!("project:{project_id}"));
+        }
+        if let Some(task_id) = &checkpoint.task_id {
+            tags.push(format!("task:{task_id}"));
+        }
+        if let Some(team_id) = &checkpoint.team_id {
+            tags.push(format!("team:{team_id}"));
+        }
+        tags.sort();
+        tags.dedup();
+
+        let mut candidate = FactCandidate::observed(
+            self.kind.fact_type(),
+            self.content.clone(),
+            checkpoint.fact_scope(),
+            FactSource {
+                kind: SourceKind::Memory,
+                id: checkpoint.checkpoint_id.clone(),
+                label: Some("session semantic checkpoint".to_string()),
+            },
+        )
+        .with_evidence(evidence)
+        .with_confidence(Confidence::from_basis_points(
+            (self.confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16,
+        ))
+        .with_method(ExtractionMethod::Checkpoint, "memory-session-checkpoint:v1")
+        .with_payload(json!({
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "session_id": checkpoint.session_id,
+            "agent_id": checkpoint.agent_id,
+            "project_id": checkpoint.project_id,
+            "task_id": checkpoint.task_id,
+            "team_id": checkpoint.team_id,
+            "fact_index": fact_index,
+            "fact_kind": self.kind,
+            "title": self.title,
+            "category": self.category,
+            "layer": self.layer,
+            "source_range": checkpoint.source_range,
+            "token_stats": checkpoint.token_stats,
+        }))
+        .with_tags(tags);
+        candidate.candidate_id = checkpoint.fact_candidate_id(fact_index);
+        candidate
+    }
+}
+
+fn evidence_id_from_ref(reference: &EvidenceRef) -> EvidenceId {
+    EvidenceId::from_string(format!("{}:{}", reference.0.ref_type, reference.0.id))
 }
 
 impl SessionCompactor {
@@ -1110,6 +1267,7 @@ impl SessionCompressor {
 mod tests {
     use super::*;
     use crate::types::{Message, MessageRole};
+    use harness_contract::core::KernelRef;
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {
@@ -1143,6 +1301,67 @@ mod tests {
             msg(MessageRole::User, &"z".repeat(100)),
         ];
         assert!(compactor.should_compact(&messages));
+    }
+
+    #[test]
+    fn semantic_checkpoint_exports_fact_extraction_batch_with_stable_scope() {
+        let evidence_ref = EvidenceRef(
+            KernelRef::new("session-message", "session-a:0").with_label("source message"),
+        );
+        let checkpoint = SessionSemanticCheckpoint {
+            checkpoint_id: "checkpoint-a".to_string(),
+            session_id: "session-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            project_id: Some("project-a".to_string()),
+            task_id: Some("task-a".to_string()),
+            team_id: Some("team-a".to_string()),
+            summary: "summary".to_string(),
+            token_stats: CheckpointTokenStats {
+                before: 120,
+                after: 30,
+                message_count: 4,
+            },
+            source_range: CompactionSourceRange {
+                session_id: "session-a".to_string(),
+                message_start: 0,
+                message_end_exclusive: 2,
+                event_start: Some(0),
+                event_end_exclusive: Some(2),
+                raw_refs: vec![evidence_ref.clone()],
+            },
+            facts: vec![checkpoint_fact(
+                CheckpointFactKind::Decision,
+                "Decision",
+                "Use fact-kernel review before memory promotion",
+                MemoryCategory::Decision,
+                MemoryLayer::L2,
+                vec!["decision"],
+                0.9,
+                &[evidence_ref],
+            )],
+        };
+
+        let batch = checkpoint.to_fact_extraction_batch();
+
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.session_id.as_deref(), Some("session-a"));
+        assert_eq!(batch.task_id.as_deref(), Some("task-a"));
+        assert_eq!(
+            batch.source_evidence[0].as_str(),
+            "session-message:session-a:0"
+        );
+        assert_eq!(batch.token_usage.total_tokens, 150);
+        let candidate = &batch.candidates[0];
+        assert_eq!(
+            candidate.candidate_id.as_str(),
+            "checkpoint:checkpoint-a:fact:0"
+        );
+        assert_eq!(candidate.fact_type, "memory.decision");
+        assert_eq!(candidate.scope.key(), "task:task-a");
+        assert_eq!(
+            candidate.evidence[0].as_str(),
+            "session-message:session-a:0"
+        );
     }
 
     #[test]

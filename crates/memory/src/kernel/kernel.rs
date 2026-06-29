@@ -11,6 +11,7 @@ use std::{
 };
 
 use chrono::Utc;
+use fact_kernel::{FactKernelService, FactReviewReceipt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -86,6 +87,12 @@ pub enum MemoryState {
     Superseded,
     Stale,
     Archived,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticCheckpointMemoryReceipt {
+    pub memory_ids: Vec<MemoryId>,
+    pub fact_review: FactReviewReceipt,
 }
 
 /// Read-side atom projection used by kernel/UI/tests.
@@ -490,13 +497,32 @@ impl MemoryKernel {
         &self,
         ctx: &MemoryTurnContext,
         checkpoint: SessionSemanticCheckpoint,
-    ) -> MemoryKernelResult<Vec<MemoryId>> {
-        let mut ids = Vec::with_capacity(checkpoint.facts.len());
-        for fact in checkpoint.facts {
-            let id = self.remember_checkpoint_fact(ctx, fact).await?;
+    ) -> MemoryKernelResult<SemanticCheckpointMemoryReceipt> {
+        let candidate_to_fact = checkpoint
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| (checkpoint.fact_candidate_id_key(index), fact.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut fact_service = FactKernelService::new();
+        for entry in self.manager.list_all_entries().await? {
+            fact_service.upsert_fact(entry.to_fact_record());
+        }
+        let fact_review = fact_service.review_candidates(checkpoint.to_fact_extraction_batch());
+
+        let mut ids = Vec::with_capacity(fact_review.promoted.len());
+        for decision in &fact_review.promoted {
+            let Some(fact) = candidate_to_fact.get(decision.candidate.candidate_id.as_str()) else {
+                continue;
+            };
+            let id = self.remember_checkpoint_fact(ctx, fact.clone()).await?;
             ids.push(id);
         }
-        Ok(ids)
+
+        Ok(SemanticCheckpointMemoryReceipt {
+            memory_ids: ids,
+            fact_review,
+        })
     }
 
     async fn remember_checkpoint_fact(

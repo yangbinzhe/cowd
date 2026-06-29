@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use harness_contract::core::{EvidenceRef, KernelRef};
+use memory::compression::session::{
+    CheckpointFactKind, CheckpointTokenStats, CompactionSourceRange, SessionCheckpointFact,
+    SessionSemanticCheckpoint,
+};
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
     AgentVisibility, CognitiveContextManager, MemoryAtomView, MemoryCategory, MemoryConfig,
@@ -145,6 +150,103 @@ async fn memory_kernel_binds_session_agent_scope() {
             .map(|e| e.content.len() as u64 / 4)
             .sum::<u64>()
     );
+}
+
+#[tokio::test]
+async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let mut ctx = MemoryTurnContext::new("session-checkpoint", "agent-primary");
+    ctx.project_id = Some("project-checkpoint".to_string());
+    ctx.task_id = Some("task-checkpoint".to_string());
+    let mut existing = entry(
+        MemoryLayer::L2,
+        MemorySource::Compression,
+        "Existing checkpoint decision",
+    );
+    existing.category = MemoryCategory::Decision;
+    existing.content = "Existing checkpoint duplicate should be held".to_string();
+    existing.scope = MemoryScope::Task("task-checkpoint".to_string());
+    manager.remember(existing).await.unwrap();
+
+    let evidence_ref = EvidenceRef(
+        KernelRef::new("session-message", "session-checkpoint:0").with_label("source message"),
+    );
+    let checkpoint = SessionSemanticCheckpoint {
+        checkpoint_id: "checkpoint-review".to_string(),
+        session_id: "session-checkpoint".to_string(),
+        agent_id: "agent-primary".to_string(),
+        project_id: ctx.project_id.clone(),
+        task_id: ctx.task_id.clone(),
+        team_id: None,
+        summary: "checkpoint summary".to_string(),
+        token_stats: CheckpointTokenStats {
+            before: 100,
+            after: 25,
+            message_count: 3,
+        },
+        source_range: CompactionSourceRange {
+            session_id: "session-checkpoint".to_string(),
+            message_start: 0,
+            message_end_exclusive: 1,
+            event_start: Some(0),
+            event_end_exclusive: Some(1),
+            raw_refs: vec![evidence_ref.clone()],
+        },
+        facts: vec![
+            SessionCheckpointFact {
+                kind: CheckpointFactKind::Decision,
+                title: "Duplicate decision".to_string(),
+                content: "Existing checkpoint duplicate should be held".to_string(),
+                category: MemoryCategory::Decision,
+                layer: MemoryLayer::L2,
+                tags: vec!["semantic-checkpoint".to_string()],
+                confidence: 0.9,
+                evidence_refs: vec![evidence_ref.clone()],
+            },
+            SessionCheckpointFact {
+                kind: CheckpointFactKind::Decision,
+                title: "Decision".to_string(),
+                content: "Use fact review before checkpoint memory promotion".to_string(),
+                category: MemoryCategory::Decision,
+                layer: MemoryLayer::L2,
+                tags: vec!["semantic-checkpoint".to_string()],
+                confidence: 0.9,
+                evidence_refs: vec![evidence_ref],
+            },
+            SessionCheckpointFact {
+                kind: CheckpointFactKind::Preference,
+                title: "Ungrounded preference".to_string(),
+                content: "This candidate lacks evidence and must stay out of memory".to_string(),
+                category: MemoryCategory::UserPreference,
+                layer: MemoryLayer::L2,
+                tags: vec!["semantic-checkpoint".to_string()],
+                confidence: 0.9,
+                evidence_refs: Vec::new(),
+            },
+        ],
+    };
+
+    let receipt = kernel
+        .checkpoint_compaction(&ctx, checkpoint)
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.fact_review.promoted.len(), 1);
+    assert_eq!(receipt.fact_review.held.len(), 2);
+    assert_eq!(receipt.memory_ids.len(), 1);
+    let entries = manager.list_all_entries().await.unwrap();
+    assert!(entries
+        .iter()
+        .any(|entry| entry.content.contains("Use fact review")));
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.content.contains("lacks evidence")));
 }
 
 #[tokio::test]

@@ -4,20 +4,31 @@
 //! Matrix repositories, Gateway services, Runtime executors, or external SDKs.
 
 pub mod bridge;
+pub mod candidate;
 pub mod core;
+pub mod extraction;
 pub mod growth;
 pub mod health;
 pub mod hypothesis;
 pub mod indexer;
 pub mod matrix;
 pub mod memory;
+pub mod review;
 pub mod service;
 pub mod store;
 
 pub use bridge::{decide_candidate_promotion, BridgeDecision};
+pub use candidate::{
+    ExtractionMethod, FactCandidate, FactCandidateId, FactCandidateRelation,
+    FactCandidateRelationKind, FactScope, FactStatus,
+};
 pub use core::{
     Confidence, EvidenceId, EvidencePacket, FactId, FactRecord, FactSource, Provenance, SourceKind,
 };
+pub use extraction::{
+    FactExtractionBatch, FactExtractionBatchId, FactExtractionTokenUsage, FactExtractionTrigger,
+};
 pub use indexer::FactSearchHit;
+pub use review::{FactConflict, FactReviewDecision, FactReviewDecisionKind, FactReviewReceipt};
 pub use service::{FactKernelService, PromotionReceipt};
 pub use store::{FactStore, InMemoryFactStore};

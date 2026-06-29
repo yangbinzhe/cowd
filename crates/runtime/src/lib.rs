@@ -154,6 +154,8 @@ pub mod evidence_planner;
 pub mod execution_core;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
+#[path = "context/fact_extraction.rs"]
+pub mod fact_extraction;
 #[path = "agent/intent_planner.rs"]
 pub mod intent_planner;
 #[path = "agent/joint_problem_solving.rs"]
