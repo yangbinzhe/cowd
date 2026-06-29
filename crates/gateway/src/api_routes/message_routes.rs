@@ -18,6 +18,7 @@ use futures::{stream::Stream, StreamExt};
 use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -575,55 +576,74 @@ async fn send_message(
         cancellation_token,
         hook_abort_signal,
     );
-    let turn_result = runtime_service
-        .run_turn_with_timeout(&session_id, active_task_id, content, TURN_TIMEOUT)
-        .await;
-    clear_active_turn_control(&session_id, &run_id);
-    let turn_sink = RuntimeTurnSink {
-        state: &state,
-        runtime_service: &runtime_service,
-        event_bus: &event_bus,
-    };
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let worker_state = state.clone();
+    let worker_runtime_service = runtime_service.clone();
+    let worker_event_bus = event_bus.clone();
+    let worker_session_id = session_id.clone();
+    let worker_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let turn_result = worker_runtime_service
+            .run_turn_with_timeout(&worker_session_id, active_task_id, content, TURN_TIMEOUT)
+            .await;
+        clear_active_turn_control(&worker_session_id, &worker_run_id);
+        let turn_sink = RuntimeTurnSink {
+            state: &worker_state,
+            runtime_service: &worker_runtime_service,
+            event_bus: &worker_event_bus,
+        };
 
-    match turn_result {
-        Ok(execution) => {
-            let response = turn_sink
-                .complete(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    execution,
-                    run_started_at_ms,
-                )
-                .await;
-            Ok(Json(response))
-        }
-        Err(error) => {
-            let status = match error {
-                crate::runtime_service::RuntimeTurnExecutionError::Timeout { .. } => {
-                    StatusCode::REQUEST_TIMEOUT
-                }
-                crate::runtime_service::RuntimeTurnExecutionError::NotFound(_) => {
-                    StatusCode::NOT_FOUND
-                }
-                crate::runtime_service::RuntimeTurnExecutionError::Runtime(_)
-                | crate::runtime_service::RuntimeTurnExecutionError::Join(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-            let error_msg = turn_sink
-                .fail(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    status,
-                    &error,
-                    run_started_at_ms,
-                )
-                .await;
+        let completion = match turn_result {
+            Ok(execution) => {
+                let response = turn_sink
+                    .complete(
+                        &worker_session_id,
+                        &worker_run_id,
+                        run_profile,
+                        execution,
+                        run_started_at_ms,
+                    )
+                    .await;
+                Ok(response)
+            }
+            Err(error) => {
+                let status = match error {
+                    crate::runtime_service::RuntimeTurnExecutionError::Timeout { .. } => {
+                        StatusCode::REQUEST_TIMEOUT
+                    }
+                    crate::runtime_service::RuntimeTurnExecutionError::NotFound(_) => {
+                        StatusCode::NOT_FOUND
+                    }
+                    crate::runtime_service::RuntimeTurnExecutionError::Runtime(_)
+                    | crate::runtime_service::RuntimeTurnExecutionError::Join(_) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                };
+                let error_msg = turn_sink
+                    .fail(
+                        &worker_session_id,
+                        &worker_run_id,
+                        run_profile,
+                        status,
+                        &error,
+                        run_started_at_ms,
+                    )
+                    .await;
+                Err((status, error_msg))
+            }
+        };
+        let _ = completion_tx.send(completion);
+    });
 
-            Err((status, Json(ErrorResponse { error: error_msg })))
-        }
+    match completion_rx.await {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err((status, error_msg))) => Err((status, Json(ErrorResponse { error: error_msg }))),
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "runtime turn worker stopped before completion".to_string(),
+            }),
+        )),
     }
 }
 
