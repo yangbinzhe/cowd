@@ -286,7 +286,8 @@ impl RuntimeActivityPanel {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default() as usize;
             self.projection_model_speed = projection
-                .pointer("/token_speed/model_telemetry/tokens_per_second")
+                .pointer("/token_speed/model_telemetry/wall_tokens_per_second")
+                .or_else(|| projection.pointer("/token_speed/model_telemetry/tokens_per_second"))
                 .and_then(serde_json::Value::as_f64)
                 .map(|value| format!("{value:.1} tok/s"))
                 .or_else(|| {
@@ -799,6 +800,7 @@ mod tests {
                     }
                 },
                 "model_telemetry": {
+                    "wall_tokens_per_second": 21.25,
                     "tokens_per_second": 21.25
                 }
             }

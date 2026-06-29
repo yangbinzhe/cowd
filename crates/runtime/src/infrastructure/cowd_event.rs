@@ -70,6 +70,10 @@ pub struct RunModelTelemetry {
     pub cache_read_tokens: u64,
     pub total_tokens: u64,
     pub usage_source: String,
+    pub wall_chars_per_second: Option<f64>,
+    pub wall_tokens_per_second: Option<f64>,
+    pub active_chars_per_second: Option<f64>,
+    pub active_tokens_per_second: Option<f64>,
     pub chars_per_second: Option<f64>,
     pub tokens_per_second: Option<f64>,
 }

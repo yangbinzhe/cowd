@@ -42,9 +42,11 @@ runtime:
       max_failures_before_review: 2
     context:
       preserve_stable_head: true
-      yolo_budget_tokens: 12000
-      collaboration_budget_tokens: 10000
-      review_budget_tokens: 9000
+      # 0 表示由 RuntimeBudgetPlan 按模型上下文窗口动态派生。
+      # 只有在需要强制压低特定模式预算时才设置为固定 token 数。
+      yolo_budget_tokens: 0
+      collaboration_budget_tokens: 0
+      review_budget_tokens: 0
       degrade_on_pressure_bp: 8500
     memory:
       emit_pulses_from_workgraph: true
@@ -144,39 +146,19 @@ trusted_roots: []
 # =============================================================================
 # 预检自动压缩: 每次模型调用前检测上下文窗口使用率，超限时自动压缩
 
-# 压缩阈值与环境变量:
-#   COWD_AUTO_COMPACT_INPUT_TOKENS: 绝对 token 阈值 (设置后百分比方式失效)
-#   COWD_COMPACT_THRESHOLD_PERCENT: 百分比阈值 (默认 80%)
+# 压缩阈值:
+#   默认按模型上下文窗口的 70% 触发，适配 32K/128K/1M 等不同窗口。
+#   COWD_AUTO_COMPACT_INPUT_TOKENS 可作为绝对阈值覆盖，仅建议调试或强约束环境使用。
 compression:
-  # 微压缩 (per-tool-result 截断)
-  micro:
-    enabled: true
-    tool_result_max_chars: 4000     # 工具结果最大字符数
-    time_decay_factor: 0.9          # 时间衰减系数
-
   # 会话级自动压缩
   session:
-    threshold_tokens: 80000         # 触发压缩的 token 阈值
-    preserve_recent: 6              # 保留最近 N 条消息
-    summary_max_tokens: 2000        # 摘要最大 token 数
-    buffer_tokens: 13000            # 预留缓冲 token
+    threshold_tokens: 0             # 0=按 threshold_ratio_bp 动态计算；>0=固定绝对阈值
+    threshold_ratio_bp: 7000        # 触发比例，7000=模型上下文窗口的 70%
+    preserve_recent: 6              # 压缩后保留最近 N 条消息原文
 
-  # 深度迭代压缩 (多次压缩)
+  # 记忆深度压缩开关。会话自动压缩由 session 配置控制。
   deep:
     enabled: true
-    iterative_update: true          # 增量更新模式
-
-  # 熔断器 (防止无限压缩)
-  circuit_breaker:
-    max_retries: 3                  # 最大压缩重试次数
-    cooldown_secs: 30               # 冷却时间(秒)
-
-  # LLM 语义摘要 (可选, 需配置 API)
-  # llm:
-  #   enabled: false
-  #   api_url: ""                   # 环境变量: COWD_LLM_API_URL
-  #   api_key: ""                   # 环境变量: COWD_LLM_API_KEY
-  #   model: "gpt-4o-mini"          # 环境变量: COWD_LLM_MODEL
 
 # =============================================================================
 # System Prompt 缓存
@@ -254,44 +236,13 @@ memory:
     timeout_secs: 30              # 嵌入 API 调用超时 (秒)
     batch_size: 32                # 批量嵌入请求的最大条目数
 
-  # ── Token 预算 ──
-  budget:
-    context_window: 200000        # 上下文窗口总大小 (按模型自适应)
-    reserved_system: 10000        # 系统提示预留
-    reserved_response: 8000       # 响应预留
-    warning_threshold: 0.70       # 警告阈值 (70%)
-    critical_threshold: 0.90      # 临界阈值 (90%)
-
-  # ── 压缩管线 ──
-  compression:
-    micro:
-      enabled: true
-      tool_result_max_chars: 4000
-      time_decay_factor: 0.9
-    session:
-      threshold_tokens: 80000
-      preserve_recent: 6
-      summary_max_tokens: 2000
-      buffer_tokens: 13000
-    deep:
-      enabled: true
-      iterative_update: true
-    circuit_breaker:
-      max_retries: 3
-      cooldown_secs: 30
-
-    # LLM 摘要生成 (可选, 需配置 API)
-    # 启用后压缩管线使用 LLM 生成语义摘要, 替代模板回退。
-    # 支持 OpenAI 兼容接口 (也可用于 Ollama / vLLM 等本地服务)。
-    #
-    # API key 优先级: 环境变量 CC_LLM_API_KEY > 配置文件 api_key 值
-    # API URL 优先级: 环境变量 CC_LLM_API_URL > 配置文件 api_url 值
-    # Model 优先级:  环境变量 CC_LLM_MODEL > 配置文件 model 值
-    llm:
-      enabled: false
-      api_url: ""                   # 环境变量: CC_LLM_API_URL
-      api_key: ""                   # 环境变量: CC_LLM_API_KEY
-      model: "gpt-4o-mini"         # 环境变量: CC_LLM_MODEL
+  # ── Runtime 记忆治理 ──
+  # Runtime 根据当前模型窗口和任务画像动态派生记忆检索预算；
+  # memory crate 内部仅保留独立运行兜底默认值，不在用户模板中暴露重复预算。
+  runtime:
+    use_runtime_budget: true
+    semantic_checkpoint_enabled: true
+    recall_checkpoint_limit: 3
 
   # ── 记忆提取器 ──
   extractor:
@@ -324,8 +275,8 @@ memory:
   # ── 分层配置 ──
   layers:
     l0_enabled: true              # L0: 身份层
-    l1_max_tokens: 2000           # L1: 核心层最大 tokens
-    l2_max_tokens: 3000           # L2: 项目层最大 tokens
+    l1_max_tokens: 4000           # L1: 核心层最大 tokens
+    l2_max_tokens: 6000           # L2: 项目层最大 tokens
     l3_search_limit: 5            # L3: 深度召回结果数
     l4_enabled: false             # L4: 共享层 (团队模式启用)
 
@@ -478,18 +429,12 @@ gateway:
 #   OPENAI_BASE_URL                - OpenAI Base URL
 #
 # 压缩:
-#   COWD_AUTO_COMPACT_INPUT_TOKENS - 绝对 token 阈值触发压缩
-#   COWD_COMPACT_THRESHOLD_PERCENT - 百分比阈值 (覆盖 compression.session.threshold_tokens)
+#   COWD_AUTO_COMPACT_INPUT_TOKENS - 绝对 token 阈值触发压缩；未设置时使用 compression.session.threshold_ratio_bp
 #
 # 记忆:
 #   COWD_MEMORY_VECTOR_MODEL       - 向量嵌入模型名
 #   COWD_MEMORY_VECTOR_API_URL     - 向量嵌入 API URL
 #   COWD_VECTOR_API_KEY            - 向量 API 密钥
-#
-# LLM 压缩:
-#   COWD_LLM_API_URL               - LLM 摘要 API URL
-#   COWD_LLM_API_KEY               - LLM 摘要 API 密钥
-#   COWD_LLM_MODEL                 - LLM 摘要模型名
 #
 # 权限:
 #   COWD_PERMISSION_MODE           - 覆盖 permissions.defaultMode

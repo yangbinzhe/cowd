@@ -2,7 +2,8 @@
 //! wave-based parallel dispatch, result synthesis with fact-checking, and
 //! L4 team memory finalization.
 
-use std::collections::BTreeSet;
+use std::collections::{hash_map::DefaultHasher, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -633,7 +634,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             return;
         };
         let memory_ctx =
-            MemoryTurnContext::new("collaboration-orchestrator", "collaboration-orchestrator");
+            MemoryTurnContext::new("collaboration-orchestrator", "collaboration-orchestrator")
+                .with_task_id(Some(stable_collaboration_task_id(task_desc)))
+                .with_team_id(Some("collaboration-orchestrator".to_string()));
         let kernel = MemoryKernel::new(Arc::clone(mem));
 
         let entry = MemoryEntry {
@@ -886,6 +889,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{truncated}...")
     }
+}
+
+fn stable_collaboration_task_id(task_desc: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    task_desc.hash(&mut hasher);
+    format!("collaboration-task-{:016x}", hasher.finish())
 }
 
 fn build_collaboration_board(results: &[SubAgentResult]) -> CollaborationBoard {

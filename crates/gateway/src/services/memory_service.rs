@@ -453,6 +453,7 @@ fn knowledge_namespace_for_entry(entry: &MemoryEntry) -> KnowledgeNamespace {
             memory::MemoryScope::Project(project) => KnowledgeNamespace::Project(project.clone()),
             memory::MemoryScope::Global => KnowledgeNamespace::SharedLibrary("global".to_string()),
             memory::MemoryScope::Session(session) => KnowledgeNamespace::Corpus(session.clone()),
+            memory::MemoryScope::Task(task) => KnowledgeNamespace::Corpus(task.clone()),
             memory::MemoryScope::Agent(agent) => KnowledgeNamespace::Corpus(agent.clone()),
         }
     }

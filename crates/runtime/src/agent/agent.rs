@@ -7,6 +7,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use harness_contract::context::{
     AgentReturnPacketV2, ContextArtifact, ContextArtifactKind, ContextRetentionPolicy, EvidenceRef,
@@ -15,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::{AgentContextLease, AgentReturnRequirement, ContextSourceKind};
 use crate::tool_orchestrator::ToolResultBudget;
+
+pub const DEFAULT_SUBAGENT_BUDGET_TOKENS: usize =
+    crate::budget_policy::DEFAULT_SUBAGENT_BUDGET_TOKENS;
 
 use memory::cognitive::CognitiveContextManager;
 use memory::project_scope::MemoryScope;
@@ -236,7 +243,7 @@ fn default_max_turns() -> usize {
 }
 
 fn default_budget_tokens() -> usize {
-    20_000
+    DEFAULT_SUBAGENT_BUDGET_TOKENS
 }
 
 fn default_max_parallel() -> usize {
@@ -618,6 +625,8 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
 
     fn memory_turn_context(&self) -> MemoryTurnContext {
         MemoryTurnContext::new(self.runtime.session().session_id, self.agent_id.clone())
+            .with_task_id(Some(stable_agent_task_id(&self.config.task_description)))
+            .with_team_id(Some(format!("agent-role:{}", self.config.agent_role)))
     }
 
     /// Check if a tool is allowed for this sub-agent.
@@ -990,6 +999,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{}...", truncated)
     }
+}
+
+fn stable_agent_task_id(task_description: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    task_description.hash(&mut hasher);
+    format!("subagent-task-{:016x}", hasher.finish())
 }
 
 /// Format a `PreparedContext` into a memory section for injection into the system prompt.

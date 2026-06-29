@@ -326,6 +326,8 @@ fn runtime_model_router_capability() -> Value {
         "intents": ["quick", "standard", "deep", "recovery"],
         "signals": [
             "first_token_latency_ms",
+            "wall_tokens_per_second",
+            "active_tokens_per_second",
             "tokens_per_second",
             "usage_source",
             "quality_score",
@@ -473,7 +475,7 @@ mod tests {
         );
         assert!(response["model_router"]["signals"]
             .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "tokens_per_second")));
+            .is_some_and(|items| items.iter().any(|item| item == "wall_tokens_per_second")));
         assert!(
             response["strategy"]["current_turn_overrides_conflicting_memory"]
                 .as_bool()

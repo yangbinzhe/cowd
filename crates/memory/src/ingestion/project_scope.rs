@@ -34,6 +34,8 @@ pub enum MemoryScope {
     Project(String),
     /// Session-scoped memory, keyed by a session identifier.
     Session(String),
+    /// Task-scoped memory, keyed by a runtime task identifier.
+    Task(String),
     /// Agent-scoped memory, keyed by an agent identifier.
     Agent(String),
 }
@@ -49,6 +51,7 @@ impl MemoryScope {
     /// assert_eq!(MemoryScope::Global.scope_key(), "global");
     /// assert_eq!(MemoryScope::Project("abc".into()).scope_key(), "project_abc");
     /// assert_eq!(MemoryScope::Session("s1".into()).scope_key(), "session_s1");
+    /// assert_eq!(MemoryScope::Task("t1".into()).scope_key(), "task_t1");
     /// assert_eq!(MemoryScope::Agent("a1".into()).scope_key(), "agent_a1");
     /// ```
     pub fn scope_key(&self) -> String {
@@ -56,6 +59,7 @@ impl MemoryScope {
             MemoryScope::Global => "global".to_string(),
             MemoryScope::Project(id) => format!("project_{id}"),
             MemoryScope::Session(id) => format!("session_{id}"),
+            MemoryScope::Task(id) => format!("task_{id}"),
             MemoryScope::Agent(id) => format!("agent_{id}"),
         }
     }
@@ -80,6 +84,7 @@ impl std::str::FromStr for MemoryScope {
             "global" => Ok(MemoryScope::Global),
             _ if s.starts_with("project_") => Ok(MemoryScope::Project(s[8..].to_string())),
             _ if s.starts_with("session_") => Ok(MemoryScope::Session(s[8..].to_string())),
+            _ if s.starts_with("task_") => Ok(MemoryScope::Task(s[5..].to_string())),
             _ if s.starts_with("agent_") => Ok(MemoryScope::Agent(s[6..].to_string())),
             other => Err(format!("unknown scope key: {other}")),
         }
@@ -1488,6 +1493,10 @@ mod tests {
         assert_eq!(
             MemoryScope::Session("sess_1".into()).scope_key(),
             "session_sess_1"
+        );
+        assert_eq!(
+            MemoryScope::Task("task_1".into()).scope_key(),
+            "task_task_1"
         );
         assert_eq!(
             MemoryScope::Agent("agent_x".into()).scope_key(),

@@ -115,9 +115,9 @@ impl Default for ContextControlPolicy {
     fn default() -> Self {
         Self {
             preserve_stable_head: true,
-            yolo_budget_tokens: 12_000,
-            collaboration_budget_tokens: 10_000,
-            review_budget_tokens: 9_000,
+            yolo_budget_tokens: 0,
+            collaboration_budget_tokens: 0,
+            review_budget_tokens: 0,
             degrade_on_pressure_bp: 8_500,
         }
     }

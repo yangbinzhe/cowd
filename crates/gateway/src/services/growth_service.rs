@@ -662,6 +662,7 @@ fn memory_scope_key(scope: &MemoryScope) -> String {
         MemoryScope::Global => "global".to_string(),
         MemoryScope::Project(value) => format!("project:{value}"),
         MemoryScope::Session(value) => format!("session:{value}"),
+        MemoryScope::Task(value) => format!("task:{value}"),
         MemoryScope::Agent(value) => format!("agent:{value}"),
     }
 }

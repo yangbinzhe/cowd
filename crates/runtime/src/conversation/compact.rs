@@ -32,6 +32,8 @@ pub struct CompactionResult {
     pub formatted_summary: String,
     pub compacted_session: Session,
     pub removed_message_count: usize,
+    pub source_message_start: usize,
+    pub source_message_end: usize,
 }
 
 /// Roughly estimates the token footprint of the current session transcript.
@@ -104,6 +106,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             formatted_summary: String::new(),
             compacted_session: session.clone(),
             removed_message_count: 0,
+            source_message_start: 0,
+            source_message_end: 0,
         };
     }
 
@@ -183,6 +187,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         formatted_summary,
         compacted_session,
         removed_message_count: removed.len(),
+        source_message_start: compacted_prefix_len,
+        source_message_end: keep_from,
     }
 }
 

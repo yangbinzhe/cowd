@@ -8,7 +8,8 @@
 //! The engine subscribes to `EventBus::TurnCompleted` to auto-detect
 //! L4 conflicts and trigger discussion rounds when needed.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -634,7 +635,9 @@ impl DiscussionEngine {
         let memory_ctx = MemoryTurnContext::new(
             format!("discussion:{}", discussion.topic),
             leader_id.clone(),
-        );
+        )
+        .with_task_id(Some(stable_discussion_task_id(&discussion.topic)))
+        .with_team_id(Some("agent-discussion".to_string()));
         let kernel = MemoryKernel::new(Arc::clone(&self.memory));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
@@ -706,7 +709,13 @@ impl DiscussionEngine {
                     .unwrap_or("active")
             ),
             agent.agent_id.clone(),
-        );
+        )
+        .with_task_id(
+            self.discussion
+                .as_ref()
+                .map(|discussion| stable_discussion_task_id(&discussion.topic)),
+        )
+        .with_team_id(Some("agent-discussion".to_string()));
         let kernel = MemoryKernel::new(Arc::clone(&self.memory));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
@@ -763,6 +772,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{truncated}...")
     }
+}
+
+fn stable_discussion_task_id(topic: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    topic.hash(&mut hasher);
+    format!("discussion-task-{:016x}", hasher.finish())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

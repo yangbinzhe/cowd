@@ -4,13 +4,18 @@
 //! [`CognitiveContextManager`]. It establishes the v0.8.12 control boundary
 //! without rewriting the mature memory subsystems underneath it.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     cognitive::CognitiveContextManager,
+    compression::session::{SessionCheckpointFact, SessionSemanticCheckpoint},
     error::MemoryError,
     memory_authority::{
         authority_decision, same_memory_key, MemoryAuthorityAction, MemoryAuthorityDecision,
@@ -19,7 +24,8 @@ use crate::{
     memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
     project_scope::MemoryScope,
     types::{
-        AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, Message, PreparedContext, TokenBudget,
+        AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Message,
+        PreparedContext, Priority, TokenBudget,
     },
 };
 
@@ -247,6 +253,24 @@ impl MemoryTurnContext {
             task_id: None,
         }
     }
+
+    #[must_use]
+    pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
+        self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_id(mut self, task_id: Option<String>) -> Self {
+        self.task_id = task_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_team_id(mut self, team_id: Option<String>) -> Self {
+        self.team_id = team_id;
+        self
+    }
 }
 
 /// A degraded memory subsystem or fallback path.
@@ -457,6 +481,84 @@ impl MemoryKernel {
         Ok(())
     }
 
+    /// Persist a runtime semantic compaction checkpoint through the memory
+    /// governance boundary.
+    ///
+    /// The checkpoint is produced by the session compactor but written here so
+    /// every fact receives active session/agent scope and lifecycle governance.
+    pub async fn checkpoint_compaction(
+        &self,
+        ctx: &MemoryTurnContext,
+        checkpoint: SessionSemanticCheckpoint,
+    ) -> MemoryKernelResult<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(checkpoint.facts.len());
+        for fact in checkpoint.facts {
+            let id = self.remember_checkpoint_fact(ctx, fact).await?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    async fn remember_checkpoint_fact(
+        &self,
+        ctx: &MemoryTurnContext,
+        fact: SessionCheckpointFact,
+    ) -> MemoryKernelResult<MemoryId> {
+        let now = Utc::now();
+        let evidence_block = if fact.evidence_refs.is_empty() {
+            String::new()
+        } else {
+            let refs = fact
+                .evidence_refs
+                .iter()
+                .map(|evidence| {
+                    let label = evidence.0.label.as_deref().unwrap_or("source");
+                    format!("- {}:{} ({label})", evidence.0.ref_type, evidence.0.id)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\nEvidence refs:\n{refs}")
+        };
+        let scope = ctx
+            .task_id
+            .as_ref()
+            .map(|task_id| MemoryScope::Task(task_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone()));
+        let mut tags = fact.tags;
+        tags.push(format!("fact-kind:{:?}", fact.kind).to_lowercase());
+        if let Some(project_id) = &ctx.project_id {
+            tags.push(format!("project:{project_id}"));
+        }
+        if let Some(task_id) = &ctx.task_id {
+            tags.push(format!("task:{task_id}"));
+        }
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: fact.layer,
+            category: fact.category,
+            priority: Priority::Normal,
+            source: MemorySource::Compression,
+            title: fact.title,
+            content: format!("{}{}", fact.content, evidence_block),
+            embedding: None,
+            tags,
+            relations: vec![],
+            confidence: fact.confidence,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope,
+            session_id: Some(ctx.session_id.clone()),
+            source_agent: Some(ctx.agent_id.clone()),
+            visibility: AgentVisibility::default(),
+        };
+        let id = entry.id;
+        self.remember(ctx, entry).await?;
+        Ok(id)
+    }
+
     pub async fn archive(
         &self,
         ctx: &MemoryTurnContext,
@@ -510,12 +612,99 @@ impl MemoryKernel {
         max_items: usize,
         max_tokens: u64,
     ) -> MemoryKernelResult<MemoryContextPacket> {
-        let prepared = self.prepare(ctx, query, messages).await?;
-        let packet = self
-            .context_packet_from_entries(prepared.entries, max_items, max_tokens)
+        let mut prepared = self.prepare(ctx, query, messages).await?;
+        let mut checkpoint_omissions = Vec::new();
+        prepared.entries.retain(|entry| {
+            if !entry.tags.iter().any(|tag| tag == "semantic-checkpoint") {
+                return true;
+            }
+            let score = checkpoint_recall_score(entry, ctx, query);
+            if score >= 0.35 {
+                true
+            } else {
+                checkpoint_omissions.push(OmittedMemory {
+                    id: entry.id,
+                    title: entry.title.clone(),
+                    reason: format!("semantic checkpoint relevance too low ({score:.2})"),
+                });
+                false
+            }
+        });
+        let checkpoint_limit = (max_items / 4).clamp(1, 6);
+        let (checkpoint_entries, mut scoped_checkpoint_omissions) = self
+            .scoped_checkpoint_entries(ctx, query, checkpoint_limit)
+            .await;
+        checkpoint_omissions.append(&mut scoped_checkpoint_omissions);
+        if !checkpoint_entries.is_empty() {
+            let mut seen: HashSet<MemoryId> =
+                prepared.entries.iter().map(|entry| entry.id).collect();
+            let mut merged = Vec::with_capacity(prepared.entries.len() + checkpoint_entries.len());
+            for entry in checkpoint_entries {
+                if seen.insert(entry.id) {
+                    merged.push(entry);
+                }
+            }
+            merged.extend(prepared.entries);
+            prepared.entries = merged;
+        }
+        let mut packet = self
+            .context_packet_from_entries_with_budget(
+                prepared.entries,
+                max_items,
+                max_tokens,
+                &self.manager.budget_config(),
+            )
             .await?;
+        packet.omitted.extend(checkpoint_omissions);
         self.record_context_usage(ctx, &packet).await?;
         Ok(packet)
+    }
+
+    async fn scoped_checkpoint_entries(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<MemoryEntry>, Vec<OmittedMemory>) {
+        let Ok(entries) = self.manager.list_all_entries().await else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut omitted = Vec::new();
+        let mut scored = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.tags.iter().any(|tag| tag == "semantic-checkpoint")
+                    && memory_scope_visible_to_ctx(&entry.scope, ctx)
+            })
+            .map(|entry| (checkpoint_recall_score(&entry, ctx, query), entry))
+            .collect::<Vec<_>>();
+        scored.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        let mut selected = Vec::new();
+        for (score, entry) in scored {
+            if score < 0.35 {
+                omitted.push(OmittedMemory {
+                    id: entry.id,
+                    title: entry.title,
+                    reason: format!("semantic checkpoint relevance too low ({score:.2})"),
+                });
+                continue;
+            }
+            if selected.len() < limit.max(1) {
+                selected.push(entry);
+            } else {
+                omitted.push(OmittedMemory {
+                    id: entry.id,
+                    title: entry.title,
+                    reason: "semantic checkpoint recall limit exhausted".to_string(),
+                });
+            }
+        }
+        (selected, omitted)
     }
 
     pub async fn context_packet_from_entries(
@@ -524,9 +713,29 @@ impl MemoryKernel {
         max_items: usize,
         max_tokens: u64,
     ) -> MemoryKernelResult<MemoryContextPacket> {
+        self.context_packet_from_entries_with_budget(
+            entries,
+            max_items,
+            max_tokens,
+            &self.manager.budget_config(),
+        )
+        .await
+    }
+
+    async fn context_packet_from_entries_with_budget(
+        &self,
+        mut entries: Vec<MemoryEntry>,
+        max_items: usize,
+        max_tokens: u64,
+        budget: &crate::config::BudgetConfig,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        entries.sort_by(|left, right| {
+            memory_entry_selection_rank(right).cmp(&memory_entry_selection_rank(left))
+        });
         let mut selected = Vec::new();
         let mut omitted = Vec::new();
         let mut token_estimate = 0_u64;
+        let mut layer_tokens: HashMap<MemoryLayer, u64> = HashMap::new();
         let mut truncated = false;
 
         for entry in entries {
@@ -534,6 +743,18 @@ impl MemoryKernel {
                 .atom_with_lifecycle_state(&entry, MemoryInformationState::Orientation)
                 .await;
             let item_tokens = (entry.content.len() as u64 / 4).max(1);
+            if let Some(layer_cap) = layer_budget_cap(budget, entry.layer) {
+                let used = layer_tokens.get(&entry.layer).copied().unwrap_or_default();
+                if used.saturating_add(item_tokens) > layer_cap {
+                    truncated = true;
+                    omitted.push(OmittedMemory {
+                        id: entry.id,
+                        title: entry.title,
+                        reason: format!("layer {:?} budget exhausted", entry.layer),
+                    });
+                    continue;
+                }
+            }
             if selected.len() >= max_items
                 || token_estimate.saturating_add(item_tokens) > max_tokens
             {
@@ -547,6 +768,10 @@ impl MemoryKernel {
             }
 
             let (role, reason) = packet_role_and_reason(&atom);
+            layer_tokens
+                .entry(entry.layer)
+                .and_modify(|used| *used = used.saturating_add(item_tokens))
+                .or_insert(item_tokens);
             selected.push(MemoryPacketItem { atom, role, reason });
             token_estimate = token_estimate.saturating_add(item_tokens);
         }
@@ -1052,8 +1277,111 @@ fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemorySco
             .as_ref()
             .map(|project_id| MemoryScope::Project(project_id.clone()))
             .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
+        MemoryScope::Task(task) if task == "default" => ctx
+            .task_id
+            .as_ref()
+            .map(|task_id| MemoryScope::Task(task_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
         other => other.clone(),
     }
+}
+
+fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
+    match scope {
+        MemoryScope::Global => true,
+        MemoryScope::Session(session_id) => session_id == &ctx.session_id,
+        MemoryScope::Project(project_id) => {
+            ctx.project_id.as_ref() == Some(project_id) || ctx.team_id.as_ref() == Some(project_id)
+        }
+        MemoryScope::Task(task_id) => ctx.task_id.as_ref() == Some(task_id),
+        MemoryScope::Agent(agent_id) => agent_id == &ctx.agent_id,
+    }
+}
+
+fn checkpoint_recall_score(entry: &MemoryEntry, ctx: &MemoryTurnContext, query: &str) -> f32 {
+    let scope_score = match &entry.scope {
+        MemoryScope::Task(task_id) if ctx.task_id.as_ref() == Some(task_id) => 0.34,
+        MemoryScope::Session(session_id) if session_id == &ctx.session_id => 0.30,
+        MemoryScope::Project(project_id)
+            if ctx.project_id.as_ref() == Some(project_id)
+                || ctx.team_id.as_ref() == Some(project_id) =>
+        {
+            0.20
+        }
+        MemoryScope::Agent(agent_id) if agent_id == &ctx.agent_id => 0.18,
+        MemoryScope::Global => 0.08,
+        _ => 0.0,
+    };
+    let overlap_score = query_overlap_score(query, &entry.title, &entry.content);
+    let kind_score = if entry
+        .tags
+        .iter()
+        .any(|tag| tag == "fact-kind:constraint" || tag == "fact-kind:summary")
+    {
+        0.08
+    } else if entry
+        .tags
+        .iter()
+        .any(|tag| tag == "fact-kind:decision" || tag == "fact-kind:pendingwork")
+    {
+        0.06
+    } else {
+        0.03
+    };
+    if overlap_score <= 0.0 && !query.trim().is_empty() {
+        return (scope_score + kind_score * 0.2 + entry.confidence.clamp(0.0, 1.0) * 0.02)
+            .min(0.30);
+    }
+    (scope_score + overlap_score + kind_score + entry.confidence.clamp(0.0, 1.0) * 0.08).min(1.0)
+}
+
+fn query_overlap_score(query: &str, title: &str, content: &str) -> f32 {
+    let query = query.to_lowercase();
+    let haystack = format!("{} {}", title.to_lowercase(), content.to_lowercase());
+    if query.trim().len() > 8 && haystack.contains(query.trim()) {
+        return 0.46;
+    }
+    let tokens = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|token| token.len() >= 3)
+        .collect::<HashSet<_>>();
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let matched = tokens
+        .iter()
+        .filter(|token| haystack.contains(**token))
+        .count();
+    ((matched as f32 / tokens.len() as f32) * 0.42).min(0.42)
+}
+
+fn memory_entry_selection_rank(entry: &MemoryEntry) -> i32 {
+    let explicit = matches!(entry.source, MemorySource::UserExplicit);
+    let checkpoint = entry.tags.iter().any(|tag| tag == "semantic-checkpoint");
+    match (explicit, entry.layer, checkpoint) {
+        (true, MemoryLayer::L0 | MemoryLayer::L1, _) => 100,
+        (true, _, _) => 90,
+        (_, MemoryLayer::L0, _) => 80,
+        (_, MemoryLayer::L1, _) => 70,
+        (_, _, true) => 60,
+        (_, MemoryLayer::L2, _) => 50,
+        (_, MemoryLayer::L3, _) => 40,
+        (_, MemoryLayer::L4, _) => 30,
+    }
+}
+
+fn layer_budget_cap(budget: &crate::config::BudgetConfig, layer: MemoryLayer) -> Option<u64> {
+    if !budget.runtime_managed {
+        return None;
+    }
+    let cap = match layer {
+        MemoryLayer::L0 => budget.l0_reserved,
+        MemoryLayer::L1 => budget.l1_working,
+        MemoryLayer::L2 => budget.l2_project,
+        MemoryLayer::L3 => budget.l3_deep.saturating_add(budget.l3_checkpoint),
+        MemoryLayer::L4 => budget.l4_shared,
+    };
+    (cap > 0).then_some(cap)
 }
 
 fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) -> MemoryHealth {

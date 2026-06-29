@@ -29,6 +29,24 @@ pub struct BudgetConfig {
     /// Critical threshold (0.0-1.0)
     #[serde(default = "default_critical_threshold")]
     pub critical_threshold: f32,
+    /// True when runtime has already derived the final lease for this turn.
+    /// In that mode memory must not apply another role multiplier.
+    #[serde(default)]
+    pub runtime_managed: bool,
+    #[serde(default)]
+    pub selected_item_limit: usize,
+    #[serde(default)]
+    pub l0_reserved: u64,
+    #[serde(default)]
+    pub l1_working: u64,
+    #[serde(default)]
+    pub l2_project: u64,
+    #[serde(default)]
+    pub l3_deep: u64,
+    #[serde(default)]
+    pub l3_checkpoint: u64,
+    #[serde(default)]
+    pub l4_shared: u64,
 }
 
 fn default_context_window() -> u64 {
@@ -55,6 +73,14 @@ impl Default for BudgetConfig {
             reserved_response: 8_000,
             warning_threshold: 0.70,
             critical_threshold: 0.90,
+            runtime_managed: false,
+            selected_item_limit: 0,
+            l0_reserved: 0,
+            l1_working: 0,
+            l2_project: 0,
+            l3_deep: 0,
+            l3_checkpoint: 0,
+            l4_shared: 0,
         }
     }
 }
@@ -87,6 +113,14 @@ impl BudgetConfig {
             reserved_response,
             warning_threshold: 0.70,
             critical_threshold: 0.90,
+            runtime_managed: false,
+            selected_item_limit: 0,
+            l0_reserved: 0,
+            l1_working: 0,
+            l2_project: 0,
+            l3_deep: 0,
+            l3_checkpoint: 0,
+            l4_shared: 0,
         }
     }
 }

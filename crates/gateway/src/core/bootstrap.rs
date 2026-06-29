@@ -220,7 +220,7 @@ compression:
     toolResultMaxChars: 6000
     timeDecayFactor: 0.9
   session:
-    thresholdTokens: 180000
+    thresholdRatioBp: 7000
     preserveRecent: 10
     summaryMaxTokens: 2000
     bufferTokens: 13000

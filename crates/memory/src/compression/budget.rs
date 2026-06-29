@@ -131,6 +131,7 @@ mod tests {
             reserved_response: 4_000,
             warning_threshold: 0.7,
             critical_threshold: 0.95,
+            ..Default::default()
         });
         let alloc = mgr.allocate(AllocationPhase::MemoryInjection, 50_000);
         assert!(alloc.max_tokens > 0);
@@ -145,6 +146,7 @@ mod tests {
             reserved_response: 4_000,
             warning_threshold: 0.7,
             critical_threshold: 0.95,
+            ..Default::default()
         });
         let alloc = mgr.allocate(AllocationPhase::MemoryInjection, 85_000);
         assert!(
@@ -162,6 +164,7 @@ mod tests {
             reserved_response: 4_000,
             warning_threshold: 0.7,
             critical_threshold: 0.95,
+            ..Default::default()
         });
         let alloc = mgr.allocate(AllocationPhase::SystemPrompt, 90_000);
         assert!((alloc.pressure_factor - 1.0).abs() < 0.01);

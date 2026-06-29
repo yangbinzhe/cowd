@@ -163,7 +163,9 @@ impl ModelPerformanceRegistry {
         );
         entry.avg_tokens_per_second = rolling_average(
             entry.avg_tokens_per_second,
-            telemetry.tokens_per_second,
+            telemetry
+                .wall_tokens_per_second
+                .or(telemetry.tokens_per_second),
             entry.samples,
         );
         if telemetry.usage_source == "provider" {
@@ -492,8 +494,12 @@ mod tests {
                 cache_read_tokens: 0,
                 total_tokens: 680,
                 usage_source: "provider".to_string(),
+                wall_chars_per_second: Some(769.23),
+                wall_tokens_per_second: Some(138.46),
+                active_chars_per_second: Some(1_000.0),
+                active_tokens_per_second: Some(180.0),
                 chars_per_second: Some(1_000.0),
-                tokens_per_second: Some(180.0),
+                tokens_per_second: Some(138.46),
             },
             Some(0.72),
             false,
@@ -513,8 +519,12 @@ mod tests {
                 cache_read_tokens: 0,
                 total_tokens: 1_260,
                 usage_source: "provider".to_string(),
+                wall_chars_per_second: Some(800.0),
+                wall_tokens_per_second: Some(72.0),
+                active_chars_per_second: Some(1_000.0),
+                active_tokens_per_second: Some(90.0),
                 chars_per_second: Some(1_000.0),
-                tokens_per_second: Some(90.0),
+                tokens_per_second: Some(72.0),
             },
             Some(0.95),
             false,

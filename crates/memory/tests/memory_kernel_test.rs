@@ -537,6 +537,124 @@ async fn memory_context_packet_prefers_explainable_orientation() {
 }
 
 #[tokio::test]
+async fn memory_context_packet_includes_scoped_semantic_checkpoint() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-packet.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-checkpoint", "agent-checkpoint");
+    let mut checkpoint = entry(
+        MemoryLayer::L3,
+        MemorySource::Compression,
+        "SEMANTIC_CHECKPOINT_VISIBLE",
+    );
+    checkpoint.category = MemoryCategory::CompressedSummary;
+    checkpoint.content =
+        "SEMANTIC_CHECKPOINT_VISIBLE carries the previous session decisions.".to_string();
+    checkpoint.tags = vec!["semantic-checkpoint".to_string()];
+    checkpoint.scope = MemoryScope::Session(ctx.session_id.clone());
+    checkpoint.session_id = Some(ctx.session_id.clone());
+    manager.remember(checkpoint).await.unwrap();
+
+    let packet = kernel
+        .context_packet(&ctx, "previous session decisions", &[], 8, 1_000)
+        .await
+        .unwrap();
+
+    assert!(packet
+        .selected
+        .iter()
+        .any(|item| item.atom.title == "SEMANTIC_CHECKPOINT_VISIBLE"));
+}
+
+#[tokio::test]
+async fn memory_context_packet_omits_unrelated_semantic_checkpoint() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-unrelated.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-checkpoint-unrelated", "agent-checkpoint");
+    let mut checkpoint = entry(
+        MemoryLayer::L3,
+        MemorySource::Compression,
+        "SUPPLY_CHAIN_CHECKPOINT",
+    );
+    checkpoint.category = MemoryCategory::CompressedSummary;
+    checkpoint.content =
+        "SUPPLY_CHAIN_CHECKPOINT contains supplier lead time decisions.".to_string();
+    checkpoint.tags = vec!["semantic-checkpoint".to_string()];
+    checkpoint.scope = MemoryScope::Session(ctx.session_id.clone());
+    checkpoint.session_id = Some(ctx.session_id.clone());
+    manager.remember(checkpoint).await.unwrap();
+
+    let packet = kernel
+        .context_packet(&ctx, "frontend color palette", &[], 8, 1_000)
+        .await
+        .unwrap();
+
+    assert!(!packet
+        .selected
+        .iter()
+        .any(|item| item.atom.title == "SUPPLY_CHAIN_CHECKPOINT"));
+    assert!(packet.omitted.iter().any(|item| {
+        item.title == "SUPPLY_CHAIN_CHECKPOINT"
+            && item
+                .reason
+                .contains("semantic checkpoint relevance too low")
+    }));
+}
+
+#[tokio::test]
+async fn task_scoped_checkpoint_isolated_between_tasks() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-task.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx_a = MemoryTurnContext::new("session-task-scope", "agent-checkpoint")
+        .with_task_id(Some("task-a".to_string()));
+    let ctx_b = MemoryTurnContext::new("session-task-scope", "agent-checkpoint")
+        .with_task_id(Some("task-b".to_string()));
+    let mut checkpoint = entry(
+        MemoryLayer::L3,
+        MemorySource::Compression,
+        "TASK_A_CHECKPOINT",
+    );
+    checkpoint.category = MemoryCategory::CompressedSummary;
+    checkpoint.content = "TASK_A_CHECKPOINT records backend migration decisions.".to_string();
+    checkpoint.tags = vec!["semantic-checkpoint".to_string()];
+    checkpoint.scope = MemoryScope::Task("task-a".to_string());
+    checkpoint.session_id = Some(ctx_a.session_id.clone());
+    manager.remember(checkpoint).await.unwrap();
+
+    let packet_a = kernel
+        .context_packet(&ctx_a, "backend migration decisions", &[], 8, 1_000)
+        .await
+        .unwrap();
+    let packet_b = kernel
+        .context_packet(&ctx_b, "backend migration decisions", &[], 8, 1_000)
+        .await
+        .unwrap();
+
+    assert!(packet_a
+        .selected
+        .iter()
+        .any(|item| item.atom.title == "TASK_A_CHECKPOINT"));
+    assert!(!packet_b
+        .selected
+        .iter()
+        .any(|item| item.atom.title == "TASK_A_CHECKPOINT"));
+}
+
+#[tokio::test]
 async fn memory_context_packet_stays_bounded_on_large_candidate_set() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
@@ -568,6 +686,41 @@ async fn memory_context_packet_stays_bounded_on_large_candidate_set() {
     assert!(packet.selected.len() <= 3);
     assert!(packet.truncated);
     assert!(!packet.omitted.is_empty());
+}
+
+#[tokio::test]
+async fn runtime_managed_memory_packet_enforces_layer_budget() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config(&tmp.path().join("layer-budget.db"));
+    cfg.budget.runtime_managed = true;
+    cfg.budget.l2_project = 12;
+    cfg.budget.l3_deep = 1_000;
+    cfg.budget.l3_checkpoint = 1_000;
+    let manager = Arc::new(CognitiveContextManager::new(cfg).await.unwrap());
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let candidates = (0..3)
+        .map(|idx| {
+            let mut candidate = entry(
+                MemoryLayer::L2,
+                MemorySource::UserExplicit,
+                &format!("L2_NOISE_{idx}"),
+            );
+            candidate.content = "x".repeat(24);
+            candidate
+        })
+        .collect::<Vec<_>>();
+
+    let packet = kernel
+        .context_packet_from_entries(candidates, 8, 1_000)
+        .await
+        .unwrap();
+
+    assert_eq!(packet.selected.len(), 2);
+    assert_eq!(packet.omitted.len(), 1);
+    assert!(packet
+        .omitted
+        .iter()
+        .any(|item| item.reason.contains("layer L2 budget exhausted")));
 }
 
 #[tokio::test]

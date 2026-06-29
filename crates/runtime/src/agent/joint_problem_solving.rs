@@ -9,7 +9,11 @@
 //! 6. Execution        – Wave tasks → SubAgents execute
 //! 7. Review           – Reviewer agent checks results
 
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -233,7 +237,7 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
     /// Returns the aggregated discussion turns.
     pub async fn discuss(
         &self,
-        _topic: &str,
+        topic: &str,
         agent_prompts: &[(String, String)], // (agent_id, prompt)
     ) -> Vec<DiscussionTurn> {
         let mut turns: Vec<DiscussionTurn> = Vec::with_capacity(agent_prompts.len());
@@ -271,7 +275,9 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
                 let memory_ctx = MemoryTurnContext::new(
                     "joint-problem-solving-discussion",
                     turn.agent_id.clone(),
-                );
+                )
+                .with_task_id(Some(stable_jps_task_id(topic)))
+                .with_team_id(Some("joint-problem-solving".to_string()));
                 let entry = MemoryEntry {
                     id: MemoryId::new_v4(),
                     layer: MemoryLayer::L4,
@@ -397,7 +403,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         let perspectives = if let Some(ref mem) = self.parent_memory {
             // Write problem to L4 for all agents to discover.
             let memory_ctx =
-                MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline");
+                MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline")
+                    .with_task_id(Some(stable_jps_task_id(&problem.description)))
+                    .with_team_id(Some("joint-problem-solving".to_string()));
             let kernel = MemoryKernel::new(Arc::clone(mem));
             let problem_entry = MemoryEntry {
                 id: MemoryId::new_v4(),
@@ -876,7 +884,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         );
 
         let memory_ctx =
-            MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline");
+            MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline")
+                .with_task_id(Some(stable_jps_task_id(&result.problem.description)))
+                .with_team_id(Some("joint-problem-solving".to_string()));
         let kernel = MemoryKernel::new(Arc::clone(mem));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
@@ -1057,6 +1067,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{truncated}...")
     }
+}
+
+fn stable_jps_task_id(seed: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    format!("jps-task-{:016x}", hasher.finish())
 }
 
 /// Parse multiple solutions from free-text agent output.

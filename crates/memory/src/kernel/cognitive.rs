@@ -2319,6 +2319,11 @@ impl CognitiveContextManager {
         self.orchestrator.store().list_all().await
     }
 
+    /// Snapshot the active token budget configuration used by the kernel.
+    pub fn budget_config(&self) -> crate::config::BudgetConfig {
+        self.config.budget.clone()
+    }
+
     /// Scan current memories and enqueue reviewable lifecycle maintenance
     /// candidates. This never mutates or deletes memory entries.
     pub async fn scan_memory_maintenance(
@@ -3038,6 +3043,9 @@ impl CognitiveContextManager {
     /// Role multipliers: Planner=0.40, Executor=0.25, Reviewer=0.15, Orchestrator=0.50.
     /// Unknown roles default to Orchestrator (0.50).
     fn compute_budget(&self) -> TokenBudget {
+        if self.config.budget.runtime_managed {
+            return BudgetCalculator::new(self.config.budget.clone()).make_budget();
+        }
         let role = self
             .current_agent
             .lock()

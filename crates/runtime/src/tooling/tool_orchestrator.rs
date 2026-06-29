@@ -394,13 +394,14 @@ pub struct ToolResultBudget {
 
 impl Default for ToolResultBudget {
     fn default() -> Self {
-        Self {
-            max_total_tokens: 50_000,
-            per_tool_max_tokens: 10_000,
-            truncation_strategy: TruncationStrategy::HeadAndTail,
-            head_chars: 3000,
-            tail_chars: 2000,
-        }
+        crate::budget_policy::RuntimeBudgetPlan::derive(
+            crate::budget_policy::RuntimeBudgetInputs::new(
+                crate::budget_policy::FALLBACK_MODEL_CONTEXT_WINDOW,
+                4_096,
+            ),
+        )
+        .tool_result_budget
+        .to_tool_result_budget()
     }
 }
 
@@ -502,6 +503,10 @@ impl ToolOrchestrator {
             budget,
             overrides: HashMap::new(),
         }
+    }
+
+    pub fn set_budget(&mut self, budget: ToolResultBudget) {
+        self.budget = budget;
     }
 
     /// Override the safety category for a specific tool.

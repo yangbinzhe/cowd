@@ -585,7 +585,7 @@ impl ContextRuntimeKernel {
         omitted.extend(lease_omissions);
         let dynamic_tail = dynamic_items
             .iter()
-            .map(format_context_item)
+            .map(Self::format_context_item)
             .collect::<Vec<_>>();
         let used_tokens = request
             .stable_head
@@ -659,6 +659,14 @@ impl ContextRuntimeKernel {
             ),
             degraded_sources: envelope.diagnostics.degraded_sources.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn format_context_item(item: &ContextItem) -> String {
+        format!(
+            "### context {:?} | {:?} | score {:.2}\n{}",
+            item.source, item.role, item.score, item.content
+        )
     }
 
     pub fn policy_decision(probe: &ContextLeanProbe) -> ContextPolicyDecision {
@@ -1494,13 +1502,6 @@ impl ContextRuntimeKernel {
     }
 }
 
-fn format_context_item(item: &ContextItem) -> String {
-    format!(
-        "<context_item source=\"{:?}\" role=\"{:?}\" score=\"{:.2}\">\n{}\n</context_item>",
-        item.source, item.role, item.score, item.content
-    )
-}
-
 fn context_lease(
     source: ContextSourceKind,
     min_tokens: u64,
@@ -2217,6 +2218,23 @@ mod tests {
         assert!(json.contains("dynamic_tail_hash"));
         assert!(json.contains("recommendations"));
         assert!(json.contains("serialize me"));
+    }
+
+    #[test]
+    fn dynamic_context_items_use_compact_markdown_not_xml_tags() {
+        let envelope =
+            ContextRuntimeKernel::build_envelope(request_with_dynamic("compact context body"));
+        let rendered = envelope
+            .assembled
+            .dynamic_tail
+            .first()
+            .expect("dynamic context should be rendered");
+
+        assert!(rendered.starts_with("### context Memory | Orientation"));
+        assert!(rendered.contains("score "));
+        assert!(rendered.contains("compact context body"));
+        assert!(!rendered.contains("<context_item"));
+        assert!(!rendered.contains("</context_item>"));
     }
 
     #[test]

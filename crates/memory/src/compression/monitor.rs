@@ -218,6 +218,7 @@ mod tests {
             reserved_response: 0,
             warning_threshold: 0.65, // used ≥ 65 % → Warning via budget
             critical_threshold: 0.90,
+            ..Default::default()
         };
         ContextWindowMonitor::with_thresholds(
             BudgetManager::new(cfg),

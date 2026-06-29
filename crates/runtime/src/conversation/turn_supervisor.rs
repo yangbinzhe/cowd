@@ -28,6 +28,50 @@ pub struct ToolProgressObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub tool_name: String,
+    pub target: String,
+    pub input_hash: u64,
+    pub output_hash: u64,
+    pub produced_new_evidence: bool,
+    pub duplicate_call: bool,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallLedger {
+    pub calls: Vec<ToolCallRecord>,
+    pub duplicate_count: usize,
+    pub no_progress_count: usize,
+    pub evidence_count: usize,
+}
+
+impl ToolCallLedger {
+    #[must_use]
+    pub fn compact_summary(&self) -> String {
+        format!(
+            "tool_calls={}, evidence={}, duplicates={}, no_progress={}",
+            self.calls.len(),
+            self.evidence_count,
+            self.duplicate_count,
+            self.no_progress_count
+        )
+    }
+
+    #[must_use]
+    pub fn evidence_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for call in &self.calls {
+            if call.produced_new_evidence && seen.insert(call.target.clone()) {
+                targets.push(format!("{} -> {}", call.tool_name, call.target));
+            }
+        }
+        targets
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorDecision {
     Continue,
@@ -130,6 +174,7 @@ pub struct TurnSupervisor {
     observed_output_hashes: HashSet<u64>,
     injected_decisions: usize,
     total_observations: usize,
+    ledger: ToolCallLedger,
 }
 
 impl TurnSupervisor {
@@ -141,6 +186,7 @@ impl TurnSupervisor {
             observed_output_hashes: HashSet::new(),
             injected_decisions: 0,
             total_observations: 0,
+            ledger: ToolCallLedger::default(),
         }
     }
 
@@ -165,6 +211,24 @@ impl TurnSupervisor {
         let target_count = increment(&mut self.same_target_counts, target_key);
         let exact_count = increment(&mut self.exact_counts, exact_key);
         let novel_output = self.observed_output_hashes.insert(fingerprint.output_hash);
+        let duplicate_call = exact_count > 1;
+        if duplicate_call {
+            self.ledger.duplicate_count = self.ledger.duplicate_count.saturating_add(1);
+        }
+        if novel_output && !is_error {
+            self.ledger.evidence_count = self.ledger.evidence_count.saturating_add(1);
+        } else if !is_error {
+            self.ledger.no_progress_count = self.ledger.no_progress_count.saturating_add(1);
+        }
+        self.ledger.calls.push(ToolCallRecord {
+            tool_name: fingerprint.tool_name.clone(),
+            target: fingerprint.target.clone(),
+            input_hash: fingerprint.input_hash,
+            output_hash: fingerprint.output_hash,
+            produced_new_evidence: novel_output && !is_error,
+            duplicate_call,
+            is_error,
+        });
         let observation = ToolProgressObservation {
             fingerprint,
             is_error,
@@ -175,6 +239,37 @@ impl TurnSupervisor {
             self.injected_decisions = self.injected_decisions.saturating_add(1);
         }
         (observation, decision)
+    }
+
+    #[must_use]
+    pub fn ledger(&self) -> &ToolCallLedger {
+        &self.ledger
+    }
+
+    #[must_use]
+    pub fn partial_answer_text(&self, reason: &str) -> String {
+        let mut lines = vec![
+            "Runtime supervisor produced a partial answer instead of dropping the turn."
+                .to_string(),
+            format!("Reason: {reason}"),
+            format!("Tool governance: {}", self.ledger.compact_summary()),
+        ];
+        let targets = self.ledger.evidence_targets();
+        if targets.is_empty() {
+            lines.push("Checked evidence targets: none recorded.".to_string());
+        } else {
+            lines.push("Checked evidence targets:".to_string());
+            for target in targets.into_iter().take(12) {
+                lines.push(format!("- {target}"));
+            }
+        }
+        lines.push(
+            "Current status: the runtime stopped repeated or over-budget tool exploration and preserved the evidence trail for review.".to_string(),
+        );
+        lines.push(
+            "Next step: synthesize from the checked evidence or change strategy before requesting more tools.".to_string(),
+        );
+        lines.join("\n")
     }
 
     fn decide(
@@ -397,5 +492,26 @@ mod tests {
         }
 
         assert!(decisions.contains(&"nudge"));
+    }
+
+    #[test]
+    fn ledger_tracks_duplicates_and_partial_answer_evidence() {
+        let mut supervisor = TurnSupervisor::new();
+        for _ in 0..3 {
+            let _ = supervisor.observe_tool_result(
+                "grep_search",
+                r#"{"path":"crates/runtime","pattern":"RunModelTelemetry"}"#,
+                "same telemetry evidence",
+                false,
+            );
+        }
+
+        assert_eq!(supervisor.ledger().calls.len(), 3);
+        assert!(supervisor.ledger().duplicate_count >= 2);
+        assert!(supervisor.ledger().no_progress_count >= 2);
+        let partial = supervisor.partial_answer_text("test stop");
+        assert!(partial.contains("partial answer"));
+        assert!(partial.contains("duplicates="));
+        assert!(partial.contains("grep_search"));
     }
 }

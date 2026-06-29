@@ -53,6 +53,8 @@ mod hooks;
 #[path = "infrastructure/json.rs"]
 mod json;
 pub use json::JsonValue;
+#[path = "context/budget_policy.rs"]
+pub mod budget_policy;
 #[path = "context/context_profiler.rs"]
 pub mod context_profiler;
 #[path = "context/context_runtime.rs"]
@@ -583,6 +585,11 @@ pub use worker_boot::{
 
 #[path = "conversation/cached_prompt.rs"]
 pub mod cached_prompt;
+pub use budget_policy::{
+    clamp_context_budget_ratio_bp, resolve_compact_threshold, resolve_context_budget_tokens,
+    MemoryBudgetLease, RuntimeBudgetInputs, RuntimeBudgetPlan, RuntimeControlBudgetLease,
+    ToolResultBudgetLease, DEFAULT_CONTEXT_BUDGET_RATIO_BP, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+};
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{
     AgentContextLease, AgentContextView, AgentReturnPacket, AgentReturnRequirement,

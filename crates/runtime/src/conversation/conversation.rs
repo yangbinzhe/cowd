@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,13 +29,17 @@ impl CancellationToken {
 use futures::stream::Stream;
 use harness_contract::{
     context::{
-        ContextGovernanceDecision, ContextPressureState, ContextTurnReport, EvidenceRef,
-        ToolObservation,
+        CompactionReceipt, ContextGovernanceDecision, ContextPressureState, ContextTurnReport,
+        EvidenceRef, ToolObservation,
     },
+    core::KernelRef,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
 };
 use memory::cognitive::CognitiveContextManager;
+use memory::compression::session::{
+    CompactionSourceRange, SessionCheckpointBuildContext, SessionCompactor,
+};
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
@@ -47,10 +52,14 @@ use crate::agent_collaboration::{
     CollaborationContextResult, CollaborationOps, MemoryPulseCandidate, MemoryPulseKind,
 };
 use crate::agent_discussion::DiscussionEngine;
+use crate::budget_policy::{
+    clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
+    RuntimeBudgetPlan, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
+use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
@@ -76,7 +85,6 @@ use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 use model_protocol::usage::TokenUsage;
 
-const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
 const DEFAULT_RUNTIME_MAX_ITERATIONS: usize = 64;
 
@@ -240,6 +248,30 @@ fn millis_since(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
+fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
+    if count == 0 || duration_ms == 0 {
+        return None;
+    }
+    Some(count as f64 / (duration_ms as f64 / 1_000.0))
+}
+
+fn active_rate_per_second(count: u64, active_duration_ms: Option<u64>) -> Option<f64> {
+    active_duration_ms
+        .filter(|duration| *duration >= 250)
+        .and_then(|duration| rate_per_second(count, duration))
+}
+
+fn apply_runtime_budget_to_control_policy(
+    policy: &mut RuntimeControlPolicy,
+    budget_plan: &RuntimeBudgetPlan,
+) {
+    policy.context.yolo_budget_tokens = budget_plan.runtime_control_budget.yolo_budget_tokens;
+    policy.context.collaboration_budget_tokens = budget_plan
+        .runtime_control_budget
+        .collaboration_budget_tokens;
+    policy.context.review_budget_tokens = budget_plan.runtime_control_budget.review_budget_tokens;
+}
+
 fn knowledge_hard_gate_active(system_prompt: &[String]) -> bool {
     system_prompt
         .iter()
@@ -372,9 +404,10 @@ pub struct TurnSummary {
 }
 
 /// Details about automatic session compaction applied during a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    pub compaction_receipt: Option<CompactionReceipt>,
 }
 
 /// P1-05: Callback for generator-style turn injection after tool results.
@@ -405,6 +438,9 @@ pub struct ConversationRuntime<C, T> {
     profiler: crate::context_profiler::ContextProfiler,
     use_aaak_index: bool,
     auto_compaction_input_tokens_threshold: u32,
+    context_budget_ratio_bp: u32,
+    session_compaction_config: RuntimeSessionCompactConfig,
+    semantic_checkpoint_enabled: bool,
     model_context_window: u32,
     cached_prompt: crate::cached_prompt::CachedSystemPrompt,
     hook_abort_signal: HookAbortSignal,
@@ -519,9 +555,28 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let context_budget_ratio_bp =
+            clamp_context_budget_ratio_bp(feature_config.compression().session.threshold_ratio_bp);
+        let initial_model_context_window = feature_config.model().map_or(0, |model| {
+            provider::model_context_window_with_overrides(
+                model,
+                Some(feature_config.model_context_windows()),
+            )
+        });
+        let initial_model_max_output = feature_config
+            .model()
+            .map_or(0, provider::max_tokens_for_model);
+        let initial_budget_plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            model_context_window: initial_model_context_window,
+            model_max_output_tokens: initial_model_max_output,
+            context_budget_ratio_bp,
+            compact_threshold_ratio_bp: context_budget_ratio_bp,
+            profile: ContextProfile::MainTurn,
+            autonomy_mode: None,
+        });
         // Initialise the cognitive memory manager if the memory subsystem is enabled.
         let (memory_manager, memory_status) = if feature_config.memory().enabled {
-            let mem_cfg = build_cc_memory_config(feature_config);
+            let mem_cfg = build_cc_memory_config_with_budget(feature_config, &initial_budget_plan);
             match tokio::runtime::Handle::try_current() {
                 Ok(_) => {
                     // Inside a runtime — spawn a fresh thread with its own runtime
@@ -588,6 +643,8 @@ where
             (None, None)
         };
         let session = Arc::new(RwLock::new(session));
+        let mut runtime_control_policy = feature_config.runtime_control().policy.clone();
+        apply_runtime_budget_to_control_policy(&mut runtime_control_policy, &initial_budget_plan);
         Self {
             session,
             api_client,
@@ -606,11 +663,19 @@ where
                 let env_val = auto_compaction_threshold_from_env();
                 if env_val > 0 {
                     env_val
-                } else {
+                } else if feature_config.compression().session.threshold_tokens > 0 {
                     feature_config.compression().session.threshold_tokens
+                } else {
+                    initial_budget_plan.compaction_threshold_tokens as u32
                 }
             },
-            model_context_window: 0,
+            context_budget_ratio_bp,
+            session_compaction_config: feature_config.compression().session.clone(),
+            semantic_checkpoint_enabled: feature_config
+                .memory()
+                .runtime
+                .semantic_checkpoint_enabled,
+            model_context_window: initial_model_context_window,
             cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
                 crate::cowd_dirs::project_dot_dir(&std::env::current_dir().unwrap_or_default())
                     .join(crate::cowd_dirs::CONFIG_FILE_YAML),
@@ -647,10 +712,14 @@ where
             model: feature_config.model().map(str::to_string),
             fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
-            tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
+            tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::with_budget(
+                initial_budget_plan
+                    .tool_result_budget
+                    .to_tool_result_budget(),
+            ),
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
-            runtime_control_policy: feature_config.runtime_control().policy.clone(),
+            runtime_control_policy,
             external_context_items: std::sync::Mutex::new(Vec::new()),
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -879,12 +948,7 @@ where
         self.external_context_items()
             .into_iter()
             .chain(self.tool_trace_context_items())
-            .map(|item| {
-                format!(
-                    "<context_item source=\"{:?}\" role=\"{:?}\" score=\"{:.2}\">\n{}\n</context_item>",
-                    item.source, item.role, item.score, item.content
-                )
-            })
+            .map(|item| ContextRuntimeKernel::format_context_item(&item))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1019,11 +1083,33 @@ where
     }
 
     fn context_budget_tokens(&self) -> u64 {
-        if self.model_context_window > 0 {
-            u64::from(self.model_context_window)
-        } else {
-            8_000
-        }
+        self.runtime_budget_plan().effective_context_budget
+    }
+
+    fn runtime_budget_plan(&self) -> RuntimeBudgetPlan {
+        let model_max_output = self
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+            .map_or(0, provider::max_tokens_for_model);
+        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            model_context_window: self.model_context_window,
+            model_max_output_tokens: model_max_output,
+            context_budget_ratio_bp: self.context_budget_ratio_bp,
+            compact_threshold_ratio_bp: self.context_budget_ratio_bp,
+            profile: self.context_profile(),
+            autonomy_mode: None,
+        })
+    }
+
+    fn memory_turn_context(&self, agent_id: impl Into<String>) -> MemoryTurnContext {
+        let session = self.session();
+        let project_id = memory_project_id_for_session(&session);
+        let task_id = Some(format!("session-task-{}", session.session_id));
+        MemoryTurnContext::new(session.session_id, agent_id)
+            .with_project_id(project_id)
+            .with_task_id(task_id)
+            .with_team_id(None)
     }
 
     fn build_context_turn_report(
@@ -1047,13 +1133,19 @@ where
                 "context pressure within governance budget"
             },
         );
-        if let Some(compaction) = auto_compaction {
+        let compaction_receipt = auto_compaction
+            .as_ref()
+            .and_then(|compaction| compaction.compaction_receipt.clone());
+        if let Some(compaction) = auto_compaction.as_ref() {
             decision.compact = true;
             decision.estimated_tokens_to_reclaim = compaction.removed_message_count as u64;
         }
         let mut report = ContextTurnReport::new(turn_id.to_string(), pressure)
             .with_output_token_estimate(u64::from(usage.output_tokens))
             .with_governance_decision(decision);
+        if let Some(receipt) = compaction_receipt {
+            report = report.with_compaction_receipt(receipt);
+        }
         for observation in self.turn_tool_observations() {
             report = report.with_observation(observation);
         }
@@ -1158,10 +1250,19 @@ where
     }
 
     pub fn with_model_context_window(mut self, ctx_window: u32) -> Self {
+        let previous_window = self.model_context_window;
+        let previous_derived_threshold =
+            resolve_compact_threshold(previous_window, self.context_budget_ratio_bp);
         self.model_context_window = ctx_window;
-        if self.auto_compaction_input_tokens_threshold == 0 {
-            self.auto_compaction_input_tokens_threshold = resolve_compact_threshold(ctx_window);
+        let plan = self.runtime_budget_plan();
+        if self.auto_compaction_input_tokens_threshold == 0
+            || self.auto_compaction_input_tokens_threshold == previous_derived_threshold
+        {
+            self.auto_compaction_input_tokens_threshold = plan.compaction_threshold_tokens as u32;
         }
+        self.tool_orchestrator
+            .set_budget(plan.tool_result_budget.to_tool_result_budget());
+        apply_runtime_budget_to_control_policy(&mut self.runtime_control_policy, &plan);
         self
     }
 
@@ -1401,6 +1502,14 @@ where
         C: Clone,
     {
         let mut config = config.clone();
+        if config.context_lease().is_none()
+            && config.budget_tokens == DEFAULT_SUBAGENT_BUDGET_TOKENS
+        {
+            config.budget_tokens = self
+                .runtime_budget_plan()
+                .subagent_default_budget
+                .min(usize::MAX as u64) as usize;
+        }
         let parent_session_id = self.session().session_id;
         let lease = config.ensure_context_lease(parent_session_id, "primary");
         let model = config.model.clone().or_else(|| self.model.clone());
@@ -1812,29 +1921,45 @@ where
         loop {
             iterations += 1;
             if iterations > self.max_iterations {
-                let error = RuntimeError::new("max iterations exceeded");
-                tracing::error!(iterations, "turn failed: max iterations exceeded");
-                self.record_turn_failed(iterations, &error);
-                return Err(error);
+                let reason = "max iterations exceeded";
+                tracing::warn!(iterations, "turn supervisor returned partial answer");
+                let partial_text = turn_supervisor.partial_answer_text(reason);
+                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: partial_text.clone(),
+                }]);
+                self.session
+                    .write()
+                    .await
+                    .push_message(partial_msg.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(
+                    &partial_msg,
+                    self.session().messages.len().wrapping_sub(1),
+                );
+                if let Some(ref cowd) = self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
+                        message: format!(
+                            "tool governance returned partial answer: {}; {}",
+                            reason,
+                            turn_supervisor.ledger().compact_summary()
+                        ),
+                    });
+                }
+                assistant_messages.push(partial_msg);
+                break;
             }
 
             if self.auto_compaction_input_tokens_threshold > 0
                 && estimate_session_tokens(&*self.session.read().await)
                     > self.auto_compaction_input_tokens_threshold as usize
             {
-                let result =
-                    compact_session(&*self.session.read().await, CompactionConfig::default());
-                if result.removed_message_count > 0 {
-                    let compacted_len = result.compacted_session.messages.len();
-                    *self.session.write().await = result.compacted_session;
-                    // Record compaction as a MessagesTruncated event for event log.
-                    if let Some(ref log) = self.event_log {
-                        if let Ok(mut guard) = log.lock() {
-                            guard.push(MessageEvent::MessagesTruncated {
-                                sequence: compacted_len,
-                            });
-                        }
-                    }
+                if self
+                    .compact_session_with_checkpoint(self.compaction_config_for_session(
+                        CompactionConfig::default().max_estimated_tokens,
+                    ))
+                    .await
+                    .is_some()
+                {
                     effective_system_prompt = self.prepare_reality_context(&user_input).await;
                     effective_system_prompt.push(evidence_plan_guidance.clone());
                     if knowledge_hard_gate_active(&effective_system_prompt) {
@@ -2319,15 +2444,36 @@ where
             // tool evidence, and callback-injected context all have a chance to
             // influence the answer.
             if supervisor_final_answer_deadline.is_some_and(|deadline| iterations >= deadline) {
-                let error = RuntimeError::new(
-                    "turn supervisor stopped repeated low-novelty tool loop after fallback guidance was ignored",
-                );
+                let reason =
+                    "turn supervisor stopped repeated low-novelty tool loop after fallback guidance was ignored";
                 tracing::warn!(
                     iterations,
                     "turn supervisor stopped repeated low-novelty tool loop"
                 );
-                self.record_turn_failed(iterations, &error);
-                return Err(error);
+                let partial_text = turn_supervisor.partial_answer_text(reason);
+                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: partial_text.clone(),
+                }]);
+                self.session
+                    .write()
+                    .await
+                    .push_message(partial_msg.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(
+                    &partial_msg,
+                    self.session().messages.len().wrapping_sub(1),
+                );
+                if let Some(ref cowd) = self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
+                        message: format!(
+                            "tool governance returned partial answer: {}; {}",
+                            reason,
+                            turn_supervisor.ledger().compact_summary()
+                        ),
+                    });
+                }
+                assistant_messages.push(partial_msg);
+                break;
             }
             continue;
         }
@@ -2515,10 +2661,7 @@ where
                             "Collaboration synthesis complete"
                         );
                         if let Some(mem) = memory {
-                            let memory_ctx = MemoryTurnContext::new(
-                                self.session().session_id,
-                                "collaboration-orchestrator",
-                            );
+                            let memory_ctx = self.memory_turn_context("collaboration-orchestrator");
                             let kernel = MemoryKernel::new(Arc::clone(&mem));
                             let entry = memory::types::MemoryEntry {
                                 id: memory::types::MemoryId::new_v4(),
@@ -2627,10 +2770,16 @@ where
         let active_stream_duration_ms = first_stream_token_at
             .zip(last_stream_token_at)
             .map(|(first, last)| last.saturating_duration_since(first).as_millis() as u64);
-        let speed_duration_ms = active_stream_duration_ms
-            .filter(|duration| *duration > 0)
-            .unwrap_or_else(|| millis_since(turn_started_at).max(1));
-        let speed_seconds = speed_duration_ms as f64 / 1_000.0;
+        let wall_duration_ms = millis_since(turn_started_at).max(1);
+        let wall_chars_per_second = rate_per_second(output_chars, wall_duration_ms);
+        let wall_tokens_per_second =
+            rate_per_second(u64::from(telemetry_usage.output_tokens), wall_duration_ms);
+        let active_chars_per_second =
+            active_rate_per_second(output_chars, active_stream_duration_ms);
+        let active_tokens_per_second = active_rate_per_second(
+            u64::from(telemetry_usage.output_tokens),
+            active_stream_duration_ms,
+        );
         let model_telemetry = crate::cowd_event::RunModelTelemetry {
             model: models_used.last().cloned().or_else(|| {
                 self.model
@@ -2641,7 +2790,7 @@ where
             models_used,
             first_token_latency_ms,
             active_stream_duration_ms,
-            wall_duration_ms: millis_since(turn_started_at),
+            wall_duration_ms,
             output_chars,
             output_chunks,
             input_tokens: u64::from(telemetry_usage.input_tokens),
@@ -2654,14 +2803,17 @@ where
             } else {
                 "estimated".to_string()
             },
-            chars_per_second: (output_chars > 0).then_some(output_chars as f64 / speed_seconds),
-            tokens_per_second: (telemetry_usage.output_tokens > 0)
-                .then_some(f64::from(telemetry_usage.output_tokens) / speed_seconds),
+            wall_chars_per_second,
+            wall_tokens_per_second,
+            active_chars_per_second,
+            active_tokens_per_second,
+            chars_per_second: wall_chars_per_second,
+            tokens_per_second: wall_tokens_per_second,
         };
         let context_turn_report = self.build_context_turn_report(
             &ai_kernel_trace.harness_receipt.id,
             usage,
-            auto_compaction,
+            auto_compaction.clone(),
         );
         if let Ok(mut registry) = self.model_performance_registry.lock() {
             registry.record_telemetry(&model_telemetry, None, false);
@@ -3492,34 +3644,231 @@ where
             return None;
         }
 
-        let result = compact_session(
-            &*self.session.read().await,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                priority_threshold: 3,
-                keep_high_priority: true,
-                ..CompactionConfig::default()
-            },
-        );
+        self.compact_session_with_checkpoint(self.compaction_config_for_session(0))
+            .await
+    }
+
+    async fn compact_session_with_checkpoint(
+        &mut self,
+        config: CompactionConfig,
+    ) -> Option<AutoCompactionEvent> {
+        let original_session = self.session.read().await.clone();
+        let result = compact_session(&original_session, config);
 
         if result.removed_message_count == 0 {
             return None;
         }
 
-        tracing::info!(removed = result.removed_message_count, "compaction");
-        let compacted_len = result.compacted_session.messages.len();
-        *self.session.write().await = result.compacted_session;
-        // Record compaction as a MessagesTruncated event for event log.
-        if let Some(ref log) = self.event_log {
-            if let Ok(mut guard) = log.lock() {
-                guard.push(MessageEvent::MessagesTruncated {
-                    sequence: compacted_len,
-                });
+        let source_messages = compacted_source_messages(
+            &original_session.messages,
+            result.source_message_start,
+            result.source_message_end,
+        );
+        let raw_refs = source_message_evidence_refs(
+            &original_session.session_id,
+            &original_session.messages,
+            result.source_message_start,
+            result.source_message_end,
+        );
+        let checkpoint = if self.semantic_checkpoint_enabled && !source_messages.is_empty() {
+            let mem_messages = conversation_messages_to_mem_messages(source_messages);
+            let previous_summary = original_session
+                .compaction
+                .as_ref()
+                .map(|compaction| compaction.summary.as_str());
+            let source_range = CompactionSourceRange {
+                session_id: original_session.session_id.clone(),
+                message_start: result.source_message_start,
+                message_end_exclusive: result.source_message_end,
+                event_start: Some(result.source_message_start),
+                event_end_exclusive: Some(result.source_message_end),
+                raw_refs: raw_refs.clone(),
+            };
+            let ctx = self.memory_turn_context("primary");
+            let build_context = SessionCheckpointBuildContext::new(
+                original_session.session_id.clone(),
+                ctx.agent_id.clone(),
+                source_range,
+            )
+            .with_project_id(ctx.project_id.clone())
+            .with_task_id(ctx.task_id.clone())
+            .with_team_id(ctx.team_id.clone());
+            match SessionCompactor::new()
+                .build_checkpoint(&mem_messages, previous_summary, build_context)
+                .await
+            {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(error) => {
+                    tracing::warn!(%error, "semantic compaction checkpoint build degraded");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut receipt = checkpoint.as_ref().map(|checkpoint| {
+            let mut receipt = CompactionReceipt::new(
+                "runtime_auto_compaction",
+                checkpoint.token_stats.before,
+                checkpoint.token_stats.after,
+            )
+            .with_evidence_ref(EvidenceRef(
+                KernelRef::new("checkpoint", checkpoint.checkpoint_id.clone())
+                    .with_label("semantic_compaction_checkpoint"),
+            ));
+            receipt
+                .retained_artifact_ids
+                .push(format!("checkpoint:{}", checkpoint.checkpoint_id));
+            for evidence in &checkpoint.source_range.raw_refs {
+                receipt.evidence_refs.push(evidence.clone());
+                receipt
+                    .dropped_artifact_ids
+                    .push(format!("{}:{}", evidence.0.ref_type, evidence.0.id));
+            }
+            receipt
+        });
+
+        if let (Some(mgr), Some(checkpoint), Some(receipt_mut)) =
+            (&self.memory_manager, checkpoint, receipt.as_mut())
+        {
+            let ctx = self.memory_turn_context("primary");
+            let kernel = MemoryKernel::new(Arc::clone(mgr));
+            match kernel.checkpoint_compaction(&ctx, checkpoint).await {
+                Ok(memory_ids) => {
+                    receipt_mut
+                        .retained_artifact_ids
+                        .extend(memory_ids.iter().map(|id| format!("memory:{id}")));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "semantic compaction checkpoint persist degraded");
+                    receipt_mut.evidence_refs.push(EvidenceRef(
+                        KernelRef::new("memory", "semantic_checkpoint_degraded")
+                            .with_label(error.to_string()),
+                    ));
+                }
             }
         }
+
+        tracing::info!(removed = result.removed_message_count, "compaction");
+        let compacted_len = result.compacted_session.messages.len();
+        let compaction = result.compacted_session.compaction.clone();
+        *self.session.write().await = result.compacted_session;
+        self.record_session_compacted(compaction, compacted_len, receipt.clone())
+            .await;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
+            compaction_receipt: receipt,
         })
+    }
+
+    fn compaction_config_for_session(&self, max_estimated_tokens: usize) -> CompactionConfig {
+        CompactionConfig {
+            preserve_recent_messages: self.session_compaction_config.preserve_recent as usize,
+            max_estimated_tokens,
+            priority_threshold: 3,
+            keep_high_priority: true,
+        }
+    }
+
+    async fn record_session_compacted(
+        &self,
+        compaction: Option<crate::session::SessionCompaction>,
+        sequence: usize,
+        receipt: Option<CompactionReceipt>,
+    ) {
+        if let Some(ref log) = self.event_log {
+            if let Ok(mut guard) = log.lock() {
+                guard.push(MessageEvent::MessagesTruncated { sequence });
+                if let Some(compaction) = compaction.clone() {
+                    guard.push(MessageEvent::SessionCompacted { compaction });
+                }
+            }
+        }
+
+        let Some(compaction) = compaction else {
+            return;
+        };
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "type": "SessionCompacted",
+            "sequence": sequence,
+            "compaction": {
+                "count": compaction.count,
+                "removed_message_count": compaction.removed_message_count,
+                "summary": compaction.summary,
+            },
+            "receipt": receipt,
+        });
+        let event_sequence = match store.next_event_sequence(&session_id).await {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "session compaction event sequence allocation failed");
+                return;
+            }
+        };
+        let created_at_ms = now_ms();
+        let event = memory::SessionEvent {
+            session_id: session_id.clone(),
+            event_type: "SessionCompacted".to_string(),
+            event_json: payload.to_string(),
+            sequence: event_sequence,
+            created_at_ms,
+        };
+        if let Err(error) = store.append_event(&event).await {
+            tracing::warn!(%error, session_id, event_sequence, "session compaction event append failed");
+            return;
+        }
+        let context_payload = serde_json::json!({
+            "source": "conversation_runtime.compaction",
+            "sequence": sequence,
+            "compaction": {
+                "count": compaction.count,
+                "removed_message_count": compaction.removed_message_count,
+            },
+            "receipt": receipt,
+        });
+        let context_event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            event_sequence.saturating_add(1),
+            memory::RuntimeEventScope::Context,
+            "context.session_compacted",
+            context_payload,
+            created_at_ms,
+        );
+        if let Err(error) = store.append_runtime_event(&context_event).await {
+            tracing::warn!(%error, session_id, event_sequence, "canonical compaction runtime event append failed");
+            return;
+        }
+        if let Some(receipt) = context_event
+            .payload
+            .get("receipt")
+            .filter(|receipt| !receipt.is_null())
+        {
+            if receipt
+                .get("retained_artifact_ids")
+                .and_then(|ids| ids.as_array())
+                .is_some_and(|ids| !ids.is_empty())
+            {
+                let memory_event = memory::RuntimeEvent::new(
+                    session_id.clone(),
+                    event_sequence.saturating_add(2),
+                    memory::RuntimeEventScope::Memory,
+                    "memory.semantic_checkpoint.created",
+                    serde_json::json!({
+                        "source": "conversation_runtime.compaction",
+                        "receipt": receipt,
+                    }),
+                    created_at_ms,
+                );
+                if let Err(error) = store.append_runtime_event(&memory_event).await {
+                    tracing::warn!(%error, session_id, event_sequence, "semantic checkpoint runtime event append failed");
+                }
+            }
+        }
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -3754,10 +4103,18 @@ where
             .collect();
 
         let session_id = self.session().session_id;
-        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let memory_ctx = self.memory_turn_context("primary");
         let kernel = MemoryKernel::new(Arc::clone(mgr));
+        let memory_budget = self.runtime_budget_plan().memory_retrieval_budget;
+        let memory_budget_tokens = memory_budget.retrieval_budget.min(u64::from(u32::MAX));
         match kernel
-            .context_packet(&memory_ctx, user_input, &mem_messages, 20, 8_000)
+            .context_packet(
+                &memory_ctx,
+                user_input,
+                &mem_messages,
+                memory_budget.selected_item_limit,
+                memory_budget_tokens,
+            )
             .await
         {
             Ok(packet) => {
@@ -3971,8 +4328,7 @@ where
         let Some(mgr) = self.memory_manager.as_ref() else {
             return Ok(());
         };
-        let session_id = self.session().session_id;
-        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let memory_ctx = self.memory_turn_context("primary");
         let kernel = MemoryKernel::new(Arc::clone(mgr));
 
         // Convert session messages to memory's Message type for post-turn extraction.
@@ -4701,19 +5057,6 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
     parse_auto_compaction_threshold(value.as_deref())
 }
 
-fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
-    let env_val = auto_compaction_threshold_from_env();
-    if env_val > 0 {
-        return env_val;
-    }
-    if let Ok(pct_str) = std::env::var("COWD_COMPACT_THRESHOLD_PERCENT") {
-        if let Ok(pct) = pct_str.parse::<u32>() {
-            return (model_ctx_window * pct / 100).min(model_ctx_window.saturating_sub(8_000));
-        }
-    }
-    (model_ctx_window * 80 / 100).min(model_ctx_window.saturating_sub(8_000))
-}
-
 fn filter_system_prompt_for_role(system_prompt: &[String], task_description: &str) -> Vec<String> {
     let mut filtered = vec![format!(
         "You are a sub-agent with the following task:\n\n{}\n\
@@ -4730,6 +5073,32 @@ fn filter_system_prompt_for_role(system_prompt: &[String], task_description: &st
 #[doc(alias = "memory")]
 #[doc(alias = "CognitiveContextManager")]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
+    let model_context_window = feature_config.model().map_or(0, |model| {
+        provider::model_context_window_with_overrides(
+            model,
+            Some(feature_config.model_context_windows()),
+        )
+    });
+    let model_max_output = feature_config
+        .model()
+        .map_or(0, provider::max_tokens_for_model);
+    let ratio_bp =
+        clamp_context_budget_ratio_bp(feature_config.compression().session.threshold_ratio_bp);
+    let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+        model_context_window,
+        model_max_output_tokens: model_max_output,
+        context_budget_ratio_bp: ratio_bp,
+        compact_threshold_ratio_bp: ratio_bp,
+        profile: ContextProfile::MainTurn,
+        autonomy_mode: None,
+    });
+    build_cc_memory_config_with_budget(feature_config, &plan)
+}
+
+pub fn build_cc_memory_config_with_budget(
+    feature_config: &RuntimeFeatureConfig,
+    budget_plan: &RuntimeBudgetPlan,
+) -> CcMemoryConfig {
     use memory::config::{
         BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig,
     };
@@ -4775,12 +5144,20 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             llm: Default::default(),
         },
         budget: BudgetConfig {
-            context_window: 200_000,
+            context_window: budget_plan.memory_retrieval_budget.context_window,
             reserved_system: u64::from(mem.layers.l1_max_tokens)
                 + u64::from(mem.layers.l2_max_tokens),
-            reserved_response: 8_000,
+            reserved_response: budget_plan.memory_retrieval_budget.reserved_response,
             warning_threshold: 0.70,
             critical_threshold: 0.90,
+            runtime_managed: mem.runtime.use_runtime_budget,
+            selected_item_limit: budget_plan.memory_retrieval_budget.selected_item_limit,
+            l0_reserved: budget_plan.memory_retrieval_budget.l0_reserved,
+            l1_working: budget_plan.memory_retrieval_budget.l1_working,
+            l2_project: budget_plan.memory_retrieval_budget.l2_project,
+            l3_deep: budget_plan.memory_retrieval_budget.l3_deep,
+            l3_checkpoint: budget_plan.memory_retrieval_budget.l3_checkpoint,
+            l4_shared: budget_plan.memory_retrieval_budget.l4_shared,
         },
         extractor: ExtractorConfig {
             poll_interval_secs: 30,
@@ -4800,7 +5177,7 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
     value
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+        .unwrap_or(0)
 }
 
 fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
@@ -4814,6 +5191,128 @@ fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
     } else {
         (String::new(), String::new())
     }
+}
+
+fn compacted_source_messages(
+    messages: &[ConversationMessage],
+    start: usize,
+    end_exclusive: usize,
+) -> &[ConversationMessage] {
+    let start = start.min(messages.len());
+    let end_exclusive = end_exclusive.min(messages.len()).max(start);
+    &messages[start..end_exclusive]
+}
+
+fn source_message_evidence_refs(
+    session_id: &str,
+    messages: &[ConversationMessage],
+    start: usize,
+    end_exclusive: usize,
+) -> Vec<EvidenceRef> {
+    let start = start.min(messages.len());
+    let end_exclusive = end_exclusive.min(messages.len()).max(start);
+    messages[start..end_exclusive]
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| {
+            let index = start + offset;
+            EvidenceRef(
+                KernelRef::new("session-message", format!("{session_id}:{index}"))
+                    .with_label(message_index_label(message)),
+            )
+        })
+        .collect()
+}
+
+fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Vec<MemMessage> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let role = match msg.role {
+                crate::session::MessageRole::System => MemMessageRole::System,
+                crate::session::MessageRole::User => MemMessageRole::User,
+                crate::session::MessageRole::Assistant => MemMessageRole::Assistant,
+                crate::session::MessageRole::Tool => MemMessageRole::Tool,
+            };
+            let content = msg
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text.clone(),
+                    ContentBlock::Thinking { thinking, .. } => format!("[thinking]\n{thinking}"),
+                    ContentBlock::ToolUse { id, name, input } => {
+                        format!("[tool_use id={id} name={name}]\n{input}")
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    } => format!(
+                        "[tool_result id={tool_use_id} name={tool_name} error={is_error}]\n{output}"
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let (tool_use_id, tool_name) = msg.blocks.iter().fold((None, None), |acc, block| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    ..
+                } = block
+                {
+                    (Some(tool_use_id.clone()), Some(tool_name.clone()))
+                } else {
+                    acc
+                }
+            });
+            MemMessage {
+                turn_index: idx,
+                role,
+                content,
+                tool_use_id,
+                tool_name,
+                pinned: false,
+            }
+        })
+        .collect()
+}
+
+fn message_index_label(message: &ConversationMessage) -> String {
+    let mut checksum = 0_u64;
+    for byte in message
+        .blocks
+        .iter()
+        .flat_map(|block| format!("{block:?}").into_bytes())
+    {
+        checksum = checksum.wrapping_mul(31).wrapping_add(u64::from(byte));
+    }
+    format!("{}:{checksum:x}", message.role.role_str())
+}
+
+fn memory_project_id_for_session(session: &Session) -> Option<String> {
+    let root = session
+        .workspace_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.display().to_string().hash(&mut hasher);
+    let hash = hasher.finish();
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Some(format!("{name}-{hash:016x}"))
 }
 
 fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize {
@@ -5162,7 +5661,8 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        preview_chars, stream_idle_timeout_for_messages, ApiClient, ApiRequest, AssistantEvent,
+        active_rate_per_second, build_cc_memory_config_with_budget, preview_chars, rate_per_second,
+        stream_idle_timeout_for_messages, ApiClient, ApiRequest, AssistantEvent,
         CognitiveContextManager, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, DEFAULT_RUNTIME_MAX_ITERATIONS,
     };
@@ -5185,6 +5685,7 @@ mod tests {
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::SubAgentConfig;
     use crate::ToolError;
+    use crate::{resolve_context_budget_tokens, RuntimeBudgetInputs, RuntimeBudgetPlan};
     use futures::stream::Stream;
     use harness_contract::skill::{
         AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
@@ -5400,6 +5901,33 @@ mod tests {
         }
     }
 
+    struct EndlessToolApiClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for EndlessToolApiClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            use futures::stream;
+            self.call_count += 1;
+            Box::pin(stream::iter(
+                vec![
+                    AssistantEvent::TextDelta("checking".to_string()),
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{}", self.call_count),
+                        name: "read_file".to_string(),
+                        input: r#"{"path":"README.md"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]
+                .into_iter()
+                .map(Ok),
+            ))
+        }
+    }
+
     struct PromptAllowAll;
 
     impl PermissionPrompter for PromptAllowAll {
@@ -5492,6 +6020,92 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_defaults_to_seventy_percent_of_model_window() {
+        assert_eq!(resolve_context_budget_tokens(1_000_000, 7_000), 700_000);
+        assert_eq!(resolve_context_budget_tokens(128_000, 7_000), 89_600);
+        assert_eq!(resolve_context_budget_tokens(32_000, 7_000), 22_400);
+    }
+
+    #[test]
+    fn context_budget_ratio_is_clamped_to_safe_bounds() {
+        assert_eq!(resolve_context_budget_tokens(1_000_000, 99_999), 950_000);
+        assert_eq!(resolve_context_budget_tokens(1_000_000, 1), 100_000);
+    }
+
+    #[test]
+    fn memory_config_consumes_runtime_budget_plan() {
+        let feature_config = RuntimeFeatureConfig::default();
+        let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            model_context_window: 1_000_000,
+            model_max_output_tokens: 32_000,
+            context_budget_ratio_bp: 7_000,
+            compact_threshold_ratio_bp: 7_000,
+            profile: ContextProfile::MainTurn,
+            autonomy_mode: None,
+        });
+
+        let mem_cfg = build_cc_memory_config_with_budget(&feature_config, &plan);
+
+        assert_eq!(mem_cfg.budget.context_window, 700_000);
+        assert_eq!(mem_cfg.budget.reserved_response, 32_000);
+        assert_ne!(mem_cfg.budget.context_window, 200_000);
+        assert!(mem_cfg.budget.runtime_managed);
+        assert_eq!(
+            mem_cfg.budget.selected_item_limit,
+            plan.memory_retrieval_budget.selected_item_limit
+        );
+        assert_eq!(
+            mem_cfg.budget.l3_checkpoint,
+            plan.memory_retrieval_budget.l3_checkpoint
+        );
+    }
+
+    #[test]
+    fn telemetry_wall_speed_is_primary_and_tiny_active_duration_is_ignored() {
+        let wall_speed = rate_per_second(8_562, 178_350).expect("wall speed");
+        let tiny_active = active_rate_per_second(8_562, Some(1));
+        let normal_active = active_rate_per_second(8_562, Some(2_000)).expect("active speed");
+
+        assert!((wall_speed - 48.01).abs() < 0.2);
+        assert_eq!(tiny_active, None);
+        assert!(normal_active > wall_speed);
+    }
+
+    #[test]
+    fn max_iteration_tool_loop_returns_partial_report() {
+        let tool_executor =
+            StaticToolExecutor::new().register("read_file", |_input| Ok("same evidence".into()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EndlessToolApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_max_iterations(1);
+
+        let prompter = SharedPrompter::new(Box::new(PromptAllowAll));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let summary = rt
+            .block_on(runtime.run_turn_async("inspect until done", &prompter))
+            .expect("tool governance should return partial report instead of an error");
+
+        let final_text = summary
+            .assistant_messages
+            .last()
+            .and_then(|message| message.blocks.first())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(final_text.contains("partial answer"));
+        assert!(final_text.contains("max iterations exceeded"));
+        assert_eq!(summary.tool_results.len(), 1);
+    }
+
+    #[test]
     fn max_iterations_accessor_tracks_runtime_budget_updates() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -5543,8 +6157,12 @@ mod tests {
                     cache_read_tokens: 0,
                     total_tokens: 580,
                     usage_source: "provider".to_string(),
-                    chars_per_second: Some(1_000.0),
-                    tokens_per_second: Some(180.0),
+                    wall_chars_per_second: Some(833.33),
+                    wall_tokens_per_second: Some(150.0),
+                    active_chars_per_second: Some(1_000.0),
+                    active_tokens_per_second: Some(180.0),
+                    chars_per_second: Some(833.33),
+                    tokens_per_second: Some(150.0),
                 },
                 Some(0.72),
                 false,
@@ -5564,8 +6182,12 @@ mod tests {
                     cache_read_tokens: 0,
                     total_tokens: 1_260,
                     usage_source: "provider".to_string(),
-                    chars_per_second: Some(1_000.0),
-                    tokens_per_second: Some(90.0),
+                    wall_chars_per_second: Some(800.0),
+                    wall_tokens_per_second: Some(72.0),
+                    active_chars_per_second: Some(1_000.0),
+                    active_tokens_per_second: Some(90.0),
+                    chars_per_second: Some(800.0),
+                    tokens_per_second: Some(72.0),
                 },
                 Some(0.96),
                 false,
@@ -6449,6 +7071,147 @@ mod tests {
             runtime.session().session_id
         );
         assert!(result.compacted_session.compaction.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_compaction_writes_traceable_semantic_checkpoint() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "we should preserve the migration constraint and next todo".to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let mem_cfg = memory::config::MemoryConfig {
+            store: memory::config::StoreConfig {
+                sqlite_path: tmp.path().join("memory.db"),
+                blob_dir,
+                enable_vector_index: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let now = "2026-06-29T00:00:00Z".to_string();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: session_id.clone(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "none".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_memory_manager(Arc::clone(&mgr))
+        .with_session_store(Arc::clone(&store));
+        let prompter = SharedPrompter::none();
+
+        runtime
+            .run_turn_async("must keep the backend migration constraint", &prompter)
+            .await
+            .unwrap();
+        runtime
+            .run_turn_async("next we should verify checkpoint recall", &prompter)
+            .await
+            .unwrap();
+        runtime
+            .run_turn_async("record tool evidence and critical context", &prompter)
+            .await
+            .unwrap();
+
+        let event = runtime
+            .compact_session_with_checkpoint(CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+                priority_threshold: 3,
+                keep_high_priority: true,
+            })
+            .await
+            .expect("compaction should run");
+        let receipt = event
+            .compaction_receipt
+            .expect("semantic compaction receipt should exist");
+
+        assert!(receipt
+            .dropped_artifact_ids
+            .iter()
+            .any(|id| id.starts_with("session-message:")));
+        assert!(receipt
+            .evidence_refs
+            .iter()
+            .any(|reference| reference.0.ref_type == "session-message"));
+        assert!(receipt
+            .retained_artifact_ids
+            .iter()
+            .any(|id| id.starts_with("checkpoint:")));
+        assert!(receipt
+            .retained_artifact_ids
+            .iter()
+            .any(|id| id.starts_with("memory:")));
+
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            events = store.get_events(&session_id, 0).await.unwrap();
+            if events
+                .iter()
+                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .any(|event| event.kind == "context.session_compacted")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let runtime_events = events
+            .iter()
+            .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
+            .collect::<Vec<_>>();
+        assert!(runtime_events
+            .iter()
+            .any(|event| event.kind == "context.session_compacted"));
+        assert!(runtime_events
+            .iter()
+            .any(|event| event.kind == "memory.semantic_checkpoint.created"));
+
+        let entries = mgr.list_all_entries().await.unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.tags.iter().any(|tag| tag == "semantic-checkpoint")
+                && entry.content.contains("Evidence refs:")
+                && entry.session_id.as_deref() == Some(&session_id)
+        }));
+        let stored_count = store.get_message_count(&session_id).await.unwrap();
+        assert!(stored_count >= 6, "raw messages should remain persisted");
     }
 
     #[test]

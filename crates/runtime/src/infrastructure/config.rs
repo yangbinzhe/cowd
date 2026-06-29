@@ -423,6 +423,8 @@ impl Default for MicroCompactConfig {
 pub struct SessionCompactConfig {
     #[serde(default = "default_session_threshold_tokens")]
     pub threshold_tokens: u32,
+    #[serde(default = "default_session_threshold_ratio_bp")]
+    pub threshold_ratio_bp: u32,
     #[serde(default = "default_preserve_recent")]
     pub preserve_recent: u32,
     #[serde(default = "default_summary_max")]
@@ -432,7 +434,10 @@ pub struct SessionCompactConfig {
 }
 
 fn default_session_threshold_tokens() -> u32 {
-    80000
+    0
+}
+fn default_session_threshold_ratio_bp() -> u32 {
+    7000
 }
 fn default_preserve_recent() -> u32 {
     6
@@ -447,7 +452,8 @@ fn default_buffer_tokens() -> u32 {
 impl Default for SessionCompactConfig {
     fn default() -> Self {
         Self {
-            threshold_tokens: 80000,
+            threshold_tokens: 0,
+            threshold_ratio_bp: 7000,
             preserve_recent: 6,
             summary_max_tokens: 2000,
             buffer_tokens: 13000,
@@ -712,6 +718,7 @@ pub struct McpManagedProxyServerConfig {
 pub struct MemoryConfig {
     pub enabled: bool,
     pub store_path: Option<PathBuf>,
+    pub runtime: MemoryRuntimeConfig,
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
     pub vector: VectorConfig,
@@ -722,6 +729,14 @@ pub struct MemoryConfig {
     /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
     /// Entries with score below this are excluded from context injection.
     pub coherence_threshold_bp: u32,
+}
+
+/// Runtime-owned memory execution switches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRuntimeConfig {
+    pub use_runtime_budget: bool,
+    pub semantic_checkpoint_enabled: bool,
+    pub recall_checkpoint_limit: u32,
 }
 
 /// Controls automatic memory extraction behaviour.
@@ -735,11 +750,22 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             store_path: None,
+            runtime: MemoryRuntimeConfig::default(),
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
             vector: VectorConfig::default(),
             aaak_index_enabled: true,
             coherence_threshold_bp: 1000,
+        }
+    }
+}
+
+impl Default for MemoryRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            use_runtime_budget: true,
+            semantic_checkpoint_enabled: true,
+            recall_checkpoint_limit: 3,
         }
     }
 }
@@ -1854,6 +1880,31 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
         .map(|s| crate::cowd_dirs::expand_tilde(s));
+    let runtime = if let Some(runtime_val) = mem.get("runtime") {
+        let r = expect_object(runtime_val, "merged settings.memory.runtime")?;
+        MemoryRuntimeConfig {
+            use_runtime_budget: optional_bool_dual(
+                r,
+                "use_runtime_budget",
+                "merged settings.memory.runtime",
+            )?
+            .unwrap_or(MemoryRuntimeConfig::default().use_runtime_budget),
+            semantic_checkpoint_enabled: optional_bool_dual(
+                r,
+                "semantic_checkpoint_enabled",
+                "merged settings.memory.runtime",
+            )?
+            .unwrap_or(MemoryRuntimeConfig::default().semantic_checkpoint_enabled),
+            recall_checkpoint_limit: optional_u32_dual(
+                r,
+                "recall_checkpoint_limit",
+                "merged settings.memory.runtime",
+            )?
+            .unwrap_or(MemoryRuntimeConfig::default().recall_checkpoint_limit),
+        }
+    } else {
+        MemoryRuntimeConfig::default()
+    };
     let layers = if let Some(layers_val) = mem.get("layers") {
         let l = expect_object(layers_val, "merged settings.memory.layers")?;
         LayerConfig {
@@ -1953,6 +2004,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     Ok(MemoryConfig {
         enabled: enabled.unwrap_or(MemoryConfig::default().enabled),
         store_path,
+        runtime,
         layers,
         extraction,
         vector,
@@ -1974,17 +2026,17 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let micro = if let Some(micro_val) = cmp.get("micro") {
         let m = expect_object(micro_val, "merged settings.compression.micro")?;
         MicroCompactConfig {
-            enabled: optional_bool(m, "enabled", "merged settings.compression.micro")?
+            enabled: optional_bool_dual(m, "enabled", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().enabled),
-            tool_result_max_chars: optional_u32(
+            tool_result_max_chars: optional_u32_dual(
                 m,
-                "toolResultMaxChars",
+                "tool_result_max_chars",
                 "merged settings.compression.micro",
             )?
             .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
-            time_decay_factor: optional_f32(
+            time_decay_factor: optional_f32_dual(
                 m,
-                "timeDecayFactor",
+                "time_decay_factor",
                 "merged settings.compression.micro",
             )?
             .unwrap_or(MicroCompactConfig::default().time_decay_factor),
@@ -1995,26 +2047,36 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let session = if let Some(sess_val) = cmp.get("session") {
         let s = expect_object(sess_val, "merged settings.compression.session")?;
         SessionCompactConfig {
-            threshold_tokens: optional_u32(
+            threshold_tokens: optional_u32_dual(
                 s,
-                "thresholdTokens",
+                "threshold_tokens",
                 "merged settings.compression.session",
             )?
             .unwrap_or(SessionCompactConfig::default().threshold_tokens),
-            preserve_recent: optional_u32(
+            threshold_ratio_bp: optional_u32_dual(
                 s,
-                "preserveRecent",
+                "threshold_ratio_bp",
+                "merged settings.compression.session",
+            )?
+            .unwrap_or(SessionCompactConfig::default().threshold_ratio_bp),
+            preserve_recent: optional_u32_dual(
+                s,
+                "preserve_recent",
                 "merged settings.compression.session",
             )?
             .unwrap_or(SessionCompactConfig::default().preserve_recent),
-            summary_max_tokens: optional_u32(
+            summary_max_tokens: optional_u32_dual(
                 s,
-                "summaryMaxTokens",
+                "summary_max_tokens",
                 "merged settings.compression.session",
             )?
             .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
-            buffer_tokens: optional_u32(s, "bufferTokens", "merged settings.compression.session")?
-                .unwrap_or(SessionCompactConfig::default().buffer_tokens),
+            buffer_tokens: optional_u32_dual(
+                s,
+                "buffer_tokens",
+                "merged settings.compression.session",
+            )?
+            .unwrap_or(SessionCompactConfig::default().buffer_tokens),
         }
     } else {
         SessionCompactConfig::default()
@@ -2022,11 +2084,11 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let deep = if let Some(deep_val) = cmp.get("deep") {
         let d = expect_object(deep_val, "merged settings.compression.deep")?;
         DeepCompactConfig {
-            enabled: optional_bool(d, "enabled", "merged settings.compression.deep")?
+            enabled: optional_bool_dual(d, "enabled", "merged settings.compression.deep")?
                 .unwrap_or(DeepCompactConfig::default().enabled),
-            iterative_update: optional_bool(
+            iterative_update: optional_bool_dual(
                 d,
-                "iterativeUpdate",
+                "iterative_update",
                 "merged settings.compression.deep",
             )?
             .unwrap_or(DeepCompactConfig::default().iterative_update),
@@ -2034,18 +2096,20 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     } else {
         DeepCompactConfig::default()
     };
-    let circuit_breaker = if let Some(cb_val) = cmp.get("circuitBreaker") {
+    let circuit_breaker = if let Some(cb_val) =
+        find_key_dual(cmp, "circuit_breaker", "merged settings.compression")
+    {
         let cb = expect_object(cb_val, "merged settings.compression.circuitBreaker")?;
         CircuitBreakerConfig {
-            max_retries: optional_u32(
+            max_retries: optional_u32_dual(
                 cb,
-                "maxRetries",
+                "max_retries",
                 "merged settings.compression.circuitBreaker",
             )?
             .unwrap_or(CircuitBreakerConfig::default().max_retries),
-            cooldown_secs: optional_u32(
+            cooldown_secs: optional_u32_dual(
                 cb,
-                "cooldownSecs",
+                "cooldown_secs",
                 "merged settings.compression.circuitBreaker",
             )?
             .unwrap_or(CircuitBreakerConfig::default().cooldown_secs),
@@ -2370,6 +2434,25 @@ fn optional_f32(
             json_value_type_name(other)
         ))),
     }
+}
+
+/// Look up a f32 config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_f32_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<f32>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_f32(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_f32(object, &camel_key, ctx);
+    }
+    Ok(None)
 }
 
 fn json_value_type_name(v: &JsonValue) -> &'static str {
@@ -2883,9 +2966,10 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource, DomainProfile,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, COWD_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_optional_compression_config, parse_permission_mode_label,
+        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport,
+        ResolvedPermissionMode, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -3950,5 +4034,72 @@ gateway:
 
         // then — should fall back to None (not panic)
         assert_eq!(config.max_output_tokens(), None);
+    }
+
+    #[test]
+    fn compression_session_defaults_to_ratio_based_threshold() {
+        let session = SessionCompactConfig::default();
+
+        assert_eq!(session.threshold_tokens, 0);
+        assert_eq!(session.threshold_ratio_bp, 7000);
+    }
+
+    #[test]
+    fn parses_compression_session_threshold_ratio_bp() {
+        let root = JsonValue::parse(
+            r#"{
+                "compression": {
+                    "micro": {
+                        "tool_result_max_chars": 8000,
+                        "time_decay_factor": 1
+                    },
+                    "session": {
+                        "threshold_ratio_bp": 6500,
+                        "preserve_recent": 12
+                    },
+                    "deep": {
+                        "iterative_update": false
+                    },
+                    "circuit_breaker": {
+                        "max_retries": 5,
+                        "cooldown_secs": 60
+                    }
+                }
+            }"#,
+        )
+        .expect("json should parse");
+
+        let compression =
+            parse_optional_compression_config(&root).expect("compression config should parse");
+
+        assert_eq!(compression.session.threshold_tokens, 0);
+        assert_eq!(compression.session.threshold_ratio_bp, 6500);
+        assert_eq!(compression.session.preserve_recent, 12);
+        assert_eq!(compression.micro.tool_result_max_chars, 8000);
+        assert!((compression.micro.time_decay_factor - 1.0).abs() < f32::EPSILON);
+        assert!(!compression.deep.iterative_update);
+        assert_eq!(compression.circuit_breaker.max_retries, 5);
+        assert_eq!(compression.circuit_breaker.cooldown_secs, 60);
+    }
+
+    #[test]
+    fn parses_deprecated_camel_case_compression_keys() {
+        let root = JsonValue::parse(
+            r#"{
+                "compression": {
+                    "session": {
+                        "thresholdRatioBp": 6400,
+                        "preserveRecent": 10
+                    }
+                }
+            }"#,
+        )
+        .expect("json should parse");
+
+        let compression =
+            parse_optional_compression_config(&root).expect("compression config should parse");
+
+        assert_eq!(compression.session.threshold_ratio_bp, 6400);
+        assert_eq!(compression.session.preserve_recent, 10);
     }
 }

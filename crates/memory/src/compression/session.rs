@@ -12,6 +12,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use harness_contract::core::EvidenceRef;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     compression::{llm_summarizer::LlmSummarizer, Result},
@@ -111,6 +113,110 @@ pub struct SessionCompactor {
     config: SessionCompactConfig,
     /// Optional LLM summariser for semantic summary generation.
     llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionSourceRange {
+    pub session_id: String,
+    pub message_start: usize,
+    pub message_end_exclusive: usize,
+    pub event_start: Option<usize>,
+    pub event_end_exclusive: Option<usize>,
+    pub raw_refs: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFactKind {
+    Decision,
+    Constraint,
+    PendingWork,
+    Preference,
+    CodeChange,
+    ToolEvidence,
+    CriticalContext,
+    Summary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCheckpointBuildContext {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub team_id: Option<String>,
+    pub source_range: CompactionSourceRange,
+}
+
+impl SessionCheckpointBuildContext {
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        source_range: CompactionSourceRange,
+    ) -> Self {
+        Self {
+            checkpoint_id: format!("checkpoint-{}", uuid::Uuid::new_v4()),
+            session_id: session_id.into(),
+            agent_id: agent_id.into(),
+            project_id: None,
+            task_id: None,
+            team_id: None,
+            source_range,
+        }
+    }
+
+    #[must_use]
+    pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
+        self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_id(mut self, task_id: Option<String>) -> Self {
+        self.task_id = task_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_team_id(mut self, team_id: Option<String>) -> Self {
+        self.team_id = team_id;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointTokenStats {
+    pub before: u64,
+    pub after: u64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCheckpointFact {
+    pub kind: CheckpointFactKind,
+    pub title: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub layer: MemoryLayer,
+    pub tags: Vec<String>,
+    pub confidence: f32,
+    pub evidence_refs: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSemanticCheckpoint {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub team_id: Option<String>,
+    pub summary: String,
+    pub token_stats: CheckpointTokenStats,
+    pub source_range: CompactionSourceRange,
+    pub facts: Vec<SessionCheckpointFact>,
 }
 
 impl SessionCompactor {
@@ -218,6 +324,155 @@ impl SessionCompactor {
             tokens_after,
             memories_extracted,
             summary_tokens,
+        })
+    }
+
+    /// Build a semantic checkpoint without mutating messages or writing memory.
+    ///
+    /// Runtime uses this API before replacing old messages, then writes the
+    /// returned summary/facts through [`MemoryKernel`] with the active
+    /// session/project scope. This avoids the historical empty-scope writes in
+    /// [`Self::compact`] while preserving the mature summary extraction logic.
+    pub async fn build_checkpoint(
+        &self,
+        messages: &[Message],
+        previous_summary: Option<&str>,
+        build_context: SessionCheckpointBuildContext,
+    ) -> Result<SessionSemanticCheckpoint> {
+        let summary = self.generate_summary(messages, previous_summary).await;
+        let summary_tokens = (summary.len() as u32).div_ceil(4);
+        let input_tokens = self.estimate_tokens(messages);
+        let mut facts = Vec::new();
+        let evidence_refs = build_context.source_range.raw_refs.clone();
+
+        for decision in self.extract_decisions(messages) {
+            let decision_title: String = decision.chars().take(80).collect();
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::Decision,
+                format!("Decision: {decision_title}"),
+                decision,
+                MemoryCategory::Decision,
+                MemoryLayer::L2,
+                vec!["decision"],
+                0.82,
+                &evidence_refs,
+            ));
+        }
+
+        let preferences = self.extract_preferences(messages);
+        if !preferences.trim().is_empty() && preferences.trim() != "None" {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::Preference,
+                "Session preferences checkpoint",
+                preferences,
+                MemoryCategory::UserPreference,
+                MemoryLayer::L2,
+                vec!["preference"],
+                0.76,
+                &evidence_refs,
+            ));
+        }
+
+        let constraints = self.extract_constraints(messages);
+        if !constraints.is_empty() {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::Constraint,
+                "Session constraints checkpoint",
+                constraints,
+                MemoryCategory::ProjectConvention,
+                MemoryLayer::L2,
+                vec!["constraint"],
+                0.74,
+                &evidence_refs,
+            ));
+        }
+
+        let pending_work = self.infer_next_steps(messages);
+        if !pending_work.trim().is_empty() && pending_work.trim() != "None" {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::PendingWork,
+                "Session pending work checkpoint",
+                pending_work,
+                MemoryCategory::ProjectKnowledge,
+                MemoryLayer::L2,
+                vec!["pending-work"],
+                0.72,
+                &evidence_refs,
+            ));
+        }
+
+        let code_changes = self.extract_code_changes(messages);
+        if !is_negative_checkpoint_text(&code_changes) {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::CodeChange,
+                "Session code changes checkpoint",
+                code_changes,
+                MemoryCategory::ProjectKnowledge,
+                MemoryLayer::L2,
+                vec!["code-change"],
+                0.70,
+                &evidence_refs,
+            ));
+        }
+
+        let tool_evidence = self.extract_tool_evidence(messages);
+        if !tool_evidence.is_empty() {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::ToolEvidence,
+                "Session tool evidence checkpoint",
+                tool_evidence,
+                MemoryCategory::Reference,
+                MemoryLayer::L3,
+                vec!["tool-evidence"],
+                0.80,
+                &evidence_refs,
+            ));
+        }
+
+        let critical_context = self.extract_critical_context(messages);
+        if !critical_context.is_empty() {
+            facts.push(checkpoint_fact(
+                CheckpointFactKind::CriticalContext,
+                "Session critical context checkpoint",
+                critical_context,
+                MemoryCategory::Reference,
+                MemoryLayer::L3,
+                vec!["critical-context"],
+                0.78,
+                &evidence_refs,
+            ));
+        }
+
+        facts.push(checkpoint_fact(
+            CheckpointFactKind::Summary,
+            format!(
+                "Session checkpoint {} - {}",
+                build_context.checkpoint_id,
+                Utc::now().format("%Y-%m-%d %H:%M")
+            ),
+            summary.clone(),
+            MemoryCategory::CompressedSummary,
+            MemoryLayer::L3,
+            vec!["session-summary"],
+            0.86,
+            &evidence_refs,
+        ));
+
+        Ok(SessionSemanticCheckpoint {
+            checkpoint_id: build_context.checkpoint_id,
+            session_id: build_context.session_id,
+            agent_id: build_context.agent_id,
+            project_id: build_context.project_id,
+            task_id: build_context.task_id,
+            team_id: build_context.team_id,
+            summary,
+            token_stats: CheckpointTokenStats {
+                before: u64::from(input_tokens),
+                after: u64::from(summary_tokens),
+                message_count: messages.len(),
+            },
+            source_range: build_context.source_range,
+            facts,
         })
     }
 
@@ -515,6 +770,35 @@ None
         decisions
     }
 
+    fn extract_constraints(&self, messages: &[Message]) -> String {
+        let keywords = [
+            "must",
+            "必须",
+            "一定要",
+            "不要",
+            "不能",
+            "禁止",
+            "constraint",
+            "requirement",
+            "strictly",
+            "ensure",
+        ];
+        let mut constraints = Vec::new();
+        for msg in messages {
+            for line in msg.content.lines() {
+                let lower = line.to_lowercase();
+                if keywords.iter().any(|kw| lower.contains(kw)) {
+                    let trimmed = line.trim();
+                    if trimmed.len() > 10 && trimmed.len() < 400 {
+                        constraints.push(format!("- {trimmed}"));
+                    }
+                }
+            }
+        }
+        constraints.dedup();
+        constraints.join("\n")
+    }
+
     fn extract_code_changes(&self, messages: &[Message]) -> String {
         // Count tool calls that look like file writes.
         let write_ops = messages
@@ -534,6 +818,46 @@ None
         } else {
             format!("{write_ops} file write/edit operation(s) performed.")
         }
+    }
+
+    fn extract_tool_evidence(&self, messages: &[Message]) -> String {
+        let mut tools = messages
+            .iter()
+            .filter(|message| message.is_tool_result())
+            .filter_map(|message| message.tool_name.as_deref())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        tools.sort();
+        tools.dedup();
+        if tools.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Tools observed while producing this checkpoint: {}",
+                tools.join(", ")
+            )
+        }
+    }
+
+    fn extract_critical_context(&self, messages: &[Message]) -> String {
+        let keywords = [
+            "token", "version", "tag", "branch", "api", "配置", "版本", "权限", "测试", "失败",
+            "error", "warning",
+        ];
+        let mut lines = Vec::new();
+        for msg in messages.iter().rev().take(24) {
+            for line in msg.content.lines() {
+                let lower = line.to_lowercase();
+                if keywords.iter().any(|kw| lower.contains(kw)) {
+                    let trimmed = line.trim();
+                    if trimmed.len() > 12 && trimmed.len() < 500 {
+                        lines.push(format!("- {trimmed}"));
+                    }
+                }
+            }
+        }
+        lines.dedup();
+        lines.into_iter().take(12).collect::<Vec<_>>().join("\n")
     }
 
     fn extract_errors_fixed(&self, messages: &[Message]) -> String {
@@ -686,6 +1010,40 @@ impl Default for SessionCompactor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn checkpoint_fact(
+    kind: CheckpointFactKind,
+    title: impl Into<String>,
+    content: impl Into<String>,
+    category: MemoryCategory,
+    layer: MemoryLayer,
+    specific_tags: Vec<&str>,
+    confidence: f32,
+    evidence_refs: &[EvidenceRef],
+) -> SessionCheckpointFact {
+    let mut tags = vec!["compression".to_string(), "semantic-checkpoint".to_string()];
+    tags.extend(specific_tags.into_iter().map(str::to_string));
+    SessionCheckpointFact {
+        kind,
+        title: title.into(),
+        content: content.into(),
+        category,
+        layer,
+        tags,
+        confidence,
+        evidence_refs: evidence_refs.to_vec(),
+    }
+}
+
+fn is_negative_checkpoint_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed == "None"
+        || trimmed.starts_with("No ")
+        || trimmed.starts_with("No explicit")
+        || trimmed.starts_with("No file")
+        || trimmed.starts_with("No next")
 }
 
 // ---------------------------------------------------------------------------
