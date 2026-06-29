@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_returning_actions_are_not_fake_accepted() {
+    fn complex_execution_actions_return_runtime_owned_ready_packets() {
         for action in [
             RuntimeOrchestrationAction::RequestParallelTools,
             RuntimeOrchestrationAction::RequestRewooEvidence,
@@ -108,9 +108,14 @@ mod tests {
                 constraints: Default::default(),
                 surface: None,
             });
-            assert_eq!(result.status, "planned");
-            assert_eq!(result.execution["status"], "planned");
-            assert!(result.execution["execution_fidelity"].is_string());
+            assert_eq!(result.status, "ready");
+            assert_eq!(result.execution["status"], "ready");
+            let fidelity = result.execution["execution_fidelity"]
+                .as_str()
+                .expect("execution fidelity");
+            assert!(fidelity.starts_with("runtime_owned_"), "{fidelity}");
+            assert!(!fidelity.contains("planned"), "{fidelity}");
+            assert!(result.execution["engine"]["owned_by"] == "runtime");
         }
     }
 

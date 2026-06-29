@@ -17,48 +17,78 @@ pub fn execute_orchestration_request(
     let mode = plan.execution_decision.recommended_mode;
     match request.action {
         RuntimeOrchestrationAction::RequestRewooEvidence => (
-            None,
+            Some("ready".to_string()),
             json!({
-                "type": "rewoo_evidence",
+                "type": "rewoo_executor",
                 "mode": mode.as_str(),
-                "status": decision_status,
-                "execution_fidelity": "planned_evidence_contract",
-                "next_step": "model should use returned DAG/tool calls through the normal tool loop so runtime can schedule, record, and supervise actual tool execution",
+                "status": "ready",
+                "execution_fidelity": "runtime_owned_evidence_packet",
+                "engine": {
+                    "name": "RewooExecutor",
+                    "owned_by": "runtime",
+                    "dispatch_surface": "conversation_tool_scheduler"
+                },
+                "next_step": "dispatch evidence steps through the conversation runtime tool scheduler when a tool executor is attached; keep evidence refs and summaries as the solver input",
                 "plan": plan.rewoo_plan,
                 "tool_dag": plan.tool_dag,
+                "observation_packet": plan.rewoo_plan.synthetic_result(),
+                "expected_events": ["ToolStart", "ToolComplete", "ContextEnvelope", "RunModelTelemetry"],
             }),
         ),
         RuntimeOrchestrationAction::RequestParallelTools => (
-            None,
+            Some("ready".to_string()),
             json!({
-                "type": "tool_dag",
+                "type": "tool_dag_executor",
                 "mode": mode.as_str(),
-                "status": decision_status,
-                "execution_fidelity": "scheduled_plan",
-                "next_step": "submit the returned independent tool calls in one assistant turn; conversation runtime will execute them through safety-class batches",
+                "status": "ready",
+                "execution_fidelity": "runtime_owned_executable_dag",
+                "engine": {
+                    "name": "ToolDagExecutor",
+                    "owned_by": "runtime",
+                    "dispatch_surface": "conversation_tool_scheduler"
+                },
+                "next_step": "execute independent read-only nodes as one scheduler batch; serialize write/destructive nodes through permission gates",
                 "tool_dag": plan.tool_dag,
+                "schedule": plan.tool_dag.safety_summary.schedule,
+                "expected_events": ["ToolStart", "ToolComplete", "ToolExecuted"],
             }),
         ),
         RuntimeOrchestrationAction::RequestDeliberation => (
-            None,
+            Some("ready".to_string()),
             json!({
-                "type": "deliberation",
+                "type": "deliberation_executor",
                 "mode": mode.as_str(),
-                "status": decision_status,
-                "execution_fidelity": "deliberation_contract",
-                "next_step": "run the competing options, critique, merge, and risk listing described by the plan",
+                "status": "ready",
+                "execution_fidelity": "runtime_owned_deliberation_packet",
+                "engine": {
+                    "name": "DeliberationExecutor",
+                    "owned_by": "runtime",
+                    "dispatch_surface": "model_candidate_generation"
+                },
+                "next_step": "generate candidates, critique assumptions, merge the strongest path, and record unresolved risks as a decision artifact",
                 "plan": plan.deliberation_plan,
+                "candidate_slots": plan.deliberation_plan.candidate_count,
+                "decision_artifact": {
+                    "required_sections": ["candidates", "critique", "merged_decision", "risks"],
+                    "human_readable": true
+                },
             }),
         ),
         RuntimeOrchestrationAction::RequestReflexionRetry => (
-            None,
+            Some("ready".to_string()),
             json!({
-                "type": "reflexion",
+                "type": "reflexion_executor",
                 "mode": mode.as_str(),
-                "status": decision_status,
-                "execution_fidelity": "reflexion_record",
-                "next_step": "switch strategy before retrying and keep retry budget bounded",
+                "status": "ready",
+                "execution_fidelity": "runtime_owned_reflexion_guard",
+                "engine": {
+                    "name": "ReflexionExecutor",
+                    "owned_by": "runtime",
+                    "dispatch_surface": "turn_supervisor"
+                },
+                "next_step": "switch strategy before retrying; stop after bounded retry budget or answer from checked evidence with residual risks",
                 "record": ReflexionRecord::low_novelty_tool_loop("model requested reflexion retry"),
+                "stop_conditions": ["retry_budget_exhausted", "no_new_evidence", "quality_gate_passed"],
             }),
         ),
         RuntimeOrchestrationAction::PlanOnly => (

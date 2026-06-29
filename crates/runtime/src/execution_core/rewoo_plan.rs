@@ -91,7 +91,10 @@ impl RewooEvidencePlan {
             .map(|step| RewooObservation {
                 step_id: step.id.clone(),
                 output_ref: step.output_ref.clone(),
-                summary: format!("planned {} for {}", step.tool_name, step.purpose),
+                summary: format!(
+                    "prepared executable evidence step `{}` for {}",
+                    step.tool_name, step.purpose
+                ),
             })
             .collect::<Vec<_>>();
         RewooEvidenceResult {
@@ -102,7 +105,7 @@ impl RewooEvidencePlan {
                 .map(|step| step.output_ref.clone())
                 .collect(),
             observations,
-            summary: format!("{} evidence steps planned", self.steps.len()),
+            summary: format!("{} executable evidence steps prepared", self.steps.len()),
             next_guidance: self.solver_contract.answer_guidance.clone(),
         }
     }
