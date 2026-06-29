@@ -184,6 +184,10 @@ fn suppression_reason_for_turn_intent(
         );
     }
 
+    if let Some(reason) = code_evidence_quantity_conflict(&intent_text, &item_text) {
+        return Some(reason);
+    }
+
     if turn_caps_code_evidence_to_two(&intent_text)
         && memory_requires_many_code_evidence_paths(&item_text)
     {
@@ -200,6 +204,93 @@ fn suppression_reason_for_turn_intent(
         );
     }
 
+    None
+}
+
+fn code_evidence_quantity_conflict(intent: &str, memory: &str) -> Option<String> {
+    if !mentions_code_evidence(intent) || !mentions_code_evidence(memory) {
+        return None;
+    }
+    let current_max = extract_quantity_bound(
+        intent,
+        &["最多", "不超过", "以内", "at most", "no more than"],
+    )?;
+    let memory_min = extract_quantity_bound(memory, &["至少", "不少于", "minimum", "at least"])?;
+    if memory_min > current_max {
+        return Some(format!(
+            "suppressed_for_current_turn: current instruction caps code evidence to {current_max}, recalled memory requires at least {memory_min}"
+        ));
+    }
+    None
+}
+
+fn mentions_code_evidence(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "代码点",
+            "代码路径",
+            "关键代码",
+            "代码",
+            "路径",
+            "引用",
+            "证据",
+            "code point",
+            "code path",
+            "code references",
+            "code",
+            "path",
+            "reference",
+            "evidence",
+        ],
+    )
+}
+
+fn extract_quantity_bound(text: &str, markers: &[&str]) -> Option<usize> {
+    markers
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|index| &text[index + marker.len()..]))
+        .filter_map(extract_leading_quantity)
+        .next()
+}
+
+fn extract_leading_quantity(text: &str) -> Option<usize> {
+    let trimmed = text
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：' | ',' | '，'));
+    let digits = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if !digits.is_empty() {
+        return digits.parse::<usize>().ok();
+    }
+    for (word, value) in [
+        ("一", 1),
+        ("二", 2),
+        ("两", 2),
+        ("三", 3),
+        ("四", 4),
+        ("五", 5),
+        ("六", 6),
+        ("七", 7),
+        ("八", 8),
+        ("九", 9),
+        ("十", 10),
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+    ] {
+        if trimmed.starts_with(word) {
+            return Some(value);
+        }
+    }
     None
 }
 
@@ -656,6 +747,28 @@ mod tests {
                 &packet,
             )
             .is_none());
+    }
+
+    #[test]
+    fn runtime_memory_filter_suppresses_generalized_code_evidence_quantity_conflict() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Review rule: at least five code references are required",
+                MemoryLayer::L3,
+                MemoryPacketRole::Warning,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+        };
+
+        let filtered = filter_packet_for_turn_intent(&packet, "Use at most three code references.");
+
+        assert!(filtered.selected.is_empty());
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("current instruction caps code evidence to 3"));
+        assert!(filtered.omitted[0].reason.contains("requires at least 5"));
     }
 
     #[test]
