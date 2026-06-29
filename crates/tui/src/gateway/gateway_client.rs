@@ -145,6 +145,17 @@ impl GatewayApiClient {
         self.get_json("/api/sessions").await
     }
 
+    pub async fn session_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/projection",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
     pub async fn ensure_session(
         &self,
         session_id: &str,
@@ -1349,6 +1360,38 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
         "TurnCancelRequested" | "turn_cancel_requested" => Some(CowdEvent::Warning {
             message: "Gateway cancel request accepted".to_string(),
         }),
+        "ContextEnvelope" | "context_envelope" => value
+            .get("envelope")
+            .cloned()
+            .map(|envelope| CowdEvent::ContextEnvelope { envelope }),
+        "TokenUsage" | "token_usage" => Some(CowdEvent::TokenUsage {
+            input: value
+                .get("input")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            output: value
+                .get("output")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache_create: value
+                .get("cache_create")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache_read: value
+                .get("cache_read")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        }),
+        "RuntimePolicyDecision" | "runtime_policy_decision" => value
+            .get("summary")
+            .cloned()
+            .and_then(|summary| serde_json::from_value(summary).ok())
+            .map(|summary| CowdEvent::RuntimePolicyDecision { summary }),
+        "WorkGraphSummary" | "workgraph_summary" => value
+            .get("summary")
+            .cloned()
+            .and_then(|summary| serde_json::from_value(summary).ok())
+            .map(|summary| CowdEvent::WorkGraphSummary { summary }),
         _ => None,
     }
 }
@@ -1419,6 +1462,26 @@ mod tests {
             })),
             Some(CowdEvent::TurnComplete { .. })
         ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "ContextEnvelope",
+                "envelope": {
+                    "id": "ctx-v31",
+                    "selected": []
+                }
+            })),
+            Some(CowdEvent::ContextEnvelope { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "TokenUsage",
+                "input": 1,
+                "output": 2,
+                "cache_create": 3,
+                "cache_read": 4
+            })),
+            Some(CowdEvent::TokenUsage { .. })
+        ));
     }
 
     #[test]
@@ -1438,6 +1501,7 @@ mod tests {
             "status",
             "runtime_snapshot",
             "list_sessions",
+            "session_projection",
             "ensure_session",
             "acquire_session_lease",
             "release_session_lease",
@@ -1533,7 +1597,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 96);
+        assert_eq!(migrated.len(), 97);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -1588,6 +1652,33 @@ mod tests {
         let json = client.cowd_projection("tui").await.expect("json");
         assert_eq!(json["surface"], "tui");
         assert_eq!(json["capability_count"], 1);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn session_projection_gets_session_run_projection_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept projection");
+            let mut buf = vec![0; 2048];
+            let n = socket.read(&mut buf).await.expect("read projection");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET /api/sessions/session%20v31/projection HTTP/1.1"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{\"kind\":\"session.run_projection\",\"session_id\":\"session v31\"}",
+                )
+                .await
+                .expect("write projection");
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        let json = client
+            .session_projection("session v31")
+            .await
+            .expect("json");
+        assert_eq!(json["kind"], "session.run_projection");
         server.await.expect("server task");
     }
 

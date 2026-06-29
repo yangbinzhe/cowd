@@ -368,6 +368,16 @@ fn attach_gateway_session(
     let components = snapshot.runtime_components.unwrap_or_default();
     let degraded_reasons = snapshot.degraded_reasons.clone();
     snapshot.apply_to_app(&mut state.app);
+    match shared_rt().block_on(gateway_client.session_projection(&config.session_id)) {
+        Ok(projection) => {
+            state.app.apply_run_projection(projection);
+            state.add_message("system", "Gateway session run projection loaded");
+        }
+        Err(err) => state.add_message(
+            "system",
+            &format!("Gateway session run projection unavailable: {err}"),
+        ),
+    }
     if let Some(readiness) = readiness {
         state.add_message(
             "system",

@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.425`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.426`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -360,6 +360,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 | API | 用途 |
 |---|---|
+| `GET /api/sessions/:id/projection` | Session 运行投影：run graph、工具时间线、token/model telemetry、memory/context、team/session、risk/approval |
 | `GET /api/context/current` | 当前上下文 |
 | `GET /api/evidence/resolve` | evidence ref 解析 |
 | `GET /api/memory/status` | memory 状态 |
@@ -657,11 +658,12 @@ cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-par
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 - Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
+- Gateway 已提供 `session.run_projection`，从持久 `session_events` 聚合 run graph、工具时间线、token/model telemetry、memory/context 证据、team/session 状态和 risk/approval 事件；TUI 启动时会拉取该投影并在 Runtime Activity 面板展示紧凑摘要，WebUI/报告可消费同一事实源。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.425`。
+- 版本标签：`v0.9.426`。
 
 ### 11.2 是否达到当前阶段目标
 

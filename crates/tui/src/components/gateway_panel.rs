@@ -1053,7 +1053,11 @@ impl Component for GatewayPanel {
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
-            ("POST /api/sessions/:id/msgs", "Send message"),
+            ("POST /api/sessions/:id/messages", "Send message"),
+            (
+                "GET  /api/sessions/:id/projection",
+                "Session run evidence projection",
+            ),
             ("GET  /api/memory", "Memory status"),
             ("GET  /api/memory/stats", "Memory statistics"),
             ("GET  /api/memory/search", "Search memory"),

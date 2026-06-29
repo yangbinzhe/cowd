@@ -267,6 +267,7 @@ pub struct App {
     pub latest_context_envelope: Option<Value>,
     pub latest_runtime_policy: Option<crate::RuntimePolicyDecisionSummary>,
     pub latest_workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
+    pub latest_run_projection: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 
@@ -543,6 +544,7 @@ impl App {
             latest_context_envelope: None,
             latest_runtime_policy: None,
             latest_workgraph_summary: None,
+            latest_run_projection: None,
             input_tokens: 0,
             output_tokens: 0,
 
@@ -582,6 +584,25 @@ impl App {
             layout_state: LayoutState::new(),
             compact_chat: false,
         }
+    }
+
+    pub fn apply_run_projection(&mut self, projection: Value) {
+        if projection.get("kind").and_then(Value::as_str) != Some("session.run_projection") {
+            return;
+        }
+        if let Some(total) = projection
+            .pointer("/token_speed/stats/tokens/total")
+            .and_then(Value::as_u64)
+        {
+            self.token_count = total;
+        }
+        if let Some(envelope) = projection.pointer("/memory_context/context_envelope") {
+            if !envelope.is_null() {
+                self.latest_context_envelope = Some(envelope.clone());
+            }
+        }
+        self.latest_run_projection = Some(projection);
+        self.msg_version = self.msg_version.wrapping_add(1);
     }
 
     pub fn mark_dirty(&mut self) {
@@ -1220,6 +1241,7 @@ impl App {
                 self.latest_context_envelope = None;
                 self.latest_runtime_policy = None;
                 self.latest_workgraph_summary = None;
+                self.latest_run_projection = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
                 self.pre_turn_output = self.output_tokens;
@@ -1449,12 +1471,52 @@ mod tests {
             synthesis_lift: None,
             complementarity_score: None,
         });
+        app.latest_run_projection = Some(serde_json::json!({"kind": "session.run_projection"}));
 
         app.apply_event(CowdEvent::TurnStarted);
 
         assert!(app.latest_context_envelope.is_none());
         assert!(app.latest_runtime_policy.is_none());
         assert!(app.latest_workgraph_summary.is_none());
+        assert!(app.latest_run_projection.is_none());
+    }
+
+    #[test]
+    fn app_applies_gateway_session_run_projection() {
+        let mut app = App::new("test", "sess");
+        app.apply_run_projection(serde_json::json!({
+            "kind": "session.run_projection",
+            "token_speed": {
+                "stats": {
+                    "tokens": {
+                        "total": 512
+                    }
+                }
+            },
+            "memory_context": {
+                "context_envelope": {
+                    "id": "ctx-v31",
+                    "selected": [{"id": "mem-1"}],
+                    "omitted": []
+                }
+            }
+        }));
+
+        assert_eq!(app.token_count, 512);
+        assert_eq!(
+            app.latest_context_envelope
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some("ctx-v31")
+        );
+        assert_eq!(
+            app.latest_run_projection
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some("session.run_projection")
+        );
     }
 
     #[test]

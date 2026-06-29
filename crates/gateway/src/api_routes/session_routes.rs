@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -39,6 +42,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/:id/events", get(get_session_events))
         .route("/api/sessions/:id/runs", get(get_session_runs))
+        .route("/api/sessions/:id/projection", get(get_session_projection))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
 }
@@ -783,7 +787,7 @@ fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
 }
 
 fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     let mut parents: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -853,6 +857,192 @@ fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
     })
 }
 
+fn session_event_value(event: &SessionEvent) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+    serde_json::json!({
+        "session_id": event.session_id,
+        "type": event.event_type,
+        "sequence": event.sequence,
+        "created_at_ms": event.created_at_ms,
+        "payload": payload,
+    })
+}
+
+fn latest_payload_by_type(
+    events: &[serde_json::Value],
+    event_type: &str,
+) -> Option<serde_json::Value> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event["type"].as_str() == Some(event_type))
+        .and_then(|event| event.get("payload").cloned())
+}
+
+fn collect_payloads_by_types(
+    events: &[serde_json::Value],
+    event_types: &[&str],
+) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|event_type| event_types.contains(&event_type))
+        })
+        .filter_map(|event| event.get("payload").cloned())
+        .collect()
+}
+
+fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool {
+    payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| payload.get("kind").and_then(serde_json::Value::as_str))
+        .or_else(|| payload.get("event").and_then(serde_json::Value::as_str))
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            needles.iter().any(|needle| value.contains(needle))
+        })
+        .unwrap_or(false)
+}
+
+fn session_run_projection_from_events(
+    session_id: &str,
+    stored_events: Vec<SessionEvent>,
+    stats: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let events = stored_events
+        .iter()
+        .map(session_event_value)
+        .collect::<Vec<_>>();
+    let runs = stored_events
+        .iter()
+        .filter(|event| event.event_type == "RuntimeRun")
+        .cloned()
+        .map(runtime_run_event_json)
+        .collect::<Vec<_>>();
+    let runtime_run_count = runs.len();
+    let run_graph = runtime_run_tree_summary(&runs);
+    let tool_timeline = collect_payloads_by_types(
+        &events,
+        &["ToolStart", "ToolProgress", "ToolComplete", "PartialAnswer"],
+    );
+    let token_usage = collect_payloads_by_types(&events, &["TokenUsage"]);
+    let latest_model_telemetry = latest_payload_by_type(&events, "RunModelTelemetry")
+        .and_then(|payload| payload.get("telemetry").cloned().or(Some(payload)));
+    let latest_context_payload = latest_payload_by_type(&events, "ContextEnvelope");
+    let latest_context_envelope = latest_context_payload
+        .as_ref()
+        .and_then(|payload| payload.get("envelope").cloned());
+    let latest_context_turn_report = latest_payload_by_type(&events, "ContextTurnReport");
+    let selected_count = latest_context_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.get("selected"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let omitted_count = latest_context_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.get("omitted"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let evidence_refs = latest_context_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.get("selected"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("id")
+                        .or_else(|| item.get("memory_id"))
+                        .or_else(|| item.get("source_id"))
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for tool in &tool_timeline {
+        let name = tool
+            .get("name")
+            .or_else(|| tool.get("tool_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        *tool_counts.entry(name).or_default() += 1;
+    }
+    let agent_events = events
+        .iter()
+        .filter(|event| {
+            payload_type_contains(
+                event.get("payload").unwrap_or(&serde_json::Value::Null),
+                &["agent", "team", "mission", "workgraph", "collaboration"],
+            ) || payload_type_contains(event, &["agent", "team", "mission", "workgraph"])
+        })
+        .take(50)
+        .cloned()
+        .collect::<Vec<_>>();
+    let approval_events = events
+        .iter()
+        .filter(|event| {
+            payload_type_contains(
+                event.get("payload").unwrap_or(&serde_json::Value::Null),
+                &["approval", "risk", "permission"],
+            ) || payload_type_contains(event, &["approval", "risk", "permission"])
+        })
+        .take(50)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "kind": "session.run_projection",
+        "source": "gateway.session_events",
+        "session_id": session_id,
+        "view_modes": {
+            "default": "full_evidence",
+            "pure_available": true,
+            "pure_description": "正文和计数摘要由 surface 自行展示；证据详情来自同一投影。"
+        },
+        "runs": runs,
+        "run_graph": run_graph,
+        "tool_timeline": tool_timeline,
+        "tool_summary": {
+            "count": tool_counts.values().sum::<usize>(),
+            "by_name": tool_counts,
+        },
+        "token_speed": {
+            "stats": stats,
+            "token_usage": token_usage,
+            "model_telemetry": latest_model_telemetry,
+        },
+        "memory_context": {
+            "context_envelope": latest_context_envelope,
+            "context_turn_report": latest_context_turn_report,
+            "selected_count": selected_count,
+            "omitted_count": omitted_count,
+            "evidence_refs": evidence_refs,
+        },
+        "team_session": {
+            "runtime_run_count": runtime_run_count,
+            "agent_events": agent_events,
+            "session_event_count": events.len(),
+        },
+        "risk_approval": {
+            "count": approval_events.len(),
+            "approval_events": approval_events,
+        },
+        "event_digest": {
+            "total": events.len(),
+            "last_sequence": events.last().and_then(|event| event["sequence"].as_u64()),
+            "recent": events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+        }
+    })
+}
+
 async fn get_session_runs(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -903,6 +1093,62 @@ async fn get_session_runs(
         "limit": limit,
         "has_more": has_more,
     })))
+}
+
+async fn get_session_projection(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let Some((total, stored_events)) = state
+        .services
+        .session
+        .stored_events_page(&id, from_seq, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session projection events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let active_stats = if let Some(runtime_service) = state.services.runtime.as_ref() {
+        runtime_service
+            .active_session_stats(&id)
+            .await
+            .and_then(|stats| serde_json::to_value(stats).ok())
+    } else {
+        None
+    };
+    let stats = if active_stats.is_some() {
+        active_stats
+    } else {
+        stored_session_stats_response(&state, &id)
+            .await
+            .ok()
+            .and_then(|Json(stats)| serde_json::to_value(stats).ok())
+    };
+    let mut projection = session_run_projection_from_events(&id, stored_events, stats);
+    projection["paging"] = serde_json::json!({
+        "total": total,
+        "from_seq": from_seq,
+        "limit": limit,
+        "has_more": projection["event_digest"]["total"].as_u64().unwrap_or_default() < total as u64,
+    });
+
+    Ok(Json(projection))
 }
 
 async fn search_messages_handler(
@@ -1170,5 +1416,173 @@ async fn update_session_handler(
                 error: format!("session {id} not found"),
             }),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_event(
+        sequence: usize,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> SessionEvent {
+        SessionEvent {
+            session_id: "session-v31".to_string(),
+            event_type: event_type.to_string(),
+            event_json: payload.to_string(),
+            sequence,
+            created_at_ms: 1_000 + sequence as u64,
+        }
+    }
+
+    #[test]
+    fn session_run_projection_aggregates_runtime_evidence() {
+        let events = vec![
+            session_event(
+                0,
+                "RuntimeRun",
+                serde_json::json!({
+                    "run_id": "run-root",
+                    "parent_run_id": null,
+                    "status": "running"
+                }),
+            ),
+            session_event(
+                1,
+                "ToolStart",
+                serde_json::json!({
+                    "type": "ToolStart",
+                    "run_id": "run-root",
+                    "id": "tool-1",
+                    "name": "read",
+                    "preview": "README.md"
+                }),
+            ),
+            session_event(
+                2,
+                "ToolComplete",
+                serde_json::json!({
+                    "type": "ToolComplete",
+                    "run_id": "run-root",
+                    "id": "tool-1",
+                    "name": "read",
+                    "summary": "ok",
+                    "exit_code": 0
+                }),
+            ),
+            session_event(
+                3,
+                "TokenUsage",
+                serde_json::json!({
+                    "type": "TokenUsage",
+                    "input": 100,
+                    "output": 40,
+                    "cache_create": 0,
+                    "cache_read": 10,
+                    "total": 150
+                }),
+            ),
+            session_event(
+                4,
+                "RunModelTelemetry",
+                serde_json::json!({
+                    "type": "RunModelTelemetry",
+                    "telemetry": {
+                        "model": "deepseek-v4-flash",
+                        "tokens_per_second": 24.5
+                    }
+                }),
+            ),
+            session_event(
+                5,
+                "ContextEnvelope",
+                serde_json::json!({
+                    "type": "ContextEnvelope",
+                    "envelope_id": "ctx-1",
+                    "envelope": {
+                        "id": "ctx-1",
+                        "selected": [{"id": "mem-1"}, {"id": "mem-2"}],
+                        "omitted": [{"id": "mem-old"}],
+                        "diagnostics": {
+                            "pressure_bp": 1000
+                        }
+                    }
+                }),
+            ),
+            session_event(
+                6,
+                "ContextTurnReport",
+                serde_json::json!({
+                    "type": "ContextTurnReport",
+                    "run_id": "run-root",
+                    "turn_id": "turn-1",
+                    "context_turn_report": {
+                        "selected_count": 2,
+                        "omitted_count": 1
+                    }
+                }),
+            ),
+            session_event(
+                7,
+                "RuntimeRun",
+                serde_json::json!({
+                    "run_id": "run-root",
+                    "parent_run_id": null,
+                    "status": "completed"
+                }),
+            ),
+            session_event(
+                8,
+                "AgentTeamStatus",
+                serde_json::json!({
+                    "type": "AgentTeamStatus",
+                    "agent_count": 2
+                }),
+            ),
+            session_event(
+                9,
+                "ApprovalRequested",
+                serde_json::json!({
+                    "type": "ApprovalRequested",
+                    "risk": "workspace_write"
+                }),
+            ),
+        ];
+
+        let projection = session_run_projection_from_events(
+            "session-v31",
+            events,
+            Some(serde_json::json!({
+                "tokens": {
+                    "input": 100,
+                    "output": 40,
+                    "total": 140
+                }
+            })),
+        );
+
+        assert_eq!(projection["kind"], "session.run_projection");
+        assert_eq!(projection["source"], "gateway.session_events");
+        assert_eq!(projection["view_modes"]["default"], "full_evidence");
+        assert_eq!(projection["run_graph"]["summary"]["completed_count"], 1);
+        assert_eq!(projection["tool_summary"]["by_name"]["read"], 2);
+        assert_eq!(projection["token_speed"]["token_usage"][0]["total"], 150);
+        assert_eq!(
+            projection["token_speed"]["model_telemetry"]["model"],
+            "deepseek-v4-flash"
+        );
+        assert_eq!(projection["memory_context"]["selected_count"], 2);
+        assert_eq!(projection["memory_context"]["omitted_count"], 1);
+        assert_eq!(projection["memory_context"]["evidence_refs"][0], "mem-1");
+        assert_eq!(
+            projection["team_session"]["agent_events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(projection["risk_approval"]["count"], 1);
     }
 }

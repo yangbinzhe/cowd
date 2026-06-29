@@ -365,12 +365,26 @@ impl<'a> RuntimeTurnSink<'a> {
             "turn_id": &turn_id,
             "response": final_text,
             "iterations": summary.iterations,
-            "model_telemetry": summary.model_telemetry,
-            "context_turn_report": context_turn_report,
+            "model_telemetry": summary.model_telemetry.clone(),
+            "context_turn_report": context_turn_report.clone(),
         });
         self.event_bus
             .broadcast(session_id, &sse_data.to_string())
             .await;
+        append_session_timeline_event(
+            &self.state.services.session,
+            session_id,
+            "ContextTurnReport",
+            serde_json::json!({
+                "type": "ContextTurnReport",
+                "session_id": session_id,
+                "run_id": run_id,
+                "turn_id": &turn_id,
+                "model_telemetry": summary.model_telemetry.clone(),
+                "context_turn_report": context_turn_report.clone(),
+            }),
+        )
+        .await;
         append_session_timeline_event(
             &self.state.services.session,
             session_id,
@@ -643,6 +657,13 @@ async fn send_message(
                             "envelope": envelope,
                         });
                         eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "ContextEnvelope",
+                            json,
+                        )
+                        .await;
                     }
                     runtime::CowdEvent::TokenUsage {
                         input,
