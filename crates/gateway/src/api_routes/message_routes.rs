@@ -365,6 +365,7 @@ impl<'a> RuntimeTurnSink<'a> {
             "turn_id": &turn_id,
             "response": final_text,
             "iterations": summary.iterations,
+            "model_telemetry": summary.model_telemetry,
             "context_turn_report": context_turn_report,
         });
         self.event_bus
@@ -397,6 +398,7 @@ impl<'a> RuntimeTurnSink<'a> {
             "status": "complete",
             "response": final_text,
             "iterations": summary.iterations,
+            "model_telemetry": summary.model_telemetry,
             "context_turn_report": context_turn_report,
         })
     }
@@ -642,8 +644,41 @@ async fn send_message(
                         });
                         eb.broadcast(&sid, &json.to_string()).await;
                     }
-                    runtime::CowdEvent::TokenUsage { .. }
-                    | runtime::CowdEvent::Warning { .. }
+                    runtime::CowdEvent::TokenUsage {
+                        input,
+                        output,
+                        cache_create,
+                        cache_read,
+                    } => {
+                        let json = serde_json::json!({
+                            "type": "TokenUsage",
+                            "run_id": active_run_id.clone(),
+                            "input": input,
+                            "output": output,
+                            "cache_create": cache_create,
+                            "cache_read": cache_read,
+                            "total": input + output + cache_create + cache_read,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(&session_service, &sid, "TokenUsage", json)
+                            .await;
+                    }
+                    runtime::CowdEvent::RunModelTelemetry { telemetry } => {
+                        let json = serde_json::json!({
+                            "type": "RunModelTelemetry",
+                            "run_id": active_run_id.clone(),
+                            "telemetry": telemetry,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "RunModelTelemetry",
+                            json,
+                        )
+                        .await;
+                    }
+                    runtime::CowdEvent::Warning { .. }
                     | runtime::CowdEvent::CompactionNotice { .. } => {}
                     _ => {}
                 }

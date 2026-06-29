@@ -333,7 +333,8 @@ pub use conversation::{
     TurnSummary,
 };
 pub use cowd_event::{
-    CowdEvent, CowdEventBus, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary,
+    CowdEvent, CowdEventBus, RunModelTelemetry, RuntimePolicyDecisionSummary,
+    RuntimeWorkGraphSummary,
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,

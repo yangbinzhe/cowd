@@ -55,6 +55,25 @@ pub struct RuntimePolicyDecisionSummary {
     pub signal_count: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RunModelTelemetry {
+    pub model: Option<String>,
+    pub models_used: Vec<String>,
+    pub first_token_latency_ms: Option<u64>,
+    pub active_stream_duration_ms: Option<u64>,
+    pub wall_duration_ms: u64,
+    pub output_chars: u64,
+    pub output_chunks: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_create_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub usage_source: String,
+    pub chars_per_second: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     // Streaming — field names match TuiEvent
@@ -117,6 +136,9 @@ pub enum CowdEvent {
         output: u64,
         cache_create: u64,
         cache_read: u64,
+    },
+    RunModelTelemetry {
+        telemetry: RunModelTelemetry,
     },
     CompactionNotice {
         removed_count: usize,

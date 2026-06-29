@@ -225,6 +225,21 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
     preview
 }
 
+fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+}
+
+fn millis_since(start: Instant) -> u64 {
+    start.elapsed().as_millis() as u64
+}
+
 fn knowledge_hard_gate_active(system_prompt: &[String]) -> bool {
     system_prompt
         .iter()
@@ -350,6 +365,7 @@ pub struct TurnSummary {
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub iterations: usize,
     pub usage: TokenUsage,
+    pub model_telemetry: crate::cowd_event::RunModelTelemetry,
     pub auto_compaction: Option<AutoCompactionEvent>,
     pub ai_kernel_trace: RuntimeAiKernelTrace,
     pub context_turn_report: ContextTurnReport,
@@ -1662,6 +1678,15 @@ where
         user_input: impl Into<String>,
         prompter: &crate::permissions::SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
+        let turn_started_at = Instant::now();
+        let mut first_token_latency_ms: Option<u64> = None;
+        let mut first_stream_token_at: Option<Instant> = None;
+        let mut last_stream_token_at: Option<Instant> = None;
+        let mut output_chars: u64 = 0;
+        let mut output_chunks: u64 = 0;
+        let mut provider_usage_total = TokenUsage::default();
+        let mut provider_usage_seen = false;
+        let mut models_used: Vec<String> = Vec::new();
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
@@ -1887,6 +1912,18 @@ where
                             };
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
+                                    let now = Instant::now();
+                                    if !text.is_empty() {
+                                        if first_token_latency_ms.is_none() {
+                                            first_token_latency_ms =
+                                                Some(millis_since(turn_started_at));
+                                            first_stream_token_at = Some(now);
+                                        }
+                                        last_stream_token_at = Some(now);
+                                        output_chars = output_chars
+                                            .saturating_add(text.chars().count() as u64);
+                                        output_chunks = output_chunks.saturating_add(1);
+                                    }
                                     model_current_text.push_str(&text);
                                     if let Some(ref cowd) = self.cowd_bus {
                                         cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
@@ -1935,6 +1972,18 @@ where
                                     model_pending_tool_uses.push((id, name, input));
                                 }
                                 Ok(AssistantEvent::Usage(usage)) => {
+                                    provider_usage_seen = true;
+                                    add_token_usage(&mut provider_usage_total, usage);
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::TokenUsage {
+                                            input: u64::from(usage.input_tokens),
+                                            output: u64::from(usage.output_tokens),
+                                            cache_create: u64::from(
+                                                usage.cache_creation_input_tokens,
+                                            ),
+                                            cache_read: u64::from(usage.cache_read_input_tokens),
+                                        });
+                                    }
                                     model_turn_usage = Some(usage);
                                 }
                                 Ok(AssistantEvent::MessageStop) => break,
@@ -2046,6 +2095,10 @@ where
                             pending_tool_uses = model_pending_tool_uses;
                             turn_usage = model_turn_usage;
                             stream_events = model_stream_events;
+                            if !model.is_empty() && !models_used.iter().any(|known| known == model)
+                            {
+                                models_used.push(model.to_string());
+                            }
                             if model_idx > 0 {
                                 tracing::warn!(
                                     model,
@@ -2564,6 +2617,50 @@ where
         self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
         self.record_strategy_experience(&ai_kernel_trace);
         let usage = self.usage_tracker.cumulative_usage();
+        let telemetry_usage = if provider_usage_seen {
+            provider_usage_total
+        } else {
+            TokenUsage {
+                input_tokens: ((user_input.chars().count() as u32) / 4).max(1),
+                output_tokens: ((output_chars as u32) / 4).max(u32::from(output_chars > 0)),
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }
+        };
+        let active_stream_duration_ms = first_stream_token_at
+            .zip(last_stream_token_at)
+            .map(|(first, last)| last.saturating_duration_since(first).as_millis() as u64);
+        let speed_duration_ms = active_stream_duration_ms
+            .filter(|duration| *duration > 0)
+            .unwrap_or_else(|| millis_since(turn_started_at).max(1));
+        let speed_seconds = speed_duration_ms as f64 / 1_000.0;
+        let model_telemetry = crate::cowd_event::RunModelTelemetry {
+            model: models_used.last().cloned().or_else(|| {
+                self.model
+                    .as_ref()
+                    .filter(|model| !model.is_empty())
+                    .cloned()
+            }),
+            models_used,
+            first_token_latency_ms,
+            active_stream_duration_ms,
+            wall_duration_ms: millis_since(turn_started_at),
+            output_chars,
+            output_chunks,
+            input_tokens: u64::from(telemetry_usage.input_tokens),
+            output_tokens: u64::from(telemetry_usage.output_tokens),
+            cache_create_tokens: u64::from(telemetry_usage.cache_creation_input_tokens),
+            cache_read_tokens: u64::from(telemetry_usage.cache_read_input_tokens),
+            total_tokens: u64::from(telemetry_usage.total_tokens()),
+            usage_source: if provider_usage_seen {
+                "provider".to_string()
+            } else {
+                "estimated".to_string()
+            },
+            chars_per_second: (output_chars > 0).then_some(output_chars as f64 / speed_seconds),
+            tokens_per_second: (telemetry_usage.output_tokens > 0)
+                .then_some(f64::from(telemetry_usage.output_tokens) / speed_seconds),
+        };
         let context_turn_report = self.build_context_turn_report(
             &ai_kernel_trace.harness_receipt.id,
             usage,
@@ -2576,6 +2673,7 @@ where
             prompt_cache_events,
             iterations,
             usage,
+            model_telemetry: model_telemetry.clone(),
             auto_compaction,
             ai_kernel_trace,
             context_turn_report,
@@ -2583,6 +2681,9 @@ where
         self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
         if let Some(ref cowd) = self.cowd_bus {
+            cowd.emit(crate::cowd_event::CowdEvent::RunModelTelemetry {
+                telemetry: model_telemetry,
+            });
             cowd.emit(crate::cowd_event::CowdEvent::TurnComplete {
                 assistant_text,
                 iterations: summary.iterations as u32,
@@ -5410,6 +5511,15 @@ mod tests {
         assert_eq!(summary.prompt_cache_events.len(), 1);
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
+        assert_eq!(summary.model_telemetry.usage_source, "provider");
+        assert_eq!(summary.model_telemetry.input_tokens, 44);
+        assert_eq!(summary.model_telemetry.output_tokens, 10);
+        assert_eq!(summary.model_telemetry.cache_create_tokens, 2);
+        assert_eq!(summary.model_telemetry.cache_read_tokens, 5);
+        assert!(summary.model_telemetry.first_token_latency_ms.is_some());
+        assert!(summary.model_telemetry.output_chars > 0);
+        assert!(summary.model_telemetry.output_chunks >= 2);
+        assert!(summary.model_telemetry.tokens_per_second.is_some());
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(
             summary.ai_kernel_trace.strategy.mode,
