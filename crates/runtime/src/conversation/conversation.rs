@@ -2657,6 +2657,7 @@ where
                             ToolFailureKind::ApprovalDenied,
                             &reason,
                         );
+                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(),
                             tool_name.to_string(),
@@ -2718,6 +2719,7 @@ where
                             ToolFailureKind::GateDenied,
                             &reason,
                         );
+                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(),
                             tool_name.to_string(),
@@ -2749,6 +2751,7 @@ where
                     self.session().messages.len(),
                 );
                 self.record_tool_started(iterations, tool_name);
+                self.emit_tool_started(tool_use_id, tool_name, &effective_input);
 
                 if let Some(callback) = &self.tool_callback {
                     let preview: String = effective_input.chars().take(200).collect();
@@ -2864,6 +2867,12 @@ where
                 );
                 let model_summary =
                     self.tool_model_summary(tool_name, &combined, is_error, &raw_ref);
+                self.emit_tool_completed(
+                    tool_use_id,
+                    tool_name,
+                    &combined,
+                    if is_error { Some(1) } else { Some(0) },
+                );
                 self.push_turn_tool_observation(ToolObservation::new(
                     tool_name.to_string(),
                     completed_record.invocation_id.clone(),
@@ -2908,6 +2917,7 @@ where
                     failure_kind,
                     &reason,
                 );
+                self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                 let denied = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
@@ -3441,6 +3451,35 @@ where
         attributes.insert("tool_name".to_string(), Value::String(tool_name.clone()));
         attributes.insert("is_error".to_string(), Value::Bool(*is_error));
         session_tracer.record("tool_execution_finished", attributes);
+    }
+
+    fn emit_tool_started(&self, tool_use_id: &str, tool_name: &str, input: &str) {
+        let Some(ref cowd) = self.cowd_bus else {
+            return;
+        };
+        cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
+            id: tool_use_id.to_string(),
+            name: tool_name.to_string(),
+            preview: preview_chars(input, 200),
+        });
+    }
+
+    fn emit_tool_completed(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) {
+        let Some(ref cowd) = self.cowd_bus else {
+            return;
+        };
+        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete {
+            id: tool_use_id.to_string(),
+            name: tool_name.to_string(),
+            summary: preview_chars(output, 500),
+            exit_code,
+        });
     }
 
     fn record_turn_completed(&self, summary: &TurnSummary) {
@@ -5393,6 +5432,70 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn real_tool_execution_emits_cowd_lifecycle_events() {
+        use crate::cowd_event::{CowdEvent, CowdEventBus};
+
+        let bus = CowdEventBus::new();
+        let mut rx = bus.subscribe();
+        let tool_executor = StaticToolExecutor::new().register("add", |_input| Ok("4".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_cowd_event_bus(bus);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(runtime.run_turn_async(
+            "what is 2 + 2?",
+            &SharedPrompter::new(Box::new(PromptAllowOnce)),
+        ))
+        .expect("tool turn should succeed");
+
+        let events = rt.block_on(async {
+            let mut events = Vec::new();
+            for _ in 0..16 {
+                if let Ok(Ok(event)) =
+                    tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+                {
+                    events.push(event);
+                }
+            }
+            events
+        });
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CowdEvent::ToolStart { id, name, preview }
+                    if id == "tool-1" && name == "add" && preview == "2,2"
+            )),
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CowdEvent::ToolComplete {
+                    id,
+                    name,
+                    summary,
+                    exit_code
+                } if id == "tool-1" && name == "add" && summary == "4" && *exit_code == Some(0)
+            )),
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CowdEvent::ToolExecuted { name, .. } if name == "add"
+            )),
+            "{events:#?}"
+        );
     }
 
     #[test]
