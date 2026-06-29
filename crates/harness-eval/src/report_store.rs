@@ -7,6 +7,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
+    evaluate_report_gate,
     report::{
         HarnessEvalReportDetail, HarnessEvalReportSummary, HarnessEvalRunRecord,
         HarnessEvalUsageSummary,
@@ -89,22 +90,87 @@ impl HarnessEvalReportStore {
         let base = format!("{stamp}-mission-harness-{level}");
         let run_dir = self.root.join("runs").join(&base);
         let evidence_dir = run_dir.join("evidence");
+        let requests_dir = run_dir.join("requests");
+        let responses_dir = run_dir.join("responses");
+        let events_dir = run_dir.join("events");
+        let run_evidence_dir = run_dir.join("run-evidence");
+        let model_speed_dir = run_dir.join("model-speed");
+        let quality_rubric_dir = run_dir.join("quality-rubric");
         fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
+        for dir in [
+            &requests_dir,
+            &responses_dir,
+            &events_dir,
+            &run_evidence_dir,
+            &model_speed_dir,
+            &quality_rubric_dir,
+        ] {
+            fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        }
         report["result_package_dir"] = Value::String(run_dir.display().to_string());
+        report["report_package"] = serde_json::json!({
+            "status": "written",
+            "root": run_dir.display().to_string(),
+            "required_dirs": ["requests", "responses", "events", "run-evidence", "model-speed", "quality-rubric"],
+            "summary": "summary.md",
+            "full_report": "full-report.md",
+            "quality_rubric": "quality-rubric/quality-rubric.json"
+        });
+        report["report_gate"] = serde_json::to_value(evaluate_report_gate(report))
+            .map_err(|error| error.to_string())?;
         let json_path = run_dir.join("report.json");
         let md_path = run_dir.join("report.md");
+        let markdown = render_markdown_report(report);
         fs::write(
             &json_path,
             serde_json::to_string_pretty(report).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        fs::write(&md_path, render_markdown_report(report)).map_err(|error| error.to_string())?;
+        fs::write(&md_path, &markdown).map_err(|error| error.to_string())?;
+        fs::write(run_dir.join("summary.md"), render_summary_report(report))
+            .map_err(|error| error.to_string())?;
+        fs::write(run_dir.join("full-report.md"), &markdown).map_err(|error| error.to_string())?;
         fs::write(
             run_dir.join("execution-trace.json"),
             serde_json::to_string_pretty(report.get("execution_trace").unwrap_or(&Value::Null))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        fs::write(
+            events_dir.join("runtime-actions.json"),
+            serde_json::to_string_pretty(
+                report
+                    .get("execution_trace")
+                    .and_then(|trace| trace.get("runtime_action_log"))
+                    .unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            model_speed_dir.join("summary.json"),
+            serde_json::to_string_pretty(
+                report
+                    .get("execution_trace")
+                    .and_then(|trace| trace.get("total_usage"))
+                    .unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            quality_rubric_dir.join("quality-rubric.json"),
+            serde_json::to_string_pretty(report.get("report_gate").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        write_tool_call_artifacts(
+            report,
+            &requests_dir,
+            &responses_dir,
+            &events_dir,
+            &run_evidence_dir,
+        )?;
         fs::write(
             evidence_dir.join("stable-ai-health.json"),
             serde_json::to_string_pretty(stable_ai).map_err(|error| error.to_string())?,
@@ -295,7 +361,102 @@ fn render_markdown_report(report: &Value) -> String {
                 .replace('|', "\\|"),
         ));
     }
+    if let Some(gate) = report.get("report_gate") {
+        markdown.push_str("\n## Report Gate\n\n");
+        markdown.push_str(&format!(
+            "- status: {}\n- passed: {}\n- failed: {}\n\n",
+            gate.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            gate.get("passed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            gate.get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        ));
+        markdown.push_str("| Gate | Status | Evidence |\n| --- | --- | --- |\n");
+        for item in gate
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            markdown.push_str(&format!(
+                "| {} | {} | {} |\n",
+                item.get("name").and_then(Value::as_str).unwrap_or("-"),
+                item.get("status").and_then(Value::as_str).unwrap_or("-"),
+                item.get("evidence")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .replace('|', "\\|"),
+            ));
+        }
+    }
     markdown
+}
+
+fn render_summary_report(report: &Value) -> String {
+    let level = report
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = report
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let gate = report.get("report_gate").unwrap_or(&Value::Null);
+    format!(
+        "# Harness Eval Summary\n\n- level: {level}\n- status: {status}\n- gate: {}\n- failed_gates: {}\n- report: `full-report.md`\n- trace: `execution-trace.json`\n",
+        gate.get("status").and_then(Value::as_str).unwrap_or("unknown"),
+        gate.get("failed").and_then(Value::as_u64).unwrap_or_default(),
+    )
+}
+
+fn write_tool_call_artifacts(
+    report: &Value,
+    requests_dir: &Path,
+    responses_dir: &Path,
+    events_dir: &Path,
+    run_evidence_dir: &Path,
+) -> Result<(), String> {
+    let Some(details) = report.get("tool_call_details").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for detail in details {
+        let index = detail
+            .get("summary")
+            .and_then(|summary| summary.get("call_index"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        fs::write(
+            requests_dir.join(format!("tool-call-{index}.json")),
+            serde_json::to_string_pretty(detail.get("input").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            responses_dir.join(format!("tool-call-{index}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "output": detail.get("output").unwrap_or(&Value::Null),
+                "error": detail.get("error").unwrap_or(&Value::Null)
+            }))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            events_dir.join(format!("tool-call-{index}.json")),
+            serde_json::to_string_pretty(detail.get("summary").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            run_evidence_dir.join(format!("tool-call-{index}.json")),
+            serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn write_stable_ai_health(root: &Path, report: &StableAiHealthReport) -> Result<(), String> {
@@ -337,6 +498,18 @@ mod tests {
             .expect("report exists");
         assert_eq!(detail.summary.id, reports[0].id);
         assert!(!detail.artifacts.is_empty());
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("summary.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("full-report.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("quality-rubric.json")));
         let _ = fs::remove_dir_all(root);
     }
 }

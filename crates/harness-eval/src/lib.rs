@@ -8,7 +8,8 @@ mod report_store;
 mod runner;
 
 pub use report::{
-    CapabilityResult, ExecutionTrace, HarnessEvalLevel, HarnessEvalReportDetail,
+    evaluate_report_gate, CapabilityResult, ExecutionTrace, HarnessEvalLevel,
+    HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
     HarnessEvalReportSummary, HarnessEvalRunRecord, HarnessEvalRunRequest, HarnessEvalRunStatus,
     HarnessEvalUsageSummary, HarnessMetric, MissionHarnessEvalReport, ProviderRoundDetail,
     ProviderRoundSummary, RealToolScenarioReport, RealToolScenarioResult, ToolCallDetail,
@@ -2026,6 +2027,46 @@ mod tests {
         assert!(result
             .failed_checks
             .contains(&"evidence.contains_recovery".to_string()));
+    }
+
+    #[test]
+    fn report_gate_rejects_full_report_without_tool_or_token_evidence() {
+        let report = serde_json::json!({
+            "level": "full",
+            "status": "passed",
+            "scenarios": [
+                {"capability": "stable_ai_scenario_matrix", "status": "passed"},
+                {"capability": "harness_capability_coverage", "status": "passed"},
+                {"capability": "knowledge_fabric_context_governance", "status": "passed"}
+            ],
+            "complex_scenarios": {"failed": 0, "average_score": 1.0},
+            "real_tool_scenarios": {"tool_calls": 0},
+            "event_observation_parity": {"status": "passed"},
+            "report_package": {
+                "status": "written",
+                "required_dirs": ["requests", "responses", "events", "run-evidence", "model-speed", "quality-rubric"]
+            },
+            "execution_trace": {
+                "runtime_actions": 4,
+                "tool_calls": 0,
+                "tool_call_log": [],
+                "total_usage": {"total_tokens": 0, "usage_source": "unavailable"}
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+
+        assert_eq!(gate.status, "failed");
+        assert!(gate
+            .items
+            .iter()
+            .any(|item| item.name == "complex_tool_calls_nonzero" && item.status == "failed"));
+        assert!(
+            gate.items
+                .iter()
+                .any(|item| item.name == "token_usage_nonzero_or_estimated"
+                    && item.status == "failed")
+        );
     }
 
     #[test]

@@ -134,6 +134,221 @@ pub struct HarnessEvalRunRequest {
     pub objective: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessEvalReportGateItem {
+    pub name: String,
+    pub status: String,
+    pub required: bool,
+    pub evidence: String,
+    pub repair_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessEvalReportGate {
+    pub kind: String,
+    pub status: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub items: Vec<HarnessEvalReportGateItem>,
+}
+
+impl HarnessEvalReportGateItem {
+    fn new(
+        name: impl Into<String>,
+        passed: bool,
+        required: bool,
+        evidence: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: if passed { "passed" } else { "failed" }.to_string(),
+            required,
+            evidence: evidence.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
+}
+
+impl HarnessEvalReportGate {
+    fn from_items(items: Vec<HarnessEvalReportGateItem>) -> Self {
+        let total = items.len();
+        let passed = items.iter().filter(|item| item.status == "passed").count();
+        let failed = items
+            .iter()
+            .filter(|item| item.required && item.status != "passed")
+            .count();
+        Self {
+            kind: "harness_eval.report_gate".to_string(),
+            status: if failed == 0 { "passed" } else { "failed" }.to_string(),
+            total,
+            passed,
+            failed,
+            items,
+        }
+    }
+}
+
+#[must_use]
+pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
+    let level = report
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let trace = report.get("execution_trace").unwrap_or(&Value::Null);
+    let total_tokens = trace
+        .get("total_usage")
+        .and_then(|value| value.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let usage_source = trace
+        .get("total_usage")
+        .and_then(|value| value.get("usage_source"))
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    let tool_calls = trace
+        .get("tool_calls")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let tool_log_count = trace
+        .get("tool_call_log")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len) as u64;
+    let runtime_actions = trace
+        .get("runtime_actions")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let scenarios = report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let complex = report.get("complex_scenarios").unwrap_or(&Value::Null);
+    let real_tools = report.get("real_tool_scenarios").unwrap_or(&Value::Null);
+    let parity = report
+        .get("event_observation_parity")
+        .unwrap_or(&Value::Null);
+    let package = report.get("report_package").unwrap_or(&Value::Null);
+    let is_quick = level == "quick";
+
+    let mut items = Vec::new();
+    items.push(HarnessEvalReportGateItem::new(
+        "scenario_capability_status",
+        !scenarios.is_empty()
+            && scenarios
+                .iter()
+                .all(|item| item.get("status").and_then(Value::as_str) == Some("passed")),
+        true,
+        format!("scenario_capabilities={}", scenarios.len()),
+        "fix failed capability rows before accepting the report",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "runtime_actions_recorded",
+        runtime_actions >= 3,
+        true,
+        format!("runtime_actions={runtime_actions}"),
+        "record capability, coverage, knowledge, and complex action traces",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "report_package_layout",
+        package
+            .get("required_dirs")
+            .and_then(Value::as_array)
+            .is_some_and(|dirs| dirs.len() >= 6),
+        true,
+        format!("package={}", package.get("status").and_then(Value::as_str).unwrap_or("missing")),
+        "write summary/full report and requests/responses/events/run-evidence/model-speed artifacts",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "knowledge_memory_governance",
+        scenario_status(&scenarios, "knowledge_fabric_context_governance") == Some("passed"),
+        true,
+        "knowledge fabric scenario must pass",
+        "repair memory namespace, conflict, and activation evaluation",
+    ));
+
+    if is_quick {
+        items.push(HarnessEvalReportGateItem::new(
+            "quick_smoke_declares_no_tool_lane",
+            tool_calls == 0 && usage_source == "deterministic_smoke",
+            true,
+            format!("tool_calls={tool_calls}, usage_source={usage_source}"),
+            "quick must either stay explicitly deterministic or be promoted to full eval",
+        ));
+    } else {
+        let complex_ok = complex
+            .get("failed")
+            .and_then(Value::as_u64)
+            .is_some_and(|failed| failed == 0)
+            && complex
+                .get("average_score")
+                .and_then(Value::as_f64)
+                .is_some_and(|score| score >= 0.9);
+        let real_tool_calls = real_tools
+            .get("tool_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        items.push(HarnessEvalReportGateItem::new(
+            "complex_scenarios_passed",
+            complex_ok,
+            true,
+            format!(
+                "failed={}, average={}",
+                complex
+                    .get("failed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                complex
+                    .get("average_score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default()
+            ),
+            "full/deep eval must execute the complex scenario suite",
+        ));
+        items.push(HarnessEvalReportGateItem::new(
+            "complex_tool_calls_nonzero",
+            tool_calls > 0 && real_tool_calls > 0,
+            true,
+            format!("trace_tool_calls={tool_calls}, real_tool_calls={real_tool_calls}"),
+            "full/deep eval cannot pass complex scenarios with zero real tool evidence",
+        ));
+        items.push(HarnessEvalReportGateItem::new(
+            "token_usage_nonzero_or_estimated",
+            total_tokens > 0 && usage_source != "unavailable",
+            true,
+            format!("total_tokens={total_tokens}, usage_source={usage_source}"),
+            "record provider usage or explicit deterministic/estimated fallback",
+        ));
+        items.push(HarnessEvalReportGateItem::new(
+            "events_observations_parity",
+            parity.get("status").and_then(Value::as_str) == Some("passed")
+                && tool_calls == tool_log_count,
+            true,
+            format!(
+                "parity={}, tool_calls={}, tool_log_count={}",
+                parity
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing"),
+                tool_calls,
+                tool_log_count
+            ),
+            "tool events, observations, and report trace must share one count",
+        ));
+    }
+
+    HarnessEvalReportGate::from_items(items)
+}
+
+fn scenario_status<'a>(scenarios: &'a [Value], capability: &str) -> Option<&'a str> {
+    scenarios
+        .iter()
+        .find(|item| item.get("capability").and_then(Value::as_str) == Some(capability))
+        .and_then(|item| item.get("status"))
+        .and_then(Value::as_str)
+}
+
 #[derive(Debug, Serialize)]
 pub struct CapabilityResult {
     pub capability: &'static str,

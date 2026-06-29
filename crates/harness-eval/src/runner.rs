@@ -6,11 +6,14 @@ use serde_json::{json, Value};
 
 use crate::{
     evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
-    harness_capability_coverage_report,
-    report::{HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus},
+    evaluate_report_gate, harness_capability_coverage_report,
+    report::{
+        HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, ToolCallDetail,
+        ToolCallSummary,
+    },
     report_store::{empty_usage, now_ms, HarnessEvalReportStore},
-    stable_ai_scenario_matrix, E2eScenarioKind, ScenarioCheck, ScenarioObservation, ScenarioSpec,
-    ScenarioSuite, StableAiHealthReport,
+    stable_ai_scenario_matrix, E2eScenarioKind, RealToolScenarioReport, RealToolScenarioResult,
+    ScenarioCheck, ScenarioObservation, ScenarioSpec, ScenarioSuite, StableAiHealthReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +75,7 @@ pub fn run_eval(
     let complex =
         (options.level == HarnessEvalLevel::Full).then(evaluate_complex_harness_scenarios);
     let knowledge = evaluate_knowledge_fabric_context_governance();
+    let real_tool = (options.level == HarnessEvalLevel::Full).then(run_full_real_tool_scenarios);
     let mut scenarios = vec![
         json!({
             "capability": "stable_ai_scenario_matrix",
@@ -103,7 +107,38 @@ pub fn run_eval(
 
     let total_elapsed_ms = started.elapsed().as_millis();
     let runtime_actions = 3 + usize::from(complex.is_some());
-    let usage = empty_usage("deterministic_smoke");
+    let mut usage = empty_usage("deterministic_smoke");
+    let mut tool_call_log = Vec::new();
+    let mut tool_call_details = Vec::new();
+    let mut real_tool_scenarios = None;
+    if let Some(real_tool) = real_tool {
+        usage = real_tool.usage;
+        tool_call_log = real_tool
+            .tool_details
+            .iter()
+            .map(|detail| detail.summary.clone())
+            .collect();
+        tool_call_details = real_tool
+            .tool_details
+            .iter()
+            .map(|detail| {
+                json!({
+                    "summary": detail.summary,
+                    "input": detail.input,
+                    "output": detail.output,
+                    "error": detail.error,
+                })
+            })
+            .collect();
+        real_tool_scenarios = Some(real_tool.report);
+    }
+    let tool_calls = tool_call_log.len();
+    let event_observation_parity = json!({
+        "status": if tool_calls == tool_call_details.len() { "passed" } else { "failed" },
+        "tool_events": tool_calls,
+        "observations": tool_call_details.len(),
+        "source": "harness_eval.execution_trace"
+    });
     let mut report = json!({
         "kind": "mission_harness.eval_report",
         "level": options.level.as_str(),
@@ -117,10 +152,15 @@ pub fn run_eval(
         "metrics": [
             {"name": "provider_rounds", "value": "0", "notes": "default gateway run is deterministic and does not consume provider tokens"},
             {"name": "runtime_actions", "value": runtime_actions.to_string(), "notes": "library runner exercised scenario, coverage, and knowledge fabric checks"},
-            {"name": "tool_calls", "value": "0", "notes": "smoke lane does not execute tools; deep CLI lane records real tool evidence"}
+            {"name": "tool_calls", "value": tool_calls.to_string(), "notes": if options.level == HarnessEvalLevel::Full { "full eval executed local read-only tool evidence" } else { "quick smoke lane intentionally does not execute tools" }}
         ],
         "complex_scenarios": complex,
-        "real_tool_scenarios": null,
+        "real_tool_scenarios": real_tool_scenarios,
+        "event_observation_parity": event_observation_parity,
+        "report_package": {
+            "status": "prepared",
+            "required_dirs": ["requests", "responses", "events", "run-evidence", "model-speed", "quality-rubric"]
+        },
         "execution_trace": {
             "kind": "harness_eval.execution_trace",
             "started_at_ms": requested_at_ms,
@@ -128,18 +168,22 @@ pub fn run_eval(
             "total_elapsed_ms": total_elapsed_ms,
             "provider_rounds": 0,
             "runtime_actions": runtime_actions,
-            "tool_calls": 0,
+            "tool_calls": tool_calls,
             "total_usage": usage,
             "rounds": [],
-            "tool_call_log": [],
+            "tool_call_log": tool_call_log,
             "runtime_action_log": [
                 {"index": 1, "action": "stable_ai_scenario_matrix", "evidence": "deterministic fake provider suite"},
                 {"index": 2, "action": "harness_capability_coverage", "evidence": "runtime module map coverage"},
                 {"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"}
             ]
         },
+        "tool_call_details": tool_call_details,
         "result_package_dir": null
     });
+    let gate = evaluate_report_gate(&report);
+    report["report_gate"] = serde_json::to_value(&gate).map_err(|error| error.to_string())?;
+    report["status"] = Value::String(gate.status.clone());
     let summary = store.write_report(options.level.as_str(), &mut report, &stable_ai)?;
     let record = HarnessEvalRunRecord {
         run_id,
@@ -162,6 +206,158 @@ pub fn run_eval(
     };
     store.append_run(&record)?;
     Ok(record)
+}
+
+struct FullRealToolEval {
+    report: RealToolScenarioReport,
+    tool_details: Vec<ToolCallDetail>,
+    usage: crate::HarnessEvalUsageSummary,
+}
+
+fn run_full_real_tool_scenarios() -> FullRealToolEval {
+    let target_repo = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let mut tool_details = Vec::new();
+    tool_details.push(run_eval_tool_call(
+        1,
+        "repo_refactor",
+        "workspace_snapshot",
+        json!({
+            "include_git": true,
+            "include_files": true,
+            "roots": ["crates/harness-eval/src", "crates/runtime/src/execution_core"],
+            "max_files": 80
+        }),
+    ));
+    tool_details.push(run_eval_tool_call(
+        2,
+        "repo_refactor",
+        "grep_many",
+        json!({
+            "searches": [
+                { "pattern": "runtime_orchestrate", "path": "crates", "glob": "*.rs" },
+                { "pattern": "ToolStart|ToolComplete", "path": "crates", "glob": "*.rs" }
+            ],
+            "max_concurrency": 2
+        }),
+    ));
+    tool_details.push(run_eval_tool_call(
+        3,
+        "reality_memory",
+        "grep_many",
+        json!({
+            "searches": [
+                { "pattern": "KnowledgeFabric|context_governance|suppressed_for_current_turn", "path": "crates", "glob": "*.rs" },
+                { "pattern": "team_runtime|collaboration_run|Mission", "path": "crates/runtime/src", "glob": "*.rs" }
+            ],
+            "max_concurrency": 2
+        }),
+    ));
+    let passed_tool_calls = tool_details
+        .iter()
+        .filter(|detail| detail.summary.status == "passed")
+        .count();
+    let report = RealToolScenarioReport {
+        kind: "harness_eval.real_tool_scenario_report",
+        target_repo,
+        total: 3,
+        passed: usize::from(passed_tool_calls == tool_details.len()),
+        tool_calls: tool_details.len(),
+        scenarios: vec![RealToolScenarioResult {
+            scenario_id: "full_readonly_evidence".to_string(),
+            title: "Full eval local read-only evidence collection".to_string(),
+            status: if passed_tool_calls == tool_details.len() {
+                "passed"
+            } else {
+                "failed"
+            }
+            .to_string(),
+            tool_calls: tool_details.len(),
+            runtime_evidence: vec![
+                "workspace_snapshot captured runtime/eval code roots".to_string(),
+                "grep_many scanned orchestration and tool event markers".to_string(),
+            ],
+            matrix_evidence: vec!["KnowledgeFabric/matrix related code markers scanned".to_string()],
+            memory_evidence: vec![
+                "suppressed_for_current_turn marker participates in context authority checks"
+                    .to_string(),
+            ],
+            changed_files: Vec::new(),
+            diff_summary: "read-only eval changed no source files".to_string(),
+            conclusion: "full harness eval produced real local tool evidence".to_string(),
+        }],
+    };
+    let estimated_tokens = estimate_tool_detail_tokens(&tool_details);
+    FullRealToolEval {
+        report,
+        tool_details,
+        usage: crate::HarnessEvalUsageSummary {
+            input_tokens: estimated_tokens / 3,
+            output_tokens: estimated_tokens.saturating_sub(estimated_tokens / 3),
+            total_tokens: estimated_tokens,
+            usage_source: "deterministic_tool_estimate".to_string(),
+            ..crate::HarnessEvalUsageSummary::default()
+        },
+    }
+}
+
+fn run_eval_tool_call(
+    call_index: usize,
+    scenario_id: &str,
+    name: &str,
+    input: Value,
+) -> ToolCallDetail {
+    let started = Instant::now();
+    let result = tools::execute_tool(name, &input);
+    let elapsed_ms = started.elapsed().as_millis();
+    let (status, output, error) = match result {
+        Ok(output) => ("passed".to_string(), Some(output), None),
+        Err(error) => ("failed".to_string(), None, Some(error)),
+    };
+    let output_summary = output
+        .as_deref()
+        .map(summarize_text)
+        .or_else(|| error.as_deref().map(summarize_text))
+        .unwrap_or_else(|| "no output".to_string());
+    ToolCallDetail {
+        summary: ToolCallSummary {
+            call_index,
+            scenario_id: scenario_id.to_string(),
+            name: name.to_string(),
+            status,
+            elapsed_ms,
+            input_summary: summarize_text(&input.to_string()),
+            output_summary,
+            detail_path: format!("run-evidence/tool-call-{call_index}.json"),
+        },
+        input,
+        output,
+        error,
+    }
+}
+
+fn summarize_text(text: &str) -> String {
+    const LIMIT: usize = 220;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= LIMIT {
+        compact
+    } else {
+        format!("{}...", compact.chars().take(LIMIT).collect::<String>())
+    }
+}
+
+fn estimate_tool_detail_tokens(details: &[ToolCallDetail]) -> u32 {
+    let chars = details
+        .iter()
+        .map(|detail| {
+            detail.summary.input_summary.len()
+                + detail.summary.output_summary.len()
+                + detail.output.as_ref().map_or(0, String::len)
+                + detail.error.as_ref().map_or(0, String::len)
+        })
+        .sum::<usize>();
+    ((chars / 4).max(1)).min(u32::MAX as usize) as u32
 }
 
 fn stable_ai_report_for(options: &HarnessEvalRunnerOptions) -> StableAiHealthReport {
@@ -265,6 +461,56 @@ mod tests {
         assert_eq!(record.total_tokens, 0);
         assert!(store.list_reports().expect("reports").is_empty());
         assert_eq!(store.list_runs().expect("runs").len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_eval_generates_real_tool_evidence_and_report_gate() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-harness-eval-full-{}", uuid::Uuid::new_v4()));
+        let store = HarnessEvalReportStore::new(&root);
+        let record = run_eval(
+            &store,
+            HarnessEvalRunnerOptions {
+                level: HarnessEvalLevel::Full,
+                provider: None,
+                budget: Some("low".to_string()),
+                allow_real_model: false,
+            },
+        )
+        .expect("run eval");
+
+        assert_eq!(record.status, "completed");
+        assert!(record.tool_calls >= 3);
+        assert!(record.total_tokens > 0);
+        let report_id = record.report_id.as_deref().expect("report id");
+        let detail = store
+            .get_report(report_id)
+            .expect("detail")
+            .expect("report exists");
+        assert_eq!(detail.summary.status, "passed");
+        assert_eq!(detail.report["report_gate"]["status"], "passed");
+        assert_eq!(
+            detail.report["event_observation_parity"]["status"],
+            "passed"
+        );
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("summary.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("quality-rubric.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("run-evidence/tool-call-1.json")));
+        assert!(
+            detail.report["real_tool_scenarios"]["scenarios"][0]["changed_files"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
