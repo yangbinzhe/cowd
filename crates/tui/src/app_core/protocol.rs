@@ -61,6 +61,9 @@ pub enum CowdEvent {
         assistant_text: String,
         iterations: u32,
     },
+    ResourcesCommitted {
+        ids: Vec<String>,
+    },
     TurnError {
         error: String,
     },

@@ -60,5 +60,6 @@ async-trait = "0.1"
 provider = { path = "../provider" }
 serde_json.workspace = true
 serial_test = "3"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }

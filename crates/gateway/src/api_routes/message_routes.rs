@@ -47,6 +47,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
+    #[serde(default)]
+    resource_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -526,7 +528,14 @@ async fn send_message(
 
     let runtime_service = runtime_service.clone();
 
-    tracing::info!(%id, content_len = body.content.len(), "API message received");
+    tracing::info!(
+        %id,
+        content_len = body.content.len(),
+        resource_count = body.resource_ids.len(),
+        "API message received"
+    );
+    let runtime_content =
+        render_message_resource_context(&state.config_home, &body.content, &body.resource_ids);
 
     let session_id = id.clone();
     let event_bus = state.event_bus();
@@ -547,7 +556,7 @@ async fn send_message(
             &session_id,
             &run_id,
             run_profile,
-            &body.content,
+            &runtime_content,
             run_started_at_ms,
         ),
     )
@@ -722,7 +731,7 @@ async fn send_message(
             )
         })?;
 
-    let content = body.content;
+    let content = runtime_content;
     let turn_timeout = turn_timeout_for_prompt(&content, run_profile);
     let turn_max_iterations = turn_max_iterations_for_prompt(&content, run_profile);
     let cancellation_token = runtime::CancellationToken::new();
@@ -765,6 +774,7 @@ async fn send_message(
                 RuntimeTurnOptions {
                     profile: run_profile,
                     max_iterations: Some(turn_max_iterations),
+                    ..RuntimeTurnOptions::default()
                 },
             )
             .await;
@@ -827,6 +837,45 @@ async fn send_message(
             }),
         )),
     }
+}
+
+fn render_message_resource_context(
+    config_home: &std::path::Path,
+    content: &str,
+    ids: &[String],
+) -> String {
+    if ids.is_empty() {
+        return content.to_string();
+    }
+    let store = runtime::ResourceStore::default_for_config_home(config_home);
+    let mut pairs = Vec::new();
+    let mut failures = Vec::new();
+    for raw_id in ids {
+        let id = raw_id.trim().trim_start_matches("resource://");
+        if id.is_empty() {
+            continue;
+        }
+        match store.get(id) {
+            Ok(envelope) => {
+                let hint = runtime::resource_hint(
+                    &envelope,
+                    &runtime::ResourceCapabilitySnapshot::default(),
+                );
+                pairs.push((envelope, hint));
+            }
+            Err(error) => failures.push((raw_id.clone(), error)),
+        }
+    }
+    let mut rendered = content.to_string();
+    rendered.push_str(&runtime::render_resource_context_markdown(&pairs));
+    if !failures.is_empty() {
+        rendered.push_str("\n\n## Attached Resource Lookup Failures\n\n");
+        for (id, error) in failures {
+            rendered.push_str(&format!("- {id}: {error}\n"));
+        }
+        rendered.push_str("If a resource cannot be loaded, explain the boundary instead of pretending to inspect it.\n");
+    }
+    rendered
 }
 
 async fn get_session_messages(
@@ -1031,5 +1080,33 @@ mod tests {
             turn_timeout_for_prompt("继续执行", ContextProfile::YoloGoal),
             Duration::from_secs(900)
         );
+    }
+
+    #[test]
+    fn message_resource_ids_render_runtime_resource_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let input = temp.path().join("voice.mp3");
+        std::fs::write(&input, b"fake mp3").expect("write resource");
+        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let (resource, _) = store
+            .register_resource_from_path(
+                &input,
+                "test",
+                None,
+                Some("session-1".to_string()),
+                Some("application/octet-stream".to_string()),
+            )
+            .expect("resource registers");
+
+        let rendered = render_message_resource_context(
+            &temp.path().join("home"),
+            "请分析附件",
+            std::slice::from_ref(&resource.id),
+        );
+
+        assert!(rendered.contains("请分析附件"));
+        assert!(rendered.contains("## Attached Resources"));
+        assert!(rendered.contains("kind: audio"));
+        assert!(rendered.contains("Do not claim audio content"));
     }
 }

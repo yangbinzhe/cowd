@@ -30,6 +30,7 @@ crates/cowd-cli/static/
 # Runtime databases (auto-generated, should never be committed)
 *.db
 memory_blobs/
+crates/gateway/surface-messages/
 .cargo/.global-cache
 .cowd-todos.json
 

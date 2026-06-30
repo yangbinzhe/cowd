@@ -4,9 +4,10 @@ use crate::agent_collaboration::CollaborationContextResult;
 use crate::{
     agent, agent_collaboration, joint_problem_solving, model_context_window_with_overrides,
     permissions::SharedPrompter, CompactionConfig, CompactionResult, ContextEnvelope, ContextItem,
-    ContextProfile, CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter,
-    PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket,
-    RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor, TurnSummary,
+    ContextProfile, ConversationMessage, CowdEvent, CowdEventBus, HookAbortSignal,
+    HookProgressReporter, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition,
+    ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor,
+    TurnSummary,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 
@@ -163,6 +164,13 @@ where
         prompter: &SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
         self.runtime_mut().run_turn_async(content, prompter).await
+    }
+
+    pub async fn append_external_message(
+        &self,
+        message: ConversationMessage,
+    ) -> Result<(), RuntimeError> {
+        self.runtime_ref().append_external_message(message).await
     }
 
     pub fn session(&self) -> Session {

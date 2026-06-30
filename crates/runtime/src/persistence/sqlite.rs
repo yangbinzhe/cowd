@@ -99,6 +99,27 @@ fn block_to_block_data(block: &ContentBlock) -> BlockData {
             tool_output: None,
             is_error: false,
         },
+        ContentBlock::Image {
+            media_type,
+            data,
+            source_path,
+        } => BlockData {
+            block_type: "image".into(),
+            text: Some(
+                serde_json::json!({
+                    "media_type": media_type,
+                    "data": data,
+                    "source_path": source_path,
+                })
+                .to_string(),
+            ),
+            signature: None,
+            tool_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: false,
+        },
         ContentBlock::Thinking {
             thinking,
             signature,
@@ -154,6 +175,29 @@ fn message_data_to_message(data: &MessageData) -> ConversationMessage {
             "text" => ContentBlock::Text {
                 text: b.text.clone().unwrap_or_default(),
             },
+            "image" => b
+                .text
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .map(|value| ContentBlock::Image {
+                    media_type: value
+                        .get("media_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("application/octet-stream")
+                        .to_string(),
+                    data: value
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    source_path: value
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                })
+                .unwrap_or_else(|| ContentBlock::Text {
+                    text: "[image block could not be restored]".into(),
+                }),
             "thinking" => ContentBlock::Thinking {
                 thinking: b.text.clone().unwrap_or_default(),
                 signature: b.signature.clone(),

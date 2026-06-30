@@ -127,6 +127,13 @@ impl GatewayRuntimeEntry {
         self.runtime_mut().run_turn_async(content, prompter).await
     }
 
+    pub(crate) async fn append_external_message(
+        &self,
+        message: runtime::ConversationMessage,
+    ) -> Result<(), runtime::RuntimeError> {
+        self.runtime_ref().append_external_message(message).await
+    }
+
     pub(crate) fn session(&self) -> runtime::Session {
         self.runtime_ref().session()
     }

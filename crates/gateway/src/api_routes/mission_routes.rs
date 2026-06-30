@@ -653,6 +653,7 @@ async fn consume_mission_session_command_as_turn(
             RuntimeTurnOptions {
                 profile: runtime::ContextProfile::DeepInvestigation,
                 max_iterations: Some(64),
+                ..RuntimeTurnOptions::default()
             },
         )
         .await

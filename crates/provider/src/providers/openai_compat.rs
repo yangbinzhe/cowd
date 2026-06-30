@@ -1014,7 +1014,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                             "arguments": input.to_string(),
                         }
                     })),
-                    InputContentBlock::ToolResult { .. } => {}
+                    InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
                     InputContentBlock::Thinking {
                         thinking: value, ..
                     } => {
@@ -1043,6 +1043,52 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 vec![msg]
             }
         }
+        _ if message
+            .content
+            .iter()
+            .any(|block| matches!(block, InputContentBlock::Image { .. })) =>
+        {
+            let content = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    InputContentBlock::Text { text } if !text.is_empty() => Some(json!({
+                        "type": "text",
+                        "text": text,
+                    })),
+                    InputContentBlock::Image { source } => {
+                        let data_url = format!("data:{};base64,{}", source.media_type, source.data);
+                        Some(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url,
+                            },
+                        }))
+                    }
+                    InputContentBlock::ToolResult { content, .. } => {
+                        let text = flatten_tool_result_content(content);
+                        (!text.is_empty()).then(|| {
+                            json!({
+                                "type": "text",
+                                "text": text,
+                            })
+                        })
+                    }
+                    InputContentBlock::Text { .. }
+                    | InputContentBlock::ToolUse { .. }
+                    | InputContentBlock::Thinking { .. }
+                    | InputContentBlock::RedactedThinking { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "role": "user",
+                    "content": content,
+                })]
+            }
+        }
         _ => message
             .content
             .iter()
@@ -1061,9 +1107,10 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     "content": flatten_tool_result_content(content),
                     "is_error": is_error,
                 })),
-                InputContentBlock::ToolUse { .. } => None,
-                InputContentBlock::Thinking { .. } => None,
-                InputContentBlock::RedactedThinking { .. } => None,
+                InputContentBlock::Image { .. }
+                | InputContentBlock::ToolUse { .. }
+                | InputContentBlock::Thinking { .. }
+                | InputContentBlock::RedactedThinking { .. } => None,
             })
             .collect(),
     }
@@ -1455,7 +1502,7 @@ mod tests {
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
+        ImageSource, InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
         ToolResultContentBlock,
     };
     use serde_json::json;
@@ -1500,6 +1547,40 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn request_translation_uses_image_url_for_image_blocks() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        InputContentBlock::Text {
+                            text: "describe it".to_string(),
+                        },
+                        InputContentBlock::Image {
+                            source: ImageSource::base64("image/png", "aW1hZ2U="),
+                        },
+                    ],
+                }],
+                stream: false,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], json!("user"));
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            json!("data:image/png;base64,aW1hZ2U=")
+        );
     }
 
     #[test]

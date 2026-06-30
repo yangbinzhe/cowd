@@ -18,6 +18,14 @@ pub(crate) fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image {
+                    media_type,
+                    source_path,
+                    ..
+                } => lines.push(format!(
+                    "[image media_type={media_type} source_path={}]",
+                    source_path.as_deref().unwrap_or("<inline>")
+                )),
                 ContentBlock::Thinking { thinking, .. } => {
                     lines.push(format!("[thinking] {thinking}"))
                 }
@@ -199,6 +207,17 @@ pub(crate) fn render_session_markdown(
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Image {
+                    media_type,
+                    source_path,
+                    ..
+                } => {
+                    lines.push(format!(
+                        "**Image attachment** `{media_type}` _source `{}`_",
+                        source_path.as_deref().unwrap_or("<inline>")
+                    ));
+                    lines.push(String::new());
                 }
                 ContentBlock::Thinking { thinking, .. } => {
                     lines.push(format!(

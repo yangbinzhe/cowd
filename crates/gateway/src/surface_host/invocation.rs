@@ -26,7 +26,8 @@ impl SurfaceHost {
             .map(ToString::to_string);
         let reply_to_message_id = request
             .metadata
-            .get("reply_to")
+            .get("local_reply_to")
+            .or_else(|| request.metadata.get("reply_to"))
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
         let delivery = self
@@ -492,4 +493,39 @@ fn route_matches(route: &SurfaceRoute, path: &str, method: &str) -> bool {
     let route_path = normalize_request_path(&route.path);
     let request_path = normalize_request_path(path);
     route_path == request_path && route.method.eq_ignore_ascii_case(method)
+}
+
+#[cfg(test)]
+mod tests {
+    use surface::SurfaceSendRequest;
+
+    use super::SurfaceHost;
+
+    #[tokio::test]
+    async fn send_uses_local_reply_to_for_gateway_ledger_when_present() {
+        let host = SurfaceHost::default();
+        let _ = host
+            .send(SurfaceSendRequest {
+                surface: "feishu".to_string(),
+                recipient: "chat-a".to_string(),
+                thread: Some("thread-a".to_string()),
+                text: "hello".to_string(),
+                metadata: serde_json::json!({
+                    "reply_to": "om_external",
+                    "local_reply_to": "om_external:replay:local",
+                }),
+            })
+            .await;
+
+        let outbox = host.outbox("feishu");
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(
+            outbox[0].reply_to_message_id.as_deref(),
+            Some("om_external:replay:local")
+        );
+        assert_eq!(
+            outbox[0].request_json["metadata"]["reply_to"],
+            serde_json::json!("om_external")
+        );
+    }
 }

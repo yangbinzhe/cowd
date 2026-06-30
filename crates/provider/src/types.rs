@@ -82,6 +82,12 @@ pub enum InputContentBlock {
     Text {
         text: String,
     },
+    /// Base64 image input block. This serializes to Anthropic's native
+    /// `image` block shape; OpenAI-compatible adapters translate it to
+    /// `image_url` data URLs at the transport boundary.
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -104,6 +110,25 @@ pub enum InputContentBlock {
     RedactedThinking {
         data: Value,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ImageSource {
+    #[must_use]
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            source_type: "base64".to_string(),
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -50,10 +50,11 @@ pub(crate) struct RuntimeTurnExecution {
     pub(crate) receipt: TurnReceipt,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct RuntimeTurnOptions {
     pub(crate) profile: runtime::ContextProfile,
     pub(crate) max_iterations: Option<usize>,
+    pub(crate) pre_messages: Vec<runtime::ConversationMessage>,
 }
 
 impl Default for RuntimeTurnOptions {
@@ -61,6 +62,7 @@ impl Default for RuntimeTurnOptions {
         Self {
             profile: runtime::ContextProfile::MainTurn,
             max_iterations: None,
+            pre_messages: Vec::new(),
         }
     }
 }
@@ -400,6 +402,12 @@ impl RuntimeService {
                 runtime_guard.set_context_profile(options.profile);
                 let previous_max_iterations =
                     apply_scoped_max_iterations(&mut *runtime_guard, options.max_iterations);
+                for message in options.pre_messages {
+                    if let Err(error) = runtime_guard.append_external_message(message).await {
+                        restore_scoped_max_iterations(&mut *runtime_guard, previous_max_iterations);
+                        return Ok(Err(error));
+                    }
+                }
                 let result = timeout(
                     turn_timeout,
                     runtime_guard
@@ -656,6 +664,18 @@ impl RuntimeService {
                     .map(|block| match block {
                         runtime::ContentBlock::Text { text } => {
                             serde_json::json!({"type": "text", "text": text})
+                        }
+                        runtime::ContentBlock::Image {
+                            media_type,
+                            data,
+                            source_path,
+                        } => {
+                            serde_json::json!({
+                                "type": "image",
+                                "media_type": media_type,
+                                "source_path": source_path,
+                                "size_bytes": data.len() * 3 / 4,
+                            })
                         }
                         runtime::ContentBlock::Thinking {
                             thinking,

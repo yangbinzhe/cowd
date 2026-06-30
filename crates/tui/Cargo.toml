@@ -12,7 +12,7 @@ futures = "0.3"
 libc = "0.2.186"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

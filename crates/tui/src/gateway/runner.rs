@@ -11,6 +11,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use crate::app::PendingResource;
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
@@ -151,6 +152,47 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                     if matches!(text.as_str(), "/exit" | "/quit") {
                                         break;
                                     }
+                                    if let Some(path) = attach_path_from_command(&text) {
+                                        match gateway_client.upload_resource_path(path, &session_id).await {
+                                            Ok(value) => {
+                                                if let Some(resource) = value.get("resource") {
+                                                    let id = resource
+                                                        .get("id")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .unwrap_or_default()
+                                                        .to_string();
+                                                    let label = resource
+                                                        .get("original_name")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .map(str::to_string)
+                                                        .unwrap_or_else(|| path.display().to_string());
+                                                    let kind = resource
+                                                        .get("kind")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .unwrap_or("resource")
+                                                        .to_string();
+                                                    if !id.is_empty() {
+                                                        state.app.pending_resources.push(PendingResource {
+                                                            id: id.clone(),
+                                                            label: label.clone(),
+                                                            kind: kind.clone(),
+                                                        });
+                                                        state.add_message(
+                                                            "system",
+                                                            &format!("Attached resource {label} ({kind}) as resource://{id}"),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                state.add_message(
+                                                    "system",
+                                                    &format!("Attach failed: {err}"),
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     if text.starts_with('/') {
                                         dispatch_gateway_slash(
                                             &gateway_client,
@@ -167,11 +209,18 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                     }
                                     state.add_message("user", &text);
                                     state.is_loading = true;
+                                    let resource_ids = state
+                                        .app
+                                        .pending_resources
+                                        .iter()
+                                        .map(|resource| resource.id.clone())
+                                        .collect::<Vec<_>>();
                                     dispatch_gateway_message(
                                         &gateway_client,
                                         &tui_tx,
                                         &session_id,
                                         text,
+                                        resource_ids,
                                     );
                                     continue;
                                 }
@@ -480,13 +529,22 @@ fn dispatch_gateway_message(
     tx: &crate::events::CowdEventSender,
     session_id: &str,
     text: String,
+    resource_ids: Vec<String>,
 ) {
     let event_client = gateway_client.clone();
     let event_session_id = session_id.to_string();
     let event_tx = tx.clone();
     shared_rt().spawn(async move {
-        match event_client.send_message(&event_session_id, &text).await {
+        match event_client
+            .send_message_with_resources(&event_session_id, &text, &resource_ids)
+            .await
+        {
             Ok(value) => {
+                if !resource_ids.is_empty() {
+                    let _ = event_tx.send(CowdEvent::ResourcesCommitted {
+                        ids: resource_ids.clone(),
+                    });
+                }
                 if let Some(response) = value
                     .get("response")
                     .and_then(serde_json::Value::as_str)
@@ -516,6 +574,18 @@ fn dispatch_gateway_message(
             }
         }
     });
+}
+
+fn attach_path_from_command(text: &str) -> Option<&Path> {
+    let trimmed = text.trim();
+    if trimmed != "/attach" && !trimmed.starts_with("/attach ") {
+        return None;
+    }
+    let raw = trimmed
+        .strip_prefix("/attach")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(Path::new(raw.trim_matches('"').trim_matches('\'')))
 }
 
 fn dispatch_gateway_cancel(
@@ -651,4 +721,27 @@ fn shared_rt() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("failed to build TUI runtime")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_command_extracts_path() {
+        assert_eq!(
+            attach_path_from_command("/attach /tmp/a.mp3")
+                .expect("path")
+                .to_string_lossy(),
+            "/tmp/a.mp3"
+        );
+        assert_eq!(
+            attach_path_from_command("/attach \"/tmp/a b.pdf\"")
+                .expect("quoted path")
+                .to_string_lossy(),
+            "/tmp/a b.pdf"
+        );
+        assert!(attach_path_from_command("/status").is_none());
+        assert!(attach_path_from_command("/attachment").is_none());
+    }
 }

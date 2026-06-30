@@ -4,8 +4,8 @@ use std::pin::Pin;
 
 use futures::StreamExt;
 use provider::{
-    max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    max_tokens_for_model, ApiError, ContentBlockDelta, ImageSource, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -43,6 +43,14 @@ impl ProviderRuntimeClient {
     ) -> Result<Self, String> {
         let primary = build_provider_entry(&model)?;
         let mut chain = vec![primary];
+        if let Some(vision_model) = load_vision_model_config() {
+            match build_provider_entry(&vision_model) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
+                }
+            }
+        }
         for fallback_model in fallbacks {
             match build_provider_entry(fallback_model) {
                 Ok(entry) => chain.push(entry),
@@ -97,6 +105,14 @@ impl ProviderRuntimeClient {
     }
 
     fn model_fallbacks_extend(&mut self) {
+        if let Some(vision_model) = load_vision_model_config() {
+            match build_provider_entry(&vision_model) {
+                Ok(entry) => self.chain.push(entry),
+                Err(error) => {
+                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
+                }
+            }
+        }
         for fallback_model in load_provider_fallback_config() {
             match build_provider_entry(&fallback_model) {
                 Ok(entry) => self.chain.push(entry),
@@ -135,6 +151,14 @@ fn load_provider_fallback_config() -> Vec<String> {
         .map_or_else(Vec::new, |config| config.fallbacks().to_vec())
 }
 
+fn load_vision_model_config() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .and_then(|config| config.aliases().get("vision").cloned())
+        .filter(|model| !model.trim().is_empty())
+}
+
 impl ApiClient for ProviderRuntimeClient {
     fn stream(
         &mut self,
@@ -162,7 +186,8 @@ impl ProviderRuntimeClient {
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.tool_definitions.is_empty()).then_some(ToolChoice::Auto);
 
-        let chain = &self.chain;
+        let needs_vision = request_has_image_input(&messages);
+        let chain = self.candidate_chain(needs_vision);
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
@@ -193,6 +218,17 @@ impl ProviderRuntimeClient {
                     );
                     last_error = Some(error);
                 }
+                Err(error)
+                    if needs_vision
+                        && index + 1 < chain.len()
+                        && looks_like_vision_unsupported(&error) =>
+                {
+                    tracing::warn!(
+                        "provider {} rejected vision input, falling back: {error}",
+                        entry.model
+                    );
+                    last_error = Some(error);
+                }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),
             }
         }
@@ -202,6 +238,53 @@ impl ProviderRuntimeClient {
             |error| error.to_string(),
         )))
     }
+
+    fn candidate_chain(&self, needs_vision: bool) -> Vec<&ProviderEntry> {
+        if !needs_vision {
+            return self.chain.iter().collect();
+        }
+        let filtered = self
+            .chain
+            .iter()
+            .filter(|entry| !model_is_known_without_vision(&entry.model))
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            self.chain.iter().collect()
+        } else {
+            filtered
+        }
+    }
+}
+
+fn request_has_image_input(messages: &[InputMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, InputContentBlock::Image { .. }))
+    })
+}
+
+fn model_is_known_without_vision(model: &str) -> bool {
+    let canonical = model.split_once('/').map_or(model, |(_, rest)| rest).trim();
+    model_protocol::model_registry::global_registry()
+        .get(canonical)
+        .is_some_and(|info| {
+            !info
+                .capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("vision"))
+        })
+}
+
+fn looks_like_vision_unsupported(error: &ApiError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    (text.contains("image") || text.contains("vision") || text.contains("multimodal"))
+        && (text.contains("unsupported")
+            || text.contains("not support")
+            || text.contains("does not support")
+            || text.contains("invalid")
+            || text.contains("extra inputs"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -311,6 +394,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type, data, ..
+                    } => InputContentBlock::Image {
+                        source: ImageSource::base64(media_type.clone(), data.clone()),
+                    },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -410,4 +498,42 @@ fn prompt_cache_record_to_runtime_event(
         current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
         token_drop: cache_break.token_drop,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{looks_like_vision_unsupported, request_has_image_input};
+    use provider::{ApiError, ImageSource, InputContentBlock, InputMessage};
+
+    #[test]
+    fn request_has_image_input_detects_structured_image_blocks() {
+        let messages = vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![
+                InputContentBlock::Text {
+                    text: "describe".to_string(),
+                },
+                InputContentBlock::Image {
+                    source: ImageSource::base64("image/png", "aW1hZ2U="),
+                },
+            ],
+        }];
+
+        assert!(request_has_image_input(&messages));
+    }
+
+    #[test]
+    fn vision_unsupported_errors_can_continue_fallback_chain() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request".to_string()),
+            message: Some("This model does not support image input".to_string()),
+            request_id: None,
+            body: "image input unsupported".to_string(),
+            retryable: false,
+            suggested_action: None,
+        };
+
+        assert!(looks_like_vision_unsupported(&error));
+    }
 }

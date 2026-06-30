@@ -106,6 +106,8 @@ pub mod recovery;
 pub mod recovery_recipes;
 #[path = "infrastructure/remote.rs"]
 mod remote;
+#[path = "context/resources/mod.rs"]
+pub mod resources;
 #[path = "infrastructure/runtime_control.rs"]
 pub mod runtime_control;
 #[path = "infrastructure/sandbox.rs"]
@@ -331,10 +333,10 @@ pub use config_validate::{
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use control_plane::{global_runtime_control_plane, global_task_registry, RuntimeControlPlane};
 pub use conversation::{
-    auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
-    AssistantEvent, AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
-    PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor,
-    TurnSummary,
+    auto_compaction_threshold_from_env, build_cc_memory_config, image_user_message_from_path,
+    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, CancellationToken,
+    ConversationRuntime, MemoryCallback, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+    ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CowdEvent, CowdEventBus, RunModelTelemetry, RuntimePolicyDecisionSummary,
@@ -482,6 +484,11 @@ pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
+};
+pub use resources::{
+    register_resource_from_path, render_resource_context_markdown, resource_hint,
+    ResourceCapabilitySnapshot, ResourceEnvelope, ResourceEvidence, ResourceHint, ResourceKind,
+    ResourceStore, MAX_RESOURCE_BYTES,
 };
 pub use runtime_event_replay::{
     RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeReplayReport,

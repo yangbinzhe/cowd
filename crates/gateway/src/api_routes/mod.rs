@@ -68,6 +68,7 @@ mod mission_routes;
 mod profile_routes;
 mod public_routes;
 mod reality_routes;
+mod resource_routes;
 pub(crate) mod route_manifest;
 mod runtime_routes;
 mod session_routes;
@@ -338,6 +339,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(message_routes::router())
         .merge(profile_routes::router())
         .merge(reality_routes::router())
+        .merge(resource_routes::router())
         .merge(runtime_routes::router())
         .merge(session_routes::router())
         .merge(skill_routes::router())
@@ -4988,6 +4990,96 @@ mod tests {
             .unwrap();
         assert_eq!(delete_file.status(), StatusCode::OK);
         assert!(!workspace.join("uploads/sample.md").exists());
+    }
+
+    #[tokio::test]
+    async fn resource_upload_query_and_evidence_do_not_touch_workspace() {
+        let workspace = test_temp_dir("resource-upload-workspace");
+        let config_home = test_temp_dir("resource-upload-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let boundary = "cowd-resource-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"session_id\"\r\n\r\nsession-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\nwebui\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.mp3\"\r\nContent-Type: application/octet-stream\r\n\r\nfake mp3 data\r\n--{boundary}--\r\n"
+        );
+        let upload_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/resources")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_response.status(), StatusCode::CREATED);
+        let body = to_bytes(upload_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resource_id = json["resource"]["id"].as_str().unwrap().to_string();
+        assert!(json["resource"]["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("resource://"));
+        assert_eq!(json["resource"]["kind"], "audio");
+        assert_eq!(json["resource"]["detected_mime"], "audio/mpeg");
+        assert!(json["hint"]["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap_or("")
+                .contains("Do not claim audio content")));
+        assert!(!workspace.join("voice.mp3").exists());
+
+        let metadata_path = config_home
+            .join("storage")
+            .join("resources")
+            .join("metadata")
+            .join(format!("{resource_id}.json"));
+        assert!(metadata_path.exists());
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/resources/{resource_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let evidence_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/resources/{resource_id}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence_response.status(), StatusCode::OK);
+        let evidence_body = to_bytes(evidence_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
+        assert!(evidence_json["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["action"] == "register_resource_from_path"));
     }
 
     #[tokio::test]

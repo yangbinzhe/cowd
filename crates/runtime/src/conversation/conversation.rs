@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use fact_kernel::FactExtractionTokenUsage;
 use tokio::sync::{RwLock, Semaphore};
 
@@ -423,6 +425,142 @@ impl TurnCallback {
         Self {
             on_tool_result: Box::new(f),
         }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PreparedVisionPayload {
+    tool: String,
+    status: String,
+    image_path: String,
+    media_type: String,
+    prompt: String,
+    image_base64: String,
+    size_bytes: Option<u64>,
+}
+
+fn prepared_vision_payload(
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> Option<PreparedVisionPayload> {
+    if is_error || tool_name != "vision_analyze" {
+        return None;
+    }
+    let payload = serde_json::from_str::<PreparedVisionPayload>(output).ok()?;
+    if payload.tool != "vision_analyze"
+        || payload.status != "prepared"
+        || payload.image_base64.trim().is_empty()
+        || !payload.media_type.starts_with("image/")
+    {
+        return None;
+    }
+    Some(payload)
+}
+
+fn vision_index_summary(payload: &PreparedVisionPayload) -> String {
+    format!(
+        "vision_analyze prepared image input: path={}, media_type={}, size_bytes={}, prompt={}",
+        payload.image_path,
+        payload.media_type,
+        payload.size_bytes.unwrap_or_default(),
+        payload.prompt
+    )
+}
+
+fn vision_tool_model_summary(payload: &PreparedVisionPayload, raw_ref: &EvidenceRef) -> String {
+    format!(
+        "Tool `vision_analyze` completed. Raw evidence ref: tool://{}. Image input is attached as a structured vision block for the next model call. path={}, media_type={}, size_bytes={}, prompt={}",
+        raw_ref.id(),
+        payload.image_path,
+        payload.media_type,
+        payload.size_bytes.unwrap_or_default(),
+        payload.prompt
+    )
+}
+
+fn vision_user_message(payload: &PreparedVisionPayload) -> ConversationMessage {
+    ConversationMessage {
+        role: crate::session::MessageRole::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: format!(
+                    "Analyze the attached image for this request. Original image path: {}. Prompt: {}",
+                    payload.image_path, payload.prompt
+                ),
+            },
+            ContentBlock::Image {
+                media_type: payload.media_type.clone(),
+                data: payload.image_base64.clone(),
+                source_path: Some(payload.image_path.clone()),
+            },
+        ],
+        usage: None,
+    }
+}
+
+/// Build a structured user message that carries an image as multimodal input.
+///
+/// Surface adapters use this to hand already-downloaded media to runtime without
+/// asking the model to first call a preparation tool. The caller is still
+/// expected to pass the natural-language request as the actual turn prompt.
+pub fn image_user_message_from_path(
+    image_path: impl AsRef<Path>,
+    media_type: impl AsRef<str>,
+    prompt: impl AsRef<str>,
+) -> Result<ConversationMessage, RuntimeError> {
+    let image_path = image_path.as_ref();
+    let media_type =
+        normalize_image_media_type(image_path, media_type.as_ref()).ok_or_else(|| {
+            RuntimeError::new(format!(
+                "unsupported image media type `{}` for {}",
+                media_type.as_ref(),
+                image_path.display()
+            ))
+        })?;
+    let image_data = std::fs::read(image_path).map_err(|error| {
+        RuntimeError::new(format!(
+            "failed to read image attachment {}: {error}",
+            image_path.display()
+        ))
+    })?;
+    let image_base64 = base64::engine::general_purpose::STANDARD.encode(image_data);
+    Ok(ConversationMessage {
+        role: crate::session::MessageRole::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: format!(
+                    "Structured image attachment for the current turn. Source path: {}. Request: {}",
+                    image_path.display(),
+                    prompt.as_ref()
+                ),
+            },
+            ContentBlock::Image {
+                media_type,
+                data: image_base64,
+                source_path: Some(image_path.display().to_string()),
+            },
+        ],
+        usage: None,
+    })
+}
+
+fn normalize_image_media_type(path: &Path, media_type: &str) -> Option<String> {
+    let media_type = media_type.trim();
+    if media_type.starts_with("image/") {
+        return Some(media_type.to_string());
+    }
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png".to_string()),
+        Some("jpg" | "jpeg") => Some("image/jpeg".to_string()),
+        Some("gif") => Some("image/gif".to_string()),
+        Some("webp") => Some("image/webp".to_string()),
+        _ => None,
     }
 }
 
@@ -3113,7 +3251,12 @@ where
                         DEFAULT_OUTPUT_REF_MIN_LINES,
                     )
                 };
-                self.maybe_index_tool_output(tool_use_id, tool_name, &combined);
+                let prepared_vision = prepared_vision_payload(tool_name, &combined, is_error);
+                let indexable_output = prepared_vision
+                    .as_ref()
+                    .map(vision_index_summary)
+                    .unwrap_or_else(|| combined.clone());
+                self.maybe_index_tool_output(tool_use_id, tool_name, &indexable_output);
                 let raw_ref = self.record_tool_raw_evidence(
                     tool_use_id,
                     tool_name,
@@ -3122,12 +3265,16 @@ where
                     is_error,
                     elapsed_ms,
                 );
-                let model_summary =
-                    self.tool_model_summary(tool_name, &combined, is_error, &raw_ref);
+                let model_summary = prepared_vision
+                    .as_ref()
+                    .map(|payload| vision_tool_model_summary(payload, &raw_ref))
+                    .unwrap_or_else(|| {
+                        self.tool_model_summary(tool_name, &combined, is_error, &raw_ref)
+                    });
                 self.emit_tool_completed(
                     tool_use_id,
                     tool_name,
-                    &combined,
+                    &indexable_output,
                     if is_error { Some(1) } else { Some(0) },
                 );
                 self.push_turn_tool_observation(ToolObservation::new(
@@ -3148,6 +3295,18 @@ where
                     .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
+                if let Some(payload) = prepared_vision {
+                    let image_message = vision_user_message(&payload);
+                    self.session
+                        .write()
+                        .await
+                        .push_message(image_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.dual_write_message(
+                        &image_message,
+                        self.session().messages.len().wrapping_sub(1),
+                    );
+                }
                 self.record_tool_invocation_event(
                     &completed_record,
                     if is_error {
@@ -3624,6 +3783,20 @@ where
 
     pub async fn session_mut_async(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
         self.session.write().await
+    }
+
+    pub async fn append_external_message(
+        &self,
+        message: ConversationMessage,
+    ) -> Result<(), RuntimeError> {
+        let mut session = self.session.write().await;
+        session
+            .push_message(message.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let sequence = session.messages.len().wrapping_sub(1);
+        drop(session);
+        self.dual_write_message(&message, sequence);
+        Ok(())
     }
 
     #[must_use]
@@ -4660,6 +4833,7 @@ where
         )
     }
 
+    #[allow(dead_code)]
     fn start_tool_invocation_record(
         &self,
         tool_use_id: &str,
@@ -5292,6 +5466,15 @@ fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Ve
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => text.clone(),
+                    ContentBlock::Image {
+                        media_type,
+                        source_path,
+                        ..
+                    } => format!(
+                        "[image media_type={} source_path={}]",
+                        media_type,
+                        source_path.as_deref().unwrap_or("<inline>")
+                    ),
                     ContentBlock::Thinking { thinking, .. } => format!("[thinking]\n{thinking}"),
                     ContentBlock::ToolUse { id, name, input } => {
                         format!("[tool_use id={id} name={name}]\n{input}")
@@ -5713,10 +5896,11 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        active_rate_per_second, build_cc_memory_config_with_budget, preview_chars, rate_per_second,
-        stream_idle_timeout_for_messages, ApiClient, ApiRequest, AssistantEvent,
-        CognitiveContextManager, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, DEFAULT_RUNTIME_MAX_ITERATIONS,
+        active_rate_per_second, build_cc_memory_config_with_budget, image_user_message_from_path,
+        prepared_vision_payload, preview_chars, rate_per_second, stream_idle_timeout_for_messages,
+        vision_user_message, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
+        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+        DEFAULT_RUNTIME_MAX_ITERATIONS,
     };
     use crate::agent_collaboration::{
         AgentTaskTrace, AgentTeam, CollaborationContextResult, CollaborationOps,
@@ -5757,6 +5941,57 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn prepared_vision_payload_becomes_user_image_message() {
+        let output = serde_json::json!({
+            "tool": "vision_analyze",
+            "status": "prepared",
+            "image_path": "/tmp/cowd-test.png",
+            "media_type": "image/png",
+            "prompt": "describe it",
+            "image_base64": "aW1hZ2U=",
+            "size_bytes": 5
+        })
+        .to_string();
+
+        let payload = prepared_vision_payload("vision_analyze", &output, false)
+            .expect("prepared vision payload should parse");
+        let message = vision_user_message(&payload);
+
+        assert_eq!(message.role, MessageRole::User);
+        assert!(matches!(
+            message.blocks.get(1),
+            Some(ContentBlock::Image {
+                media_type,
+                data,
+                source_path
+            }) if media_type == "image/png"
+                && data == "aW1hZ2U="
+                && source_path.as_deref() == Some("/tmp/cowd-test.png")
+        ));
+    }
+
+    #[test]
+    fn image_user_message_from_path_reads_image_as_structured_block() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-runtime-image-message-{}.jpg",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, b"fake-jpeg-bytes").expect("test image should write");
+
+        let message = image_user_message_from_path(&path, "image/jpeg", "describe it")
+            .expect("image message should be prepared");
+
+        assert_eq!(message.role, MessageRole::User);
+        assert!(message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Image { media_type, data, source_path }
+                if media_type == "image/jpeg"
+                    && data == "ZmFrZS1qcGVnLWJ5dGVz"
+                    && source_path.as_deref() == Some(path.to_string_lossy().as_ref()))
+        }));
+        let _ = fs::remove_file(path);
     }
 
     #[test]

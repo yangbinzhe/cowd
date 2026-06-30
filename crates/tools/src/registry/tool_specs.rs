@@ -772,9 +772,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         // 3B-4: Built-in vision analysis tool (requires multimodal LLM support)
         ToolSpec {
             name: "vision_analyze",
-            description: "Analyze an image using multimodal LLM vision capabilities. \
-                Requires the configured LLM to support image inputs (e.g., Claude 3.5+ with vision). \
-                If the LLM does not support vision, this tool will return an error.",
+            description: "Prepare a local image file for multimodal LLM analysis. \
+                The tool validates and encodes the image; the runtime then attaches it as a structured vision input on the next model call. \
+                Use it when a prompt references an image path that is not already attached as vision input.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -152,6 +152,13 @@ pub struct SessionSummary {
     pub message_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingResource {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
 pub struct App {
     pub model: String,
     pub session_id: String,
@@ -181,6 +188,7 @@ pub struct App {
     pub delegate_tasks: Vec<DelegateTask>,
     pub memory_entries: Vec<MemoryEntry>,
     pub skill_list: Vec<SkillSummary>,
+    pub pending_resources: Vec<PendingResource>,
     pub skin: crate::skin::SkinConfig,
     pub memory_status: Option<String>,
     pub memory_total_entries: Option<usize>,
@@ -492,6 +500,7 @@ impl App {
             delegate_tasks: Vec::new(),
             memory_entries: Vec::new(),
             skill_list: Vec::new(),
+            pending_resources: Vec::new(),
             skin: crate::skin::SkinConfig::default(),
             memory_status: None,
             memory_total_entries: None,
@@ -1281,6 +1290,12 @@ impl App {
                     }
                 }
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            CowdEvent::ResourcesCommitted { ids } => {
+                self.pending_resources
+                    .retain(|resource| !ids.contains(&resource.id));
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 

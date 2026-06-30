@@ -95,8 +95,9 @@ use model_protocol::usage::TokenUsage;
 use provider as provider_crate;
 #[cfg(test)]
 use provider_crate::{
-    resolve_startup_auth_source, AuthSource, InputContentBlock, InputMessage, MessageResponse,
-    OutputContentBlock, ProviderClient as ApiProviderClient, ToolResultContentBlock,
+    resolve_startup_auth_source, AuthSource, ImageSource, InputContentBlock, InputMessage,
+    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
+    ToolResultContentBlock,
 };
 
 #[cfg(test)]
@@ -3327,6 +3328,14 @@ fn compact_message_text(message: &ConversationMessage) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image {
+                media_type,
+                source_path,
+                ..
+            } => Some(match source_path {
+                Some(path) => path.as_str(),
+                None => media_type.as_str(),
+            }),
             ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
@@ -4638,6 +4647,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type, data, ..
+                    } => InputContentBlock::Image {
+                        source: ImageSource::base64(media_type.clone(), data.clone()),
+                    },
                     ContentBlock::Thinking {
                         thinking,
                         signature,

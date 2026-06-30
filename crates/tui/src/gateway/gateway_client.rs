@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -173,11 +174,55 @@ impl GatewayApiClient {
         session_id: &str,
         content: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
+        self.send_message_with_resources(session_id, content, &[])
+            .await
+    }
+
+    pub async fn send_message_with_resources(
+        &self,
+        session_id: &str,
+        content: &str,
+        resource_ids: &[String],
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/messages", url_encode(session_id)),
-            serde_json::json!({ "content": content }),
+            serde_json::json!({ "content": content, "resource_ids": resource_ids }),
         )
         .await
+    }
+
+    pub async fn upload_resource_path(
+        &self,
+        path: &Path,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let bytes = std::fs::read(path).map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("resource.bin")
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("source", "tui")
+            .text("session_id", session_id.to_string());
+        let url = format!("{}/api/resources", self.base_url);
+        let mut request = self.client.post(url).multipart(form);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        let text = response.text().await.map_err(GatewayApiError::Http)?;
+        if !status.is_success() {
+            return Err(GatewayApiError::Status(status, text));
+        }
+        serde_json::from_str(&text).map_err(|error| GatewayApiError::Url(error.to_string()))
     }
 
     pub async fn cancel_session_turn(

@@ -94,6 +94,9 @@ mod tests {
                 assistant_text: "ok".into(),
                 iterations: 1,
             },
+            CowdEvent::ResourcesCommitted {
+                ids: vec!["res-a".into()],
+            },
             CowdEvent::WorkGraphSummary {
                 summary: crate::RuntimeWorkGraphSummary {
                     graph_id: Some("graph".into()),

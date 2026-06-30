@@ -44,6 +44,11 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        media_type: String,
+        data: String,
+        source_path: Option<String>,
+    },
     /// P1-7: Extended thinking content (reasoning model output).
     /// The `signature` field must be preserved and passed back verbatim
     /// in subsequent requests when the provider requires it (e.g., Anthropic).
@@ -962,6 +967,21 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Image {
+                media_type,
+                data,
+                source_path,
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "media_type".to_string(),
+                    JsonValue::String(media_type.clone()),
+                );
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+                if let Some(path) = source_path {
+                    object.insert("source_path".to_string(), JsonValue::String(path.clone()));
+                }
+            }
             Self::Thinking {
                 thinking,
                 signature,
@@ -1020,6 +1040,14 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "image" => Ok(Self::Image {
+                media_type: required_string(object, "media_type")?,
+                data: required_string(object, "data")?,
+                source_path: object
+                    .get("source_path")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
             }),
             "thinking" => Ok(Self::Thinking {
                 thinking: required_string(object, "thinking")?,

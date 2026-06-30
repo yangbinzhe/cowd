@@ -1171,10 +1171,21 @@ impl TuiState {
         // 2.5. Render input directly from app.input (BUG 1 FIX: single source of truth)
         // FIX B: Set block on textarea before rendering for cursor visibility
         {
+            let pending_resource_hint = if self.app.pending_resources.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · {} resource(s) attached",
+                    self.app.pending_resources.len()
+                )
+            };
             self.app.input.set_block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
-                    .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
+                    .title(format!(
+                        " Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline{}) ",
+                        pending_resource_hint
+                    )),
             );
             // Render app.input widget directly — NOT through prompt
             {
@@ -4593,6 +4604,28 @@ mod tests {
                 .any(|(_, entry)| entry.full_text().contains("Done")),
             "turn completion should not inject Done messages"
         );
+    }
+
+    #[test]
+    fn apply_event_resources_committed_clears_only_sent_resources() {
+        let mut state = TuiState::new("m", "s");
+        state.pending_resources.push(crate::app::PendingResource {
+            id: "res-a".into(),
+            label: "a.mp3".into(),
+            kind: "audio".into(),
+        });
+        state.pending_resources.push(crate::app::PendingResource {
+            id: "res-b".into(),
+            label: "b.pdf".into(),
+            kind: "pdf".into(),
+        });
+
+        state.apply_event(CowdEvent::ResourcesCommitted {
+            ids: vec!["res-a".into()],
+        });
+
+        assert_eq!(state.pending_resources.len(), 1);
+        assert_eq!(state.pending_resources[0].id, "res-b");
     }
 
     #[test]
