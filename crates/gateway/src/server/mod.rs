@@ -116,15 +116,22 @@ fn process_exists(_pid: u32) -> bool {
 }
 
 pub fn stop_server() -> Result<(), ServerError> {
-    if let Some(info) = get_server_status()? {
-        #[cfg(unix)]
-        {
-            if info.pid != 0 {
-                std::process::Command::new("kill")
-                    .arg("-TERM")
-                    .arg(info.pid.to_string())
-                    .output()?;
+    let status_pid = get_server_status()?.map(|info| info.pid);
+    #[cfg(unix)]
+    {
+        let mut pids = std::collections::BTreeSet::new();
+        if let Some(pid) = status_pid.filter(|pid| *pid != 0) {
+            pids.insert(pid);
+        }
+        pids.extend(discover_current_exe_gateway_run_processes());
+        for pid in pids {
+            if pid == std::process::id() {
+                continue;
             }
+            std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output()?;
         }
     }
     for pid_path in status_pid_files() {
@@ -132,6 +139,49 @@ pub fn stop_server() -> Result<(), ServerError> {
         let _ = std::fs::remove_file(pid_path.with_extension("addr"));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn discover_current_exe_gateway_run_processes() -> Vec<u32> {
+    let current_exe = match std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok())
+    {
+        Some(path) => path,
+        None => return Vec::new(),
+    };
+
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            if pid == std::process::id() {
+                return None;
+            }
+            let proc_dir = entry.path();
+            let cmdline = fs::read(proc_dir.join("cmdline")).ok()?;
+            if !cmdline_is_gateway_run(&cmdline) {
+                return None;
+            }
+            let exe = fs::read_link(proc_dir.join("exe"))
+                .ok()
+                .and_then(|path| fs::canonicalize(path).ok())?;
+            (exe == current_exe).then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn cmdline_is_gateway_run(cmdline: &[u8]) -> bool {
+    let args: Vec<&[u8]> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    args.windows(2)
+        .any(|pair| pair[0] == b"gateway" && pair[1] == b"run")
 }
 
 #[cfg(unix)]
@@ -188,5 +238,14 @@ mod tests {
             super::extract_pid_from_ss_line("LISTEN 127.0.0.1:8642"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_gateway_run_cmdline() {
+        assert!(super::cmdline_is_gateway_run(b"/tmp/cowd\0gateway\0run\0"));
+        assert!(!super::cmdline_is_gateway_run(
+            b"/tmp/cowd\0gateway\0stop\0"
+        ));
     }
 }

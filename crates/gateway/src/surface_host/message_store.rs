@@ -778,6 +778,13 @@ fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
                 .last_error
                 .clone()
                 .or_else(|| outbox_failure_reason(outbox));
+        } else if is_active_inbox_status(&inbox.status) {
+            inbox.status = "failed".to_string();
+            inbox.updated_at_ms = now_ms();
+            inbox.last_error = Some(
+                "surface processing was interrupted by gateway restart before a reply was queued"
+                    .to_string(),
+            );
         }
     }
 }
@@ -1081,6 +1088,39 @@ mod tests {
         assert_eq!(
             reloaded.snapshot("feishu").inbox[0].status,
             "failed_notified"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_marks_orphan_active_inbox_as_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-orphan-inbox-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let inbox = store
+            .record_inbox_received(
+                "feishu",
+                "msg-1",
+                &serde_json::json!({"text": "hello"}),
+                "feishu:user:chat",
+                Some("chat".to_string()),
+                Some("user".to_string()),
+            )
+            .unwrap();
+        store
+            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .unwrap();
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        let snapshot = reloaded.snapshot("feishu");
+        assert_eq!(snapshot.inbox[0].status, "failed");
+        assert!(snapshot.active_inbox.is_empty());
+        assert_eq!(
+            snapshot.inbox[0].last_error.as_deref(),
+            Some("surface processing was interrupted by gateway restart before a reply was queued")
         );
 
         let _ = std::fs::remove_dir_all(root);
