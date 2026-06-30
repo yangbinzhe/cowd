@@ -719,8 +719,24 @@ async fn send_message(
     let resume_context = active_task
         .as_ref()
         .map(|task| task_resume_context_packet(&session_id, task));
+    let reality_context_items = state
+        .services
+        .reality
+        .recall_augmentation(
+            &state.config_home,
+            &state.services.matrix,
+            &state.services.growth,
+            &runtime_content,
+            8,
+        )
+        .context_items;
     runtime_service
-        .configure_turn_context(&session_id, run_profile, resume_context)
+        .configure_turn_context(
+            &session_id,
+            run_profile,
+            resume_context,
+            reality_context_items,
+        )
         .await
         .map_err(|error| {
             (

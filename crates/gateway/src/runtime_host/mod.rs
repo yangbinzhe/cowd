@@ -603,7 +603,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         roots = ?surface_discovery.roots,
         "surface host discovery completed"
     );
-    let services = Arc::new(crate::services::GatewayServices::new(
+    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
         Arc::new(RuntimeService::new(
             sessions.clone(),
             lease_registry.clone(),
@@ -616,6 +616,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         cognitive.clone(),
         approval_gate.clone(),
         approval_repository,
+        &approval_dir,
     ));
 
     let app_state = Arc::new(api_routes::AppState {

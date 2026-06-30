@@ -23,7 +23,14 @@ impl ContextService {
             .unwrap_or(ContextProfile::MainTurn);
 
         if let Some(envelope) = active_envelope {
-            return context_projection_json("runtime", envelope, &params);
+            if extra_dynamic_items.is_empty() {
+                return context_projection_json("runtime", envelope, &params);
+            }
+            return context_projection_json(
+                "runtime_with_reality_overlay",
+                merge_runtime_envelope_overlay(envelope, query, extra_dynamic_items),
+                &params,
+            );
         }
 
         let mut identity = ContextIdentity::main(session_id.clone());
@@ -106,6 +113,40 @@ impl ContextService {
 
         resources.into_iter().map(resource_context_item).collect()
     }
+}
+
+fn merge_runtime_envelope_overlay(
+    envelope: ContextEnvelope,
+    query: String,
+    extra_dynamic_items: Vec<ContextItem>,
+) -> ContextEnvelope {
+    let mut dynamic_items = envelope.selected.clone();
+    let existing_ids = dynamic_items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    dynamic_items.extend(
+        extra_dynamic_items
+            .into_iter()
+            .filter(|item| !existing_ids.contains(&item.id)),
+    );
+
+    let mut merged = RuntimeContextBoundary::build_envelope(ContextEnvelopeRequest {
+        profile: envelope.profile,
+        runtime_header: envelope.assembled.runtime_header,
+        identity: envelope.identity,
+        intent: if query.trim().is_empty() {
+            envelope.intent
+        } else {
+            query
+        },
+        stable_head: envelope.assembled.stable_head,
+        dynamic_items,
+        omitted: envelope.omitted,
+        total_budget_tokens: envelope.budget.total_tokens,
+    });
+    merged.diagnostics.degraded_sources = envelope.diagnostics.degraded_sources;
+    merged
 }
 
 fn context_projection_json(

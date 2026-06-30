@@ -87,7 +87,7 @@ impl RealityService {
         audit: &AuditService,
     ) -> RealityStatusProjection {
         let memory_status = memory.status_projection().await;
-        let knowledge_status = memory.knowledge_projection().await;
+        let knowledge_status = memory.knowledge_projection(config_home).await;
         let matrix_health = matrix_health_value(matrix, config_home);
         let growth_events = growth
             .durable_event_log(config_home)
@@ -156,7 +156,7 @@ impl RealityService {
         audit: &AuditService,
     ) -> RealityStaticProjection {
         let memory_status = memory.status_projection().await;
-        let knowledge_status = memory.knowledge_projection().await;
+        let knowledge_status = memory.knowledge_projection(config_home).await;
         let matrix_health = matrix_health_value(matrix, config_home);
         serde_json::json!({
             "kind": "reality.static",

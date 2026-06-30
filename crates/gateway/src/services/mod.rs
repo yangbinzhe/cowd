@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use harness_contract::{
     core::{ExecutionMode, TaskComplexity, TaskRisk},
@@ -333,14 +336,16 @@ pub(crate) struct GrowthService {
 
 impl GrowthService {
     pub(crate) fn new() -> Self {
+        Self::new_for_config_home(runtime::cowd_dirs::config_home_dir())
+    }
+
+    pub(crate) fn new_for_config_home(config_home: impl AsRef<Path>) -> Self {
         Self {
             label: "growth",
             owner: "0.9.380 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
             fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::with_store(
-                growth_service::GatewayFactStore::open_for_config_home(
-                    runtime::cowd_dirs::config_home_dir(),
-                )
+                growth_service::GatewayFactStore::open_for_config_home(config_home)
                 .unwrap_or_else(|error| {
                     tracing::warn!(%error, "durable fact store unavailable; using memory-only gateway fact store");
                     growth_service::GatewayFactStore::memory_only()

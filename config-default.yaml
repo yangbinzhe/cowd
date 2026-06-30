@@ -84,10 +84,8 @@ providers: {}
   #   models: ["qwen3-max", "qwen3-coder-next"]
 
 # Provider 故障转移链
-# 当主 Provider 返回 429/500/503 等可重试错误时自动切换
-provider_fallbacks:
-  primary: ""
-  fallbacks: []
+# 当主 Provider 返回 429/500/503 等可重试错误时按顺序自动切换模型。
+fallbacks: []
 
 # =============================================================================
 # 权限与审批

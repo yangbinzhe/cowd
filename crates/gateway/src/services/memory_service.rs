@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use harness_contract::{
     knowledge::{KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace},
@@ -76,7 +76,10 @@ impl MemoryService {
                     })
                 });
             let vector_count = mgr.vector_index_count();
-            let capabilities = memory_capabilities_json(true, vector_count);
+            let search_mode = mgr.search_mode_label();
+            let semantic_supported = mgr.embedding_capability().supports_semantic();
+            let capabilities =
+                memory_capabilities_json(true, vector_count, search_mode, semantic_supported);
             let total_entries: usize = layers
                 .iter()
                 .filter_map(|layer| layer.get("entry_count").and_then(|value| value.as_u64()))
@@ -106,7 +109,7 @@ impl MemoryService {
                 "layers": empty_memory_layers_json(),
                 "total_entries": 0,
                 "vector_count": 0,
-                "capabilities": memory_capabilities_json(false, 0),
+                "capabilities": memory_capabilities_json(false, 0, "unavailable", false),
                 "session_store": false,
                 "context_health": {
                     "level": "unavailable",
@@ -350,7 +353,7 @@ impl MemoryService {
         }
     }
 
-    pub(crate) async fn knowledge_projection(&self) -> serde_json::Value {
+    pub(crate) async fn knowledge_projection(&self, config_home: &Path) -> serde_json::Value {
         let Some(_mgr) = self.manager() else {
             return serde_json::json!({
                 "enabled": false,
@@ -382,8 +385,7 @@ impl MemoryService {
             .iter()
             .filter(|entry| is_knowledge_memory_entry(entry))
             .count();
-        let durable_fabric =
-            memory::durable_knowledge_fabric_for_config_home(runtime::cowd_dirs::config_home_dir());
+        let durable_fabric = memory::durable_knowledge_fabric_for_config_home(config_home);
         let (capability_status, projection_mode, durable, degraded, degraded_reason, projection) =
             match durable_fabric {
                 Ok(fabric) => (
@@ -533,7 +535,12 @@ fn knowledge_governance_for_entry(entry: &MemoryEntry) -> KnowledgeGovernanceLev
     }
 }
 
-fn memory_capabilities_json(enabled: bool, vector_count: usize) -> serde_json::Value {
+fn memory_capabilities_json(
+    enabled: bool,
+    vector_count: usize,
+    search_mode: &str,
+    semantic_supported: bool,
+) -> serde_json::Value {
     if !enabled {
         return serde_json::json!({
             "vector_semantic": capability_probe_json(
@@ -555,13 +562,23 @@ fn memory_capabilities_json(enabled: bool, vector_count: usize) -> serde_json::V
         });
     }
 
+    let vector_status = if semantic_supported {
+        RealityCapabilityStatus::EnabledAndWired
+    } else {
+        RealityCapabilityStatus::ConfiguredButUnwired
+    };
+    let vector_reason = if semantic_supported {
+        format!(
+            "semantic embedding backend is configured; search_mode={search_mode}; vector index currently stores {vector_count} embeddings"
+        )
+    } else {
+        format!(
+            "semantic embedding backend is not configured; search_mode={search_mode}; recall is using keyword/AAAK sources while vector_count={vector_count}"
+        )
+    };
+
     serde_json::json!({
-        "vector_semantic": capability_probe_json(
-            RealityCapabilityStatus::EnabledAndWired,
-            format!(
-                "vector index stores {vector_count} embeddings and participates in MemoryKernel recall as a first-class source when embeddings are available"
-            )
-        ),
+        "vector_semantic": capability_probe_json(vector_status, vector_reason),
         "aaak_index": capability_probe_json(
             RealityCapabilityStatus::EnabledAndWired,
             "AAAK compact navigation is exposed as a recall source and omission pointer for deep context recovery"

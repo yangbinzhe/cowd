@@ -20,6 +20,26 @@ impl GatewayServices {
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
     ) -> Self {
+        Self::new_with_config_home(
+            runtime,
+            task_kernel,
+            surface_host,
+            memory_manager,
+            approval_gate,
+            approval_repository,
+            ::runtime::cowd_dirs::config_home_dir(),
+        )
+    }
+
+    pub(crate) fn new_with_config_home(
+        runtime: Arc<RuntimeService>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_repository: FileApprovalRepository,
+        config_home: impl AsRef<std::path::Path>,
+    ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
         let session_kernel = runtime.session_kernel();
         let lifecycle_kernel = runtime.lifecycle_kernel();
@@ -31,11 +51,15 @@ impl GatewayServices {
             task: TaskService::with_kernel(task_kernel),
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
-            ..Self::baseline()
+            ..Self::baseline_with_config_home(config_home)
         }
     }
 
     pub(crate) fn baseline() -> Self {
+        Self::baseline_with_config_home(::runtime::cowd_dirs::config_home_dir())
+    }
+
+    pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
         Self {
             runtime: None,
             surface: SurfaceService::new(),
@@ -53,7 +77,7 @@ impl GatewayServices {
             harness_eval: HarnessEvalService::new(),
             provider: ProviderService::new(),
             reality: RealityService::new(),
-            growth: GrowthService::new(),
+            growth: GrowthService::new_for_config_home(config_home),
             workspace: WorkspaceService::new(),
             skill: SkillService::new(),
             agent: AgentService::new(),

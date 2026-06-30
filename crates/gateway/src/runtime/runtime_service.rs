@@ -338,12 +338,20 @@ impl RuntimeService {
         session_id: &str,
         profile: runtime::ContextProfile,
         resume_context: Option<runtime::ResumeContextPacket>,
+        reality_context_items: Vec<runtime::ContextItem>,
     ) -> Result<(), RuntimeTurnExecutionError> {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let runtime_guard = runtime_entry.lock().await;
         runtime_guard.set_context_profile(profile);
+        runtime_guard.replace_external_context_sources(
+            &[
+                runtime::ContextSourceKind::Fact,
+                runtime::ContextSourceKind::Matrix,
+            ],
+            reality_context_items,
+        );
         if let Some(packet) = resume_context {
             runtime_guard.inject_resume_context(packet);
         }

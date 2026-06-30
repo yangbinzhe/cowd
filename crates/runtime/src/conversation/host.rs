@@ -4,10 +4,10 @@ use crate::agent_collaboration::CollaborationContextResult;
 use crate::{
     agent, agent_collaboration, joint_problem_solving, model_context_window_with_overrides,
     permissions::SharedPrompter, CompactionConfig, CompactionResult, ContextEnvelope, ContextItem,
-    ContextProfile, ConversationMessage, CowdEvent, CowdEventBus, HookAbortSignal,
-    HookProgressReporter, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition,
-    ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor,
-    TurnSummary,
+    ContextProfile, ContextSourceKind, ConversationMessage, CowdEvent, CowdEventBus,
+    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
+    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
+    ToolCallback, ToolExecutor, TurnSummary,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 
@@ -156,6 +156,20 @@ where
 
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
+    }
+
+    pub fn replace_external_context_sources(
+        &self,
+        sources: &[ContextSourceKind],
+        items: Vec<ContextItem>,
+    ) {
+        let runtime = self.runtime_ref();
+        for source in sources {
+            runtime.clear_external_context_source(*source);
+        }
+        for item in items {
+            runtime.push_external_context_item(item);
+        }
     }
 
     pub async fn run_turn_async(

@@ -131,13 +131,23 @@ async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
 }
 
 async fn memory_knowledge_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.memory.knowledge_projection().await)
+    Json(
+        state
+            .services
+            .memory
+            .knowledge_projection(&state.config_home)
+            .await,
+    )
 }
 
 async fn memory_knowledge_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let projection = state.services.memory.knowledge_projection().await;
+    let projection = state
+        .services
+        .memory
+        .knowledge_projection(&state.config_home)
+        .await;
     Json(serde_json::json!({
         "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "degraded": projection.get("degraded").cloned().unwrap_or(serde_json::Value::Bool(true)),

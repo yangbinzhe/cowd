@@ -1601,10 +1601,17 @@ fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, Co
     let Some(object) = root.as_object() else {
         return Ok(ApprovalConfig::default());
     };
-    let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) else {
-        return Ok(ApprovalConfig::default());
-    };
-    let Some(approval) = permissions.get("approval").and_then(JsonValue::as_object) else {
+    let approval = object
+        .get("approval")
+        .and_then(JsonValue::as_object)
+        .or_else(|| {
+            object
+                .get("permissions")
+                .and_then(JsonValue::as_object)
+                .and_then(|permissions| permissions.get("approval"))
+                .and_then(JsonValue::as_object)
+        });
+    let Some(approval) = approval else {
         return Ok(ApprovalConfig::default());
     };
 
@@ -1690,7 +1697,11 @@ fn parse_optional_permission_mode(
     let Some(mode) = object
         .get("permissions")
         .and_then(JsonValue::as_object)
-        .and_then(|permissions| permissions.get("defaultMode"))
+        .and_then(|permissions| {
+            permissions
+                .get("defaultMode")
+                .or_else(|| permissions.get("default_mode"))
+        })
         .and_then(JsonValue::as_str)
     else {
         return Ok(None);
@@ -2169,12 +2180,18 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 let p = expect_object(v, &ctx)?;
                 Ok(PlatformConfig {
                     platform_type: expect_string(p, "platformType", &ctx)
+                        .or_else(|_| expect_string(p, "platform_type", &ctx))
                         .or_else(|_| expect_string(p, "type", &ctx)) // fallback: "type" key
                         .map(|s| s.to_string())?,
                     enabled: optional_bool(p, "enabled", &ctx)?.unwrap_or(true),
                     extra: p
                         .iter()
-                        .filter(|(k, _)| k.as_str() != "platformType" && k.as_str() != "enabled")
+                        .filter(|(k, _)| {
+                            !matches!(
+                                k.as_str(),
+                                "platformType" | "platform_type" | "type" | "enabled"
+                            )
+                        })
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                 })
@@ -3139,6 +3156,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_snake_case_permission_mode_from_default_template_shape() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+permissions:
+  default_mode: "acceptEdits"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            loaded.permission_mode(),
+            Some(ResolvedPermissionMode::WorkspaceWrite)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_top_level_approval_from_default_template_shape() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+approval:
+  solo_mode: true
+  solo_honor_critical: false
+  auto_pass_read_only: false
+  auto_pass_low_risk: false
+"#,
+        )
+        .expect("write config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.approval().solo_mode);
+        assert!(!loaded.approval().solo_honor_critical);
+        assert!(!loaded.approval().auto_pass_read_only);
+        assert!(!loaded.approval().auto_pass_low_risk);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -4010,6 +4086,46 @@ gateway:
         assert_eq!(
             loaded.gateway().webui_dir.as_deref(),
             Some(std::path::Path::new("/tmp/cowd-surface-webui-dist"))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn gateway_platform_accepts_snake_case_platform_type() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+gateway:
+  enabled: true
+  platforms:
+    - platform_type: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+"#,
+        )
+        .expect("write gateway config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let platform = loaded
+            .gateway()
+            .platforms
+            .first()
+            .expect("platform should be parsed");
+        assert_eq!(platform.platform_type, "api_server");
+        assert!(!platform.extra.contains_key("platform_type"));
+        assert_eq!(
+            platform.extra.get("host").and_then(JsonValue::as_str),
+            Some("127.0.0.1")
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

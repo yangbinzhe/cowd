@@ -113,6 +113,15 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().inject_resume_context(packet);
     }
 
+    pub(crate) fn replace_external_context_sources(
+        &self,
+        sources: &[runtime::ContextSourceKind],
+        items: Vec<runtime::ContextItem>,
+    ) {
+        self.runtime_ref()
+            .replace_external_context_sources(sources, items);
+    }
+
     pub(crate) fn last_context_turn_report(
         &self,
     ) -> Option<harness_contract::context::ContextTurnReport> {
