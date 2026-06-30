@@ -98,6 +98,8 @@ impl StorageLayout {
         let sqlite = BTreeMap::from([
             ("session".to_string(), root.join("session.sqlite")),
             ("memory".to_string(), root.join("memory.sqlite")),
+            ("knowledge".to_string(), root.join("knowledge.sqlite")),
+            ("fact".to_string(), root.join("fact.sqlite")),
             ("matrix".to_string(), root.join("matrix.sqlite")),
             ("mfg".to_string(), root.join("mfg.sqlite")),
             (
@@ -240,6 +242,8 @@ fn owner_for_domain(domain: &str) -> &'static str {
     match domain {
         "session" => "session",
         "memory" => "memory",
+        "knowledge" => "memory",
+        "fact" => "fact-kernel",
         "matrix" => "matrix",
         "mfg" => "mfg",
         "resource_directory" => "connector",

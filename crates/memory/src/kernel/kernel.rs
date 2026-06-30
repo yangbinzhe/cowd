@@ -4,6 +4,8 @@
 //! [`CognitiveContextManager`]. It establishes the v0.8.12 control boundary
 //! without rewriting the mature memory subsystems underneath it.
 
+pub mod reality_recall;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -11,7 +13,8 @@ use std::{
 };
 
 use chrono::Utc;
-use fact_kernel::{FactKernelService, FactReviewReceipt};
+use fact_kernel::{FactKernelService, FactReviewReceipt, InMemoryFactStore};
+use harness_contract::reality::RecallSourceKind;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -29,6 +32,8 @@ use crate::{
         PreparedContext, Priority, TokenBudget,
     },
 };
+
+use reality_recall::{RecallCandidate, RecallOmission, RecallReport, RecallSourceResult};
 
 /// Result alias for the MemoryKernel boundary.
 pub type MemoryKernelResult<T> = std::result::Result<T, MemoryKernelError>;
@@ -200,6 +205,8 @@ pub struct MemoryPacketItem {
     pub atom: MemoryAtomView,
     pub role: MemoryPacketRole,
     pub reason: String,
+    #[serde(default)]
+    pub content_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,6 +222,20 @@ pub struct MemoryContextPacket {
     pub omitted: Vec<OmittedMemory>,
     pub token_estimate: u64,
     pub truncated: bool,
+    #[serde(default)]
+    pub recall_report: RecallReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryContextPacketMode {
+    RecordUsage,
+    Preview,
+}
+
+impl MemoryContextPacketMode {
+    fn records_usage(self) -> bool {
+        matches!(self, Self::RecordUsage)
+    }
 }
 
 impl MemoryLayerView {
@@ -504,7 +525,7 @@ impl MemoryKernel {
             .enumerate()
             .map(|(index, fact)| (checkpoint.fact_candidate_id_key(index), fact.clone()))
             .collect::<HashMap<_, _>>();
-        let mut fact_service = FactKernelService::new();
+        let mut fact_service = FactKernelService::with_store(InMemoryFactStore::new());
         for entry in self.manager.list_all_entries().await? {
             fact_service.upsert_fact(entry.to_fact_record());
         }
@@ -638,7 +659,49 @@ impl MemoryKernel {
         max_items: usize,
         max_tokens: u64,
     ) -> MemoryKernelResult<MemoryContextPacket> {
+        self.context_packet_with_mode(
+            ctx,
+            query,
+            messages,
+            max_items,
+            max_tokens,
+            MemoryContextPacketMode::RecordUsage,
+        )
+        .await
+    }
+
+    pub async fn context_packet_preview(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        messages: &[Message],
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        self.context_packet_with_mode(
+            ctx,
+            query,
+            messages,
+            max_items,
+            max_tokens,
+            MemoryContextPacketMode::Preview,
+        )
+        .await
+    }
+
+    async fn context_packet_with_mode(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        messages: &[Message],
+        max_items: usize,
+        max_tokens: u64,
+        mode: MemoryContextPacketMode,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
         let mut prepared = self.prepare(ctx, query, messages).await?;
+        let mut source_results = Vec::new();
+        let mut selected_sources: HashMap<MemoryId, RecallSourceKind> = HashMap::new();
+        let mut vector_scores: HashMap<MemoryId, f32> = HashMap::new();
         let mut checkpoint_omissions = Vec::new();
         prepared.entries.retain(|entry| {
             if !entry.tags.iter().any(|tag| tag == "semantic-checkpoint") {
@@ -673,16 +736,74 @@ impl MemoryKernel {
             merged.extend(prepared.entries);
             prepared.entries = merged;
         }
+        let mut seen_for_vector: HashSet<MemoryId> =
+            prepared.entries.iter().map(|entry| entry.id).collect();
+        match self
+            .manager
+            .vector_recall_candidates(query, &seen_for_vector, max_items.max(1))
+            .await
+        {
+            Ok(vector_entries) => {
+                let mut added = 0usize;
+                for (entry, score) in vector_entries {
+                    if seen_for_vector.insert(entry.id) {
+                        vector_scores.insert(entry.id, score);
+                        selected_sources.insert(entry.id, RecallSourceKind::Memory);
+                        prepared.entries.push(entry);
+                        added += 1;
+                    }
+                }
+                source_results.push(RecallSourceResult {
+                    source: RecallSourceKind::Memory,
+                    status: "enabled_and_wired".to_string(),
+                    selected_count: added,
+                    omitted_count: 0,
+                    degraded_reason: None,
+                });
+            }
+            Err(error) => source_results.push(RecallSourceResult {
+                source: RecallSourceKind::Memory,
+                status: "degraded".to_string(),
+                selected_count: 0,
+                omitted_count: 0,
+                degraded_reason: Some(format!("vector recall unavailable: {error}")),
+            }),
+        }
+        let aaak_index = crate::aaak_index::AaakIndex::from_entries(
+            &prepared.entries,
+            (max_tokens / 8).clamp(128, 2_048),
+        );
+        source_results.push(RecallSourceResult {
+            source: RecallSourceKind::CompactNavigation,
+            status: if aaak_index.slots.is_empty() {
+                "degraded"
+            } else {
+                "enabled_and_wired"
+            }
+            .to_string(),
+            selected_count: aaak_index.slots.len(),
+            omitted_count: 0,
+            degraded_reason: aaak_index
+                .slots
+                .is_empty()
+                .then(|| "AAAK compact index has no slots for this packet".to_string()),
+        });
+        let usage_summary = self.usage_summary().await.unwrap_or_default();
         let mut packet = self
             .context_packet_from_entries_with_budget(
                 prepared.entries,
                 max_items,
                 max_tokens,
                 &self.manager.budget_config(),
+                Some(&usage_summary),
             )
             .await?;
         packet.omitted.extend(checkpoint_omissions);
-        self.record_context_usage(ctx, &packet).await?;
+        packet.recall_report =
+            recall_report_from_packet(&packet, selected_sources, vector_scores, source_results);
+        if mode.records_usage() {
+            self.record_context_usage(ctx, &packet).await?;
+        }
         Ok(packet)
     }
 
@@ -744,6 +865,7 @@ impl MemoryKernel {
             max_items,
             max_tokens,
             &self.manager.budget_config(),
+            None,
         )
         .await
     }
@@ -754,9 +876,11 @@ impl MemoryKernel {
         max_items: usize,
         max_tokens: u64,
         budget: &crate::config::BudgetConfig,
+        usage: Option<&MemoryUsageSummary>,
     ) -> MemoryKernelResult<MemoryContextPacket> {
         entries.sort_by(|left, right| {
-            memory_entry_selection_rank(right).cmp(&memory_entry_selection_rank(left))
+            memory_entry_selection_rank_with_usage(right, usage)
+                .cmp(&memory_entry_selection_rank_with_usage(left, usage))
         });
         let mut selected = Vec::new();
         let mut omitted = Vec::new();
@@ -793,12 +917,24 @@ impl MemoryKernel {
                 continue;
             }
 
-            let (role, reason) = packet_role_and_reason(&atom);
+            let (role, mut reason) = packet_role_and_reason(&atom);
+            if let Some(selected_count) =
+                usage.and_then(|summary| summary.per_memory_selected.get(&entry.id).copied())
+            {
+                if selected_count > 0 {
+                    reason.push_str(&format!("; usage_feedback:selected_count={selected_count}"));
+                }
+            }
             layer_tokens
                 .entry(entry.layer)
                 .and_modify(|used| *used = used.saturating_add(item_tokens))
                 .or_insert(item_tokens);
-            selected.push(MemoryPacketItem { atom, role, reason });
+            selected.push(MemoryPacketItem {
+                atom,
+                role,
+                reason,
+                content_preview: truncate_memory_content_preview(&entry.content),
+            });
             token_estimate = token_estimate.saturating_add(item_tokens);
         }
 
@@ -807,6 +943,7 @@ impl MemoryKernel {
             omitted,
             token_estimate,
             truncated,
+            recall_report: RecallReport::default(),
         })
     }
 
@@ -1361,6 +1498,115 @@ fn checkpoint_recall_score(entry: &MemoryEntry, ctx: &MemoryTurnContext, query: 
     (scope_score + overlap_score + kind_score + entry.confidence.clamp(0.0, 1.0) * 0.08).min(1.0)
 }
 
+fn recall_report_from_packet(
+    packet: &MemoryContextPacket,
+    source_by_id: HashMap<MemoryId, RecallSourceKind>,
+    vector_scores: HashMap<MemoryId, f32>,
+    mut sources: Vec<RecallSourceResult>,
+) -> RecallReport {
+    let selected = packet
+        .selected
+        .iter()
+        .map(|item| {
+            let source = source_by_id
+                .get(&item.atom.id)
+                .copied()
+                .unwrap_or(RecallSourceKind::Memory);
+            let relevance = memory_atom_relevance(&item.atom);
+            let entry = memory_entry_from_packet_item(item);
+            let mut candidate = RecallCandidate::from_entry(entry, source, relevance);
+            if let Some(score) = vector_scores.get(&item.atom.id).copied() {
+                candidate = candidate.with_vector_similarity(score);
+            }
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let omitted = packet
+        .omitted
+        .iter()
+        .map(|item| RecallOmission {
+            id: item.id,
+            title: item.title.clone(),
+            source: RecallSourceKind::Memory,
+            reason: item.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    let memory_selected = selected.len();
+    let memory_omitted = omitted.len();
+    if let Some(memory_source) = sources
+        .iter_mut()
+        .find(|source| source.source == RecallSourceKind::Memory)
+    {
+        memory_source.selected_count = memory_source.selected_count.max(memory_selected);
+        memory_source.omitted_count = memory_source.omitted_count.max(memory_omitted);
+    } else {
+        sources.push(RecallSourceResult {
+            source: RecallSourceKind::Memory,
+            status: "enabled_and_wired".to_string(),
+            selected_count: memory_selected,
+            omitted_count: memory_omitted,
+            degraded_reason: None,
+        });
+    }
+    RecallReport::from_selected_omitted(selected, omitted, sources, packet.truncated)
+}
+
+fn memory_entry_from_packet_item(item: &MemoryPacketItem) -> MemoryEntry {
+    MemoryEntry {
+        id: item.atom.id,
+        layer: item.atom.layer,
+        category: crate::types::MemoryCategory::Reference,
+        priority: if item.atom.salience >= 3.0 {
+            Priority::High
+        } else {
+            Priority::Normal
+        },
+        source: MemorySource::AutoExtracted,
+        title: item.atom.title.clone(),
+        content: if item.content_preview.trim().is_empty() {
+            item.reason.clone()
+        } else {
+            item.content_preview.clone()
+        },
+        embedding: None,
+        tags: vec![format!("packet-role:{:?}", item.role)],
+        relations: Vec::new(),
+        confidence: item.atom.confidence,
+        access_count: 0,
+        staleness: (1.0 - item.atom.salience / 5.0).clamp(0.0, 1.0),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_accessed_at: None,
+        scope: MemoryScope::Global,
+        session_id: None,
+        source_agent: None,
+        visibility: AgentVisibility::Shared,
+    }
+}
+
+fn truncate_memory_content_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 480;
+    let mut chars = content.chars();
+    let preview = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn memory_atom_relevance(atom: &MemoryAtomView) -> f32 {
+    let state_score = match atom.state {
+        MemoryState::Validated => 1.0,
+        MemoryState::Active => 0.85,
+        MemoryState::Observed => 0.75,
+        MemoryState::Candidate => 0.60,
+        MemoryState::Conflicted => 0.35,
+        MemoryState::Stale | MemoryState::Superseded | MemoryState::Archived => 0.20,
+    };
+    (state_score * 0.6 + atom.confidence.clamp(0.0, 1.0) * 0.4).clamp(0.0, 1.0)
+}
+
 fn query_overlap_score(query: &str, title: &str, content: &str) -> f32 {
     let query = query.to_lowercase();
     let haystack = format!("{} {}", title.to_lowercase(), content.to_lowercase());
@@ -1394,6 +1640,24 @@ fn memory_entry_selection_rank(entry: &MemoryEntry) -> i32 {
         (_, MemoryLayer::L3, _) => 40,
         (_, MemoryLayer::L4, _) => 30,
     }
+}
+
+fn memory_entry_selection_rank_with_usage(
+    entry: &MemoryEntry,
+    usage: Option<&MemoryUsageSummary>,
+) -> i32 {
+    let base = memory_entry_selection_rank(entry);
+    let selected_count = usage
+        .and_then(|summary| summary.per_memory_selected.get(&entry.id).copied())
+        .unwrap_or_default();
+    let boost = match selected_count {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=5 => 4,
+        _ => 6,
+    };
+    base + boost
 }
 
 fn layer_budget_cap(budget: &crate::config::BudgetConfig, layer: MemoryLayer) -> Option<u64> {

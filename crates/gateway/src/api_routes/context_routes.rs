@@ -75,6 +75,22 @@ async fn context_current_handler(
             runtime_service.last_context_envelope_nonblocking(session_id)
         })
     });
+    let query = params
+        .get("q")
+        .or_else(|| params.get("query"))
+        .cloned()
+        .unwrap_or_default();
+    let reality_items = state
+        .services
+        .reality
+        .recall_augmentation(
+            &state.config_home,
+            &state.services.matrix,
+            &state.services.growth,
+            &query,
+            8,
+        )
+        .context_items;
     Json(
         state
             .services
@@ -86,6 +102,7 @@ async fn context_current_handler(
                 active_envelope,
                 requested_session_id,
                 params,
+                reality_items,
             )
             .await,
     )

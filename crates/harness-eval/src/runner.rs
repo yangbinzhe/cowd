@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::{
     evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
-    evaluate_report_gate, harness_capability_coverage_report,
+    evaluate_reality_context_scenarios, evaluate_report_gate, harness_capability_coverage_report,
     report::{
         HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, ToolCallDetail,
         ToolCallSummary,
@@ -75,6 +75,7 @@ pub fn run_eval(
     let complex =
         (options.level == HarnessEvalLevel::Full).then(evaluate_complex_harness_scenarios);
     let knowledge = evaluate_knowledge_fabric_context_governance();
+    let reality_context = evaluate_reality_context_scenarios();
     let real_tool = (options.level == HarnessEvalLevel::Full).then(run_full_real_tool_scenarios);
     let mut scenarios = vec![
         json!({
@@ -95,6 +96,12 @@ pub fn run_eval(
             "evidence": format!("active_packs={}, blocked_namespaces={}, conflicts={}, evidence={}", knowledge.active_pack_count, knowledge.blocked_namespace_count, knowledge.conflict_count, knowledge.evidence_count),
             "notes": knowledge.notes.join("; ")
         }),
+        json!({
+            "capability": "reality_context_eval",
+            "status": if reality_context.failed == 0 { "passed" } else { "failed" },
+            "evidence": format!("{}/{} reality scenarios passed; selected_context={}, omitted_context={}, evidence_refs={}", reality_context.passed, reality_context.total, reality_context.selected_context_total, reality_context.omitted_context_total, reality_context.evidence_ref_total),
+            "notes": "validates RecallReport, ContextEnvelope, selected/omitted context, evidence refs, scoped recall, knowledge activation, fact/matrix trace, tool sandbox, multi-agent and cross-session evidence"
+        }),
     ];
     if let Some(complex) = &complex {
         scenarios.push(json!({
@@ -106,7 +113,7 @@ pub fn run_eval(
     }
 
     let total_elapsed_ms = started.elapsed().as_millis();
-    let runtime_actions = 3 + usize::from(complex.is_some());
+    let runtime_actions = 4 + usize::from(complex.is_some());
     let mut usage = empty_usage("deterministic_smoke");
     let mut tool_call_log = Vec::new();
     let mut tool_call_details = Vec::new();
@@ -155,6 +162,7 @@ pub fn run_eval(
             {"name": "tool_calls", "value": tool_calls.to_string(), "notes": if options.level == HarnessEvalLevel::Full { "full eval executed local read-only tool evidence" } else { "quick smoke lane intentionally does not execute tools" }}
         ],
         "complex_scenarios": complex,
+        "reality_context_eval": reality_context,
         "real_tool_scenarios": real_tool_scenarios,
         "event_observation_parity": event_observation_parity,
         "report_package": {
@@ -175,7 +183,8 @@ pub fn run_eval(
             "runtime_action_log": [
                 {"index": 1, "action": "stable_ai_scenario_matrix", "evidence": "deterministic fake provider suite"},
                 {"index": 2, "action": "harness_capability_coverage", "evidence": "runtime module map coverage"},
-                {"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"}
+                {"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"},
+                {"index": 4, "action": "reality_context_eval.evaluate", "evidence": "RecallReport and ContextEnvelope scenario matrix generated"}
             ]
         },
         "tool_call_details": tool_call_details,
@@ -494,6 +503,10 @@ mod tests {
             detail.report["event_observation_parity"]["status"],
             "passed"
         );
+        assert_eq!(detail.report["reality_context_eval"]["failed"], 0);
+        assert!(detail.report["reality_context_eval"]["scenarios"]
+            .as_array()
+            .is_some_and(|items| items.len() >= 10));
         assert!(detail
             .artifacts
             .iter()
@@ -506,6 +519,10 @@ mod tests {
             .artifacts
             .iter()
             .any(|path| path.ends_with("run-evidence/tool-call-1.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/reality-context-eval.json")));
         assert!(
             detail.report["real_tool_scenarios"]["scenarios"][0]["changed_files"]
                 .as_array()

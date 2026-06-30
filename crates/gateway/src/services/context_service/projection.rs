@@ -9,6 +9,7 @@ impl ContextService {
         active_envelope: Option<ContextEnvelope>,
         fallback_session_id: Option<String>,
         params: HashMap<String, String>,
+        extra_dynamic_items: Vec<ContextItem>,
     ) -> serde_json::Value {
         let session_id = params
             .get("session_id")
@@ -32,7 +33,7 @@ impl ContextService {
         let mut degraded = Vec::new();
 
         match memory
-            .context_packet(session_id.clone(), "api", query.clone(), 12, 2_000)
+            .context_packet_preview(session_id.clone(), "api", query.clone(), 12, 2_000)
             .await
         {
             Ok(packet) => {
@@ -47,8 +48,9 @@ impl ContextService {
                             | memory::MemoryPacketRole::Conflict => ContextRole::Warning,
                         },
                         format!(
-                            "{}\nreason: {}\nevidence: {}",
+                            "{}\ncontent: {}\nreason: {}\nevidence: {}",
                             item.atom.title,
+                            item.content_preview,
                             item.reason,
                             item.atom.evidence_pointer.as_deref().unwrap_or("")
                         ),
@@ -70,6 +72,7 @@ impl ContextService {
         }
 
         dynamic_items.extend(self.resource_context_items(connector, workspace_root, &query));
+        dynamic_items.extend(extra_dynamic_items);
 
         let mut envelope = RuntimeContextBoundary::build_envelope(ContextEnvelopeRequest {
             profile,
@@ -163,6 +166,8 @@ fn context_agent_view_from_params(
                 ContextSourceKind::Task,
                 ContextSourceKind::Workspace,
                 ContextSourceKind::Memory,
+                ContextSourceKind::Fact,
+                ContextSourceKind::Matrix,
                 ContextSourceKind::AgentPeer,
             ]
         });
@@ -197,6 +202,8 @@ fn parse_context_source_kind(value: &str) -> Option<ContextSourceKind> {
         "conversation" => Some(ContextSourceKind::Conversation),
         "memory" => Some(ContextSourceKind::Memory),
         "knowledge" => Some(ContextSourceKind::Knowledge),
+        "fact" | "facts" => Some(ContextSourceKind::Fact),
+        "matrix" => Some(ContextSourceKind::Matrix),
         "task" => Some(ContextSourceKind::Task),
         "tooltrace" | "tool_trace" => Some(ContextSourceKind::ToolTrace),
         "workspace" => Some(ContextSourceKind::Workspace),

@@ -1,6 +1,10 @@
 use std::path::Path;
 
 use chrono::Utc;
+use harness_contract::reality::{RealityBoundary, RealityCapabilityStatus, RecallSourceKind};
+use memory::types::MemoryLayer;
+use memory::{rank_candidates, RecallCandidate, RecallOmission, RecallReport, RecallSourceResult};
+use runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 use serde::{Deserialize, Serialize};
 
 use super::{AuditService, ContextService, GrowthService, MatrixService, MemoryService};
@@ -23,6 +27,13 @@ pub(crate) type RealityStaticProjection = serde_json::Value;
 pub(crate) type FactFlowProjection = serde_json::Value;
 pub(crate) type RealityBoundaryProjection = serde_json::Value;
 pub(crate) type PromotionTraceProjection = serde_json::Value;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RealityRecallAugmentation {
+    pub(crate) candidates: Vec<RecallCandidate>,
+    pub(crate) sources: Vec<RecallSourceResult>,
+    pub(crate) context_items: Vec<ContextItem>,
+}
 
 impl RealityService {
     pub(crate) fn new() -> Self {
@@ -85,6 +96,7 @@ impl RealityService {
             .durable_promotion_log(config_home)
             .unwrap_or_default();
         let degraded_reasons = degraded_reasons(&memory_status, &matrix_health);
+        let capabilities = reality_capabilities(&memory_status, &knowledge_status, &matrix_health);
 
         serde_json::json!({
             "kind": "reality.status",
@@ -96,6 +108,7 @@ impl RealityService {
                 "degraded": !degraded_reasons.is_empty(),
                 "degraded_reasons": degraded_reasons,
             },
+            "capabilities": capabilities,
             "engines": {
                 "fact_kernel": {
                     "status": "ready",
@@ -258,9 +271,9 @@ impl RealityService {
                 {
                     "id": "context",
                     "label": "Context Bridge",
-                    "scope": "Current context packets, evidence routing, budget pressure, and session recommendations.",
+                    "scope": "Current context packets, recall reports, evidence routing, budget pressure, and session recommendations.",
                     "route": "/context",
-                    "api": ["/api/context/current", "/api/evidence/resolve", "/api/sessions/:id/context/recommendations"],
+                    "api": ["/api/context/current", "/api/reality/recall/report", "/api/reality/context/envelope", "/api/reality/evidence/:id", "/api/evidence/resolve", "/api/sessions/:id/context/recommendations"],
                     "owner": "gateway.context",
                     "mode": "read-write"
                 },
@@ -431,6 +444,361 @@ impl RealityService {
             "source": "growth.promotion_receipts",
         })
     }
+
+    pub(crate) fn recall_augmentation(
+        &self,
+        config_home: &Path,
+        matrix: &MatrixService,
+        growth: &GrowthService,
+        query: &str,
+        limit: usize,
+    ) -> RealityRecallAugmentation {
+        let limit = limit.clamp(1, 100);
+        let mut augmentation = RealityRecallAugmentation::default();
+        let mut fact_omitted = 0usize;
+        let fact_hits = growth.recall_facts(query, limit);
+        for hit in fact_hits {
+            let fact = hit.fact;
+            let boundary = fact_boundary(&fact);
+            if !boundary.can_be_authoritative() {
+                fact_omitted += 1;
+                continue;
+            }
+            let refs = fact_references(&fact);
+            let candidate = RecallCandidate::from_external(
+                format!("Fact {} · {}", fact.id.as_str(), fact.fact_type),
+                fact.statement.clone(),
+                MemoryLayer::L3,
+                RecallSourceKind::Fact,
+                (hit.score as f32 / 40.0).clamp(0.1, 1.0),
+                fact.confidence.basis_points() as f32 / 10_000.0,
+                refs.clone(),
+                boundary,
+            );
+            augmentation
+                .context_items
+                .push(fact_context_item(&fact, &refs, boundary));
+            augmentation.candidates.push(candidate);
+        }
+        augmentation.sources.push(RecallSourceResult {
+            source: RecallSourceKind::Fact,
+            status: "enabled_and_wired".to_string(),
+            selected_count: augmentation
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.source == RecallSourceKind::Fact)
+                .count(),
+            omitted_count: fact_omitted,
+            degraded_reason: None,
+        });
+
+        match matrix.list_facts(config_home, limit.saturating_mul(3)) {
+            Ok(facts) => {
+                let mut selected = 0usize;
+                let mut omitted = 0usize;
+                for fact in facts {
+                    if selected >= limit {
+                        omitted += 1;
+                        continue;
+                    }
+                    let score = matrix_fact_score(&fact, query);
+                    if score <= 0.0 {
+                        omitted += 1;
+                        continue;
+                    }
+                    let boundary = matrix_boundary(fact.confidence);
+                    if !boundary.can_be_authoritative() {
+                        omitted += 1;
+                        continue;
+                    }
+                    let refs = matrix_fact_references(&fact);
+                    let content = matrix_fact_summary(&fact);
+                    augmentation.candidates.push(RecallCandidate::from_external(
+                        format!("Matrix fact {} · {}", fact.fact_id, fact.fact_type),
+                        content.clone(),
+                        MemoryLayer::L4,
+                        RecallSourceKind::Matrix,
+                        score,
+                        fact.confidence,
+                        refs.clone(),
+                        boundary,
+                    ));
+                    augmentation.context_items.push(matrix_context_item(
+                        &fact.fact_id,
+                        content,
+                        &refs,
+                        fact.confidence,
+                    ));
+                    selected += 1;
+                }
+                match matrix.list_evidence_packets(config_home, limit) {
+                    Ok(packets) => {
+                        for packet in packets {
+                            if selected >= limit {
+                                omitted += 1;
+                                continue;
+                            }
+                            let score = text_overlap_score(query, &packet.problem_statement);
+                            if score <= 0.0 && !query.trim().is_empty() {
+                                omitted += 1;
+                                continue;
+                            }
+                            let boundary = matrix_boundary(packet.confidence);
+                            if !boundary.can_be_authoritative() {
+                                omitted += 1;
+                                continue;
+                            }
+                            let refs = vec![format!("matrix:evidence:{}", packet.packet_id)];
+                            let content = packet.context_summary();
+                            augmentation.candidates.push(RecallCandidate::from_external(
+                                format!("Matrix evidence {}", packet.packet_id),
+                                content.clone(),
+                                MemoryLayer::L4,
+                                RecallSourceKind::Matrix,
+                                score.max(0.35),
+                                packet.confidence,
+                                refs.clone(),
+                                boundary,
+                            ));
+                            augmentation.context_items.push(matrix_context_item(
+                                &packet.packet_id,
+                                content,
+                                &refs,
+                                packet.confidence,
+                            ));
+                            selected += 1;
+                        }
+                    }
+                    Err(error) => augmentation.sources.push(RecallSourceResult {
+                        source: RecallSourceKind::Matrix,
+                        status: "degraded".to_string(),
+                        selected_count: selected,
+                        omitted_count: omitted,
+                        degraded_reason: Some(format!(
+                            "matrix evidence recall unavailable: {error}"
+                        )),
+                    }),
+                }
+                if !augmentation
+                    .sources
+                    .iter()
+                    .any(|source| source.source == RecallSourceKind::Matrix)
+                {
+                    augmentation.sources.push(RecallSourceResult {
+                        source: RecallSourceKind::Matrix,
+                        status: "enabled_and_wired".to_string(),
+                        selected_count: selected,
+                        omitted_count: omitted,
+                        degraded_reason: None,
+                    });
+                }
+            }
+            Err(error) => augmentation.sources.push(RecallSourceResult {
+                source: RecallSourceKind::Matrix,
+                status: "degraded".to_string(),
+                selected_count: 0,
+                omitted_count: 0,
+                degraded_reason: Some(format!("matrix fact recall unavailable: {error}")),
+            }),
+        }
+
+        augmentation
+    }
+
+    pub(crate) fn augment_recall_report(
+        &self,
+        config_home: &Path,
+        matrix: &MatrixService,
+        growth: &GrowthService,
+        query: &str,
+        max_items: usize,
+        report: &mut RecallReport,
+    ) -> RealityRecallAugmentation {
+        let augmentation = self.recall_augmentation(config_home, matrix, growth, query, max_items);
+        report.selected.extend(augmentation.candidates.clone());
+        rank_candidates(&mut report.selected);
+        let max_items = max_items.max(1);
+        if report.selected.len() > max_items {
+            let overflow = report.selected.split_off(max_items);
+            report
+                .omitted
+                .extend(overflow.into_iter().map(|candidate| RecallOmission {
+                    id: candidate.id,
+                    title: candidate.title,
+                    source: candidate.source,
+                    reason: "reality recall report budget exhausted".to_string(),
+                }));
+            report.truncated = true;
+        }
+        for source in &augmentation.sources {
+            merge_recall_source(&mut report.sources, source.clone());
+        }
+        augmentation
+    }
+}
+
+fn merge_recall_source(sources: &mut Vec<RecallSourceResult>, incoming: RecallSourceResult) {
+    if let Some(existing) = sources
+        .iter_mut()
+        .find(|source| source.source == incoming.source)
+    {
+        existing.selected_count = existing
+            .selected_count
+            .saturating_add(incoming.selected_count);
+        existing.omitted_count = existing
+            .omitted_count
+            .saturating_add(incoming.omitted_count);
+        if incoming.status == "degraded" {
+            existing.status = incoming.status;
+            existing.degraded_reason = incoming.degraded_reason;
+        }
+    } else {
+        sources.push(incoming);
+    }
+}
+
+fn fact_boundary(fact: &fact_kernel::FactRecord) -> RealityBoundary {
+    let status = fact.status.to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "conflict"
+            | "conflicted"
+            | "superseded"
+            | "stale"
+            | "archived"
+            | "rejected"
+            | "held"
+            | "hold"
+    ) {
+        return RealityBoundary::Conflict;
+    }
+    if matches!(status.as_str(), "simulated" | "simulation") {
+        return RealityBoundary::Simulated;
+    }
+    if matches!(status.as_str(), "hypothetical" | "candidate") {
+        return RealityBoundary::Hypothetical;
+    }
+    if fact.confidence.basis_points() < 5_000 {
+        return RealityBoundary::Inferred;
+    }
+    RealityBoundary::Observed
+}
+
+fn fact_references(fact: &fact_kernel::FactRecord) -> Vec<String> {
+    let mut refs = vec![format!("fact:{}", fact.id.as_str())];
+    refs.extend(
+        fact.evidence
+            .iter()
+            .map(|evidence| format!("fact:evidence:{}", evidence.as_str())),
+    );
+    refs
+}
+
+fn fact_context_item(
+    fact: &fact_kernel::FactRecord,
+    refs: &[String],
+    boundary: RealityBoundary,
+) -> ContextItem {
+    let mut item = ContextItem::new(
+        format!("fact:{}", fact.id.as_str()),
+        ContextSourceKind::Fact,
+        ContextRole::Evidence,
+        format!(
+            "Fact {} ({})\nstatus: {}\nboundary: {}\nconfidence_bp: {}\nstatement: {}",
+            fact.id.as_str(),
+            fact.fact_type,
+            fact.status,
+            boundary.as_str(),
+            fact.confidence.basis_points(),
+            fact.statement
+        ),
+    );
+    item.authority = if boundary == RealityBoundary::Observed {
+        ContextAuthority::Derived
+    } else {
+        ContextAuthority::Tool
+    };
+    item.visibility = ContextVisibility::Shared;
+    item.score = fact.confidence.basis_points() as f32 / 10_000.0;
+    item.evidence = refs.to_vec();
+    item
+}
+
+fn matrix_boundary(confidence: f32) -> RealityBoundary {
+    if confidence >= 0.5 {
+        RealityBoundary::Observed
+    } else if confidence >= 0.35 {
+        RealityBoundary::Inferred
+    } else {
+        RealityBoundary::Hypothetical
+    }
+}
+
+fn matrix_fact_references(fact: &matrix_core::MatrixFact) -> Vec<String> {
+    let mut refs = vec![format!("matrix:fact:{}", fact.fact_id)];
+    if let Some(source_ref) = &fact.source_ref {
+        refs.push(source_ref.clone());
+    }
+    refs
+}
+
+fn matrix_fact_summary(fact: &matrix_core::MatrixFact) -> String {
+    format!(
+        "Matrix fact {}\ntype: {}\nmetric: {}\nentities: {}\nconfidence: {:.2}\ndimensions: {}\nmeasures: {}",
+        fact.fact_id,
+        fact.fact_type,
+        fact.metric_key.as_deref().unwrap_or("none"),
+        fact.entity_refs.join(", "),
+        fact.confidence,
+        fact.dimensions,
+        fact.measures
+    )
+}
+
+fn matrix_context_item(id: &str, content: String, refs: &[String], confidence: f32) -> ContextItem {
+    let mut item = ContextItem::new(
+        format!("matrix:{id}"),
+        ContextSourceKind::Matrix,
+        ContextRole::Evidence,
+        content,
+    );
+    item.authority = ContextAuthority::Derived;
+    item.visibility = ContextVisibility::Shared;
+    item.score = confidence.clamp(0.0, 1.0);
+    item.evidence = refs.to_vec();
+    item
+}
+
+fn matrix_fact_score(fact: &matrix_core::MatrixFact, query: &str) -> f32 {
+    let haystack = format!(
+        "{} {} {} {} {}",
+        fact.fact_id,
+        fact.fact_type,
+        fact.metric_key.as_deref().unwrap_or_default(),
+        fact.entity_refs.join(" "),
+        fact.measures
+    );
+    text_overlap_score(query, &haystack).max((fact.confidence * 0.3).min(0.3))
+}
+
+fn text_overlap_score(query: &str, text: &str) -> f32 {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0.35;
+    }
+    let text = text.to_ascii_lowercase();
+    if text.contains(&query) {
+        return 0.95;
+    }
+    let tokens = query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let matched = tokens.iter().filter(|token| text.contains(**token)).count();
+    (matched as f32 / tokens.len() as f32).clamp(0.0, 1.0)
 }
 
 fn matrix_health_value(matrix: &MatrixService, config_home: &Path) -> serde_json::Value {
@@ -478,6 +846,62 @@ fn status_string(value: &serde_json::Value) -> String {
             }
         })
         .to_string()
+}
+
+fn reality_capabilities(
+    memory_status: &serde_json::Value,
+    knowledge_status: &serde_json::Value,
+    matrix_health: &serde_json::Value,
+) -> serde_json::Value {
+    let matrix_status =
+        if matrix_health.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            RealityCapabilityStatus::Degraded
+        } else {
+            RealityCapabilityStatus::EnabledAndWired
+        };
+
+    serde_json::json!({
+        "memory": memory_status
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        "knowledge_fabric": {
+            "status": knowledge_status
+                .get("capability_status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(RealityCapabilityStatus::ConfiguredButUnwired.as_str()),
+            "reason": knowledge_status
+                .get("degraded_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("KnowledgeFabric durable projection is provided by MemoryService when storage is available"),
+            "projection_mode": knowledge_status
+                .get("projection_mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("durable_knowledge_store"),
+        },
+        "matrix_context_source": {
+            "status": matrix_status.as_str(),
+            "reason": if matrix_status == RealityCapabilityStatus::Degraded {
+                matrix_health
+                    .get("degraded_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("matrix repository degraded")
+            } else {
+                "Matrix facts and evidence packets are read through MatrixService and merged into Reality recall reports/context projections as lightweight evidence refs; details expand through /api/reality/evidence/:id"
+            },
+        },
+        "fact_runtime": {
+            "status": RealityCapabilityStatus::EnabledAndWired.as_str(),
+            "reason": "GrowthService injects a gateway-owned durable FactStore into FactKernelService, persists promoted facts/evidence in storage/fact.sqlite, and exposes fact recall to Reality reports/context projections",
+        },
+        "context_envelope": memory_status
+            .pointer("/capabilities/context_envelope")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({
+                "status": RealityCapabilityStatus::ConfiguredButUnwired.as_str(),
+                "reason": "ContextEnvelope status is not exposed by memory projection",
+            })),
+    })
 }
 
 fn degraded_reasons(

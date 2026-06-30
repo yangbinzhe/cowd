@@ -542,8 +542,11 @@ impl Component for GatewayPanel {
                     Span::styled("Engines: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!(
-                            "memory {} · matrix {} · growth {}",
-                            reality.memory_status, reality.matrix_status, reality.growth_status
+                            "fact {} · memory {} · matrix {} · growth {}",
+                            reality.fact_status,
+                            reality.memory_status,
+                            reality.matrix_status,
+                            reality.growth_status
                         ),
                         Style::default().fg(Color::White),
                     ),
@@ -552,8 +555,10 @@ impl Component for GatewayPanel {
                     Span::styled("Bridge: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!(
-                            "context {} · audit {}",
-                            reality.context_status, reality.audit_status
+                            "context {} · matrix-source {} · audit {}",
+                            reality.context_status,
+                            reality.matrix_context_status,
+                            reality.audit_status
                         ),
                         Style::default().fg(Color::Cyan),
                     ),
@@ -1062,9 +1067,20 @@ impl Component for GatewayPanel {
             ("GET  /api/memory/stats", "Memory statistics"),
             ("GET  /api/memory/search", "Search memory"),
             ("GET  /api/reality/status", "Reality Core health"),
+            ("GET  /api/reality/capabilities", "Reality capability map"),
             ("GET  /api/reality/static", "Reality Core map"),
             ("GET  /api/reality/flow", "Fact Flow trace"),
+            ("GET  /api/reality/recall/report", "Recall source report"),
+            (
+                "GET  /api/reality/context/envelope",
+                "ContextEnvelope projection",
+            ),
+            (
+                "GET  /api/reality/evidence/:id",
+                "Reality evidence resolver",
+            ),
             ("GET  /api/reality/promotions", "Growth promotion trace"),
+            ("GET  /api/reality/governance", "Reality governance summary"),
             ("GET  /api/reality/boundaries", "Reality boundary map"),
             ("GET  /api/config", "View config"),
             ("PUT  /api/config", "Update config"),
@@ -1485,8 +1501,10 @@ mod tests {
         panel.health_status = Some("Healthy".to_string());
         panel.reality_core = Some(RealityCoreSummary {
             status: "ready".to_string(),
+            fact_status: "enabled_and_wired".to_string(),
             memory_status: "ready".to_string(),
             matrix_status: "ready".to_string(),
+            matrix_context_status: "enabled_and_wired".to_string(),
             growth_status: "ready".to_string(),
             context_status: "ready".to_string(),
             audit_status: "ready".to_string(),
@@ -1513,10 +1531,15 @@ mod tests {
             "Should show Reality Core section, got: {joined}"
         );
         assert!(
-            joined.contains("memory ready")
+            joined.contains("fact enabled_and_wired")
+                && joined.contains("memory ready")
                 && joined.contains("matrix ready")
                 && joined.contains("growth ready"),
             "Should show Reality engines, got: {joined}"
+        );
+        assert!(
+            joined.contains("matrix-source enabled_and_wired"),
+            "Should show Reality context source status, got: {joined}"
         );
         assert!(
             joined.contains("Fact Flow")

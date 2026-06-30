@@ -1086,26 +1086,6 @@ where
         }
     }
 
-    fn external_context_prompt_tail(&self) -> String {
-        self.external_context_items()
-            .into_iter()
-            .chain(self.tool_trace_context_items())
-            .map(|item| ContextRuntimeKernel::format_context_item(&item))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn dynamic_tail_with_external_context(&self, tail: String) -> String {
-        let external = self.external_context_prompt_tail();
-        if external.trim().is_empty() {
-            tail
-        } else if tail.trim().is_empty() {
-            external
-        } else {
-            format!("{external}\n{tail}")
-        }
-    }
-
     fn remember_context_envelope(&self, envelope: ContextEnvelope) {
         if let Ok(mut guard) = self.last_context_envelope.lock() {
             *guard = Some(envelope.clone());
@@ -4404,13 +4384,13 @@ where
                                 MemoryLayer::L4 => "raw",
                             };
                             layer_text.push_str(&format!(
-                                "  <memory role=\"{:?}\" layer=\"{}\" state=\"{:?}\" confidence=\"{:.2}\" salience=\"{:.2}\">\n    <title>{}</title>\n    <reason>{}</reason>\n    <evidence>{}</evidence>\n  </memory>\n",
+                                "### Context: Memory | {layer_tag}\n- role: {:?}\n- state: {:?}\n- confidence: {:.2}\n- salience: {:.2}\n- title: {}\n- content: {}\n- reason: {}\n- evidence: {}\n",
                                 item.role,
-                                layer_tag,
                                 atom.state,
                                 atom.confidence,
                                 atom.salience,
                                 atom.title,
+                                item.content_preview,
                                 item.reason,
                                 atom.evidence_pointer.as_deref().unwrap_or("")
                             ));
@@ -4418,32 +4398,6 @@ where
                         self.cached_prompt
                             .rebuild_layer(cache_layer, vec![layer_text], count);
                     }
-                }
-
-                let mut context = format!(
-                    "<memory_context mode=\"packet\" selected=\"{}\" omitted=\"{}\" tokens=\"{}\" truncated=\"{}\">\n",
-                    packet.selected.len(),
-                    packet.omitted.len(),
-                    packet.token_estimate,
-                    packet.truncated
-                );
-                for cache_layer in CacheLayer::all() {
-                    let fragment = self.cached_prompt.get_layer(cache_layer);
-                    for line in &fragment {
-                        context.push_str(line);
-                    }
-                }
-                context.push_str("</memory_context>");
-
-                if !packet.omitted.is_empty() {
-                    context.push_str("\n<context_omissions>\n");
-                    for omitted in packet.omitted.iter().take(8) {
-                        context.push_str(&format!(
-                            "  <omitted id=\"{}\" reason=\"{}\">{}</omitted>\n",
-                            omitted.id, omitted.reason, omitted.title
-                        ));
-                    }
-                    context.push_str("</context_omissions>\n");
                 }
 
                 if let Some(cb) = &self.memory_callback {
@@ -4482,8 +4436,9 @@ where
                             ContextSourceKind::Memory,
                             role,
                             format!(
-                                "{}\nreason: {}\nevidence: {}",
+                                "{}\ncontent: {}\nreason: {}\nevidence: {}",
                                 item.atom.title,
+                                item.content_preview,
                                 item.reason,
                                 item.atom.evidence_pointer.as_deref().unwrap_or("")
                             ),
@@ -4497,12 +4452,20 @@ where
                         context_item
                     })
                     .collect::<Vec<_>>();
-                let knowledge_activation = KnowledgeActivationRuntime::new().activate_from_packet(
-                    &session_id,
-                    user_input,
-                    &format!("{:?}", self.context_profile()),
-                    &packet,
-                );
+                let knowledge_activation = match KnowledgeActivationRuntime::for_config_home(
+                    crate::cowd_dirs::config_home_dir(),
+                ) {
+                    Ok(runtime) => runtime.activate_from_packet(
+                        &session_id,
+                        user_input,
+                        &format!("{:?}", self.context_profile()),
+                        &packet,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "durable knowledge activation unavailable");
+                        None
+                    }
+                };
                 let omissions = packet
                     .omitted
                     .iter()
@@ -4515,16 +4478,11 @@ where
                 let mut dynamic_items = dynamic_items;
                 if let Some(activation) = knowledge_activation {
                     dynamic_items.extend(activation.items);
-                    context.push('\n');
-                    context.push_str(&activation.prompt_fragment);
                     self.set_turn_knowledge_report(activation.report);
                 }
                 let envelope =
                     self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
-                let prompt = Self::provider_prompt_from_envelope(
-                    &envelope,
-                    Some(self.dynamic_tail_with_external_context(context)),
-                );
+                let prompt = Self::provider_prompt_from_envelope(&envelope, None);
                 self.remember_context_envelope(envelope);
                 prompt
             }
@@ -5350,7 +5308,7 @@ pub fn build_cc_memory_config_with_budget(
         store: StoreConfig {
             sqlite_path,
             blob_dir,
-            enable_vector_index: mem.vector.enabled,
+            enable_vector_index: mem.store_enable_vector_index && mem.vector.enabled,
             cache_capacity: 512,
             vector: memory::config::VectorConfig {
                 enabled: mem.vector.enabled,

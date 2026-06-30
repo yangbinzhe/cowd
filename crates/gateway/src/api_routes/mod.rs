@@ -3380,9 +3380,20 @@ mod tests {
 
         for (uri, kind) in [
             ("/api/reality/status", "reality.status"),
+            ("/api/reality/capabilities", "reality.capabilities"),
             ("/api/reality/static", "reality.static"),
             ("/api/reality/flow", "reality.fact_flow"),
+            (
+                "/api/reality/recall/report?q=reality",
+                "reality.recall_report",
+            ),
+            (
+                "/api/reality/context/envelope?q=reality",
+                "reality.context_envelope",
+            ),
+            ("/api/reality/evidence/missing-evidence", "reality.evidence"),
             ("/api/reality/promotions", "reality.promotions"),
+            ("/api/reality/governance", "reality.governance"),
             ("/api/reality/boundaries", "reality.boundaries"),
         ] {
             let response = app
@@ -3410,6 +3421,129 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["source"], "growth.promotions");
         assert!(json["stages"].as_array().is_some());
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn reality_recall_report_and_context_include_fact_and_matrix_sources() {
+        let workspace = test_temp_dir("reality-recall");
+        let config_home = test_temp_dir("reality-recall-config");
+        let state = test_state_with_workspace(workspace.clone(), config_home.clone());
+        let app = api_router(state.clone());
+
+        let record = harness_contract::growth::LearningRecord::from_input(
+            harness_contract::growth::GrowthInput {
+                selected_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                complexity: harness_contract::core::TaskComplexity::Complex,
+                risk: harness_contract::core::TaskRisk::Medium,
+                context_omitted: 0,
+                tool_requires_checkpoint: false,
+                tool_requires_human_confirm: false,
+                verification_can_finalize: true,
+                bench_passed: true,
+            },
+        );
+        let mut event = harness_contract::growth::GrowthEvent::from_input(
+            harness_contract::growth::GrowthEventInput {
+                session_id: "session-reality-recall".to_string(),
+                source_event_kind: "runtime.context.reality_test".to_string(),
+                strategy_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                learning_record: record,
+                evidence_refs: vec![harness_contract::growth::GrowthEvidenceRef::new(
+                    "test_evidence",
+                    "trace:gpu-shortage",
+                    "GPU shortage trace",
+                )],
+            },
+        );
+        event.memory_candidates = vec![harness_contract::growth::GrowthMemoryCandidate {
+            id: "candidate-gpu-shortage".to_string(),
+            kind: harness_contract::growth::GrowthMemoryCandidateKind::AuthorityPromotion,
+            summary: "GPU shortage requires expedited supplier allocation".to_string(),
+            reason: "observed shortage was confirmed by runtime evidence".to_string(),
+            confidence_bp: 9_100,
+        }];
+        event.matrix_signals = vec![harness_contract::growth::GrowthMatrixSignal {
+            fact_type: "supply.material_shortage".to_string(),
+            dimensions: serde_json::json!({"component": "gpu", "week": "2026-W24"}),
+            measures: serde_json::json!({"short_qty": 42, "risk": "high"}),
+            confidence_bp: 9_200,
+        }];
+        let receipt = state
+            .services
+            .growth
+            .ingest_growth_event(
+                &state.config_home,
+                &state.services.memory,
+                &state.services.matrix,
+                event,
+            )
+            .await;
+        assert!(receipt.errors.is_empty(), "{receipt:#?}");
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "fact.memory" && item.status == "promote"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "matrix.fact" && item.status == "promoted"));
+
+        let recall = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reality/recall/report?q=GPU%20shortage&max_items=20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recall.status(), StatusCode::OK);
+        let body = to_bytes(recall.into_body(), usize::MAX).await.unwrap();
+        let recall_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let source_names = recall_json["recall_report"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|source| source["source"].as_str())
+            .collect::<Vec<_>>();
+        assert!(source_names.contains(&"fact"), "{recall_json:#}");
+        assert!(source_names.contains(&"matrix"), "{recall_json:#}");
+        assert!(recall_json["recall_report"]["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == "fact"));
+        assert!(recall_json["recall_report"]["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == "matrix"));
+
+        let context = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=GPU%20shortage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.status(), StatusCode::OK);
+        let body = to_bytes(context.into_body(), usize::MAX).await.unwrap();
+        let context_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let selected = context_json["envelope"]["selected"].as_array().unwrap();
+        assert!(
+            selected.iter().any(|item| item["source"] == "Fact"),
+            "{context_json:#}"
+        );
+        assert!(
+            selected.iter().any(|item| item["source"] == "Matrix"),
+            "{context_json:#}"
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);

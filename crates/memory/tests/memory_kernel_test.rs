@@ -1042,6 +1042,68 @@ async fn context_usage_feedback_promotes_hot_memory_summary() {
 }
 
 #[tokio::test]
+async fn context_packet_preview_does_not_record_usage_or_validate_atoms() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("usage-preview.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-usage-preview", "agent-usage");
+    let mut entry = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "PREVIEW_MEMORY_ALPHA",
+    );
+    entry.content =
+        "PREVIEW_MEMORY_ALPHA should be visible but not recorded by preview".to_string();
+    entry.scope = MemoryScope::Session(ctx.session_id.clone());
+    entry.session_id = Some(ctx.session_id.clone());
+    let memory_id = entry.id;
+    manager.remember(entry).await.unwrap();
+
+    let preview = kernel
+        .context_packet_preview(&ctx, "PREVIEW_MEMORY_ALPHA", &[], 4, 1_000)
+        .await
+        .unwrap();
+    assert!(preview
+        .selected
+        .iter()
+        .any(|item| item.atom.id == memory_id));
+    assert!(preview.selected.iter().any(|item| {
+        item.atom.id == memory_id
+            && item
+                .content_preview
+                .contains("PREVIEW_MEMORY_ALPHA should be visible")
+    }));
+    assert!(preview.recall_report.selected.iter().any(|candidate| {
+        candidate.id == memory_id
+            && candidate
+                .content_preview
+                .contains("PREVIEW_MEMORY_ALPHA should be visible")
+    }));
+    assert_eq!(kernel.usage_summary().await.unwrap().total_selected, 0);
+
+    let recorded = kernel
+        .context_packet(&ctx, "PREVIEW_MEMORY_ALPHA", &[], 4, 1_000)
+        .await
+        .unwrap();
+    assert!(recorded
+        .selected
+        .iter()
+        .any(|item| item.atom.id == memory_id));
+    assert!(kernel.usage_summary().await.unwrap().total_selected > 0);
+    let feedback = kernel
+        .context_packet_preview(&ctx, "PREVIEW_MEMORY_ALPHA", &[], 4, 1_000)
+        .await
+        .unwrap();
+    assert!(feedback.selected.iter().any(|item| {
+        item.atom.id == memory_id && item.reason.contains("usage_feedback:selected_count=")
+    }));
+}
+
+#[tokio::test]
 async fn large_memory_context_packet_stays_bounded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

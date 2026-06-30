@@ -27,6 +27,8 @@
 
 #[path = "ingestion/aaak_compression.rs"]
 pub mod aaak_compression;
+#[path = "ingestion/aaak_index.rs"]
+pub mod aaak_index;
 #[path = "lifecycle/agent_directory.rs"]
 pub mod agent_directory;
 #[path = "lifecycle/agent_reputation.rs"]
@@ -137,6 +139,7 @@ pub use aaak_compression::{
     AaakCompressed, AaakCompressor, AaakDictionary, Abbreviation, EntityType, GsdContext, GsdState,
     PriorityItem,
 };
+pub use aaak_index::{estimate_full_injection_tokens, AaakIndex, AaakSlot};
 pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,
     RANK_BOOSTS,
@@ -164,20 +167,27 @@ pub use hot_reload::{
     ConfigChangeEvent, ConfigFile, ConfigHotReloader, HotReloadConfig, HotReloadHandle,
     SharedConfigReloader,
 };
+pub use kernel::reality_recall::{
+    rank_candidates, CompactNavigationPointer, RecallCandidate, RecallCandidateEvidence,
+    RecallCandidateScores, RecallFence, RecallOmission, RecallReport, RecallRequest, RecallSource,
+    RecallSourceResult, RecallSourceStatus,
+};
 pub use kernel::{
-    MemoryAtomView, MemoryContextPacket, MemoryDegradation, MemoryHealth, MemoryInformationState,
-    MemoryKernel, MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent,
-    MemoryLink, MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive,
-    MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
+    MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation, MemoryHealth,
+    MemoryInformationState, MemoryKernel, MemoryKernelError, MemoryKernelResult, MemoryLayerView,
+    MemoryLifecycleEvent, MemoryLink, MemoryLinkKind, MemoryPacketItem, MemoryPacketRole,
+    MemoryPath, MemoryPrimitive, MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext,
+    OmittedMemory,
 };
 pub use knowledge::{
-    ActivationGovernor, CanonExtractor, ClassificationResult, ConflictGovernor, ConflictStrategy,
-    DocumentCategory, DocumentClassifier, DocumentContent, DocumentIngestor, DocumentMetadata,
-    InMemoryKnowledgeStore, IngestionResult, KnowledgeChunk, KnowledgeFabric,
-    KnowledgeFabricHealth, KnowledgeGraphBuilder, KnowledgeIngestionReceipt,
-    KnowledgeIngestionService, KnowledgeMatrixBridgeFact, KnowledgeMatrixBridgeInput,
-    KnowledgeMatrixBridgeRelation, KnowledgeNamespaceSearchResult, KnowledgeSnapshot,
-    KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore, UsageFeedbackLoop,
+    durable_knowledge_fabric_for_config_home, ActivationGovernor, CanonExtractor,
+    ClassificationResult, ConflictGovernor, ConflictStrategy, DocumentCategory, DocumentClassifier,
+    DocumentContent, DocumentIngestor, DocumentMetadata, InMemoryKnowledgeStore, IngestionResult,
+    KnowledgeChunk, KnowledgeFabric, KnowledgeFabricHealth, KnowledgeGraphBuilder,
+    KnowledgeIngestionReceipt, KnowledgeIngestionService, KnowledgeMatrixBridgeFact,
+    KnowledgeMatrixBridgeInput, KnowledgeMatrixBridgeRelation, KnowledgeNamespaceSearchResult,
+    KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore,
+    UsageFeedbackLoop,
 };
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{

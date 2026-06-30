@@ -14,6 +14,7 @@ scenario-run/
   tool-calls/
   runtime-events/
   evidence/
+    reality-context-eval.json
   token-usage/
   traces/
 ```
@@ -27,6 +28,7 @@ scenario-run/
 - Selected execution mode and template.
 - Runtime decision: accepted, planned, rejected, needs approval, running, completed, or failed.
 - Tool DAG / ReWOO / team / deliberation / reflexion evidence.
+- Reality evidence: RecallReport, ContextEnvelope, selected context, omitted context, evidence refs.
 - Token usage by round and total.
 - Latency by round and total.
 - Tool count and agent count.
@@ -43,8 +45,11 @@ scenario-run/
 | architecture_tradeoff | deliberation_search / debate_consensus | Alternatives, critique, merged decision |
 | manufacturing_what_if | deliberation_search + matrix evidence | Structured facts and what-if reasoning |
 | memory_conflict | reflexion / reality memory | Scope, conflict, latest-fact handling |
+| reality_recall | reality_context_eval | RecallReport selected/omitted/source evidence |
+| context_envelope | context_envelope | Stable head, runtime header, dynamic items, omissions |
+| knowledge_default | knowledge_activation | Shared/default knowledge activation and namespace blocking |
+| fact_matrix_trace | structured_evidence | Fact/Matrix evidence refs and boundary |
 | failure_loop | reflexion_retry | Supervisor mode switch |
 | multi_agent | supervisor_subagents | Team/agent progress and synthesis |
 | cross_session | request_session_link | Session relation and boundary |
 | high_risk | risk_gate / human_confirm | Approval or explicit rejection |
-

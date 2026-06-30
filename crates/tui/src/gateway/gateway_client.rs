@@ -462,6 +462,10 @@ impl GatewayApiClient {
         self.get_json("/api/reality/status").await
     }
 
+    pub async fn reality_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/reality/capabilities").await
+    }
+
     pub async fn reality_flow(
         &self,
         session_id: Option<&str>,
@@ -475,6 +479,10 @@ impl GatewayApiClient {
 
     pub async fn reality_boundaries(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/reality/boundaries").await
+    }
+
+    pub async fn reality_governance(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/reality/governance").await
     }
 
     pub async fn task_status(&self) -> Result<serde_json::Value, GatewayApiError> {

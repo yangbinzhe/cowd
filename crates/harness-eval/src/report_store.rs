@@ -176,6 +176,14 @@ impl HarnessEvalReportStore {
             serde_json::to_string_pretty(stable_ai).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("reality-context-eval.json"),
+            serde_json::to_string_pretty(
+                report.get("reality_context_eval").unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         fs::copy(&json_path, self.root.join(format!("{base}.json")))
             .map_err(|error| error.to_string())?;
         fs::copy(&md_path, self.root.join(format!("{base}.md")))
@@ -393,6 +401,49 @@ fn render_markdown_report(report: &Value) -> String {
             ));
         }
     }
+    if let Some(reality) = report.get("reality_context_eval") {
+        markdown.push_str("\n## Reality Context Eval\n\n");
+        markdown.push_str(&format!(
+            "- total: {}\n- passed: {}\n- failed: {}\n- selected_context_total: {}\n- omitted_context_total: {}\n- evidence_ref_total: {}\n- detail: `evidence/reality-context-eval.json`\n\n",
+            reality.get("total").and_then(Value::as_u64).unwrap_or_default(),
+            reality.get("passed").and_then(Value::as_u64).unwrap_or_default(),
+            reality.get("failed").and_then(Value::as_u64).unwrap_or_default(),
+            reality.get("selected_context_total").and_then(Value::as_u64).unwrap_or_default(),
+            reality.get("omitted_context_total").and_then(Value::as_u64).unwrap_or_default(),
+            reality.get("evidence_ref_total").and_then(Value::as_u64).unwrap_or_default(),
+        ));
+        markdown.push_str("| Scenario | Status | Selected | Omitted | Evidence |\n| --- | --- | ---: | ---: | ---: |\n");
+        for scenario in reality
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                scenario
+                    .get("scenario_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                scenario
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                scenario
+                    .get("selected_context_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                scenario
+                    .get("omitted_context_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                scenario
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            ));
+        }
+    }
     markdown
 }
 
@@ -510,6 +561,10 @@ mod tests {
             .artifacts
             .iter()
             .any(|path| path.ends_with("quality-rubric.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/reality-context-eval.json")));
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -2650,6 +2650,49 @@ impl CognitiveContextManager {
         }
     }
 
+    /// Recall entries through the in-process vector index.
+    ///
+    /// This is the runtime semantic recall source. The SQLite
+    /// `MemoryStore::search_vector` path remains a backend capability boundary,
+    /// but production context recall should use this method because embeddings
+    /// are stored in `CognitiveContextManager::vector_index`.
+    pub async fn vector_recall_candidates(
+        &self,
+        query: &str,
+        already_surfaced: &HashSet<MemoryId>,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        let EmbeddingCapability::Remote { client } = &self.embedding_capability else {
+            return Ok(Vec::new());
+        };
+        if self.vector_index.lock().count() == 0 {
+            return Ok(Vec::new());
+        }
+        let embedding = match client.embed_one(query).await {
+            Ok(embedding) => embedding,
+            Err(error) => {
+                tracing::warn!(%error, "vector recall query embedding failed");
+                return Ok(Vec::new());
+            }
+        };
+        let scored = {
+            let index = self.vector_index.lock();
+            index.search_with_filter(&embedding, limit.max(1) * 2, &|id| {
+                !already_surfaced.contains(id)
+            })?
+        };
+        let mut entries = Vec::new();
+        for (id, score) in scored {
+            if let Some(entry) = self.orchestrator.recall(&id).await? {
+                entries.push((entry, score));
+            }
+            if entries.len() >= limit.max(1) {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
     /// Return the current embedding capability level.
     #[must_use]
     pub fn embedding_capability(&self) -> &EmbeddingCapability {

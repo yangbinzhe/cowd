@@ -1,6 +1,8 @@
 use harness_contract::knowledge::{
     KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace, KnowledgeTurnReport,
 };
+#[cfg(test)]
+use memory::RecallReport;
 use memory::{
     DocumentContent, KnowledgeFabric, MemoryContextPacket, MemoryPacketRole, OmittedMemory,
 };
@@ -13,7 +15,7 @@ use crate::knowledge_compliance::{KnowledgeComplianceDecision, KnowledgeComplian
 #[derive(Debug, Clone)]
 pub struct RuntimeKnowledgeActivation {
     pub items: Vec<ContextItem>,
-    pub prompt_fragment: String,
+    pub debug_fragment: String,
     pub report: KnowledgeTurnReport,
     pub compliance_decision: KnowledgeComplianceDecision,
 }
@@ -27,6 +29,17 @@ impl KnowledgeActivationRuntime {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_fabric(fabric: KnowledgeFabric) -> Self {
+        Self { fabric }
+    }
+
+    pub fn for_config_home(config_home: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        memory::durable_knowledge_fabric_for_config_home(config_home)
+            .map(Self::with_fabric)
+            .map_err(|error| error.to_string())
     }
 
     #[must_use]
@@ -60,7 +73,7 @@ impl KnowledgeActivationRuntime {
         }
 
         let mut items = Vec::new();
-        let mut fragment = String::from("<knowledge_context>\n");
+        let mut fragment = String::from("### Context: Knowledge\n");
         for canon in canon_packs {
             let content = format!(
                 "{}\nrules:\n{}\nprocedures:\n{}\nevidence_refs: {}",
@@ -94,37 +107,36 @@ impl KnowledgeActivationRuntime {
                 .map(|reference| format!("knowledge://{}/{}", reference.ref_type, reference.id))
                 .collect();
             fragment.push_str(&format!(
-                "  <knowledge canon=\"{}\" tokens=\"{}\">\n{}\n  </knowledge>\n",
-                canon.canon_id, canon.token_estimate, content
+                "- canon: {}\n  tokens: {}\n  summary: {}\n",
+                canon.canon_id,
+                canon.token_estimate,
+                content.replace('\n', "\n  ")
             ));
             items.push(item);
         }
         let compliance_decision = KnowledgeComplianceRuntime::new().decide(warnings);
         if !compliance_decision.warnings.is_empty() {
-            fragment.push_str("  <knowledge_compliance>\n");
+            fragment.push_str("## Compliance\n");
             for warning in &compliance_decision.warnings {
                 fragment.push_str(&format!(
-                    "    <warning level=\"{:?}\" pack=\"{}\">{}</warning>\n",
+                    "- warning: {:?} pack={} {}\n",
                     warning.level, warning.pack_id, warning.summary
                 ));
             }
             if !compliance_decision.allows_execution() {
-                fragment.push_str("    <hard_gate action=\"block\">\n");
+                fragment.push_str("- hard_gate: block\n");
                 for reason in &compliance_decision.hard_gate_reasons {
-                    fragment.push_str(&format!("      <reason>{reason}</reason>\n"));
+                    fragment.push_str(&format!("  reason: {reason}\n"));
                 }
-                fragment.push_str("    </hard_gate>\n");
             }
-            fragment.push_str("  </knowledge_compliance>\n");
         }
-        fragment.push_str("</knowledge_context>");
 
         let report = self
             .fabric
             .turn_report(&plan, compliance_decision.warnings.clone());
         Some(RuntimeKnowledgeActivation {
             items,
-            prompt_fragment: fragment,
+            debug_fragment: fragment,
             report,
             compliance_decision,
         })
@@ -151,11 +163,25 @@ pub fn filter_packet_for_turn_intent(
         }
     }
 
+    let mut recall_report = packet.recall_report.clone();
+    recall_report
+        .selected
+        .retain(|candidate| selected.iter().any(|item| item.atom.id == candidate.id));
+    recall_report
+        .omitted
+        .extend(omitted.iter().map(|item| memory::RecallOmission {
+            id: item.id,
+            title: item.title.clone(),
+            source: harness_contract::reality::RecallSourceKind::Memory,
+            reason: item.reason.clone(),
+        }));
+
     MemoryContextPacket {
         selected,
         omitted,
         token_estimate: packet.token_estimate,
         truncated: packet.truncated,
+        recall_report,
     }
 }
 
@@ -508,8 +534,9 @@ fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<Document
     Some(DocumentContent {
         title: atom.title.clone(),
         body: format!(
-            "{}\nreason: {}\nevidence: {}",
+            "{}\ncontent: {}\nreason: {}\nevidence: {}",
             atom.title,
+            item.content_preview,
             item.reason,
             atom.evidence_pointer.as_deref().unwrap_or("memory packet")
         ),
@@ -596,6 +623,7 @@ mod tests {
             },
             role,
             reason: "must be applied to this task".to_string(),
+            content_preview: format!("{title} full policy body"),
         }
     }
 
@@ -610,6 +638,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let activation = KnowledgeActivationRuntime::new()
@@ -625,7 +654,11 @@ mod tests {
             .items
             .iter()
             .all(|item| item.source == ContextSourceKind::Knowledge));
-        assert!(activation.prompt_fragment.contains("<knowledge_context>"));
+        assert!(activation.debug_fragment.contains("### Context: Knowledge"));
+        assert!(activation
+            .items
+            .iter()
+            .any(|item| item.content.contains("full policy body")));
         assert!(!activation.report.active_pack_ids.is_empty());
         assert!(!activation.report.evidence_refs.is_empty());
     }
@@ -641,6 +674,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 64,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         assert!(KnowledgeActivationRuntime::new()
@@ -659,15 +693,14 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let activation = KnowledgeActivationRuntime::new()
             .activate_from_packet("s1", "safety policy approval", "DeepInvestigation", &packet)
             .expect("blocking knowledge should activate");
 
-        assert!(activation
-            .prompt_fragment
-            .contains("<hard_gate action=\"block\">"));
+        assert!(activation.debug_fragment.contains("hard_gate: block"));
         assert!(!activation.compliance_decision.allows_execution());
     }
 
@@ -689,6 +722,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 256,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let filtered =
@@ -716,6 +750,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let filtered = filter_packet_for_turn_intent(&packet, "不要使用工具，纯文字回答");
@@ -737,6 +772,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         assert!(KnowledgeActivationRuntime::new()
@@ -760,6 +796,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let filtered = filter_packet_for_turn_intent(&packet, "Use at most three code references.");
@@ -782,6 +819,7 @@ mod tests {
             omitted: Vec::new(),
             token_estimate: 128,
             truncated: false,
+            recall_report: RecallReport::default(),
         };
 
         let filtered = filter_packet_for_turn_intent(&packet, "不要往后推，一次性全部解决");

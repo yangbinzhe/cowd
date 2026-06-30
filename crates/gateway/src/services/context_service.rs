@@ -42,7 +42,7 @@ impl ContextService {
     pub(crate) fn structured_evidence_item(&self, packet: &MatrixEvidencePacket) -> ContextItem {
         let mut item = ContextItem::new(
             format!("structured-evidence:{}", packet.packet_id),
-            ContextSourceKind::ToolTrace,
+            ContextSourceKind::Matrix,
             ContextRole::Evidence,
             format!(
                 "Structured evidence packet {}: {}. Confidence {:.2}.",

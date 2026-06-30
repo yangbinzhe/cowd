@@ -128,8 +128,10 @@ pub struct StructuredDataSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RealityCoreSummary {
     pub status: String,
+    pub fact_status: String,
     pub memory_status: String,
     pub matrix_status: String,
+    pub matrix_context_status: String,
     pub growth_status: String,
     pub context_status: String,
     pub audit_status: String,
@@ -521,8 +523,18 @@ impl RuntimeControlSnapshot {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown")
                 .to_string(),
+            fact_status: value
+                .pointer("/capabilities/fact_runtime/status")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| reality_component_status(value, "fact_kernel")),
             memory_status: reality_component_status(value, "memory"),
             matrix_status: reality_component_status(value, "matrix"),
+            matrix_context_status: value
+                .pointer("/capabilities/matrix_context_source/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
             growth_status: reality_component_status(value, "growth"),
             context_status: reality_component_status(value, "context"),
             audit_status: reality_component_status(value, "audit"),
@@ -1771,11 +1783,16 @@ mod tests {
             "kind": "reality.status",
             "status": "ready",
             "engines": {
+                "fact_kernel": {"status": "ready"},
                 "memory": {"status": "ready"},
                 "matrix": {"status": "ready"},
                 "growth": {"status": "ready"},
                 "context": {"status": "ready"},
                 "audit": {"status": "ready"}
+            },
+            "capabilities": {
+                "fact_runtime": {"status": "enabled_and_wired"},
+                "matrix_context_source": {"status": "enabled_and_wired"}
             },
             "degraded_reasons": []
         }));
@@ -1796,8 +1813,10 @@ mod tests {
 
         let reality = snapshot.reality_core.as_ref().expect("reality summary");
         assert_eq!(reality.status, "ready");
+        assert_eq!(reality.fact_status, "enabled_and_wired");
         assert_eq!(reality.memory_status, "ready");
         assert_eq!(reality.matrix_status, "ready");
+        assert_eq!(reality.matrix_context_status, "enabled_and_wired");
         assert_eq!(reality.growth_status, "ready");
 
         let flow = snapshot.fact_flow.as_ref().expect("fact flow summary");
@@ -1894,8 +1913,10 @@ mod tests {
             }),
             reality_core: Some(RealityCoreSummary {
                 status: "ready".to_string(),
+                fact_status: "enabled_and_wired".to_string(),
                 memory_status: "ready".to_string(),
                 matrix_status: "ready".to_string(),
+                matrix_context_status: "enabled_and_wired".to_string(),
                 growth_status: "ready".to_string(),
                 context_status: "ready".to_string(),
                 audit_status: "ready".to_string(),

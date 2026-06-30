@@ -328,7 +328,7 @@ pub(crate) struct GrowthService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     events: Arc<Mutex<Vec<GrowthEvent>>>,
-    fact_kernel: Arc<Mutex<fact_kernel::FactKernelService>>,
+    fact_kernel: Arc<Mutex<fact_kernel::FactKernelService<growth_service::GatewayFactStore>>>,
 }
 
 impl GrowthService {
@@ -337,7 +337,15 @@ impl GrowthService {
             label: "growth",
             owner: "0.9.380 Growth service boundary",
             events: Arc::new(Mutex::new(Vec::new())),
-            fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::new())),
+            fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::with_store(
+                growth_service::GatewayFactStore::open_for_config_home(
+                    runtime::cowd_dirs::config_home_dir(),
+                )
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "durable fact store unavailable; using memory-only gateway fact store");
+                    growth_service::GatewayFactStore::memory_only()
+                }),
+            ))),
         }
     }
 

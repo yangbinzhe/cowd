@@ -1,13 +1,13 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use chrono::Utc;
 use fact_kernel::{
-    core::{EvidencePacket, FactSource, SourceKind},
+    core::{EvidenceId, EvidencePacket, FactRecord, FactSource, SourceKind},
     growth::GrowthCandidate,
     hypothesis::HypothesisBoundary,
     matrix::MatrixFact as KernelMatrixFact,
     memory::MemoryCandidate as KernelMemoryCandidate,
-    Confidence, FactId,
+    Confidence, FactId, FactStore,
 };
 use harness_contract::growth::{GrowthEvent, GrowthMatrixSignal, GrowthMemoryCandidate};
 use matrix_core::{MatrixFact, MatrixFactInput};
@@ -20,6 +20,161 @@ use serde::{Deserialize, Serialize};
 use storage::{MigrationRunner, SqliteConnectionFactory, StorageMigrationSpec, StorageRegistry};
 
 use super::{GrowthService, MatrixService, MemoryService};
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GatewayFactStore {
+    db_path: Option<std::path::PathBuf>,
+    facts: BTreeMap<String, FactRecord>,
+    evidence: BTreeMap<String, EvidencePacket>,
+}
+
+impl GatewayFactStore {
+    pub(crate) fn memory_only() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn open_for_config_home(config_home: impl AsRef<Path>) -> Result<Self, String> {
+        let registry = StorageRegistry::default_for_config_home(config_home);
+        let handle = registry
+            .sqlite_handle("fact")
+            .map_err(|error| error.to_string())?;
+        if let Some(parent) = handle.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let conn = SqliteConnectionFactory::default()
+            .open_handle(handle)
+            .map_err(|error| error.to_string())?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS fact_records (
+                fact_id TEXT PRIMARY KEY,
+                fact_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS fact_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                collected_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+        let facts = load_fact_records(&conn)?;
+        let evidence = load_fact_evidence(&conn)?;
+        Ok(Self {
+            db_path: Some(handle.path.clone()),
+            facts,
+            evidence,
+        })
+    }
+
+    fn connection(&self) -> Result<Option<Connection>, String> {
+        let Some(path) = self.db_path.as_ref() else {
+            return Ok(None);
+        };
+        Connection::open(path)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl FactStore for GatewayFactStore {
+    fn upsert_fact(&mut self, fact: FactRecord) -> FactRecord {
+        if let Ok(Some(conn)) = self.connection() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO fact_records (fact_id, fact_type, status, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    fact.id.as_str(),
+                    &fact.fact_type,
+                    &fact.status,
+                    serde_json::to_string(&fact).unwrap_or_default(),
+                    fact.updated_at.to_rfc3339(),
+                ],
+            );
+        }
+        self.facts
+            .insert(fact.id.as_str().to_string(), fact.clone());
+        fact
+    }
+
+    fn get_fact(&self, id: &FactId) -> Option<&FactRecord> {
+        self.facts.get(id.as_str())
+    }
+
+    fn list_facts(&self) -> Vec<FactRecord> {
+        self.facts.values().cloned().collect()
+    }
+
+    fn insert_evidence(&mut self, evidence: EvidencePacket) -> EvidencePacket {
+        if let Ok(Some(conn)) = self.connection() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO fact_evidence (evidence_id, source_kind, payload_json, collected_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    evidence.id.as_str(),
+                    format!("{:?}", evidence.source.kind),
+                    serde_json::to_string(&evidence).unwrap_or_default(),
+                    evidence.collected_at.to_rfc3339(),
+                ],
+            );
+        }
+        self.evidence
+            .insert(evidence.id.as_str().to_string(), evidence.clone());
+        evidence
+    }
+
+    fn get_evidence(&self, id: &EvidenceId) -> Option<&EvidencePacket> {
+        self.evidence.get(id.as_str())
+    }
+
+    fn list_evidence(&self) -> Vec<EvidencePacket> {
+        self.evidence.values().cloned().collect()
+    }
+}
+
+fn load_fact_records(conn: &Connection) -> Result<BTreeMap<String, FactRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT fact_id, payload_json FROM fact_records ORDER BY updated_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            Ok((id, payload))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut facts = BTreeMap::new();
+    for row in rows {
+        let (id, payload) = row.map_err(|error| error.to_string())?;
+        let fact =
+            serde_json::from_str::<FactRecord>(&payload).map_err(|error| error.to_string())?;
+        facts.insert(id, fact);
+    }
+    Ok(facts)
+}
+
+fn load_fact_evidence(conn: &Connection) -> Result<BTreeMap<String, EvidencePacket>, String> {
+    let mut stmt = conn
+        .prepare("SELECT evidence_id, payload_json FROM fact_evidence ORDER BY collected_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            Ok((id, payload))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut evidence = BTreeMap::new();
+    for row in rows {
+        let (id, payload) = row.map_err(|error| error.to_string())?;
+        let packet =
+            serde_json::from_str::<EvidencePacket>(&payload).map_err(|error| error.to_string())?;
+        evidence.insert(id, packet);
+    }
+    Ok(evidence)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GrowthPromotionReceipt {
@@ -40,6 +195,39 @@ pub(crate) struct GrowthIngestReceipt {
 }
 
 impl GrowthService {
+    pub(crate) fn fact_evidence(&self, evidence_id: &str) -> Option<fact_kernel::EvidencePacket> {
+        let kernel = self
+            .fact_kernel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kernel
+            .store()
+            .get_evidence(&fact_kernel::EvidenceId::from_string(evidence_id))
+            .cloned()
+    }
+
+    pub(crate) fn recall_facts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<fact_kernel::FactSearchHit> {
+        let kernel = self
+            .fact_kernel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut recall_query = fact_kernel::memory::RecallQuery::new(query);
+        recall_query.limit = limit.max(1);
+        kernel.recall(&recall_query)
+    }
+
+    pub(crate) fn list_fact_records(&self) -> Vec<fact_kernel::FactRecord> {
+        let kernel = self
+            .fact_kernel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kernel.store().list_facts()
+    }
+
     pub(crate) async fn ingest_growth_event(
         &self,
         config_home: impl AsRef<Path>,

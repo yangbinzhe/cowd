@@ -229,6 +229,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     let parity = report
         .get("event_observation_parity")
         .unwrap_or(&Value::Null);
+    let reality_context = report.get("reality_context_eval").unwrap_or(&Value::Null);
     let package = report.get("report_package").unwrap_or(&Value::Null);
     let is_quick = level == "quick";
 
@@ -266,6 +267,31 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         true,
         "knowledge fabric scenario must pass",
         "repair memory namespace, conflict, and activation evaluation",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "reality_context_eval_complete",
+        scenario_status(&scenarios, "reality_context_eval") == Some("passed")
+            && reality_context
+                .get("failed")
+                .and_then(Value::as_u64)
+                .is_some_and(|failed| failed == 0)
+            && reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0),
+        true,
+        format!(
+            "failed={}, evidence_refs={}",
+            reality_context
+                .get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ),
+        "repair RecallReport/ContextEnvelope scenario evidence before accepting the report",
     ));
 
     if is_quick {

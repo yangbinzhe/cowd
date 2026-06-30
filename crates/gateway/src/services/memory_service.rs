@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use harness_contract::knowledge::{
-    KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+use harness_contract::{
+    knowledge::{KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace},
+    reality::RealityCapabilityStatus,
 };
 use memory::types::{MemoryEntry, MemoryId, MemoryLayer};
 use memory::{MemoryContextPacket, MemoryKernel, MemoryTurnContext, RotAlert};
@@ -75,6 +76,7 @@ impl MemoryService {
                     })
                 });
             let vector_count = mgr.vector_index_count();
+            let capabilities = memory_capabilities_json(true, vector_count);
             let total_entries: usize = layers
                 .iter()
                 .filter_map(|layer| layer.get("entry_count").and_then(|value| value.as_u64()))
@@ -88,6 +90,7 @@ impl MemoryService {
                 "layers": layers,
                 "total_entries": total_entries,
                 "vector_count": vector_count,
+                "capabilities": capabilities,
                 "session_store": true,
                 "context_health": context_health_json(mgr.ctx_health()),
                 "kernel_health": kernel_health,
@@ -103,6 +106,7 @@ impl MemoryService {
                 "layers": empty_memory_layers_json(),
                 "total_entries": 0,
                 "vector_count": 0,
+                "capabilities": memory_capabilities_json(false, 0),
                 "session_store": false,
                 "context_health": {
                     "level": "unavailable",
@@ -207,7 +211,7 @@ impl MemoryService {
                 let kernel = MemoryKernel::new(mgr);
                 let ctx = MemoryTurnContext::new("api-memory-packet", "api");
                 kernel
-                    .context_packet(&ctx, &query_for_packet, &[], max_items, max_tokens)
+                    .context_packet_preview(&ctx, &query_for_packet, &[], max_items, max_tokens)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -255,6 +259,35 @@ impl MemoryService {
                 let ctx = MemoryTurnContext::new(session_id, source);
                 kernel
                     .context_packet(&ctx, &query, &[], max_items, max_tokens)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    pub(crate) async fn context_packet_preview(
+        &self,
+        session_id: String,
+        source: &'static str,
+        query: String,
+        max_items: usize,
+        max_tokens: u64,
+    ) -> Result<MemoryContextPacket, String> {
+        let mgr = self
+            .manager()
+            .ok_or_else(|| "memory not configured".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            rt.block_on(async move {
+                let kernel = MemoryKernel::new(mgr);
+                let ctx = MemoryTurnContext::new(session_id, source);
+                kernel
+                    .context_packet_preview(&ctx, &query, &[], max_items, max_tokens)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -322,6 +355,9 @@ impl MemoryService {
             return serde_json::json!({
                 "enabled": false,
                 "kind": "memory.knowledge_fabric",
+                "capability_status": RealityCapabilityStatus::Disabled.as_str(),
+                "projection_mode": "unavailable",
+                "durable": false,
                 "degraded": true,
                 "degraded_reason": "memory not configured",
                 "projection": null,
@@ -333,42 +369,51 @@ impl MemoryService {
                 return serde_json::json!({
                     "enabled": true,
                     "kind": "memory.knowledge_fabric",
+                    "capability_status": RealityCapabilityStatus::Degraded.as_str(),
+                    "projection_mode": "synthetic_from_memory_entries",
+                    "durable": false,
                     "degraded": true,
                     "degraded_reason": error,
                     "projection": null,
                 });
             }
         };
-        let fabric = memory::KnowledgeFabric::new();
-        let mut ingested = 0usize;
-        for entry in entries.into_iter().filter(is_knowledge_memory_entry) {
-            let namespace = knowledge_namespace_for_entry(&entry);
-            let activation_policy = knowledge_activation_policy_for_entry(&entry);
-            let governance_level = knowledge_governance_for_entry(&entry);
-            fabric.ingest_document(
-                namespace,
-                activation_policy,
-                governance_level,
-                memory::DocumentContent {
-                    title: entry.title,
-                    body: entry.content,
-                    source: Some(format!("memory:{}", entry.id)),
-                    author: entry.source_agent,
-                    created_at: Some(entry.created_at.to_rfc3339()),
-                    modified_at: Some(entry.updated_at.to_rfc3339()),
-                    language: None,
-                },
-            );
-            ingested += 1;
-        }
+        let import_candidate_count = entries
+            .iter()
+            .filter(|entry| is_knowledge_memory_entry(entry))
+            .count();
+        let durable_fabric =
+            memory::durable_knowledge_fabric_for_config_home(runtime::cowd_dirs::config_home_dir());
+        let (capability_status, projection_mode, durable, degraded, degraded_reason, projection) =
+            match durable_fabric {
+                Ok(fabric) => (
+                    RealityCapabilityStatus::EnabledAndWired.as_str(),
+                    "durable_knowledge_store",
+                    true,
+                    false,
+                    serde_json::Value::Null,
+                    fabric.projection(),
+                ),
+                Err(error) => (
+                    RealityCapabilityStatus::Degraded.as_str(),
+                    "durable_knowledge_store_unavailable",
+                    false,
+                    true,
+                    serde_json::json!(error.to_string()),
+                    serde_json::Value::Null,
+                ),
+            };
         serde_json::json!({
             "enabled": true,
             "kind": "memory.knowledge_fabric",
-            "degraded": false,
-            "degraded_reason": null,
-            "source": "memory.entries",
-            "ingested_entry_count": ingested,
-            "projection": fabric.projection(),
+            "capability_status": capability_status,
+            "projection_mode": projection_mode,
+            "durable": durable,
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
+            "source": "knowledge.sqlite",
+            "import_candidate_count": import_candidate_count,
+            "projection": projection,
         })
     }
 
@@ -486,6 +531,60 @@ fn knowledge_governance_for_entry(entry: &MemoryEntry) -> KnowledgeGovernanceLev
     } else {
         KnowledgeGovernanceLevel::Advisory
     }
+}
+
+fn memory_capabilities_json(enabled: bool, vector_count: usize) -> serde_json::Value {
+    if !enabled {
+        return serde_json::json!({
+            "vector_semantic": capability_probe_json(
+                RealityCapabilityStatus::Disabled,
+                "memory manager is not configured"
+            ),
+            "aaak_index": capability_probe_json(
+                RealityCapabilityStatus::Disabled,
+                "memory manager is not configured"
+            ),
+            "knowledge_fabric": capability_probe_json(
+                RealityCapabilityStatus::Disabled,
+                "memory manager is not configured"
+            ),
+            "context_envelope": capability_probe_json(
+                RealityCapabilityStatus::Disabled,
+                "memory manager is not configured"
+            ),
+        });
+    }
+
+    serde_json::json!({
+        "vector_semantic": capability_probe_json(
+            RealityCapabilityStatus::EnabledAndWired,
+            format!(
+                "vector index stores {vector_count} embeddings and participates in MemoryKernel recall as a first-class source when embeddings are available"
+            )
+        ),
+        "aaak_index": capability_probe_json(
+            RealityCapabilityStatus::EnabledAndWired,
+            "AAAK compact navigation is exposed as a recall source and omission pointer for deep context recovery"
+        ),
+        "knowledge_fabric": capability_probe_json(
+            RealityCapabilityStatus::EnabledAndWired,
+            "KnowledgeFabric uses durable storage/knowledge.sqlite and feeds activation evidence through runtime context assembly"
+        ),
+        "context_envelope": capability_probe_json(
+            RealityCapabilityStatus::EnabledAndWired,
+            "ContextEnvelope is the single runtime prompt assembly boundary and is persisted for evidence and replay"
+        ),
+    })
+}
+
+fn capability_probe_json(
+    status: RealityCapabilityStatus,
+    reason: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status.as_str(),
+        "reason": reason.into(),
+    })
 }
 
 #[cfg(test)]

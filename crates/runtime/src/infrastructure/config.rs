@@ -718,6 +718,7 @@ pub struct McpManagedProxyServerConfig {
 pub struct MemoryConfig {
     pub enabled: bool,
     pub store_path: Option<PathBuf>,
+    pub store_enable_vector_index: bool,
     pub runtime: MemoryRuntimeConfig,
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
@@ -750,6 +751,7 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             store_path: None,
+            store_enable_vector_index: true,
             runtime: MemoryRuntimeConfig::default(),
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
@@ -1880,6 +1882,13 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
         .map(|s| crate::cowd_dirs::expand_tilde(s));
+    let store_enable_vector_index = if let Some(store_val) = mem.get("store") {
+        let store = expect_object(store_val, "merged settings.memory.store")?;
+        optional_bool_dual(store, "enable_vector_index", "merged settings.memory.store")?
+            .unwrap_or(MemoryConfig::default().store_enable_vector_index)
+    } else {
+        MemoryConfig::default().store_enable_vector_index
+    };
     let runtime = if let Some(runtime_val) = mem.get("runtime") {
         let r = expect_object(runtime_val, "merged settings.memory.runtime")?;
         MemoryRuntimeConfig {
@@ -2004,14 +2013,23 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     Ok(MemoryConfig {
         enabled: enabled.unwrap_or(MemoryConfig::default().enabled),
         store_path,
+        store_enable_vector_index,
         runtime,
         layers,
         extraction,
         vector,
-        aaak_index_enabled: optional_bool(mem, "aaakIndexEnabled", "merged settings.memory")?
-            .unwrap_or(MemoryConfig::default().aaak_index_enabled),
-        coherence_threshold_bp: optional_u32(mem, "coherenceThreshold", "merged settings.memory")?
-            .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
+        aaak_index_enabled: optional_bool_dual(
+            mem,
+            "aaak_index_enabled",
+            "merged settings.memory",
+        )?
+        .unwrap_or(MemoryConfig::default().aaak_index_enabled),
+        coherence_threshold_bp: optional_u32_dual(
+            mem,
+            "coherence_threshold_bp",
+            "merged settings.memory",
+        )?
+        .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
     })
 }
 
