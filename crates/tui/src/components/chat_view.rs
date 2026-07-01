@@ -94,10 +94,11 @@ struct ChatTurnStats {
 
 impl ChatView {
     fn renders_in_main_chat(entry: &TimelineEntry) -> bool {
-        matches!(
-            entry,
-            TimelineEntry::Message { .. } | TimelineEntry::SlashOutput { .. }
-        )
+        match entry {
+            TimelineEntry::Message { role, .. } => role == "user" || role == "assistant",
+            TimelineEntry::SlashOutput { .. } => true,
+            _ => false,
+        }
     }
 
     fn visible_main_entries(&self) -> impl Iterator<Item = (usize, &TimelineEntry)> {
@@ -1367,8 +1368,8 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         assert!(
-            lines.iter().any(|l| l.contains("System notification.")),
-            "Expected system message text"
+            !lines.iter().any(|l| l.contains("System notification.")),
+            "system notices should not render in main chat"
         );
     }
 

@@ -412,8 +412,8 @@ pub fn default_bindings() -> KeyMap {
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
         },
-        Action::TogglePerformanceDashboard,
-        "Performance dashboard",
+        Action::ToggleCommandPalette,
+        "Command palette",
         GROUP_DIALOG,
     );
     map.add_grouped(
@@ -423,8 +423,8 @@ pub fn default_bindings() -> KeyMap {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             )],
         },
-        Action::ToggleCommandPalette,
-        "Command palette",
+        Action::TogglePerformanceDashboard,
+        "Performance dashboard",
         GROUP_DIALOG,
     );
     map.add_grouped(

@@ -21,11 +21,23 @@ impl ActivityPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
+        let mut labels = app.recent_system_notice_labels(80);
+        labels.extend(
+            app.timeline_clone_vec()
+                .into_iter()
+                .rev()
+                .filter_map(activity_label),
+        );
+        self.labels = labels;
+        self.scroll.sync(self.labels.len(), 10);
+    }
+
+    pub fn sync_from_timeline_for_tests(&mut self, app: &App) {
         self.labels = app
             .timeline_clone_vec()
             .into_iter()
             .rev()
-            .map(activity_label)
+            .filter_map(activity_label)
             .collect();
         self.scroll.sync(self.labels.len(), 10);
     }
@@ -155,7 +167,7 @@ impl Component for ActivityPanel {
     }
 }
 
-fn activity_label(entry: TimelineEntry) -> String {
+fn activity_label(entry: TimelineEntry) -> Option<String> {
     match entry {
         TimelineEntry::Thinking {
             complete, content, ..
@@ -166,9 +178,9 @@ fn activity_label(entry: TimelineEntry) -> String {
                 "thinking"
             };
             if content.is_empty() {
-                state.to_string()
+                Some(state.to_string())
             } else {
-                format!("{state}: {}", preview(&content, 48))
+                Some(format!("{state}: {}", preview(&content, 48)))
             }
         }
         TimelineEntry::ToolCall {
@@ -179,19 +191,15 @@ fn activity_label(entry: TimelineEntry) -> String {
         } => {
             let state = if done { "tool done" } else { "tool running" };
             if preview.is_empty() {
-                format!("{state}: {name}")
+                Some(format!("{state}: {name}"))
             } else {
-                format!("{state}: {name} {}", preview_text(&preview, 38))
+                Some(format!("{state}: {name} {}", preview_text(&preview, 38)))
             }
         }
-        TimelineEntry::Message { role, content, .. } => {
-            format!("{role}: {}", preview(&content, 56))
-        }
+        TimelineEntry::Message { .. } => None,
         TimelineEntry::SlashOutput {
             command, output, ..
-        } => {
-            format!("/{command}: {}", preview(&output, 50))
-        }
+        } => Some(format!("/{command}: {}", preview(&output, 50))),
     }
 }
 
@@ -215,14 +223,14 @@ mod tests {
     #[test]
     fn activity_panel_syncs_newest_first() {
         let mut app = App::new("m", "s");
-        app.add_message("user", "first");
-        app.add_message("assistant", "second");
+        app.add_message("system", "connected");
+        app.add_slash_output("status", "ready");
         let mut panel = ActivityPanel::new();
 
         panel.sync_from_app(&app);
 
-        assert!(panel.labels[0].contains("assistant"));
-        assert!(panel.labels[1].contains("user"));
+        assert!(panel.labels[0].contains("notice: connected"));
+        assert!(panel.labels[1].contains("/status"));
     }
 
     #[test]

@@ -258,7 +258,7 @@ fn collect_visible(nodes: &[FileNode], ancestors_last: &[bool], result: &mut Vec
 /// - Build from `Vec<FileEntry>` (via `rebuild`)
 /// - Keyboard navigation (j/k, Enter/l/h)
 /// - Git status overlay (via `load_git_status`)
-/// - File preview on selection (first 20 lines via `std::fs`)
+/// - File preview on selection through the Gateway workspace API
 /// - Tree rendering with `├──`/`└──` connectors
 pub struct FileTree {
     /// Root-level tree nodes (source of truth).
@@ -307,6 +307,24 @@ impl FileTree {
         self.scroll_offset = 0;
     }
 
+    /// Return the selected file path relative to the Gateway workspace.
+    pub fn selected_file_path(&self) -> Option<String> {
+        let vis = self.visible_nodes();
+        let node = vis.get(self.cursor)?;
+        (!node.is_dir).then(|| node.path.clone())
+    }
+
+    /// Return the preview path currently shown by the widget.
+    pub fn preview_path(&self) -> Option<&str> {
+        self.preview_path.as_deref()
+    }
+
+    /// Replace preview content after the state layer has loaded it via Gateway.
+    pub fn apply_preview(&mut self, path: &str, content: impl Into<String>) {
+        self.preview_path = Some(path.to_string());
+        self.preview = Some(content.into());
+    }
+
     /// Load git status by running `git status --porcelain` in `cwd`.
     ///
     /// Populates `self.git_statuses` and propagates statuses onto tree nodes.
@@ -330,7 +348,7 @@ impl FileTree {
         apply_git_status_recursive(&mut self.root_nodes, statuses);
     }
 
-    /// Load a preview for the file at `cursor`.
+    /// Mark a preview request for the file at `cursor`.
     fn load_preview(&mut self) {
         self.preview = None;
         self.preview_path = None;
@@ -343,18 +361,8 @@ impl FileTree {
         if node.is_dir {
             return;
         }
-        let path = self.cwd.join(&node.path);
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().take(20).collect();
-                self.preview = Some(lines.join("\n"));
-                self.preview_path = Some(node.path.clone());
-            }
-            Err(e) => {
-                self.preview = Some(format!("<read error: {e}>"));
-                self.preview_path = Some(node.path.clone());
-            }
-        }
+        self.preview_path = Some(node.path.clone());
+        self.preview = Some("Loading preview through Gateway...".to_string());
     }
 
     // ── Flattened view ────────────────────────────────────────────
@@ -449,6 +457,18 @@ impl FileTree {
         };
         Self::set_expanded(&mut self.root_nodes, &path, false);
         self.clamp_cursor();
+        self.load_preview();
+    }
+
+    fn collapse_all(&mut self) {
+        fn visit(nodes: &mut [FileNode]) {
+            for node in nodes {
+                node.is_expanded = false;
+                visit(&mut node.children);
+            }
+        }
+        visit(&mut self.root_nodes);
+        self.cursor = self.cursor.min(self.visible_count().saturating_sub(1));
         self.load_preview();
     }
 
@@ -550,6 +570,15 @@ impl Component for FileTree {
                 }
                 KeyCode::Char('h') => {
                     self.collapse_at_cursor();
+                    EventResult::Consumed
+                }
+                KeyCode::Char('o') => {
+                    self.collapse_all();
+                    EventResult::Consumed
+                }
+                KeyCode::Char('r') => {
+                    self.load_git_status(None);
+                    self.load_preview();
                     EventResult::Consumed
                 }
                 _ => EventResult::NotConsumed,
@@ -684,7 +713,7 @@ impl FileTree {
 
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "Keys: j↓ k↑ Enter:open  h:toggle-hidden  r:refresh  o:collapse",
+            "Keys: j/k move  Enter toggle  l/h expand/collapse  o collapse-all  r git",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1140,8 +1169,7 @@ mod tests {
 
         assert!(ft.preview.is_some());
         let preview = ft.preview.as_ref().unwrap();
-        assert!(preview.contains("line1"));
-        assert!(preview.contains("line5"));
+        assert!(preview.contains("Gateway"));
 
         // Clean up.
         let _ = std::fs::remove_file(&tmp);

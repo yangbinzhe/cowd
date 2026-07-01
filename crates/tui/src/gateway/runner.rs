@@ -11,7 +11,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::PendingResource;
+use crate::app::{PendingResource, SystemNoticeKind};
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
@@ -57,8 +57,6 @@ pub fn terminal_entry() {
 }
 
 pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = std::env::current_dir().unwrap_or_default();
-
     error_recovery::install_tui_panic_hook();
     let migration_report = config_migration::run_startup_migration();
 
@@ -85,8 +83,8 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let session_id = config.session_id.clone();
     let mut state = TuiState::new(&config.model, &session_id);
     state.app.yolo_mode = config.yolo_mode;
-    state.add_message("system", &config.startup_banner);
-    state.add_message("system", &config.connected_line);
+    state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
+    state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
 
     let gateway_actor_id = format!("tui:{}", std::process::id());
     let mut gateway_lease_owner: Option<String> = None;
@@ -114,9 +112,19 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         state.theme_engine = crate::theme::ThemeEngine::new(high_contrast_theme);
     }
     if !migration_report.contains("nothing to migrate") {
-        state.add_message("system", &migration_report);
+        state.add_system_notice(SystemNoticeKind::Info, &migration_report);
     }
-    state.app.file_entries = list_workspace_files(&workspace);
+    match list_workspace_files(&gateway_client) {
+        Ok(files) => {
+            state.app.file_entries = files;
+        }
+        Err(error) => {
+            state.add_system_notice(
+                SystemNoticeKind::Warning,
+                &format!("Gateway workspace projection unavailable: {error}"),
+            );
+        }
+    }
     send_session_list(&tui_tx, gateway_session_ids, &session_id);
 
     let startup_ready = true;
@@ -177,16 +185,16 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                                             label: label.clone(),
                                                             kind: kind.clone(),
                                                         });
-                                                        state.add_message(
-                                                            "system",
+                                                        state.add_system_notice(
+                                                            SystemNoticeKind::Info,
                                                             &format!("Attached resource {label} ({kind}) as resource://{id}"),
                                                         );
                                                     }
                                                 }
                                             }
                                             Err(err) => {
-                                                state.add_message(
-                                                    "system",
+                                                state.add_system_notice(
+                                                    SystemNoticeKind::Error,
                                                     &format!("Attach failed: {err}"),
                                                 );
                                             }
@@ -204,7 +212,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         continue;
                                     }
                                     if state.is_loading || state.turn_active {
-                                        state.add_message("system", "Already processing, please wait...");
+                                        state.add_system_notice(
+                                            SystemNoticeKind::Warning,
+                                            "Already processing, please wait...",
+                                        );
                                         continue;
                                     }
                                     state.add_message("user", &text);
@@ -290,8 +301,8 @@ fn attach_gateway_session(
 
     let active_api_sessions = state.app.active_api_sessions;
     let server_uptime_secs = state.app.server_uptime_secs.unwrap_or_default();
-    state.add_message(
-        "system",
+    state.add_system_notice(
+        SystemNoticeKind::Info,
         &format!("Gateway API connected: {active_api_sessions} active sessions, uptime {server_uptime_secs}s"),
     );
 
@@ -317,8 +328,8 @@ fn attach_gateway_session(
     } else {
         "attached"
     };
-    state.add_message(
-        "system",
+    state.add_system_notice(
+        SystemNoticeKind::Info,
         &format!("Gateway session {action}: {ensured_session_id}"),
     );
 
@@ -329,8 +340,8 @@ fn attach_gateway_session(
         Some("writer"),
     )) {
         Ok(attached) => {
-            state.add_message(
-                "system",
+            state.add_system_notice(
+                SystemNoticeKind::Info,
                 &format!(
                     "Gateway lifecycle attached: state={}, seq={}",
                     attached
@@ -344,8 +355,8 @@ fn attach_gateway_session(
                 ),
             );
             match shared_rt().block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
-                Ok(replay) => state.add_message(
-                    "system",
+                Ok(replay) => state.add_system_notice(
+                    SystemNoticeKind::Info,
                     &format!(
                         "Gateway replay ready: total={}, next_seq={}",
                         replay
@@ -358,13 +369,14 @@ fn attach_gateway_session(
                             .unwrap_or_default()
                     ),
                 ),
-                Err(err) => {
-                    state.add_message("system", &format!("Gateway replay unavailable: {err}"))
-                }
+                Err(err) => state.add_system_notice(
+                    SystemNoticeKind::Error,
+                    &format!("Gateway replay unavailable: {err}"),
+                ),
             }
         }
-        Err(err) => state.add_message(
-            "system",
+        Err(err) => state.add_system_notice(
+            SystemNoticeKind::Error,
             &format!("Gateway lifecycle attach unavailable: {err}"),
         ),
     }
@@ -385,8 +397,8 @@ fn attach_gateway_session(
                 .get("mode")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
-            state.add_message(
-                "system",
+            state.add_system_notice(
+                SystemNoticeKind::Info,
                 &format!(
                     "Gateway session lease acquired: owner={}, mode={}",
                     lease
@@ -400,8 +412,8 @@ fn attach_gateway_session(
                 ),
             );
         }
-        Err(err) => state.add_message(
-            "system",
+        Err(err) => state.add_system_notice(
+            SystemNoticeKind::Error,
             &format!("Gateway session lease unavailable: {err}"),
         ),
     }
@@ -420,21 +432,27 @@ fn attach_gateway_session(
     match shared_rt().block_on(gateway_client.session_projection(&config.session_id)) {
         Ok(projection) => {
             state.app.apply_run_projection(projection);
-            state.add_message("system", "Gateway session run projection loaded");
+            state.add_system_notice(
+                SystemNoticeKind::Info,
+                "Gateway session run projection loaded",
+            );
         }
-        Err(err) => state.add_message(
-            "system",
+        Err(err) => state.add_system_notice(
+            SystemNoticeKind::Error,
             &format!("Gateway session run projection unavailable: {err}"),
         ),
     }
     if let Some(readiness) = readiness {
-        state.add_message(
-            "system",
+        state.add_system_notice(
+            SystemNoticeKind::Info,
             &format!("Gateway runtime projection connected: readiness={readiness}, components={components}"),
         );
     }
     for reason in degraded_reasons.into_iter().take(3) {
-        state.add_message("system", &format!("Gateway projection degraded: {reason}"));
+        state.add_system_notice(
+            SystemNoticeKind::Warning,
+            &format!("Gateway projection degraded: {reason}"),
+        );
     }
 
     let event_client = gateway_client.clone();
@@ -450,7 +468,10 @@ fn attach_gateway_session(
             });
         }
     });
-    state.add_message("system", "Gateway event stream subscribed for this session");
+    state.add_system_notice(
+        SystemNoticeKind::Info,
+        "Gateway event stream subscribed for this session",
+    );
     Ok(gateway_session_ids)
 }
 
@@ -633,36 +654,53 @@ fn drain_cowd_events_state(rx: &crate::CowdEventReceiver, state: &mut TuiState) 
     }
 }
 
-fn list_workspace_files(workspace: &Path) -> Vec<FileEntry> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(workspace) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.starts_with('.') {
-                continue;
-            }
-            files.push(FileEntry {
-                name,
-                is_dir: path.is_dir(),
-                size: if path.is_dir() {
-                    0
-                } else {
-                    path.metadata().map(|meta| meta.len()).unwrap_or(0)
-                },
-            });
-        }
-    }
+fn list_workspace_files(gateway_client: &GatewayApiClient) -> Result<Vec<FileEntry>, String> {
+    let projection = shared_rt()
+        .block_on(gateway_client.workspace_files(None))
+        .map_err(|error| error.to_string())?;
+    let Some(items) = projection
+        .get("files")
+        .or_else(|| projection.get("entries"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut files = items
+        .iter()
+        .filter_map(workspace_file_entry_from_json)
+        .collect::<Vec<_>>();
     files.sort_by(|left, right| {
         right
             .is_dir
             .cmp(&left.is_dir)
             .then(left.name.cmp(&right.name))
     });
-    files
+    Ok(files)
+}
+
+fn workspace_file_entry_from_json(item: &serde_json::Value) -> Option<FileEntry> {
+    let name = item
+        .get("path")
+        .or_else(|| item.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.starts_with('.'))?
+        .to_string();
+    let is_dir = item
+        .get("is_dir")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            item.get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| matches!(kind, "dir" | "directory" | "folder"))
+        })
+        .unwrap_or(false);
+    let size = item
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(FileEntry { name, is_dir, size })
 }
 
 fn arg_value(args: &[String], names: &[&str]) -> Option<String> {

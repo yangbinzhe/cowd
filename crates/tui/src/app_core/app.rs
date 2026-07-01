@@ -159,6 +159,31 @@ pub struct PendingResource {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemNoticeKind {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemNotice {
+    pub kind: SystemNoticeKind,
+    pub content: String,
+    pub timestamp: String,
+}
+
+impl SystemNotice {
+    pub fn label(&self) -> String {
+        let prefix = match self.kind {
+            SystemNoticeKind::Info => "notice",
+            SystemNoticeKind::Warning => "warning",
+            SystemNoticeKind::Error => "error",
+        };
+        format!("{prefix}: {}", self.content)
+    }
+}
+
 pub struct App {
     pub model: String,
     pub session_id: String,
@@ -189,6 +214,7 @@ pub struct App {
     pub memory_entries: Vec<MemoryEntry>,
     pub skill_list: Vec<SkillSummary>,
     pub pending_resources: Vec<PendingResource>,
+    pub system_notices: VecDeque<SystemNotice>,
     pub skin: crate::skin::SkinConfig,
     pub memory_status: Option<String>,
     pub memory_total_entries: Option<usize>,
@@ -501,6 +527,7 @@ impl App {
             memory_entries: Vec::new(),
             skill_list: Vec::new(),
             pending_resources: Vec::new(),
+            system_notices: VecDeque::new(),
             skin: crate::skin::SkinConfig::default(),
             memory_status: None,
             memory_total_entries: None,
@@ -903,6 +930,22 @@ impl App {
     }
 
     pub fn add_message(&mut self, role: &str, content: &str) {
+        if role == "system" {
+            let kind = if content.to_ascii_lowercase().contains("error")
+                || content.to_ascii_lowercase().contains("failed")
+                || content.to_ascii_lowercase().contains("unavailable")
+            {
+                SystemNoticeKind::Error
+            } else if content.to_ascii_lowercase().contains("degraded")
+                || content.to_ascii_lowercase().contains("warning")
+            {
+                SystemNoticeKind::Warning
+            } else {
+                SystemNoticeKind::Info
+            };
+            self.add_system_notice(kind, content);
+            return;
+        }
         self.timeline_push(TimelineEntry::Message {
             role: role.to_string(),
             content: content.to_string(),
@@ -912,24 +955,44 @@ impl App {
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
+    pub fn add_system_notice(&mut self, kind: SystemNoticeKind, content: &str) {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.system_notices.push_back(SystemNotice {
+            kind,
+            content: trimmed.to_string(),
+            timestamp: App::format_timestamp(),
+        });
+        const SYSTEM_NOTICE_CAP: usize = 500;
+        while self.system_notices.len() > SYSTEM_NOTICE_CAP {
+            self.system_notices.pop_front();
+        }
+        self.msg_version = self.msg_version.wrapping_add(1);
+    }
+
+    pub fn recent_system_notice_labels(&self, limit: usize) -> Vec<String> {
+        self.system_notices
+            .iter()
+            .rev()
+            .take(limit)
+            .map(SystemNotice::label)
+            .collect()
+    }
+
     pub fn add_slash_output(&mut self, command: &str, output: &str) {
         let trimmed = output.trim();
         if trimmed.is_empty() {
             return;
         }
-        let line_count = trimmed.lines().count();
-        if line_count <= 3 {
-            self.add_message("system", &format!("/{command}:"));
-            self.add_message("system", trimmed);
-        } else {
-            self.timeline_push(TimelineEntry::SlashOutput {
-                command: command.to_string(),
-                output: trimmed.to_string(),
-                expanded: false,
-            });
-            self.timeline_cursor = self.timeline_len().saturating_sub(1);
-            self.msg_version = self.msg_version.wrapping_add(1);
-        }
+        self.timeline_push(TimelineEntry::SlashOutput {
+            command: command.to_string(),
+            output: trimmed.to_string(),
+            expanded: trimmed.lines().count() <= 3,
+        });
+        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.msg_version = self.msg_version.wrapping_add(1);
     }
 
     pub fn copy_focused_content(&self) -> bool {
@@ -1302,24 +1365,15 @@ impl App {
             CowdEvent::TurnError { error } => {
                 self.is_loading = false;
                 self.turn_active = false;
-                self.timeline_push(TimelineEntry::Message {
-                    role: "system".into(),
-                    content: format!("Error: {error}"),
-                    timestamp: App::format_timestamp(),
-                });
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.add_system_notice(SystemNoticeKind::Error, &format!("Error: {error}"));
             }
 
             CowdEvent::CompactionNotice { removed_count } => {
                 self.compaction_count += 1;
-                self.timeline_push(TimelineEntry::Message {
-                    role: "system".into(),
-                    content: format!("Compacted {removed_count} earlier messages to save context."),
-                    timestamp: App::format_timestamp(),
-                });
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.add_system_notice(
+                    SystemNoticeKind::Info,
+                    &format!("Compacted {removed_count} earlier messages to save context."),
+                );
             }
 
             CowdEvent::MemoryEntry { .. } => {
@@ -1609,7 +1663,7 @@ mod tests {
         assert_eq!(stats.thinking_count, 1);
         assert_eq!(stats.tool_count, 1);
         assert_eq!(stats.message_count, 2);
-        assert_eq!(stats.event_count, 5);
+        assert_eq!(stats.event_count, 4);
     }
 
     #[test]

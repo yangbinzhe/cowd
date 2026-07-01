@@ -266,9 +266,9 @@ fn integration_theme_toggle() {
 fn integration_diff_viewer_component_exists() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.add_message("system", "diff --git a/file.rs b/file.rs");
-    state.add_message("system", "+ added line");
-    state.add_message("system", "- removed line");
+    state.add_message("assistant", "diff --git a/file.rs b/file.rs");
+    state.add_message("assistant", "+ added line");
+    state.add_message("assistant", "- removed line");
 
     assert!(state.timeline_len() >= 3);
 }

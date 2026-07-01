@@ -10,6 +10,7 @@ use crate::CowdEvent;
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
+const DEFAULT_GATEWAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8642";
 
 #[derive(Debug, Clone)]
@@ -32,7 +33,7 @@ impl GatewayApiClient {
         auth_token: Option<String>,
     ) -> Result<Self, GatewayApiError> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(DEFAULT_GATEWAY_REQUEST_TIMEOUT)
             .build()
             .map_err(GatewayApiError::Http)?;
         Ok(Self {
@@ -223,6 +224,174 @@ impl GatewayApiClient {
             return Err(GatewayApiError::Status(status, text));
         }
         serde_json::from_str(&text).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn workspace_overview(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/workspace").await
+    }
+
+    pub async fn workspace_files(
+        &self,
+        dir: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let path = match dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+            Some(dir) => format!("/api/workspace/files?dir={}", url_encode(dir)),
+            None => "/api/workspace/files".to_string(),
+        };
+        self.get_json(&path).await
+    }
+
+    pub async fn create_workspace_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/workspace/files",
+            serde_json::json!({ "path": path, "content": content }),
+        )
+        .await
+    }
+
+    pub async fn create_workspace_dir(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/workspace/dirs", serde_json::json!({ "path": path }))
+            .await
+    }
+
+    pub async fn delete_workspace_path(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.delete_json(&format!("/api/workspace/files?path={}", url_encode(path)))
+            .await
+    }
+
+    pub async fn rename_workspace_path(
+        &self,
+        path: &str,
+        to: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/workspace/rename",
+            serde_json::json!({ "path": path, "to": to }),
+        )
+        .await
+    }
+
+    pub async fn workspace_meta(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/workspace/meta?path={}", url_encode(path)))
+            .await
+    }
+
+    pub async fn download_workspace_path(&self, path: &str) -> Result<Vec<u8>, GatewayApiError> {
+        self.get_bytes(&format!(
+            "/api/workspace/download?path={}",
+            url_encode(path)
+        ))
+        .await
+    }
+
+    pub async fn workspace_file_preview(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let bytes = self
+            .get_bytes(&format!("/api/file/raw?path={}", url_encode(path)))
+            .await?;
+        let truncated = bytes.len() > max_bytes;
+        let slice = if truncated {
+            &bytes[..max_bytes]
+        } else {
+            bytes.as_slice()
+        };
+        let content = String::from_utf8_lossy(slice).to_string();
+        Ok(serde_json::json!({
+            "path": path,
+            "content": content,
+            "bytes": bytes.len(),
+            "truncated": truncated,
+        }))
+    }
+
+    pub async fn upload_workspace_file_path(
+        &self,
+        path: &Path,
+        dir: Option<&str>,
+        overwrite: bool,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let bytes = std::fs::read(path).map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload.bin")
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("dir", dir.unwrap_or_default().to_string())
+            .text("overwrite", overwrite.to_string());
+        let url = format!("{}/api/upload", self.base_url);
+        let mut request = self.client.post(url).multipart(form);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        let text = response.text().await.map_err(GatewayApiError::Http)?;
+        if !status.is_success() {
+            return Err(GatewayApiError::Status(status, text));
+        }
+        serde_json::from_str(&text).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn list_session_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/attachments",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn add_session_attachment(
+        &self,
+        session_id: &str,
+        path: &str,
+        kind: &str,
+        label: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/sessions/{}/attachments", url_encode(session_id)),
+            serde_json::json!({
+                "path": path,
+                "kind": kind,
+                "label": label,
+            }),
+        )
+        .await
+    }
+
+    pub async fn delete_session_attachment(
+        &self,
+        session_id: &str,
+        ref_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.delete_json(&format!(
+            "/api/sessions/{}/attachments/{}",
+            url_encode(session_id),
+            url_encode(ref_id)
+        ))
+        .await
     }
 
     pub async fn cancel_session_turn(
@@ -426,6 +595,27 @@ impl GatewayApiClient {
 
     pub async fn runtime_effective_config(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/runtime/config/effective").await
+    }
+
+    pub async fn config(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/config").await
+    }
+
+    pub async fn config_providers(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/config/providers").await
+    }
+
+    pub async fn update_config_model(
+        &self,
+        model: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.put_json("/api/config", serde_json::json!({ "model": model }))
+            .await
+    }
+
+    pub async fn reload_runtime_providers(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/runtime/providers/reload", serde_json::json!({}))
+            .await
     }
 
     pub async fn runtime_timeline(
@@ -1240,6 +1430,71 @@ impl GatewayApiClient {
             return Err(GatewayApiError::Status(status, body));
         }
         response.json().await.map_err(GatewayApiError::Http)
+    }
+
+    async fn put_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.put(url).json(&body);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+        response.json().await.map_err(GatewayApiError::Http)
+    }
+
+    async fn delete_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.delete(url);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+        response.json().await.map_err(GatewayApiError::Http)
+    }
+
+    async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, GatewayApiError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.get(url);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(GatewayApiError::Http)
     }
 }
 

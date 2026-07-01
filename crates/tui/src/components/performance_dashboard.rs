@@ -5,7 +5,7 @@
 //   - Bar chart for compression ratio
 //   - Tuning status with last-adjustment timestamp
 //
-// Toggled via Ctrl+P; auto-refreshes every 2 seconds.
+// Toggled via Ctrl+Shift+P; auto-refreshes every 2 seconds.
 
 #![allow(dead_code)]
 
@@ -268,7 +268,7 @@ impl PerformanceDashboard {
 
         lines.push(Line::from(Span::styled(
             format!(
-                " Updated: {}  |  Ctrl+P: close",
+                " Updated: {}  |  Ctrl+Shift+P: close",
                 report
                     .last_updated
                     .map(|updated| updated.format("%H:%M:%S").to_string())

@@ -22,6 +22,7 @@ use ratatui::Frame;
 use crate::components::base::{Component, EventResult, RenderContext};
 use crate::keybind::Action;
 use crate::runtime_control_store::RuntimeControlSnapshot;
+use crate::workbench::action_registry;
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -178,6 +179,28 @@ fn registry_entries_from_payload(payload: &serde_json::Value) -> Vec<CommandEntr
     entries
 }
 
+fn workbench_registry_entries() -> Vec<CommandEntry> {
+    action_registry::registered_actions()
+        .into_iter()
+        .map(|action| {
+            CommandEntry::static_entry(
+                action.label,
+                format!(
+                    "{} · domain:{} · risk:{:?} · receipt:{}",
+                    action.description, action.domain, action.risk, action.receipt_target
+                ),
+                action.action,
+            )
+        })
+        .collect()
+}
+
+fn static_entries_from_payload(payload: &serde_json::Value) -> Vec<CommandEntry> {
+    let mut entries = registry_entries_from_payload(payload);
+    entries.extend(workbench_registry_entries());
+    entries
+}
+
 fn action_from_target(target: Option<&serde_json::Value>, fallback_command: &str) -> Action {
     let kind = target
         .and_then(|value| value.get("kind"))
@@ -236,8 +259,9 @@ impl CommandPalette {
     /// Create a new command palette with all default commands pre-registered.
     #[must_use]
     pub fn new() -> Self {
+        let all_commands = workbench_registry_entries();
         Self {
-            all_commands: Vec::new(),
+            all_commands,
             search_input: String::new(),
             cursor: 0,
             results: Vec::new(),
@@ -249,7 +273,7 @@ impl CommandPalette {
 
     #[cfg(test)]
     fn new_with_projection(payload: &serde_json::Value) -> Self {
-        let all_commands = registry_entries_from_payload(payload);
+        let all_commands = static_entries_from_payload(payload);
         Self {
             all_commands,
             search_input: String::new(),
@@ -268,7 +292,7 @@ impl CommandPalette {
             .filter(|entry| entry.dynamic)
             .cloned()
             .collect::<Vec<_>>();
-        self.all_commands = registry_entries_from_payload(payload);
+        self.all_commands = static_entries_from_payload(payload);
         self.all_commands.extend(dynamic);
         self.run_search();
     }

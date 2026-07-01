@@ -20,10 +20,13 @@ use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
 use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
+use crate::components::surface_panel::SurfacePanel;
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::ToolOpsPanel;
+use crate::components::Component;
 #[cfg(test)]
-use crate::components::{Component, EventResult, RenderContext};
+use crate::components::{EventResult, RenderContext};
+use crate::workbench::panel_registry;
 
 // ── Placeholder Component ──────────────────────────────────────────
 
@@ -57,7 +60,7 @@ impl Component for PlaceholderComponent {
 /// ```text
 /// Split(Horizontal, 0.7)
 ///   ├── Leaf("chat_view")           — 70 % of width
-///   └── TabGroup (9 panel tabs)     — 30 % of width
+///   └── TabGroup (registry-backed panel tabs) — 30% of width
 ///         ├── Tab 0: "runtime"      (▶)
 ///         ├── Tab 1: "tools"        (⚒)
 ///         ├── Tab 2: "changes"      (📄)
@@ -66,66 +69,47 @@ impl Component for PlaceholderComponent {
 ///         ├── Tab 5: "todo"         (☑)
 ///         ├── Tab 6: "files"        (📁)
 ///         ├── Tab 7: "sessions"     (◫)
-///         └── Tab 8: "gateway"      (🌐)
+///         ├── Tab 8: "surfaces"     (S)
+///         └── Tab 9: "gateway"      (🌐)
 /// ```
 #[must_use]
 pub fn build_default_layout() -> LayoutTree {
-    let sidebar_tabs = vec![
-        TabDef {
-            id: "runtime".to_string(),
-            label: "Runtime".to_string(),
-            icon: Some("▶".to_string()),
-            content: Box::new(RuntimeActivityPanel::new()),
-        },
-        TabDef {
-            id: "tools".to_string(),
-            label: "Tools".to_string(),
-            icon: Some("⚒".to_string()),
-            content: Box::new(ToolOpsPanel::new()),
-        },
-        TabDef {
-            id: "changes".to_string(),
-            label: "Changes".to_string(),
-            icon: Some("📄".to_string()),
-            content: Box::new(FileChangesPanel::new()),
-        },
-        TabDef {
-            id: "goals".to_string(),
-            label: "Goals".to_string(),
-            icon: Some("◎".to_string()),
-            content: Box::new(GoalWorkbenchPanel::new()),
-        },
-        TabDef {
-            id: "approvals".to_string(),
-            label: "Approvals".to_string(),
-            icon: Some("!".to_string()),
-            content: Box::new(ApprovalCockpitPanel::new()),
-        },
-        TabDef {
-            id: "todo".to_string(),
-            label: "Todo".to_string(),
-            icon: Some("☑".to_string()),
-            content: Box::new(TodoPanel::new()),
-        },
-        TabDef {
-            id: "files".to_string(),
-            label: "Files".to_string(),
-            icon: Some("📁".to_string()),
-            content: Box::new(FileTree::new()),
-        },
-        TabDef {
-            id: "sessions".to_string(),
-            label: "Sessions".to_string(),
-            icon: Some("◫".to_string()),
-            content: Box::new(SessionSidebar::new("")),
-        },
-        TabDef {
-            id: "gateway".to_string(),
-            label: "Gateway".to_string(),
-            icon: Some("🌐".to_string()),
-            content: Box::new(GatewayPanel::new()),
-        },
-    ];
+    let sidebar_tabs = panel_registry::sidebar_panels()
+        .into_iter()
+        .map(|panel| TabDef {
+            id: panel.id.to_string(),
+            label: panel.label.to_string(),
+            icon: Some(
+                match panel.id {
+                    "runtime" => "▶",
+                    "tools" => "⚒",
+                    "changes" => "📄",
+                    "goals" => "◎",
+                    "approvals" => "!",
+                    "todo" => "☑",
+                    "files" => "📁",
+                    "sessions" => "◫",
+                    "surfaces" => "S",
+                    "gateway" => "🌐",
+                    _ => "?",
+                }
+                .to_string(),
+            ),
+            content: match panel.id {
+                "runtime" => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
+                "tools" => Box::new(ToolOpsPanel::new()) as Box<dyn Component>,
+                "changes" => Box::new(FileChangesPanel::new()) as Box<dyn Component>,
+                "goals" => Box::new(GoalWorkbenchPanel::new()) as Box<dyn Component>,
+                "approvals" => Box::new(ApprovalCockpitPanel::new()) as Box<dyn Component>,
+                "todo" => Box::new(TodoPanel::new()) as Box<dyn Component>,
+                "files" => Box::new(FileTree::new()) as Box<dyn Component>,
+                "sessions" => Box::new(SessionSidebar::new("")) as Box<dyn Component>,
+                "surfaces" => Box::new(SurfacePanel::new()) as Box<dyn Component>,
+                "gateway" => Box::new(GatewayPanel::new()) as Box<dyn Component>,
+                _ => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
+            },
+        })
+        .collect::<Vec<_>>();
 
     let root = LayoutNode::Split(Split {
         direction: SplitDirection::Horizontal,
@@ -391,7 +375,7 @@ mod tests {
                 // Second child: TabGroup with panel tabs
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs.len(), 9, "expected 9 panel tabs");
+                        assert_eq!(tg.tabs.len(), 10, "expected 10 panel tabs");
                         assert_eq!(tg.active, 0, "first tab should be active by default");
 
                         let expected: &[(&str, &str)] = &[
@@ -403,6 +387,7 @@ mod tests {
                             ("todo", "Todo"),
                             ("files", "Files"),
                             ("sessions", "Sessions"),
+                            ("surfaces", "Surfaces"),
                             ("gateway", "Gateway"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
@@ -694,6 +679,10 @@ mod tests {
 
                         tg.next_tab();
                         assert_eq!(tg.active, 8);
+                        assert_eq!(tg.active_tab().unwrap().id, "surfaces");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 9);
                         assert_eq!(tg.active_tab().unwrap().id, "gateway");
 
                         // Wrap around
@@ -702,7 +691,7 @@ mod tests {
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 8);
+                        assert_eq!(tg.active, 9);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -727,7 +716,8 @@ mod tests {
                     assert_eq!(tg.tabs[5].icon.as_deref(), Some("☑"));
                     assert_eq!(tg.tabs[6].icon.as_deref(), Some("📁"));
                     assert_eq!(tg.tabs[7].icon.as_deref(), Some("◫"));
-                    assert_eq!(tg.tabs[8].icon.as_deref(), Some("🌐"));
+                    assert_eq!(tg.tabs[8].icon.as_deref(), Some("S"));
+                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("🌐"));
                 }
                 _ => panic!("expected TabGroup as second child"),
             },

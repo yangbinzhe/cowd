@@ -24,13 +24,15 @@ use ratatui::Frame;
 
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
-use crate::app::App;
+use crate::app::{App, SystemNoticeKind};
 use crate::components::activity_panel::ActivityPanel;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::agents_overlay::AgentsOverlay;
 use crate::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::components::chat_view::ChatView;
 use crate::components::command_palette::CommandPalette;
+use crate::components::composer::Composer;
+use crate::components::config_panel::ConfigPanel;
 use crate::components::context_panel::ContextPanel;
 use crate::components::context_suggestions::ContextSuggestions;
 use crate::components::dialog::DialogManager;
@@ -44,6 +46,7 @@ use crate::components::memory_panel::MemoryPanel;
 use crate::components::performance_dashboard::PerformanceDashboard;
 use crate::components::prompt::Prompt;
 use crate::components::question_form::QuestionForm;
+use crate::components::reality_panel::RealityPanel;
 use crate::components::revert_dialog::RevertDialog;
 use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
@@ -66,6 +69,7 @@ use crate::keybind::{default_bindings, KeybindEngine};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
 use crate::theme::ThemeEngine;
+use crate::workbench::panel_registry;
 use crate::CowdEvent;
 
 /// Result of processing a key event through the TUI input pipeline.
@@ -111,6 +115,8 @@ impl FocusTarget {
             FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => "diff",
             FocusTarget::TopicPanel(SidebarTopicPanel::Memory) => "memory",
             FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => "skills",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Config) => "config",
+            FocusTarget::TopicPanel(SidebarTopicPanel::Reality) => "reality",
             FocusTarget::CommandPalette => "palette",
             FocusTarget::PromptSuggestions => "suggest",
             FocusTarget::Dialog => "dialog",
@@ -132,6 +138,12 @@ impl FocusTarget {
             FocusTarget::TopicPanel(SidebarTopicPanel::Skills) => {
                 "j/k select · Tab category · Enter detail · Esc close"
             }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Config) => {
+                "j/k select model · Enter set · r reload · e refresh · Esc close"
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Reality) => {
+                "1 overview · 2 samples · j/k scroll · Esc close"
+            }
             FocusTarget::CommandPalette => "type to filter · j/k move · Enter run · Esc close",
             FocusTarget::PromptSuggestions => "Tab accept · arrows move · Esc close",
             FocusTarget::Dialog => "Tab move · Enter confirm · Esc close",
@@ -144,6 +156,8 @@ pub(crate) enum SidebarTopicPanel {
     Diff,
     Memory,
     Skills,
+    Config,
+    Reality,
 }
 
 impl SidebarTopicPanel {
@@ -152,29 +166,14 @@ impl SidebarTopicPanel {
             SidebarTopicPanel::Diff => "Diff",
             SidebarTopicPanel::Memory => "Memory",
             SidebarTopicPanel::Skills => "Skills",
+            SidebarTopicPanel::Config => "Config",
+            SidebarTopicPanel::Reality => "Reality",
         }
     }
 }
 
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
-    if width < 96 {
-        vec![
-            "Run", "Tool", "Chg", "Goal", "Appr", "Todo", "File", "Sess", "Surf", "Gate",
-        ]
-    } else {
-        vec![
-            "Run",
-            "Tools",
-            "Changes",
-            "Goals",
-            "Approvals",
-            "Todo",
-            "Files",
-            "Sessions",
-            "Surfaces",
-            "Gateway",
-        ]
-    }
+    panel_registry::sidebar_labels(width)
 }
 
 fn char_col_to_byte_offset(text: &str, col: usize) -> usize {
@@ -420,6 +419,9 @@ pub struct TuiState {
     /// Prompt component with autocomplete, frecency scoring, @file completion.
     pub prompt: Prompt,
 
+    /// Composer owns the bottom input UI, autocomplete dropdown placement, and submit affordance.
+    pub composer: Composer,
+
     /// File tree browser with git status overlay.
     pub file_tree: FileTree,
 
@@ -429,11 +431,17 @@ pub struct TuiState {
     /// Memory browser panel with layer filter, search, detail view, delete.
     pub memory_panel: MemoryPanel,
 
+    /// Reality Core panel for facts, memory, matrix, flow, and structured evidence.
+    pub reality_panel: RealityPanel,
+
     /// Performance dashboard overlay with sparkline, gauge, compression bar.
     pub performance_dashboard: PerformanceDashboard,
 
     /// Skills panel showing categorized skill/plugin browsing.
     pub skills_panel: SkillsPanel,
+
+    /// Runtime configuration and provider routing panel.
+    pub config_panel: ConfigPanel,
 
     /// Gateway panel showing backend runtime/API gateway status.
     pub gateway_panel: GatewayPanel,
@@ -561,11 +569,14 @@ impl TuiState {
         let diff_viewer = DiffViewer::new("Diff");
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let prompt = Prompt::new(cwd);
+        let composer = Composer::new();
         let file_tree = FileTree::new();
         let session_sidebar = SessionSidebar::new(session_id);
         let memory_panel = MemoryPanel::new();
+        let reality_panel = RealityPanel::new();
         let performance_dashboard = PerformanceDashboard::new();
         let skills_panel = SkillsPanel::new();
+        let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
@@ -608,11 +619,14 @@ impl TuiState {
             render_profiler,
             diff_viewer,
             prompt,
+            composer,
             file_tree,
             session_sidebar,
             memory_panel,
+            reality_panel,
             performance_dashboard,
             skills_panel,
+            config_panel,
             gateway_panel,
             surface_panel,
             runtime_activity_panel,
@@ -755,6 +769,8 @@ impl TuiState {
                         self.memory_panel.sync_from_app(&self.app);
                     }
                     SidebarTopicPanel::Skills => self.skills_panel.sync_from_app(&self.app),
+                    SidebarTopicPanel::Config => {}
+                    SidebarTopicPanel::Reality => self.reality_panel.sync_from_app(&self.app),
                 }
             } else {
                 match self.sidebar_active_tab {
@@ -1056,6 +1072,22 @@ impl TuiState {
                                 }),
                             );
                         }
+                        SidebarTopicPanel::Config => {
+                            let _ = error_recovery::catch_render_panic(
+                                "config_panel",
+                                AssertUnwindSafe(|| {
+                                    self.config_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        SidebarTopicPanel::Reality => {
+                            let _ = error_recovery::catch_render_panic(
+                                "reality_panel",
+                                AssertUnwindSafe(|| {
+                                    self.reality_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
                     }
                 } else {
                     match self.sidebar_active_tab {
@@ -1164,56 +1196,35 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
-        // 2.5. Render input directly from app.input (BUG 1 FIX: single source of truth)
-        // FIX B: Set block on textarea before rendering for cursor visibility
+        // 2.5. Render the bottom composer. The text buffer remains app.input for
+        // history/submit compatibility, but input UI ownership is centralized here.
         {
-            let pending_resource_hint = if self.app.pending_resources.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " · {} resource(s) attached",
-                    self.app.pending_resources.len()
-                )
+            let pending_resources = self.app.pending_resources.len();
+            let degraded = {
+                let _guard = self.render_profiler.guard("composer");
+                match error_recovery::catch_render_panic(
+                    "composer",
+                    AssertUnwindSafe(|| {
+                        self.composer.render(
+                            &mut main_ctx,
+                            frame_areas.input,
+                            &mut self.app.input,
+                            &mut self.prompt,
+                            &mut self.context_suggestions,
+                            pending_resources,
+                        );
+                    }),
+                ) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
             };
-            self.app.input.set_block(
-                ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .title(format!(
-                        " Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline{}) ",
-                        pending_resource_hint
-                    )),
-            );
-            // Render app.input widget directly — NOT through prompt
-            {
-                let _guard = self.render_profiler.guard("input");
-                main_ctx
-                    .frame_mut()
-                    .render_widget(&self.app.input, frame_areas.input);
-            }
-            // Render prompt's autocomplete dropdown as overlay
-            {
-                let _guard = self.render_profiler.guard("prompt_dropdown");
-                let _ = error_recovery::catch_render_panic(
-                    "prompt_dropdown",
-                    AssertUnwindSafe(|| {
-                        self.prompt
-                            .render_dropdown(&mut main_ctx, frame_areas.input);
-                    }),
-                );
-            }
-            // Render context suggestion bar above the input area
-            if self.context_suggestions.is_active() && !self.prompt.suggestions_visible() {
-                let _ = error_recovery::catch_render_panic(
-                    "context_suggestions",
-                    AssertUnwindSafe(|| {
-                        self.context_suggestions
-                            .render(&mut main_ctx, frame_areas.input);
-                    }),
-                );
+            if let Some(msg) = degraded {
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1235,7 +1246,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1254,7 +1265,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1280,7 +1291,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1305,7 +1316,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1324,7 +1335,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1343,7 +1354,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1363,7 +1374,7 @@ impl TuiState {
                     }
                 };
                 if let Some(msg) = degraded {
-                    self.add_message("system", &msg);
+                    self.add_system_notice(SystemNoticeKind::Warning, &msg);
                 }
             }
         }
@@ -1383,7 +1394,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -1410,7 +1421,7 @@ impl TuiState {
                 }
             };
             if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                self.add_system_notice(SystemNoticeKind::Warning, &msg);
             }
         }
 
@@ -2183,6 +2194,27 @@ impl TuiState {
                     false
                 }
             }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Config) => {
+                if self.handle_config_panel_action(&event)
+                    || self.config_panel.handle_event(&event)
+                        == crate::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Config));
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusTarget::TopicPanel(SidebarTopicPanel::Reality) => {
+                if self.reality_panel.handle_event(&event)
+                    == crate::components::EventResult::Consumed
+                {
+                    self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Reality));
+                    true
+                } else {
+                    false
+                }
+            }
             FocusTarget::Sidebar => self.route_navigation_to_sidebar(event),
             FocusTarget::Chat => {
                 let crossterm::event::Event::Key(key) = event else {
@@ -2234,7 +2266,13 @@ impl TuiState {
             TAB_GOALS => self.goal_workbench_panel.handle_event(&event),
             TAB_APPROVALS => self.approval_cockpit_panel.handle_event(&event),
             TAB_TODO => self.todo_panel.handle_event(&event),
-            TAB_FILES => self.file_tree.handle_event(&event),
+            TAB_FILES => {
+                let result = self.file_tree.handle_event(&event);
+                if result == crate::components::EventResult::Consumed {
+                    self.refresh_file_preview_from_gateway();
+                }
+                result
+            }
             TAB_SESSIONS => self.session_sidebar.handle_event(&event),
             TAB_SURFACES => {
                 if self.handle_surface_panel_action(&event) {
@@ -2256,6 +2294,42 @@ impl TuiState {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    fn refresh_file_preview_from_gateway(&mut self) {
+        let Some(path) = self.file_tree.selected_file_path() else {
+            return;
+        };
+        if self.file_tree.preview_path() == Some(path.as_str()) {
+            let path_for_request = path.clone();
+            let result = run_gateway_api_blocking(move |client| async move {
+                client
+                    .workspace_file_preview(&path_for_request, 64 * 1024)
+                    .await
+            });
+            match result {
+                Ok(value) => {
+                    let content = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let truncated = value
+                        .get("truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let rendered = if truncated {
+                        format!("{content}\n\n<preview truncated>")
+                    } else {
+                        content.to_string()
+                    };
+                    self.file_tree.apply_preview(&path, rendered);
+                }
+                Err(error) => {
+                    self.file_tree
+                        .apply_preview(&path, format!("<gateway preview error: {error}>"));
+                }
+            }
+        }
     }
 
     fn handle_agent_team_action(&mut self, key: &KeyEvent) -> bool {
@@ -2867,6 +2941,8 @@ impl TuiState {
                         SidebarTopicPanel::Diff => self.diff_viewer.handle_event(&event),
                         SidebarTopicPanel::Memory => self.memory_panel.handle_event(&event),
                         SidebarTopicPanel::Skills => self.skills_panel.handle_event(&event),
+                        SidebarTopicPanel::Config => self.config_panel.handle_event(&event),
+                        SidebarTopicPanel::Reality => self.reality_panel.handle_event(&event),
                     } == crate::components::EventResult::Consumed;
                     if consumed {
                         self.set_focus_target(FocusTarget::TopicPanel(topic));
@@ -3000,6 +3076,9 @@ impl TuiState {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
         self.active_topic_panel = Some(panel);
+        if panel == SidebarTopicPanel::Config {
+            self.refresh_config_panel();
+        }
         self.set_focus_target(FocusTarget::TopicPanel(panel));
         self.toast_manager.push(
             ToastVariant::Info,
@@ -3051,6 +3130,8 @@ impl TuiState {
             "diff" => Some(SidebarTopicPanel::Diff),
             "memory" => Some(SidebarTopicPanel::Memory),
             "skills" | "skill" => Some(SidebarTopicPanel::Skills),
+            "config" | "settings" | "providers" => Some(SidebarTopicPanel::Config),
+            "reality" | "facts" | "fact-flow" | "matrix" => Some(SidebarTopicPanel::Reality),
             _ => None,
         };
         if let Some(topic) = topic {
@@ -3058,32 +3139,39 @@ impl TuiState {
             return true;
         }
 
-        let Some((tab, label)) = (match name {
-            "context" | "runtime" => Some((TAB_RUNTIME, "Runtime")),
-            "tools" | "toolops" | "tool-ops" => Some((TAB_TOOLS, "Tools")),
-            "changes" => Some((TAB_CHANGES, "Changes")),
-            "tasks" | "goals" => Some((TAB_GOALS, "Goals")),
-            "approvals" | "approve" => Some((TAB_APPROVALS, "Approvals")),
-            "todo" => Some((TAB_TODO, "Todo")),
-            "files" => Some((TAB_FILES, "Files")),
-            "sessions" => Some((TAB_SESSIONS, "Sessions")),
-            "surfaces" | "surface" => Some((TAB_SURFACES, "Surfaces")),
-            "gateway" => Some((TAB_GATEWAY, "Gateway")),
-            _ => None,
-        }) else {
-            return false;
-        };
+        if let Some(panel) = panel_registry::find_by_alias(name) {
+            if let Some(tab) = panel.sidebar_index {
+                self.open_sidebar_tab(tab, panel.label);
+                return true;
+            }
+            self.toast_manager.push(
+                ToastVariant::Info,
+                Some("Workbench".into()),
+                format!(
+                    "{} workbench is being opened through its current surface",
+                    panel.label
+                ),
+                1800,
+            );
+            match panel.id {
+                "config" => self.open_topic_panel(SidebarTopicPanel::Config),
+                "reality" => self.open_topic_panel(SidebarTopicPanel::Reality),
+                _ => {}
+            }
+            return true;
+        }
 
-        self.open_sidebar_tab(tab, label);
-        true
+        false
     }
 
     pub fn open_surface_for_slash_result(&mut self, command_name: &str) {
         match command_name {
-            "status" | "model" | "cost" | "sandbox" | "config" | "doctor" | "context" => {
+            "status" | "model" | "cost" | "sandbox" | "doctor" | "context" => {
                 self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
             }
+            "config" | "providers" => self.open_topic_panel(SidebarTopicPanel::Config),
             "memory" | "closet" => self.open_topic_panel(SidebarTopicPanel::Memory),
+            "reality" | "matrix" | "fact-flow" => self.open_topic_panel(SidebarTopicPanel::Reality),
             "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
             "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
             "tools" | "toolops" | "tool-ops" => self.open_sidebar_tab(TAB_TOOLS, "Tools"),
@@ -3105,7 +3193,7 @@ impl TuiState {
             self.toast_manager.push(
                 ToastVariant::Info,
                 Some("Focus".into()),
-                "Use /focus chat|input|activity|runtime|tools|files|sessions|gateway|diff|memory|skills"
+                "Use /focus chat|input|activity|runtime|tools|files|sessions|gateway|diff|memory|skills|config"
                     .into(),
                 2400,
             );
@@ -3138,20 +3226,28 @@ impl TuiState {
                 self.activity_panel_visible = false;
                 self.set_focus_target(FocusTarget::Sidebar);
             }
-            "runtime" | "status" => self.open_sidebar_tab(TAB_RUNTIME, "Runtime"),
-            "tools" | "toolops" | "tool-ops" => self.open_sidebar_tab(TAB_TOOLS, "Tools"),
-            "changes" => self.open_sidebar_tab(TAB_CHANGES, "Changes"),
-            "tasks" | "goals" => self.open_sidebar_tab(TAB_GOALS, "Goals"),
-            "approvals" | "approve" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
-            "todo" => self.open_sidebar_tab(TAB_TODO, "Todo"),
-            "files" => self.open_sidebar_tab(TAB_FILES, "Files"),
-            "sessions" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
-            "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
-            "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             "diff" => self.open_topic_panel(SidebarTopicPanel::Diff),
             "memory" => self.open_topic_panel(SidebarTopicPanel::Memory),
             "skills" | "skill" => self.open_topic_panel(SidebarTopicPanel::Skills),
-            _ => return false,
+            "config" | "settings" | "providers" => self.open_topic_panel(SidebarTopicPanel::Config),
+            "reality" | "facts" | "fact-flow" | "matrix" => {
+                self.open_topic_panel(SidebarTopicPanel::Reality)
+            }
+            _ => {
+                if let Some(panel) = panel_registry::find_by_alias(target) {
+                    if let Some(tab) = panel.sidebar_index {
+                        self.open_sidebar_tab(tab, panel.label);
+                    } else if panel.id == "config" {
+                        self.open_topic_panel(SidebarTopicPanel::Config);
+                    } else if panel.id == "reality" {
+                        self.open_topic_panel(SidebarTopicPanel::Reality);
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
         }
         true
     }
@@ -3414,7 +3510,7 @@ impl TuiState {
                 }
             }
             Action::ReloadProviders => {
-                self.reload_runtime_provider_projection();
+                self.reload_runtime_provider_registry();
             }
             Action::HistoryBrowse(older) => {
                 let text = if older {
@@ -3893,6 +3989,78 @@ impl TuiState {
         );
         self.app.show_notification(&message);
         true
+    }
+
+    fn refresh_config_panel(&mut self) -> bool {
+        let config = run_gateway_api_blocking(|client| async move { client.config().await });
+        let providers =
+            run_gateway_api_blocking(|client| async move { client.config_providers().await });
+        let effective =
+            run_gateway_api_blocking(
+                |client| async move { client.runtime_effective_config().await },
+            );
+
+        match (config, providers, effective) {
+            (Ok(config), Ok(providers), Ok(effective)) => {
+                self.config_panel.sync_config(config, providers, effective);
+                self.config_panel.set_status("Config projection refreshed");
+                true
+            }
+            (config, providers, effective) => {
+                let mut errors = Vec::new();
+                if let Err(error) = config {
+                    errors.push(format!("config: {error}"));
+                }
+                if let Err(error) = providers {
+                    errors.push(format!("providers: {error}"));
+                }
+                if let Err(error) = effective {
+                    errors.push(format!("effective: {error}"));
+                }
+                self.config_panel
+                    .set_status(format!("Config refresh failed: {}", errors.join("; ")));
+                false
+            }
+        }
+    }
+
+    fn reload_runtime_provider_registry(&mut self) -> bool {
+        let result =
+            run_gateway_api_blocking(
+                |client| async move { client.reload_runtime_providers().await },
+            );
+        self.config_panel
+            .record_action_result("runtime.providers.reload", result);
+        self.refresh_config_panel();
+        self.runtime_activity_panel.sync_from_app(&self.app);
+        true
+    }
+
+    fn handle_config_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('e') => self.refresh_config_panel(),
+            KeyCode::Char('r') => self.reload_runtime_provider_registry(),
+            KeyCode::Enter => {
+                let Some(model) = self.config_panel.selected_model_id() else {
+                    self.config_panel.set_status("No model selected");
+                    return true;
+                };
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.update_config_model(&model).await
+                });
+                self.config_panel
+                    .record_action_result("config.model.update", result);
+                self.refresh_config_panel();
+                true
+            }
+            _ => false,
+        }
     }
 
     // ── Convenience Methods ─────────────────────────────────────
@@ -4540,7 +4708,7 @@ mod tests {
         state.add_message("system", "test");
         state.add_message("assistant", "response");
 
-        assert_eq!(state.timeline_len(), 2);
+        assert_eq!(state.timeline_len(), 1);
         assert!(state.auto_scroll);
 
         // picker methods
@@ -4901,7 +5069,7 @@ mod tests {
         assert_eq!(compact[TAB_FILES], "File");
         assert!(!compact.contains(&"Mem"));
         assert!(!compact.contains(&"Skill"));
-        assert_eq!(full[TAB_RUNTIME], "Run");
+        assert_eq!(full[TAB_RUNTIME], "Runtime");
         assert_eq!(full[TAB_TOOLS], "Tools");
         assert_eq!(full[TAB_APPROVALS], "Approvals");
         assert_eq!(full[TAB_FILES], "Files");
@@ -5481,7 +5649,7 @@ mod tests {
             .expect("loading overlay should render");
         let input_row = lines
             .iter()
-            .position(|line| line.contains("Input (Enter=send"))
+            .position(|line| line.contains("Chat Composer"))
             .expect("input should render");
 
         assert!(
@@ -5566,6 +5734,73 @@ mod tests {
                 "gateway bridge render should contain {expected}, got: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn system_notices_do_not_pollute_main_chat_timeline() {
+        let mut state = TuiState::new("m", "s");
+        state.app.add_message("system", "Gateway connected");
+        state.app.add_message("assistant", "Visible answer");
+
+        let mut terminal = MockTerminal::new(100, 24);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert_eq!(state.timeline_len(), 1);
+        assert!(joined.contains("Visible answer"), "{joined}");
+        assert!(
+            !joined.contains("Gateway connected"),
+            "system control notices must stay out of main chat: {joined}"
+        );
+    }
+
+    #[test]
+    fn config_and_reality_topics_open_dedicated_workbench_panels() {
+        let mut state = TuiState::new("m", "s");
+
+        state.dispatch_action(Action::Execute("/config".into()));
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Config));
+        assert_eq!(
+            state.focus_target,
+            FocusTarget::TopicPanel(SidebarTopicPanel::Config)
+        );
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(joined.contains("Config"), "{joined}");
+
+        state.dispatch_action(Action::Execute("/reality".into()));
+        assert_eq!(state.active_topic_panel, Some(SidebarTopicPanel::Reality));
+        state.app.gateway_reality_core = Some(crate::runtime_control_store::RealityCoreSummary {
+            status: "ready".to_string(),
+            fact_status: "ready".to_string(),
+            memory_status: "available".to_string(),
+            matrix_status: "ready".to_string(),
+            matrix_context_status: "ready".to_string(),
+            growth_status: "ready".to_string(),
+            context_status: "ready".to_string(),
+            audit_status: "ready".to_string(),
+            degraded_reasons: Vec::new(),
+        });
+        state.app.gateway_structured_data =
+            Some(crate::runtime_control_store::StructuredDataSummary {
+                source_count: 2,
+                fact_count: 7,
+                evidence_count: 3,
+                watermark_count: 1,
+                sample_sources: vec!["source://a".into()],
+                sample_facts: vec!["fact://a".into()],
+                sample_evidence: vec!["evidence://a".into()],
+                sample_watermarks: vec!["wm://a".into()],
+            });
+
+        let mut terminal = MockTerminal::new(120, 30);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(joined.contains("Reality Core"), "{joined}");
+        assert!(joined.contains("facts 7"), "{joined}");
+        assert!(joined.contains("Matrix"), "{joined}");
     }
 
     // ── startup_loading ─────────────────────────────────────────
