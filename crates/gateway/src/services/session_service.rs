@@ -431,6 +431,21 @@ impl SessionService {
         }
     }
 
+    pub(crate) async fn copy_stored_messages(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<Option<usize>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .copy_stored_messages(source_session_id, target_session_id)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn append_timeline_event(
         &self,
         session_id: &str,

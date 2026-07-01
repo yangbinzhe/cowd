@@ -236,6 +236,35 @@ impl SessionKernel {
             .map(Some)
     }
 
+    pub(crate) async fn copy_stored_messages(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<Option<usize>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        let total = store.get_message_count(source_session_id).await?;
+        if total == 0 {
+            return Ok(Some(0));
+        }
+        let mut messages = store
+            .get_messages(source_session_id, 0, total)
+            .await?
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, mut message)| {
+                message.session_id = target_session_id.to_string();
+                message.sequence = sequence;
+                message
+            })
+            .collect::<Vec<_>>();
+        let copied = messages.len();
+        store.insert_messages_batch(&messages).await?;
+        messages.clear();
+        Ok(Some(copied))
+    }
+
     pub(crate) async fn stored_events_page(
         &self,
         session_id: &str,

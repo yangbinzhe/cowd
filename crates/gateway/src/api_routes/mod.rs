@@ -1065,6 +1065,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_translate_route_rejects_empty_content_before_model_call() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/local:missing/translate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"content": ""}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "content is required");
+    }
+
+    #[tokio::test]
+    async fn branch_session_copies_stored_messages_into_new_session() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let source_id = "branch-source";
+        let mut source = new_api_session_record(source_id, Some("test-model".into()));
+        source.metadata_json = Some(serde_json::json!({"title": "Source Topic"}).to_string());
+        source.message_count = 2;
+        store.create_session(&source).await.unwrap();
+        store
+            .insert_messages_batch(&[
+                memory::store::session::SessionMessage {
+                    session_id: source_id.to_string(),
+                    sequence: 0,
+                    role: "user".to_string(),
+                    content_json: serde_json::json!([{"type":"text","text":"hello"}]).to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: 10,
+                },
+                memory::store::session::SessionMessage {
+                    session_id: source_id.to_string(),
+                    sequence: 1,
+                    role: "assistant".to_string(),
+                    content_json: serde_json::json!([{"type":"text","text":"world"}]).to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: 11,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let app = api_router(test_state_with_store(store.clone()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{source_id}/branch"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let branch_id = json["id"].as_str().expect("branch id should be returned");
+        let copied = store.get_messages(branch_id, 0, 10).await.unwrap();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].session_id, branch_id);
+        assert_eq!(copied[0].sequence, 0);
+        assert!(copied[0].content_json.contains("hello"));
+        let branch_record = store
+            .get_session(branch_id)
+            .await
+            .unwrap()
+            .expect("branch record should exist");
+        assert_eq!(branch_record.message_count, 2);
+        assert!(branch_record
+            .metadata_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("branch-source"));
+        let source_events = store.get_events(source_id, 0).await.unwrap();
+        assert!(source_events.iter().any(|event| {
+            event.event_type == "SessionBranched"
+                && event.event_json.contains(branch_id)
+                && event.event_json.contains("\"copied_message_count\":2")
+        }));
+        let branch_events = store.get_events(branch_id, 0).await.unwrap();
+        assert!(branch_events.iter().any(|event| {
+            event.event_type == "BranchCreated"
+                && event.event_json.contains(source_id)
+                && event.event_json.contains("\"copied_message_count\":2")
+        }));
+    }
+
+    #[tokio::test]
     async fn harness_eval_routes_create_smoke_run_and_report_latest() {
         let workspace = test_temp_dir("harness-eval-route-workspace");
         let report_dir = test_temp_dir("harness-eval-route-reports");

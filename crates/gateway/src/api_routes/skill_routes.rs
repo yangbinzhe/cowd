@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use provider::{InputMessage, MessageRequest, OutputContentBlock, ProviderClient};
+use serde::Deserialize;
 
 use crate::services::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
@@ -38,6 +40,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/skills/:id/actions/run",
             post(skill_action_run_handler),
         )
+        .route("/api/skills/:id/translate", post(skill_translate_handler))
         .route("/api/skills/:id/files", get(skill_files_handler))
         .route("/api/skills/:id/files/raw", get(skill_file_raw_handler))
         .route("/api/skills/:id", get(skill_get_handler))
@@ -144,6 +147,96 @@ fn skill_action_handler(
         )
         .map(Json)
         .map_err(skill_error)
+}
+
+#[derive(Deserialize)]
+struct SkillTranslateRequest {
+    content: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
+}
+
+async fn skill_translate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillTranslateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let content = request.content.trim();
+    if content.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "content is required".to_string(),
+        ));
+    }
+    state
+        .services
+        .skill
+        .detail(&state.workspace_root, &id)
+        .map_err(skill_error)?;
+
+    let runtime_config = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let model = runtime_config
+        .model()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(crate::DEFAULT_MODEL)
+        .to_string();
+    let client = match runtime_config.providers().resolve_full(&model) {
+        Some(provider) => ProviderClient::from_config(provider),
+        None => ProviderClient::from_model(&model),
+    }
+    .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+
+    let char_limit = 24_000usize;
+    let truncated = content.chars().count() > char_limit;
+    let source = content.chars().take(char_limit).collect::<String>();
+    let locale = request.locale.unwrap_or_else(|| "zh-CN".to_string());
+    let prompt = format!(
+        "请把下面的 Skill Markdown 翻译为 {locale}。\n\
+         要求：保留 Markdown 结构、代码块、YAML front matter、命令和路径；只翻译自然语言说明；不要添加额外解释。\n\n\
+         <skill id=\"{id}\" path=\"{}\">\n{}\n</skill>",
+        request.path.as_deref().unwrap_or("SKILL.md"),
+        source
+    );
+    let response = client
+        .send_message(&MessageRequest {
+            model: model.clone(),
+            max_tokens: 4096,
+            messages: vec![InputMessage::user_text(prompt)],
+            system: Some("你是 Skill 文档翻译器，输出必须是可直接预览的 Markdown。".to_string()),
+            temperature: Some(0.2),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let translated_markdown = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string();
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "skills.translation",
+        "skill_id": id,
+        "path": request.path,
+        "locale": locale,
+        "model": response.model,
+        "translated_markdown": translated_markdown,
+        "truncated": truncated,
+        "usage": response.usage,
+    })))
 }
 
 async fn skill_get_handler(

@@ -563,6 +563,7 @@ async fn branch_session_handler(
     }
 
     let mut info = active_session_info(branch_id.clone());
+    let mut copied_messages = 0usize;
     if state.services.session.has_unified_store() {
         let mut record = new_api_session_record(&branch_id, Some(model));
         record.metadata_json = Some(
@@ -586,6 +587,48 @@ async fn branch_session_handler(
                     }),
                 )
             })?;
+        copied_messages = state
+            .services
+            .session
+            .copy_stored_messages(&id, &branch_id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to copy branch messages: {error}"),
+                    }),
+                )
+            })?
+            .unwrap_or(0);
+        record.message_count = copied_messages as i64;
+        state
+            .services
+            .session
+            .update_stored_session(&record)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to update branch session: {error}"),
+                    }),
+                )
+            })?;
+        let _ = state
+            .services
+            .session
+            .append_timeline_event(
+                &branch_id,
+                "BranchCreated",
+                serde_json::json!({
+                    "source_session_id": id,
+                    "branch_session_id": branch_id,
+                    "copied_message_count": copied_messages,
+                    "status": "created",
+                }),
+            )
+            .await;
         info = session_info_from_record(record);
     }
 
@@ -598,6 +641,7 @@ async fn branch_session_handler(
             serde_json::json!({
                 "source_session_id": id,
                 "branch_session_id": branch_id,
+                "copied_message_count": copied_messages,
                 "status": "created",
             }),
         )
