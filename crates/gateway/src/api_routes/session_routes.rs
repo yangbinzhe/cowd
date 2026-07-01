@@ -23,6 +23,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/search", get(search_messages_handler))
         .route("/api/sessions/:id/ensure", post(ensure_session_handler))
+        .route("/api/sessions/:id/branch", post(branch_session_handler))
         .route("/api/sessions/:id/attach", post(attach_session_handler))
         .route("/api/sessions/:id/detach", post(detach_session_handler))
         .route(
@@ -446,6 +447,161 @@ async fn create_session(
             })?;
         info = session_info_from_record(record);
     }
+
+    Ok((StatusCode::CREATED, Json(info)))
+}
+
+async fn branch_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session id is required".to_string(),
+            }),
+        ));
+    }
+    if !state
+        .services
+        .session
+        .session_exists(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load source session: {error}"),
+                }),
+            )
+        })?
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {id} not found"),
+            }),
+        ));
+    }
+
+    let source_record = state
+        .services
+        .session
+        .stored_session(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load source session: {error}"),
+                }),
+            )
+        })?;
+    let source_title = source_record
+        .as_ref()
+        .and_then(|record| session_title_from_metadata(record.metadata_json.as_deref()))
+        .unwrap_or_else(|| id.chars().take(8).collect::<String>());
+    let model = source_record
+        .as_ref()
+        .and_then(|record| record.model.clone())
+        .unwrap_or_else(|| default_session_model(&state));
+    let branch_id = uuid::Uuid::new_v4().to_string();
+    let session = runtime::Session::new();
+    let runtime = if let Some(store) = state.services.session.unified_store() {
+        crate::runtime_factory::create_runtime_entry_with_session_store(
+            store.clone(),
+            session,
+            &branch_id,
+            model.clone(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    } else {
+        crate::runtime_factory::create_runtime_entry(
+            session,
+            &branch_id,
+            model.clone(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    }
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to build runtime: {error}"),
+            }),
+        )
+    })?;
+
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service not configured".to_string(),
+            }),
+        )
+    })?;
+    if let Err(error) = runtime_service.register_runtime(branch_id.clone(), runtime) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("failed to register branch session: {error}"),
+            }),
+        ));
+    }
+
+    let mut info = active_session_info(branch_id.clone());
+    if state.services.session.has_unified_store() {
+        let mut record = new_api_session_record(&branch_id, Some(model));
+        record.metadata_json = Some(
+            serde_json::json!({
+                "title": format!("{} / branch", source_title),
+                "branched_from": id,
+                "branch_source_title": source_title,
+            })
+            .to_string(),
+        );
+        state
+            .services
+            .session
+            .upsert_stored_session(&record)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to persist branch session: {error}"),
+                    }),
+                )
+            })?;
+        info = session_info_from_record(record);
+    }
+
+    let _ = state
+        .services
+        .session
+        .append_timeline_event(
+            &id,
+            "SessionBranched",
+            serde_json::json!({
+                "source_session_id": id,
+                "branch_session_id": branch_id,
+                "status": "created",
+            }),
+        )
+        .await;
 
     Ok((StatusCode::CREATED, Json(info)))
 }
