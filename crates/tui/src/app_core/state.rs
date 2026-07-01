@@ -59,7 +59,7 @@ use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
 use crate::components::{Component, RenderContext};
-use crate::context_tokens::validate_context_tokens;
+use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
 use crate::error_recovery::{self, RenderResult};
 use crate::event::dispatcher::EventDispatcher;
 use crate::event::{ComponentId as EventComponentId, EventBus, EventPriority};
@@ -1827,8 +1827,8 @@ impl TuiState {
                 self.replace_input_text("");
                 return ProcessedKey::Nothing;
             }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            if let Err(err) = validate_context_tokens(&text, &cwd) {
+            let context_entries = context_entries_from_file_entries(&self.app.file_entries);
+            if let Err(err) = validate_context_tokens_against_entries(&text, &context_entries) {
                 self.toast_manager.push(
                     ToastVariant::Error,
                     Some("Context invalid".into()),
@@ -4253,6 +4253,13 @@ impl std::ops::DerefMut for TuiState {
     }
 }
 
+fn context_entries_from_file_entries(entries: &[crate::FileEntry]) -> Vec<ContextWorkspaceEntry> {
+    entries
+        .iter()
+        .map(|entry| ContextWorkspaceEntry::new(entry.name.clone(), entry.is_dir))
+        .collect()
+}
+
 // ── Startup Phase ──────────────────────────────────────────────
 
 /// Tracks the TUI startup loading overlay state machine.
@@ -4512,7 +4519,6 @@ mod tests {
     use crate::layout::LayoutNode;
     use crate::test_utils::MockTerminal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use serial_test::serial;
     use std::time::Duration;
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -4883,12 +4889,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn process_raw_key_blocks_submit_when_context_file_is_missing() {
-        let original_cwd = std::env::current_dir().unwrap();
-        let dir = unique_temp_dir("cowd-tui-context-missing");
-        std::env::set_current_dir(&dir).unwrap();
-
         let mut state = TuiState::new("m", "s");
         state.replace_input_text("分析 @file:missing.rs");
 
@@ -4896,20 +4897,16 @@ mod tests {
 
         assert!(matches!(result, ProcessedKey::Nothing));
         assert!(!state.toast_manager.is_empty());
-
-        std::env::set_current_dir(original_cwd).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    #[serial]
     fn process_raw_key_allows_submit_when_context_file_is_valid() {
-        let original_cwd = std::env::current_dir().unwrap();
-        let dir = unique_temp_dir("cowd-tui-context-valid");
-        std::fs::write(dir.join("readme.md"), "readme").unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
         let mut state = TuiState::new("m", "s");
+        state.app.file_entries = vec![crate::FileEntry {
+            name: "readme.md".to_string(),
+            is_dir: false,
+            size: 6,
+        }];
         state.replace_input_text("分析 @file:readme.md");
 
         let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -4918,9 +4915,6 @@ mod tests {
             ProcessedKey::Submit(text) => assert_eq!(text, "分析 @file:readme.md"),
             other => panic!("expected submit, got {other:?}"),
         }
-
-        std::env::set_current_dir(original_cwd).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

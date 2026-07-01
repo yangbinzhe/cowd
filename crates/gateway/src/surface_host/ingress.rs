@@ -380,7 +380,7 @@ async fn notify_surface_processing_lifecycle(
 }
 
 fn surface_context_profile(content: &str) -> runtime::ContextProfile {
-    let normalized = content.to_ascii_lowercase();
+    let normalized = surface_intent_text(content).to_ascii_lowercase();
     let deep_markers = [
         "深度",
         "分析",
@@ -411,6 +411,14 @@ fn surface_context_profile(content: &str) -> runtime::ContextProfile {
     } else {
         runtime::ContextProfile::SurfaceQuickReply
     }
+}
+
+fn surface_intent_text(content: &str) -> &str {
+    content
+        .split_once("\n## Attached Resources")
+        .or_else(|| content.split_once("\n## Resource registration failures"))
+        .map(|(intent, _)| intent.trim())
+        .unwrap_or_else(|| content.trim())
 }
 
 fn surface_turn_policy(content: &str) -> SurfaceTurnPolicy {
@@ -1065,6 +1073,17 @@ mod tests {
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
         assert_eq!(policy.max_iterations, SURFACE_MEDIA_MAX_ITERATIONS);
         assert_eq!(policy.timeout, SURFACE_MEDIA_WALL_CLOCK);
+    }
+
+    #[test]
+    fn media_surface_message_uses_deep_budget_when_user_intent_is_deep() {
+        let policy = surface_turn_policy(
+            "请分析这张图片是否有问题\n\n## Attached Resources\n\n### resource://res_test\n- kind: image\n",
+        );
+
+        assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
+        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
+        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]

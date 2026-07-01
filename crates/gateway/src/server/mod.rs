@@ -97,7 +97,15 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
         return Ok(Some(ServerInfo { pid, address }));
     }
 
+    if config_home_overridden() {
+        return Ok(None);
+    }
+
     Ok(discover_default_gateway_listener())
+}
+
+fn config_home_overridden() -> bool {
+    std::env::var_os("COWD_CONFIG_HOME").is_some()
 }
 
 #[cfg(unix)]
@@ -226,6 +234,8 @@ fn extract_pid_from_ss_line(line: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     #[test]
     fn parses_pid_from_ss_listener_line() {
         let line = r#"LISTEN 0 128 127.0.0.1:8642 0.0.0.0:* users:(("cowd",pid=1834062,fd=35))"#;
@@ -247,5 +257,27 @@ mod tests {
         assert!(!super::cmdline_is_gateway_run(
             b"/tmp/cowd\0gateway\0stop\0"
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn config_home_override_disables_default_gateway_discovery() {
+        let original_config_home = std::env::var_os("COWD_CONFIG_HOME");
+        let original_xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let config_home = tempfile::tempdir().unwrap();
+        let xdg_runtime = tempfile::tempdir().unwrap();
+        std::env::set_var("COWD_CONFIG_HOME", config_home.path());
+        std::env::set_var("XDG_RUNTIME_DIR", xdg_runtime.path());
+
+        assert!(super::get_server_status().unwrap().is_none());
+
+        match original_config_home {
+            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
+            None => std::env::remove_var("COWD_CONFIG_HOME"),
+        }
+        match original_xdg_runtime {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 }

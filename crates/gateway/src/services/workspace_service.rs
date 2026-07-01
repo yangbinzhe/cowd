@@ -9,6 +9,18 @@ use sha2::{Digest, Sha256};
 
 use super::{ServiceEnvelope, WorkspaceService};
 
+const WORKSPACE_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+];
+
 #[derive(Serialize)]
 struct WorkspaceFileItem {
     name: String,
@@ -91,26 +103,45 @@ impl WorkspaceService {
         &self,
         workspace_root: &Path,
         dir: Option<&str>,
+        recursive: bool,
+        limit: usize,
     ) -> Result<serde_json::Value, String> {
         let root = workspace_root_canonical(workspace_root)?;
         let dir = resolve_existing_workspace_path(workspace_root, dir)?;
         if !dir.is_dir() {
             return Err("path is not a directory".to_string());
         }
-        let mut files = fs::read_dir(&dir)
-            .map_err(|error| error.to_string())?
-            .flatten()
-            .filter_map(|entry| workspace_file_item(&root, entry.path()))
-            .collect::<Vec<_>>();
+        let limit = limit.clamp(1, 10_000);
+        let mut truncated = false;
+        let mut files = Vec::new();
+        if recursive {
+            collect_workspace_files_recursive(&root, &dir, &mut files, limit, &mut truncated)?;
+        } else {
+            files = fs::read_dir(&dir)
+                .map_err(|error| error.to_string())?
+                .flatten()
+                .filter_map(|entry| workspace_file_item(&root, entry.path()))
+                .take(limit)
+                .collect::<Vec<_>>();
+            truncated = fs::read_dir(&dir)
+                .map_err(|error| error.to_string())?
+                .flatten()
+                .filter_map(|entry| workspace_file_item(&root, entry.path()))
+                .nth(limit)
+                .is_some();
+        }
         files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
-        files.truncate(500);
         Ok(serde_json::json!({
             "workspace_root": workspace_root.display().to_string(),
             "dir": workspace_relative_path(&root, &dir),
+            "recursive": recursive,
+            "limit": limit,
+            "truncated": truncated,
+            "ignored": WORKSPACE_IGNORED_DIRS,
             "files": files,
         }))
     }
@@ -437,6 +468,53 @@ fn workspace_file_item(root: &Path, path: PathBuf) -> Option<WorkspaceFileItem> 
         size: if is_dir { 0 } else { metadata.len() },
         modified_ms,
     })
+}
+
+fn collect_workspace_files_recursive(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<WorkspaceFileItem>,
+    limit: usize,
+    truncated: &mut bool,
+) -> Result<(), String> {
+    if files.len() >= limit {
+        *truncated = true;
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        if files.len() >= limit {
+            *truncated = true;
+            return Ok(());
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() && WORKSPACE_IGNORED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+
+        if let Some(item) = workspace_file_item(root, path.clone()) {
+            files.push(item);
+        }
+        if metadata.is_dir() {
+            collect_workspace_files_recursive(root, &path, files, limit, truncated)?;
+        }
+    }
+    Ok(())
 }
 
 fn append_workspace_dir_to_tar<W: std::io::Write>(

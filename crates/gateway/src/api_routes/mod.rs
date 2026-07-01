@@ -4909,6 +4909,7 @@ mod tests {
         assert_eq!(json["workspace_root"], workspace.display().to_string());
 
         let files_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/workspace/files?dir=src")
@@ -4926,6 +4927,36 @@ mod tests {
         assert_eq!(json["files"][0]["name"], "main.rs");
         assert_eq!(json["files"][0]["path"], "src/main.rs");
         assert_eq!(json["files"][0]["type"], "file");
+
+        std::fs::create_dir_all(workspace.join("src/bin")).unwrap();
+        std::fs::write(workspace.join("src/bin").join("tool.rs"), "fn tool() {}\n").unwrap();
+        std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        std::fs::write(workspace.join("target/debug/ignored.rs"), "ignored").unwrap();
+        let recursive_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/files?recursive=true&limit=100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recursive_response.status(), StatusCode::OK);
+        let body = to_bytes(recursive_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let paths = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+        assert!(paths.contains(&"src/bin/tool.rs"), "{paths:?}");
+        assert!(!paths.iter().any(|path| path.starts_with("target/")));
+        assert_eq!(json["recursive"], true);
+        assert_eq!(json["truncated"], false);
     }
 
     #[tokio::test]

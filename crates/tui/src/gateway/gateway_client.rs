@@ -241,6 +241,23 @@ impl GatewayApiClient {
         self.get_json(&path).await
     }
 
+    pub async fn workspace_files_recursive(
+        &self,
+        dir: Option<&str>,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let mut path = match dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+            Some(dir) => format!("/api/workspace/files?dir={}", url_encode(dir)),
+            None => "/api/workspace/files?".to_string(),
+        };
+        if !path.ends_with('?') && !path.ends_with('&') {
+            path.push('&');
+        }
+        path.push_str("recursive=true&limit=");
+        path.push_str(&limit.to_string());
+        self.get_json(&path).await
+    }
+
     pub async fn create_workspace_file(
         &self,
         path: &str,

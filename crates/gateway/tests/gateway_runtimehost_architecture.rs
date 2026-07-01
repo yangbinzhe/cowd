@@ -1437,7 +1437,8 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
         "runtime host must assemble Gateway RuntimeService instead of executing turns directly"
     );
     assert!(
-        runtime_host.contains("GatewayServices::new(")
+        (runtime_host.contains("GatewayServices::new(")
+            || runtime_host.contains("GatewayServices::new_with_config_home("))
             && runtime_host.contains("Arc::new(RuntimeService::new("),
         "runtime host must register RuntimeService through GatewayServices"
     );

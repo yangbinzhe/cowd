@@ -25,6 +25,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::components::base::{Component, EventResult, RenderContext};
+use crate::context_tokens::ContextWorkspaceEntry;
 
 // ═══════════════════════════════════════════════════════════════════
 // Suggestion types
@@ -163,13 +164,13 @@ impl Default for FrecencyTracker {
 
 /// Engine that produces autocomplete suggestions based on a prefix.
 ///
-/// - If `prefix` starts with `@`: glob directory for matching file paths.
+/// - If `prefix` starts with `@`: match Gateway-projected workspace entries.
 /// - If `prefix` starts with `/`: match against known slash commands.
 /// - Otherwise: match against command history entries.
 #[derive(Debug, Clone)]
 pub struct AutocompleteEngine {
-    /// The current working directory for file-system completions.
-    cwd: std::path::PathBuf,
+    /// Workspace entries projected by Gateway. TUI never scans the local workspace directly.
+    workspace_entries: Vec<ContextWorkspaceEntry>,
     /// Command history for free-text matching.
     history: Vec<String>,
     /// Slash command names supplied by the Gateway command projection.
@@ -183,8 +184,9 @@ pub struct AutocompleteEngine {
 impl AutocompleteEngine {
     /// Create a new autocomplete engine.
     pub fn new(cwd: impl Into<std::path::PathBuf>) -> Self {
+        let _ = cwd.into();
         Self {
-            cwd: cwd.into(),
+            workspace_entries: Vec::new(),
             history: Vec::new(),
             commands: BTreeSet::new(),
             frecency: FrecencyTracker::new(),
@@ -200,6 +202,19 @@ impl AutocompleteEngine {
             .into_iter()
             .map(|command| command.trim_start_matches('/').to_string())
             .collect();
+    }
+
+    pub fn set_workspace_entries<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = ContextWorkspaceEntry>,
+    {
+        self.workspace_entries = entries.into_iter().collect();
+        self.workspace_entries.sort_by(|left, right| {
+            right
+                .is_dir
+                .cmp(&left.is_dir)
+                .then(left.path.cmp(&right.path))
+        });
     }
 
     /// Add a command to the history (for future free-text matching).
@@ -320,8 +335,20 @@ impl AutocompleteEngine {
     }
 
     fn fuzzy_repo_file_suggestions(&self, query: &str) -> Vec<Suggestion> {
-        let mut ranked = Vec::new();
-        collect_repo_file_matches(&self.cwd, &self.cwd, query, 0, &mut ranked);
+        let mut ranked = self
+            .workspace_entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .filter_map(|entry| {
+                let basename = entry
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .filter(|basename| !basename.is_empty())?;
+                let rank = fuzzy_basename_rank(basename, query)?;
+                Some((rank, entry.path.clone()))
+            })
+            .collect::<Vec<_>>();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         ranked
             .into_iter()
@@ -335,43 +362,21 @@ impl AutocompleteEngine {
     }
 
     fn file_suggestions_filtered(&self, prefix: &str, want_dir: Option<bool>) -> Vec<Suggestion> {
-        // Determine the directory and file prefix from the pattern.
-        // e.g., prefix "sr" with cwd "/project" → look in cwd for "sr*"
-        let (search_dir, file_prefix) = resolve_file_search(&self.cwd, prefix);
-
-        let mut results = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&search_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with(&file_prefix) {
-                    let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-                    if let Some(want_dir) = want_dir {
-                        if want_dir != is_dir {
-                            continue;
-                        }
-                    }
-                    // Reconstruct the full suggestion text relative to cwd
-                    let rel_path = if search_dir == self.cwd {
-                        name_str.to_string()
-                    } else {
-                        // Include the directory prefix
-                        let rel_dir = search_dir.strip_prefix(&self.cwd).unwrap_or(&search_dir);
-                        format!("{}/{}", rel_dir.display(), name_str)
-                    };
-
-                    // Add trailing slash for directories
-                    let display = if is_dir {
-                        format!("{}/", rel_path)
-                    } else {
-                        rel_path
-                    };
-
-                    results.push(Suggestion::new(display, SuggestionKind::File));
-                }
-            }
-        }
-        results
+        let prefix = normalize_workspace_prefix(prefix);
+        self.workspace_entries
+            .iter()
+            .filter(|entry| want_dir.is_none_or(|want_dir| want_dir == entry.is_dir))
+            .filter(|entry| workspace_path_matches_prefix(&entry.path, &prefix))
+            .take(self.max_suggestions)
+            .map(|entry| {
+                let display = if entry.is_dir {
+                    format!("{}/", entry.path)
+                } else {
+                    entry.path.clone()
+                };
+                Suggestion::new(display, SuggestionKind::File)
+            })
+            .collect()
     }
 
     fn command_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
@@ -397,73 +402,44 @@ impl AutocompleteEngine {
     }
 }
 
-/// Resolve which directory to search and what file-name prefix to match.
-///
-/// Given a cwd and a user-typed pattern like `sr` or `src/ma`:
-/// - If the pattern contains a `/`, use the part before the last `/` as the
-///   subdirectory and the part after as the filename prefix.
-/// - Otherwise, search in cwd directly.
-fn resolve_file_search(cwd: &std::path::Path, pattern: &str) -> (std::path::PathBuf, String) {
-    if let Some(last_slash) = pattern.rfind('/') {
-        let dir_part = &pattern[..last_slash];
-        let file_part = &pattern[last_slash + 1..];
-        let search_dir = cwd.join(dir_part);
-        (search_dir, file_part.to_string())
-    } else {
-        (cwd.to_path_buf(), pattern.to_string())
-    }
+fn normalize_workspace_prefix(pattern: &str) -> String {
+    pattern
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
 }
 
-fn collect_repo_file_matches(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    query: &str,
-    depth: usize,
-    ranked: &mut Vec<((usize, usize), String)>,
-) {
-    if depth > 8 || ranked.len() > 200 {
-        return;
+fn workspace_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return !path.contains('/');
+    }
+    if prefix.ends_with('/') {
+        return path.starts_with(prefix);
+    }
+    if let Some(last_slash) = prefix.rfind('/') {
+        let parent = &prefix[..=last_slash];
+        let leaf_prefix = &prefix[last_slash + 1..];
+        let Some(rest) = path.strip_prefix(parent) else {
+            return false;
+        };
+        return rest.starts_with(leaf_prefix);
     }
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            ".git" | "target" | "node_modules" | ".venv" | "venv"
-        ) {
-            continue;
-        }
-
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_dir() {
-            collect_repo_file_matches(root, &path, query, depth + 1, ranked);
-            continue;
-        }
-
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let Some(rank) = fuzzy_basename_rank(&name, query) else {
-            continue;
-        };
-
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        ranked.push((rank, rel));
+    if path == prefix {
+        return true;
     }
+    if prefix.len() >= 3 {
+        return path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'));
+    }
+    if !path.contains('/') {
+        return path.starts_with(prefix);
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn fuzzy_basename_rank(name: &str, query: &str) -> Option<(usize, usize)> {
@@ -754,6 +730,13 @@ impl Prompt {
                 names
             });
         self.engine.set_commands(commands);
+    }
+
+    pub fn set_workspace_entries<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = ContextWorkspaceEntry>,
+    {
+        self.engine.set_workspace_entries(entries);
     }
 
     /// Create a prompt with a custom block title.
@@ -1611,6 +1594,28 @@ mod tests {
         prompt
     }
 
+    fn workspace_entries() -> Vec<ContextWorkspaceEntry> {
+        vec![
+            ContextWorkspaceEntry::new("src", true),
+            ContextWorkspaceEntry::new("src/main.rs", false),
+            ContextWorkspaceEntry::new("src/lib.rs", false),
+            ContextWorkspaceEntry::new("src/bin/main.rs", false),
+            ContextWorkspaceEntry::new("src2", true),
+            ContextWorkspaceEntry::new("src2/other.rs", false),
+            ContextWorkspaceEntry::new("tests", true),
+            ContextWorkspaceEntry::new("tests/test_main.rs", false),
+            ContextWorkspaceEntry::new("readme.md", false),
+            ContextWorkspaceEntry::new(".env", false),
+            ContextWorkspaceEntry::new("Cargo.toml", false),
+        ]
+    }
+
+    fn engine_with_workspace_entries() -> AutocompleteEngine {
+        let mut engine = AutocompleteEngine::new("/tmp");
+        engine.set_workspace_entries(workspace_entries());
+        engine
+    }
+
     #[test]
     fn autocomplete_command_prefix() {
         let mut engine = engine_with_test_commands();
@@ -1704,45 +1709,27 @@ mod tests {
 
     #[test]
     fn autocomplete_file_prefix() {
-        // Create a temp directory with some files
-        let dir = std::env::temp_dir().join("cowd_prompt_test_files");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src").join("main.rs"), "// main").unwrap();
-        std::fs::write(dir.join("src").join("lib.rs"), "// lib").unwrap();
-        std::fs::create_dir_all(dir.join("tests")).unwrap();
-        std::fs::write(dir.join("tests").join("test_main.rs"), "// test").unwrap();
+        let mut engine = engine_with_workspace_entries();
 
-        let mut engine = AutocompleteEngine::new(dir.clone());
-
-        // Test: @src → should find src/main.rs, src/lib.rs
         let suggestions = engine.suggest("@src");
-        // The cwd is "dir", so @src should match "src" as a directory
-        // But actually @src matches the prefix "src" — the @ is stripped,
-        // so it looks for files starting with "src" in cwd.
-        // That would match "src/" directory itself since read_dir returns "src"
         let found = suggestions.iter().any(|s| s.text.starts_with("src"));
+        let has_src2 = suggestions.iter().any(|s| s.text.starts_with("src2"));
         assert!(
             found,
             "should find files starting with 'src', got: {:?}",
             suggestions.iter().map(|s| &s.text).collect::<Vec<_>>()
         );
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !has_src2,
+            "path segment completion for 'src' must not include src2: {:?}",
+            suggestions.iter().map(|s| &s.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn autocomplete_file_subdirectory() {
-        let dir = std::env::temp_dir().join("cowd_prompt_test_subdir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src").join("main.rs"), "// main").unwrap();
-        std::fs::write(dir.join("src").join("lib.rs"), "// lib").unwrap();
+        let mut engine = engine_with_workspace_entries();
 
-        let mut engine = AutocompleteEngine::new(dir.clone());
-
-        // @src/ma → should match src/main.rs
         let suggestions = engine.suggest("@src/ma");
         let has_main = suggestions.iter().any(|s| s.text.contains("main.rs"));
         assert!(
@@ -1750,8 +1737,6 @@ mod tests {
             "@src/ma should find src/main.rs, got: {:?}",
             suggestions.iter().map(|s| &s.text).collect::<Vec<_>>()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1769,13 +1754,7 @@ mod tests {
 
     #[test]
     fn autocomplete_at_file_only_yields_files() {
-        let dir = std::env::temp_dir().join("cowd_prompt_test_at_file");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("readme.md"), "readme").unwrap();
-        std::fs::write(dir.join(".env"), "secret").unwrap();
-
-        let mut engine = AutocompleteEngine::new(dir.clone());
+        let mut engine = engine_with_workspace_entries();
         let suggestions = engine.suggest("@file:");
         let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
 
@@ -1785,68 +1764,25 @@ mod tests {
             !texts.iter().any(|text| text.starts_with("@file:src/")),
             "{texts:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn autocomplete_at_folder_only_yields_directories() {
-        let dir = std::env::temp_dir().join("cowd_prompt_test_at_folder");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("readme.md"), "readme").unwrap();
-
-        let mut engine = AutocompleteEngine::new(dir.clone());
+        let mut engine = engine_with_workspace_entries();
         let suggestions = engine.suggest("@folder:");
         let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
 
         assert!(texts.contains(&"@folder:src/"), "{texts:?}");
         assert!(!texts.contains(&"@folder:readme.md"), "{texts:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn autocomplete_at_file_fuzzy_finds_nested_basename() {
-        let dir = std::env::temp_dir().join("cowd_prompt_test_at_file_fuzzy");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
-        std::fs::write(dir.join("src/bin").join("main.rs"), "fn main() {}").unwrap();
-        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
-
-        let mut engine = AutocompleteEngine::new(dir.clone());
+        let mut engine = engine_with_workspace_entries();
         let suggestions = engine.suggest("@file:mai");
         let texts: Vec<&str> = suggestions.iter().map(|s| s.text.as_str()).collect();
 
         assert!(texts.contains(&"@file:src/bin/main.rs"), "{texts:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ── resolve_file_search tests ──────────────────────────────────
-
-    #[test]
-    fn resolve_file_search_flat() {
-        let cwd = std::path::Path::new("/project");
-        let (dir, prefix) = resolve_file_search(cwd, "src");
-        assert_eq!(dir, std::path::Path::new("/project"));
-        assert_eq!(prefix, "src");
-    }
-
-    #[test]
-    fn resolve_file_search_nested() {
-        let cwd = std::path::Path::new("/project");
-        let (dir, prefix) = resolve_file_search(cwd, "src/main");
-        assert_eq!(dir, std::path::Path::new("/project/src"));
-        assert_eq!(prefix, "main");
-    }
-
-    #[test]
-    fn resolve_file_search_deeply_nested() {
-        let cwd = std::path::Path::new("/project");
-        let (dir, prefix) = resolve_file_search(cwd, "a/b/c/fi");
-        assert_eq!(dir, std::path::Path::new("/project/a/b/c"));
-        assert_eq!(prefix, "fi");
     }
 
     // ── CompletionKernel tests ────────────────────────────────────

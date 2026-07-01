@@ -558,7 +558,7 @@ impl StorageLockDiagnostics {
     pub fn for_handle(handle: &StorageHandle, busy_timeout_ms: u64) -> Self {
         let path = handle.path.clone();
         let (status, locked_or_busy, last_error, suggested_action) =
-            diagnose_sqlite_path(&path, &handle.backend);
+            diagnose_sqlite_path(&path, &handle.backend, busy_timeout_ms);
         Self {
             domain: handle.domain.clone(),
             backend: handle.backend.clone(),
@@ -594,6 +594,7 @@ impl StorageLockDiagnostics {
 fn diagnose_sqlite_path(
     path: &Path,
     backend: &StorageBackendKind,
+    busy_timeout_ms: u64,
 ) -> (String, bool, Option<String>, Option<String>) {
     if !matches!(backend, StorageBackendKind::Sqlite) {
         return ("not_sqlite".to_string(), false, None, None);
@@ -607,23 +608,53 @@ fn diagnose_sqlite_path(
         );
     }
     match rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(connection) => match connection
-            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
-        {
-            Ok(value) if value.eq_ignore_ascii_case("ok") => ("ok".to_string(), false, None, None),
-            Ok(value) => (
-                "degraded".to_string(),
-                false,
-                Some(format!("quick_check={value}")),
-                Some("inspect sqlite integrity before writes".to_string()),
-            ),
-            Err(error) => (
-                "error".to_string(),
-                is_busy_or_locked(&StorageError::from(error)),
-                Some("quick_check failed".to_string()),
-                Some("retry after active writer completes or inspect stale locks".to_string()),
-            ),
-        },
+        Ok(connection) => {
+            let _ = connection.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
+            if let Err(error) = sqlite_read_probe(&connection) {
+                let message = error.to_string();
+                return (
+                    "error".to_string(),
+                    is_busy_or_locked(&message),
+                    Some(format!("read_probe failed: {message}")),
+                    Some("retry after active writer completes or inspect stale locks".to_string()),
+                );
+            }
+
+            match connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)) {
+                Ok(value) if value.eq_ignore_ascii_case("ok") => {
+                    ("ok".to_string(), false, None, None)
+                }
+                Ok(value)
+                    if is_readonly_fts_quick_check_limitation(&value)
+                        && sqlite_has_fts_tables(&connection) =>
+                {
+                    readonly_fts_quick_check_skipped()
+                }
+                Ok(value) => (
+                    "degraded".to_string(),
+                    false,
+                    Some(format!("quick_check={value}")),
+                    Some("inspect sqlite integrity before writes".to_string()),
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    if is_readonly_fts_quick_check_limitation(&message)
+                        && sqlite_has_fts_tables(&connection)
+                    {
+                        return readonly_fts_quick_check_skipped();
+                    }
+                    (
+                        "error".to_string(),
+                        is_busy_or_locked(&message),
+                        Some(format!("quick_check failed: {message}")),
+                        Some(
+                            "retry after active writer completes or inspect stale locks"
+                                .to_string(),
+                        ),
+                    )
+                }
+            }
+        }
         Err(error) => (
             "error".to_string(),
             is_busy_or_locked(&error),
@@ -631,6 +662,48 @@ fn diagnose_sqlite_path(
             Some("check file permissions and active sqlite writers".to_string()),
         ),
     }
+}
+
+fn readonly_fts_quick_check_skipped() -> (String, bool, Option<String>, Option<String>) {
+    (
+        "ok".to_string(),
+        false,
+        Some("quick_check_skipped_for_readonly_fts".to_string()),
+        Some(
+            "sqlite FTS quick_check requires write access on this database; read probe passed"
+                .to_string(),
+        ),
+    )
+}
+
+fn is_readonly_fts_quick_check_limitation(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("attempt to write a readonly database")
+        || (message.contains("unable to validate the inverted index")
+            && message.contains("readonly database"))
+}
+
+fn sqlite_read_probe(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |_row| Ok(()))?;
+    connection.query_row("PRAGMA database_list", [], |_row| Ok(()))?;
+    Ok(())
+}
+
+fn sqlite_has_fts_tables(connection: &rusqlite::Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND lower(COALESCE(sql, '')) LIKE '%virtual table%'
+                  AND lower(COALESCE(sql, '')) LIKE '%using fts%'
+            )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .unwrap_or(false)
 }
 
 fn is_busy_or_locked(error: &impl std::fmt::Display) -> bool {
@@ -835,6 +908,46 @@ mod tests {
         assert_eq!(diagnostics.status, "ok");
         assert!(!diagnostics.locked_or_busy);
         assert_eq!(diagnostics.busy_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn lock_diagnostics_do_not_mark_readable_fts_database_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE code_symbols_fts USING fts5(symbol, body);
+                     INSERT INTO code_symbols_fts(symbol, body) VALUES ('main', 'fn main() {}');",
+                )
+                .unwrap();
+        }
+
+        let handle = StorageHandle {
+            domain: "memory".to_string(),
+            backend: StorageBackendKind::Sqlite,
+            path,
+            owner: "memory".to_string(),
+            migration: "test".to_string(),
+        };
+        let diagnostics = StorageLockDiagnostics::for_handle(&handle, 5_000);
+
+        assert_eq!(diagnostics.status, "ok");
+        assert!(!diagnostics.locked_or_busy);
+    }
+
+    #[test]
+    fn readonly_fts_quick_check_message_is_classified_as_limitation() {
+        assert!(is_readonly_fts_quick_check_limitation(
+            "quick_check=unable to validate the inverted index for FTS5 table main.sessions_fts: attempt to write a readonly database"
+        ));
+        assert!(is_readonly_fts_quick_check_limitation(
+            "unable to validate the inverted index for FTS5 table main.sessions_fts: readonly database"
+        ));
+        assert!(!is_readonly_fts_quick_check_limitation(
+            "database disk image is malformed"
+        ));
     }
 
     #[test]

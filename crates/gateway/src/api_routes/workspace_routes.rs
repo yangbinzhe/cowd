@@ -44,6 +44,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 struct WorkspaceFilesParams {
     #[serde(default)]
     dir: Option<String>,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +115,12 @@ async fn workspace_files_handler(
     state
         .services
         .workspace
-        .list_files(&state.workspace_root, params.dir.as_deref())
+        .list_files(
+            &state.workspace_root,
+            params.dir.as_deref(),
+            params.recursive,
+            params.limit.unwrap_or(500),
+        )
         .map(Json)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
 }

@@ -12,6 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{PendingResource, SystemNoticeKind};
+use crate::context_tokens::ContextWorkspaceEntry;
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
@@ -116,6 +117,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     }
     match list_workspace_files(&gateway_client) {
         Ok(files) => {
+            state.prompt.set_workspace_entries(
+                files
+                    .iter()
+                    .map(|entry| ContextWorkspaceEntry::new(entry.name.clone(), entry.is_dir)),
+            );
             state.app.file_entries = files;
         }
         Err(error) => {
@@ -656,8 +662,27 @@ fn drain_cowd_events_state(rx: &crate::CowdEventReceiver, state: &mut TuiState) 
 
 fn list_workspace_files(gateway_client: &GatewayApiClient) -> Result<Vec<FileEntry>, String> {
     let projection = shared_rt()
-        .block_on(gateway_client.workspace_files(None))
+        .block_on(gateway_client.workspace_files_recursive(None, 5_000))
         .map_err(|error| error.to_string())?;
+    parse_workspace_files_projection(&projection)
+}
+
+fn parse_workspace_files_projection(
+    projection: &serde_json::Value,
+) -> Result<Vec<FileEntry>, String> {
+    if projection
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let limit = projection
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(5_000);
+        return Err(format!(
+            "Gateway workspace projection truncated at {limit} entries; file context disabled until projection limit or workspace scope is adjusted"
+        ));
+    }
     let Some(items) = projection
         .get("files")
         .or_else(|| projection.get("entries"))
@@ -685,7 +710,7 @@ fn workspace_file_entry_from_json(item: &serde_json::Value) -> Option<FileEntry>
         .or_else(|| item.get("name"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty() && !name.starts_with('.'))?
+        .filter(|name| !name.is_empty())?
         .to_string();
     let is_dir = item
         .get("is_dir")
@@ -781,5 +806,40 @@ mod tests {
         );
         assert!(attach_path_from_command("/status").is_none());
         assert!(attach_path_from_command("/attachment").is_none());
+    }
+
+    #[test]
+    fn workspace_projection_keeps_hidden_files_from_gateway() {
+        let projection = serde_json::json!({
+            "truncated": false,
+            "files": [
+                {"path": ".env", "is_dir": false, "size": 12},
+                {"path": "src", "is_dir": true, "size": 0}
+            ]
+        });
+
+        let files = parse_workspace_files_projection(&projection).unwrap();
+
+        assert!(files.iter().any(|entry| entry.name == ".env"));
+        assert!(files
+            .iter()
+            .any(|entry| entry.name == "src" && entry.is_dir));
+    }
+
+    #[test]
+    fn workspace_projection_rejects_truncated_facts() {
+        let projection = serde_json::json!({
+            "truncated": true,
+            "limit": 2,
+            "files": [
+                {"path": "a.rs", "is_dir": false, "size": 1},
+                {"path": "b.rs", "is_dir": false, "size": 1}
+            ]
+        });
+
+        let err = parse_workspace_files_projection(&projection).unwrap_err();
+
+        assert!(err.contains("truncated at 2 entries"), "{err}");
+        assert!(err.contains("file context disabled"), "{err}");
     }
 }
