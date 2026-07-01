@@ -52,6 +52,9 @@ impl KnowledgeActivationRuntime {
     ) -> Option<RuntimeKnowledgeActivation> {
         let packet = filter_packet_for_turn_intent(packet, intent);
         for item in &packet.selected {
+            if is_runtime_memory_noise_item(item) {
+                continue;
+            }
             let Some(document) = document_from_memory_item(item) else {
                 continue;
             };
@@ -519,6 +522,9 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<DocumentContent> {
+    if is_runtime_memory_noise_item(item) {
+        return None;
+    }
     let atom = &item.atom;
     let category_is_knowledge = matches!(
         atom.layer,
@@ -546,6 +552,35 @@ fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<Document
         modified_at: None,
         language: None,
     })
+}
+
+fn is_runtime_memory_noise_item(item: &memory::MemoryPacketItem) -> bool {
+    let text = normalize_turn_text(&format!(
+        "{} {} {}",
+        item.atom.title, item.content_preview, item.reason
+    ));
+    contains_any(
+        &text,
+        &[
+            "user preference:",
+            "session critical context checkpoint",
+            "session pending work checkpoint",
+            "session preferences checkpoint",
+            "session tool evidence checkpoint",
+            "frequent tool usage:",
+            "usage_feedback:selected_count",
+            "active memory lacks explicit orientation evidence",
+        ],
+    ) || contains_any(
+        &text,
+        &[
+            "用户偏好:",
+            "用户偏好：",
+            "会话 checkpoint",
+            "会话检查点",
+            "工具使用频率",
+        ],
+    )
 }
 
 fn governance_from_memory_item(item: &memory::MemoryPacketItem) -> KnowledgeGovernanceLevel {
@@ -679,6 +714,25 @@ mod tests {
 
         assert!(KnowledgeActivationRuntime::new()
             .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
+            .is_none());
+    }
+
+    #[test]
+    fn runtime_knowledge_activation_ignores_user_preference_noise() {
+        let packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "User preference: 不要无限展开读取上下文",
+                MemoryLayer::L3,
+                MemoryPacketRole::Warning,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 96,
+            truncated: false,
+            recall_report: RecallReport::default(),
+        };
+
+        assert!(KnowledgeActivationRuntime::new()
+            .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
             .is_none());
     }
 

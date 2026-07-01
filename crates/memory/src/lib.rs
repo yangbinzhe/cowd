@@ -168,9 +168,9 @@ pub use hot_reload::{
     SharedConfigReloader,
 };
 pub use kernel::reality_recall::{
-    rank_candidates, CompactNavigationPointer, RecallCandidate, RecallCandidateEvidence,
-    RecallCandidateScores, RecallFence, RecallOmission, RecallReport, RecallRequest, RecallSource,
-    RecallSourceResult, RecallSourceStatus,
+    rank_and_deduplicate_candidates, rank_candidates, CompactNavigationPointer, RecallCandidate,
+    RecallCandidateEvidence, RecallCandidateScores, RecallFence, RecallOmission, RecallReport,
+    RecallRequest, RecallSource, RecallSourceResult, RecallSourceStatus,
 };
 pub use kernel::{
     MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation, MemoryHealth,

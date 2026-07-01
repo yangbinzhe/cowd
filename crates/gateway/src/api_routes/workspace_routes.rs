@@ -24,6 +24,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/workspace/dirs", post(create_workspace_dir_handler))
         .route("/api/workspace/meta", get(workspace_meta_handler))
         .route("/api/workspace/rename", post(rename_workspace_path_handler))
+        .route(
+            "/api/workspace/download",
+            get(download_workspace_path_handler),
+        )
         .route("/api/upload", post(upload_workspace_file_handler))
         .route("/api/file/raw", get(raw_workspace_file_handler))
         .route(
@@ -266,6 +270,40 @@ async fn raw_workspace_file_handler(
         [(header::CONTENT_TYPE, "application/octet-stream")],
         bytes,
     ))
+}
+
+async fn download_workspace_path_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<PathParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let download = state
+        .services
+        .workspace
+        .download_path(&state.workspace_root, &params.path)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, download.content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}\"",
+                    sanitize_download_name(&download.file_name)
+                ),
+            ),
+        ],
+        download.bytes,
+    ))
+}
+
+fn sanitize_download_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '/' | '\0' => '_',
+            _ => ch,
+        })
+        .collect()
 }
 
 async fn list_session_attachments_handler(

@@ -4990,6 +4990,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_download_returns_files_and_directory_tar() {
+        let workspace = test_temp_dir("workspace-download");
+        let config_home = test_temp_dir("workspace-download-config");
+        std::fs::create_dir_all(workspace.join("docs/nested")).unwrap();
+        std::fs::write(workspace.join("docs/readme.md"), "# readme").unwrap();
+        std::fs::write(workspace.join("docs/nested/a.txt"), "nested").unwrap();
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let file_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/download?path=docs%2Freadme.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_response.status(), StatusCode::OK);
+        assert_eq!(
+            file_response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"readme.md\""
+        );
+        let body = to_bytes(file_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"# readme");
+
+        let dir_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/download?path=docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dir_response.status(), StatusCode::OK);
+        assert_eq!(
+            dir_response.headers()[header::CONTENT_TYPE],
+            "application/x-tar"
+        );
+        let body = to_bytes(dir_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(body));
+        let names = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "docs/readme.md"));
+        assert!(names.iter().any(|name| name == "docs/nested/a.txt"));
+    }
+
+    #[tokio::test]
     async fn workspace_upload_meta_delete_and_attachments_are_real() {
         let workspace = test_temp_dir("workspace-upload");
         let config_home = test_temp_dir("workspace-config");

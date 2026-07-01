@@ -38,6 +38,10 @@ use reality_recall::{RecallCandidate, RecallOmission, RecallReport, RecallSource
 /// Result alias for the MemoryKernel boundary.
 pub type MemoryKernelResult<T> = std::result::Result<T, MemoryKernelError>;
 
+const MEMORY_STALE_WARNING_THRESHOLD: f32 = 0.85;
+const MEMORY_STALE_RANK_PENALTY: i32 = 45;
+const MEMORY_AGING_RANK_PENALTY: i32 = 18;
+
 /// Errors at the kernel boundary.
 ///
 /// Foreground prepare/post-turn paths should usually degrade instead of
@@ -121,7 +125,7 @@ impl MemoryAtomView {
     pub fn from_entry(entry: &MemoryEntry, information_state: MemoryInformationState) -> Self {
         let explicit_authority = matches!(entry.layer, MemoryLayer::L0)
             || matches!(entry.source, crate::types::MemorySource::UserExplicit);
-        let state = if entry.staleness >= 1.0 {
+        let state = if entry.staleness >= MEMORY_STALE_WARNING_THRESHOLD {
             MemoryState::Stale
         } else if entry.confidence < 0.35 {
             MemoryState::Conflicted
@@ -460,6 +464,25 @@ impl MemoryKernel {
             .as_ref()
             .map(|(_, decision)| decision.action)
             .unwrap_or(MemoryAuthorityAction::SupersedeExisting);
+        if matches!(authority_action, MemoryAuthorityAction::Duplicate) {
+            if let Some((existing_id, decision)) = authority_match {
+                self.record_lifecycle_event(
+                    ctx,
+                    existing_id,
+                    self.latest_state(existing_id).await.unwrap_or(None),
+                    MemoryState::Observed,
+                    format!("duplicate write skipped: {}", decision.reason),
+                )
+                .await;
+            }
+            tracing::debug!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                memory_id = %memory_id,
+                "memory kernel skipped duplicate write"
+            );
+            return Ok(());
+        }
         if let Err(error) = self.manager.remember(entry).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
@@ -769,6 +792,10 @@ impl MemoryKernel {
                 degraded_reason: Some(format!("vector recall unavailable: {error}")),
             }),
         }
+        let (deduplicated_entries, mut duplicate_omissions) =
+            deduplicate_memory_entries_for_recall(prepared.entries);
+        prepared.entries = deduplicated_entries;
+        checkpoint_omissions.append(&mut duplicate_omissions);
         let aaak_index = crate::aaak_index::AaakIndex::from_entries(
             &prepared.entries,
             (max_tokens / 8).clamp(128, 2_048),
@@ -1657,7 +1684,95 @@ fn memory_entry_selection_rank_with_usage(
         3..=5 => 4,
         _ => 6,
     };
-    base + boost
+    let stale_penalty = if entry.staleness >= MEMORY_STALE_WARNING_THRESHOLD {
+        MEMORY_STALE_RANK_PENALTY
+    } else if entry.staleness >= 0.65 {
+        MEMORY_AGING_RANK_PENALTY
+    } else {
+        0
+    };
+    base + boost - stale_penalty
+}
+
+fn deduplicate_memory_entries_for_recall(
+    entries: Vec<MemoryEntry>,
+) -> (Vec<MemoryEntry>, Vec<OmittedMemory>) {
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut deduplicated: Vec<MemoryEntry> = Vec::with_capacity(entries.len());
+    let mut omitted = Vec::new();
+
+    for entry in entries {
+        let key = memory_entry_dedup_key(&entry);
+        let Some(existing_index) = by_key.get(&key).copied() else {
+            by_key.insert(key, deduplicated.len());
+            deduplicated.push(entry);
+            continue;
+        };
+
+        if memory_entry_is_better_recall_representative(&entry, &deduplicated[existing_index]) {
+            let previous = std::mem::replace(&mut deduplicated[existing_index], entry);
+            omitted.push(OmittedMemory {
+                id: previous.id,
+                title: previous.title,
+                reason: format!(
+                    "duplicate recall candidate merged into {}",
+                    deduplicated[existing_index].id
+                ),
+            });
+        } else {
+            omitted.push(OmittedMemory {
+                id: entry.id,
+                title: entry.title,
+                reason: format!(
+                    "duplicate recall candidate merged into {}",
+                    deduplicated[existing_index].id
+                ),
+            });
+        }
+    }
+
+    (deduplicated, omitted)
+}
+
+fn memory_entry_is_better_recall_representative(
+    candidate: &MemoryEntry,
+    current: &MemoryEntry,
+) -> bool {
+    let candidate_rank = memory_entry_selection_rank(candidate);
+    let current_rank = memory_entry_selection_rank(current);
+    candidate_rank
+        .cmp(&current_rank)
+        .then_with(|| {
+            current
+                .staleness
+                .partial_cmp(&candidate.staleness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            candidate
+                .confidence
+                .partial_cmp(&current.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| candidate.updated_at.cmp(&current.updated_at))
+        .is_gt()
+}
+
+fn memory_entry_dedup_key(entry: &MemoryEntry) -> String {
+    let title = normalize_memory_dedup_text(&entry.title);
+    let content = normalize_memory_dedup_text(&entry.content);
+    if title.len().saturating_add(content.len()) < 12 {
+        return entry.id.to_string();
+    }
+    format!("{title}\n{content}")
+}
+
+fn normalize_memory_dedup_text(text: &str) -> String {
+    text.to_lowercase()
+        .replace('…', "...")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn layer_budget_cap(budget: &crate::config::BudgetConfig, layer: MemoryLayer) -> Option<u64> {
@@ -1698,7 +1813,7 @@ fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) 
         .count() as f32;
     let stale = entries
         .iter()
-        .filter(|entry| entry.staleness >= 1.0)
+        .filter(|entry| entry.staleness >= MEMORY_STALE_WARNING_THRESHOLD)
         .count() as f32;
     let evidence_backed = entries
         .iter()
@@ -1727,5 +1842,87 @@ fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) 
         link_coverage: (linked / total).clamp(0.0, 1.0),
         background_lag_ms,
         degraded: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+
+    use super::*;
+    use crate::types::{AgentVisibility, MemoryCategory};
+
+    fn memory_entry(
+        title: &str,
+        content: &str,
+        staleness: f32,
+        confidence: f32,
+        updated_offset_secs: i64,
+    ) -> MemoryEntry {
+        let now = Utc::now();
+        MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Reference,
+            priority: Priority::High,
+            source: MemorySource::AutoExtracted,
+            title: title.to_string(),
+            content: content.to_string(),
+            embedding: None,
+            tags: vec!["knowledge".to_string()],
+            relations: Vec::new(),
+            confidence,
+            access_count: 0,
+            staleness,
+            created_at: now - Duration::days(1),
+            updated_at: now + Duration::seconds(updated_offset_secs),
+            last_accessed_at: None,
+            scope: MemoryScope::Project("cowd".to_string()),
+            session_id: Some("s1".to_string()),
+            source_agent: Some("kernel-test".to_string()),
+            visibility: AgentVisibility::Shared,
+        }
+    }
+
+    #[test]
+    fn stale_memory_becomes_warning_at_threshold() {
+        let entry = memory_entry("Old decision", "Use the previous API", 0.86, 1.0, 0);
+
+        let atom = MemoryAtomView::from_entry(&entry, MemoryInformationState::Orientation);
+        let (role, reason) = packet_role_and_reason(&atom);
+
+        assert_eq!(atom.state, MemoryState::Stale);
+        assert_eq!(role, MemoryPacketRole::Warning);
+        assert!(reason.contains("stale"));
+        assert!(
+            memory_entry_selection_rank_with_usage(&entry, None)
+                < memory_entry_selection_rank(&entry)
+        );
+    }
+
+    #[test]
+    fn deduplicate_memory_entries_for_recall_keeps_fresher_candidate() {
+        let stale = memory_entry(
+            "Runtime rule",
+            "Do not expand context endlessly",
+            0.91,
+            0.95,
+            -30,
+        );
+        let fresh = memory_entry(
+            "Runtime rule",
+            "Do not expand context endlessly",
+            0.05,
+            0.90,
+            30,
+        );
+        let fresh_id = fresh.id;
+
+        let (deduplicated, omitted) = deduplicate_memory_entries_for_recall(vec![stale, fresh]);
+
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].id, fresh_id);
+        assert_eq!(omitted.len(), 1);
+        assert!(omitted[0].reason.contains("duplicate recall candidate"));
     }
 }

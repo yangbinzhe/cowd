@@ -57,6 +57,7 @@ use crate::{
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
     state_rebuilder::StateRebuilder,
+    store::sqlite::SqliteStore,
     store::vector::VectorIndex,
     store::{FtsSearchOptions, FtsSearchResult},
     tool_sandbox::ToolOutputSandbox,
@@ -258,8 +259,9 @@ impl CognitiveContextManager {
         // falling back to the store default only when the index is empty.
         let dimension = config.store.vector.dimension as u32;
         let persist_path = config.store.blob_dir.join("vector_index.json");
+        let vector_sqlite_store = SqliteStore::open(&config.store).ok();
         let vector_index = Mutex::new(
-            VectorIndex::load(persist_path, dimension)
+            VectorIndex::load_with_store(persist_path, dimension, vector_sqlite_store)
                 .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?,
         );
 
@@ -1763,7 +1765,7 @@ impl CognitiveContextManager {
                 }
 
                 for entry in &heuristic_entries {
-                    if entry.confidence > 0.7 {
+                    if should_auto_share_heuristic_memory(entry) {
                         let _ = self
                             .orchestrator
                             .team_remember(
@@ -3352,6 +3354,29 @@ impl CognitiveContextManager {
         self.perf_monitor
             .report(&tuning_config, tuning_applied, last_tuning)
     }
+}
+
+fn should_auto_share_heuristic_memory(entry: &MemoryEntry) -> bool {
+    if entry.confidence <= 0.7 {
+        return false;
+    }
+    if matches!(
+        entry.category,
+        MemoryCategory::UserPreference | MemoryCategory::CompressedSummary
+    ) {
+        return false;
+    }
+    if entry
+        .tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "preference" | "user" | "tool" | "pattern"))
+    {
+        return false;
+    }
+    matches!(
+        entry.category,
+        MemoryCategory::Decision | MemoryCategory::Reference | MemoryCategory::ProjectKnowledge
+    )
 }
 
 // ---------------------------------------------------------------------------

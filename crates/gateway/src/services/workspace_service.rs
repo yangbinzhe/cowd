@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Cursor,
     path::{Component, Path, PathBuf},
 };
 
@@ -28,6 +29,12 @@ pub(crate) struct SessionAttachment {
     pub(crate) size: u64,
     pub(crate) sha256: String,
     pub(crate) added_at_ms: i64,
+}
+
+pub(crate) struct WorkspaceDownload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) file_name: String,
+    pub(crate) content_type: &'static str,
 }
 
 impl WorkspaceService {
@@ -235,6 +242,46 @@ impl WorkspaceService {
         fs::read(&file).map_err(|error| error.to_string())
     }
 
+    pub(crate) fn download_path(
+        &self,
+        workspace_root: &Path,
+        path: &str,
+    ) -> Result<WorkspaceDownload, String> {
+        let root = workspace_root_canonical(workspace_root)?;
+        let target = resolve_existing_workspace_path(workspace_root, Some(path))?;
+        if target.is_file() {
+            let bytes = fs::read(&target).map_err(|error| error.to_string())?;
+            return Ok(WorkspaceDownload {
+                bytes,
+                file_name: target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("download.bin")
+                    .to_string(),
+                content_type: "application/octet-stream",
+            });
+        }
+        if !target.is_dir() {
+            return Err("path is not downloadable".to_string());
+        }
+        let archive_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_workspace_dir_to_tar(&mut builder, &root, &target, Path::new(&archive_name))?;
+            builder.finish().map_err(|error| error.to_string())?;
+        }
+        Ok(WorkspaceDownload {
+            bytes,
+            file_name: format!("{archive_name}.tar"),
+            content_type: "application/x-tar",
+        })
+    }
+
     pub(crate) fn list_attachments(
         &self,
         config_home: &Path,
@@ -390,6 +437,48 @@ fn workspace_file_item(root: &Path, path: PathBuf) -> Option<WorkspaceFileItem> 
         size: if is_dir { 0 } else { metadata.len() },
         modified_ms,
     })
+}
+
+fn append_workspace_dir_to_tar<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    source: &Path,
+    archive_path: &Path,
+) -> Result<(), String> {
+    if !source.starts_with(root) {
+        return Err("path must stay inside the workspace".to_string());
+    }
+    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        builder
+            .append_dir(archive_path, source)
+            .map_err(|error| error.to_string())?;
+        let mut entries = fs::read_dir(source)
+            .map_err(|error| error.to_string())?
+            .flatten()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let child = entry.path();
+            let child_name = entry.file_name();
+            append_workspace_dir_to_tar(builder, root, &child, &archive_path.join(child_name))?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let bytes = fs::read(source).map_err(|error| error.to_string())?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, archive_path, Cursor::new(bytes))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {

@@ -6,7 +6,7 @@
 //! # Extraction strategy
 //!
 //! The extractor is **heuristic-only** – it does not require an LLM call.
-//! It applies four independent passes over the message slice:
+//! It applies three persistent-memory passes over the message slice:
 //!
 //! 1. **Preference pass** – scans user messages for natural-language preference
 //!    signals ("I like", "please always", "never", "don't", …) and records
@@ -20,15 +20,12 @@
 //!    error immediately followed by a corrective assistant turn) and records
 //!    the resolution as [`MemoryCategory::Reference`] / [`MemoryLayer::L2`].
 //!
-//! 4. **Pattern pass** – counts repeated tool invocations and records
-//!    frequently-used commands as [`MemoryCategory::ProjectConvention`] /
-//!    [`MemoryLayer::L2`].
-//!
 //! # Derivation-exclusion principle
 //!
 //! Only information that **cannot** be re-derived by re-running a tool is
 //! persisted.  Raw file contents, search results, and command outputs are
-//! explicitly skipped.
+//! explicitly skipped. Tool invocation frequency is runtime telemetry, not
+//! durable memory, and must not be promoted into project conventions.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -264,7 +261,6 @@ impl MemoryExtractor {
         entries.extend(self.extract_preferences(&chunked));
         entries.extend(self.extract_decisions(&chunked));
         entries.extend(self.extract_error_fixes(&chunked));
-        entries.extend(self.extract_patterns(&chunked));
         entries
     }
 
@@ -585,57 +581,6 @@ impl MemoryExtractor {
                 Priority::Normal,
                 0.70,
                 vec!["error".into(), "fix".into(), tool_name.into()],
-            ));
-        }
-
-        entries
-    }
-
-    /// Pass 4 – repeated tool-usage pattern detection.
-    ///
-    /// If the same tool is called 3 or more times in a conversation it is
-    /// likely a project convention worth remembering.
-    fn extract_patterns(&self, messages: &[Message]) -> Vec<MemoryEntry> {
-        let mut tool_counts: HashMap<String, usize> = HashMap::new();
-
-        for msg in messages {
-            if let Some(name) = &msg.tool_name {
-                *tool_counts.entry(name.clone()).or_insert(0) += 1;
-            }
-            // Also count tool-use markers embedded in assistant messages
-            // (e.g. `<tool_use>read_file</tool_use>`).
-            if msg.role == MessageRole::Assistant {
-                // Simple heuristic: count occurrences of known tool patterns.
-                for keyword in &["read_file", "write_file", "run_bash", "search_code"] {
-                    let count = msg.content.to_lowercase().matches(keyword).count();
-                    if count > 0 {
-                        *tool_counts.entry((*keyword).to_string()).or_insert(0) += count;
-                    }
-                }
-            }
-        }
-
-        let mut entries = Vec::new();
-
-        for (tool, count) in &tool_counts {
-            if *count < 3 {
-                continue;
-            }
-
-            let title = format!("Frequent tool usage: `{tool}` ({count}×)");
-            let content = format!(
-                "The tool `{tool}` was invoked {count} times in this session, \
-                 indicating it is a regularly used operation."
-            );
-
-            entries.push(Self::build_entry(
-                title,
-                content,
-                MemoryLayer::L2,
-                MemoryCategory::ProjectConvention,
-                Priority::Low,
-                0.65,
-                vec!["pattern".into(), "tool".into(), tool.clone()],
             ));
         }
 
@@ -1075,6 +1020,27 @@ mod tests {
             .iter()
             .find(|e| e.category == MemoryCategory::Reference && e.tags.contains(&"fix".into()));
         assert!(fix.is_some(), "expected an error-fix Reference entry");
+    }
+
+    #[tokio::test]
+    async fn extract_does_not_persist_tool_frequency_as_memory() {
+        let ex = default_extractor();
+        let msgs = vec![
+            Message::user("请分析这个问题，并根据结果给出结论。"),
+            Message::assistant("我会读取信息后判断，但工具频率不是长期事实。"),
+            Message::tool_result("t1", "read_file", "ok"),
+            Message::tool_result("t2", "read_file", "ok"),
+            Message::tool_result("t3", "read_file", "ok"),
+        ];
+
+        let entries = ex.extract(&msgs).await.unwrap();
+
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.title.starts_with("Frequent tool usage:")));
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.tags.iter().any(|tag| tag == "tool")));
     }
 
     #[tokio::test]

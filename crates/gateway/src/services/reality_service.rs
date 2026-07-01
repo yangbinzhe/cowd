@@ -3,7 +3,10 @@ use std::path::Path;
 use chrono::Utc;
 use harness_contract::reality::{RealityBoundary, RealityCapabilityStatus, RecallSourceKind};
 use memory::types::MemoryLayer;
-use memory::{rank_candidates, RecallCandidate, RecallOmission, RecallReport, RecallSourceResult};
+use memory::{
+    rank_and_deduplicate_candidates, RecallCandidate, RecallOmission, RecallReport,
+    RecallSourceResult,
+};
 use runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 use serde::{Deserialize, Serialize};
 
@@ -616,7 +619,7 @@ impl RealityService {
     ) -> RealityRecallAugmentation {
         let augmentation = self.recall_augmentation(config_home, matrix, growth, query, max_items);
         report.selected.extend(augmentation.candidates.clone());
-        rank_candidates(&mut report.selected);
+        rank_and_deduplicate_candidates(&mut report.selected);
         let max_items = max_items.max(1);
         if report.selected.len() > max_items {
             let overflow = report.selected.split_off(max_items);

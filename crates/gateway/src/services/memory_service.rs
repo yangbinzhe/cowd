@@ -469,6 +469,10 @@ impl MemoryService {
 }
 
 fn is_knowledge_memory_entry(entry: &MemoryEntry) -> bool {
+    if is_runtime_memory_noise_entry(entry) {
+        return false;
+    }
+
     matches!(
         entry.layer,
         MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4
@@ -486,6 +490,48 @@ fn is_knowledge_memory_entry(entry: &MemoryEntry) -> bool {
                 | "global"
         )
     })
+}
+
+fn is_runtime_memory_noise_entry(entry: &MemoryEntry) -> bool {
+    matches!(
+        entry.category,
+        memory::types::MemoryCategory::UserPreference
+            | memory::types::MemoryCategory::CompressedSummary
+    ) || entry.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "runtime"
+                | "session-checkpoint"
+                | "semantic-checkpoint"
+                | "tool-usage"
+                | "usage-feedback"
+        )
+    }) || runtime_memory_noise_text(&format!("{} {}", entry.title, entry.content))
+}
+
+fn runtime_memory_noise_text(text: &str) -> bool {
+    let normalized = text
+        .to_lowercase()
+        .replace('：', ":")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "user preference:",
+        "session critical context checkpoint",
+        "session pending work checkpoint",
+        "session preferences checkpoint",
+        "session tool evidence checkpoint",
+        "frequent tool usage:",
+        "usage_feedback:selected_count",
+        "active memory lacks explicit orientation evidence",
+        "用户偏好:",
+        "会话 checkpoint",
+        "会话检查点",
+        "工具使用频率",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn knowledge_namespace_for_entry(entry: &MemoryEntry) -> KnowledgeNamespace {
@@ -672,6 +718,44 @@ mod tests {
             knowledge_governance_for_entry(&project),
             KnowledgeGovernanceLevel::Required
         );
+    }
+
+    #[test]
+    fn knowledge_helpers_exclude_runtime_memory_noise() {
+        let mut preference = memory_entry(
+            MemoryLayer::L3,
+            vec!["global".to_string(), "default".to_string()],
+            memory::MemoryScope::Global,
+            "不要无限展开读取上下文",
+        );
+        preference.category = MemoryCategory::UserPreference;
+        preference.title = "User preference: 不要无限展开".to_string();
+
+        let checkpoint = memory_entry(
+            MemoryLayer::L3,
+            vec!["semantic-checkpoint".to_string()],
+            memory::MemoryScope::Session("s1".to_string()),
+            "Session critical context checkpoint",
+        );
+
+        let tool_usage = memory_entry(
+            MemoryLayer::L2,
+            vec!["tool-usage".to_string()],
+            memory::MemoryScope::Project("cowd".to_string()),
+            "Frequent tool usage: rg selected_count=10",
+        );
+
+        let knowledge = memory_entry(
+            MemoryLayer::L3,
+            vec!["knowledge".to_string()],
+            memory::MemoryScope::Project("cowd".to_string()),
+            "必须保留证据链",
+        );
+
+        assert!(!is_knowledge_memory_entry(&preference));
+        assert!(!is_knowledge_memory_entry(&checkpoint));
+        assert!(!is_knowledge_memory_entry(&tool_usage));
+        assert!(is_knowledge_memory_entry(&knowledge));
     }
 }
 

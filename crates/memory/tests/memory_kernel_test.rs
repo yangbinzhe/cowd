@@ -970,6 +970,49 @@ async fn equal_authority_conflict_is_visible_for_review() {
 }
 
 #[tokio::test]
+async fn duplicate_memory_write_is_not_persisted_again() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("duplicate.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-duplicate", "agent-duplicate");
+    let first = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "duplicate rule",
+    );
+    let first_id = first.id;
+    let mut second = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "duplicate rule",
+    );
+    second.content = first.content.clone();
+    let second_id = second.id;
+
+    kernel.remember(&ctx, first).await.unwrap();
+    kernel.remember(&ctx, second).await.unwrap();
+
+    let entries = manager.list_all_entries().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries.iter().any(|entry| entry.id == first_id));
+    assert!(!entries.iter().any(|entry| entry.id == second_id));
+    assert_eq!(
+        kernel
+            .lifecycle_events(first_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Observed
+    );
+}
+
+#[tokio::test]
 async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
