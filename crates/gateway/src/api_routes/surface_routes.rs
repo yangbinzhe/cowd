@@ -484,7 +484,7 @@ async fn surface_static_handler(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header("x-cowd-surface", file.surface)
+        .header("x-cowd-edge-surface", file.surface)
         .header("x-cowd-edge-spa-fallback", file.spa_fallback.to_string())
         .body(axum::body::Body::from(bytes))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))

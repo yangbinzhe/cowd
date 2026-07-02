@@ -14,7 +14,7 @@ active contract groups that must remain available during the entrypoint split.
 | app-mfg | active | WebUI, reports | manufacturing incidents, analysis, actions, reports |
 | approvals | active | TUI, WebUI | approval gates and decisions |
 | tools/mcp | active | TUI, WebUI | tool and MCP status/action surface |
-| static WebUI | active | browser | serves `cowd-surface/surfaces/webui` build output from `gateway.webui_dir` when valid |
+| static WebUI | active | browser | serves `cowd-edge/surfaces/webui` build output from `gateway.webui_dir` when valid |
 
 ## Rules
 

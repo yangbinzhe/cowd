@@ -215,11 +215,12 @@ pub fn builtin_source_adapter_manifests() -> Vec<SourceAdapterManifest> {
             "PostgreSQL",
             "source.sql",
             "database_service",
-            &["snapshot", "incremental"],
+            &["snapshot", "incremental", "event"],
             "schema://connector/source/postgres/read-plan",
             &[
                 "database network drivers run in a source sidecar, not in the core gateway/runtime",
                 "rows are delivered to Matrix through the SourceRecordBatch contract",
+                "event payloads are normalized through Edge source event actions",
             ],
         ),
         SourceAdapterManifest::sidecar_with_access_mode(
@@ -227,11 +228,12 @@ pub fn builtin_source_adapter_manifests() -> Vec<SourceAdapterManifest> {
             "MySQL",
             "source.sql",
             "database_service",
-            &["snapshot", "incremental"],
+            &["snapshot", "incremental", "event"],
             "schema://connector/source/mysql/read-plan",
             &[
                 "database network drivers run in a source sidecar, not in the core gateway/runtime",
                 "rows are delivered to Matrix through the SourceRecordBatch contract",
+                "event payloads are normalized through Edge source event actions",
             ],
         ),
         SourceAdapterManifest::sidecar_with_access_mode(
@@ -239,11 +241,12 @@ pub fn builtin_source_adapter_manifests() -> Vec<SourceAdapterManifest> {
             "MariaDB",
             "source.sql",
             "database_service",
-            &["snapshot", "incremental"],
+            &["snapshot", "incremental", "event"],
             "schema://connector/source/mariadb/read-plan",
             &[
                 "database network drivers run in a source sidecar, not in the core gateway/runtime",
                 "rows are delivered to Matrix through the SourceRecordBatch contract",
+                "event payloads are normalized through Edge source event actions",
             ],
         ),
         SourceAdapterManifest::local(
@@ -653,6 +656,20 @@ mod tests {
         assert!(ids.contains(&"mariadb".to_string()));
         assert!(ids.contains(&"feishu_bitable".to_string()));
         assert!(ids.contains(&"lark_bitable".to_string()));
+    }
+
+    #[test]
+    fn database_source_manifests_are_sidecar_event_capable() {
+        for adapter_id in ["postgres", "mysql", "mariadb"] {
+            let manifest = source_adapter_manifest(adapter_id).unwrap();
+            assert!(manifest.requires_sidecar);
+            assert!(manifest.supports_schema_discovery);
+            assert!(manifest.supports_snapshot);
+            assert!(manifest.supports_incremental);
+            assert!(manifest.supports_event_subscription);
+            assert!(manifest.refresh_modes.iter().any(|mode| mode == "event"));
+            assert_eq!(manifest.access_mode, "database_service");
+        }
     }
 
     #[test]

@@ -46,7 +46,7 @@ runtime core dependency.
 
 ## Static WebUI
 
-The WebUI is external to this repository in `cowd-surface/surfaces/webui`.
+The WebUI is external to this repository in `cowd-edge/surfaces/webui`.
 Gateway reads `gateway.webui_dir` and
 serves the configured directory only when it contains `index.html`. Without a
 valid configured WebUI directory, Gateway remains healthy and returns runtime

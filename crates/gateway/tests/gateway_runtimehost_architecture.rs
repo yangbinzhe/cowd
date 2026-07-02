@@ -491,7 +491,7 @@ fn connector_is_independent_external_resource_boundary() {
 fn channel_contracts_drive_gateway_surface_readiness() {
     assert!(
         !repo_root().join("crates/channel-adapters").exists(),
-        "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-surface"
+        "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-edge"
     );
     assert!(
         !repo_root().join("crates/channel").exists(),

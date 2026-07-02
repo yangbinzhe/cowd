@@ -21,7 +21,7 @@ where it must not be used as an internal Rust boundary name.
 | `COWD_CONFIG_HOME` | environment variable | config | external-stable |
 | `.cowd` | project/user config directory | config | external-stable |
 | `cowd-serve.pid` | local process status file | gateway | external-stable |
-| `cowd-surface` | external surface monorepo for WebUI and non-TUI surfaces | surface | external-stable |
+| `cowd-edge` | external surface monorepo for WebUI and non-TUI surfaces | surface | external-stable |
 | `cowd_capabilities` | HTTP response field | gateway API | external-stable |
 | `cowd_projection` | HTTP response field | gateway API | external-stable |
 | `cowd_surfaces` | HTTP response field | gateway API | external-stable |

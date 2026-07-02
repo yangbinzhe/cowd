@@ -4,7 +4,7 @@ set -euo pipefail
 SURFACE_WEBUI_DIR="${COWD_SURFACE_WEBUI_DIR:-}"
 
 if [[ -z "$SURFACE_WEBUI_DIR" ]]; then
-  echo "live WebUI workbench scenario moved to cowd-surface; set COWD_SURFACE_WEBUI_DIR to surfaces/webui"
+  echo "live WebUI workbench scenario moved to cowd-edge; set COWD_SURFACE_WEBUI_DIR to surfaces/webui"
   exit 0
 fi
 

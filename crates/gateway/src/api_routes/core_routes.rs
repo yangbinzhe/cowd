@@ -270,7 +270,7 @@ fn frontend_api_matrix_ready() -> bool {
 }
 
 fn surface_version_compatible() -> bool {
-    std::env::var_os("COWD_SKIP_SURFACE_VERSION_GATE").is_some()
+    std::env::var_os("COWD_SKIP_EDGE_VERSION_GATE").is_some()
         || surface_repo_file_exists("scripts/edge-version-gate.mjs")
 }
 
@@ -279,10 +279,10 @@ fn surface_repo_file_exists(relative: &str) -> bool {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| manifest_dir.to_path_buf());
     [
-        cwd.join("../cowd-surface").join(relative),
-        cwd.join("cowd-surface").join(relative),
-        manifest_dir.join("../../../cowd-surface").join(relative),
-        manifest_dir.join("../../cowd-surface").join(relative),
+        cwd.join("../cowd-edge").join(relative),
+        cwd.join("cowd-edge").join(relative),
+        manifest_dir.join("../../../cowd-edge").join(relative),
+        manifest_dir.join("../../cowd-edge").join(relative),
     ]
     .iter()
     .any(|path| path.is_file())

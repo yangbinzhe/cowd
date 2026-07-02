@@ -1,10 +1,10 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.437`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.438`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
-非 TUI surface 已从 core 仓库迁出，统一进入独立仓库 `cowd-surface`。core 仓库只保留协议、Gateway 装载能力、AI Harness 核心能力，以及可选的 TUI surface。
+非 TUI surface 已从 core 仓库迁出，统一进入独立仓库 `cowd-edge`。core 仓库只保留协议、Gateway 装载能力、AI Harness 核心能力，以及可选的 TUI surface。
 
 ## 1. 总体设计
 
@@ -16,8 +16,8 @@ Cowd core 负责 AI Harness 的稳定内核，不负责把所有 UI 和平台 SD
 用户入口
   CLI       极薄命令入口，负责配置、诊断、Gateway 启动等轻控制
   TUI       core 仓内唯一 UI surface，仅 full/release 联调时构建
-  WebUI     cowd-surface 中的浏览器 surface
-  Channel   cowd-surface 中的外部渠道 sidecar
+  WebUI     cowd-edge 中的浏览器 surface
+  Channel   cowd-edge 中的外部渠道 sidecar
 
 Gateway
   HTTP/SSE API
@@ -52,7 +52,7 @@ Fact/application layer
 - CLI 不做交互 UI，不承载业务执行器，只负责轻量命令、配置、诊断和 Gateway 启动。
 - 默认开发/debug 构建不带 TUI，TUI 与 Gateway 分开开发。
 - 只有 TUI 联调、完整产品验证和正式 release 才构建 `--features full`。
-- 非 TUI surface 不在 core workspace 编译，全部从 `cowd-surface` 按需独立构建和交付。
+- 非 TUI surface 不在 core workspace 编译，全部从 `cowd-edge` 按需独立构建和交付。
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据。
 - MFG 是应用层，不是 AI Harness 内核。
 
@@ -71,7 +71,7 @@ crates/tui        core 仓内唯一 UI surface，full 构建才进入 cowd
 ### 2.2 edge 仓库
 
 ```text
-cowd-edge（当前本地目录可能仍为 cowd-surface）
+cowd-edge
   surfaces/webui                 WebUI 静态 surface
   connectors/message/feishu      飞书消息 connector
   connectors/message/email       邮件消息 connector
@@ -268,7 +268,7 @@ Surface 可靠消息层由 Gateway `SurfaceHost` 持有。inbound 先写持久 i
 WebUI 不在 core 仓库。它位于：
 
 ```text
-cowd-surface/surfaces/webui
+cowd-edge/surfaces/webui
 ```
 
 Gateway 通过配置读取 WebUI 构建产物：
@@ -278,7 +278,7 @@ gateway:
   enabled: true
   host: "127.0.0.1"
   port: 8642
-  webui_dir: "/path/to/cowd-surface/surfaces/webui/dist"
+  webui_dir: "/path/to/cowd-edge/surfaces/webui/dist"
 ```
 
 如果未配置 `gateway.webui_dir`，或者目录没有 `index.html`，Gateway 仍应健康启动，并在根路由返回 health/status，而不是失败退出。
@@ -458,10 +458,10 @@ cargo run -p cli --bin cowd --features full -- tui
 
 ### 6.4 WebUI
 
-WebUI 在 `cowd-surface` 构建：
+WebUI 在 `cowd-edge` 构建：
 
 ```bash
-cd ../cowd-surface
+cd ../cowd-edge
 npm --prefix surfaces/webui test
 npm --prefix surfaces/webui run build
 ```
@@ -473,7 +473,7 @@ npm --prefix surfaces/webui run build
 外部 surface 与 connector 在 Cowd Edge 仓库构建：
 
 ```bash
-cd ../cowd-surface
+cd ../cowd-edge
 cargo check --workspace --bins
 cargo build --release -p edge-adapters --bins
 ```
@@ -601,7 +601,7 @@ gateway:
   enabled: true
   host: "127.0.0.1"
   port: 8642
-  webui_dir: "/path/to/cowd-surface/surfaces/webui/dist"
+  webui_dir: "/path/to/cowd-edge/surfaces/webui/dist"
 ```
 
 模型/API 密钥属于配置和 secrets，不应成为顶层 auth 模块。Gateway 的 WebUI 静态资源配置是可选项，缺失时服务仍应可用。
@@ -623,7 +623,7 @@ scripts/scenarios/tui-daemon-attach.sh
 surface 仓库验证：
 
 ```bash
-cd ../cowd-surface
+cd ../cowd-edge
 cargo fmt --all --check
 cargo check --workspace --bins
 npm --prefix surfaces/webui test
@@ -647,7 +647,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - `crates/cli` 默认不编译 `crates/tui`。
 - `crates/gateway` 通过 `surface::channel` 使用 channel 合同和 `surface` 协议，但不依赖平台 SDK。
 - `crates/runtime` 不依赖 channel/surface adapter。
-- `cowd-surface` 承载 WebUI 和非 TUI sidecar。
+- `cowd-edge` 承载 WebUI 和非 TUI sidecar。
 - TUI 已形成 Clean/Panorama、Control Deck 和 Gateway attach 场景验证闭环。
 - WebUI/TUI 的核心入口都走 Gateway，符合 Gateway 作为唯一后台服务入口的原则。
 - Mission Control Runtime 已提供全局 projection 和 command receipt。
@@ -666,7 +666,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.437`。
+- 版本标签：`v0.9.438`。
 
 ### 11.2 是否达到当前阶段目标
 
