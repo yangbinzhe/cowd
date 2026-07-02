@@ -4068,7 +4068,7 @@ memory:
             r#"
 gateway:
   enabled: true
-  webui_dir: "/tmp/cowd-surface-webui-dist"
+  webui_dir: "/tmp/cowd-edge-webui-dist"
   platforms:
     - platformType: "api_server"
       enabled: true
@@ -4085,7 +4085,7 @@ gateway:
         assert!(loaded.gateway().enabled);
         assert_eq!(
             loaded.gateway().webui_dir.as_deref(),
-            Some(std::path::Path::new("/tmp/cowd-surface-webui-dist"))
+            Some(std::path::Path::new("/tmp/cowd-edge-webui-dist"))
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

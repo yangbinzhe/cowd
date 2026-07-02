@@ -76,14 +76,12 @@ impl MatrixConnectorRun {
         let mode = input.mode.clone().unwrap_or_else(|| "plan".to_string());
         let connector_kind = connector_kind(source_pack);
         let quality_report = quality_report(source_pack, &input);
-        let status = if mode == "run" && quality_report.status == "ready" {
-            "completed"
-        } else if quality_report.status == "blocked" {
+        let status = if quality_report.status == "blocked" {
             "blocked"
         } else {
             "planned"
         };
-        let retryable = status != "completed";
+        let retryable = status != "planned";
         Self {
             run_id: input
                 .run_id
@@ -172,8 +170,10 @@ fn quality_report(
 
 fn receipt_message(status: &str) -> String {
     match status {
-        "completed" => "connector run completed with governed receipt".to_string(),
         "blocked" => "connector run blocked by source pack quality gate".to_string(),
-        _ => "connector run planned and ready for controlled execution".to_string(),
+        _ => {
+            "connector run planned; execute through source snapshot capture/apply for a real receipt"
+                .to_string()
+        }
     }
 }

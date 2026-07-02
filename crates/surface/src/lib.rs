@@ -9,6 +9,13 @@ use uuid::Uuid;
 
 pub mod channel;
 
+/// Current wire protocol for Cowd edge sidecars.
+///
+/// The crate is still named `surface` because WebUI/TUI are real surfaces and
+/// TUI stays in the core repository for now. The manifest, runtime, and JSONL
+/// primitives are intentionally edge-compatible: non-UI message/source
+/// connectors use the same lifecycle contract while exposing a different
+/// business domain.
 pub const SURFACE_PROTOCOL: &str = "cowd.surface.v1";
 pub const SURFACE_MANIFEST_FILE: &str = "surface.json";
 
@@ -42,7 +49,18 @@ pub enum SurfaceKind {
     InteractiveSurface,
     WebSurface,
     ExternalIntegration,
+    MessageConnector,
+    SourceConnector,
     AutomationEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDomain {
+    Surface,
+    MessageConnector,
+    SourceConnector,
+    AutomationConnector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,7 +496,7 @@ impl SurfaceManifest {
         {
             return Err(SurfaceError::InvalidManifest {
                 surface: self.id.clone(),
-                reason: "external surface requires entry".to_string(),
+                reason: "external edge connector requires entry".to_string(),
             });
         }
         for route in &self.routes {
@@ -516,6 +534,11 @@ impl SurfaceManifest {
             .iter()
             .map(|capability| SurfaceCapability::new(&self.id, capability.clone()))
             .collect()
+    }
+
+    #[must_use]
+    pub fn edge_domain(&self) -> EdgeDomain {
+        classify_edge_domain(self.kind, &self.capabilities, &self.id)
     }
 }
 
@@ -560,6 +583,7 @@ pub struct SurfaceDescriptor {
     pub routes: Vec<SurfaceRoute>,
     pub resources: Vec<SurfaceResource>,
     pub health: SurfaceHealthSpec,
+    pub edge_domain: EdgeDomain,
     pub diagnostics: Vec<String>,
 }
 
@@ -583,9 +607,46 @@ impl SurfaceDescriptor {
             routes: manifest.routes.clone(),
             resources: manifest.resources.clone(),
             health: manifest.health.clone(),
+            edge_domain: manifest.edge_domain(),
             diagnostics: Vec::new(),
         }
     }
+
+    #[must_use]
+    pub fn edge_domain(&self) -> EdgeDomain {
+        self.edge_domain
+    }
+}
+
+fn classify_edge_domain(kind: SurfaceKind, capabilities: &[String], id: &str) -> EdgeDomain {
+    match kind {
+        SurfaceKind::InteractiveSurface | SurfaceKind::WebSurface => EdgeDomain::Surface,
+        SurfaceKind::MessageConnector => EdgeDomain::MessageConnector,
+        SurfaceKind::SourceConnector => EdgeDomain::SourceConnector,
+        SurfaceKind::AutomationEndpoint => EdgeDomain::AutomationConnector,
+        SurfaceKind::ExternalIntegration => classify_external_integration(capabilities, id),
+    }
+}
+
+fn classify_external_integration(capabilities: &[String], id: &str) -> EdgeDomain {
+    if capabilities
+        .iter()
+        .any(|capability| capability.starts_with("source."))
+        || id.contains("bitable")
+        || id.contains("base")
+    {
+        return EdgeDomain::SourceConnector;
+    }
+    if capabilities.iter().any(|capability| {
+        capability.starts_with("message.")
+            || matches!(
+                capability.as_str(),
+                "ingress" | "egress" | "delivery" | "callback" | "processing_lifecycle"
+            )
+    }) {
+        return EdgeDomain::MessageConnector;
+    }
+    EdgeDomain::AutomationConnector
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -834,6 +895,8 @@ mod tests {
         let surfaces = builtin_surfaces();
         assert!(surfaces.contains_key("tui"));
         assert!(surfaces.contains_key("webui"));
+        assert_eq!(surfaces["tui"].edge_domain(), EdgeDomain::Surface);
+        assert_eq!(surfaces["webui"].edge_domain(), EdgeDomain::Surface);
     }
 
     #[test]
@@ -849,13 +912,13 @@ mod tests {
             r#"{
                 "schema": "cowd.surface.v1",
                 "id": "feishu",
-                "name": "Feishu Surface",
+                "name": "Feishu Message Connector",
                 "version": "1.0.0",
-                "kind": "external-integration",
-                "entry": "./cowd-surface-feishu",
+                "kind": "message-connector",
+                "entry": "./cowd-edge-feishu-message",
                 "transport": "stdio-jsonl",
                 "lifecycle": "managed",
-                "capabilities": ["send_text", "callback"],
+                "capabilities": ["message.send_text", "message.callback"],
                 "routes": [
                     {"kind": "callback", "path": "/webhook", "method": "POST", "public": true}
                 ],
@@ -870,9 +933,30 @@ mod tests {
         manifest.validate().unwrap();
         let descriptor = SurfaceDescriptor::from_manifest(&manifest, "/tmp/surface.json");
         assert_eq!(descriptor.lifecycle, SurfaceLifecycle::Managed);
+        assert_eq!(descriptor.edge_domain(), EdgeDomain::MessageConnector);
         assert_eq!(descriptor.routes.len(), 1);
         assert_eq!(descriptor.resources.len(), 1);
         assert_eq!(descriptor.health.mode, SurfaceHealthMode::Jsonl);
+    }
+
+    #[test]
+    fn edge_domain_distinguishes_source_connectors() {
+        let manifest = serde_json::from_str::<SurfaceManifest>(
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "feishu-bitable",
+                "name": "Feishu Bitable Source Connector",
+                "version": "1.0.0",
+                "kind": "source-connector",
+                "entry": "./cowd-edge-feishu-bitable-source",
+                "capabilities": ["source.schema_discovery", "source.snapshot", "source.health"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.edge_domain(), EdgeDomain::SourceConnector);
+        let descriptor = SurfaceDescriptor::from_manifest(&manifest, "/tmp/source.json");
+        assert_eq!(descriptor.edge_domain(), EdgeDomain::SourceConnector);
     }
 
     #[test]

@@ -18,7 +18,7 @@ model-protocol = { path = "../model-protocol" }
 storage = { path = "../storage" }
 surface = { path = "../surface" }
 approval = { path = "../approval" }
-axum = { version = "0.7", features = ["ws", "multipart"] }
+axum = { version = "0.7", features = ["multipart"] }
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 connector = { path = "../connector" }

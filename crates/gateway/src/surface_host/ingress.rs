@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn surface_runtime_pre_messages_attach_current_image_block() {
         let path = std::env::temp_dir().join(format!(
-            "cowd-surface-image-pre-message-{}.jpg",
+            "cowd-edge-image-pre-message-{}.jpg",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"fake-jpeg-bytes").expect("test image should write");

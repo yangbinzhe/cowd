@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn surface_inbox_dedupes_across_store_reload() {
         let root =
-            std::env::temp_dir().join(format!("cowd-surface-inbox-store-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cowd-edge-inbox-store-{}", uuid::Uuid::new_v4()));
         let store = SurfaceMessageStore::new(&root);
         let receipt = store
             .record_inbox_received(
@@ -925,10 +925,8 @@ mod tests {
 
     #[test]
     fn surface_outbox_records_retry_and_dead_letter_states() {
-        let root = std::env::temp_dir().join(format!(
-            "cowd-surface-outbox-store-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-outbox-store-{}", uuid::Uuid::new_v4()));
         let store = SurfaceMessageStore::new(&root);
         let request = SurfaceSendRequest {
             surface: "feishu".to_string(),
@@ -962,10 +960,8 @@ mod tests {
 
     #[test]
     fn surface_inbox_reaches_replied_after_reply_delivery() {
-        let root = std::env::temp_dir().join(format!(
-            "cowd-surface-replied-store-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-replied-store-{}", uuid::Uuid::new_v4()));
         let store = SurfaceMessageStore::new(&root);
         let inbox = store
             .record_inbox_received(
@@ -1022,7 +1018,7 @@ mod tests {
     #[test]
     fn surface_failure_notice_marks_inbox_failed_notified() {
         let root = std::env::temp_dir().join(format!(
-            "cowd-surface-failure-notice-store-{}",
+            "cowd-edge-failure-notice-store-{}",
             uuid::Uuid::new_v4()
         ));
         let store = SurfaceMessageStore::new(&root);
@@ -1096,7 +1092,7 @@ mod tests {
     #[test]
     fn reload_marks_orphan_active_inbox_as_failed() {
         let root = std::env::temp_dir().join(format!(
-            "cowd-surface-orphan-inbox-store-{}",
+            "cowd-edge-orphan-inbox-store-{}",
             uuid::Uuid::new_v4()
         ));
         let store = SurfaceMessageStore::new(&root);

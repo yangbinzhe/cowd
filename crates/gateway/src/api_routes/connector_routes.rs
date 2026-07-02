@@ -7,9 +7,10 @@ use axum::{
     Json, Router,
 };
 use connector::{
-    builtin_service_connector_registry, default_capabilities, CapabilityManifest,
-    ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth, ConnectorRegistrySnapshot,
-    ExternalResourceRef, ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
+    CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
+    ConnectorRegistrySnapshot, ExternalResourceRef, ProviderAccount, ServiceConnector,
+    ServiceToolRequest, ServiceToolResult,
 };
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
@@ -42,6 +43,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/resources",
             get(connector_resources_handler),
         )
+        .route("/api/connectors/sources", get(connector_sources_handler))
         .route(
             "/api/connectors/resources/revalidate",
             axum::routing::post(connector_resource_revalidate_handler),
@@ -59,6 +61,13 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/services/:service_id/execute",
             axum::routing::post(connector_service_execute_handler),
         )
+}
+
+async fn connector_sources_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "kind": "connector.source_adapters",
+        "adapters": builtin_source_adapter_manifests(),
+    }))
 }
 
 const MAX_CONNECTOR_RESOURCE_PAGE: usize = 200;

@@ -687,8 +687,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         tracing::warn!("failed to write addr file: {e}");
     }
 
-    // 4. Surface sidecars are discovered and represented in SurfaceHost. External
-    // sidecar process launch is driven by surface requests, not by runtime boot.
+    // 4. Edge surfaces/connectors are discovered and represented in SurfaceHost.
+    // External sidecar process launch is driven by edge requests, not by runtime boot.
 
     // 5. HTTP server with graceful shutdown on SIGINT/SIGTERM
     let shutdown_signal = async {
@@ -740,7 +740,7 @@ mod tests {
 
     fn temp_webui_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(
-            "cowd-surface-webui-{label}-{}-{}",
+            "cowd-edge-webui-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -895,13 +895,16 @@ mod tests {
         let surface = SurfaceManifest {
             schema: surface::SURFACE_PROTOCOL.to_string(),
             id: "feishu".to_string(),
-            name: "Feishu Surface".to_string(),
+            name: "Feishu Message Connector".to_string(),
             version: "0.1.0".to_string(),
-            kind: surface::SurfaceKind::ExternalIntegration,
-            entry: Some("./cowd-surface-feishu".to_string()),
+            kind: surface::SurfaceKind::MessageConnector,
+            entry: Some("./cowd-edge-feishu-message".to_string()),
             transport: surface::SurfaceTransport::StdioJsonl,
             lifecycle: surface::SurfaceLifecycle::Managed,
-            capabilities: vec!["ingress".to_string(), "delivery".to_string()],
+            capabilities: vec![
+                "message.ingress".to_string(),
+                "message.delivery".to_string(),
+            ],
             routes: Vec::new(),
             resources: Vec::new(),
             health: surface::SurfaceHealthSpec {

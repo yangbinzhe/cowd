@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, State as AxumState},
+    extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use connector::SourceReadPlan;
 use matrix_core::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
     MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
-    MATRIX_SCHEMA_VERSION,
+    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourceKind,
+    MatrixSourcePack, MatrixSourceSnapshotInput, MATRIX_SCHEMA_VERSION,
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::services::GatewayMatrixRepositoryError as MatrixStoreError;
 
@@ -73,8 +75,24 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(matrix_source_pack_connector_run_execute_handler),
         )
         .route(
+            "/api/matrix/source-packs/:id/snapshots/plan",
+            post(matrix_source_snapshot_plan_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/snapshots/run",
+            post(matrix_source_snapshot_run_handler),
+        )
+        .route(
+            "/api/matrix/source-packs/:id/snapshots",
+            get(matrix_source_pack_snapshots_handler),
+        )
+        .route(
             "/api/matrix/connector-runs/:id",
             get(matrix_connector_run_get_handler),
+        )
+        .route(
+            "/api/matrix/source-snapshots/:id",
+            get(matrix_source_snapshot_get_handler),
         )
         .route("/api/matrix/entities", get(matrix_entities_handler))
         .route(
@@ -334,6 +352,40 @@ struct MatrixConnectorRunRequest {
     run: Option<MatrixConnectorRunInput>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MatrixSourceSnapshotPlanRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+    #[serde(default)]
+    estimated_rows: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatrixSourceSnapshotRunRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    snapshot: Option<MatrixSourceSnapshotInput>,
+    #[serde(default)]
+    source_read_plan: Option<SourceReadPlan>,
+    #[serde(default)]
+    rows: Vec<Value>,
+    #[serde(default)]
+    facts: Vec<MatrixFactInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatrixSourceSnapshotListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 async fn matrix_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -367,6 +419,7 @@ async fn matrix_health_handler(
         "source_pack_count": health.source_pack_count,
         "data_plane_watermark_count": health.data_plane_watermark_count,
         "connector_run_count": health.connector_run_count,
+        "source_snapshot_count": health.source_snapshot_count,
         "ontology_pack_count": health.ontology_pack_count,
         "entity_match_candidate_count": health.entity_match_candidate_count,
         "entity_conflict_decision_count": health.entity_conflict_decision_count,
@@ -385,6 +438,10 @@ fn matrix_health_capabilities() -> Vec<&'static str> {
         "connector_runtime",
         "connector_run_receipt",
         "connector_quality_report",
+        "source_snapshot_plan",
+        "source_snapshot_capture",
+        "source_snapshot_apply",
+        "source_snapshot_repository",
         "entity_match_candidate",
         "entity_conflict_decision",
         "entity_survivorship_rule",

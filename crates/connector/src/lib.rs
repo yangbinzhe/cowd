@@ -4,6 +4,8 @@
 //! references without binding them to channel adapters or service SDKs. The
 //! cross-plane policy engine remains the execution governance layer.
 
+pub mod source;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, RwLock};
@@ -14,6 +16,12 @@ pub use harness_contract::policy::{CrossPlaneRisk, DataClassification};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use source::{
+    builtin_source_adapter_manifests, read_local_source_batch, source_adapter_manifest,
+    SourceAdapterManifest, SourceBatchCursor, SourceFieldSchema, SourceReadPlan, SourceRecordBatch,
+    SourceTableSchema,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

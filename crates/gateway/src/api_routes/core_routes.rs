@@ -271,7 +271,7 @@ fn frontend_api_matrix_ready() -> bool {
 
 fn surface_version_compatible() -> bool {
     std::env::var_os("COWD_SKIP_SURFACE_VERSION_GATE").is_some()
-        || surface_repo_file_exists("scripts/surface-version-gate.mjs")
+        || surface_repo_file_exists("scripts/edge-version-gate.mjs")
 }
 
 fn surface_repo_file_exists(relative: &str) -> bool {

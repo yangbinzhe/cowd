@@ -66,13 +66,16 @@ pub use ontology::{
 };
 pub use quality::MatrixQualityGateDecision;
 pub use relation::{MatrixImpactHop, MatrixImpactTrace, MatrixRelation, MatrixRelationInput};
-pub use source::{MatrixSourceKind, MatrixSourceSnapshot};
+pub use source::{
+    MatrixSourceKind, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
+    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+};
 pub use source_pack::{
     MatrixSourceDeltaPlan, MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourcePack,
-    MatrixSourcePackValidation,
+    MatrixSourcePackValidation, MatrixSourceRelationMapping,
 };
 
-pub const MATRIX_SCHEMA_VERSION: i64 = 17;
+pub const MATRIX_SCHEMA_VERSION: i64 = 18;
 
 #[must_use]
 pub fn matrix_reference(kind: &str, id: &str) -> String {
@@ -90,6 +93,6 @@ mod tests {
 
     #[test]
     fn matrix_schema_version_is_owned_by_matrix_contract() {
-        assert_eq!(MATRIX_SCHEMA_VERSION, 17);
+        assert_eq!(MATRIX_SCHEMA_VERSION, 18);
     }
 }

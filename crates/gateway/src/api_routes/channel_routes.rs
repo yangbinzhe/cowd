@@ -327,7 +327,7 @@ async fn wechat_ilink_accounts_handler(
         "surface_available": surface_available,
         "usable": false,
         "accounts": [],
-        "diagnostics": ["wechat-ilink account listing is provided by the wechat-ilink surface sidecar"]
+        "diagnostics": ["wechat-ilink account listing is provided by the wechat-ilink Edge message connector"]
     }))
 }
 

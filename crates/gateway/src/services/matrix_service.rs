@@ -9,9 +9,11 @@ use matrix_core::{
     MatrixMetricAttentionPlan, MatrixMetricDefinition, MatrixMetricDependency, MatrixMetricLineage,
     MatrixMetricSnapshot, MatrixMetricState, MatrixQualityGateDecision, MatrixRelation,
     MatrixRelationInput, MatrixSourceDeltaPlan, MatrixSourceFactMapping, MatrixSourcePack,
-    MatrixSourcePackValidation,
+    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
+    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 use matrix_repository::{MatrixHealth, MatrixRepository};
+use serde_json::Value;
 
 use super::{GatewayMatrixRepositoryError, ServiceEnvelope};
 
@@ -144,6 +146,59 @@ impl MatrixService {
     ) -> Result<Option<MatrixConnectorRun>, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .get_connector_run(run_id)
+    }
+
+    pub(crate) fn plan_source_snapshot(
+        &self,
+        config_home: impl AsRef<Path>,
+        source_pack_id: &str,
+        resource_ref: Option<String>,
+        estimated_rows: Option<u64>,
+    ) -> Result<MatrixSourceSnapshotPlan, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?.plan_source_snapshot(
+            source_pack_id,
+            resource_ref,
+            estimated_rows,
+        )
+    }
+
+    pub(crate) fn create_source_snapshot(
+        &self,
+        config_home: impl AsRef<Path>,
+        input: MatrixSourceSnapshotInput,
+    ) -> Result<MatrixSourceSnapshot, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .create_source_snapshot(input)
+    }
+
+    pub(crate) fn get_source_snapshot(
+        &self,
+        config_home: impl AsRef<Path>,
+        snapshot_id: &str,
+    ) -> Result<Option<MatrixSourceSnapshot>, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .get_source_snapshot(snapshot_id)
+    }
+
+    pub(crate) fn list_source_snapshots(
+        &self,
+        config_home: impl AsRef<Path>,
+        source_pack_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MatrixSourceSnapshot>, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .list_source_snapshots(source_pack_id, limit)
+    }
+
+    pub(crate) fn apply_source_snapshot_rows(
+        &self,
+        config_home: impl AsRef<Path>,
+        source_pack_id: &str,
+        snapshot: MatrixSourceSnapshot,
+        rows: &[Value],
+    ) -> Result<MatrixSourceSnapshotApplyReport, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .apply_source_snapshot_rows(source_pack_id, snapshot, rows)
     }
 
     pub(crate) fn plan_data_plane_ingest(
@@ -431,10 +486,12 @@ impl MatrixService {
                     metric_key: fact.fact_type.clone(),
                     entity_ref_fields: vec!["pack_id".to_string()],
                     measure_fields: vec!["confidence".to_string()],
+                    event_time_field: None,
                     dedup_key: fact.fact_id.clone(),
                     delta_signature: fact.source_ref.clone(),
                 })
                 .collect(),
+            relation_mappings: Vec::new(),
             reconciliation_rules: vec!["knowledge_fabric_is_source_of_truth".to_string()],
             quality_rules: vec!["evidence_ref_required".to_string()],
             freshness_sla: Some("on_update".to_string()),

@@ -64,24 +64,26 @@ Fact/application layer
 crates/cli        极薄 CLI 入口，默认 debug 不编译 TUI
 crates/gateway    HTTP/SSE 服务入口，负责 RuntimeHost 与 SurfaceHost
 crates/runtime    AI Harness 运行时核心，不依赖 channel/surface SDK
-crates/surface    Surface JSONL 协议与 manifest 合同
+crates/surface    Edge JSONL 协议与 manifest 合同（底层协议名仍为 cowd.surface.v1）
 crates/tui        core 仓内唯一 UI surface，full 构建才进入 cowd
 ```
 
-### 2.2 surface 仓库
+### 2.2 edge 仓库
 
 ```text
-cowd-surface
-  surfaces/webui          WebUI 静态 surface
-  surfaces/feishu         飞书 sidecar surface
-  surfaces/email          邮件 sidecar surface
-  surfaces/wecom          企微 sidecar surface
-  surfaces/wechat-ilink   微信 iLink sidecar surface
-  crates/surface          Surface 协议镜像
-  crates/surface-adapters 平台适配实现和 sidecar 二进制
+cowd-edge（当前本地目录可能仍为 cowd-surface）
+  surfaces/webui                 WebUI 静态 surface
+  connectors/message/feishu      飞书消息 connector
+  connectors/message/email       邮件消息 connector
+  connectors/message/wecom       企微消息 connector
+  connectors/message/wechat-ilink 微信 iLink 消息 connector
+  connectors/source/feishu-bitable 飞书多维表格数据源 connector
+  connectors/source/lark-bitable   Lark Bitable 数据源 connector
+  crates/edge-contract           Edge 协议镜像
+  crates/edge-adapters           平台适配实现和 sidecar 二进制
 ```
 
-WebUI、飞书、邮件、企微、微信 iLink 不再进入 core workspace。它们通过 `surface.json` 和 JSONL sidecar 协议被 Gateway 发现和调用。
+WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进入 core workspace。它们通过 `surface.json` 和 JSONL sidecar 协议被 Gateway 发现和调用。
 
 ## 3. Workspace 能力分层
 
@@ -202,12 +204,12 @@ Surface 通过 `surface.json` 描述自己：
 {
   "schema": "cowd.surface.v1",
   "id": "feishu",
-  "name": "Feishu Surface",
-  "kind": "external-integration",
-  "entry": "./cowd-surface-feishu",
+  "name": "Feishu Message Connector",
+  "kind": "message-connector",
+  "entry": "./cowd-edge-feishu-message",
   "transport": "stdio-jsonl",
   "lifecycle": "managed",
-  "capabilities": ["ingress", "egress", "callback", "health"],
+  "capabilities": ["message.ingress", "message.egress", "message.callback", "health"],
   "routes": [
     { "kind": "callback", "path": "/events", "method": "POST", "public": true }
   ],
@@ -466,17 +468,17 @@ npm --prefix surfaces/webui run build
 
 然后通过 `gateway.webui_dir` 指向 `surfaces/webui/dist`。
 
-### 6.5 外部渠道
+### 6.5 Cowd Edge
 
-外部渠道在 `cowd-surface` 构建：
+外部 surface 与 connector 在 Cowd Edge 仓库构建：
 
 ```bash
 cd ../cowd-surface
 cargo check --workspace --bins
-cargo build --release -p surface-adapters --bins
+cargo build --release -p edge-adapters --bins
 ```
 
-每个渠道 surface 都通过 `surface.json` 暴露能力，不进入 core 依赖图。
+每个 UI surface、message connector 与 source connector 都通过 `surface.json` 暴露能力，不进入 core 依赖图。
 
 ## 7. Capability 与投影
 
@@ -632,7 +634,7 @@ npm --prefix surfaces/webui run build
 
 ```bash
 cargo tree -p cli --edges normal | rg 'tui|ratatui|crossterm|syntect|tui-textarea'
-cargo tree -p gateway --edges normal | rg 'surface-adapters|lettre|imap|mail-parser'
+cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser'
 ```
 
 默认情况下第一条不应输出 TUI 渲染依赖；第二条不应输出平台 SDK。

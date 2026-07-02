@@ -14,6 +14,8 @@ pub struct MatrixSourcePack {
     #[serde(default)]
     pub fact_mappings: Vec<MatrixSourceFactMapping>,
     #[serde(default)]
+    pub relation_mappings: Vec<MatrixSourceRelationMapping>,
+    #[serde(default)]
     pub reconciliation_rules: Vec<String>,
     #[serde(default)]
     pub quality_rules: Vec<String>,
@@ -49,8 +51,21 @@ pub struct MatrixSourceFactMapping {
     pub entity_ref_fields: Vec<String>,
     #[serde(default)]
     pub measure_fields: Vec<String>,
+    #[serde(default)]
+    pub event_time_field: Option<String>,
     pub dedup_key: String,
     pub delta_signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixSourceRelationMapping {
+    pub source_table: String,
+    pub relation_type: String,
+    pub from_source_key_field: String,
+    pub to_source_key_field: String,
+    #[serde(default)]
+    pub attribute_fields: Vec<String>,
+    pub dedup_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -298,9 +298,9 @@ fn setup_wechat_item() -> SetupItem {
         id: "wechat",
         label: "WeChat",
         status: "action",
-        summary: "Provided by the wechat-ilink Surface sidecar".to_string(),
+        summary: "Provided by the wechat-ilink Edge message connector".to_string(),
         next: Some(
-            "Install cowd-surface-wechat-ilink under the configured surfaces directory".to_string(),
+            "Install cowd-edge-wechat-ilink-message under the configured connectors/message directory".to_string(),
         ),
     }
 }

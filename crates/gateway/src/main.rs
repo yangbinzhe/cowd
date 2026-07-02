@@ -372,7 +372,7 @@ fn build_memory_config(
     Some(mc)
 }
 
-/// Convert `runtime::GatewayConfig` into external Surface descriptors.
+/// Convert `runtime::GatewayConfig` into external Edge message connector descriptors.
 /// Filters out `api_server` because it is the gateway listener itself.
 fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceManifest> {
     if !gw.enabled {
@@ -390,15 +390,15 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
             surface::SurfaceManifest {
                 schema: surface::SURFACE_PROTOCOL.to_string(),
                 id: id.clone(),
-                name: format!("{id} surface"),
+                name: format!("{id} message connector"),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                kind: surface::SurfaceKind::ExternalIntegration,
-                entry: Some(format!("./cowd-surface-{id}")),
+                kind: surface::SurfaceKind::MessageConnector,
+                entry: Some(format!("./cowd-edge-{id}-message")),
                 transport: surface::SurfaceTransport::StdioJsonl,
                 lifecycle: surface::SurfaceLifecycle::Managed,
                 capabilities: surface::channel::channel_transport_capabilities(&id)
                     .into_iter()
-                    .map(str::to_string)
+                    .map(|capability| format!("message.{capability}"))
                     .collect(),
                 routes: Vec::new(),
                 resources: Vec::new(),
@@ -833,7 +833,7 @@ fn run_gateway_action(
 }
 
 fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
-    Err("wechat QR login is provided by the `wechat-ilink` Surface sidecar; install and enable `cowd-surface-wechat-ilink`".into())
+    Err("wechat QR login is provided by the `wechat-ilink` Edge message connector; install and enable `cowd-edge-wechat-ilink-message`".into())
 }
 
 fn should_bootstrap_for_action(_action: &CliAction) -> bool {

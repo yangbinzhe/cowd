@@ -91,7 +91,7 @@ fn gateway_owns_surface_boundary(repo_root: &Path) -> SourceSelfAuditCheck {
         passed,
         "gateway must expose channel APIs through Surface contracts without adapter SDK coupling",
         vec![path, channel_routes],
-        "depend on surface, use surface::channel contracts, and keep platform SDKs behind JSONL Surface sidecars",
+        "depend on surface, use surface::channel contracts, and keep platform SDKs behind JSONL Edge sidecars",
     )
 }
 

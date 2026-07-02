@@ -22,7 +22,8 @@ use matrix_core::{
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
     MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
     MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
-    MatrixSourcePackValidation,
+    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
+    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 
 #[derive(Debug, Error)]
@@ -54,6 +55,7 @@ pub struct MatrixHealth {
     pub source_pack_count: u64,
     pub data_plane_watermark_count: u64,
     pub connector_run_count: u64,
+    pub source_snapshot_count: u64,
     pub ontology_pack_count: u64,
     pub entity_match_candidate_count: u64,
     pub entity_conflict_decision_count: u64,
@@ -123,6 +125,7 @@ impl MatrixSqliteRepository {
             source_pack_count: count_table(&connection, "matrix_source_pack")?,
             data_plane_watermark_count: count_table(&connection, "matrix_data_plane_watermark")?,
             connector_run_count: count_table(&connection, "matrix_connector_run")?,
+            source_snapshot_count: count_table(&connection, "matrix_source_snapshot")?,
             ontology_pack_count: count_table(&connection, "matrix_ontology_pack")?,
             entity_match_candidate_count: count_table(
                 &connection,
@@ -624,6 +627,281 @@ impl MatrixSqliteRepository {
         find_connector_run(&connection, run_id)
     }
 
+    pub fn plan_source_snapshot(
+        &self,
+        source_pack_id: &str,
+        resource_ref: Option<String>,
+        estimated_rows: Option<u64>,
+    ) -> Result<MatrixSourceSnapshotPlan, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_pack = find_source_pack(&connection, source_pack_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
+        let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
+        let validation = source_pack.validate();
+        Ok(MatrixSourceSnapshotPlan {
+            source_pack_id: source_pack.source_pack_id.clone(),
+            source_ref: resource_ref.unwrap_or_else(|| source_pack.source_name.clone()),
+            source_kind: source_kind_for_access_mode(&source_pack.access_mode),
+            access_mode: source_pack.access_mode,
+            refresh_mode: source_pack.refresh_mode,
+            estimated_rows: estimated_rows.unwrap_or(0),
+            fact_types: delta_plan.fact_types,
+            affected_metric_ids: delta_plan.affected_metric_ids,
+            quality_warnings: validation.warnings,
+            planned_at: Utc::now(),
+        })
+    }
+
+    pub fn upsert_source_snapshot(
+        &self,
+        snapshot: MatrixSourceSnapshot,
+    ) -> Result<MatrixSourceSnapshot, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_source_snapshot(&connection, &snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn create_source_snapshot(
+        &self,
+        input: MatrixSourceSnapshotInput,
+    ) -> Result<MatrixSourceSnapshot, MatrixSqliteRepositoryError> {
+        self.upsert_source_snapshot(MatrixSourceSnapshot::from_input(input))
+    }
+
+    pub fn get_source_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_source_snapshot(&connection, snapshot_id)
+    }
+
+    pub fn list_source_snapshots(
+        &self,
+        source_pack_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_source_snapshots(&connection, source_pack_id, limit)
+    }
+
+    pub fn apply_source_snapshot_rows(
+        &self,
+        source_pack_id: &str,
+        snapshot: MatrixSourceSnapshot,
+        rows: &[Value],
+    ) -> Result<MatrixSourceSnapshotApplyReport, MatrixSqliteRepositoryError> {
+        let mut attention_count = 0usize;
+        let mut relation_count = 0usize;
+        let mut fact_refs = Vec::new();
+        let mut warnings = BTreeSet::new();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_pack = find_source_pack(&connection, source_pack_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
+        insert_source_snapshot(&connection, &snapshot)?;
+
+        for row in rows {
+            let row_hash = stable_json_hash(row);
+            for mapping in &source_pack.entity_mappings {
+                if let Some(source_key) = row_value(row, &mapping.source_key_field) {
+                    let entity = MatrixEntity::from_input(matrix_core::MatrixEntityInput {
+                        entity_id: Some(stable_entity_id(
+                            &source_pack.source_name,
+                            &mapping.matrix_entity_type,
+                            &source_key,
+                        )),
+                        entity_type: mapping.matrix_entity_type.clone(),
+                        canonical_key: source_key.clone(),
+                        display_name: Some(source_key.clone()),
+                        source_keys: vec![MatrixSourceKey {
+                            source_system: source_pack.source_name.clone(),
+                            source_key,
+                            source_ref: Some(format!("{}/row/{row_hash}", snapshot.reference())),
+                        }],
+                        attributes: row.clone(),
+                        confidence: Some(snapshot.confidence),
+                    });
+                    upsert_entity(&connection, &entity)?;
+                }
+            }
+
+            for mapping in &source_pack.fact_mappings {
+                let source_ref = format!("{}/row/{row_hash}", snapshot.reference());
+                let entity_refs = mapping
+                    .entity_ref_fields
+                    .iter()
+                    .filter_map(|field| {
+                        row_value(row, field).map(|value| {
+                            stable_entity_reference_for_field(&source_pack, field, &value)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let measures = pick_fields(row, &mapping.measure_fields);
+                let dimensions = omit_fields(
+                    row,
+                    &mapping
+                        .measure_fields
+                        .iter()
+                        .chain(std::iter::once(&mapping.dedup_key))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+                let fact = MatrixFact::from_input(matrix_core::MatrixFactInput {
+                    fact_id: Some(stable_fact_id(
+                        &snapshot.snapshot_id,
+                        &mapping.fact_type,
+                        row_value(row, &mapping.dedup_key)
+                            .as_deref()
+                            .unwrap_or(&row_hash),
+                    )),
+                    snapshot_id: Some(snapshot.snapshot_id.clone()),
+                    fact_type: mapping.fact_type.clone(),
+                    entity_refs,
+                    metric_key: Some(mapping.metric_key.clone()),
+                    dimensions,
+                    measures,
+                    event_time: mapping
+                        .event_time_field
+                        .as_deref()
+                        .and_then(|field| row_value(row, field))
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                        .map(|value| value.with_timezone(&Utc))
+                        .or(Some(snapshot.captured_at)),
+                    valid_from: None,
+                    valid_to: None,
+                    source_ref: Some(source_ref),
+                    confidence: Some(snapshot.confidence),
+                    raw_hash: Some(stable_json_hash(&serde_json::json!({
+                        "row": row,
+                        "mapping": mapping,
+                        "snapshot": snapshot.snapshot_id,
+                    }))),
+                });
+                let mut attention = MatrixAttentionItem::from_fact(
+                    &fact.fact_id,
+                    &fact.fact_type,
+                    fact.entity_refs.first().cloned(),
+                    fact.confidence,
+                );
+                attention.attention_id =
+                    stable_attention_id("source_snapshot_apply", &fact.fact_id);
+                connection.execute(
+                    r"INSERT OR REPLACE INTO matrix_fact (
+                        fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
+                        dimensions_json, measures_json, event_time, valid_from, valid_to,
+                        source_ref, confidence, raw_hash, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        fact.fact_id,
+                        fact.snapshot_id,
+                        fact.fact_type,
+                        serde_json::to_string(&fact.entity_refs)?,
+                        fact.metric_key,
+                        serde_json::to_string(&fact.dimensions)?,
+                        serde_json::to_string(&fact.measures)?,
+                        fact.event_time.to_rfc3339(),
+                        fact.valid_from.map(|value| value.to_rfc3339()),
+                        fact.valid_to.map(|value| value.to_rfc3339()),
+                        fact.source_ref,
+                        fact.confidence,
+                        fact.raw_hash,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+                upsert_attention(&connection, &attention)?;
+                attention_count += 1;
+                fact_refs.push(format!("matrix:fact:{}", fact.fact_id));
+            }
+
+            for mapping in &source_pack.relation_mappings {
+                let Some(from_key) = row_value(row, &mapping.from_source_key_field) else {
+                    warnings.insert(format!(
+                        "relation_mapping_missing_from_field:{}",
+                        mapping.from_source_key_field
+                    ));
+                    continue;
+                };
+                let Some(to_key) = row_value(row, &mapping.to_source_key_field) else {
+                    warnings.insert(format!(
+                        "relation_mapping_missing_to_field:{}",
+                        mapping.to_source_key_field
+                    ));
+                    continue;
+                };
+                let Some(from_entity_id) = stable_entity_id_for_field(
+                    &source_pack,
+                    &mapping.from_source_key_field,
+                    &from_key,
+                ) else {
+                    warnings.insert(format!(
+                        "relation_mapping_missing_entity_mapping:{}",
+                        mapping.from_source_key_field
+                    ));
+                    continue;
+                };
+                let Some(to_entity_id) =
+                    stable_entity_id_for_field(&source_pack, &mapping.to_source_key_field, &to_key)
+                else {
+                    warnings.insert(format!(
+                        "relation_mapping_missing_entity_mapping:{}",
+                        mapping.to_source_key_field
+                    ));
+                    continue;
+                };
+                let relation = MatrixRelation::from_input(matrix_core::MatrixRelationInput {
+                    relation_id: Some(stable_relation_id(
+                        &snapshot.snapshot_id,
+                        &mapping.relation_type,
+                        &from_entity_id,
+                        &to_entity_id,
+                        row_value(row, &mapping.dedup_key)
+                            .as_deref()
+                            .unwrap_or(&row_hash),
+                    )),
+                    relation_type: mapping.relation_type.clone(),
+                    from_entity_id,
+                    to_entity_id,
+                    attributes: pick_fields(row, &mapping.attribute_fields),
+                    confidence: Some(snapshot.confidence),
+                });
+                upsert_relation(&connection, &relation)?;
+                relation_count += 1;
+            }
+        }
+
+        if source_pack.fact_mappings.is_empty() {
+            warnings.insert("source_pack_has_no_fact_mappings".to_string());
+        }
+
+        Ok(MatrixSourceSnapshotApplyReport {
+            snapshot_id: snapshot.snapshot_id,
+            source_pack_id: source_pack_id.to_string(),
+            status: "applied".to_string(),
+            row_count: rows.len() as u64,
+            fact_count: fact_refs.len(),
+            relation_count,
+            attention_count,
+            warnings: warnings.into_iter().collect(),
+            fact_refs,
+            applied_at: Utc::now(),
+        })
+    }
+
     pub fn list_attention(
         &self,
         limit: usize,
@@ -943,7 +1221,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO matrix_schema (id, schema_version, updated_at)
-        VALUES (1, 17, datetime('now'))
+        VALUES (1, 18, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN matrix_schema.schema_version < excluded.schema_version
@@ -1151,6 +1429,22 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             ON matrix_connector_run(source_pack_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_matrix_connector_run_status
             ON matrix_connector_run(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_source_snapshot (
+            snapshot_id TEXT PRIMARY KEY,
+            source_pack_id TEXT,
+            source_system TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            resource_ref TEXT,
+            row_count INTEGER NOT NULL,
+            checksum TEXT,
+            snapshot_json TEXT NOT NULL,
+            captured_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_source_snapshot_pack
+            ON matrix_source_snapshot(source_pack_id, captured_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_matrix_source_snapshot_source
+            ON matrix_source_snapshot(source_system, captured_at DESC);
 
         CREATE TABLE IF NOT EXISTS matrix_ontology_pack (
             ontology_id TEXT PRIMARY KEY,
@@ -2553,6 +2847,81 @@ fn find_connector_run(
         .transpose()
 }
 
+fn insert_source_snapshot(
+    connection: &Connection,
+    snapshot: &MatrixSourceSnapshot,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO matrix_source_snapshot (
+            snapshot_id, source_pack_id, source_system, source_kind, resource_ref,
+            row_count, checksum, snapshot_json, captured_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            snapshot.snapshot_id,
+            snapshot.source_pack_id,
+            snapshot.source_system,
+            format!("{:?}", snapshot.source_kind).to_ascii_lowercase(),
+            snapshot.resource_ref,
+            snapshot.row_count as i64,
+            snapshot.checksum,
+            serde_json::to_string(snapshot)?,
+            snapshot.captured_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_source_snapshot(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<Option<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
+    connection
+        .query_row(
+            "SELECT snapshot_json FROM matrix_source_snapshot WHERE snapshot_id = ?1",
+            params![snapshot_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
+        .transpose()
+}
+
+fn list_source_snapshots(
+    connection: &Connection,
+    source_pack_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
+    let limit = limit.clamp(1, 500);
+    let mut snapshots = Vec::new();
+    if let Some(source_pack_id) = source_pack_id {
+        let mut statement = connection.prepare(
+            r"SELECT snapshot_json
+              FROM matrix_source_snapshot
+              WHERE source_pack_id = ?1
+              ORDER BY captured_at DESC, snapshot_id ASC
+              LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![source_pack_id, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            snapshots.push(serde_json::from_str(&row?)?);
+        }
+    } else {
+        let mut statement = connection.prepare(
+            r"SELECT snapshot_json
+              FROM matrix_source_snapshot
+              ORDER BY captured_at DESC, snapshot_id ASC
+              LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            snapshots.push(serde_json::from_str(&row?)?);
+        }
+    }
+    Ok(snapshots)
+}
+
 fn upsert_data_plane_watermark(
     connection: &Connection,
     watermark: &MatrixDataPlaneWatermark,
@@ -2598,6 +2967,161 @@ fn parse_rfc3339_utc(value: &str) -> Result<chrono::DateTime<Utc>, MatrixSqliteR
             )))
         })?
         .with_timezone(&Utc))
+}
+
+fn source_kind_for_access_mode(access_mode: &str) -> matrix_core::MatrixSourceKind {
+    match access_mode {
+        "api" => matrix_core::MatrixSourceKind::Api,
+        "db_view" | "database_view" | "database_file" | "database_service" | "sqlite" => {
+            matrix_core::MatrixSourceKind::Db
+        }
+        "file" | "batch_file" | "file_batch" | "manual_upload" => {
+            matrix_core::MatrixSourceKind::File
+        }
+        "manual" => matrix_core::MatrixSourceKind::Manual,
+        "connector" => matrix_core::MatrixSourceKind::Connector,
+        "rpa" => matrix_core::MatrixSourceKind::Rpa,
+        _ => matrix_core::MatrixSourceKind::Connector,
+    }
+}
+
+fn row_value(row: &Value, field: &str) -> Option<String> {
+    row.get(field)
+        .map(json_scalar_to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn json_scalar_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+fn pick_fields(row: &Value, fields: &[String]) -> Value {
+    let mut object = serde_json::Map::new();
+    if fields.is_empty() {
+        return row.clone();
+    }
+    for field in fields {
+        object.insert(
+            field.clone(),
+            row.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(object)
+}
+
+fn omit_fields(row: &Value, fields: &[String]) -> Value {
+    let Some(source) = row.as_object() else {
+        return row.clone();
+    };
+    let mut object = serde_json::Map::new();
+    for (key, value) in source {
+        if !fields.iter().any(|field| field == key) {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(object)
+}
+
+fn stable_json_hash(value: &Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    stable_hash_bytes(&bytes)
+}
+
+fn stable_hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+fn stable_suffix(parts: &[&str]) -> String {
+    let mut bytes = Vec::new();
+    for part in parts {
+        bytes.extend_from_slice(part.as_bytes());
+        bytes.push(0);
+    }
+    stable_hash_bytes(&bytes)
+        .trim_start_matches("sha256:")
+        .chars()
+        .take(24)
+        .collect()
+}
+
+fn stable_entity_id(source_name: &str, entity_type: &str, source_key: &str) -> String {
+    format!(
+        "entity-{}",
+        stable_suffix(&[source_name, entity_type, source_key])
+    )
+}
+
+fn stable_entity_reference(source_name: &str, source_key: &str) -> String {
+    format!(
+        "matrix:entity:{}",
+        stable_suffix(&[source_name, source_key])
+    )
+}
+
+fn stable_entity_id_for_field(
+    source_pack: &MatrixSourcePack,
+    source_key_field: &str,
+    source_key: &str,
+) -> Option<String> {
+    source_pack
+        .entity_mappings
+        .iter()
+        .find(|mapping| mapping.source_key_field == source_key_field)
+        .map(|mapping| {
+            stable_entity_id(
+                &source_pack.source_name,
+                &mapping.matrix_entity_type,
+                source_key,
+            )
+        })
+}
+
+fn stable_entity_reference_for_field(
+    source_pack: &MatrixSourcePack,
+    source_key_field: &str,
+    source_key: &str,
+) -> String {
+    stable_entity_id_for_field(source_pack, source_key_field, source_key)
+        .map(|entity_id| format!("matrix:entity:{entity_id}"))
+        .unwrap_or_else(|| stable_entity_reference(&source_pack.source_name, source_key))
+}
+
+fn stable_fact_id(snapshot_id: &str, fact_type: &str, dedup_key: &str) -> String {
+    format!(
+        "fact-{}",
+        stable_suffix(&[snapshot_id, fact_type, dedup_key])
+    )
+}
+
+fn stable_relation_id(
+    snapshot_id: &str,
+    relation_type: &str,
+    from_entity_id: &str,
+    to_entity_id: &str,
+    dedup_key: &str,
+) -> String {
+    format!(
+        "relation-{}",
+        stable_suffix(&[
+            snapshot_id,
+            relation_type,
+            from_entity_id,
+            to_entity_id,
+            dedup_key
+        ])
+    )
+}
+
+fn stable_attention_id(source: &str, fact_id: &str) -> String {
+    format!("attention-{}", stable_suffix(&[source, fact_id]))
 }
 
 fn parse_optional_rfc3339_utc(
@@ -2663,5 +3187,135 @@ fn attention_from_change(
         status: "open".to_string(),
         created_at: now,
         updated_at: now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_core::{
+        MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKind,
+        MatrixSourceRelationMapping,
+    };
+
+    #[test]
+    fn source_snapshot_apply_maps_rows_to_matrix_records_idempotently() {
+        let repository = MatrixSqliteRepository::in_memory().unwrap();
+        let source_pack = MatrixSourcePack {
+            source_pack_id: "source-pack-supply-orders".to_string(),
+            source_name: "supply_fixture".to_string(),
+            owner: "test".to_string(),
+            access_mode: "file".to_string(),
+            refresh_mode: "snapshot".to_string(),
+            entity_mappings: vec![
+                MatrixSourceEntityMapping {
+                    source_entity: "supplier".to_string(),
+                    matrix_entity_type: "supplier".to_string(),
+                    source_key_field: "supplier_id".to_string(),
+                },
+                MatrixSourceEntityMapping {
+                    source_entity: "part".to_string(),
+                    matrix_entity_type: "part".to_string(),
+                    source_key_field: "part_id".to_string(),
+                },
+            ],
+            fact_mappings: vec![MatrixSourceFactMapping {
+                source_table: "orders".to_string(),
+                fact_type: "supply.order".to_string(),
+                metric_key: "supply_qty".to_string(),
+                entity_ref_fields: vec!["supplier_id".to_string(), "part_id".to_string()],
+                measure_fields: vec!["qty".to_string()],
+                event_time_field: Some("event_time".to_string()),
+                dedup_key: "order_id".to_string(),
+                delta_signature: "order_id".to_string(),
+            }],
+            relation_mappings: vec![MatrixSourceRelationMapping {
+                source_table: "orders".to_string(),
+                relation_type: "supplies".to_string(),
+                from_source_key_field: "supplier_id".to_string(),
+                to_source_key_field: "part_id".to_string(),
+                attribute_fields: vec!["qty".to_string()],
+                dedup_key: "order_id".to_string(),
+            }],
+            reconciliation_rules: vec!["source_snapshot_is_idempotent".to_string()],
+            quality_rules: vec!["dedup_key_required".to_string()],
+            freshness_sla: Some("manual".to_string()),
+            security_policy: Some("test_fixture".to_string()),
+            metadata: serde_json::json!({"fixture": true}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        repository.upsert_source_pack(source_pack).unwrap();
+
+        let rows = vec![
+            serde_json::json!({
+                "order_id": "O1",
+                "supplier_id": "S1",
+                "part_id": "P1",
+                "qty": 12,
+                "event_time": "2026-07-02T00:00:00Z"
+            }),
+            serde_json::json!({
+                "order_id": "O2",
+                "supplier_id": "S2",
+                "part_id": "P2",
+                "qty": 4,
+                "event_time": "2026-07-02T01:00:00Z"
+            }),
+        ];
+        let snapshot = repository
+            .create_source_snapshot(MatrixSourceSnapshotInput {
+                snapshot_id: Some("snapshot-source-orders-1".to_string()),
+                source_pack_id: Some("source-pack-supply-orders".to_string()),
+                source_system: "supply_fixture".to_string(),
+                source_kind: MatrixSourceKind::File,
+                resource_ref: Some("file://orders.csv".to_string()),
+                business_period: None,
+                captured_at: None,
+                schema_version: Some("source:csv:orders".to_string()),
+                row_count: Some(rows.len() as u64),
+                checksum: Some("sha256:test".to_string()),
+                confidence: Some(0.96),
+                metadata: Value::Null,
+            })
+            .unwrap();
+
+        let report = repository
+            .apply_source_snapshot_rows("source-pack-supply-orders", snapshot.clone(), &rows)
+            .unwrap();
+        assert_eq!(report.fact_count, 2);
+        assert_eq!(report.relation_count, 2);
+        assert!(report.warnings.is_empty());
+
+        let supplier = repository
+            .resolve_entity_by_source_key("supply_fixture", "S1")
+            .unwrap()
+            .expect("supplier entity should be indexed by source key");
+        let relations = repository
+            .list_entity_relations(&supplier.entity_id, 10)
+            .unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_type, "supplies");
+
+        let facts = repository.list_facts(10).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|fact| fact
+            .entity_refs
+            .iter()
+            .any(|reference| reference.starts_with("matrix:entity:entity-"))));
+
+        let snapshots = repository
+            .list_source_snapshots(Some("source-pack-supply-orders"), 10)
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+
+        repository
+            .apply_source_snapshot_rows("source-pack-supply-orders", snapshot, &rows)
+            .unwrap();
+        let health = repository.health().unwrap();
+        assert_eq!(health.source_snapshot_count, 1);
+        assert_eq!(health.fact_count, 2);
+        assert_eq!(health.relation_count, 2);
+        assert_eq!(health.attention_count, 2);
     }
 }

@@ -522,7 +522,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
-        "gateway must not depend on channel-adapters; platform SDKs live in cowd-surface sidecars"
+        "gateway must not depend on channel-adapters; platform SDKs live in Cowd Edge sidecars"
     );
     let channel_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/channel_routes.rs",
@@ -1423,7 +1423,7 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
         !gateway_dependencies.contains("channel = { path = \"../channel\" }")
             && gateway_dependencies.contains("surface = { path = \"../surface\" }")
             && !gateway_dependencies.contains("channel-adapters = "),
-        "gateway must consume surface::channel contracts and Surface sidecar protocol without adapter SDK coupling"
+        "gateway must consume surface::channel contracts and Edge sidecar protocol without adapter SDK coupling"
     );
 
     let runtime_host =

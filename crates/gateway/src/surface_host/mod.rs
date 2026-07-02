@@ -56,7 +56,7 @@ impl SurfaceHost {
     ) -> Self {
         let message_root = roots
             .first()
-            .map(|root| root.join(".cowd-surface-messages"))
+            .map(|root| root.join(".cowd-edge-messages"))
             .unwrap_or_else(|| SurfaceMessageStore::default_root(Path::new(".")));
         Self::with_configs_and_message_store(
             roots,
@@ -97,12 +97,12 @@ impl SurfaceHost {
         let install_root = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .map(|root| root.join("surfaces"));
+            .map(|root| edge_manifest_roots(&root));
         let mut roots = Vec::new();
-        if let Some(root) = install_root {
-            roots.push(root);
+        if let Some(mut install_roots) = install_root {
+            roots.append(&mut install_roots);
         }
-        roots.push(config_home.join("surfaces"));
+        roots.extend(edge_manifest_roots(config_home));
         Self::with_configs_and_message_store(
             roots,
             configs,
@@ -119,6 +119,17 @@ impl SurfaceHost {
     pub(crate) fn message_store_root(&self) -> &Path {
         self.messages.root()
     }
+}
+
+fn edge_manifest_roots(root: &Path) -> Vec<PathBuf> {
+    [
+        root.join("surfaces"),
+        root.join("connectors").join("message"),
+        root.join("connectors").join("source"),
+        root.join("connectors").join("automation"),
+    ]
+    .into_iter()
+    .collect()
 }
 
 impl Default for SurfaceHost {
@@ -139,14 +150,24 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn edge_manifest_roots_include_surfaces_and_connectors() {
+        let root = PathBuf::from("/tmp/cowd-edge-root");
+        let roots = edge_manifest_roots(&root);
+        assert!(roots.contains(&root.join("surfaces")));
+        assert!(roots.contains(&root.join("connectors").join("message")));
+        assert!(roots.contains(&root.join("connectors").join("source")));
+        assert!(roots.contains(&root.join("connectors").join("automation")));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn discovers_and_invokes_stdio_jsonl_sidecar() {
         let root =
-            std::env::temp_dir().join(format!("cowd-surface-host-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cowd-edge-host-test-{}", uuid::Uuid::new_v4()));
         let surface_dir = root.join("echo");
         fs::create_dir_all(&surface_dir).unwrap();
-        let sidecar = surface_dir.join("cowd-surface-echo");
+        let sidecar = surface_dir.join("cowd-edge-echo");
         fs::write(
             &sidecar,
             "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"sent\",\"message_id\":\"m-1\"}}'\n",
@@ -163,7 +184,7 @@ mod tests {
                 "name": "Echo Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-surface-echo",
+                "entry": "./cowd-edge-echo",
                 "transport": "stdio-jsonl",
                 "capabilities": ["send_text"],
                 "default_enabled": true
@@ -196,13 +217,13 @@ mod tests {
     #[tokio::test]
     async fn resolves_static_resources_and_rejects_traversal() {
         let root =
-            std::env::temp_dir().join(format!("cowd-surface-static-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cowd-edge-static-test-{}", uuid::Uuid::new_v4()));
         let surface_dir = root.join("panel");
         let public_dir = surface_dir.join("public");
         fs::create_dir_all(&public_dir).unwrap();
         fs::write(public_dir.join("index.html"), "<!doctype html>panel").unwrap();
         fs::write(public_dir.join("app.js"), "console.log('ok');").unwrap();
-        let sidecar = surface_dir.join("cowd-surface-panel");
+        let sidecar = surface_dir.join("cowd-edge-panel");
         fs::write(
             &sidecar,
             "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"ok\"}}'\n",
@@ -219,7 +240,7 @@ mod tests {
                 "name": "Panel Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-surface-panel",
+                "entry": "./cowd-edge-panel",
                 "resources": [
                     {"kind": "static", "mount": "/", "dir": "./public", "spa": true}
                 ]
@@ -257,13 +278,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_routes_dispatch_to_surface_action() {
-        let root = std::env::temp_dir().join(format!(
-            "cowd-surface-callback-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-callback-test-{}", uuid::Uuid::new_v4()));
         let surface_dir = root.join("hook");
         fs::create_dir_all(&surface_dir).unwrap();
-        let sidecar = surface_dir.join("cowd-surface-hook");
+        let sidecar = surface_dir.join("cowd-edge-hook");
         fs::write(
             &sidecar,
             "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"ok\",\"message_id\":\"cb-1\"}}'\n",
@@ -280,7 +299,7 @@ mod tests {
                 "name": "Hook Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-surface-hook",
+                "entry": "./cowd-edge-hook",
                 "routes": [
                     {"kind": "callback", "path": "/webhook", "method": "POST", "public": true}
                 ]
@@ -313,13 +332,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_sidecar_reuses_process_and_collects_events() {
-        let root = std::env::temp_dir().join(format!(
-            "cowd-surface-managed-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-managed-test-{}", uuid::Uuid::new_v4()));
         let surface_dir = root.join("managed");
         fs::create_dir_all(&surface_dir).unwrap();
-        let sidecar = surface_dir.join("cowd-surface-managed");
+        let sidecar = surface_dir.join("cowd-edge-managed");
         fs::write(
             &sidecar,
             r#"#!/usr/bin/env sh
@@ -342,7 +359,7 @@ done
                 "name": "Managed Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-surface-managed",
+                "entry": "./cowd-edge-managed",
                 "lifecycle": "managed",
                 "capabilities": ["send_text", "inbound"]
             }"#,

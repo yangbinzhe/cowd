@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use connector::{SourceReadPlan, SourceRecordBatch};
 use surface::{
     SurfaceActionRequest, SurfaceFrame, SurfaceOperationResult, SurfaceRegistrySnapshot,
     SurfaceRuntimeSnapshot, SurfaceSendRequest, SurfaceSupervisorEvent,
@@ -201,6 +202,44 @@ impl SurfaceService {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) async fn read_source_batch(
+        &self,
+        read_plan: &SourceReadPlan,
+    ) -> Result<SourceRecordBatch, String> {
+        let surface = source_connector_surface_id(&read_plan.adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.read_batch".to_string(),
+                payload: serde_json::to_value(read_plan)
+                    .map_err(|error| format!("source read plan encode failed: {error}"))?,
+            })
+            .await?;
+        if let Some(error) = result.error {
+            return Err(format!(
+                "source connector `{surface}` failed: {}",
+                error.message
+            ));
+        }
+        let payload = result
+            .payload
+            .ok_or_else(|| format!("source connector `{surface}` returned no payload"))?;
+        let batch_value = payload
+            .get("source_batch")
+            .cloned()
+            .unwrap_or_else(|| payload.clone());
+        let batch = serde_json::from_value::<SourceRecordBatch>(batch_value).map_err(|error| {
+            format!("source connector `{surface}` returned invalid batch: {error}")
+        })?;
+        if batch.adapter_id != read_plan.adapter_id {
+            return Err(format!(
+                "source connector `{surface}` returned adapter `{}` for requested `{}`",
+                batch.adapter_id, read_plan.adapter_id
+            ));
+        }
+        Ok(batch)
+    }
+
     pub(crate) async fn callback(
         &self,
         surface: &str,
@@ -274,5 +313,86 @@ impl SurfaceService {
             .repair_surface(surface)
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+fn source_connector_surface_id(adapter_id: &str) -> String {
+    match adapter_id {
+        "feishu_bitable" => "feishu-bitable".to_string(),
+        "lark_bitable" => "lark-bitable".to_string(),
+        other => surface::normalize_surface_id(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+
+    use connector::SourceReadPlan;
+
+    use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_source_batch_invokes_edge_source_connector() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-source-service-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let connector_dir = root.join("feishu-bitable");
+        fs::create_dir_all(&connector_dir).unwrap();
+        let sidecar = connector_dir.join("cowd-edge-fixture-source");
+        fs::write(
+            &sidecar,
+            r#"#!/usr/bin/env sh
+read _line
+printf '%s\n' '{"type":"ok","id":"reply","payload":{"status":"ok","source_batch":{"adapter_id":"feishu_bitable","resource_ref":"feishu-bitable://app/table","table":"orders","schema":{"table_name":"orders","fields":[{"name":"sku","data_type":"string","nullable":false}],"primary_key":[]},"rows":[{"sku":"A1"}],"cursor":{"offset":0,"limit":100,"next_offset":null},"row_count":1,"checksum":"fixture","truncated":false}}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&sidecar, permissions).unwrap();
+        fs::write(
+            connector_dir.join(surface::SURFACE_MANIFEST_FILE),
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "feishu-bitable",
+                "name": "Feishu Bitable Source Connector",
+                "version": "1.0.0",
+                "kind": "source-connector",
+                "entry": "./cowd-edge-fixture-source",
+                "capabilities": ["source.snapshot"],
+                "default_enabled": true
+            }"#,
+        )
+        .unwrap();
+
+        let host = Arc::new(crate::surface_host::SurfaceHost::new(vec![root.clone()]));
+        assert_eq!(host.discover().discovered, 1);
+        let service = SurfaceService::with_host(host);
+        let batch = service
+            .read_source_batch(&SourceReadPlan {
+                adapter_id: "feishu_bitable".to_string(),
+                resource_ref: "feishu-bitable://app/table".to_string(),
+                table: Some("orders".to_string()),
+                fields: Vec::new(),
+                limit: None,
+                offset: None,
+                cursor: None,
+                metadata: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(batch.adapter_id, "feishu_bitable");
+        assert_eq!(batch.rows.len(), 1);
+        assert_eq!(batch.schema.table_name, "orders");
+
+        let _ = fs::remove_dir_all(root);
     }
 }

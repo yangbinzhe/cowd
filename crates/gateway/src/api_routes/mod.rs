@@ -56,6 +56,7 @@ pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
+mod edge_routes;
 mod growth_routes;
 mod harness_eval_routes;
 mod matrix_outcomes;
@@ -330,6 +331,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(context_routes::router())
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
+        .merge(edge_routes::router())
         .merge(growth_routes::router())
         .merge(harness_eval_routes::router())
         .merge(matrix_routes::router())
@@ -521,7 +523,7 @@ fn api_error(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{
         body::to_bytes,
@@ -656,7 +658,7 @@ mod tests {
         ))
     }
 
-    fn test_state() -> Arc<AppState> {
+    pub(crate) fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
@@ -3035,6 +3037,186 @@ mod tests {
         );
         assert_eq!(watermarks_json["list_status"], "ready");
         assert_eq!(watermarks_json["items"][0]["source_ref"], "pack-1");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn matrix_source_snapshot_run_maps_rows_through_gateway_api() {
+        let workspace = test_temp_dir("matrix-source-snapshot-workspace");
+        let config_home = test_temp_dir("matrix-source-snapshot-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let adapters = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/sources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(adapters.status(), StatusCode::OK);
+        let adapters_body = to_bytes(adapters.into_body(), usize::MAX).await.unwrap();
+        let adapters_json: serde_json::Value = serde_json::from_slice(&adapters_body).unwrap();
+        assert!(adapters_json["adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| adapter["adapter_id"] == "feishu_bitable"));
+
+        let source_upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/matrix/source-packs/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_pack": {
+                                "source_pack_id": "pack-snapshot-orders",
+                                "source_name": "supply_gateway_fixture",
+                                "owner": "operations",
+                                "access_mode": "file",
+                                "refresh_mode": "snapshot",
+                                "entity_mappings": [
+                                    {
+                                        "source_entity": "supplier",
+                                        "matrix_entity_type": "supplier",
+                                        "source_key_field": "supplier_id"
+                                    },
+                                    {
+                                        "source_entity": "part",
+                                        "matrix_entity_type": "part",
+                                        "source_key_field": "part_id"
+                                    }
+                                ],
+                                "fact_mappings": [{
+                                    "source_table": "orders",
+                                    "fact_type": "supply.order",
+                                    "metric_key": "supply_qty",
+                                    "entity_ref_fields": ["supplier_id", "part_id"],
+                                    "measure_fields": ["qty"],
+                                    "event_time_field": "event_time",
+                                    "dedup_key": "order_id",
+                                    "delta_signature": "order_id"
+                                }],
+                                "relation_mappings": [{
+                                    "source_table": "orders",
+                                    "relation_type": "supplies",
+                                    "from_source_key_field": "supplier_id",
+                                    "to_source_key_field": "part_id",
+                                    "attribute_fields": ["qty"],
+                                    "dedup_key": "order_id"
+                                }],
+                                "reconciliation_rules": ["source_snapshot_is_idempotent"],
+                                "quality_rules": ["dedup_key_required"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source_upsert.status(), StatusCode::OK);
+
+        let plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/matrix/source-packs/pack-snapshot-orders/snapshots/plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "resource_ref": "file://orders.csv",
+                            "estimated_rows": 2
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), StatusCode::OK);
+
+        let run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/matrix/source-packs/pack-snapshot-orders/snapshots/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "snapshot": {
+                                "snapshot_id": "snapshot-gateway-orders-1",
+                                "source_system": "supply_gateway_fixture",
+                                "source_kind": "file",
+                                "resource_ref": "file://orders.csv",
+                                "schema_version": "source:csv:orders",
+                                "row_count": 2,
+                                "checksum": "sha256:fixture",
+                                "confidence": 0.95
+                            },
+                            "rows": [
+                                {
+                                    "order_id": "O1",
+                                    "supplier_id": "S1",
+                                    "part_id": "P1",
+                                    "qty": 12,
+                                    "event_time": "2026-07-02T00:00:00Z"
+                                },
+                                {
+                                    "order_id": "O2",
+                                    "supplier_id": "S2",
+                                    "part_id": "P2",
+                                    "qty": 4,
+                                    "event_time": "2026-07-02T01:00:00Z"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status(), StatusCode::OK);
+        let run_body = to_bytes(run.into_body(), usize::MAX).await.unwrap();
+        let run_json: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
+        assert_eq!(run_json["kind"], "matrix.source_snapshot.run");
+        assert_eq!(run_json["apply_report"]["fact_count"], 2);
+        assert_eq!(run_json["apply_report"]["relation_count"], 2);
+
+        let snapshots = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/matrix/source-packs/pack-snapshot-orders/snapshots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshots.status(), StatusCode::OK);
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/matrix/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let health_body = to_bytes(health.into_body(), usize::MAX).await.unwrap();
+        let health_json: serde_json::Value = serde_json::from_slice(&health_body).unwrap();
+        assert_eq!(health_json["source_snapshot_count"], 1);
+        assert_eq!(health_json["fact_count"], 2);
+        assert_eq!(health_json["relation_count"], 2);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
