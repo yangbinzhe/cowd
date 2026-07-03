@@ -1368,12 +1368,12 @@ fn palette_command_definitions() -> Vec<CommandDefinition> {
             },
         ),
         (
-            "palette.reload-providers",
-            "Reload Providers",
-            "Reload provider and model routing from runtime config",
+            "palette.refresh-config-status",
+            "Refresh Config Status",
+            "Refresh effective config, provider projection, and Gateway hot-reload status",
             CommandCategory::Config,
             CommandActionTarget::Client {
-                action: "reload-providers".into(),
+                action: "refresh-config-status".into(),
             },
         ),
         (

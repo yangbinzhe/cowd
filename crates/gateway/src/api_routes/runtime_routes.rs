@@ -1,7 +1,4 @@
-use std::{
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -22,7 +19,7 @@ pub(super) use control::{
 };
 use memory::store::session::SessionListOptions;
 use memory::RuntimeEvent;
-use runtime::{init_global_providers, AgentControlPolicy, RuntimeConfig};
+use runtime::{AgentControlPolicy, RuntimeConfig};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -34,6 +31,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/runtime/providers/reload",
             post(reload_runtime_providers),
+        )
+        .route("/api/runtime/config/reload", post(reload_runtime_config))
+        .route(
+            "/api/runtime/config/reload/status",
+            get(get_runtime_config_reload_status),
         )
         .route("/api/runtime/status", get(get_runtime_status))
         .route("/api/runtime/events", get(get_runtime_events))
@@ -400,91 +402,17 @@ pub(super) async fn get_runtime_effective_config(
 pub(super) async fn reload_runtime_providers(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    let loaded = state
-        .services
-        .system
-        .runtime_config(&state.workspace_root, &state.config_home);
-    match loaded {
-        Ok(runtime_config) => {
-            let source = if runtime_config.loaded_entries().is_empty() {
-                "default"
-            } else {
-                "config"
-            };
-            let providers = runtime_config.providers().clone();
-            let provider_count = providers.providers.len();
-            let provider_model_count: usize = providers
-                .providers
-                .values()
-                .map(|provider| provider.models.len())
-                .sum();
-            let configured_model = runtime_config.model().map(str::to_string);
-            let configured_model_provider = configured_model
-                .as_deref()
-                .and_then(|model| providers.resolve_full(model))
-                .map(|provider| provider.name.clone());
-            let configured_model_resolved =
-                configured_model.is_none() || configured_model_provider.is_some();
-            let mut provider_names: Vec<String> = providers.providers.keys().cloned().collect();
-            provider_names.sort();
+    Json(crate::runtime_config_reload::reload_runtime_providers_from_disk(&state).await)
+}
 
-            init_global_providers(providers);
+pub(super) async fn reload_runtime_config(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<Value> {
+    Json(crate::runtime_config_reload::force_gateway_config_reload(&state, "manual").await)
+}
 
-            tracing::info!(
-                target: "cowd.runtime.provider",
-                applied = true,
-                source,
-                provider_count,
-                provider_model_count,
-                configured_model = configured_model.as_deref().unwrap_or(""),
-                configured_model_provider = configured_model_provider.as_deref().unwrap_or(""),
-                configured_model_resolved,
-                "runtime providers reloaded"
-            );
-
-            Json(serde_json::json!({
-                "kind": "runtime_provider_reload",
-                "status": if provider_count == 0 { "unconfigured" } else if configured_model_resolved { "applied" } else { "attention" },
-                "applied": true,
-                "source": source,
-                "provider_count": provider_count,
-                "provider_model_count": provider_model_count,
-                "provider_names": provider_names,
-                "configured_model": configured_model,
-                "configured_model_provider": configured_model_provider,
-                "configured_model_resolved": configured_model_resolved,
-                "warnings": if provider_count == 0 {
-                    serde_json::json!(["no runtime providers are configured"])
-                } else if !configured_model_resolved {
-                    serde_json::json!(["configured default model is not declared by any provider"])
-                } else {
-                    serde_json::json!([])
-                }
-            }))
-        }
-        Err(error) => {
-            let message = format!("failed to load runtime config: {error}");
-            tracing::warn!(
-                target: "cowd.runtime.provider",
-                applied = false,
-                error = %error,
-                "runtime providers reload skipped"
-            );
-            Json(serde_json::json!({
-                "kind": "runtime_provider_reload",
-                "status": "failed",
-                "applied": false,
-                "source": "error",
-                "provider_count": 0,
-                "provider_model_count": 0,
-                "provider_names": [],
-                "configured_model": null,
-                "configured_model_provider": null,
-                "configured_model_resolved": false,
-                "warnings": [message]
-            }))
-        }
-    }
+pub(super) async fn get_runtime_config_reload_status() -> Json<Value> {
+    Json(crate::runtime_config_reload::status_value())
 }
 
 async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {

@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderValue;
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{
+    http::{header, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 use session::SessionLeaseRegistry;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
@@ -137,8 +138,9 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
     fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
         Ok(serde_json::json!({
             "ok": true,
-            "status": "reload_not_required",
-            "source": "runtime_mcp_service_adapter"
+            "status": "managed_by_gateway_config_reload",
+            "source": "runtime_mcp_service_adapter",
+            "hint": "use POST /api/runtime/config/reload to rebuild the MCP service from current config"
         }))
     }
 
@@ -224,6 +226,21 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
             output,
         })
     }
+}
+
+pub(crate) async fn install_runtime_mcp_service_from_config(
+    config: &RuntimeConfig,
+) -> Result<serde_json::Value, String> {
+    let service = Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(config).await);
+    let health = mcp::McpService::health(service.as_ref())
+        .map_err(|error| format!("failed to project MCP service health: {error}"))?;
+    tools::set_mcp_service(service).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "status": "applied",
+        "source": "runtime_mcp_service_adapter",
+        "health": health,
+    }))
 }
 
 // ── Background session cleanup task ────────────────────────────
@@ -409,6 +426,61 @@ async fn webui_not_configured_handler() -> impl IntoResponse {
     )
 }
 
+async fn webui_static_fallback_handler(state: Arc<api_routes::AppState>, uri: Uri) -> Response {
+    match state.services.surface.resolve_static("webui", uri.path()) {
+        Ok(Some(file)) => match tokio::fs::read(&file.file_path).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type_for_path(&file.file_path))],
+                bytes,
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to read WebUI asset: {error}"),
+                })),
+            )
+                .into_response(),
+        },
+        Ok(None) => webui_not_configured_handler().await.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
 fn build_cors_layer(explicit_origins: Vec<HeaderValue>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
@@ -515,9 +587,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             tracing::warn!(%error, "failed to load runtime config for MCP service");
             RuntimeConfig::empty()
         });
-    let mcp_service =
-        Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
-    let _ = tools::set_mcp_service(mcp_service);
+    let _ = install_runtime_mcp_service_from_config(&runtime_config).await;
     let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
     storage_config
         .layout
@@ -633,6 +703,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
+    crate::runtime_config_reload::initialize_config_reload_status(&app_state);
+    let _config_reload_watcher = crate::runtime_config_reload::spawn_config_reload_watcher(
+        app_state.clone(),
+        Duration::from_secs(2),
+    );
     crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)
@@ -655,14 +730,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let cors = build_cors_layer(cors_origin_values);
 
         let router = api_routes::api_router(app_state.clone());
-        if let (true, Some(webui_dir), Some(index_path)) = (
-            static_webui.available,
-            static_webui.configured_path.clone(),
-            static_webui.index_path.clone(),
-        ) {
-            tracing::info!(path = %webui_dir.display(), "serving configured WebUI assets");
+        let fallback_state = app_state.clone();
+        if static_webui.available {
+            tracing::info!(
+                path = %static_webui
+                    .configured_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                "serving configured WebUI assets through dynamic surface fallback"
+            );
             router
-                .fallback_service(ServeDir::new(webui_dir).fallback(ServeFile::new(index_path)))
+                .fallback(move |uri: Uri| {
+                    webui_static_fallback_handler(fallback_state.clone(), uri)
+                })
                 .layer(cors)
         } else {
             tracing::info!(
@@ -670,7 +751,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 config_key = static_webui.config_key,
                 "WebUI assets disabled; serving gateway API only"
             );
-            router.fallback(webui_not_configured_handler).layer(cors)
+            router
+                .fallback(move |uri: Uri| {
+                    webui_static_fallback_handler(fallback_state.clone(), uri)
+                })
+                .layer(cors)
         }
     };
 

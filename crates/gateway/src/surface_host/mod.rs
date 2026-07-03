@@ -160,6 +160,63 @@ mod tests {
         assert!(roots.contains(&root.join("connectors").join("automation")));
     }
 
+    #[tokio::test]
+    async fn reload_manifests_upserts_and_prunes_removed_edges() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-reload-test-{}", uuid::Uuid::new_v4()));
+        let surface_dir = root.join("echo");
+        fs::create_dir_all(&surface_dir).unwrap();
+        let manifest_path = surface_dir.join(SURFACE_MANIFEST_FILE);
+        fs::write(
+            &manifest_path,
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "echo",
+                "name": "Echo Surface",
+                "version": "1.0.0",
+                "kind": "external-integration",
+                "entry": "./cowd-edge-echo",
+                "transport": "stdio-jsonl",
+                "capabilities": ["send_text"],
+                "default_enabled": true
+            }"#,
+        )
+        .unwrap();
+
+        let host = SurfaceHost::new(vec![root.clone()]);
+        let first = host.reload_manifests().await;
+        assert_eq!(first.discovered, 1);
+        assert!(first.removed.is_empty());
+        assert_eq!(host.get("echo").unwrap().version, "1.0.0");
+
+        fs::write(
+            &manifest_path,
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "echo",
+                "name": "Echo Surface",
+                "version": "2.0.0",
+                "kind": "external-integration",
+                "entry": "./cowd-edge-echo",
+                "transport": "stdio-jsonl",
+                "capabilities": ["send_text", "receive_text"],
+                "default_enabled": true
+            }"#,
+        )
+        .unwrap();
+        let second = host.reload_manifests().await;
+        assert_eq!(second.discovered, 1);
+        assert_eq!(host.get("echo").unwrap().version, "2.0.0");
+
+        fs::remove_dir_all(&surface_dir).unwrap();
+        let third = host.reload_manifests().await;
+        assert_eq!(third.discovered, 0);
+        assert_eq!(third.removed, vec!["echo".to_string()]);
+        assert!(host.get("echo").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn discovers_and_invokes_stdio_jsonl_sidecar() {

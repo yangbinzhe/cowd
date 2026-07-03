@@ -176,10 +176,11 @@ pub(super) async fn mcp_servers_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<McpServerQuery>,
 ) -> impl IntoResponse {
-    let mut servers = configured_mcp_servers(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let mut servers = configured_mcp_servers(config.as_ref());
     let timeout_ms = query.timeout_ms.unwrap_or(300).clamp(50, 2_000);
     if query.probe {
-        apply_mcp_probe_results(&mut servers, state.config.as_ref(), timeout_ms).await;
+        apply_mcp_probe_results(&mut servers, config.as_ref(), timeout_ms).await;
     }
     let ready = servers
         .iter()

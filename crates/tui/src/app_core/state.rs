@@ -3509,8 +3509,9 @@ impl TuiState {
                         .show_notification(&format!("Switched to model: {model}"));
                 }
             }
-            Action::ReloadProviders => {
-                self.reload_runtime_provider_registry();
+            Action::RefreshConfigStatus => {
+                self.refresh_config_panel();
+                self.reload_runtime_provider_projection();
             }
             Action::HistoryBrowse(older) => {
                 let text = if older {
@@ -3999,14 +4000,17 @@ impl TuiState {
             run_gateway_api_blocking(
                 |client| async move { client.runtime_effective_config().await },
             );
+        let reload_status =
+            run_gateway_api_blocking(|client| async move { client.config_reload_status().await });
 
-        match (config, providers, effective) {
-            (Ok(config), Ok(providers), Ok(effective)) => {
+        match (config, providers, effective, reload_status) {
+            (Ok(config), Ok(providers), Ok(effective), Ok(reload_status)) => {
                 self.config_panel.sync_config(config, providers, effective);
+                self.config_panel.sync_config_reload_status(reload_status);
                 self.config_panel.set_status("Config projection refreshed");
                 true
             }
-            (config, providers, effective) => {
+            (config, providers, effective, reload_status) => {
                 let mut errors = Vec::new();
                 if let Err(error) = config {
                     errors.push(format!("config: {error}"));
@@ -4017,23 +4021,14 @@ impl TuiState {
                 if let Err(error) = effective {
                     errors.push(format!("effective: {error}"));
                 }
+                if let Err(error) = reload_status {
+                    errors.push(format!("reload-status: {error}"));
+                }
                 self.config_panel
                     .set_status(format!("Config refresh failed: {}", errors.join("; ")));
                 false
             }
         }
-    }
-
-    fn reload_runtime_provider_registry(&mut self) -> bool {
-        let result =
-            run_gateway_api_blocking(
-                |client| async move { client.reload_runtime_providers().await },
-            );
-        self.config_panel
-            .record_action_result("runtime.providers.reload", result);
-        self.refresh_config_panel();
-        self.runtime_activity_panel.sync_from_app(&self.app);
-        true
     }
 
     fn handle_config_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
@@ -4045,7 +4040,7 @@ impl TuiState {
         }
         match key.code {
             KeyCode::Char('e') => self.refresh_config_panel(),
-            KeyCode::Char('r') => self.reload_runtime_provider_registry(),
+            KeyCode::Char('r') => self.refresh_config_panel(),
             KeyCode::Enter => {
                 let Some(model) = self.config_panel.selected_model_id() else {
                     self.config_panel.set_status("No model selected");

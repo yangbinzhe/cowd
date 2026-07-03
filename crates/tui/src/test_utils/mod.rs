@@ -90,10 +90,10 @@ pub fn gateway_command_projection_fixture() -> serde_json::Value {
                 "action": { "kind": "client", "action": "slash:diff" }
             },
             {
-                "name": "Reload Providers",
-                "description": "Reload provider projection",
+                "name": "Refresh Config Status",
+                "description": "Refresh config projection and hot-reload status",
                 "aliases": [],
-                "action": { "kind": "client", "action": "reload-providers" }
+                "action": { "kind": "client", "action": "refresh-config-status" }
             },
             {
                 "name": "/setup",

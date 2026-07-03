@@ -630,9 +630,8 @@ impl GatewayApiClient {
             .await
     }
 
-    pub async fn reload_runtime_providers(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/runtime/providers/reload", serde_json::json!({}))
-            .await
+    pub async fn config_reload_status(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/config/reload/status").await
     }
 
     pub async fn runtime_timeline(

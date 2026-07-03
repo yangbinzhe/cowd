@@ -21,6 +21,8 @@ pub(super) struct ManagedSurfaceProcess {
 pub(crate) struct SurfaceDiscoveryReport {
     pub(crate) roots: Vec<String>,
     pub(crate) discovered: usize,
+    #[serde(default)]
+    pub(crate) removed: Vec<String>,
     pub(crate) failures: Vec<SurfaceDiscoveryFailure>,
 }
 

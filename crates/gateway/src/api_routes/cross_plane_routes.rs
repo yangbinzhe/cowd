@@ -236,7 +236,8 @@ async fn cross_plane_audit_handler(
 async fn cross_plane_action_adapters_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = channel_routes::configured_platforms(config.as_ref());
     let bound_adapters = bound_adapter_snapshot(&state).await;
     let capabilities = platforms
         .iter()
@@ -515,7 +516,8 @@ async fn evaluate_action_readiness(
 ) -> CrossPlaneActionReadiness {
     let (action, decision, evidence) = decide_connector_action(state, action, mode, now);
     let target_platform = target_platform_from_action(&action);
-    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = channel_routes::configured_platforms(config.as_ref());
     let platform_readiness = target_platform.as_ref().and_then(|target| {
         platforms
             .into_iter()

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use harness_contract::tool::{
     ToolDefinition as KernelToolDefinition, ToolPermissionMode as KernelToolPermissionMode,
@@ -18,25 +19,36 @@ pub use tool_specs::{mvp_tool_specs, ToolSpec};
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
-    use std::sync::OnceLock;
     static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
     REGISTRY.get_or_init(LspRegistry::new)
 }
 
-fn global_mcp_service() -> &'static std::sync::OnceLock<std::sync::Arc<dyn McpService>> {
-    use std::sync::OnceLock;
-    static SERVICE: OnceLock<std::sync::Arc<dyn McpService>> = OnceLock::new();
-    &SERVICE
+fn global_mcp_service() -> &'static RwLock<Option<Arc<dyn McpService>>> {
+    static SERVICE: OnceLock<RwLock<Option<Arc<dyn McpService>>>> = OnceLock::new();
+    SERVICE.get_or_init(|| RwLock::new(None))
 }
 
-pub fn set_mcp_service(service: std::sync::Arc<dyn McpService>) -> Result<(), &'static str> {
+pub fn set_mcp_service(service: Arc<dyn McpService>) -> Result<(), &'static str> {
+    let mut configured = global_mcp_service()
+        .write()
+        .map_err(|_| "mcp service registry poisoned")?;
+    *configured = Some(service);
+    Ok(())
+}
+
+pub fn clear_mcp_service() -> Result<(), &'static str> {
+    let mut configured = global_mcp_service()
+        .write()
+        .map_err(|_| "mcp service registry poisoned")?;
+    *configured = None;
+    Ok(())
+}
+
+fn configured_mcp_service() -> Option<Arc<dyn McpService>> {
     global_mcp_service()
-        .set(service)
-        .map_err(|_| "mcp service already configured")
-}
-
-fn configured_mcp_service() -> Option<std::sync::Arc<dyn McpService>> {
-    global_mcp_service().get().cloned()
+        .read()
+        .ok()
+        .and_then(|configured| configured.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,3 +470,100 @@ pub mod tool_orchestrator;
 pub mod tool_specs;
 #[path = "registry/web_tools.rs"]
 pub mod web_tools;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FakeMcpService {
+        name: &'static str,
+    }
+
+    impl McpService for FakeMcpService {
+        fn list_servers(&self) -> Result<Vec<mcp::McpServerProjection>, mcp::McpServiceError> {
+            Ok(vec![self.server(self.name)?])
+        }
+
+        fn server(&self, name: &str) -> Result<mcp::McpServerProjection, mcp::McpServiceError> {
+            Ok(mcp::McpServerProjection {
+                name: name.to_string(),
+                transport: mcp::McpTransportKind::ManagedProxy,
+                enabled: true,
+                status: "ready".to_string(),
+                auth_state: None,
+            })
+        }
+
+        fn health(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+            Ok(serde_json::json!({ "name": self.name }))
+        }
+
+        fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+
+        fn list_tools(
+            &self,
+            _server: Option<&str>,
+        ) -> Result<Vec<mcp::McpToolProjection>, mcp::McpServiceError> {
+            Ok(Vec::new())
+        }
+
+        fn list_resources(
+            &self,
+            _server: Option<&str>,
+        ) -> Result<Vec<mcp::McpResourceProjection>, mcp::McpServiceError> {
+            Ok(Vec::new())
+        }
+
+        fn read_resource(
+            &self,
+            server: &str,
+            uri: &str,
+        ) -> Result<mcp::McpResourceProjection, mcp::McpServiceError> {
+            Ok(mcp::McpResourceProjection {
+                server: server.to_string(),
+                uri: uri.to_string(),
+                name: None,
+                mime_type: None,
+                content: None,
+            })
+        }
+
+        fn call_tool(
+            &self,
+            request: mcp::McpToolCallRequest,
+        ) -> Result<mcp::McpToolCallReceipt, mcp::McpServiceError> {
+            Ok(mcp::McpToolCallReceipt {
+                server: request.server,
+                tool: request.tool,
+                ok: true,
+                output: serde_json::json!({ "name": self.name }),
+            })
+        }
+    }
+
+    #[test]
+    fn mcp_service_can_be_replaced_for_gateway_config_reload() {
+        clear_mcp_service().expect("clear service");
+        set_mcp_service(Arc::new(FakeMcpService { name: "first" })).expect("set first");
+        assert_eq!(
+            configured_mcp_service()
+                .expect("first service")
+                .health()
+                .unwrap()["name"],
+            "first"
+        );
+
+        set_mcp_service(Arc::new(FakeMcpService { name: "second" })).expect("replace service");
+        assert_eq!(
+            configured_mcp_service()
+                .expect("second service")
+                .health()
+                .unwrap()["name"],
+            "second"
+        );
+        clear_mcp_service().expect("clear service");
+    }
+}

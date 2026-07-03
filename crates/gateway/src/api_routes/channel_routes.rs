@@ -70,7 +70,8 @@ fn default_wechat_bot_type() -> String {
 }
 
 async fn list_platforms_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let platforms = configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
     Json(serde_json::json!(platforms))
 }
 
@@ -78,7 +79,8 @@ async fn get_platform_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let platforms = configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
     let matched = platforms
         .into_iter()
         .find(|platform| platform.name == name || platform.platform_type == name);
@@ -90,7 +92,8 @@ async fn get_platform_handler(
 }
 
 async fn list_channels_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let platforms = configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
     let runtimes = state.services.surface.runtime_snapshots();
     let channels = platforms
         .into_iter()
@@ -126,7 +129,8 @@ async fn get_channel_status_handler(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let channel = surface::channel::normalize_channel(&name);
-    let platforms = configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
     let platform = platforms
         .into_iter()
         .find(|platform| platform.platform_type == channel || platform.name == channel);

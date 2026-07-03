@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use axum::{extract::State as AxumState, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State as AxumState,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use connector::builtin_source_adapter_manifests;
 use serde::Serialize;
 use surface::{EdgeDomain, SurfaceDescriptor, SurfaceRuntimeSnapshot};
@@ -11,6 +16,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/edges", get(edge_registry_handler))
         .route("/api/edges/health", get(edge_health_handler))
+        .route("/api/edges/reload", post(edge_reload_handler))
         .route("/api/edges/surfaces", get(edge_surfaces_handler))
         .route("/api/edges/connectors", get(edge_connectors_handler))
         .route(
@@ -21,6 +27,16 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/edges/connectors/source",
             get(edge_source_connectors_handler),
         )
+}
+
+async fn edge_reload_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let discovery = state.services.surface.reload_manifests().await;
+    Json(serde_json::json!({
+        "kind": "edge.reload",
+        "status": if discovery.failures.is_empty() { "applied" } else { "attention" },
+        "discovery": discovery,
+        "registry": edge_registry_projection(&state),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]

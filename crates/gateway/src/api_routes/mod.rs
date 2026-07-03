@@ -97,6 +97,32 @@ pub struct AppState {
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
 }
 
+impl AppState {
+    pub(crate) fn startup_config_snapshot(&self) -> Option<&serde_json::Value> {
+        self.config.as_ref()
+    }
+
+    pub(crate) fn runtime_config_json_snapshot(&self) -> Option<serde_json::Value> {
+        self.services
+            .system
+            .runtime_config_json(&self.workspace_root, &self.config_home)
+            .ok()
+            .or_else(|| self.config.clone())
+    }
+
+    pub(crate) fn redacted_runtime_config_json_snapshot(&self) -> Option<serde_json::Value> {
+        self.services
+            .system
+            .redacted_runtime_config_json(&self.workspace_root, &self.config_home)
+            .ok()
+            .or_else(|| {
+                self.config
+                    .clone()
+                    .map(|value| self.services.system.redact_config_json(value))
+            })
+    }
+}
+
 #[derive(Clone)]
 struct ActiveTurnControl {
     run_id: String,
@@ -7367,6 +7393,175 @@ providers:
         runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(invalid_root);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(provider_registry)]
+    async fn runtime_config_reload_applies_gateway_runtime_dependencies() {
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+        let root = test_temp_dir("runtime-config-reload");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        let webui_dir = root.join("webui");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::create_dir_all(&webui_dir).unwrap();
+        std::fs::write(webui_dir.join("index.html"), "<!doctype html>reload").unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            format!(
+                r#"
+model: "reload-model"
+providers:
+  reload:
+    base_url: "https://reload.example/v1"
+    api_key: "reload-secret-key"
+    models: ["reload-model"]
+    protocol: "openai-compat"
+gateway:
+  enabled: true
+  webui_dir: "{}"
+  platforms:
+    - platform_type: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+    - platform_type: "feishu"
+      enabled: true
+      app_id: "app-id"
+      app_secret: "app-secret"
+"#,
+                webui_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "gateway.config.reload");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["applied_sections"]["providers"]["provider_count"], 1);
+        assert_eq!(
+            json["applied_sections"]["surface_runtime_configs"]["count"],
+            1
+        );
+        assert_eq!(json["applied_sections"]["static_webui"]["status"], "ready");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let channels: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feishu = channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|channel| channel["channel"] == "feishu")
+            .expect("feishu channel should be projected from reloaded config");
+        assert_eq!(feishu["configured"], true);
+
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_config_reload_rejects_invalid_config_without_replacing_running_state() {
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+        let root = test_temp_dir("runtime-config-reload-invalid-preserve");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let config_path = config_home.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+model: "stable-model"
+providers:
+  stable:
+    base_url: "https://stable.example/v1"
+    api_key: "stable-secret-key"
+    models: ["stable-model"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["applied"], true);
+        assert!(runtime::resolve_global_provider("stable-model").is_some());
+
+        std::fs::write(&config_path, "model: [\n").unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "invalid");
+        assert_eq!(json["applied"], false);
+        assert!(runtime::resolve_global_provider("stable-model").is_some());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/reload/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["kind"], "gateway.config.reload.status");
+        assert_eq!(status["status"], "invalid");
+        assert_eq!(status["applied"], false);
+
+        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -13,6 +13,7 @@ pub struct ConfigPanel {
     config: Option<serde_json::Value>,
     provider_projection: Option<serde_json::Value>,
     effective_config: Option<serde_json::Value>,
+    config_reload_status: Option<serde_json::Value>,
     selected_model: usize,
     last_status: Option<String>,
     last_receipt: Option<serde_json::Value>,
@@ -33,6 +34,10 @@ impl ConfigPanel {
         self.provider_projection = Some(provider_projection);
         self.effective_config = Some(effective_config);
         self.clamp_selection();
+    }
+
+    pub fn sync_config_reload_status(&mut self, status: serde_json::Value) {
+        self.config_reload_status = Some(status);
     }
 
     pub fn selected_model_id(&self) -> Option<String> {
@@ -131,6 +136,45 @@ impl ConfigPanel {
             .map(str::to_string)
             .collect()
     }
+
+    fn reload_status(&self) -> String {
+        self.config_reload_status
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    fn reload_trigger(&self) -> String {
+        self.config_reload_status
+            .as_ref()
+            .and_then(|value| value.get("trigger"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto")
+            .to_string()
+    }
+
+    fn reload_error(&self) -> Option<String> {
+        self.config_reload_status
+            .as_ref()
+            .and_then(|value| value.get("last_error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn reload_restart_fields(&self) -> Vec<String> {
+        self.config_reload_status
+            .as_ref()
+            .and_then(|value| value.get("restart_required"))
+            .and_then(|value| value.get("fields"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 impl Component for ConfigPanel {
@@ -157,9 +201,37 @@ impl Component for ConfigPanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k select model  Enter set default  r reload providers  e refresh",
+            "Keys: j/k select model  Enter set default  r refresh status  e refresh",
             Style::default().fg(Color::DarkGray),
         )));
+        let reload_status = self.reload_status();
+        let reload_color = match reload_status.as_str() {
+            "invalid" => Color::Red,
+            "reload_needed" | "attention" => Color::Yellow,
+            "applied" | "idle" => Color::Green,
+            _ => Color::DarkGray,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Config reload: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(reload_status, Style::default().fg(reload_color)),
+            Span::styled(
+                format!("  trigger {}", self.reload_trigger()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        let restart_fields = self.reload_restart_fields();
+        if !restart_fields.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Reload need: ", Style::default().fg(Color::Yellow)),
+                Span::styled(restart_fields.join(", "), Style::default().fg(Color::White)),
+            ]));
+        }
+        if let Some(error) = self.reload_error() {
+            lines.push(Line::from(vec![
+                Span::styled("Config invalid: ", Style::default().fg(Color::Red)),
+                Span::styled(error, Style::default().fg(Color::White)),
+            ]));
+        }
 
         for warning in self.warnings().into_iter().take(3) {
             lines.push(Line::from(vec![
@@ -193,11 +265,11 @@ impl Component for ConfigPanel {
         let models = self.models();
         if models.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No configured provider models. Configure providers in ~/.cowd/config.yaml, then press r.",
+                "No configured provider models. Edit ~/.cowd/config.yaml; Gateway will validate and hot-reload it automatically.",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            let max_rows = area.height.saturating_sub(9) as usize;
+            let max_rows = area.height.saturating_sub(13) as usize;
             for (index, model) in models.iter().enumerate().take(max_rows.max(1)) {
                 let id = model
                     .get("id")

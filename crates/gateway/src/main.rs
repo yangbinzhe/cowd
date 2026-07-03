@@ -49,6 +49,7 @@ mod plugin_static;
 mod runtime_bootstrap;
 #[path = "runtime/runtime_boundary.rs"]
 mod runtime_boundary;
+mod runtime_config_reload;
 #[path = "runtime/runtime_entry.rs"]
 mod runtime_entry;
 #[path = "runtime/runtime_factory.rs"]

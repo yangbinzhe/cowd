@@ -219,7 +219,7 @@ fn action_from_target(target: Option<&serde_json::Value>, fallback_command: &str
             "next-panel" => Action::NextPanel,
             "previous-panel" => Action::PrevPanel,
             "submit-input" => Action::SubmitInput,
-            "reload-providers" => Action::ReloadProviders,
+            "refresh-config-status" => Action::RefreshConfigStatus,
             "cancel" => Action::Cancel,
             "quit" => Action::Quit,
             slash if slash.starts_with("slash:") => {
@@ -1233,10 +1233,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_entries_include_reload_providers_action() {
+    fn registry_entries_include_refresh_config_status_action() {
         let p = setup_palette();
         assert!(p.all_commands.iter().any(|entry| {
-            entry.name == "Reload Providers" && entry.action == Action::ReloadProviders
+            entry.name == "Refresh Config Status" && entry.action == Action::RefreshConfigStatus
         }));
     }
 

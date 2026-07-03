@@ -80,13 +80,14 @@ fn connector_service_bulkhead() -> &'static ConnectorBulkhead {
 }
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
-    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let config = state.runtime_config_json_snapshot();
+    let platforms = channel_routes::configured_platforms(config.as_ref());
     let mut accounts = platforms
         .iter()
         .filter(|platform| platform.enabled || platform.configured)
         .map(account_from_platform)
         .collect::<Vec<_>>();
-    let mcp_servers = configured_mcp_servers(state.config.as_ref());
+    let mcp_servers = configured_mcp_servers(config.as_ref());
     accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
     let service_registry = builtin_service_connector_registry();
     accounts.extend(

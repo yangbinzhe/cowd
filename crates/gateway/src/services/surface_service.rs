@@ -8,9 +8,9 @@ use surface::{
 use tokio::sync::broadcast;
 
 use crate::surface_host::{
-    SurfaceDeliveryEvent, SurfaceHost, SurfaceHostHealth, SurfaceInboxReceipt, SurfaceInboxRecord,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceResourceSummary, SurfaceRouteSummary,
-    SurfaceStaticFile,
+    SurfaceDeliveryEvent, SurfaceDiscoveryReport, SurfaceHost, SurfaceHostHealth,
+    SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot, SurfaceOutboxRecord,
+    SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile,
 };
 
 use super::{service_envelope, ServiceEnvelope};
@@ -64,6 +64,21 @@ impl SurfaceService {
 
     pub(crate) fn runtime_snapshot(&self, id: &str) -> Option<SurfaceRuntimeSnapshot> {
         self.host.runtime_snapshot(id)
+    }
+
+    pub(crate) fn set_configs(
+        &self,
+        configs: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.host.set_configs(configs);
+    }
+
+    pub(crate) fn set_webui_static_resource(&self, dir: Option<&std::path::Path>) {
+        self.host.set_webui_static_resource(dir);
+    }
+
+    pub(crate) async fn reload_manifests(&self) -> SurfaceDiscoveryReport {
+        self.host.reload_manifests().await
     }
 
     pub(crate) fn has_surface(&self, id: &str) -> bool {
