@@ -69,7 +69,9 @@ model_context_windows: {}
 # Provider 配置 (多Provider自动路由)
 # =============================================================================
 # cowd 根据 model 名自动匹配 Provider 的 base_url 和 api_key
-# 支持任意 OpenAI 兼容接口
+# 支持 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三类协议。
+# protocol 可选；不配置时 cowd 会根据 provider 名、base_url、model 名本地探测。
+# 显式配置后不再探测，合法值为: anthropic, completions, responses。
 
 providers: {}
 # 示例:
@@ -78,10 +80,17 @@ providers: {}
 #     base_url: "https://api.deepseek.com"
 #     api_key: "sk-..."
 #     models: ["deepseek-v4-pro", "deepseek-v4-flash"]
-  # bailian:
-  #   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  #   api_key: "sk-..."
-  #   models: ["qwen3-max", "qwen3-coder-next"]
+#     protocol: "completions"
+#   openai:
+#     base_url: "https://api.openai.com/v1"
+#     api_key: "sk-..."
+#     models: ["gpt-5"]
+#     protocol: "responses"
+#   bailian:
+#     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+#     api_key: "sk-..."
+#     models: ["qwen3-max", "qwen3-coder-next"]
+#     protocol: "completions"
 
 # Provider 故障转移链
 # 当主 Provider 返回 429/500/503 等可重试错误时按顺序自动切换模型。

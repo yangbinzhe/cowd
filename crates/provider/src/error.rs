@@ -377,7 +377,7 @@ impl Display for ApiError {
             ),
             Self::NoProviderConfigured { model } => write!(
                 f,
-                "没有为模型 '{model}' 配置 provider。\n请在 ~/.cowd/config.yaml 的 providers 段添加配置，例如：\n  providers:\n    my_provider:\n      base_url: 'https://api.example.com/v1'\n      api_key: 'sk-...'\n      models: ['{model}']\n      protocol: 'openai-compat'"
+                "没有为模型 '{model}' 配置 provider。\n请在 ~/.cowd/config.yaml 的 providers 段添加配置，例如：\n  providers:\n    my_provider:\n      base_url: 'https://api.example.com/v1'\n      api_key: 'sk-...'\n      models: ['{model}']\n      protocol: 'completions'"
             ),
             Self::InvalidProviderConfig { provider, reason } => {
                 write!(f, "invalid provider config for {provider}: {reason}")

@@ -7133,7 +7133,7 @@ providers:
     base_url: "https://local.example/v1"
     api_key: "secret-local-key"
     models: ["model-a", "model-b"]
-    protocol: "openai-compat"
+    protocol: "completions"
 "#,
         )
         .unwrap();
@@ -7349,7 +7349,7 @@ providers:
     base_url: "https://reload.example/v1"
     api_key: "reload-secret-key"
     models: ["reload-model", "reload-fast"]
-    protocol: "openai-compat"
+    protocol: "completions"
 "#,
         )
         .unwrap();
@@ -7463,7 +7463,7 @@ providers:
     base_url: "https://reload.example/v1"
     api_key: "reload-secret-key"
     models: ["reload-model"]
-    protocol: "openai-compat"
+    protocol: "completions"
 gateway:
   enabled: true
   webui_dir: "{}"
@@ -7548,7 +7548,7 @@ providers:
     base_url: "https://stable.example/v1"
     api_key: "stable-secret-key"
     models: ["stable-model"]
-    protocol: "openai-compat"
+    protocol: "completions"
 "#,
         )
         .unwrap();

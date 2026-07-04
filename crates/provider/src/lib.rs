@@ -21,7 +21,7 @@ pub use model_protocol::prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
-pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
+pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_context_window, model_context_window_with_overrides, ProviderKind,

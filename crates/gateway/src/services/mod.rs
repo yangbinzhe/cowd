@@ -273,10 +273,15 @@ impl ProviderService {
             .providers
             .values()
             .map(|provider| {
+                let effective_protocol = model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
+                    .map(|protocol| protocol.as_str().to_string())
+                    .unwrap_or_else(|error| format!("invalid:{error}"));
                 serde_json::json!({
                     "name": provider.name,
                     "base_url": provider.base_url,
                     "protocol": provider.protocol,
+                    "effective_protocol": effective_protocol,
+                    "protocol_configured": provider.protocol.as_ref().is_some_and(|value| !value.trim().is_empty()),
                     "models": provider.models,
                     "model_count": provider.models.len(),
                     "credential_present": !provider.api_key.trim().is_empty(),

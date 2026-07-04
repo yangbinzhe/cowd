@@ -34,6 +34,19 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    pub wire_protocol: OpenAiWireProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiWireProtocol {
+    Completions,
+    Responses,
+}
+
+impl Default for OpenAiWireProtocol {
+    fn default() -> Self {
+        Self::Completions
+    }
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -50,6 +63,7 @@ impl OpenAiCompatConfig {
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -60,6 +74,7 @@ impl OpenAiCompatConfig {
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -74,6 +89,7 @@ impl OpenAiCompatConfig {
             api_key_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -86,6 +102,7 @@ impl OpenAiCompatConfig {
             api_key_env: "MOONSHOT_API_KEY",
             base_url_env: "MOONSHOT_BASE_URL",
             default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -98,7 +115,14 @@ impl OpenAiCompatConfig {
             api_key_env: "DEEPSEEK_API_KEY",
             base_url_env: "DEEPSEEK_BASE_URL",
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
+    }
+
+    #[must_use]
+    pub const fn with_wire_protocol(mut self, wire_protocol: OpenAiWireProtocol) -> Self {
+        self.wire_protocol = wire_protocol;
+        self
     }
 
     #[must_use]
@@ -157,10 +181,25 @@ impl OpenAiCompatClient {
         base_url: impl Into<String>,
         provider_name: impl Into<String>,
     ) -> Self {
+        Self::new_custom_with_protocol(
+            api_key,
+            base_url,
+            provider_name,
+            OpenAiWireProtocol::Completions,
+        )
+    }
+
+    #[must_use]
+    pub fn new_custom_with_protocol(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        provider_name: impl Into<String>,
+        wire_protocol: OpenAiWireProtocol,
+    ) -> Self {
         Self {
             http: build_http_client_or_default(),
             api_key: api_key.into(),
-            config: OpenAiCompatConfig::openai(),
+            config: OpenAiCompatConfig::openai().with_wire_protocol(wire_protocol),
             base_url: base_url.into(),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -202,6 +241,11 @@ impl OpenAiCompatClient {
         self.override_provider_name
             .as_deref()
             .unwrap_or(self.config.provider_name)
+    }
+
+    #[must_use]
+    pub const fn wire_protocol(&self) -> OpenAiWireProtocol {
+        self.config.wire_protocol
     }
 
     pub async fn send_message(
@@ -246,10 +290,32 @@ impl OpenAiCompatClient {
                 });
             }
         }
-        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.provider_name(), &request.model, &body, error)
-        })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => {
+                let payload =
+                    serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.provider_name(),
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_chat_completion_response(&request.model, payload)?
+            }
+            OpenAiWireProtocol::Responses => {
+                let payload =
+                    serde_json::from_str::<ResponsesApiResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.provider_name(),
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_responses_response(&request.model, payload)
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -267,7 +333,11 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.provider_name(), request.model.clone()),
+            parser: OpenAiSseParser::with_context(
+                self.provider_name(),
+                request.model.clone(),
+                self.wire_protocol(),
+            ),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -309,12 +379,21 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = chat_completions_endpoint(&self.base_url);
+        let request_url = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => chat_completions_endpoint(&self.base_url),
+            OpenAiWireProtocol::Responses => responses_endpoint(&self.base_url),
+        };
+        let request_body = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => {
+                build_chat_completion_request(request, self.config())
+            }
+            OpenAiWireProtocol::Responses => build_responses_request(request),
+        };
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&request_body)
             .send()
             .await
             .map_err(ApiError::from)
@@ -447,14 +526,20 @@ struct OpenAiSseParser {
     buffer: Vec<u8>,
     provider: String,
     model: String,
+    wire_protocol: OpenAiWireProtocol,
 }
 
 impl OpenAiSseParser {
-    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+    fn with_context(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        wire_protocol: OpenAiWireProtocol,
+    ) -> Self {
         Self {
             buffer: Vec::new(),
             provider: provider.into(),
             model: model.into(),
+            wire_protocol,
         }
     }
 
@@ -463,7 +548,15 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
+            let event = match self.wire_protocol {
+                OpenAiWireProtocol::Completions => {
+                    parse_chat_sse_frame(&frame, &self.provider, &self.model)?
+                }
+                OpenAiWireProtocol::Responses => {
+                    parse_responses_sse_frame(&frame, &self.provider, &self.model)?
+                }
+            };
+            if let Some(event) = event {
                 events.push(event);
             }
         }
@@ -531,10 +624,10 @@ impl StreamState {
 
         if let Some(usage) = chunk.usage {
             self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
+                input_tokens: usage.normalized_input_tokens(),
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
+                output_tokens: usage.normalized_output_tokens(),
             });
         }
 
@@ -813,6 +906,77 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+impl OpenAiUsage {
+    const fn normalized_input_tokens(&self) -> u32 {
+        if self.input_tokens > 0 {
+            self.input_tokens
+        } else {
+            self.prompt_tokens
+        }
+    }
+
+    const fn normalized_output_tokens(&self) -> u32 {
+        if self.output_tokens > 0 {
+            self.output_tokens
+        } else {
+            self.completion_tokens
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiResponse {
+    id: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContentPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesStreamFrame {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    response: Option<ResponsesApiResponse>,
+    #[serde(default)]
+    item: Option<ResponsesOutputItem>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    output_index: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -995,6 +1159,129 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     payload
+}
+
+fn build_responses_request(request: &MessageRequest) -> Value {
+    let wire_model = strip_routing_prefix(&request.model);
+    let mut input = Vec::new();
+    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+        input.push(json!({
+            "role": "system",
+            "content": [{"type": "input_text", "text": system}],
+        }));
+    }
+    for message in &request.messages {
+        input.extend(translate_message_for_responses(message));
+    }
+
+    let mut payload = json!({
+        "model": wire_model,
+        "max_output_tokens": request.max_tokens,
+        "input": input,
+        "stream": request.stream,
+    });
+
+    if let Some(tools) = &request.tools {
+        payload["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(responses_tool_definition)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = responses_tool_choice(tool_choice);
+    }
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+    }
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning"] = json!({ "effort": effort });
+    }
+
+    payload
+}
+
+fn translate_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "assistant" => translate_assistant_message_for_responses(message),
+        _ => translate_user_message_for_responses(message),
+    }
+}
+
+fn translate_assistant_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text } if !text.is_empty() => content.push(json!({
+                "type": "output_text",
+                "text": text,
+            })),
+            InputContentBlock::ToolUse { id, name, input } => entries.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": input.to_string(),
+            })),
+            InputContentBlock::Text { .. }
+            | InputContentBlock::Image { .. }
+            | InputContentBlock::ToolResult { .. }
+            | InputContentBlock::Thinking { .. }
+            | InputContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    if !content.is_empty() {
+        entries.insert(0, json!({ "role": "assistant", "content": content }));
+    }
+    entries
+}
+
+fn translate_user_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text } if !text.is_empty() => content.push(json!({
+                "type": "input_text",
+                "text": text,
+            })),
+            InputContentBlock::Image { source } => {
+                let image_url = format!("data:{};base64,{}", source.media_type, source.data);
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                }));
+            }
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                content: result_content,
+                ..
+            } => entries.push(json!({
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": flatten_tool_result_content(result_content),
+            })),
+            InputContentBlock::Text { .. }
+            | InputContentBlock::ToolUse { .. }
+            | InputContentBlock::Thinking { .. }
+            | InputContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    if !content.is_empty() {
+        entries.insert(0, json!({ "role": "user", "content": content }));
+    }
+    entries
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -1249,11 +1536,34 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
     }
 }
 
+fn responses_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters,
+        "strict": true,
+    })
+}
+
+fn responses_tool_choice(tool_choice: &ToolChoice) -> Value {
+    match tool_choice {
+        ToolChoice::Auto => Value::String("auto".to_string()),
+        ToolChoice::Any => Value::String("required".to_string()),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "name": name,
+        }),
+    }
+}
+
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
     matches!(config.provider_name, "OpenAI")
 }
 
-fn normalize_response(
+fn normalize_chat_completion_response(
     model: &str,
     response: ChatCompletionResponse,
 ) -> Result<MessageResponse, ApiError> {
@@ -1302,16 +1612,69 @@ fn normalize_response(
             input_tokens: response
                 .usage
                 .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
+                .map_or(0, OpenAiUsage::normalized_input_tokens),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens: response
                 .usage
                 .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
+                .map_or(0, OpenAiUsage::normalized_output_tokens),
         },
         request_id: None,
     })
+}
+
+fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> MessageResponse {
+    let mut content = Vec::new();
+    let mut has_tool_call = false;
+    for item in response.output {
+        match item.item_type.as_str() {
+            "message" => {
+                for part in item.content {
+                    if matches!(part.part_type.as_str(), "output_text" | "text") {
+                        if let Some(text) = part.text.filter(|value| !value.is_empty()) {
+                            content.push(OutputContentBlock::Text { text });
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                has_tool_call = true;
+                content.push(OutputContentBlock::ToolUse {
+                    id: item
+                        .call_id
+                        .or(item.id)
+                        .unwrap_or_else(|| "call_0".to_string()),
+                    name: item.name.unwrap_or_else(|| "unknown_tool".to_string()),
+                    input: parse_tool_arguments(item.arguments.as_deref().unwrap_or("{}")),
+                });
+            }
+            _ => {}
+        }
+    }
+    MessageResponse {
+        id: response.id,
+        kind: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: response.model.unwrap_or_else(|| model.to_string()),
+        stop_reason: Some(if has_tool_call {
+            "tool_use".to_string()
+        } else {
+            "end_turn".to_string()
+        }),
+        stop_sequence: None,
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, |usage| Usage {
+                input_tokens: usage.normalized_input_tokens(),
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: usage.normalized_output_tokens(),
+            }),
+        request_id: None,
+    }
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
@@ -1336,7 +1699,7 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(
+fn parse_chat_sse_frame(
     frame: &str,
     provider: &str,
     model: &str,
@@ -1400,6 +1763,155 @@ fn parse_sse_frame(
         })
 }
 
+fn parse_responses_sse_frame(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
+    let trimmed = frame.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut data_lines = Vec::new();
+    for line in trimmed.lines() {
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start());
+        }
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let payload = data_lines.join("\n");
+    if payload == "[DONE]" {
+        return Ok(None);
+    }
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(serde_json::Value::as_u64)
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.clone(),
+                retryable: false,
+                suggested_action: None,
+            });
+        }
+    }
+
+    let frame = serde_json::from_str::<ResponsesStreamFrame>(&payload).map_err(|error| {
+        tracing::warn!(error = %error, "responses stream chunk parse error");
+        ApiError::json_deserialize(provider, model, &payload, error)
+    })?;
+    Ok(responses_stream_frame_to_chunk(frame, model))
+}
+
+fn responses_stream_frame_to_chunk(
+    frame: ResponsesStreamFrame,
+    fallback_model: &str,
+) -> Option<ChatCompletionChunk> {
+    match frame.event_type.as_str() {
+        "response.created" => frame.response.map(|response| ChatCompletionChunk {
+            id: response.id,
+            model: response.model.or_else(|| Some(fallback_model.to_string())),
+            choices: Vec::new(),
+            usage: None,
+        }),
+        "response.output_text.delta" => frame.delta.map(|delta| ChatCompletionChunk {
+            id: "responses_stream".to_string(),
+            model: Some(fallback_model.to_string()),
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    content: Some(delta),
+                    ..ChunkDelta::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }),
+        "response.function_call_arguments.delta" => {
+            frame.delta.map(|arguments| ChatCompletionChunk {
+                id: "responses_stream".to_string(),
+                model: Some(fallback_model.to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        tool_calls: vec![DeltaToolCall {
+                            index: frame.output_index.unwrap_or(0),
+                            id: None,
+                            function: DeltaFunction {
+                                name: None,
+                                arguments: Some(arguments),
+                            },
+                        }],
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+        }
+        "response.output_item.added" => frame.item.and_then(|item| {
+            (item.item_type == "function_call").then(|| ChatCompletionChunk {
+                id: "responses_stream".to_string(),
+                model: Some(fallback_model.to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        tool_calls: vec![DeltaToolCall {
+                            index: frame.output_index.unwrap_or(0),
+                            id: item.call_id.or(item.id),
+                            function: DeltaFunction {
+                                name: item.name,
+                                arguments: item.arguments,
+                            },
+                        }],
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+        }),
+        "response.completed" => frame.response.map(|response| {
+            let has_tool_call = response
+                .output
+                .iter()
+                .any(|item| item.item_type == "function_call");
+            ChatCompletionChunk {
+                id: response.id,
+                model: response.model.or_else(|| Some(fallback_model.to_string())),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some(if has_tool_call {
+                        "tool_calls".to_string()
+                    } else {
+                        "stop".to_string()
+                    }),
+                }],
+                usage: response.usage,
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -1427,6 +1939,15 @@ fn chat_completions_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/responses") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/responses")
     }
 }
 
@@ -1496,9 +2017,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        build_chat_completion_request, build_responses_request, chat_completions_endpoint,
+        is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_tool_arguments,
+        responses_endpoint, OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1581,6 +2102,55 @@ mod tests {
             content[1]["image_url"]["url"],
             json!("data:image/png;base64,aW1hZ2U=")
         );
+    }
+
+    #[test]
+    fn responses_request_translation_uses_responses_shape() {
+        let payload = build_responses_request(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        InputContentBlock::Text {
+                            text: "inspect".to_string(),
+                        },
+                        InputContentBlock::Image {
+                            source: ImageSource::base64("image/png", "aW1hZ2U="),
+                        },
+                    ],
+                },
+                InputMessage::user_tool_result("call_1", "done", false),
+            ],
+            system: Some("Use tools when needed.".to_string()),
+            tools: Some(vec![ToolDefinition {
+                name: "inspect_repo".to_string(),
+                description: Some("Inspect repository".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            stream: true,
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(payload["model"], json!("gpt-5"));
+        assert_eq!(payload["max_output_tokens"], json!(128));
+        assert_eq!(payload["input"][0]["role"], json!("system"));
+        assert_eq!(
+            payload["input"][1]["content"][0]["type"],
+            json!("input_text")
+        );
+        assert_eq!(
+            payload["input"][1]["content"][1]["type"],
+            json!("input_image")
+        );
+        assert_eq!(payload["input"][2]["type"], json!("function_call_output"));
+        assert_eq!(payload["tools"][0]["type"], json!("function"));
+        assert_eq!(payload["tools"][0]["name"], json!("inspect_repo"));
+        assert_eq!(payload["tools"][0]["strict"], json!(true));
+        assert_eq!(payload["reasoning"]["effort"], json!("medium"));
     }
 
     #[test]
@@ -1740,6 +2310,23 @@ mod tests {
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
         );
+        assert_eq!(
+            responses_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            responses_endpoint("https://api.openai.com/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn config_can_select_responses_wire_protocol() {
+        let client = OpenAiCompatClient::new(
+            "openai-test-key",
+            OpenAiCompatConfig::openai().with_wire_protocol(OpenAiWireProtocol::Responses),
+        );
+        assert_eq!(client.wire_protocol(), OpenAiWireProtocol::Responses);
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

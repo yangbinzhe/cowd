@@ -14,7 +14,7 @@ use crate::json::JsonValue;
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 pub use model_protocol::oauth::OAuthConfig;
-pub use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+pub use model_protocol::provider_config::{ProviderConfig, ProviderProtocol, ProvidersConfig};
 
 // ── Config Error Types ─────────────────────────────────────────────────
 
@@ -1843,11 +1843,11 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
         let protocol = optional_string_dual(entry, "protocol", &ctx)?.map(str::to_string);
 
         if let Some(ref p) = protocol {
-            if p != "anthropic" && p != "openai-compat" {
+            if ProviderProtocol::parse(p).is_none() {
                 return Err(ConfigError::Invalid {
                     key: format!("providers.{name}.protocol"),
                     message: format!(
-                        "unsupported protocol '{p}'. Valid values: \"anthropic\", \"openai-compat\""
+                        "unsupported protocol '{p}'. Valid values: \"anthropic\", \"completions\", \"responses\""
                     ),
                 });
             }
@@ -3002,7 +3002,7 @@ fn deep_merge_objects(
 mod tests {
     use super::{
         deep_merge_objects, parse_optional_compression_config, parse_permission_mode_label,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport,
+        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
         ResolvedPermissionMode, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
         COWD_SETTINGS_SCHEMA_NAME,
     };
@@ -3408,6 +3408,98 @@ approval:
         let chain = loaded.fallbacks();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_provider_protocols_and_detects_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providers": {
+                "openai": {
+                  "base_url": "https://api.openai.com/v1",
+                  "api_key": "sk-openai",
+                  "models": ["gpt-5"],
+                  "protocol": "responses"
+                },
+                "deepseek": {
+                  "base_url": "https://api.deepseek.com/v1",
+                  "api_key": "sk-deepseek",
+                  "models": ["deepseek-v4-pro"],
+                  "protocol": "completions"
+                },
+                "anthropic": {
+                  "base_url": "https://api.anthropic.com",
+                  "api_key": "sk-ant",
+                  "models": ["claude-sonnet-4-6"]
+                }
+              }
+            }"#,
+        )
+        .expect("write provider settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let providers = loaded.providers();
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("openai").unwrap()).unwrap(),
+            ProviderProtocol::Responses
+        );
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("deepseek").unwrap()).unwrap(),
+            ProviderProtocol::Completions
+        );
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("anthropic").unwrap()).unwrap(),
+            ProviderProtocol::Anthropic
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_unknown_provider_protocol() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providers": {
+                "gemini": {
+                  "base_url": "https://generativelanguage.googleapis.com",
+                  "api_key": "sk-test",
+                  "models": ["gemini-2.5-pro"],
+                  "protocol": "gemini-native"
+                }
+              }
+            }"#,
+        )
+        .expect("write provider settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should reject unsupported protocol");
+
+        // then
+        assert!(error.to_string().contains("providers.gemini.protocol"));
+        assert!(error.to_string().contains("responses"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

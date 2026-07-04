@@ -6,8 +6,8 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use provider::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol, OutputContentBlock, ProviderClient,
+    StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -136,6 +136,67 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
 }
 
 #[tokio::test]
+async fn responses_protocol_posts_to_responses_endpoint_and_normalizes_output() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"resp_test\",",
+        "\"model\":\"gpt-5\",",
+        "\"output\":[",
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello from Responses\"}]},",
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"inspect_repo\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}",
+        "],",
+        "\"usage\":{\"input_tokens\":13,\"output_tokens\":7}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new(
+        "openai-test-key",
+        OpenAiCompatConfig::openai().with_wire_protocol(OpenAiWireProtocol::Responses),
+    )
+    .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            max_tokens: 256,
+            messages: vec![InputMessage::user_text("Use the tool.")],
+            tools: Some(vec![ToolDefinition {
+                name: "inspect_repo".to_string(),
+                description: Some("Inspect repository".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            ..Default::default()
+        })
+        .await
+        .expect("responses request should succeed");
+
+    assert_eq!(response.id, "resp_test");
+    assert_eq!(response.model, "gpt-5");
+    assert_eq!(response.total_tokens(), 20);
+    assert!(response.content.iter().any(
+        |block| matches!(block, OutputContentBlock::Text { text } if text == "Hello from Responses")
+    ));
+    assert!(response.content.iter().any(|block| {
+        matches!(block, OutputContentBlock::ToolUse { name, .. } if name == "inspect_repo")
+    }));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/responses");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("gpt-5"));
+    assert_eq!(body["max_output_tokens"], json!(256));
+    assert_eq!(body["tools"][0]["type"], json!("function"));
+    assert_eq!(body["tools"][0]["name"], json!("inspect_repo"));
+}
+
+#[tokio::test]
 async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
@@ -230,6 +291,78 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let captured = state.lock().await;
     let request = captured.first().expect("captured request");
     assert_eq!(request.path, "/chat/completions");
+    assert!(request.body.contains("\"stream\":true"));
+}
+
+#[tokio::test]
+async fn responses_stream_normalizes_text_usage_and_tool_calls() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",\"model\":\"gpt-5\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"inspect_repo\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\".\\\"}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"model\":\"gpt-5\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"inspect_repo\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_responses_stream")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new(
+        "openai-test-key",
+        OpenAiCompatConfig::openai().with_wire_protocol(OpenAiWireProtocol::Responses),
+    )
+    .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text("stream")],
+            tools: Some(vec![ToolDefinition {
+                name: "inspect_repo".to_string(),
+                description: Some("Inspect repository".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            ..Default::default()
+        })
+        .await
+        .expect("responses stream should start");
+
+    assert_eq!(stream.request_id(), Some("req_responses_stream"));
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(events.iter().any(
+        |event| matches!(event, StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { text },
+            ..
+        }) if text == "Hello")
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::ToolUse { name, .. },
+            ..
+        }) if name == "inspect_repo")
+    ));
+    assert!(events.iter().any(|event| {
+        matches!(event, StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) if usage.input_tokens == 8 && usage.output_tokens == 5)
+    }));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/responses");
     assert!(request.body.contains("\"stream\":true"));
 }
 

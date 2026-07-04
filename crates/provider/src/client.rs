@@ -1,10 +1,12 @@
 use crate::error::ApiError;
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
-use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::openai_compat::{
+    self, OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol,
+};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
-use model_protocol::provider_config::ProviderConfig;
+use model_protocol::provider_config::{ProviderConfig, ProviderProtocol};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -40,7 +42,23 @@ impl ProviderClient {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                         OpenAiCompatConfig::dashscope()
                     }
+                    Some(meta) if meta.auth_env == "DEEPSEEK_API_KEY" => {
+                        OpenAiCompatConfig::deepseek()
+                    }
+                    Some(meta) if meta.auth_env == "MOONSHOT_API_KEY" => {
+                        OpenAiCompatConfig::moonshot()
+                    }
                     _ => OpenAiCompatConfig::openai(),
+                };
+                let config = if ProviderProtocol::detect(
+                    "env",
+                    config.default_base_url,
+                    &[resolved_model.to_string()],
+                ) == ProviderProtocol::Responses
+                {
+                    config.with_wire_protocol(OpenAiWireProtocol::Responses)
+                } else {
+                    config
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
@@ -49,32 +67,52 @@ impl ProviderClient {
 
     /// 从配置文件 ProviderConfig 直接构造，不读任何环境变量。
     pub fn from_config(provider: &ProviderConfig) -> Result<Self, ApiError> {
-        match provider.protocol.as_deref().unwrap_or("openai-compat") {
-            "anthropic" => {
+        let protocol = ProviderProtocol::effective_for_provider(provider).map_err(|reason| {
+            ApiError::InvalidProviderConfig {
+                provider: provider.name.clone(),
+                reason,
+            }
+        })?;
+        Self::from_config_with_effective_protocol(provider, protocol)
+    }
+
+    /// 从配置直接构造，不读任何环境变量。
+    pub fn from_config_with_effective_protocol(
+        provider: &ProviderConfig,
+        protocol: ProviderProtocol,
+    ) -> Result<Self, ApiError> {
+        match protocol {
+            ProviderProtocol::Anthropic => {
                 let auth = AuthSource::ApiKey(provider.api_key.clone());
                 Ok(Self::Anthropic(
                     AnthropicClient::from_auth(auth).with_base_url(&provider.base_url),
                 ))
             }
-            "openai-compat" => {
+            ProviderProtocol::Completions | ProviderProtocol::Responses => {
                 let url = Self::normalize_openai_url(&provider.base_url);
-                Ok(Self::OpenAi(OpenAiCompatClient::new_custom(
+                let wire_protocol = match protocol {
+                    ProviderProtocol::Completions => OpenAiWireProtocol::Completions,
+                    ProviderProtocol::Responses => OpenAiWireProtocol::Responses,
+                    ProviderProtocol::Anthropic => unreachable!("handled above"),
+                };
+                Ok(Self::OpenAi(OpenAiCompatClient::new_custom_with_protocol(
                     provider.api_key.clone(),
                     url,
                     &provider.name,
+                    wire_protocol,
                 )))
             }
-            other => Err(ApiError::InvalidProviderConfig {
-                provider: provider.name.clone(),
-                reason: format!("unknown protocol: {other:?}"),
-            }),
         }
     }
 
     /// 规范化 OpenAI 兼容 API 的 base URL：确保以 /v1 结尾
     fn normalize_openai_url(base_url: &str) -> String {
-        if base_url.ends_with("/v1") || base_url.ends_with("/v1/") {
-            base_url.to_string()
+        let trimmed = base_url.trim_end_matches('/');
+        if trimmed.ends_with("/v1")
+            || trimmed.ends_with("/responses")
+            || trimmed.ends_with("/chat/completions")
+        {
+            trimmed.to_string()
         } else if base_url.ends_with('/') {
             format!("{base_url}v1")
         } else {
