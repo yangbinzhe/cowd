@@ -280,6 +280,7 @@ impl Component for ConfigPanel {
                     .get("provider")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("provider");
+                let protocol = model_protocol_summary(model);
                 let selected = model
                     .get("selected")
                     .and_then(serde_json::Value::as_bool)
@@ -302,7 +303,7 @@ impl Component for ConfigPanel {
                     Span::raw(" "),
                     Span::styled(id.to_string(), Style::default().fg(Color::White)),
                     Span::styled(
-                        format!("  {provider}{current}"),
+                        format!("  {provider} · {protocol}{current}"),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -364,4 +365,45 @@ fn compact_json(value: &serde_json::Value, width: usize) -> String {
     let mut output: String = text.chars().take(width.saturating_sub(1)).collect();
     output.push('~');
     output
+}
+
+fn model_protocol_summary(model: &serde_json::Value) -> String {
+    let protocol = model
+        .get("effective_protocol")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let source = if model
+        .get("protocol_configured")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "explicit"
+    } else {
+        "auto"
+    };
+    format!("{protocol} {source}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_protocol_summary;
+    use serde_json::json;
+
+    #[test]
+    fn model_protocol_summary_uses_gateway_projection() {
+        assert_eq!(
+            model_protocol_summary(&json!({
+                "effective_protocol": "responses",
+                "protocol_configured": true,
+            })),
+            "responses explicit"
+        );
+        assert_eq!(
+            model_protocol_summary(&json!({
+                "effective_protocol": "completions",
+                "protocol_configured": false,
+            })),
+            "completions auto"
+        );
+    }
 }

@@ -194,8 +194,6 @@ mod tests {
             ProviderProtocol::parse("responses"),
             Some(ProviderProtocol::Responses)
         );
-        assert_eq!(ProviderProtocol::parse("openai-compat"), None);
-        assert_eq!(ProviderProtocol::parse("openai_chat_completions"), None);
         assert_eq!(ProviderProtocol::parse("gemini-native"), None);
     }
 

@@ -7156,6 +7156,10 @@ providers:
         assert_eq!(json["provider_model_count"], 2);
         assert_eq!(json["configured_model"], "model-a");
         assert_eq!(json["models"][1]["id"], "model-b");
+        assert_eq!(json["models"][1]["effective_protocol"], "completions");
+        assert_eq!(json["models"][1]["protocol_configured"], true);
+        assert_eq!(json["providers"][0]["effective_protocol"], "completions");
+        assert_eq!(json["providers"][0]["protocol_configured"], true);
         assert_eq!(json["providers"][0]["credential_present"], true);
         assert!(!json.to_string().contains("secret-local-key"));
 

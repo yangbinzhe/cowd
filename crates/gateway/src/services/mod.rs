@@ -299,6 +299,12 @@ impl ProviderService {
             .iter()
             .flat_map(|provider| {
                 let provider_name = provider["name"].as_str().unwrap_or("").to_string();
+                let effective_protocol = provider["effective_protocol"]
+                    .as_str()
+                    .unwrap_or("completions")
+                    .to_string();
+                let protocol_configured =
+                    provider["protocol_configured"].as_bool().unwrap_or(false);
                 let selected_model = selected_model.clone();
                 provider["models"]
                     .as_array()
@@ -310,7 +316,9 @@ impl ProviderService {
                             serde_json::json!({
                                 "id": id,
                                 "name": id,
-                                "provider": provider_name,
+                                "provider": provider_name.clone(),
+                                "effective_protocol": effective_protocol.clone(),
+                                "protocol_configured": protocol_configured,
                                 "selected": selected_model.as_deref() == Some(id),
                             })
                         })

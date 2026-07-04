@@ -257,7 +257,7 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
         base_url,
         api_key,
         models: vec![model.to_string()],
-        name: "env-openai-compatible".to_string(),
+        name: "env-completions".to_string(),
         protocol: Some("completions".to_string()),
     })
 }
