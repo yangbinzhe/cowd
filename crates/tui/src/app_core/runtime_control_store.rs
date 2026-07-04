@@ -114,6 +114,40 @@ pub struct CowdKernelSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayCapabilityRouteSummary {
+    pub id: String,
+    pub domain: String,
+    pub title: String,
+    pub method: String,
+    pub path: String,
+    pub risk: String,
+    pub criticality: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayOpenAiToolSummary {
+    pub name: String,
+    pub description: String,
+    pub parameter_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayCapabilityContractSummary {
+    pub kind: String,
+    pub schema_version: u64,
+    pub owner: String,
+    pub route_count: u64,
+    pub capability_count: u64,
+    pub p1_count: u64,
+    pub ai_visible_count: u64,
+    pub openapi_path_count: u64,
+    pub openai_tool_count: u64,
+    pub route_contract_parity: bool,
+    pub sample_routes: Vec<GatewayCapabilityRouteSummary>,
+    pub sample_tools: Vec<GatewayOpenAiToolSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StructuredDataSummary {
     pub source_count: u64,
     pub fact_count: u64,
@@ -208,6 +242,7 @@ pub struct RuntimeControlSnapshot {
     pub surface_health: Option<SurfaceHealthSummary>,
     pub surface_events: Vec<SurfaceEventSummary>,
     pub cowd_kernel: Option<CowdKernelSummary>,
+    pub gateway_capability_contract: Option<GatewayCapabilityContractSummary>,
     pub structured_data: Option<StructuredDataSummary>,
     pub reality_core: Option<RealityCoreSummary>,
     pub fact_flow: Option<FactFlowSummary>,
@@ -280,6 +315,7 @@ impl RuntimeControlSnapshot {
             surface_health: app.gateway_surface_health.clone(),
             surface_events: app.gateway_surface_events.clone(),
             cowd_kernel: app.gateway_cowd_kernel.clone(),
+            gateway_capability_contract: app.gateway_capability_contract.clone(),
             structured_data: app.gateway_structured_data.clone(),
             reality_core: app.gateway_reality_core.clone(),
             fact_flow: app.gateway_fact_flow.clone(),
@@ -325,6 +361,7 @@ impl RuntimeControlSnapshot {
         app.gateway_surface_health = self.surface_health.clone();
         app.gateway_surface_events = self.surface_events.clone();
         app.gateway_cowd_kernel = self.cowd_kernel.clone();
+        app.gateway_capability_contract = self.gateway_capability_contract.clone();
         app.gateway_structured_data = self.structured_data.clone();
         app.gateway_reality_core = self.reality_core.clone();
         app.gateway_fact_flow = self.fact_flow.clone();
@@ -494,6 +531,106 @@ impl RuntimeControlSnapshot {
                 .unwrap_or("unknown")
                 .to_string(),
             release_gate_failed_checks,
+        });
+    }
+
+    pub fn ingest_gateway_capability_contract(
+        &mut self,
+        contract: &serde_json::Value,
+        openai_tools: &serde_json::Value,
+    ) {
+        let coverage = contract.get("coverage").unwrap_or(&serde_json::Value::Null);
+        let tools = openai_tools
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let sample_tools = tools
+            .iter()
+            .filter_map(gateway_openai_tool_summary)
+            .take(8)
+            .collect::<Vec<_>>();
+        let sample_routes = contract
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.pointer("/surface_visibility/tui")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(gateway_capability_route_summary)
+                    .take(14)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let contract_tool_count = coverage
+            .get("openai_tool_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let actual_tool_count = openai_tools
+            .get("tool_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(tools.len() as u64);
+        if contract_tool_count != 0 && actual_tool_count != contract_tool_count {
+            self.degrade(format!(
+                "gateway openai tools count mismatch: contract={contract_tool_count}, tools={actual_tool_count}"
+            ));
+        }
+        self.gateway_capability_contract = Some(GatewayCapabilityContractSummary {
+            kind: contract
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("gateway.capability_contract")
+                .to_string(),
+            schema_version: contract
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            owner: contract
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("gateway")
+                .to_string(),
+            route_count: coverage
+                .get("route_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    contract
+                        .get("route_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or_default(),
+            capability_count: coverage
+                .get("capability_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    contract
+                        .get("capability_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or_default(),
+            p1_count: coverage
+                .get("p1_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            ai_visible_count: coverage
+                .get("ai_visible_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            openapi_path_count: coverage
+                .get("openapi_path_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            openai_tool_count: actual_tool_count,
+            route_contract_parity: coverage
+                .get("route_contract_parity")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            sample_routes,
+            sample_tools,
         });
     }
 
@@ -1110,6 +1247,72 @@ fn structured_samples(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn gateway_capability_route_summary(
+    value: &serde_json::Value,
+) -> Option<GatewayCapabilityRouteSummary> {
+    let http = value.get("http")?;
+    Some(GatewayCapabilityRouteSummary {
+        id: value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        domain: value
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("gateway")
+            .to_string(),
+        title: value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        method: http
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("GET")
+            .to_string(),
+        path: http
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        risk: value
+            .get("risk")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        criticality: http
+            .get("criticality")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("p2")
+            .to_string(),
+    })
+}
+
+fn gateway_openai_tool_summary(value: &serde_json::Value) -> Option<GatewayOpenAiToolSummary> {
+    let function = value.get("function")?;
+    let parameters = function
+        .get("parameters")
+        .and_then(|item| item.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| properties.len() as u64)
+        .unwrap_or_default();
+    Some(GatewayOpenAiToolSummary {
+        name: function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        description: function
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        parameter_count: parameters,
+    })
+}
+
 fn reality_component_status(value: &serde_json::Value, component: &str) -> String {
     value
         .get("engines")
@@ -1514,6 +1717,26 @@ pub async fn refresh_runtime_control_snapshot(
             ));
         }
     }
+    let (gateway_contract, openai_tools) = tokio::join!(
+        projection.gateway_capability_contract(),
+        projection.gateway_openai_tools()
+    );
+    match (gateway_contract, openai_tools) {
+        (Ok(contract), Ok(tools)) => snapshot.ingest_gateway_capability_contract(&contract, &tools),
+        (contract, tools) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = contract {
+                reasons.push(format!("contract: {err}"));
+            }
+            if let Err(err) = tools {
+                reasons.push(format!("openai tools: {err}"));
+            }
+            snapshot.degrade(format!(
+                "gateway capability contract unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
+    }
     let (sources, facts, evidence, watermarks) = tokio::join!(
         projection.structured_sources(),
         projection.structured_facts(),
@@ -1621,6 +1844,85 @@ mod tests {
             "sessions": ["s1", "s2"],
             "leases": {"total": 0, "items": []},
         })
+    }
+
+    #[test]
+    fn snapshot_ingests_gateway_capability_contract_summary() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_gateway_capability_contract(
+            &serde_json::json!({
+                "kind": "gateway.capability_contract",
+                "schema_version": 1,
+                "owner": "gateway",
+                "route_count": 2,
+                "capability_count": 2,
+                "coverage": {
+                    "route_count": 2,
+                    "capability_count": 2,
+                    "p1_count": 1,
+                    "ai_visible_count": 2,
+                    "openapi_path_count": 2,
+                    "openai_tool_count": 1,
+                    "route_contract_parity": true
+                },
+                "capabilities": [
+                    {
+                        "id": "gateway.surface.get",
+                        "domain": "surface",
+                        "title": "Surface registry",
+                        "risk": "external",
+                        "http": {"method": "GET", "path": "/api/surfaces", "criticality": "p1"},
+                        "surface_visibility": {"tui": true}
+                    },
+                    {
+                        "id": "gateway.hidden.get",
+                        "domain": "gateway",
+                        "title": "Hidden",
+                        "risk": "read",
+                        "http": {"method": "GET", "path": "/api/hidden", "criticality": "p2"},
+                        "surface_visibility": {"tui": false}
+                    }
+                ]
+            }),
+            &serde_json::json!({
+                "kind": "gateway.openai_tools",
+                "tool_count": 1,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "gateway_get_api_sessions",
+                            "description": "List sessions",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"limit": {"type": "integer"}}
+                            }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        let contract = snapshot
+            .gateway_capability_contract
+            .as_ref()
+            .expect("contract summary");
+        assert_eq!(contract.kind, "gateway.capability_contract");
+        assert_eq!(contract.route_count, 2);
+        assert_eq!(contract.capability_count, 2);
+        assert!(contract.route_contract_parity);
+        assert_eq!(contract.sample_routes.len(), 1);
+        assert_eq!(contract.sample_routes[0].path, "/api/surfaces");
+        assert_eq!(contract.sample_tools[0].name, "gateway_get_api_sessions");
+        assert_eq!(contract.sample_tools[0].parameter_count, 1);
+
+        let mut app = App::new("test-model", "session-test");
+        snapshot.apply_to_app(&mut app);
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(
+            restored.gateway_capability_contract,
+            snapshot.gateway_capability_contract
+        );
     }
 
     #[test]

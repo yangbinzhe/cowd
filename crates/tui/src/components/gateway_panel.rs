@@ -23,8 +23,9 @@ use crate::{
     app::App,
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-        CowdKernelSummary, FactFlowSummary, MissionControlSummary, RealityCoreSummary,
-        RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
+        CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary,
+        MissionControlSummary, RealityCoreSummary, RuntimeActionReceiptSummary,
+        StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
     },
 };
 
@@ -59,6 +60,8 @@ pub struct GatewayPanel {
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
     /// Cowd kernel capability and release-gate summary.
     pub cowd_kernel: Option<CowdKernelSummary>,
+    /// Gateway-owned API capability contract summary.
+    pub gateway_capability_contract: Option<GatewayCapabilityContractSummary>,
     /// Structured data-plane summary.
     pub structured_data: Option<StructuredDataSummary>,
     /// Reality Core engine health summary.
@@ -113,6 +116,7 @@ impl GatewayPanel {
             memory_status: None,
             execution_receipts: Vec::new(),
             cowd_kernel: None,
+            gateway_capability_contract: None,
             structured_data: None,
             reality_core: None,
             fact_flow: None,
@@ -155,6 +159,7 @@ impl GatewayPanel {
         self.surfaces = app.gateway_surfaces.clone();
         self.surface_health = app.gateway_surface_health.clone();
         self.cowd_kernel = app.gateway_cowd_kernel.clone();
+        self.gateway_capability_contract = app.gateway_capability_contract.clone();
         self.structured_data = app.gateway_structured_data.clone();
         self.reality_core = app.gateway_reality_core.clone();
         self.fact_flow = app.gateway_fact_flow.clone();
@@ -1046,125 +1051,81 @@ impl Component for GatewayPanel {
             }
         }
 
-        // ── HTTP Projection Endpoints ──────────────────────────
+        // ── Gateway Capability Contract ────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "─ HTTP Projection Endpoints ─",
+            "─ Gateway Capability Contract ─",
             Style::default().fg(Color::Cyan),
         )));
-        lines.push(Line::from(""));
-
-        let endpoints: &[(&str, &str)] = &[
-            ("GET  /health", "Server health check"),
-            ("GET  /api/sessions", "List sessions"),
-            ("POST /api/sessions", "Create session"),
-            ("POST /api/sessions/:id/messages", "Send message"),
-            (
-                "GET  /api/sessions/:id/projection",
-                "Session run evidence projection",
-            ),
-            ("GET  /api/memory", "Memory status"),
-            ("GET  /api/memory/stats", "Memory statistics"),
-            ("GET  /api/memory/search", "Search memory"),
-            ("GET  /api/reality/status", "Reality Core health"),
-            ("GET  /api/reality/capabilities", "Reality capability map"),
-            ("GET  /api/reality/static", "Reality Core map"),
-            ("GET  /api/reality/flow", "Fact Flow trace"),
-            ("GET  /api/reality/recall/report", "Recall source report"),
-            (
-                "GET  /api/reality/context/envelope",
-                "ContextEnvelope projection",
-            ),
-            (
-                "GET  /api/reality/evidence/:id",
-                "Reality evidence resolver",
-            ),
-            ("GET  /api/reality/promotions", "Growth promotion trace"),
-            ("GET  /api/reality/governance", "Reality governance summary"),
-            ("GET  /api/reality/boundaries", "Reality boundary map"),
-            ("GET  /api/config", "View config"),
-            ("PUT  /api/config", "Update config"),
-            ("GET  /api/platforms", "List platforms"),
-            ("GET  /api/cowd/capabilities", "Cowd capability registry"),
-            ("GET  /api/cowd/projection", "Surface capability projection"),
-            ("GET  /api/cowd/surfaces", "Surface parity contract"),
-            ("GET  /api/cowd/release-gate", "Release gate status"),
-            (
-                "GET  /api/cowd/structured/sources",
-                "Structured data sources",
-            ),
-            ("GET  /api/cowd/structured/facts", "Structured facts"),
-            (
-                "GET  /api/cowd/structured/evidence",
-                "Structured evidence packets",
-            ),
-            (
-                "GET  /api/cowd/structured/watermarks",
-                "Structured ingest watermarks",
-            ),
-            (
-                "POST /api/cowd/structured/ingest-plan",
-                "Plan structured ingest",
-            ),
-            ("GET  /api/cross-plane/summary", "Interop policy summary"),
-            ("GET  /api/cross-plane/grants", "List interop grants"),
-            (
-                "GET  /api/cross-plane/action/adapters",
-                "Interop dispatch capability",
-            ),
-            (
-                "GET  /api/cross-plane/action/executions",
-                "Interop execution receipts",
-            ),
-            ("GET  /api/connectors/summary", "Connector summary"),
-            ("GET  /api/connectors/accounts", "Connector accounts"),
-            (
-                "GET  /api/connectors/capabilities",
-                "Connector capabilities",
-            ),
-            ("GET  /api/connectors/resources", "Connector resources"),
-            ("GET  /api/surfaces", "Surface registry"),
-            ("GET  /api/surfaces/health", "Surface host health"),
-            ("GET  /api/surfaces/:id/events", "Surface event buffer"),
-            ("POST /api/surfaces/:id/send", "Surface message egress"),
-            ("POST /api/surfaces/:id/action", "Surface action dispatch"),
-            (
-                "GET  /api/connectors/services/local.docs/tools",
-                "Local docs service tools",
-            ),
-            (
-                "POST /api/connectors/services/local.docs/execute",
-                "Local docs dry-run/commit",
-            ),
-            (
-                "POST /api/cross-plane/policy/simulate",
-                "Test policy decision",
-            ),
-            ("GET  /api/cross-plane/audit", "Interop audit records"),
-        ];
-
-        for (endpoint, desc) in endpoints {
-            let method_color = if endpoint.starts_with("GET") {
-                Color::Green
-            } else if endpoint.starts_with("POST") {
-                Color::Yellow
-            } else if endpoint.starts_with("PUT") {
-                Color::Cyan
-            } else if endpoint.starts_with("DELETE") {
-                Color::Red
+        if let Some(contract) = self.gateway_capability_contract.as_ref() {
+            let parity = if contract.route_contract_parity {
+                "parity yes"
             } else {
-                Color::White
+                "parity no"
             };
-
-            // Build endpoint with color-coded method
-            let parts: Vec<&str> = endpoint.splitn(2, ' ').collect();
-            let (method, path) = (parts[0], if parts.len() > 1 { parts[1] } else { "" });
-
             lines.push(Line::from(vec![
-                Span::styled(format!("{:4}", method), Style::default().fg(method_color)),
-                Span::styled(format!("{:25}", path), Style::default().fg(Color::White)),
-                Span::styled(format!(" — {desc}"), Style::default().fg(Color::DarkGray)),
+                Span::styled("Coverage: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "routes {} caps {} p1 {} ai {} openapi {} tools {} · {}",
+                        contract.route_count,
+                        contract.capability_count,
+                        contract.p1_count,
+                        contract.ai_visible_count,
+                        contract.openapi_path_count,
+                        contract.openai_tool_count,
+                        parity
+                    ),
+                    Style::default().fg(if contract.route_contract_parity {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
+                ),
             ]));
+            for route in contract.sample_routes.iter().take(10) {
+                let method_color = match route.method.as_str() {
+                    "GET" => Color::Green,
+                    "POST" => Color::Yellow,
+                    "PUT" | "PATCH" => Color::Cyan,
+                    "DELETE" => Color::Red,
+                    _ => Color::White,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:4}", route.method),
+                        Style::default().fg(method_color),
+                    ),
+                    Span::styled(
+                        format!("{:28}", compact_text(&route.path, 28)),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!(" {} · {} · {}", route.domain, route.risk, route.criticality),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            if !contract.sample_tools.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("AI tools: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        contract
+                            .sample_tools
+                            .iter()
+                            .take(5)
+                            .map(|tool| format!("{}({})", tool.name, tool.parameter_count))
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Gateway contract unavailable. Check /api/gateway/capability-contract.",
+                Style::default().fg(Color::Yellow),
+            )));
         }
 
         lines.push(Line::from(""));
@@ -1555,11 +1516,50 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_api_endpoints() {
+    fn render_shows_gateway_capability_contract() {
         use crate::skin::SkinConfig;
         use crate::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
+        panel.gateway_capability_contract = Some(
+            crate::runtime_control_store::GatewayCapabilityContractSummary {
+                kind: "gateway.capability_contract".to_string(),
+                schema_version: 1,
+                owner: "gateway".to_string(),
+                route_count: 120,
+                capability_count: 120,
+                p1_count: 18,
+                ai_visible_count: 64,
+                openapi_path_count: 100,
+                openai_tool_count: 42,
+                route_contract_parity: true,
+                sample_routes: vec![
+                    crate::runtime_control_store::GatewayCapabilityRouteSummary {
+                        id: "gateway.surface.get".to_string(),
+                        domain: "surface".to_string(),
+                        title: "Surface registry".to_string(),
+                        method: "GET".to_string(),
+                        path: "/api/surfaces".to_string(),
+                        risk: "external".to_string(),
+                        criticality: "p1".to_string(),
+                    },
+                    crate::runtime_control_store::GatewayCapabilityRouteSummary {
+                        id: "gateway.contract.get".to_string(),
+                        domain: "gateway".to_string(),
+                        title: "Capability contract".to_string(),
+                        method: "GET".to_string(),
+                        path: "/api/gateway/capability-contract".to_string(),
+                        risk: "read".to_string(),
+                        criticality: "p1".to_string(),
+                    },
+                ],
+                sample_tools: vec![crate::runtime_control_store::GatewayOpenAiToolSummary {
+                    name: "gateway_get_api_sessions".to_string(),
+                    description: "List sessions".to_string(),
+                    parameter_count: 1,
+                }],
+            },
+        );
         let mut terminal = MockTerminal::new(82, 72);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
@@ -1569,59 +1569,20 @@ mod tests {
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
         assert!(
-            joined.contains("HTTP Projection Endpoints"),
-            "Should show HTTP projection endpoint section, got: {joined}"
+            joined.contains("Gateway Capability Contract"),
+            "Should show Gateway contract section, got: {joined}"
         );
         assert!(
-            joined.contains("/health"),
-            "Should show /health endpoint, got: {joined}"
+            joined.contains("routes 120 caps 120 p1 18 ai 64 openapi 100 tools 42"),
+            "Should show contract coverage, got: {joined}"
         );
         assert!(
-            joined.contains("/api/sessions"),
-            "Should show sessions endpoint, got: {joined}"
+            joined.contains("/api/surfaces") && joined.contains("/api/gateway/capability"),
+            "Should show contract-derived routes, got: {joined}"
         );
         assert!(
-            joined.contains("/api/memory"),
-            "Should show memory endpoint, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/reality/status")
-                && joined.contains("/api/reality/static")
-                && joined.contains("/api/reality/flow")
-                && joined.contains("/api/reality/promotions")
-                && joined.contains("/api/reality/boundaries"),
-            "Should show Reality Core endpoints, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/config"),
-            "Should show config endpoint, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/platforms"),
-            "Should show platforms endpoint, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/cowd/capabilities")
-                && joined.contains("/api/cowd/projection")
-                && joined.contains("/api/cowd/release-gate"),
-            "Should show cowd kernel endpoints, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/cowd/structured/sources")
-                && joined.contains("/api/cowd/structured/facts")
-                && joined.contains("/api/cowd/structured/evidence")
-                && joined.contains("/api/cowd/structured/watermarks")
-                && joined.contains("/api/cowd/structured/ingest-plan"),
-            "Should show structured data endpoints, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/surfaces"),
-            "Should show surface registry endpoint, got: {joined}"
-        );
-        assert!(
-            joined.contains("/api/surfaces/:id/send")
-                && joined.contains("/api/surfaces/:id/action"),
-            "Should show surface dispatch endpoints, got: {joined}"
+            joined.contains("AI tools") && joined.contains("gateway_get_api_sessions(1)"),
+            "Should show OpenAI tool summary, got: {joined}"
         );
     }
 
@@ -1777,9 +1738,9 @@ mod tests {
             "Should show surface dispatch contract section, got: {joined}"
         );
         assert!(
-            joined.contains("/api/surfaces/:id/send")
-                && joined.contains("/api/surfaces/:id/action"),
-            "Should show surface dispatch endpoints, got: {joined}"
+            joined.contains("Gateway owns routing")
+                && joined.contains("surface send/action requests by surface id"),
+            "Should show surface dispatch ownership without hard-coded endpoints, got: {joined}"
         );
         assert!(
             !joined.contains("channel.feishu"),

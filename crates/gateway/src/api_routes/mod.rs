@@ -51,6 +51,7 @@ use memory::MemoryScope;
 mod agent_routes;
 mod approval_routes;
 mod audit_routes;
+mod capability_contract;
 mod channel_routes;
 pub(crate) mod connector_routes;
 mod context_routes;
@@ -993,6 +994,51 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gateway_capability_contract_endpoints_are_available() {
+        let app = api_router(test_state());
+        for uri in [
+            "/api/gateway/capability-contract",
+            "/api/gateway/openapi.json",
+            "/api/gateway/openai-tools",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            match uri {
+                "/api/gateway/capability-contract" => {
+                    assert_eq!(json["kind"], "gateway.capability_contract");
+                    assert!(json["route_count"].as_u64().unwrap_or_default() > 50);
+                    assert!(json["capabilities"].as_array().is_some_and(|items| {
+                        items.iter().any(|capability| {
+                            capability["http"]["path"] == "/api/gateway/openapi.json"
+                        })
+                    }));
+                }
+                "/api/gateway/openapi.json" => {
+                    assert_eq!(json["openapi"], "3.1.0");
+                    assert!(json["paths"]["/api/gateway/capability-contract"]["get"].is_object());
+                }
+                "/api/gateway/openai-tools" => {
+                    assert_eq!(json["kind"], "gateway.openai_tools");
+                    assert!(json["tools"].as_array().is_some_and(|items| {
+                        items.iter().all(|tool| {
+                            tool["type"] == "function"
+                                && tool["function"]["name"].as_str().is_some()
+                                && tool["function"]["parameters"]["type"] == "object"
+                        })
+                    }));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]

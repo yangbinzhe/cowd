@@ -550,6 +550,14 @@ impl GatewayApiClient {
         self.get_json("/api/cowd/release-gate").await
     }
 
+    pub async fn gateway_capability_contract(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/gateway/capability-contract").await
+    }
+
+    pub async fn gateway_openai_tools(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/gateway/openai-tools").await
+    }
+
     pub async fn structured_sources(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/sources").await
     }
@@ -1871,6 +1879,8 @@ mod tests {
             "cowd_projection",
             "cowd_surfaces",
             "cowd_release_gate",
+            "gateway_capability_contract",
+            "gateway_openai_tools",
             "structured_sources",
             "structured_facts",
             "structured_evidence",
@@ -1921,7 +1931,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 97);
+        assert_eq!(migrated.len(), 99);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -1976,6 +1986,55 @@ mod tests {
         let json = client.cowd_projection("tui").await.expect("json");
         assert_eq!(json["surface"], "tui");
         assert_eq!(json["capability_count"], 1);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn gateway_contract_endpoints_get_json_with_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "/api/gateway/capability-contract",
+                    r#"{"kind":"gateway.capability_contract","capability_count":1,"capabilities":[]}"#,
+                ),
+                (
+                    "/api/gateway/openai-tools",
+                    r#"{"kind":"gateway.openai_tools","tool_count":1,"tools":[]}"#,
+                ),
+            ];
+            for (path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept contract");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read contract");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with(&format!("GET {path} HTTP/1.1")), "{req}");
+                assert!(req.contains("authorization: Bearer test-token"));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write contract");
+            }
+        });
+
+        let client =
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+                .expect("client");
+        let contract = client
+            .gateway_capability_contract()
+            .await
+            .expect("contract");
+        let tools = client.gateway_openai_tools().await.expect("tools");
+        assert_eq!(contract["kind"], "gateway.capability_contract");
+        assert_eq!(tools["kind"], "gateway.openai_tools");
         server.await.expect("server task");
     }
 

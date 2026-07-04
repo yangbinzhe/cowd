@@ -10,6 +10,8 @@ pub(crate) struct GatewayRouteManifestEntry {
     pub(crate) owner: &'static str,
     pub(crate) criticality: &'static str,
     pub(crate) stability: &'static str,
+    pub(crate) source: String,
+    pub(crate) handler: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +86,7 @@ const ROUTE_SOURCES: &[GatewayRouteSource] = &[
     source("profile_routes.rs", include_str!("profile_routes.rs")),
     source("public_routes.rs", include_str!("public_routes.rs")),
     source("reality_routes.rs", include_str!("reality_routes.rs")),
+    source("resource_routes.rs", include_str!("resource_routes.rs")),
     source("runtime_routes.rs", include_str!("runtime_routes.rs")),
     source(
         "runtime_routes/control.rs",
@@ -121,7 +124,7 @@ const fn source(file: &'static str, source: &'static str) -> GatewayRouteSource 
 pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
     let mut entries = BTreeSet::new();
     for source in ROUTE_SOURCES {
-        for (method, path) in parse_routes(source.source) {
+        for (method, path, handler) in parse_routes(source.source) {
             let criticality = route_criticality(&path);
             let stability = route_stability(&path);
             entries.insert(GatewayRouteManifestEntry {
@@ -131,31 +134,35 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
                 owner: "gateway",
                 criticality,
                 stability,
+                source: source.file.to_string(),
+                handler,
             });
         }
     }
     entries.into_iter().collect()
 }
 
-fn parse_routes(source: &str) -> Vec<(&'static str, String)> {
+fn parse_routes(source: &str) -> Vec<(&'static str, String, String)> {
     let mut routes = Vec::new();
-    let mut rest = source;
-    while let Some(index) = rest.find(".route(") {
-        rest = &rest[index + ".route(".len()..];
-        let trimmed = rest.trim_start();
+    let mut offset = 0;
+    while let Some(index) = source[offset..].find(".route(") {
+        let route_args_start = offset + index + ".route(".len();
+        let Some(route_args_end) = route_call_end(source, route_args_start) else {
+            break;
+        };
+        let call = &source[route_args_start..route_args_end];
+        let trimmed = call.trim_start();
         let Some(path_start) = trimmed.strip_prefix('"') else {
+            offset = route_args_end;
             continue;
         };
         let Some(path_end) = path_start.find('"') else {
+            offset = route_args_end;
             continue;
         };
         let path = path_start[..path_end].to_string();
         let after_path = &path_start[path_end..];
-        let handler_end = after_path
-            .find(".route(")
-            .unwrap_or(after_path.len())
-            .min(512);
-        let handler_window = &after_path[..handler_end];
+        let handler_window = after_path;
         for (needle, method) in [
             ("get(", "GET"),
             ("post(", "POST"),
@@ -163,12 +170,54 @@ fn parse_routes(source: &str) -> Vec<(&'static str, String)> {
             ("patch(", "PATCH"),
             ("delete(", "DELETE"),
         ] {
-            if handler_window.contains(needle) {
-                routes.push((method, path.clone()));
+            if let Some(handler) = method_handler(handler_window, needle) {
+                routes.push((method, path.clone(), handler));
             }
         }
+        offset = route_args_end;
     }
     routes
+}
+
+fn method_handler(source: &str, needle: &str) -> Option<String> {
+    let index = source.find(needle)?;
+    let rest = &source[index + needle.len()..];
+    let handler = rest
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    (!handler.is_empty()).then_some(handler)
+}
+
+fn route_call_end(source: &str, start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (relative, ch) in source[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn route_group(file: &str) -> String {
@@ -179,12 +228,25 @@ fn route_group(file: &str) -> String {
 }
 
 fn route_criticality(path: &str) -> &'static str {
-    if path.contains("/actions/")
-        || path.contains("/release-gate")
-        || path.contains("/surfaces")
-        || path.contains("/sessions")
-        || path.contains("/runtime")
-    {
+    const P1_TOKENS: &[&str] = &[
+        "/actions/",
+        "/approval",
+        "/context",
+        "/cross-plane",
+        "/matrix",
+        "/memory",
+        "/mission",
+        "/reality",
+        "/release-gate",
+        "/resources",
+        "/runtime",
+        "/sessions",
+        "/surfaces",
+        "/tools",
+        "/workspace",
+    ];
+
+    if P1_TOKENS.iter().any(|token| path.contains(token)) {
         "p1"
     } else {
         "p2"
@@ -218,6 +280,13 @@ mod tests {
         assert!(has("POST", "/api/skills/:id/actions/plan"));
         assert!(has("POST", "/api/skills/:id/actions/run"));
         assert!(has("GET", "/api/cowd/release-gate"));
+        assert!(has("POST", "/api/resources"));
+        assert!(manifest
+            .iter()
+            .any(|entry| { entry.path == "/api/approval/pending" && entry.criticality == "p1" }));
+        assert!(manifest
+            .iter()
+            .any(|entry| entry.path == "/api/resources" && entry.criticality == "p1"));
     }
 
     #[test]
@@ -230,5 +299,35 @@ mod tests {
 
         assert_eq!(unique.len(), manifest.len());
         assert!(manifest.len() > 50);
+        assert!(manifest.iter().all(|entry| !entry.source.is_empty()));
+        assert!(manifest.iter().all(|entry| !entry.handler.is_empty()));
+        assert!(manifest.iter().any(|entry| {
+            entry.path == "/api/gateway/route-manifest"
+                && entry.handler == "route_manifest_handler"
+                && entry.source == "core_routes.rs"
+        }));
+    }
+
+    #[test]
+    fn route_manifest_does_not_parse_methods_after_last_route() {
+        let routes = parse_routes(
+            r#"
+            Router::new()
+                .route("/api/auth/logout", post(logout_handler))
+
+            fn unrelated(value: serde_json::Value) {
+                let _ = value.get("title");
+            }
+            "#,
+        );
+
+        assert_eq!(
+            routes,
+            vec![(
+                "POST",
+                "/api/auth/logout".to_string(),
+                "logout_handler".to_string()
+            )]
+        );
     }
 }
