@@ -3,10 +3,13 @@
 use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::{ToolSafetyCategory, ToolSafetyRegistry};
+
+pub const TOOL_EXECUTION_PLAN_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,8 +106,12 @@ pub struct ToolConflict {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionPlanTask {
+    pub contract_version: u32,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub idempotency_key: String,
+    pub model_visible_name: String,
+    pub can_parallelize: bool,
     pub safety_category: ToolSafetyCategory,
     pub purity: ToolPurity,
     pub resource_scope: ToolResourceScope,
@@ -164,8 +171,15 @@ impl ToolExecutionPlan {
                 };
 
                 ToolExecutionPlanTask {
+                    contract_version: TOOL_EXECUTION_PLAN_CONTRACT_VERSION,
                     tool_call_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
+                    idempotency_key: tool_plan_idempotency_key(request),
+                    model_visible_name: model_visible_tool_name(&request.tool_name),
+                    can_parallelize: matches!(
+                        execution_mode,
+                        ToolExecutionMode::ParallelRead | ToolExecutionMode::LimitedParallel
+                    ),
                     safety_category,
                     purity: analysis.purity,
                     resource_scope: analysis.resource_scope,
@@ -184,6 +198,13 @@ impl ToolExecutionPlan {
             })
             .collect::<Vec<_>>();
         annotate_conflicts(&mut tasks);
+        for task in &mut tasks {
+            task.can_parallelize = task.conflicts.is_empty()
+                && matches!(
+                    task.execution_mode,
+                    ToolExecutionMode::ParallelRead | ToolExecutionMode::LimitedParallel
+                );
+        }
 
         Self {
             plan_id: format!("tool-plan-{}", Uuid::new_v4()),
@@ -377,6 +398,24 @@ fn normalize_resource_path(path: &str) -> String {
     }
 }
 
+fn tool_plan_idempotency_key(request: &ToolRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(request.tool_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.input.as_bytes());
+    hasher.update([0]);
+    for dependency in &request.depends_on {
+        hasher.update(dependency.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("tool-plan-task:v{TOOL_EXECUTION_PLAN_CONTRACT_VERSION}:{digest}")
+}
+
+fn model_visible_tool_name(tool_name: &str) -> String {
+    tool_name.trim().replace('_', " ")
+}
+
 fn annotate_conflicts(tasks: &mut [ToolExecutionPlanTask]) {
     for left in 0..tasks.len() {
         for right in (left + 1)..tasks.len() {
@@ -456,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_classifies_parallel_limited_and_destructive_tools() {
+    fn tool_contract_plan_classifies_parallel_limited_and_destructive_tools() {
         let plan = ToolExecutionPlan::from_requests(&[
             request("read-1", "read", Vec::new()),
             request("write-1", "write", Vec::new()),
@@ -472,9 +511,19 @@ mod tests {
             ToolExecutionMode::ParallelRead
         );
         assert_eq!(
+            plan.tasks[0].contract_version,
+            TOOL_EXECUTION_PLAN_CONTRACT_VERSION
+        );
+        assert!(plan.tasks[0]
+            .idempotency_key
+            .starts_with("tool-plan-task:v2:"));
+        assert_eq!(plan.tasks[0].model_visible_name, "read");
+        assert!(!plan.tasks[0].can_parallelize);
+        assert_eq!(
             plan.tasks[2].execution_mode,
             ToolExecutionMode::SerialDestructive
         );
+        assert!(!plan.tasks[2].can_parallelize);
     }
 
     #[test]
@@ -491,6 +540,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_contract_readonly_batch_can_parallelize_without_conflicts() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            request("read-1", "read_file", Vec::new()),
+            request("read-2", "grep_search", Vec::new()),
+        ]);
+
+        assert!(plan.tasks.iter().all(|task| task.can_parallelize));
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.contract_version == TOOL_EXECUTION_PLAN_CONTRACT_VERSION));
+    }
+
+    #[test]
     fn plan_event_refs_all_tool_calls() {
         let plan = ToolExecutionPlan::from_requests(&[
             request("read-1", "read", Vec::new()),
@@ -503,6 +566,11 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["task_count"], 2);
+        assert_eq!(event.payload["tasks"][0]["contract_version"], 2);
+        assert!(event.payload["tasks"][0]["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("tool-plan-task:v2:"));
     }
 
     #[test]
@@ -550,6 +618,7 @@ mod tests {
         ]);
 
         assert_eq!(plan.tasks[0].conflicts.len(), 1);
+        assert!(!plan.tasks[0].can_parallelize);
         assert_eq!(plan.tasks[0].conflicts[0].tool_call_id, "edit-1");
         assert_eq!(plan.tasks[0].conflicts[0].kind, "path_overlap");
         assert_eq!(plan.tasks[1].conflicts[0].tool_call_id, "write-1");

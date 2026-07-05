@@ -10,6 +10,7 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 const INPUT_PREVIEW_CHARS: usize = 240;
 const OUTPUT_PREVIEW_CHARS: usize = 500;
 pub const DEFAULT_OUTPUT_REF_MIN_LINES: usize = 2000;
+pub const TOOL_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,13 +76,17 @@ pub struct ToolOutputRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationRecord {
+    pub contract_version: u32,
     pub invocation_id: String,
     pub session_id: String,
     pub turn_index: usize,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub advertised_registration_id: String,
+    pub effective_registration_id: String,
     pub input_hash: String,
     pub input_preview: String,
+    pub model_visible_preview: String,
     pub safety_category: ToolSafetyCategory,
     pub status: ToolInvocationStatus,
     pub started_at_ms: u64,
@@ -91,6 +96,12 @@ pub struct ToolInvocationRecord {
     pub output_byte_count: Option<usize>,
     pub output_preview: Option<String>,
     pub output_ref: Option<ToolOutputRef>,
+    pub full_output_ref: Option<String>,
+    pub raw_output_tokens: Option<u64>,
+    pub preview_tokens: Option<u64>,
+    pub context_saved_tokens: Option<u64>,
+    pub context_saved_ratio: Option<u16>,
+    pub stale_registration: bool,
     pub is_error: Option<bool>,
     pub failure_kind: Option<ToolFailureKind>,
 }
@@ -106,14 +117,21 @@ impl ToolInvocationRecord {
         safety_category: ToolSafetyCategory,
         started_at_ms: u64,
     ) -> Self {
+        let tool_name = tool_name.into();
+        let input_preview = preview(input, INPUT_PREVIEW_CHARS);
+        let registration_id = registration_id(&tool_name, safety_category);
         Self {
+            contract_version: TOOL_CONTRACT_VERSION,
             invocation_id: format!("tool-inv-{}", Uuid::new_v4()),
             session_id: session_id.into(),
             turn_index,
             tool_call_id: tool_call_id.into(),
-            tool_name: tool_name.into(),
+            tool_name,
+            advertised_registration_id: registration_id.registration_id.clone(),
+            effective_registration_id: registration_id.registration_id,
             input_hash: stable_hash(input),
-            input_preview: preview(input, INPUT_PREVIEW_CHARS),
+            input_preview: input_preview.clone(),
+            model_visible_preview: input_preview,
             safety_category,
             status: ToolInvocationStatus::Running,
             started_at_ms,
@@ -123,9 +141,34 @@ impl ToolInvocationRecord {
             output_byte_count: None,
             output_preview: None,
             output_ref: None,
+            full_output_ref: None,
+            raw_output_tokens: None,
+            preview_tokens: None,
+            context_saved_tokens: None,
+            context_saved_ratio: None,
+            stale_registration: false,
             is_error: None,
             failure_kind: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_effective_registration_id(
+        mut self,
+        effective_registration_id: impl Into<String>,
+    ) -> Self {
+        self.effective_registration_id = effective_registration_id.into();
+        self.stale_registration = self.advertised_registration_id != self.effective_registration_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_full_output_ref(mut self, full_output_ref: impl Into<String>) -> Self {
+        let full_output_ref = full_output_ref.into();
+        if !full_output_ref.trim().is_empty() {
+            self.full_output_ref = Some(full_output_ref);
+        }
+        self
     }
 
     #[must_use]
@@ -192,9 +235,14 @@ impl ToolInvocationRecord {
     fn with_output_digest(mut self, output: &str, output_ref_min_lines: usize) -> Self {
         let line_count = output.lines().count();
         let byte_count = output.len();
+        let output_preview = preview(output, OUTPUT_PREVIEW_CHARS);
+        let raw_tokens = estimate_tokens(output);
+        let preview_tokens = estimate_tokens(&output_preview);
+        let saved_tokens = raw_tokens.saturating_sub(preview_tokens);
         self.output_line_count = Some(line_count);
         self.output_byte_count = Some(byte_count);
-        self.output_preview = Some(preview(output, OUTPUT_PREVIEW_CHARS));
+        self.output_preview = Some(output_preview.clone());
+        self.model_visible_preview = output_preview;
         self.output_ref = large_output_ref(
             &self.tool_call_id,
             output,
@@ -202,17 +250,32 @@ impl ToolInvocationRecord {
             byte_count,
             output_ref_min_lines,
         );
+        if let Some(output_ref) = &self.output_ref {
+            self.full_output_ref = Some(output_ref.ref_id.clone());
+        }
+        self.raw_output_tokens = Some(raw_tokens);
+        self.preview_tokens = Some(preview_tokens);
+        self.context_saved_tokens = Some(saved_tokens);
+        self.context_saved_ratio = Some(if raw_tokens == 0 {
+            0
+        } else {
+            ((saved_tokens.saturating_mul(10_000)) / raw_tokens).min(10_000) as u16
+        });
         self
     }
 
     #[must_use]
     pub fn to_runtime_event(&self, sequence: usize, kind: impl Into<String>) -> RuntimeEvent {
         let payload = serde_json::json!({
+            "contract_version": self.contract_version,
             "invocation_id": self.invocation_id,
             "tool_call_id": self.tool_call_id,
             "tool_name": self.tool_name,
             "turn_index": self.turn_index,
             "status": self.status.as_str(),
+            "advertised_registration_id": self.advertised_registration_id,
+            "effective_registration_id": self.effective_registration_id,
+            "model_visible_preview": self.model_visible_preview,
             "safety_category": self.safety_category,
             "input_hash": self.input_hash,
             "input_preview": self.input_preview,
@@ -223,6 +286,12 @@ impl ToolInvocationRecord {
             "output_byte_count": self.output_byte_count,
             "output_preview": self.output_preview,
             "output_ref": self.output_ref,
+            "full_output_ref": self.full_output_ref,
+            "raw_output_tokens": self.raw_output_tokens,
+            "preview_tokens": self.preview_tokens,
+            "context_saved_tokens": self.context_saved_tokens,
+            "context_saved_ratio": self.context_saved_ratio,
+            "stale_registration": self.stale_registration,
             "is_error": self.is_error,
             "failure_kind": self.failure_kind.map(ToolFailureKind::as_str),
         });
@@ -259,9 +328,14 @@ impl ToolInvocationRecord {
 
     #[must_use]
     pub fn evidence_reference(&self) -> String {
-        self.output_ref
+        self.full_output_ref
             .as_ref()
-            .map(|reference| reference.ref_id.clone())
+            .cloned()
+            .or_else(|| {
+                self.output_ref
+                    .as_ref()
+                    .map(|reference| reference.ref_id.clone())
+            })
             .unwrap_or_else(|| self.invocation_id.clone())
     }
 
@@ -299,6 +373,30 @@ fn stable_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+struct RegistrationId {
+    registration_id: String,
+}
+
+fn registration_id(tool_name: &str, safety_category: ToolSafetyCategory) -> RegistrationId {
+    let normalized = tool_name.trim().to_ascii_lowercase().replace(' ', "_");
+    let safety = match safety_category {
+        ToolSafetyCategory::ReadOnly => "read_only",
+        ToolSafetyCategory::WriteLocal => "write_local",
+        ToolSafetyCategory::Network => "network",
+        ToolSafetyCategory::Destructive => "destructive",
+    };
+    RegistrationId {
+        registration_id: format!(
+            "tool-reg:v{}:{}:{}",
+            TOOL_CONTRACT_VERSION, safety, normalized
+        ),
+    }
+}
+
+fn estimate_tokens(content: &str) -> u64 {
+    (content.chars().count() as u64).div_ceil(4).max(1)
 }
 
 fn large_output_ref(
@@ -359,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_record_runtime_event_has_tool_scope_refs() {
+    fn tool_contract_v2_runtime_event_has_scope_refs_and_savings() {
         let record = ToolInvocationRecord::started(
             "session-1",
             4,
@@ -375,6 +473,12 @@ mod tests {
 
         assert_eq!(event.scope, RuntimeEventScope::Tool);
         assert_eq!(event.status.as_deref(), Some("completed"));
+        assert_eq!(event.payload["contract_version"], TOOL_CONTRACT_VERSION);
+        assert_eq!(event.payload["stale_registration"], false);
+        assert!(event.payload["advertised_registration_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("tool-reg:v2:read_only:read"));
         assert_eq!(event.payload["duration_ms"], 25);
         assert!(event
             .refs
@@ -431,6 +535,14 @@ mod tests {
         let event = record.to_runtime_event(10, "tool.invocation.completed");
         assert_eq!(event.payload["output_line_count"], 80);
         assert_eq!(event.payload["output_ref"]["tool_call_id"], "toolu-large");
+        assert!(event.payload["raw_output_tokens"].as_u64().unwrap() > 0);
+        assert!(event.payload["preview_tokens"].as_u64().unwrap() > 0);
+        assert!(event.payload["context_saved_tokens"].as_u64().unwrap() > 0);
+        assert!(event.payload["context_saved_ratio"].as_u64().unwrap() > 0);
+        assert!(event.payload["full_output_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("tool-output:toolu-large"));
         assert_eq!(
             event.payload["output_ref"]["search_hint"],
             "/sandbox-search toolu-large <query>"
@@ -461,5 +573,23 @@ mod tests {
         assert!(summary.contains("tool `bash`"));
         assert!(summary.contains("large output indexed by reference"));
         assert!(!summary.contains("line 79"));
+    }
+
+    #[test]
+    fn stale_registration_is_computed_from_advertised_and_effective_ids() {
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-stale",
+            "read",
+            "{}",
+            ToolSafetyCategory::ReadOnly,
+            200,
+        )
+        .with_effective_registration_id("tool-reg:v2:read_only:read:newer");
+
+        assert!(record.stale_registration);
+        let event = record.to_runtime_event(10, "tool.invocation.started");
+        assert_eq!(event.payload["stale_registration"], true);
     }
 }

@@ -1097,6 +1097,59 @@ fn collect_payloads_by_types(
         .collect()
 }
 
+fn runtime_tool_payload_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let event_type = event.get("type").and_then(serde_json::Value::as_str)?;
+    let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+    if matches!(
+        event_type,
+        "ToolStart" | "ToolProgress" | "ToolComplete" | "ToolFailure"
+    ) {
+        return Some(payload.clone());
+    }
+    if event_type != "RuntimeEvent" {
+        return None;
+    }
+    let scope = payload.get("scope").and_then(serde_json::Value::as_str)?;
+    if scope != "tool" {
+        return None;
+    }
+    let mut tool_payload = payload
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(object) = tool_payload.as_object_mut() {
+        object.insert(
+            "runtime_event_kind".to_string(),
+            payload
+                .get("kind")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "runtime_event_status".to_string(),
+            payload
+                .get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "runtime_event_id".to_string(),
+            payload
+                .get("event_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Some(tool_payload)
+}
+
+fn collect_tool_timeline(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(runtime_tool_payload_from_event)
+        .collect()
+}
+
 fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool {
     payload
         .get("type")
@@ -1149,29 +1202,30 @@ impl TurnProjectionAccumulator {
             self.observe_turn_journal(event, payload);
             return;
         }
-        match event_type {
-            "ToolStart" | "ToolProgress" | "ToolComplete" | "ToolFailure" => {
-                self.tool_calls.push(payload.clone());
-            }
-            "ApprovalRequested" | "ApprovalResolved" | "RiskApproval" => {
-                self.approvals.push(payload.clone());
-            }
-            "ContextEnvelope" | "ContextTurnReport" | "ContextRecommendationAction" => {
-                self.context_events.push(payload.clone());
-            }
-            "TokenUsage" | "RunModelTelemetry" => {
-                self.usage.push(payload.clone());
-            }
-            "SurfaceMessageProcessed" => {
-                if let Some(preview) = payload
-                    .get("response_preview")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    self.assistant_preview = Some(preview.to_string());
+        if let Some(tool_payload) = runtime_tool_payload_from_event(event) {
+            self.tool_calls.push(tool_payload);
+        } else {
+            match event_type {
+                "ApprovalRequested" | "ApprovalResolved" | "RiskApproval" => {
+                    self.approvals.push(payload.clone());
                 }
+                "ContextEnvelope" | "ContextTurnReport" | "ContextRecommendationAction" => {
+                    self.context_events.push(payload.clone());
+                }
+                "TokenUsage" | "RunModelTelemetry" => {
+                    self.usage.push(payload.clone());
+                }
+                "SurfaceMessageProcessed" => {
+                    if let Some(preview) = payload
+                        .get("response_preview")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        self.assistant_preview = Some(preview.to_string());
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
         collect_projection_evidence_refs(payload, &mut self.evidence_refs);
     }
@@ -1342,10 +1396,8 @@ fn session_run_projection_from_events(
         .collect::<Vec<_>>();
     let runtime_run_count = runs.len();
     let run_graph = runtime_run_tree_summary(&runs);
-    let tool_timeline = collect_payloads_by_types(
-        &events,
-        &["ToolStart", "ToolProgress", "ToolComplete", "PartialAnswer"],
-    );
+    let mut tool_timeline = collect_tool_timeline(&events);
+    tool_timeline.extend(collect_payloads_by_types(&events, &["PartialAnswer"]));
     let token_usage = collect_payloads_by_types(&events, &["TokenUsage"]);
     let latest_model_telemetry = latest_payload_by_type(&events, "RunModelTelemetry")
         .and_then(|payload| payload.get("telemetry").cloned().or(Some(payload)));
@@ -2048,6 +2100,53 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("ctx-report-1")));
+    }
+
+    #[test]
+    fn session_run_projection_includes_tool_contract_runtime_events() {
+        let events = vec![session_event(
+            0,
+            "RuntimeEvent",
+            serde_json::json!({
+                "event_id": "event-tool-1",
+                "session_id": "session-v31",
+                "sequence": 0,
+                "scope": "tool",
+                "kind": "tool.invocation.completed",
+                "status": "completed",
+                "payload": {
+                    "contract_version": 2,
+                    "invocation_id": "tool-inv-1",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read",
+                    "turn_index": 1,
+                    "status": "completed",
+                    "advertised_registration_id": "tool-reg:v2:read_only:read",
+                    "effective_registration_id": "tool-reg:v2:read_only:read",
+                    "model_visible_preview": "ok",
+                    "full_output_ref": "tool://raw-1",
+                    "raw_output_tokens": 100,
+                    "preview_tokens": 10,
+                    "context_saved_tokens": 90,
+                    "context_saved_ratio": 9000,
+                    "stale_registration": false
+                },
+                "created_at_ms": 1000
+            }),
+        )];
+
+        let projection = session_run_projection_from_events("session-v31", events, None);
+
+        assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
+        assert_eq!(projection["tool_timeline"][0]["contract_version"], 2);
+        assert_eq!(
+            projection["tool_timeline"][0]["full_output_ref"],
+            "tool://raw-1"
+        );
+        assert_eq!(
+            projection["tool_timeline"][0]["runtime_event_kind"],
+            "tool.invocation.completed"
+        );
     }
 
     #[test]

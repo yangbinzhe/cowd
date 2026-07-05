@@ -3245,6 +3245,8 @@ where
                     is_error,
                     elapsed_ms,
                 );
+                let completed_record =
+                    completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()));
                 let model_summary = prepared_vision
                     .as_ref()
                     .map(|payload| vision_tool_model_summary(payload, &raw_ref))
