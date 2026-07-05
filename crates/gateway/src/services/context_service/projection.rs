@@ -167,10 +167,51 @@ fn context_projection_json(
     let snapshot = RuntimeContextBoundary::snapshot(&envelope);
     let budget_explanation = RuntimeContextBoundary::budget_explanation(&envelope);
     let agent_view = context_agent_view_from_params(params, &envelope);
+    let source_registry = envelope.source_registry.clone();
+    let active_sources = envelope
+        .epoch_report
+        .as_ref()
+        .map(|report| report.active_sources.clone())
+        .unwrap_or_else(|| {
+            source_registry
+                .iter()
+                .filter(|source| {
+                    source.lifecycle != runtime::ContextSourceLifecycle::SuppressedForCurrentTurn
+                })
+                .cloned()
+                .collect()
+        });
+    let suppressed_sources = envelope
+        .epoch_report
+        .as_ref()
+        .map(|report| report.suppressed_sources.clone())
+        .unwrap_or_else(|| {
+            source_registry
+                .iter()
+                .filter(|source| {
+                    source.lifecycle == runtime::ContextSourceLifecycle::SuppressedForCurrentTurn
+                })
+                .cloned()
+                .collect()
+        });
+    let context_epoch = serde_json::json!({
+        "epoch_id": envelope.epoch_id,
+        "envelope_id": envelope.id,
+        "session_id": envelope.identity.session_id,
+        "profile": envelope.profile,
+        "selected_count": envelope.selected.len(),
+        "omitted_count": envelope.omitted.len(),
+        "source_count": source_registry.len(),
+        "report": envelope.epoch_report,
+    });
 
     serde_json::json!({
         "enabled": true,
         "source": source,
+        "context_epoch": context_epoch,
+        "source_registry": source_registry,
+        "active_sources": active_sources,
+        "suppressed_sources": suppressed_sources,
         "envelope": envelope,
         "lean_probe": lean_probe,
         "policy_decision": policy_decision,
@@ -311,4 +352,41 @@ fn resource_context_item(resource: ExternalResourceRef) -> ContextItem {
     };
     item.evidence = vec![resource.reference];
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_projection_exposes_epoch_source_registry() {
+        let envelope = RuntimeContextBoundary::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::MainTurn,
+            identity: ContextIdentity::main("session-projection"),
+            intent: "inspect context source registry".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![ContextItem::new(
+                "memory://projection",
+                ContextSourceKind::Memory,
+                ContextRole::Evidence,
+                "memory fact",
+            )],
+            omitted: vec![ContextOmission {
+                source: ContextSourceKind::Knowledge,
+                reason: "suppressed_for_current_turn: irrelevant".to_string(),
+                token_estimate: 16,
+            }],
+            total_budget_tokens: 8_000,
+        });
+        let projection = context_projection_json("test", envelope, &HashMap::new());
+
+        assert_eq!(projection["context_epoch"]["selected_count"], 1);
+        assert_eq!(projection["source_registry"].as_array().unwrap().len(), 2);
+        assert_eq!(projection["active_sources"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            projection["suppressed_sources"][0]["lifecycle"],
+            "SuppressedForCurrentTurn"
+        );
+    }
 }

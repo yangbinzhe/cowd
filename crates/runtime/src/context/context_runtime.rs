@@ -144,6 +144,64 @@ pub enum ContextRole {
     ToolSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ContextSourceLifecycle {
+    Static,
+    #[default]
+    Runtime,
+    Ephemeral,
+    Session,
+    Durable,
+    External,
+    SuppressedForCurrentTurn,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSourceRef {
+    pub source_id: String,
+    pub source_kind: ContextSourceKind,
+    pub authority: ContextAuthority,
+    pub lifecycle: ContextSourceLifecycle,
+    pub version: Option<String>,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub conflict_with: Vec<String>,
+}
+
+impl ContextSourceRef {
+    fn from_item(item: &ContextItem) -> Self {
+        Self {
+            source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
+            source_kind: item.source,
+            authority: item.authority,
+            lifecycle: item.source_lifecycle,
+            version: item.source_version.clone(),
+            reason: item.source_reason.clone(),
+            evidence: item.evidence.clone(),
+            conflict_with: item.conflict_with.clone(),
+        }
+    }
+
+    fn from_omission(omission: &ContextOmission) -> Self {
+        let source_id = format!(
+            "omitted:{:?}:{}",
+            omission.source,
+            stable_hash_bytes(omission.reason.as_bytes())
+        );
+        Self {
+            source_id,
+            source_kind: omission.source,
+            authority: ContextAuthority::Derived,
+            lifecycle: ContextSourceLifecycle::SuppressedForCurrentTurn,
+            version: None,
+            reason: Some(omission.reason.clone()),
+            evidence: Vec::new(),
+            conflict_with: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: String,
@@ -155,6 +213,16 @@ pub struct ContextItem {
     pub token_estimate: u64,
     pub score: f32,
     pub evidence: Vec<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_version: Option<String>,
+    #[serde(default)]
+    pub source_lifecycle: ContextSourceLifecycle,
+    #[serde(default)]
+    pub source_reason: Option<String>,
+    #[serde(default)]
+    pub conflict_with: Vec<String>,
 }
 
 impl ContextItem {
@@ -175,6 +243,11 @@ impl ContextItem {
             content,
             score: 1.0,
             evidence: Vec::new(),
+            source_id: None,
+            source_version: None,
+            source_lifecycle: ContextSourceLifecycle::Runtime,
+            source_reason: None,
+            conflict_with: Vec::new(),
         }
     }
 }
@@ -482,6 +555,20 @@ pub struct AgentContextView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEpochReport {
+    pub epoch_id: String,
+    pub envelope_id: String,
+    pub session_id: String,
+    pub profile: ContextProfile,
+    pub selected_count: usize,
+    pub omitted_count: usize,
+    pub source_count: usize,
+    pub active_sources: Vec<ContextSourceRef>,
+    pub suppressed_sources: Vec<ContextSourceRef>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
     pub runtime_header: Vec<String>,
@@ -503,11 +590,17 @@ impl AssembledContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextEnvelope {
     pub id: String,
+    #[serde(default)]
+    pub epoch_id: String,
     pub identity: ContextIdentity,
     pub profile: ContextProfile,
     pub intent: String,
     pub selected: Vec<ContextItem>,
     pub omitted: Vec<ContextOmission>,
+    #[serde(default)]
+    pub source_registry: Vec<ContextSourceRef>,
+    #[serde(default)]
+    pub epoch_report: Option<ContextEpochReport>,
     pub budget: ContextBudgetReport,
     pub diagnostics: ContextDiagnostics,
     pub assembled: AssembledContext,
@@ -583,6 +676,10 @@ impl ContextRuntimeKernel {
         let profile = request.profile;
         let leases = Self::default_leases(profile, request.total_budget_tokens);
         let (dynamic_items, lease_omissions) = Self::apply_leases(request.dynamic_items, &leases);
+        let dynamic_items = dynamic_items
+            .into_iter()
+            .map(normalize_context_item_source)
+            .collect::<Vec<_>>();
         let mut omitted = request.omitted;
         omitted.extend(lease_omissions);
         let dynamic_tail = dynamic_items
@@ -622,14 +719,41 @@ impl ContextRuntimeKernel {
             ),
         };
         let id = envelope_id(&request.identity, &request.intent, &diagnostics);
+        let epoch_id = context_epoch_id(&id);
+        let active_sources = dynamic_items
+            .iter()
+            .map(ContextSourceRef::from_item)
+            .collect::<Vec<_>>();
+        let suppressed_sources = omitted
+            .iter()
+            .map(ContextSourceRef::from_omission)
+            .collect::<Vec<_>>();
+        let mut source_registry = active_sources.clone();
+        source_registry.extend(suppressed_sources.clone());
+        let created_at = Utc::now();
+        let epoch_report = ContextEpochReport {
+            epoch_id: epoch_id.clone(),
+            envelope_id: id.clone(),
+            session_id: request.identity.session_id.clone(),
+            profile,
+            selected_count: dynamic_items.len(),
+            omitted_count: omitted.len(),
+            source_count: source_registry.len(),
+            active_sources,
+            suppressed_sources,
+            created_at,
+        };
 
         ContextEnvelope {
             id,
+            epoch_id,
             identity: request.identity,
             profile,
             intent: request.intent,
             selected: dynamic_items,
             omitted,
+            source_registry,
+            epoch_report: Some(epoch_report),
             budget: ContextBudgetReport {
                 total_tokens: request.total_budget_tokens,
                 used_tokens,
@@ -637,7 +761,7 @@ impl ContextRuntimeKernel {
             },
             diagnostics,
             assembled,
-            created_at: Utc::now(),
+            created_at,
         }
     }
 
@@ -1770,6 +1894,50 @@ fn envelope_id(
     format!("{:016x}", stable_hash_bytes(raw.as_bytes()))
 }
 
+fn context_epoch_id(envelope_id: &str) -> String {
+    format!("ctx-epoch-{envelope_id}")
+}
+
+fn normalize_context_item_source(mut item: ContextItem) -> ContextItem {
+    if item.source_id.as_deref().unwrap_or_default().is_empty() {
+        item.source_id = Some(item.id.clone());
+    }
+    if item.source_lifecycle == ContextSourceLifecycle::Runtime {
+        item.source_lifecycle = default_source_lifecycle(item.source);
+    }
+    if item
+        .source_reason
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        item.source_reason = Some(format!(
+            "selected_for_{:?}_profile_from_{:?}",
+            item.role, item.source
+        ));
+    }
+    item
+}
+
+fn default_source_lifecycle(source: ContextSourceKind) -> ContextSourceLifecycle {
+    match source {
+        ContextSourceKind::StableHead | ContextSourceKind::RuntimeHeader => {
+            ContextSourceLifecycle::Static
+        }
+        ContextSourceKind::Memory
+        | ContextSourceKind::Knowledge
+        | ContextSourceKind::Fact
+        | ContextSourceKind::Matrix => ContextSourceLifecycle::Durable,
+        ContextSourceKind::Workspace => ContextSourceLifecycle::External,
+        ContextSourceKind::Conversation
+        | ContextSourceKind::Task
+        | ContextSourceKind::ToolTrace
+        | ContextSourceKind::AgentPeer
+        | ContextSourceKind::Handoff => ContextSourceLifecycle::Runtime,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2435,44 @@ mod tests {
         assert!(rendered.contains("compact context body"));
         assert!(!rendered.contains("<context_item"));
         assert!(!rendered.contains("</context_item>"));
+    }
+
+    #[test]
+    fn context_epoch_report_tracks_active_and_suppressed_sources() {
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::MainTurn,
+            identity: ContextIdentity::main("session-epoch"),
+            intent: "inspect memory pollution".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![ContextItem::new(
+                "memory://active",
+                ContextSourceKind::Memory,
+                ContextRole::Evidence,
+                "active memory fact",
+            )],
+            omitted: vec![ContextOmission {
+                source: ContextSourceKind::Knowledge,
+                reason: "suppressed_for_current_turn: unrelated domain".to_string(),
+                token_estimate: 64,
+            }],
+            total_budget_tokens: 8_000,
+        });
+
+        assert!(envelope.epoch_id.starts_with("ctx-epoch-"));
+        assert_eq!(envelope.source_registry.len(), 2);
+        assert_eq!(
+            envelope.selected[0].source_lifecycle,
+            ContextSourceLifecycle::Durable
+        );
+        let report = envelope.epoch_report.as_ref().unwrap();
+        assert_eq!(report.active_sources.len(), 1);
+        assert_eq!(report.suppressed_sources.len(), 1);
+        assert_eq!(
+            report.suppressed_sources[0].lifecycle,
+            ContextSourceLifecycle::SuppressedForCurrentTurn
+        );
+        assert_eq!(report.active_sources[0].source_id, "memory://active");
     }
 
     #[test]

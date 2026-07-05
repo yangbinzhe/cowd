@@ -45,6 +45,8 @@ pub enum ContextSourceKind {
     Conversation,
     Memory,
     Knowledge,
+    Fact,
+    Matrix,
     Task,
     ToolTrace,
     Workspace,
@@ -77,6 +79,32 @@ pub enum ContextRole {
     ToolSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSourceLifecycle {
+    Static,
+    #[default]
+    Runtime,
+    Ephemeral,
+    Session,
+    Durable,
+    External,
+    SuppressedForCurrentTurn,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSourceRef {
+    pub source_id: String,
+    pub source: ContextSourceKind,
+    pub authority: ContextAuthority,
+    pub lifecycle: ContextSourceLifecycle,
+    pub version: Option<String>,
+    pub reason: Option<String>,
+    pub refs: Vec<KernelRef>,
+    pub conflict_with: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: String,
@@ -87,6 +115,16 @@ pub struct ContextItem {
     pub token_estimate: u64,
     pub score: f32,
     pub refs: Vec<KernelRef>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_version: Option<String>,
+    #[serde(default)]
+    pub source_lifecycle: ContextSourceLifecycle,
+    #[serde(default)]
+    pub source_reason: Option<String>,
+    #[serde(default)]
+    pub conflict_with: Vec<String>,
 }
 
 impl ContextItem {
@@ -107,6 +145,11 @@ impl ContextItem {
             content,
             score: 1.0,
             refs: Vec::new(),
+            source_id: None,
+            source_version: None,
+            source_lifecycle: ContextSourceLifecycle::Runtime,
+            source_reason: None,
+            conflict_with: Vec::new(),
         }
     }
 
@@ -150,6 +193,8 @@ pub struct ContextEpoch {
     pub budget: ContextBudget,
     pub selected: Vec<ContextItem>,
     pub omitted: Vec<ContextOmission>,
+    #[serde(default)]
+    pub source_registry: Vec<ContextSourceRef>,
     pub token_total: u64,
 }
 
@@ -593,11 +638,24 @@ impl ContextEpochBuilder {
         let mut selected = Vec::new();
         let mut omitted = Vec::new();
         let mut token_total = 0u64;
+        let mut source_registry = Vec::new();
         for item in self.items {
+            let item = normalize_context_item_source(item);
             if token_total.saturating_add(item.token_estimate) <= self.budget.max_tokens {
                 token_total = token_total.saturating_add(item.token_estimate);
+                source_registry.push(context_source_ref_from_item(&item));
                 selected.push(item);
             } else {
+                source_registry.push(ContextSourceRef {
+                    source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
+                    source: item.source,
+                    authority: item.authority,
+                    lifecycle: ContextSourceLifecycle::SuppressedForCurrentTurn,
+                    version: item.source_version.clone(),
+                    reason: Some("context budget exceeded".to_string()),
+                    refs: item.refs.clone(),
+                    conflict_with: item.conflict_with.clone(),
+                });
                 omitted.push(ContextOmission {
                     item_id: item.id,
                     source: item.source,
@@ -612,6 +670,7 @@ impl ContextEpochBuilder {
             budget: self.budget,
             selected,
             omitted,
+            source_registry,
             token_total,
         })
     }
@@ -661,6 +720,60 @@ impl ContextEpoch {
     }
 }
 
+fn normalize_context_item_source(mut item: ContextItem) -> ContextItem {
+    if item.source_id.as_deref().unwrap_or_default().is_empty() {
+        item.source_id = Some(item.id.clone());
+    }
+    if item.source_lifecycle == ContextSourceLifecycle::Runtime {
+        item.source_lifecycle = default_source_lifecycle(item.source);
+    }
+    if item
+        .source_reason
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        item.source_reason = Some(format!(
+            "selected_for_{:?}_role_from_{:?}",
+            item.role, item.source
+        ));
+    }
+    item
+}
+
+fn context_source_ref_from_item(item: &ContextItem) -> ContextSourceRef {
+    ContextSourceRef {
+        source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
+        source: item.source,
+        authority: item.authority,
+        lifecycle: item.source_lifecycle,
+        version: item.source_version.clone(),
+        reason: item.source_reason.clone(),
+        refs: item.refs.clone(),
+        conflict_with: item.conflict_with.clone(),
+    }
+}
+
+fn default_source_lifecycle(source: ContextSourceKind) -> ContextSourceLifecycle {
+    match source {
+        ContextSourceKind::StableHead | ContextSourceKind::RuntimeHeader => {
+            ContextSourceLifecycle::Static
+        }
+        ContextSourceKind::Memory
+        | ContextSourceKind::Knowledge
+        | ContextSourceKind::Fact
+        | ContextSourceKind::Matrix => ContextSourceLifecycle::Durable,
+        ContextSourceKind::Workspace => ContextSourceLifecycle::External,
+        ContextSourceKind::UserRequest
+        | ContextSourceKind::Conversation
+        | ContextSourceKind::Task
+        | ContextSourceKind::ToolTrace
+        | ContextSourceKind::AgentPeer
+        | ContextSourceKind::Handoff => ContextSourceLifecycle::Runtime,
+    }
+}
+
 fn compare_context_items(left: &ContextItem, right: &ContextItem) -> std::cmp::Ordering {
     source_priority(left.source)
         .cmp(&source_priority(right.source))
@@ -682,10 +795,12 @@ fn source_priority(source: ContextSourceKind) -> u8 {
         ContextSourceKind::Workspace => 4,
         ContextSourceKind::Knowledge => 5,
         ContextSourceKind::Memory => 6,
-        ContextSourceKind::ToolTrace => 7,
-        ContextSourceKind::Conversation => 8,
-        ContextSourceKind::AgentPeer => 9,
-        ContextSourceKind::Handoff => 10,
+        ContextSourceKind::Fact => 7,
+        ContextSourceKind::Matrix => 8,
+        ContextSourceKind::ToolTrace => 9,
+        ContextSourceKind::Conversation => 10,
+        ContextSourceKind::AgentPeer => 11,
+        ContextSourceKind::Handoff => 12,
     }
 }
 
@@ -758,6 +873,29 @@ mod tests {
         assert_eq!(plan.epoch_id, epoch.epoch_id);
         assert_eq!(plan.sections.len(), epoch.selected.len());
         assert_eq!(plan.omissions.len(), epoch.omitted.len());
+    }
+
+    #[test]
+    fn epoch_builds_source_registry_for_selected_and_omitted_items() {
+        let epoch = ContextEpochBuilder::new(ContextIdentity::main("s1"), ContextBudget::new(5))
+            .add_item(item(ContextSourceKind::Memory, "short", 1.0))
+            .add_item(item(
+                ContextSourceKind::Knowledge,
+                "this knowledge item is too long for the budget",
+                1.0,
+            ))
+            .build()
+            .unwrap();
+
+        assert_eq!(epoch.source_registry.len(), 2);
+        assert!(epoch
+            .source_registry
+            .iter()
+            .any(|source| source.lifecycle == ContextSourceLifecycle::Durable));
+        assert!(epoch
+            .source_registry
+            .iter()
+            .any(|source| source.lifecycle == ContextSourceLifecycle::SuppressedForCurrentTurn));
     }
 
     #[test]
