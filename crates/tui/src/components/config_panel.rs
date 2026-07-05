@@ -74,6 +74,16 @@ impl ConfigPanel {
     }
 
     fn models(&self) -> Vec<serde_json::Value> {
+        if let Some(models) = self
+            .provider_projection
+            .as_ref()
+            .and_then(|value| value.get("catalog"))
+            .and_then(|value| value.get("models"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+        {
+            return models;
+        }
         self.provider_projection
             .as_ref()
             .and_then(|value| value.get("models"))
@@ -102,6 +112,16 @@ impl ConfigPanel {
     }
 
     fn provider_count(&self) -> u64 {
+        if let Some(count) = self
+            .provider_projection
+            .as_ref()
+            .and_then(|value| value.get("catalog"))
+            .and_then(|value| value.get("providers"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.len() as u64)
+        {
+            return count;
+        }
         self.provider_projection
             .as_ref()
             .and_then(|value| value.get("provider_count"))
@@ -110,11 +130,35 @@ impl ConfigPanel {
     }
 
     fn provider_model_count(&self) -> u64 {
+        if let Some(count) = self
+            .provider_projection
+            .as_ref()
+            .and_then(|value| value.get("catalog"))
+            .and_then(|value| value.get("models"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.len() as u64)
+        {
+            return count;
+        }
         self.provider_projection
             .as_ref()
             .and_then(|value| value.get("provider_model_count"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
+    }
+
+    fn catalog_generation(&self) -> Option<String> {
+        self.provider_projection
+            .as_ref()
+            .and_then(|value| {
+                value.get("catalog_generation").or_else(|| {
+                    value
+                        .get("catalog")
+                        .and_then(|catalog| catalog.get("generation"))
+                })
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     }
 
     fn source(&self) -> &str {
@@ -200,6 +244,12 @@ impl Component for ConfigPanel {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        if let Some(generation) = self.catalog_generation() {
+            lines.push(Line::from(vec![
+                Span::styled("Provider catalog: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(generation, Style::default().fg(Color::Cyan)),
+            ]));
+        }
         lines.push(Line::from(Span::styled(
             "Keys: j/k select model  Enter set default  r refresh status  e refresh",
             Style::default().fg(Color::DarkGray),

@@ -4,6 +4,7 @@ use serde_json::Value;
 pub mod model_registry;
 pub mod oauth;
 pub mod prompt_cache;
+pub mod provider_catalog;
 pub mod provider_config;
 pub mod telemetry;
 pub mod usage;

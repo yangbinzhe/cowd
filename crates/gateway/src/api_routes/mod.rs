@@ -7092,6 +7092,14 @@ providers:
             json["components"]["provider"]["configured_model_resolved"],
             true
         );
+        assert!(json["components"]["provider"]["catalog_generation"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider-catalog-v1-"));
+        assert_eq!(
+            json["components"]["provider"]["catalog"]["models"][0]["effective_protocol"],
+            "anthropic"
+        );
         assert_eq!(
             json["components"]["provider"]["provider_names"]
                 .as_array()
@@ -7158,10 +7166,36 @@ providers:
         assert_eq!(json["models"][1]["id"], "model-b");
         assert_eq!(json["models"][1]["effective_protocol"], "completions");
         assert_eq!(json["models"][1]["protocol_configured"], true);
+        assert!(json["catalog_generation"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider-catalog-v1-"));
+        assert_eq!(json["catalog"]["providers"][0]["id"], "local");
+        assert_eq!(json["catalog"]["models"][1]["id"], "model-b");
+        assert_eq!(json["catalog"]["profiles"][0]["id"], "default");
         assert_eq!(json["providers"][0]["effective_protocol"], "completions");
         assert_eq!(json["providers"][0]["protocol_configured"], true);
         assert_eq!(json["providers"][0]["credential_present"], true);
         assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/provider-catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let catalog_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            catalog_json["catalog"]["generation"],
+            json["catalog_generation"]
+        );
+        assert_eq!(catalog_json["catalog"]["models"][0]["provider"], "local");
 
         let response = app
             .clone()

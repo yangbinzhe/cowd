@@ -50,6 +50,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(config_handler).put(update_config_handler),
         )
         .route("/api/config/providers", get(config_providers_handler))
+        .route(
+            "/api/config/provider-catalog",
+            get(config_provider_catalog_handler),
+        )
         .route("/api/usage", get(usage_handler))
 }
 
@@ -596,4 +600,21 @@ async fn config_providers_handler(
     Ok(Json(
         state.services.provider.config_projection(&runtime_config),
     ))
+}
+
+async fn config_provider_catalog_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_config = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let projection = state.services.provider.config_projection(&runtime_config);
+    Ok(Json(serde_json::json!({
+        "envelope": state.services.provider.envelope("provider_catalog"),
+        "catalog": projection.get("catalog").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "catalog_generation": projection.get("catalog_generation").cloned().unwrap_or(serde_json::Value::Null),
+        "warnings": projection.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+    })))
 }

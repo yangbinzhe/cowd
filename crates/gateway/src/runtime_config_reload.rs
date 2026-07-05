@@ -353,6 +353,20 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
         "config"
     };
     let providers = runtime_config.providers().clone();
+    let registry = model_protocol::model_registry::ModelRegistry::load()
+        .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
+    let catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+        providers: &providers,
+        registry: &registry,
+        configured_model: runtime_config.model(),
+        aliases: runtime_config.aliases(),
+        config_source: source,
+        extra_sources: Vec::new(),
+        transforms: Vec::new(),
+        warnings: Vec::new(),
+    });
+    let catalog_generation = catalog.generation.clone();
+    let catalog_updated = now_ms();
     let provider_count = providers.providers.len();
     let provider_model_count: usize = providers
         .providers
@@ -388,6 +402,17 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
         "status": if provider_count == 0 { "unconfigured" } else if configured_model_resolved { "applied" } else { "attention" },
         "applied": true,
         "source": source,
+        "catalog_generation": catalog_generation,
+        "catalog_updated": catalog_updated,
+        "catalog": {
+            "generation": catalog.generation,
+            "sources": catalog.sources,
+            "transforms": catalog.transforms,
+            "provider_count": catalog.providers.len(),
+            "model_count": catalog.models.len(),
+            "profile_count": catalog.profiles.len(),
+            "warnings": catalog.warnings,
+        },
         "provider_count": provider_count,
         "provider_model_count": provider_model_count,
         "provider_names": provider_names,

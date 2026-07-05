@@ -20,6 +20,10 @@ pub use model_protocol::prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
     PromptCacheStats,
 };
+pub use model_protocol::provider_catalog::{
+    ProviderCatalog, ProviderCatalogInput, ProviderCatalogModel, ProviderCatalogProfile,
+    ProviderCatalogProvider, ProviderCatalogSource, ProviderCatalogTransform,
+};
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol};
 pub use providers::{

@@ -264,74 +264,87 @@ impl ProviderService {
         runtime_config: &runtime::RuntimeConfig,
     ) -> serde_json::Value {
         let providers = runtime_config.providers();
+        let registry = model_protocol::model_registry::ModelRegistry::load()
+            .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
         let configured_model = runtime_config.model().map(str::to_string);
-        let configured_model_provider = configured_model
-            .as_deref()
-            .and_then(|model| providers.resolve_full(model))
-            .map(|provider| provider.name.clone());
-        let mut provider_rows = providers
+        let config_source = if runtime_config.loaded_entries().is_empty() {
+            "default"
+        } else {
+            "config"
+        };
+        let catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+            providers,
+            registry: &registry,
+            configured_model: configured_model.as_deref(),
+            aliases: runtime_config.aliases(),
+            config_source,
+            extra_sources: Vec::new(),
+            transforms: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let configured_model_provider = catalog
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "default")
+            .and_then(|profile| profile.provider.clone());
+        let catalog_generation = catalog.generation.clone();
+        let provider_count = catalog.providers.len();
+        let provider_model_count = catalog.models.len();
+        let catalog_profiles = catalog.profiles.clone();
+        let catalog_warnings = catalog.warnings.clone();
+        let provider_rows = catalog
             .providers
-            .values()
+            .iter()
             .map(|provider| {
-                let effective_protocol = model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
-                    .map(|protocol| protocol.as_str().to_string())
-                    .unwrap_or_else(|error| format!("invalid:{error}"));
+                let provider_models = catalog
+                    .models
+                    .iter()
+                    .filter(|model| model.provider == provider.id)
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>();
                 serde_json::json!({
                     "name": provider.name,
                     "base_url": provider.base_url,
-                    "protocol": provider.protocol,
-                    "effective_protocol": effective_protocol,
-                    "protocol_configured": provider.protocol.as_ref().is_some_and(|value| !value.trim().is_empty()),
-                    "models": provider.models,
-                    "model_count": provider.models.len(),
-                    "credential_present": !provider.api_key.trim().is_empty(),
+                    "protocol": provider.configured_protocol,
+                    "effective_protocol": provider.effective_protocol,
+                    "protocol_configured": provider.protocol_configured,
+                    "models": provider_models,
+                    "model_count": provider.model_count,
+                    "credential_present": provider.credential_present,
+                    "catalog_generation": catalog_generation.clone(),
                 })
             })
             .collect::<Vec<_>>();
-        provider_rows.sort_by(|left, right| {
-            left["name"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(right["name"].as_str().unwrap_or(""))
-        });
-        let selected_model = configured_model.clone();
-        let models = provider_rows
+        let models = catalog
+            .models
             .iter()
-            .flat_map(|provider| {
-                let provider_name = provider["name"].as_str().unwrap_or("").to_string();
-                let effective_protocol = provider["effective_protocol"]
-                    .as_str()
-                    .unwrap_or("completions")
-                    .to_string();
-                let protocol_configured =
-                    provider["protocol_configured"].as_bool().unwrap_or(false);
-                let selected_model = selected_model.clone();
-                provider["models"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(move |model| {
-                        model.as_str().map(|id| {
-                            serde_json::json!({
-                                "id": id,
-                                "name": id,
-                                "provider": provider_name.clone(),
-                                "effective_protocol": effective_protocol.clone(),
-                                "protocol_configured": protocol_configured,
-                                "selected": selected_model.as_deref() == Some(id),
-                            })
-                        })
-                    })
+            .map(|model| {
+                serde_json::json!({
+                    "id": model.id,
+                    "name": model.name,
+                    "display_name": model.display_name,
+                    "provider": model.provider,
+                    "effective_protocol": model.effective_protocol,
+                    "protocol_configured": model.protocol_configured,
+                    "selected": model.selected,
+                    "context_window_tokens": model.context_window_tokens,
+                    "max_output_tokens": model.max_output_tokens,
+                    "capabilities": model.capabilities,
+                    "catalog_generation": catalog_generation.clone(),
+                })
             })
             .collect::<Vec<_>>();
 
         serde_json::json!({
             "envelope": self.envelope("config_projection"),
+            "catalog": catalog,
+            "catalog_generation": catalog_generation,
             "providers": provider_rows,
             "models": models,
-            "provider_count": providers.providers.len(),
-            "provider_model_count": models.len(),
+            "profiles": catalog_profiles,
+            "warnings": catalog_warnings,
+            "provider_count": provider_count,
+            "provider_model_count": provider_model_count,
             "configured_model": configured_model,
             "configured_model_provider": configured_model_provider,
             "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
