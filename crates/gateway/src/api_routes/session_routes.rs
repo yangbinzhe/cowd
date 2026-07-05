@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -43,6 +43,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/:id/events", get(get_session_events))
         .route("/api/sessions/:id/runs", get(get_session_runs))
+        .route("/api/sessions/:id/turns", get(get_session_turns))
+        .route("/api/sessions/:id/turns/:turn_id", get(get_session_turn))
         .route("/api/sessions/:id/projection", get(get_session_projection))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
@@ -1108,6 +1110,220 @@ fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool 
         .unwrap_or(false)
 }
 
+#[derive(Default)]
+struct TurnProjectionAccumulator {
+    turn_id: String,
+    status: String,
+    submitted_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    user_preview: Option<String>,
+    assistant_preview: Option<String>,
+    tool_calls: Vec<serde_json::Value>,
+    approvals: Vec<serde_json::Value>,
+    context_events: Vec<serde_json::Value>,
+    usage: Vec<serde_json::Value>,
+    evidence_refs: BTreeSet<String>,
+    event_sequences: Vec<usize>,
+}
+
+impl TurnProjectionAccumulator {
+    fn new(turn_id: impl Into<String>) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            status: "pending".to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn observe_event(&mut self, event: &serde_json::Value) {
+        if let Some(sequence) = event.get("sequence").and_then(serde_json::Value::as_u64) {
+            self.event_sequences.push(sequence as usize);
+        }
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        if event_type == "TurnJournal" {
+            self.observe_turn_journal(event, payload);
+            return;
+        }
+        match event_type {
+            "ToolStart" | "ToolProgress" | "ToolComplete" | "ToolFailure" => {
+                self.tool_calls.push(payload.clone());
+            }
+            "ApprovalRequested" | "ApprovalResolved" | "RiskApproval" => {
+                self.approvals.push(payload.clone());
+            }
+            "ContextEnvelope" | "ContextTurnReport" | "ContextRecommendationAction" => {
+                self.context_events.push(payload.clone());
+            }
+            "TokenUsage" | "RunModelTelemetry" => {
+                self.usage.push(payload.clone());
+            }
+            "SurfaceMessageProcessed" => {
+                if let Some(preview) = payload
+                    .get("response_preview")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    self.assistant_preview = Some(preview.to_string());
+                }
+            }
+            _ => {}
+        }
+        collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+    }
+
+    fn observe_turn_journal(&mut self, event: &serde_json::Value, payload: &serde_json::Value) {
+        let created_at_ms = event
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_u64);
+        match payload.get("phase").and_then(serde_json::Value::as_str) {
+            Some("submitted") => {
+                self.status = "pending".to_string();
+                self.submitted_at_ms = self.submitted_at_ms.or(created_at_ms);
+                if let Some(preview) = payload
+                    .get("payload")
+                    .and_then(|inner| inner.get("prompt_preview"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.user_preview = Some(preview.to_string());
+                }
+            }
+            Some("running") => {
+                self.status = "running".to_string();
+                self.started_at_ms = self.started_at_ms.or(created_at_ms);
+            }
+            Some("completed") => {
+                self.status = "completed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            Some("failed") => {
+                self.status = "failed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            Some("cancelled") => {
+                self.status = "cancelled".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            _ => {}
+        }
+        collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "turn_id": self.turn_id,
+            "status": self.status,
+            "submitted_at_ms": self.submitted_at_ms,
+            "started_at_ms": self.started_at_ms,
+            "completed_at_ms": self.completed_at_ms,
+            "user_preview": self.user_preview,
+            "assistant_preview": self.assistant_preview,
+            "tool_calls": self.tool_calls,
+            "approvals": self.approvals,
+            "context_events": self.context_events,
+            "usage": self.usage,
+            "evidence_refs": self.evidence_refs.into_iter().collect::<Vec<_>>(),
+            "event_sequences": self.event_sequences,
+        })
+    }
+}
+
+fn collect_projection_evidence_refs(payload: &serde_json::Value, out: &mut BTreeSet<String>) {
+    for key in [
+        "evidence_ref",
+        "evidence_id",
+        "raw_ref",
+        "full_output_ref",
+        "output_ref",
+        "context_report_id",
+    ] {
+        if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
+            out.insert(value.to_string());
+        }
+    }
+    if let Some(values) = payload
+        .get("evidence_refs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in values {
+            if let Some(value) = value.as_str() {
+                out.insert(value.to_string());
+            }
+        }
+    }
+    if let Some(object) = payload.as_object() {
+        for value in object.values() {
+            if value.is_object() {
+                collect_projection_evidence_refs(value, out);
+            }
+        }
+    }
+}
+
+fn turn_id_from_event_value(event: &serde_json::Value) -> Option<String> {
+    let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+    payload
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("payload")
+                .and_then(|inner| inner.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("turn")
+                .and_then(|turn| turn.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("receipt")
+                .and_then(|turn| turn.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn turn_projection_from_event_values(
+    session_id: &str,
+    events: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut turns: BTreeMap<String, TurnProjectionAccumulator> = BTreeMap::new();
+    let mut unbound_events = Vec::new();
+    for event in events {
+        if let Some(turn_id) = turn_id_from_event_value(event) {
+            turns
+                .entry(turn_id.clone())
+                .or_insert_with(|| TurnProjectionAccumulator::new(turn_id))
+                .observe_event(event);
+        } else {
+            unbound_events.push(event.clone());
+        }
+    }
+    let mut turn_accumulators = turns.into_values().collect::<Vec<_>>();
+    turn_accumulators
+        .sort_by_key(|turn| turn.event_sequences.first().copied().unwrap_or(usize::MAX));
+    let turn_values = turn_accumulators
+        .into_iter()
+        .map(TurnProjectionAccumulator::into_value)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "session.turn_projection",
+        "source": "gateway.session_events.turn_journal",
+        "session_id": session_id,
+        "turn_count": turn_values.len(),
+        "turns": turn_values,
+        "unbound_event_count": unbound_events.len(),
+        "unbound_events": unbound_events.into_iter().rev().take(20).collect::<Vec<_>>(),
+    })
+}
+
 fn session_run_projection_from_events(
     session_id: &str,
     stored_events: Vec<SessionEvent>,
@@ -1117,6 +1333,7 @@ fn session_run_projection_from_events(
         .iter()
         .map(session_event_value)
         .collect::<Vec<_>>();
+    let turn_projection = turn_projection_from_event_values(session_id, &events);
     let runs = stored_events
         .iter()
         .filter(|event| event.event_type == "RuntimeRun")
@@ -1202,6 +1419,7 @@ fn session_run_projection_from_events(
         "kind": "session.run_projection",
         "source": "gateway.session_events",
         "session_id": session_id,
+        "turn_projection": turn_projection,
         "view_modes": {
             "default": "full_evidence",
             "pure_available": true,
@@ -1293,6 +1511,116 @@ async fn get_session_runs(
         "limit": limit,
         "has_more": has_more,
     })))
+}
+
+async fn get_session_turns(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let Some((total, stored_events)) = state
+        .services
+        .session
+        .stored_events_page(&id, from_seq, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session turn events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let events = stored_events
+        .iter()
+        .map(session_event_value)
+        .collect::<Vec<_>>();
+    let next_seq = events
+        .last()
+        .and_then(|event| event["sequence"].as_u64())
+        .map(|sequence| sequence as usize + 1);
+    let has_more = next_seq.is_some_and(|next| next < total);
+    let mut projection = turn_projection_from_event_values(&id, &events);
+    projection["paging"] = serde_json::json!({
+        "total": total,
+        "from_seq": from_seq,
+        "next_seq": next_seq,
+        "limit": limit,
+        "has_more": has_more,
+    });
+    Ok(Json(projection))
+}
+
+async fn get_session_turn(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let Some((_total, stored_events)) = state
+        .services
+        .session
+        .stored_events_page(&id, from_seq, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session turn events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let events = stored_events
+        .iter()
+        .map(session_event_value)
+        .collect::<Vec<_>>();
+    let projection = turn_projection_from_event_values(&id, &events);
+    let turn = projection
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| {
+                    turn.get("turn_id").and_then(serde_json::Value::as_str) == Some(&turn_id)
+                })
+                .cloned()
+        });
+    match turn {
+        Some(turn) => Ok(Json(serde_json::json!({
+            "kind": "session.turn_projection.item",
+            "session_id": id,
+            "turn_id": turn_id,
+            "turn": turn,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("turn {turn_id} not found in session {id}"),
+            }),
+        )),
+    }
 }
 
 async fn get_session_projection(
@@ -1635,6 +1963,91 @@ mod tests {
             sequence,
             created_at_ms: 1_000 + sequence as u64,
         }
+    }
+
+    #[test]
+    fn turn_projection_builds_stable_turns_from_journal() {
+        let events = vec![
+            session_event(
+                0,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-1",
+                    "sequence": 0,
+                    "event_type": "turn.submitted",
+                    "phase": "submitted",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.submitted",
+                    "payload": {
+                        "prompt_preview": "analyse this",
+                        "task_id": "task-1"
+                    },
+                    "created_at": "2026-07-05T00:00:00Z"
+                }),
+            ),
+            session_event(
+                1,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-2",
+                    "sequence": 1,
+                    "event_type": "turn.running",
+                    "phase": "running",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.running",
+                    "payload": {},
+                    "created_at": "2026-07-05T00:00:01Z"
+                }),
+            ),
+            session_event(
+                2,
+                "SurfaceMessageProcessed",
+                serde_json::json!({
+                    "type": "SurfaceMessageProcessed",
+                    "turn_id": "turn-1",
+                    "response_preview": "done"
+                }),
+            ),
+            session_event(
+                3,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-3",
+                    "sequence": 3,
+                    "event_type": "turn.completed",
+                    "phase": "completed",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.completed",
+                    "payload": {
+                        "context_report_id": "ctx-report-1"
+                    },
+                    "created_at": "2026-07-05T00:00:02Z"
+                }),
+            ),
+        ];
+        let values = events.iter().map(session_event_value).collect::<Vec<_>>();
+        let projection = turn_projection_from_event_values("session-v31", &values);
+
+        assert_eq!(projection["kind"], "session.turn_projection");
+        assert_eq!(projection["turn_count"], 1);
+        assert_eq!(projection["turns"][0]["turn_id"], "turn-1");
+        assert_eq!(projection["turns"][0]["status"], "completed");
+        assert_eq!(projection["turns"][0]["user_preview"], "analyse this");
+        assert_eq!(projection["turns"][0]["assistant_preview"], "done");
+        assert_eq!(
+            projection["turns"][0]["event_sequences"],
+            serde_json::json!([0, 1, 2, 3])
+        );
+        assert!(projection["turns"][0]["evidence_refs"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("ctx-report-1")));
     }
 
     #[test]
