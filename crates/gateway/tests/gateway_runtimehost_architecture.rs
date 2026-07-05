@@ -34,7 +34,7 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
         "doc_ops",
     ];
     let checked_files = [
-        "crates/surface/src/channel.rs",
+        "crates/surface/src/message.rs",
         "crates/connector/src/lib.rs",
         "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
@@ -488,28 +488,34 @@ fn connector_is_independent_external_resource_boundary() {
 }
 
 #[test]
-fn channel_contracts_drive_gateway_surface_readiness() {
+fn message_connector_contracts_drive_gateway_surface_readiness() {
     assert!(
         !repo_root().join("crates/channel-adapters").exists(),
         "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-edge"
     );
     assert!(
         !repo_root().join("crates/channel").exists(),
-        "channel contracts are absorbed into surface::channel"
+        "legacy channel contracts are absorbed into surface::message"
     );
 
-    let channel_source = production_part(&read_repo("crates/surface/src/channel.rs")).to_string();
+    let message_source = production_part(&read_repo("crates/surface/src/message.rs")).to_string();
     for required in [
-        "pub struct ChannelContract",
-        "pub fn channel_required_fields",
-        "pub fn channel_transport_capabilities",
-        "pub fn normalize_channel",
+        "pub struct MessageConnectorContract",
+        "pub fn message_connector_required_fields",
+        "pub fn message_connector_capabilities",
+        "pub fn normalize_message_connector",
     ] {
         assert!(
-            channel_source.contains(required),
-            "channel contract missing {required}"
+            message_source.contains(required),
+            "message connector contract missing {required}"
         );
     }
+    assert!(
+        !repo_root()
+            .join(["crates/surface/src/", "channel.rs"].concat())
+            .exists(),
+        "legacy channel contract file must be deleted from production source"
+    );
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     assert!(
@@ -518,28 +524,29 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
-        "gateway must consume channel contracts through surface::channel"
+        "gateway must consume message connector contracts through surface::message"
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
         "gateway must not depend on channel-adapters; platform SDKs live in Cowd Edge sidecars"
     );
-    let channel_routes = production_part(&read_repo(
-        "crates/gateway/src/api_routes/channel_routes.rs",
+    let message_connector_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
     ))
     .to_string();
     assert!(
-        channel_routes
-            .contains("use surface::channel::{channel_required_fields, ChannelContract};"),
-        "gateway channel routes must consume channel contract"
+        message_connector_routes.contains(
+            "use surface::message::{message_connector_required_fields, MessageConnectorContract};"
+        ),
+        "gateway message readiness routes must consume message connector contract"
     );
     assert!(
-        !channel_routes.contains("fn platform_capabilities"),
+        !message_connector_routes.contains("fn platform_capabilities"),
         "gateway must not own a duplicate platform capability table"
     );
     assert!(
-        !channel_source.contains("feishu_document_operation"),
-        "channel contract must not expose Feishu document operations as built-in channel capability"
+        !message_source.contains("feishu_document_operation"),
+        "message connector contract must not expose Feishu document operations as built-in capability"
     );
 
     let gateway_services_source = read_repo("crates/gateway/src/services/mod.rs");
@@ -568,7 +575,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
         "crates/gateway/src/main.rs",
         "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
-        "crates/gateway/src/api_routes/channel_routes.rs",
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
         "crates/gateway/src/api_routes/cross_plane_routes.rs",
         "crates/gateway/src/entry/workspace_entry.rs",
     ] {
@@ -584,7 +591,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     }
 
     for source_path in [
-        "crates/gateway/src/api_routes/channel_routes.rs",
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
         "crates/gateway/src/api_routes/cross_plane_routes.rs",
         "crates/gateway/src/api_routes/mfg_routes.rs",
         "crates/gateway/src/infrastructure/gateway_health.rs",
@@ -1377,6 +1384,16 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
         "/api/surfaces/{}/repair",
         "/api/surfaces/{}/send",
         "/api/surfaces/{}/action",
+        "pub async fn message_connectors",
+        "pub async fn message_connector_status",
+        "pub async fn message_connector_repair",
+        "pub async fn message_endpoints",
+        "pub async fn message_routes",
+        "pub async fn message_bindings",
+        "/api/message-connectors",
+        "/api/message-endpoints",
+        "/api/message-routes",
+        "/api/message-bindings",
     ] {
         assert!(
             gateway_client.contains(required),
@@ -1405,6 +1422,42 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
             );
         }
     }
+
+    let runtime_store = production_part(&read_repo(
+        "crates/tui/src/app_core/runtime_control_store.rs",
+    ))
+    .to_string();
+    for required in [
+        "pub struct MessageConnectorSummary",
+        "pub struct MessageEndpointSummary",
+        "pub struct MessageRouteSummary",
+        "pub struct MessageBindingSummary",
+        "ingest_message_connectors",
+        "ingest_message_endpoints",
+        "ingest_message_routes",
+        "ingest_message_bindings",
+        "projection.message_connectors()",
+        "projection.message_endpoints()",
+        "projection.message_routes()",
+        "projection.message_bindings()",
+    ] {
+        assert!(
+            runtime_store.contains(required),
+            "TUI runtime control store must consume Message Plane `{required}`"
+        );
+    }
+
+    let gateway_panel =
+        production_part(&read_repo("crates/tui/src/components/gateway_panel.rs")).to_string();
+    let surface_panel =
+        production_part(&read_repo("crates/tui/src/components/surface_panel.rs")).to_string();
+    assert!(
+        gateway_panel.contains("Message Plane")
+            && gateway_panel.contains("message_connectors")
+            && surface_panel.contains("Message Plane")
+            && surface_panel.contains("message_connectors"),
+        "TUI Gateway and Surface panels must display Message Plane state"
+    );
 }
 
 #[test]
@@ -1423,7 +1476,7 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
         !gateway_dependencies.contains("channel = { path = \"../channel\" }")
             && gateway_dependencies.contains("surface = { path = \"../surface\" }")
             && !gateway_dependencies.contains("channel-adapters = "),
-        "gateway must consume surface::channel contracts and Edge sidecar protocol without adapter SDK coupling"
+        "gateway must consume surface::message contracts and Edge sidecar protocol without adapter SDK coupling"
     );
 
     let runtime_host =
@@ -1547,6 +1600,7 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
 fn runtime_source_self_audit_is_exposed_through_gateway_api() {
     let runtime_lib = read_repo("crates/runtime/src/lib.rs");
     let runtime_audit = read_repo("crates/runtime/src/recovery/source_self_audit.rs");
+    let old_route_file = ["channel", "_routes.rs"].concat();
     let runtime_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/runtime_routes.rs",
     ))
@@ -1558,7 +1612,9 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
             && runtime_audit.contains("runtime.no_surface_sdk_dependency")
             && runtime_audit.contains("gateway.owns_surface_boundary")
             && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
-            && runtime_audit.contains("harness_eval.repair_hints"),
+            && runtime_audit.contains("harness_eval.repair_hints")
+            && runtime_audit.contains("message_connector_routes.rs")
+            && !runtime_audit.contains(&old_route_file),
         "runtime must expose source-aware self audit checks with repair hints"
     );
     assert!(
@@ -1587,7 +1643,7 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/agent_routes.rs",
         "api_routes/approval_routes.rs",
         "api_routes/audit_routes.rs",
-        "api_routes/channel_routes.rs",
+        "api_routes/message_connector_routes.rs",
         "api_routes/connector_routes.rs",
         "api_routes/context_routes.rs",
         "api_routes/core_routes.rs",

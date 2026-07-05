@@ -104,6 +104,54 @@ pub struct SurfaceEventSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageConnectorSummary {
+    pub connector: String,
+    pub name: String,
+    pub configuration_status: String,
+    pub runtime_status: String,
+    pub enabled: bool,
+    pub configured: bool,
+    pub capability_count: u64,
+    pub missing_required_count: u64,
+    pub consecutive_failures: u64,
+    pub restart_count: u64,
+    pub circuit_open: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageEndpointSummary {
+    pub endpoint_id: String,
+    pub connector: String,
+    pub kind: String,
+    pub status: String,
+    pub configured: bool,
+    pub capability_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageRouteSummary {
+    pub route_id: String,
+    pub connector: String,
+    pub policy: String,
+    pub status: String,
+    pub configured: bool,
+    pub capability_count: u64,
+    pub runtime_status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageBindingSummary {
+    pub binding_id: String,
+    pub connector: String,
+    pub endpoint: String,
+    pub direction: String,
+    pub status: String,
+    pub runtime_session_id: Option<String>,
+    pub resource_count: u64,
+    pub last_seen_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CowdKernelSummary {
     pub capability_count: u64,
     pub projection_capability_count: u64,
@@ -241,6 +289,10 @@ pub struct RuntimeControlSnapshot {
     pub surfaces: Vec<SurfaceSummary>,
     pub surface_health: Option<SurfaceHealthSummary>,
     pub surface_events: Vec<SurfaceEventSummary>,
+    pub message_connectors: Vec<MessageConnectorSummary>,
+    pub message_endpoints: Vec<MessageEndpointSummary>,
+    pub message_routes: Vec<MessageRouteSummary>,
+    pub message_bindings: Vec<MessageBindingSummary>,
     pub cowd_kernel: Option<CowdKernelSummary>,
     pub gateway_capability_contract: Option<GatewayCapabilityContractSummary>,
     pub structured_data: Option<StructuredDataSummary>,
@@ -314,6 +366,10 @@ impl RuntimeControlSnapshot {
             surfaces: app.gateway_surfaces.clone(),
             surface_health: app.gateway_surface_health.clone(),
             surface_events: app.gateway_surface_events.clone(),
+            message_connectors: app.gateway_message_connectors.clone(),
+            message_endpoints: app.gateway_message_endpoints.clone(),
+            message_routes: app.gateway_message_routes.clone(),
+            message_bindings: app.gateway_message_bindings.clone(),
             cowd_kernel: app.gateway_cowd_kernel.clone(),
             gateway_capability_contract: app.gateway_capability_contract.clone(),
             structured_data: app.gateway_structured_data.clone(),
@@ -360,6 +416,10 @@ impl RuntimeControlSnapshot {
         app.gateway_surfaces = self.surfaces.clone();
         app.gateway_surface_health = self.surface_health.clone();
         app.gateway_surface_events = self.surface_events.clone();
+        app.gateway_message_connectors = self.message_connectors.clone();
+        app.gateway_message_endpoints = self.message_endpoints.clone();
+        app.gateway_message_routes = self.message_routes.clone();
+        app.gateway_message_bindings = self.message_bindings.clone();
         app.gateway_cowd_kernel = self.cowd_kernel.clone();
         app.gateway_capability_contract = self.gateway_capability_contract.clone();
         app.gateway_structured_data = self.structured_data.clone();
@@ -971,6 +1031,58 @@ impl RuntimeControlSnapshot {
         }
         self.surface_events.append(&mut events);
         self.surface_events.truncate(24);
+    }
+
+    pub fn ingest_message_connectors(&mut self, value: &serde_json::Value) {
+        self.message_connectors = value
+            .get("connectors")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_connector_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_endpoints(&mut self, value: &serde_json::Value) {
+        self.message_endpoints = value
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_endpoint_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_routes(&mut self, value: &serde_json::Value) {
+        self.message_routes = value
+            .get("routes")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_route_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_bindings(&mut self, value: &serde_json::Value) {
+        self.message_bindings = value
+            .get("bindings")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_binding_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
     }
 
     pub fn begin_surface_event_refresh(&mut self) {
@@ -1601,6 +1713,112 @@ fn surface_event_summary_from_json(
     })
 }
 
+fn message_connector_from_json(value: &serde_json::Value) -> Option<MessageConnectorSummary> {
+    let connector = json_string(value, &["connector", "id", "platform_type"])?;
+    let runtime = value.get("runtime").unwrap_or(&serde_json::Value::Null);
+    Some(MessageConnectorSummary {
+        name: json_string(value, &["name"]).unwrap_or_else(|| connector.clone()),
+        configuration_status: json_string(value, &["configuration_status", "status"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        runtime_status: json_string(runtime, &["status"]).unwrap_or_else(|| {
+            if runtime.is_null() {
+                "not_running".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }),
+        enabled: value
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        missing_required_count: json_array_len(value, "missing_required"),
+        consecutive_failures: runtime
+            .get("consecutive_failures")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        restart_count: runtime
+            .get("restart_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        circuit_open: runtime
+            .get("circuit_open")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        connector,
+    })
+}
+
+fn message_endpoint_from_json(value: &serde_json::Value) -> Option<MessageEndpointSummary> {
+    let endpoint_id = json_string(value, &["endpoint_id", "id"])?;
+    Some(MessageEndpointSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        kind: json_string(value, &["kind"]).unwrap_or_else(|| "unknown".to_string()),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        endpoint_id,
+    })
+}
+
+fn message_route_from_json(value: &serde_json::Value) -> Option<MessageRouteSummary> {
+    let route_id = json_string(value, &["route_id", "id"])?;
+    let runtime = value.get("runtime").unwrap_or(&serde_json::Value::Null);
+    Some(MessageRouteSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        policy: json_string(value, &["policy"]).unwrap_or_else(|| "origin".to_string()),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        runtime_status: json_string(runtime, &["status"]).unwrap_or_else(|| {
+            if runtime.is_null() {
+                "not_running".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }),
+        route_id,
+    })
+}
+
+fn message_binding_from_json(value: &serde_json::Value) -> Option<MessageBindingSummary> {
+    let binding_id = json_string(value, &["binding_id", "id"])?;
+    Some(MessageBindingSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        endpoint: json_string(value, &["endpoint"]).unwrap_or_else(|| "-".to_string()),
+        direction: json_string(value, &["direction"]).unwrap_or_else(|| "unknown".to_string()),
+        status: json_string(value, &["status", "outbound_status"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        runtime_session_id: json_string(value, &["runtime_session_id", "source_session_id"]),
+        resource_count: value
+            .get("resource_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        last_seen_at_ms: value
+            .get("last_seen_at_ms")
+            .and_then(serde_json::Value::as_u64),
+        binding_id,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn truncate_json(value: &serde_json::Value) -> String {
     let rendered = value.to_string();
     if rendered.chars().count() <= 96 {
@@ -1782,6 +2000,44 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.connector_resources(None, 20, 0).await {
         Ok(value) => snapshot.ingest_connector_resources(&value),
         Err(err) => snapshot.degrade(format!("connector resources unavailable: {err}")),
+    }
+    let (message_connectors, message_endpoints, message_routes, message_bindings) = tokio::join!(
+        projection.message_connectors(),
+        projection.message_endpoints(),
+        projection.message_routes(),
+        projection.message_bindings()
+    );
+    match (
+        message_connectors,
+        message_endpoints,
+        message_routes,
+        message_bindings,
+    ) {
+        (Ok(connectors), Ok(endpoints), Ok(routes), Ok(bindings)) => {
+            snapshot.ingest_message_connectors(&connectors);
+            snapshot.ingest_message_endpoints(&endpoints);
+            snapshot.ingest_message_routes(&routes);
+            snapshot.ingest_message_bindings(&bindings);
+        }
+        (connectors, endpoints, routes, bindings) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = connectors {
+                reasons.push(format!("connectors: {err}"));
+            }
+            if let Err(err) = endpoints {
+                reasons.push(format!("endpoints: {err}"));
+            }
+            if let Err(err) = routes {
+                reasons.push(format!("routes: {err}"));
+            }
+            if let Err(err) = bindings {
+                reasons.push(format!("bindings: {err}"));
+            }
+            snapshot.degrade(format!(
+                "message plane projection unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
     }
     match projection.surface_registry().await {
         Ok(value) => snapshot.ingest_surface_registry(&value),
@@ -2013,6 +2269,87 @@ mod tests {
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"
         );
+    }
+
+    #[test]
+    fn snapshot_extracts_message_plane_and_round_trips_through_app() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_message_connectors(&serde_json::json!({
+            "kind": "message.connector.registry",
+            "connectors": [{
+                "connector": "feishu",
+                "name": "feishu",
+                "configuration_status": "configured",
+                "configured": true,
+                "enabled": true,
+                "missing_required": [],
+                "capabilities": ["message.send.text", "message.send.image"],
+                "runtime": {
+                    "status": "ready",
+                    "consecutive_failures": 0,
+                    "restart_count": 1,
+                    "circuit_open": false
+                }
+            }]
+        }));
+        snapshot.ingest_message_endpoints(&serde_json::json!({
+            "kind": "message.endpoint.directory",
+            "endpoints": [{
+                "endpoint_id": "message:feishu:user",
+                "connector": "feishu",
+                "kind": "User",
+                "configured": true,
+                "status": "configured",
+                "capabilities": ["message.send.text"]
+            }]
+        }));
+        snapshot.ingest_message_routes(&serde_json::json!({
+            "kind": "message.delivery.routes",
+            "routes": [{
+                "route_id": "message:feishu:default",
+                "connector": "feishu",
+                "policy": "origin",
+                "status": "configured",
+                "configured": true,
+                "capabilities": ["message.send.text"],
+                "runtime": {"status": "ready"}
+            }]
+        }));
+        snapshot.ingest_message_bindings(&serde_json::json!({
+            "kind": "message.conversation.bindings",
+            "bindings": [{
+                "binding_id": "message:feishu:user-1:thread-1",
+                "connector": "feishu",
+                "endpoint": "user-1",
+                "direction": "inbound",
+                "status": "processed",
+                "runtime_session_id": "session-feishu",
+                "resource_count": 2,
+                "last_seen_at_ms": 42
+            }]
+        }));
+
+        assert_eq!(snapshot.message_connectors.len(), 1);
+        assert_eq!(snapshot.message_connectors[0].runtime_status, "ready");
+        assert_eq!(snapshot.message_connectors[0].capability_count, 2);
+        assert_eq!(snapshot.message_endpoints[0].kind, "User");
+        assert_eq!(snapshot.message_routes[0].runtime_status, "ready");
+        assert_eq!(
+            snapshot.message_bindings[0].runtime_session_id.as_deref(),
+            Some("session-feishu")
+        );
+        assert_eq!(snapshot.message_bindings[0].resource_count, 2);
+
+        let mut app = App::new("model", "session-message-plane");
+        snapshot.apply_to_app(&mut app);
+        assert_eq!(app.gateway_message_connectors.len(), 1);
+        assert_eq!(app.gateway_message_bindings[0].status, "processed");
+
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(restored.message_connectors, snapshot.message_connectors);
+        assert_eq!(restored.message_endpoints, snapshot.message_endpoints);
+        assert_eq!(restored.message_routes, snapshot.message_routes);
+        assert_eq!(restored.message_bindings, snapshot.message_bindings);
     }
 
     #[test]

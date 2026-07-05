@@ -24,7 +24,10 @@ const ROUTE_SOURCES: &[GatewayRouteSource] = &[
     source("agent_routes.rs", include_str!("agent_routes.rs")),
     source("approval_routes.rs", include_str!("approval_routes.rs")),
     source("audit_routes.rs", include_str!("audit_routes.rs")),
-    source("channel_routes.rs", include_str!("channel_routes.rs")),
+    source(
+        "message_connector_routes.rs",
+        include_str!("message_connector_routes.rs"),
+    ),
     source("connector_routes.rs", include_str!("connector_routes.rs")),
     source(
         "connector_routes/mcp.rs",

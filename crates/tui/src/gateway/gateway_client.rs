@@ -982,6 +982,44 @@ impl GatewayApiClient {
         self.get_json(&path).await
     }
 
+    pub async fn message_connectors(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-connectors").await
+    }
+
+    pub async fn message_connector_status(
+        &self,
+        name: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/message-connectors/{}/status",
+            url_encode(name)
+        ))
+        .await
+    }
+
+    pub async fn message_connector_repair(
+        &self,
+        name: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/message-connectors/{}/repair", url_encode(name)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn message_endpoints(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-endpoints").await
+    }
+
+    pub async fn message_routes(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-routes").await
+    }
+
+    pub async fn message_bindings(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-bindings").await
+    }
+
     pub async fn surface_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/surfaces").await
     }
@@ -1870,6 +1908,12 @@ mod tests {
             "context_snapshot",
             "respond_approval",
             "connector_resources",
+            "message_connectors",
+            "message_connector_status",
+            "message_connector_repair",
+            "message_endpoints",
+            "message_routes",
+            "message_bindings",
             "revalidate_connector_resource",
             "promote_connector_resource_to_memory",
             "chat_session",
@@ -1931,7 +1975,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 99);
+        assert_eq!(migrated.len(), 105);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -2384,6 +2428,100 @@ mod tests {
             .await
             .expect("json");
         assert!(json["resources"].as_array().unwrap().is_empty());
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn message_plane_endpoints_use_gateway_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "GET",
+                    "/api/message-connectors",
+                    r#"{"kind":"message.connector.registry","connectors":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-connectors/feishu/status",
+                    r#"{"kind":"message.connector.status","connector":"feishu"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/message-connectors/feishu/repair",
+                    r#"{"kind":"message.connector.repair","connector":"feishu"}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-endpoints",
+                    r#"{"kind":"message.endpoint.directory","endpoints":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-routes",
+                    r#"{"kind":"message.delivery.routes","routes":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-bindings",
+                    r#"{"kind":"message.conversation.bindings","bindings":[]}"#,
+                ),
+            ];
+            for (method, path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept message plane");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read message plane");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with(&format!("{method} {path} HTTP/1.1")),
+                    "unexpected request: {req}"
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write message plane");
+            }
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        assert_eq!(
+            client.message_connectors().await.expect("connectors")["kind"],
+            "message.connector.registry"
+        );
+        assert_eq!(
+            client
+                .message_connector_status("feishu")
+                .await
+                .expect("status")["kind"],
+            "message.connector.status"
+        );
+        assert_eq!(
+            client
+                .message_connector_repair("feishu")
+                .await
+                .expect("repair")["kind"],
+            "message.connector.repair"
+        );
+        assert_eq!(
+            client.message_endpoints().await.expect("endpoints")["kind"],
+            "message.endpoint.directory"
+        );
+        assert_eq!(
+            client.message_routes().await.expect("routes")["kind"],
+            "message.delivery.routes"
+        );
+        assert_eq!(
+            client.message_bindings().await.expect("bindings")["kind"],
+            "message.conversation.bindings"
+        );
         server.await.expect("server task");
     }
 

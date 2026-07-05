@@ -52,7 +52,6 @@ mod agent_routes;
 mod approval_routes;
 mod audit_routes;
 mod capability_contract;
-mod channel_routes;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
@@ -63,6 +62,7 @@ mod harness_eval_routes;
 mod matrix_outcomes;
 mod matrix_routes;
 pub(crate) mod memory_routes;
+mod message_connector_routes;
 mod message_routes;
 mod mfg_outcomes;
 mod mfg_routes;
@@ -353,7 +353,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(approval_routes::router())
         .merge(agent_routes::router())
         .merge(audit_routes::router())
-        .merge(channel_routes::router())
+        .merge(message_connector_routes::router())
         .merge(connector_routes::router())
         .merge(context_routes::router())
         .merge(core_routes::router())
@@ -7513,7 +7513,7 @@ gateway:
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/channels")
+                    .uri("/api/message-connectors")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7521,13 +7521,13 @@ gateway:
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let channels: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let feishu = channels["channels"]
+        let connectors: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feishu = connectors["connectors"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|channel| channel["channel"] == "feishu")
-            .expect("feishu channel should be projected from reloaded config");
+            .find(|connector| connector["connector"] == "feishu")
+            .expect("feishu message connector should be projected from reloaded config");
         assert_eq!(feishu["configured"], true);
 
         runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
@@ -12282,7 +12282,7 @@ providers:
             "/api/workspace",
             "/api/approval/pending",
             "/api/cross-plane/summary",
-            "/api/channels/wechat-ilink/accounts",
+            "/api/message-connectors/wechat-ilink/accounts",
             "/api/memory/status",
             "/api/tasks",
             "/api/runtime/control-plane",

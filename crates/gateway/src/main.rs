@@ -383,8 +383,8 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
-            let id = surface::normalize_surface_id(&p.platform_type);
-            let required = surface::channel::channel_required_fields(&id)
+            let id = surface::message::normalize_message_connector(&p.platform_type);
+            let required = surface::message::message_connector_required_fields(&id)
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>();
@@ -397,9 +397,9 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 entry: Some(format!("./cowd-edge-{id}-message")),
                 transport: surface::SurfaceTransport::StdioJsonl,
                 lifecycle: surface::SurfaceLifecycle::Managed,
-                capabilities: surface::channel::channel_transport_capabilities(&id)
+                capabilities: surface::message::message_connector_capabilities(&id)
                     .into_iter()
-                    .map(|capability| format!("message.{capability}"))
+                    .map(str::to_string)
                     .collect(),
                 routes: Vec::new(),
                 resources: Vec::new(),

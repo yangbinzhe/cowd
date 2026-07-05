@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use surface::{
-    normalize_surface_id, SurfaceActionRequest, SurfaceDescriptor, SurfaceError,
-    SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult, SurfaceRoute,
-    SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
+    message::MessageActionKind, normalize_surface_id, SurfaceActionRequest, SurfaceDescriptor,
+    SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
+    SurfaceRoute, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -205,7 +205,7 @@ impl SurfaceHost {
         }
         self.action(SurfaceActionRequest {
             surface: descriptor.id,
-            action: "callback.dispatch".to_string(),
+            action: MessageActionKind::CallbackDispatch.as_str().to_string(),
             payload: serde_json::json!({
                 "path": normalize_request_path(path),
                 "method": method.to_ascii_uppercase(),

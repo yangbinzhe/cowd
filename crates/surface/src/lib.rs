@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub mod channel;
+pub mod message;
 
 /// Current wire protocol for Cowd edge sidecars.
 ///

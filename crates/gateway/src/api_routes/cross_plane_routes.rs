@@ -14,7 +14,7 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use surface::SurfaceSendRequest;
 
-use super::{channel_routes, AppState};
+use super::{message_connector_routes, AppState};
 use crate::services::CrossPlaneExecutionRecord;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -82,7 +82,7 @@ struct CrossPlaneActionReadiness {
     action: CrossPlaneAction,
     decision: CrossPlanePolicyDecision,
     target_platform: Option<String>,
-    platform_readiness: Option<channel_routes::PlatformReadiness>,
+    platform_readiness: Option<message_connector_routes::PlatformReadiness>,
     adapter_capability: Option<CrossPlaneAdapterCapability>,
     dispatch_target: Option<CrossPlaneDispatchTarget>,
     evidence: CrossPlaneDecisionEvidence,
@@ -237,7 +237,7 @@ async fn cross_plane_action_adapters_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     let config = state.runtime_config_json_snapshot();
-    let platforms = channel_routes::configured_platforms(config.as_ref());
+    let platforms = message_connector_routes::configured_platforms(config.as_ref());
     let bound_adapters = bound_adapter_snapshot(&state).await;
     let capabilities = platforms
         .iter()
@@ -517,7 +517,7 @@ async fn evaluate_action_readiness(
     let (action, decision, evidence) = decide_connector_action(state, action, mode, now);
     let target_platform = target_platform_from_action(&action);
     let config = state.runtime_config_json_snapshot();
-    let platforms = channel_routes::configured_platforms(config.as_ref());
+    let platforms = message_connector_routes::configured_platforms(config.as_ref());
     let platform_readiness = target_platform.as_ref().and_then(|target| {
         platforms
             .into_iter()
@@ -601,7 +601,7 @@ fn target_platform_from_ref(value: &str) -> Option<String> {
 }
 
 fn adapter_capability_for_action(
-    platform: &channel_routes::PlatformReadiness,
+    platform: &message_connector_routes::PlatformReadiness,
     action: &CrossPlaneAction,
     bound_adapters: &HashSet<String>,
 ) -> Option<CrossPlaneAdapterCapability> {
@@ -612,7 +612,7 @@ fn adapter_capability_for_action(
 }
 
 fn adapter_capabilities_for_platform(
-    platform: &channel_routes::PlatformReadiness,
+    platform: &message_connector_routes::PlatformReadiness,
     bound_adapters: &HashSet<String>,
 ) -> Vec<CrossPlaneAdapterCapability> {
     let adapter_bound = platform_binding_keys(platform)
@@ -641,7 +641,7 @@ async fn bound_adapter_snapshot(state: &AppState) -> HashSet<String> {
         .collect()
 }
 
-fn platform_binding_keys(platform: &channel_routes::PlatformReadiness) -> Vec<String> {
+fn platform_binding_keys(platform: &message_connector_routes::PlatformReadiness) -> Vec<String> {
     let mut keys = vec![
         platform.name.to_ascii_lowercase(),
         platform.platform_type.to_ascii_lowercase(),

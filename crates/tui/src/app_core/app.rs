@@ -2,7 +2,8 @@
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary, MissionControlSummary,
+    CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary, MessageBindingSummary,
+    MessageConnectorSummary, MessageEndpointSummary, MessageRouteSummary, MissionControlSummary,
     RealityCoreSummary, RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary,
     SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
@@ -270,6 +271,14 @@ pub struct App {
     pub gateway_surface_health: Option<SurfaceHealthSummary>,
     /// Recent surface events observed through Gateway SurfaceHost.
     pub gateway_surface_events: Vec<SurfaceEventSummary>,
+    /// Message connector readiness and runtime summaries observed through Gateway.
+    pub gateway_message_connectors: Vec<MessageConnectorSummary>,
+    /// Message endpoint directory observed through Gateway.
+    pub gateway_message_endpoints: Vec<MessageEndpointSummary>,
+    /// Message delivery routes observed through Gateway.
+    pub gateway_message_routes: Vec<MessageRouteSummary>,
+    /// Message conversation bindings observed through Gateway.
+    pub gateway_message_bindings: Vec<MessageBindingSummary>,
     /// Cowd kernel capability and release-gate summary observed through projection API.
     pub gateway_cowd_kernel: Option<CowdKernelSummary>,
     /// Gateway-owned API capability contract summary observed through Gateway contract API.
@@ -560,6 +569,10 @@ impl App {
             gateway_surfaces: Vec::new(),
             gateway_surface_health: None,
             gateway_surface_events: Vec::new(),
+            gateway_message_connectors: Vec::new(),
+            gateway_message_endpoints: Vec::new(),
+            gateway_message_routes: Vec::new(),
+            gateway_message_bindings: Vec::new(),
             gateway_cowd_kernel: None,
             gateway_capability_contract: None,
             gateway_structured_data: None,

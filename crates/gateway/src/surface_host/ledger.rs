@@ -95,6 +95,14 @@ impl SurfaceHost {
         self.messages.list_outbox(surface)
     }
 
+    pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.messages.list_all_inbox()
+    }
+
+    pub(crate) fn all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.messages.list_all_outbox()
+    }
+
     pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         self.messages.list_delivery_events(surface)
     }

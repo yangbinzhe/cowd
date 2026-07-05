@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use memory::SessionRecord;
 use sha2::{Digest, Sha256};
-use surface::{SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
+use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
 
 use crate::api_routes::AppState;
@@ -146,6 +146,15 @@ async fn handle_surface_message(
     let current_resources =
         register_surface_resources(&state, &surface, &session_id, &current_media);
     let recent_resources = register_surface_resources(&state, &surface, &session_id, &recent_media);
+    append_surface_resource_evidence(
+        &state,
+        &surface,
+        &session_id,
+        &message_id,
+        &current_resources,
+        &recent_resources,
+    )
+    .await?;
     let pre_messages = surface_runtime_pre_messages(&content, &current_media, &recent_media);
     let runtime_content = surface_runtime_content(&content, &current_resources, &recent_resources);
     let turn_policy = surface_turn_policy(&runtime_content);
@@ -194,7 +203,7 @@ async fn handle_surface_message(
             notify_surface_processing_lifecycle(
                 &state,
                 &surface,
-                "message.processing_failed",
+                MessageActionKind::ProcessingFailed.as_str(),
                 &message_id,
                 Some(message.clone()),
             )
@@ -235,7 +244,7 @@ async fn handle_surface_message(
         notify_surface_processing_lifecycle(
             &state,
             &surface,
-            "message.processing_complete",
+            MessageActionKind::ProcessingComplete.as_str(),
             &message_id,
             None,
         )
@@ -281,7 +290,7 @@ async fn handle_surface_message(
             notify_surface_processing_lifecycle(
                 &state,
                 &surface,
-                "message.processing_failed",
+                MessageActionKind::ProcessingFailed.as_str(),
                 &message_id,
                 Some(error.clone()),
             )
@@ -311,7 +320,7 @@ async fn handle_surface_message(
         notify_surface_processing_lifecycle(
             &state,
             &surface,
-            "message.processing_failed",
+            MessageActionKind::ProcessingFailed.as_str(),
             &message_id,
             Some(error.message.clone()),
         )
@@ -325,7 +334,7 @@ async fn handle_surface_message(
     notify_surface_processing_lifecycle(
         &state,
         &surface,
-        "message.processing_complete",
+        MessageActionKind::ProcessingComplete.as_str(),
         &message_id,
         None,
     )
@@ -542,6 +551,60 @@ async fn append_surface_timeline_event(
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+async fn append_surface_resource_evidence(
+    state: &AppState,
+    surface: &str,
+    session_id: &str,
+    message_id: &str,
+    current_resources: &[SurfaceResourceRegistration],
+    recent_resources: &[SurfaceResourceRegistration],
+) -> Result<(), String> {
+    if current_resources.is_empty() && recent_resources.is_empty() {
+        return Ok(());
+    }
+    append_surface_timeline_event(
+        state,
+        session_id,
+        "SurfaceMessageResourcesRegistered",
+        serde_json::json!({
+            "type": "SurfaceMessageResourcesRegistered",
+            "surface": surface,
+            "message_id": message_id,
+            "current": surface_resource_evidence_rows(current_resources),
+            "recent": surface_resource_evidence_rows(recent_resources),
+        }),
+    )
+    .await
+}
+
+fn surface_resource_evidence_rows(
+    resources: &[SurfaceResourceRegistration],
+) -> Vec<serde_json::Value> {
+    resources
+        .iter()
+        .map(|registration| {
+            let resource = registration.resource.as_ref().map(|(resource, hint)| {
+                serde_json::json!({
+                    "resource_id": resource.id,
+                    "uri": resource.uri,
+                    "kind": resource.kind,
+                    "declared_mime": resource.declared_mime,
+                    "detected_mime": resource.detected_mime,
+                    "storage_path": resource.storage_path,
+                    "hint": hint,
+                })
+            });
+            serde_json::json!({
+                "source_message_id": registration.attachment.source_message_id,
+                "local_path": registration.attachment.local_path,
+                "media_type": registration.attachment.media_type,
+                "resource": resource,
+                "status": if registration.resource.is_some() { "registered" } else { "failed" },
+            })
+        })
+        .collect()
 }
 
 async fn ensure_surface_runtime_session(

@@ -24,8 +24,9 @@ use crate::{
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
         CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary,
-        MissionControlSummary, RealityCoreSummary, RuntimeActionReceiptSummary,
-        StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
+        MessageBindingSummary, MessageConnectorSummary, MessageEndpointSummary,
+        MessageRouteSummary, MissionControlSummary, RealityCoreSummary,
+        RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceHealthSummary, SurfaceSummary,
     },
 };
 
@@ -74,6 +75,14 @@ pub struct GatewayPanel {
     pub surfaces: Vec<SurfaceSummary>,
     /// Surface host health summary.
     pub surface_health: Option<SurfaceHealthSummary>,
+    /// Message connector readiness summaries.
+    pub message_connectors: Vec<MessageConnectorSummary>,
+    /// Message endpoint directory summaries.
+    pub message_endpoints: Vec<MessageEndpointSummary>,
+    /// Message delivery route summaries.
+    pub message_routes: Vec<MessageRouteSummary>,
+    /// Message conversation binding summaries.
+    pub message_bindings: Vec<MessageBindingSummary>,
     /// Connector provider account summaries.
     pub connector_accounts: Vec<ConnectorAccountSummary>,
     /// Connector capability summaries.
@@ -123,6 +132,10 @@ impl GatewayPanel {
             mission_control: None,
             surfaces: Vec::new(),
             surface_health: None,
+            message_connectors: Vec::new(),
+            message_endpoints: Vec::new(),
+            message_routes: Vec::new(),
+            message_bindings: Vec::new(),
             connector_accounts: Vec::new(),
             connector_capabilities: Vec::new(),
             connector_resources: Vec::new(),
@@ -158,6 +171,10 @@ impl GatewayPanel {
         self.execution_receipts = app.gateway_action_receipts.clone();
         self.surfaces = app.gateway_surfaces.clone();
         self.surface_health = app.gateway_surface_health.clone();
+        self.message_connectors = app.gateway_message_connectors.clone();
+        self.message_endpoints = app.gateway_message_endpoints.clone();
+        self.message_routes = app.gateway_message_routes.clone();
+        self.message_bindings = app.gateway_message_bindings.clone();
         self.cowd_kernel = app.gateway_cowd_kernel.clone();
         self.gateway_capability_contract = app.gateway_capability_contract.clone();
         self.structured_data = app.gateway_structured_data.clone();
@@ -837,6 +854,103 @@ impl Component for GatewayPanel {
                 }
                 lines.push(Line::from(Span::styled(
                     "Open /surfaces for routes, resources, events, send/action.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            if !self.message_connectors.is_empty()
+                || !self.message_endpoints.is_empty()
+                || !self.message_routes.is_empty()
+                || !self.message_bindings.is_empty()
+            {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Message Plane ─",
+                    Style::default().fg(Color::Cyan),
+                )));
+                let ready = self
+                    .message_connectors
+                    .iter()
+                    .filter(|connector| {
+                        connector.enabled
+                            && connector.configured
+                            && !connector.circuit_open
+                            && !matches!(
+                                connector.runtime_status.as_str(),
+                                "failed" | "error" | "unavailable" | "circuit-open"
+                            )
+                    })
+                    .count();
+                let circuit_open = self
+                    .message_connectors
+                    .iter()
+                    .filter(|connector| connector.circuit_open)
+                    .count();
+                lines.push(Line::from(vec![
+                    Span::styled("Connectors: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{ready}/{} ready, circuit {}",
+                            self.message_connectors.len(),
+                            circuit_open
+                        ),
+                        Style::default().fg(if circuit_open > 0 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    ),
+                    Span::styled(
+                        "  Endpoints/Routes/Bindings: ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}/{}/{}",
+                            self.message_endpoints.len(),
+                            self.message_routes.len(),
+                            self.message_bindings.len()
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                let preview = self
+                    .message_connectors
+                    .iter()
+                    .take(4)
+                    .map(|connector| {
+                        format!(
+                            "{}:{}:{}",
+                            connector.connector,
+                            connector.configuration_status,
+                            connector.runtime_status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !preview.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Preview: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(preview, Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+                if let Some(binding) = self.message_bindings.first() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Latest binding: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!(
+                                "{} {} {} -> {}",
+                                binding.connector,
+                                binding.direction,
+                                binding.status,
+                                compact_text(&binding.endpoint, 24)
+                            ),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "Message connectors expose external user-message ingress/egress through Gateway.",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -1746,6 +1860,74 @@ mod tests {
             !joined.contains("channel.feishu"),
             "Should not show legacy channel templates, got: {joined}"
         );
+    }
+
+    #[test]
+    fn render_shows_message_plane_state() {
+        use crate::runtime_control_store::{
+            MessageBindingSummary, MessageConnectorSummary, MessageEndpointSummary,
+            MessageRouteSummary,
+        };
+        use crate::skin::SkinConfig;
+        use crate::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.message_connectors = vec![MessageConnectorSummary {
+            connector: "feishu".to_string(),
+            name: "feishu".to_string(),
+            configuration_status: "configured".to_string(),
+            runtime_status: "ready".to_string(),
+            enabled: true,
+            configured: true,
+            capability_count: 2,
+            missing_required_count: 0,
+            consecutive_failures: 0,
+            restart_count: 0,
+            circuit_open: false,
+        }];
+        panel.message_endpoints = vec![MessageEndpointSummary {
+            endpoint_id: "message:feishu:user".to_string(),
+            connector: "feishu".to_string(),
+            kind: "User".to_string(),
+            status: "configured".to_string(),
+            configured: true,
+            capability_count: 1,
+        }];
+        panel.message_routes = vec![MessageRouteSummary {
+            route_id: "message:feishu:default".to_string(),
+            connector: "feishu".to_string(),
+            policy: "origin".to_string(),
+            status: "configured".to_string(),
+            configured: true,
+            capability_count: 1,
+            runtime_status: "ready".to_string(),
+        }];
+        panel.message_bindings = vec![MessageBindingSummary {
+            binding_id: "message:feishu:user-1:thread-1".to_string(),
+            connector: "feishu".to_string(),
+            endpoint: "user-1".to_string(),
+            direction: "inbound".to_string(),
+            status: "processed".to_string(),
+            runtime_session_id: Some("session-feishu".to_string()),
+            resource_count: 1,
+            last_seen_at_ms: Some(42),
+        }];
+
+        let mut terminal = MockTerminal::new(112, 42);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 112, 42));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(joined.contains("Message Plane"), "{joined}");
+        assert!(joined.contains("1/1 ready"), "{joined}");
+        assert!(joined.contains("Endpoints/Routes/Bindings"), "{joined}");
+        assert!(joined.contains("feishu:configured:ready"), "{joined}");
+        assert!(joined.contains("Latest binding"), "{joined}");
+        assert!(!joined.contains("channel.feishu"), "{joined}");
     }
 
     #[test]

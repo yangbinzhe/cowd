@@ -519,6 +519,20 @@ impl SurfaceMessageStore {
             .unwrap_or_default()
     }
 
+    pub(crate) fn list_all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.state
+            .lock()
+            .map(|state| state.inbox.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn list_all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.state
+            .lock()
+            .map(|state| state.outbox.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn list_delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         let surface = normalize_surface_id(surface);
         self.state

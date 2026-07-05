@@ -478,6 +478,24 @@ impl CommandPalette {
             ));
         }
 
+        if !snapshot.message_connectors.is_empty()
+            || !snapshot.message_endpoints.is_empty()
+            || !snapshot.message_routes.is_empty()
+            || !snapshot.message_bindings.is_empty()
+        {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Inspect Message Plane",
+                format!(
+                    "{} connectors, {} endpoints, {} routes, {} bindings",
+                    snapshot.message_connectors.len(),
+                    snapshot.message_endpoints.len(),
+                    snapshot.message_routes.len(),
+                    snapshot.message_bindings.len()
+                ),
+                Action::Execute("/gateway".into()),
+            ));
+        }
+
         if !snapshot.surfaces.is_empty() || snapshot.surface_health.is_some() {
             let health = snapshot.surface_health.as_ref();
             self.all_commands.push(CommandEntry::dynamic(
@@ -1366,6 +1384,46 @@ mod tests {
                 title: "Ready Mock Document".to_string(),
                 indexed_state: "indexed".to_string(),
             }],
+            message_connectors: vec![crate::runtime_control_store::MessageConnectorSummary {
+                connector: "feishu".to_string(),
+                name: "feishu".to_string(),
+                configuration_status: "configured".to_string(),
+                runtime_status: "ready".to_string(),
+                enabled: true,
+                configured: true,
+                capability_count: 2,
+                missing_required_count: 0,
+                consecutive_failures: 0,
+                restart_count: 0,
+                circuit_open: false,
+            }],
+            message_endpoints: vec![crate::runtime_control_store::MessageEndpointSummary {
+                endpoint_id: "message:feishu:user".to_string(),
+                connector: "feishu".to_string(),
+                kind: "User".to_string(),
+                status: "configured".to_string(),
+                configured: true,
+                capability_count: 1,
+            }],
+            message_routes: vec![crate::runtime_control_store::MessageRouteSummary {
+                route_id: "message:feishu:default".to_string(),
+                connector: "feishu".to_string(),
+                policy: "origin".to_string(),
+                status: "configured".to_string(),
+                configured: true,
+                capability_count: 1,
+                runtime_status: "ready".to_string(),
+            }],
+            message_bindings: vec![crate::runtime_control_store::MessageBindingSummary {
+                binding_id: "message:feishu:user:thread".to_string(),
+                connector: "feishu".to_string(),
+                endpoint: "user".to_string(),
+                direction: "inbound".to_string(),
+                status: "processed".to_string(),
+                runtime_session_id: Some("session".to_string()),
+                resource_count: 0,
+                last_seen_at_ms: Some(1),
+            }],
             connector_degraded_reasons: vec!["resource_directory: locked".to_string()],
             ..RuntimeControlSnapshot::default()
         };
@@ -1378,6 +1436,7 @@ mod tests {
             "Mark Connector Resource Stale",
             "Remember Connector Resource",
             "Probe Connectors",
+            "Inspect Message Plane",
             "Mock Docs Dry Run",
             "Mock Docs Commit",
         ] {

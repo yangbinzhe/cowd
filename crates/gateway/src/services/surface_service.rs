@@ -173,6 +173,14 @@ impl SurfaceService {
         self.host.outbox(surface)
     }
 
+    pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.host.all_inbox()
+    }
+
+    pub(crate) fn all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.host.all_outbox()
+    }
+
     pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         self.host.delivery_events(surface)
     }

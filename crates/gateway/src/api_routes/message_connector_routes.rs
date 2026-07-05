@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -9,7 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde::Serialize;
-use surface::channel::{channel_required_fields, ChannelContract};
+use surface::message::{message_connector_required_fields, MessageConnectorContract};
 use surface::SurfaceActionRequest;
 
 use super::{api_error, AppState, ErrorResponse};
@@ -18,24 +19,36 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/platforms", get(list_platforms_handler))
         .route("/api/platforms/:name", get(get_platform_handler))
-        .route("/api/channels", get(list_channels_handler))
         .route(
-            "/api/channels/:name/status",
-            get(get_channel_status_handler),
+            "/api/message-connectors",
+            get(list_message_connectors_handler),
         )
-        .route("/api/channels/:name/repair", post(repair_channel_handler))
         .route(
-            "/api/channels/wechat-ilink/accounts",
+            "/api/message-connectors/:name/status",
+            get(get_message_connector_status_handler),
+        )
+        .route(
+            "/api/message-connectors/:name/repair",
+            post(repair_message_connector_handler),
+        )
+        .route(
+            "/api/message-connectors/wechat-ilink/accounts",
             get(wechat_ilink_accounts_handler),
         )
         .route(
-            "/api/channels/wechat-ilink/qr",
+            "/api/message-connectors/wechat-ilink/actions/account.login_qr.start",
             post(wechat_ilink_qr_start_handler),
         )
         .route(
-            "/api/channels/wechat-ilink/qr/poll",
+            "/api/message-connectors/wechat-ilink/actions/account.login_qr.poll",
             post(wechat_ilink_qr_poll_handler),
         )
+        .route(
+            "/api/message-endpoints",
+            get(list_message_endpoints_handler),
+        )
+        .route("/api/message-routes", get(list_message_routes_handler))
+        .route("/api/message-bindings", get(list_message_bindings_handler))
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,11 +104,13 @@ async fn get_platform_handler(
     }))
 }
 
-async fn list_channels_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+async fn list_message_connectors_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
     let config = state.runtime_config_json_snapshot();
     let platforms = configured_platforms(config.as_ref());
     let runtimes = state.services.surface.runtime_snapshots();
-    let channels = platforms
+    let connectors = platforms
         .into_iter()
         .map(|platform| {
             let runtime = runtimes
@@ -105,7 +120,7 @@ async fn list_channels_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
                 })
                 .cloned();
             serde_json::json!({
-                "channel": platform.platform_type,
+                "connector": platform.platform_type,
                 "name": platform.name,
                 "configuration_status": platform.status,
                 "configured": platform.configured,
@@ -118,51 +133,51 @@ async fn list_channels_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
         })
         .collect::<Vec<_>>();
     Json(serde_json::json!({
-        "kind": "channel.registry",
-        "channels": channels,
+        "kind": "message.connector.registry",
+        "connectors": connectors,
         "runtime": runtimes,
     }))
 }
 
-async fn get_channel_status_handler(
+async fn get_message_connector_status_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let channel = surface::channel::normalize_channel(&name);
+    let connector = surface::message::normalize_message_connector(&name);
     let config = state.runtime_config_json_snapshot();
     let platforms = configured_platforms(config.as_ref());
     let platform = platforms
         .into_iter()
-        .find(|platform| platform.platform_type == channel || platform.name == channel);
-    let runtime = state.services.surface.runtime_snapshot(&channel);
+        .find(|platform| platform.platform_type == connector || platform.name == connector);
+    let runtime = state.services.surface.runtime_snapshot(&connector);
     if platform.is_none() && runtime.is_none() {
         return Err(api_error(
             StatusCode::NOT_FOUND,
-            format!("channel `{name}` not found"),
+            format!("message connector `{name}` not found"),
         ));
     }
     Ok(Json(serde_json::json!({
-        "kind": "channel.status",
-        "channel": channel,
+        "kind": "message.connector.status",
+        "connector": connector,
         "configuration": platform,
         "runtime": runtime,
     })))
 }
 
-async fn repair_channel_handler(
+async fn repair_message_connector_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let channel = surface::channel::normalize_channel(&name);
+    let connector = surface::message::normalize_message_connector(&name);
     let runtime = state
         .services
         .surface
-        .repair_surface(&channel)
+        .repair_surface(&connector)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
     Ok(Json(serde_json::json!({
-        "kind": "channel.repair",
-        "channel": channel,
+        "kind": "message.connector.repair",
+        "connector": connector,
         "runtime": runtime,
     })))
 }
@@ -220,7 +235,7 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
         .get("enabled")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    let contract = ChannelContract::for_channel(&platform_type);
+    let contract = MessageConnectorContract::for_connector(&platform_type);
     let required = contract
         .required_fields
         .iter()
@@ -266,7 +281,7 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
 }
 
 fn disabled_platform(platform_type: &str) -> PlatformReadiness {
-    let contract = ChannelContract::for_channel(platform_type);
+    let contract = MessageConnectorContract::for_connector(platform_type);
     PlatformReadiness {
         name: platform_type.to_string(),
         platform_type: platform_type.to_string(),
@@ -306,7 +321,7 @@ fn platform_scopes_from_value(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn required_fields(platform_type: &str) -> Vec<&'static str> {
-    channel_required_fields(platform_type)
+    message_connector_required_fields(platform_type)
 }
 
 fn credential_field(field: &str) -> bool {
@@ -350,6 +365,143 @@ async fn wechat_ilink_qr_start_handler(
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
     Ok(Json(result))
+}
+
+async fn list_message_endpoints_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
+    let endpoints = platforms
+        .iter()
+        .flat_map(message_endpoint_projection)
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "kind": "message.endpoint.directory",
+        "endpoints": endpoints,
+    }))
+}
+
+async fn list_message_routes_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let config = state.runtime_config_json_snapshot();
+    let platforms = configured_platforms(config.as_ref());
+    let runtimes = state.services.surface.runtime_snapshots();
+    let routes = platforms
+        .iter()
+        .map(|platform| {
+            let runtime = runtimes
+                .iter()
+                .find(|runtime| {
+                    runtime.surface == platform.platform_type || runtime.surface == platform.name
+                })
+                .cloned();
+            serde_json::json!({
+                "route_id": format!("message:{}:default", platform.platform_type),
+                "connector": platform.platform_type,
+                "policy": "origin",
+                "status": platform.status,
+                "configured": platform.configured,
+                "runtime": runtime,
+                "capabilities": platform.capabilities,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "kind": "message.delivery.routes",
+        "routes": routes,
+    }))
+}
+
+async fn list_message_bindings_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mut bindings = BTreeMap::<String, serde_json::Value>::new();
+    for inbox in state.services.surface.all_inbox() {
+        let endpoint = inbox
+            .sender_id
+            .clone()
+            .unwrap_or_else(|| inbox.message_id.clone());
+        let thread = inbox.thread_id.clone().unwrap_or_default();
+        let key = format!("{}:{}:{}", inbox.surface, endpoint, thread);
+        bindings.insert(
+            key.clone(),
+            serde_json::json!({
+                "binding_id": format!("message:{key}"),
+                "connector": inbox.surface,
+                "endpoint": endpoint,
+                "thread": inbox.thread_id,
+                "message_id": inbox.message_id,
+                "runtime_session_id": inbox.runtime_session_id,
+                "runtime_turn_id": inbox.runtime_turn_id,
+                "resource_count": payload_media_count(&inbox.payload_json),
+                "status": inbox.status,
+                "last_seen_at_ms": inbox.updated_at_ms,
+                "direction": "inbound",
+            }),
+        );
+    }
+    for outbox in state.services.surface.all_outbox() {
+        let endpoint = outbox.recipient.clone();
+        let thread = outbox.thread_id.clone().unwrap_or_default();
+        let key = format!("{}:{}:{}", outbox.surface, endpoint, thread);
+        bindings
+            .entry(key.clone())
+            .and_modify(|binding| {
+                binding["outbound_status"] = serde_json::json!(outbox.status.clone());
+                binding["source_session_id"] = serde_json::json!(outbox.source_session_id.clone());
+                binding["delivery_id"] = serde_json::json!(outbox.delivery_id.clone());
+                binding["last_seen_at_ms"] = serde_json::json!(outbox.updated_at_ms);
+            })
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "binding_id": format!("message:{key}"),
+                    "connector": outbox.surface,
+                    "endpoint": endpoint,
+                    "thread": outbox.thread_id,
+                    "message_id": outbox.reply_to_message_id,
+                    "runtime_session_id": outbox.source_session_id,
+                    "runtime_turn_id": null,
+                    "status": outbox.status,
+                    "delivery_id": outbox.delivery_id,
+                    "last_seen_at_ms": outbox.updated_at_ms,
+                    "direction": "outbound",
+                })
+            });
+    }
+    let bindings = bindings.into_values().collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "kind": "message.conversation.bindings",
+        "bindings": bindings,
+    }))
+}
+
+fn message_endpoint_projection(platform: &PlatformReadiness) -> Vec<serde_json::Value> {
+    let contract = MessageConnectorContract::for_connector(&platform.platform_type);
+    contract
+        .endpoint_kinds
+        .into_iter()
+        .map(|kind| {
+            serde_json::json!({
+                "endpoint_id": format!("message:{}:{kind:?}", platform.platform_type).to_ascii_lowercase(),
+                "connector": platform.platform_type,
+                "name": platform.name,
+                "kind": kind,
+                "configured": platform.configured,
+                "status": platform.status,
+                "capabilities": platform.capabilities,
+            })
+        })
+        .collect()
+}
+
+fn payload_media_count(payload: &serde_json::Value) -> usize {
+    payload
+        .get("media_urls")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 async fn wechat_ilink_qr_poll_handler(

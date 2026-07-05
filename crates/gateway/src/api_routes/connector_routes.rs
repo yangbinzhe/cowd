@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::GatewayMemoryManager;
 
-use super::{channel_routes, AppState};
+use super::{message_connector_routes, AppState};
 
 mod mcp;
 mod resources;
@@ -81,7 +81,7 @@ fn connector_service_bulkhead() -> &'static ConnectorBulkhead {
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
     let config = state.runtime_config_json_snapshot();
-    let platforms = channel_routes::configured_platforms(config.as_ref());
+    let platforms = message_connector_routes::configured_platforms(config.as_ref());
     let mut accounts = platforms
         .iter()
         .filter(|platform| platform.enabled || platform.configured)
@@ -165,7 +165,9 @@ fn account_from_service_connector(connector: &dyn ServiceConnector) -> ProviderA
     account
 }
 
-fn account_from_platform(platform: &channel_routes::PlatformReadiness) -> ProviderAccount {
+fn account_from_platform(
+    platform: &message_connector_routes::PlatformReadiness,
+) -> ProviderAccount {
     let mut account = ProviderAccount::new(
         platform.platform_type.clone(),
         platform.name.clone(),
