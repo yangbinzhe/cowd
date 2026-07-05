@@ -82,6 +82,7 @@ struct EdgeSurfaceProjection {
     source: String,
     entry: Option<String>,
     diagnostics: Vec<String>,
+    message_descriptor: Option<surface::message::MessageConnectorDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +200,10 @@ fn edge_surface_projection(
     descriptor: &SurfaceDescriptor,
     runtime: &[SurfaceRuntimeSnapshot],
 ) -> EdgeSurfaceProjection {
+    let runtime_snapshot = runtime
+        .iter()
+        .find(|snapshot| snapshot.surface == descriptor.id)
+        .cloned();
     EdgeSurfaceProjection {
         id: descriptor.id.clone(),
         name: descriptor.name.clone(),
@@ -207,10 +212,7 @@ fn edge_surface_projection(
         kind: descriptor.kind,
         lifecycle: descriptor.lifecycle,
         status: descriptor.status.clone(),
-        runtime: runtime
-            .iter()
-            .find(|snapshot| snapshot.surface == descriptor.id)
-            .cloned(),
+        runtime: runtime_snapshot.clone(),
         capability_count: descriptor.capabilities.len(),
         capabilities: descriptor
             .capabilities
@@ -224,7 +226,75 @@ fn edge_surface_projection(
         source: descriptor.source.clone(),
         entry: descriptor.entry.clone(),
         diagnostics: descriptor.diagnostics.clone(),
+        message_descriptor: message_connector_descriptor(descriptor, runtime_snapshot.as_ref()),
     }
+}
+
+fn message_connector_descriptor(
+    descriptor: &SurfaceDescriptor,
+    runtime: Option<&SurfaceRuntimeSnapshot>,
+) -> Option<surface::message::MessageConnectorDescriptor> {
+    if descriptor.edge_domain() != EdgeDomain::MessageConnector {
+        return None;
+    }
+    let connector = descriptor
+        .id
+        .strip_prefix("message:")
+        .unwrap_or(&descriptor.id);
+    let status = runtime
+        .map(|snapshot| surface_runtime_status(snapshot.status))
+        .unwrap_or_else(|| surface_status(&descriptor.status));
+    let mut message_descriptor =
+        surface::message::MessageConnectorDescriptor::for_connector(connector, status);
+    message_descriptor.reload_required = runtime
+        .map(|snapshot| snapshot.circuit_open || !snapshot.available_actions.is_empty())
+        .unwrap_or(false);
+    message_descriptor
+        .degraded_reasons
+        .extend(descriptor.diagnostics.clone());
+    if let Some(snapshot) = runtime {
+        if let Some(error) = &snapshot.last_error {
+            message_descriptor
+                .degraded_reasons
+                .push(error.message.clone());
+        }
+        if snapshot.circuit_open {
+            message_descriptor
+                .degraded_reasons
+                .push("surface supervisor circuit is open".to_string());
+        }
+    }
+    message_descriptor.degraded_reasons.sort();
+    message_descriptor.degraded_reasons.dedup();
+    Some(message_descriptor)
+}
+
+fn surface_runtime_status(status: surface::SurfaceRuntimeStatus) -> String {
+    match status {
+        surface::SurfaceRuntimeStatus::Builtin
+        | surface::SurfaceRuntimeStatus::Discovered
+        | surface::SurfaceRuntimeStatus::Ready => "ready",
+        surface::SurfaceRuntimeStatus::Starting | surface::SurfaceRuntimeStatus::Restarting => {
+            "starting"
+        }
+        surface::SurfaceRuntimeStatus::Disabled => "disabled",
+        surface::SurfaceRuntimeStatus::CircuitOpen => "circuit_open",
+        surface::SurfaceRuntimeStatus::Degraded
+        | surface::SurfaceRuntimeStatus::Unavailable
+        | surface::SurfaceRuntimeStatus::Failed => "degraded",
+    }
+    .to_string()
+}
+
+fn surface_status(status: &surface::SurfaceStatus) -> String {
+    match status {
+        surface::SurfaceStatus::Builtin
+        | surface::SurfaceStatus::Discovered
+        | surface::SurfaceStatus::Ready => "ready",
+        surface::SurfaceStatus::Disabled => "disabled",
+        surface::SurfaceStatus::Unavailable | surface::SurfaceStatus::Error => "degraded",
+    }
+    .to_string()
 }
 
 fn source_connector_projections(
@@ -317,5 +387,41 @@ mod tests {
             .iter()
             .any(|connector| connector.adapter_id.as_deref() == Some("csv")
                 && !connector.requires_sidecar));
+    }
+
+    #[test]
+    fn surface_descriptor_projects_message_connector_descriptor() {
+        let surface = SurfaceDescriptor {
+            id: "message:feishu".to_string(),
+            name: "Feishu".to_string(),
+            version: "1.0.0".to_string(),
+            kind: surface::SurfaceKind::MessageConnector,
+            status: surface::SurfaceStatus::Ready,
+            source: "test".to_string(),
+            entry: Some("feishu".to_string()),
+            lifecycle: surface::SurfaceLifecycle::Managed,
+            capabilities: vec![surface::SurfaceCapability::new(
+                "message:feishu",
+                "message.send.text",
+            )],
+            routes: Vec::new(),
+            resources: Vec::new(),
+            health: surface::SurfaceHealthSpec::default(),
+            edge_domain: EdgeDomain::MessageConnector,
+            diagnostics: Vec::new(),
+        };
+        let projection = edge_surface_projection(&surface, &[]);
+        let descriptor = projection
+            .message_descriptor
+            .as_ref()
+            .expect("message connector descriptor should be projected");
+
+        assert_eq!(descriptor.descriptor_version, 1);
+        assert!(descriptor.max_message_length > 0);
+        assert!(descriptor
+            .supported_actions
+            .iter()
+            .any(|action| action == "message.send.text"));
+        assert!(!descriptor.markdown_dialect.is_empty());
     }
 }

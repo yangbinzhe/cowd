@@ -38,6 +38,22 @@ pub struct MessageConnectorContract {
     pub resource_modes: Vec<MessageResourceMode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageConnectorDescriptor {
+    pub descriptor_version: u32,
+    pub connector: String,
+    pub display_name: String,
+    pub message_contract: MessageConnectorContract,
+    pub markdown_dialect: String,
+    pub max_message_length: usize,
+    pub supports_threads: bool,
+    pub supports_attachments: bool,
+    pub supported_actions: Vec<String>,
+    pub status: String,
+    pub reload_required: bool,
+    pub degraded_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MessageActionKind {
@@ -134,6 +150,47 @@ impl MessageConnectorContract {
             .iter()
             .map(|capability| capability.capability.clone())
             .collect()
+    }
+}
+
+impl MessageConnectorDescriptor {
+    #[must_use]
+    pub fn for_connector(connector: impl AsRef<str>, status: impl Into<String>) -> Self {
+        let contract = MessageConnectorContract::for_connector(connector);
+        let status = status.into();
+        let degraded_reasons = if matches!(status.as_str(), "ready" | "connected") {
+            Vec::new()
+        } else {
+            vec![format!("connector status is {status}")]
+        };
+        Self {
+            descriptor_version: 1,
+            display_name: message_connector_display_name(&contract.connector).to_string(),
+            markdown_dialect: message_connector_markdown_dialect(&contract.connector).to_string(),
+            max_message_length: message_connector_max_message_length(&contract.connector),
+            supports_threads: contract
+                .endpoint_kinds
+                .contains(&MessageEndpointKind::Thread),
+            supports_attachments: contract.resource_modes.iter().any(|mode| {
+                !matches!(mode, MessageResourceMode::Text | MessageResourceMode::Event)
+            }),
+            supported_actions: contract.capability_names(),
+            connector: contract.connector.clone(),
+            message_contract: contract,
+            status,
+            reload_required: false,
+            degraded_reasons,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reload_required(mut self, reload_required: bool) -> Self {
+        self.reload_required = reload_required;
+        if reload_required {
+            self.degraded_reasons
+                .push("manifest or runtime configuration changed; reload required".to_string());
+        }
+        self
     }
 }
 
@@ -243,6 +300,36 @@ pub fn message_connector_resource_modes(connector: &str) -> Vec<MessageResourceM
     }
 }
 
+#[must_use]
+pub fn message_connector_display_name(connector: &str) -> &'static str {
+    match normalize_message_connector(connector).as_str() {
+        "feishu" => "Feishu/Lark",
+        "wechat-ilink" => "WeChat iLink",
+        "wecom" => "WeCom",
+        "email" => "Email",
+        _ => "Message Connector",
+    }
+}
+
+#[must_use]
+pub fn message_connector_markdown_dialect(connector: &str) -> &'static str {
+    match normalize_message_connector(connector).as_str() {
+        "feishu" => "feishu-post-markdown",
+        "email" => "commonmark",
+        _ => "plain-text-with-links",
+    }
+}
+
+#[must_use]
+pub fn message_connector_max_message_length(connector: &str) -> usize {
+    match normalize_message_connector(connector).as_str() {
+        "feishu" => 20_000,
+        "wechat-ilink" | "wecom" => 4_096,
+        "email" => 250_000,
+        _ => 8_000,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +363,25 @@ mod tests {
         assert!(contract
             .resource_modes
             .contains(&MessageResourceMode::Video));
+    }
+
+    #[test]
+    fn message_descriptor_exposes_runtime_capability_status() {
+        let descriptor = MessageConnectorDescriptor::for_connector("lark", "degraded")
+            .with_reload_required(true);
+
+        assert_eq!(descriptor.descriptor_version, 1);
+        assert_eq!(descriptor.connector, "feishu");
+        assert_eq!(descriptor.display_name, "Feishu/Lark");
+        assert_eq!(descriptor.markdown_dialect, "feishu-post-markdown");
+        assert_eq!(descriptor.max_message_length, 20_000);
+        assert!(descriptor.supports_threads);
+        assert!(descriptor.supports_attachments);
+        assert!(descriptor.reload_required);
+        assert!(descriptor
+            .supported_actions
+            .contains(&"message.send.image".to_string()));
+        assert!(!descriptor.degraded_reasons.is_empty());
     }
 
     #[test]
