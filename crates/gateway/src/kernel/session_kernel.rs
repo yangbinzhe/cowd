@@ -3,6 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use harness_contract::turn::TurnJournalEnvelope;
 use memory::store::session::{SessionEvent, SessionListOptions, SessionListPage, SessionMessage};
 use memory::{
     CognitiveContextManager, MemoryError, MemoryPulseReport, RuntimeEvent, RuntimeEventPage,
@@ -344,6 +345,34 @@ impl SessionKernel {
         };
         store.append_event(&event).await?;
         Ok(true)
+    }
+
+    pub(crate) async fn append_turn_journal_event(
+        &self,
+        session_id: &str,
+        envelope: TurnJournalEnvelope,
+    ) -> Result<Option<usize>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        if store.get_session(session_id).await?.is_none() {
+            let record = new_api_session_record(session_id, None);
+            store.create_session(&record).await?;
+        }
+        let sequence = store.next_event_sequence(session_id).await?;
+        let mut envelope = envelope.with_sequence(sequence);
+        envelope.session_id = session_id.to_string();
+        let created_at_ms = current_time_ms();
+        let event = SessionEvent {
+            session_id: session_id.to_string(),
+            event_type: "TurnJournal".to_string(),
+            event_json: serde_json::to_string(&envelope)
+                .map_err(|error| MemoryError::Store(error.to_string()))?,
+            sequence,
+            created_at_ms,
+        };
+        store.append_event(&event).await?;
+        Ok(Some(sequence))
     }
 
     pub(crate) async fn append_runtime_event(

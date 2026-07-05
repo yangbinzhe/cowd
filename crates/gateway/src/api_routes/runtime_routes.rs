@@ -221,9 +221,11 @@ async fn submit_runtime_turn(
     Json(body): Json<RuntimeTurnSubmitRequest>,
 ) -> Json<Value> {
     match state.services.runtime.as_ref() {
-        Some(runtime) => {
-            Json(runtime.submit_turn_value(body.session_id, body.task_id, body.prompt))
-        }
+        Some(runtime) => Json(
+            runtime
+                .submit_turn_value(body.session_id, body.task_id, body.prompt)
+                .await,
+        ),
         None => Json(serde_json::json!({
             "ok": false,
             "error": "runtime service unavailable",
@@ -259,7 +261,7 @@ async fn cancel_runtime_turn(
     Path(id): Path<String>,
 ) -> Json<Value> {
     match state.services.runtime.as_ref() {
-        Some(runtime) => Json(runtime.cancel_turn_value(&id)),
+        Some(runtime) => Json(runtime.cancel_turn_value(&id).await),
         None => Json(serde_json::json!({
             "ok": false,
             "error": "runtime service unavailable",

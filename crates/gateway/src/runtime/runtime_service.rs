@@ -14,7 +14,10 @@ use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use harness_contract::{
     task::{TaskId, TaskTurnBinding},
-    turn::{TurnEvent, TurnId, TurnInput, TurnReceipt, TurnStatus},
+    turn::{
+        TurnEvent, TurnId, TurnInput, TurnJournalEnvelope, TurnJournalPhase, TurnReceipt,
+        TurnStatus,
+    },
 };
 use runtime::agent_collaboration::CollaborationContextResult;
 use session::SessionLeaseRegistry;
@@ -192,7 +195,7 @@ impl RuntimeService {
         })
     }
 
-    pub(crate) fn submit_turn_value(
+    pub(crate) async fn submit_turn_value(
         &self,
         session_id: Option<String>,
         task_id: Option<String>,
@@ -205,24 +208,30 @@ impl RuntimeService {
             });
         }
 
-        let mut input = TurnInput::new(prompt);
-        input.session_id = session_id;
-        input.task_id = task_id;
-        let mut receipt = TurnReceipt::from_input(&input, TurnStatus::Pending);
-        receipt
-            .events
-            .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Pending));
-        self.record_turn_binding(&input);
+        let input = Self::turn_input_for(session_id, task_id, prompt);
+        let receipt = self.record_turn_from_input(&input, TurnStatus::Pending);
         let turn_id = input.turn_id.to_string();
-        self.turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(turn_id.clone(), receipt.clone());
+        let journal_sequence = self
+            .persist_turn_input_journal(&input, TurnJournalPhase::Submitted, None)
+            .await
+            .transpose()
+            .map_err(|error| {
+                tracing::warn!(
+                    turn_id = %turn_id,
+                    error = %error,
+                    "failed to persist submitted turn journal"
+                );
+                error
+            })
+            .ok()
+            .flatten();
 
         serde_json::json!({
             "ok": true,
             "dispatch": "runtime_service",
             "accepted": true,
+            "durable_journal": journal_sequence.is_some(),
+            "journal_sequence": journal_sequence,
             "turn": receipt,
         })
     }
@@ -252,34 +261,137 @@ impl RuntimeService {
         })
     }
 
-    pub(crate) fn cancel_turn_value(&self, turn_id: &str) -> serde_json::Value {
-        let mut turns = self
-            .turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(turn) = turns.get_mut(turn_id) else {
-            return serde_json::json!({
-                "ok": false,
-                "error": "turn not found",
-            });
-        };
+    pub(crate) async fn cancel_turn_value(&self, turn_id: &str) -> serde_json::Value {
+        let (turn, aborted_run_id) = {
+            let mut turns = self
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(turn) = turns.get_mut(turn_id) else {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": "turn not found",
+                });
+            };
 
-        turn.status = TurnStatus::Cancelled;
-        turn.events.push(TurnEvent::new(
-            TurnId::from_string(turn_id.to_string()),
-            TurnStatus::Cancelled,
-        ));
-        let aborted_run_id = turn
-            .session_id
-            .as_deref()
-            .and_then(crate::api_routes::abort_active_turn);
+            turn.status = TurnStatus::Cancelled;
+            turn.events.push(TurnEvent::new(
+                TurnId::from_string(turn_id.to_string()),
+                TurnStatus::Cancelled,
+            ));
+            let aborted_run_id = turn
+                .session_id
+                .as_deref()
+                .and_then(crate::api_routes::abort_active_turn);
+            (turn.clone(), aborted_run_id)
+        };
+        let journal_sequence = self
+            .persist_turn_receipt_journal(&turn, TurnJournalPhase::Cancelled, None)
+            .await
+            .transpose()
+            .map_err(|error| {
+                tracing::warn!(
+                    turn_id = %turn_id,
+                    error = %error,
+                    "failed to persist cancelled turn journal"
+                );
+                error
+            })
+            .ok()
+            .flatten();
 
         serde_json::json!({
             "ok": true,
             "cancelled": true,
             "aborted_run_id": aborted_run_id,
+            "journal_sequence": journal_sequence,
             "turn": turn,
         })
+    }
+
+    async fn persist_turn_input_journal(
+        &self,
+        input: &TurnInput,
+        phase: TurnJournalPhase,
+        message: Option<String>,
+    ) -> Option<Result<Option<usize>, memory::MemoryError>> {
+        let session_id = input
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())?;
+        let envelope = TurnJournalEnvelope::new(
+            session_id,
+            input.turn_id.clone(),
+            phase,
+            "gateway.runtime_service",
+            serde_json::json!({
+                "status": phase.as_str(),
+                "prompt": input.prompt.clone(),
+                "prompt_preview": input.prompt.chars().take(240).collect::<String>(),
+                "task_id": input.task_id.clone(),
+                "message": message,
+                "created_at": input.created_at,
+            }),
+        );
+        Some(
+            self.session_kernel
+                .append_turn_journal_event(session_id, envelope)
+                .await,
+        )
+    }
+
+    async fn persist_turn_receipt_journal(
+        &self,
+        receipt: &TurnReceipt,
+        phase: TurnJournalPhase,
+        message: Option<String>,
+    ) -> Option<Result<Option<usize>, memory::MemoryError>> {
+        let session_id = receipt
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())?;
+        let envelope = TurnJournalEnvelope::new(
+            session_id,
+            receipt.turn_id.clone(),
+            phase,
+            "gateway.runtime_service",
+            serde_json::json!({
+                "status": receipt.status.as_str(),
+                "task_id": receipt.task_id.clone(),
+                "context_report_id": receipt.context_report_id.clone(),
+                "message": message,
+                "completed_at": receipt.completed_at,
+            }),
+        );
+        Some(
+            self.session_kernel
+                .append_turn_journal_event(session_id, envelope)
+                .await,
+        )
+    }
+
+    fn turn_input_for(
+        session_id: Option<String>,
+        task_id: Option<String>,
+        prompt: String,
+    ) -> TurnInput {
+        let mut input = TurnInput::new(prompt);
+        input.session_id = session_id;
+        input.task_id = task_id;
+        input
+    }
+
+    fn record_turn_from_input(&self, input: &TurnInput, status: TurnStatus) -> TurnReceipt {
+        let mut receipt = TurnReceipt::from_input(input, status.clone());
+        receipt
+            .events
+            .push(TurnEvent::new(input.turn_id.clone(), status));
+        self.record_turn_binding(input);
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(input.turn_id.to_string(), receipt.clone());
+        receipt
     }
 
     fn turns_snapshot(&self) -> Vec<TurnReceipt> {
@@ -400,8 +512,25 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
-        let receipt =
-            self.start_running_turn(Some(session_id.to_string()), task_id, content.clone());
+        let input = Self::turn_input_for(Some(session_id.to_string()), task_id, content.clone());
+        self.record_turn_from_input(&input, TurnStatus::Pending);
+        if let Some(Err(error)) = self
+            .persist_turn_input_journal(&input, TurnJournalPhase::Submitted, None)
+            .await
+        {
+            return Err(RuntimeTurnExecutionError::Runtime(format!(
+                "failed to persist submitted turn journal: {error}"
+            )));
+        }
+        let receipt = self.record_turn_from_input(&input, TurnStatus::Running);
+        if let Some(Err(error)) = self
+            .persist_turn_input_journal(&input, TurnJournalPhase::Running, None)
+            .await
+        {
+            return Err(RuntimeTurnExecutionError::Runtime(format!(
+                "failed to persist running turn journal: {error}"
+            )));
+        }
         let turn_id = receipt.turn_id.clone();
         let turn_result = tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
@@ -437,16 +566,54 @@ impl RuntimeService {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(turn_id.to_string(), receipt.clone());
+                if let Some(Err(error)) = self
+                    .persist_turn_receipt_journal(&receipt, TurnJournalPhase::Completed, None)
+                    .await
+                {
+                    tracing::warn!(
+                        turn_id = %turn_id,
+                        error = %error,
+                        "failed to persist completed turn journal"
+                    );
+                }
                 Ok(RuntimeTurnExecution { summary, receipt })
             }
             Ok(Err(error)) => {
                 let message = error.to_string();
-                self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
+                let receipt = self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
+                if let Some(Err(error)) = self
+                    .persist_turn_receipt_journal(
+                        &receipt,
+                        TurnJournalPhase::Failed,
+                        Some(message.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        turn_id = %turn_id,
+                        error = %error,
+                        "failed to persist failed turn journal"
+                    );
+                }
                 Err(RuntimeTurnExecutionError::Runtime(message))
             }
             Err(_) => {
                 let message = format!("turn timed out after {}s", turn_timeout.as_secs());
-                self.finish_turn(&turn_id, TurnStatus::Failed, Some(message));
+                let receipt = self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
+                if let Some(Err(error)) = self
+                    .persist_turn_receipt_journal(
+                        &receipt,
+                        TurnJournalPhase::Failed,
+                        Some(message.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        turn_id = %turn_id,
+                        error = %error,
+                        "failed to persist timeout turn journal"
+                    );
+                }
                 Err(RuntimeTurnExecutionError::Timeout {
                     seconds: turn_timeout.as_secs(),
                 })
@@ -927,6 +1094,44 @@ mod tests {
         assert!(snapshot.get(&removed_legacy_key).is_none());
         assert_eq!(snapshot["leases"]["total"], 1);
         assert_eq!(snapshot["transport"]["control"], "gateway_http");
+    }
+
+    #[tokio::test]
+    async fn runtime_service_records_durable_turn_journal() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session_kernel = Arc::new(SessionKernel::new(
+            Arc::new(ActiveSessions::default()),
+            Some(store.clone()),
+            crate::event_bus::SessionEventBus::new(),
+        ));
+        let service = RuntimeService::new(
+            Arc::new(ActiveSessions::default()),
+            Arc::new(SessionLeaseRegistry::default()),
+            session_kernel,
+            Arc::new(SessionLifecycleKernel::new()),
+            Instant::now(),
+        );
+
+        let submitted = service
+            .submit_turn_value(
+                Some("journal-session".to_string()),
+                Some("task-a".to_string()),
+                "persist this turn".to_string(),
+            )
+            .await;
+
+        assert_eq!(submitted["ok"], true);
+        assert_eq!(submitted["durable_journal"], true);
+        let events = store
+            .get_events_by_type_limited("journal-session", "TurnJournal", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&events[0].event_json).unwrap();
+        assert_eq!(payload["event_type"], "turn.submitted");
+        assert_eq!(payload["phase"], "submitted");
+        assert_eq!(payload["payload"]["prompt"], "persist this turn");
+        assert_eq!(payload["payload"]["task_id"], "task-a");
     }
 
     #[test]
