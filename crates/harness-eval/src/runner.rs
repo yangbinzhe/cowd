@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{process::Command, time::Instant};
 
 use harness_contract::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
@@ -6,14 +6,16 @@ use serde_json::{json, Value};
 
 use crate::{
     evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
-    evaluate_reality_context_scenarios, evaluate_report_gate, harness_capability_coverage_report,
+    evaluate_next_gen_harness_closure, evaluate_reality_context_scenarios, evaluate_report_gate,
+    harness_capability_coverage_report,
     report::{
         HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, ToolCallDetail,
         ToolCallSummary,
     },
     report_store::{empty_usage, now_ms, HarnessEvalReportStore},
-    stable_ai_scenario_matrix, E2eScenarioKind, RealToolScenarioReport, RealToolScenarioResult,
-    ScenarioCheck, ScenarioObservation, ScenarioSpec, ScenarioSuite, StableAiHealthReport,
+    stable_ai_scenario_matrix, E2eScenarioKind, NextGenHarnessEvalInput, RealToolScenarioReport,
+    RealToolScenarioResult, ScenarioCheck, ScenarioObservation, ScenarioSpec, ScenarioSuite,
+    StableAiHealthReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,57 @@ pub fn run_eval(
     let reality_context = evaluate_reality_context_scenarios();
     let mission_runtime = evaluate_mission_runtime_collaboration_closure();
     let real_tool = (options.level == HarnessEvalLevel::Full).then(run_full_real_tool_scenarios);
+    let mut usage = empty_usage("deterministic_smoke");
+    let mut tool_call_log = Vec::new();
+    let mut tool_call_details = Vec::new();
+    let mut real_tool_scenarios = None;
+    if let Some(real_tool) = real_tool {
+        usage = real_tool.usage;
+        tool_call_log = real_tool
+            .tool_details
+            .iter()
+            .map(|detail| detail.summary.clone())
+            .collect();
+        tool_call_details = real_tool
+            .tool_details
+            .iter()
+            .map(|detail| {
+                json!({
+                    "summary": detail.summary,
+                    "input": detail.input,
+                    "output": detail.output,
+                    "error": detail.error,
+                })
+            })
+            .collect();
+        real_tool_scenarios = Some(real_tool.report);
+    }
+    let tool_calls = tool_call_log.len();
+    let runtime_actions = 5 + usize::from(complex.is_some());
+    let mission_evidence_refs = mission_runtime
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let next_gen_harness = evaluate_next_gen_harness_closure(NextGenHarnessEvalInput {
+        level: options.level.as_str().to_string(),
+        runtime_action_count: runtime_actions,
+        tool_call_count: tool_calls,
+        provider_rounds: 0,
+        total_tokens: usage.total_tokens,
+        real_model_authorized: options.allow_real_model,
+        mission_evidence_refs,
+        reality_evidence_ref_total: reality_context.evidence_ref_total,
+        source_fixture_status: "not_required_deterministic".to_string(),
+        sidecar_fixture_status: "not_required_deterministic".to_string(),
+        db_fixture_status: "not_required_deterministic".to_string(),
+    });
     let mut scenarios = vec![
         json!({
             "capability": "stable_ai_scenario_matrix",
@@ -115,6 +168,12 @@ pub fn run_eval(
             ),
             "notes": "deterministic closure exercises Runtime capability catalog, team template, WorkGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection v2"
         }),
+        json!({
+            "capability": "next_gen_harness_closure",
+            "status": next_gen_harness.status.as_str(),
+            "evidence": format!("{}/{} next-gen closure scenarios passed; missing={}", next_gen_harness.passed, next_gen_harness.total, next_gen_harness.missing_capabilities.len()),
+            "notes": "validates simple fast path, complex strategy, batch tool evidence, team/agent execution, cross-session dispatch, memory/reality governance, and conflict/recovery evidence gates"
+        }),
     ];
     if let Some(complex) = &complex {
         scenarios.push(json!({
@@ -126,33 +185,6 @@ pub fn run_eval(
     }
 
     let total_elapsed_ms = started.elapsed().as_millis();
-    let runtime_actions = 5 + usize::from(complex.is_some());
-    let mut usage = empty_usage("deterministic_smoke");
-    let mut tool_call_log = Vec::new();
-    let mut tool_call_details = Vec::new();
-    let mut real_tool_scenarios = None;
-    if let Some(real_tool) = real_tool {
-        usage = real_tool.usage;
-        tool_call_log = real_tool
-            .tool_details
-            .iter()
-            .map(|detail| detail.summary.clone())
-            .collect();
-        tool_call_details = real_tool
-            .tool_details
-            .iter()
-            .map(|detail| {
-                json!({
-                    "summary": detail.summary,
-                    "input": detail.input,
-                    "output": detail.output,
-                    "error": detail.error,
-                })
-            })
-            .collect();
-        real_tool_scenarios = Some(real_tool.report);
-    }
-    let tool_calls = tool_call_log.len();
     let event_observation_parity = json!({
         "status": if tool_calls == tool_call_details.len() { "passed" } else { "failed" },
         "tool_events": tool_calls,
@@ -173,8 +205,9 @@ pub fn run_eval(
         "kind": "mission_harness.eval_report",
         "level": options.level.as_str(),
         "status": if scenarios.iter().all(|item| item.get("status").and_then(Value::as_str) == Some("passed")) { "passed" } else { "failed" },
-        "provider": options.provider,
-        "budget": options.budget,
+        "provider": options.provider.as_deref(),
+        "budget": options.budget.as_deref(),
+        "authorized_real_model": options.allow_real_model,
         "gateway_process": false,
         "scenario_matrix": stable_ai_scenario_matrix(),
         "stable_ai": stable_ai,
@@ -187,6 +220,7 @@ pub fn run_eval(
         "complex_scenarios": complex,
         "reality_context_eval": reality_context,
         "mission_runtime_collaboration": mission_runtime,
+        "next_gen_harness_closure": next_gen_harness,
         "real_tool_scenarios": real_tool_scenarios,
         "event_observation_parity": event_observation_parity,
         "report_package": {
@@ -207,16 +241,22 @@ pub fn run_eval(
             "runtime_action_log": runtime_action_log
         },
         "tool_call_details": tool_call_details,
+        "evidence_manifest": build_evidence_manifest(&options, requested_at_ms, tool_calls, usage.total_tokens),
         "result_package_dir": null
     });
     let gate = evaluate_report_gate(&report);
     report["report_gate"] = serde_json::to_value(&gate).map_err(|error| error.to_string())?;
     report["status"] = Value::String(gate.status.clone());
     let summary = store.write_report(options.level.as_str(), &mut report, &stable_ai)?;
+    let run_status = if summary.status == "passed" {
+        HarnessEvalRunStatus::Completed
+    } else {
+        HarnessEvalRunStatus::Failed
+    };
     let record = HarnessEvalRunRecord {
         run_id,
         level: summary.level.clone(),
-        status: HarnessEvalRunStatus::Completed.as_str().to_string(),
+        status: run_status.as_str().to_string(),
         requested_at_ms,
         finished_at_ms: Some(now_ms()),
         authorized_real_model: options.allow_real_model,
@@ -240,6 +280,52 @@ struct FullRealToolEval {
     report: RealToolScenarioReport,
     tool_details: Vec<ToolCallDetail>,
     usage: crate::HarnessEvalUsageSummary,
+}
+
+fn build_evidence_manifest(
+    options: &HarnessEvalRunnerOptions,
+    requested_at_ms: u128,
+    tool_calls: usize,
+    total_tokens: u32,
+) -> Value {
+    let repo = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    json!({
+        "kind": "harness_eval.evidence_manifest",
+        "report_id": null,
+        "repo": repo,
+        "commit": commit,
+        "version": env!("CARGO_PKG_VERSION"),
+        "command": format!(
+            "harness-eval {}{}",
+            options.level.as_str(),
+            if options.allow_real_model { " --allow-real-model" } else { "" }
+        ),
+        "requested_at_ms": requested_at_ms,
+        "real_model_authorized": options.allow_real_model,
+        "provider": options.provider.as_deref(),
+        "budget": options.budget.as_deref(),
+        "token_usage": {
+            "total_tokens": total_tokens,
+            "source": if total_tokens > 0 { "provider_or_tool_estimate" } else { "deterministic_contract" }
+        },
+        "tool_calls": tool_calls,
+        "sidecar_fixture_status": "not_required_deterministic",
+        "db_fixture_status": "not_required_deterministic",
+        "source_fixture_status": "not_required_deterministic",
+        "target_repo_dirty_state": "not_checked_by_library_runner",
+        "notes": "manifest is generated by harness-eval runner and finalized with report_id by report store"
+    })
 }
 
 fn evaluate_mission_runtime_collaboration_closure() -> Value {
@@ -726,6 +812,11 @@ mod tests {
             "passed"
         );
         assert_eq!(
+            detail.report["next_gen_harness_closure"]["status"],
+            "passed"
+        );
+        assert_eq!(detail.report["next_gen_harness_closure"]["failed"], 0);
+        assert_eq!(
             detail.report["event_observation_parity"]["status"],
             "passed"
         );
@@ -744,11 +835,31 @@ mod tests {
         assert!(detail
             .artifacts
             .iter()
+            .any(|path| path.ends_with("full-analysis-report-template.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("analysis-context.json")));
+        assert!(detail
+            .artifacts
+            .iter()
             .any(|path| path.ends_with("run-evidence/tool-call-1.json")));
         assert!(detail
             .artifacts
             .iter()
+            .any(|path| path.ends_with("tool-calls/tool-call-1.json")));
+        assert!(detail
+            .artifacts
+            .iter()
             .any(|path| path.ends_with("evidence/reality-context-eval.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/next-gen-harness-closure.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/evidence-manifest.json")));
         assert!(
             detail.report["real_tool_scenarios"]["scenarios"][0]["changed_files"]
                 .as_array()
@@ -776,5 +887,74 @@ mod tests {
         assert!(report["final_result_quality"]["failed_checks"]
             .as_array()
             .is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn next_gen_harness_quick_eval_declares_plan_only_tool_lane() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-harness-eval-nextgen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = HarnessEvalReportStore::new(&root);
+        let record = run_eval(
+            &store,
+            HarnessEvalRunnerOptions {
+                level: HarnessEvalLevel::Quick,
+                provider: None,
+                budget: Some("low".to_string()),
+                allow_real_model: false,
+            },
+        )
+        .expect("run eval");
+        let detail = store
+            .get_report(record.report_id.as_deref().expect("report id"))
+            .expect("detail")
+            .expect("report exists");
+        assert_eq!(
+            detail.report["next_gen_harness_closure"]["status"],
+            "passed"
+        );
+        let tool_batch = detail.report["next_gen_harness_closure"]["scenarios"]
+            .as_array()
+            .expect("scenarios")
+            .iter()
+            .find(|scenario| scenario["scenario_id"] == "tool_batch_efficiency")
+            .expect("tool batch scenario");
+        assert_eq!(tool_batch["claims_tool_validation"], false);
+        assert_eq!(tool_batch["tool_calls"], 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deep_allow_real_without_provider_rounds_records_failed_run() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-harness-eval-deep-{}", uuid::Uuid::new_v4()));
+        let store = HarnessEvalReportStore::new(&root);
+        let record = run_eval(
+            &store,
+            HarnessEvalRunnerOptions {
+                level: HarnessEvalLevel::Deep,
+                provider: Some("configured".to_string()),
+                budget: Some("low".to_string()),
+                allow_real_model: true,
+            },
+        )
+        .expect("run eval");
+
+        assert_eq!(record.status, "failed");
+        let detail = store
+            .get_report(record.report_id.as_deref().expect("report id"))
+            .expect("detail")
+            .expect("report exists");
+        assert_eq!(detail.report["report_gate"]["status"], "failed");
+        assert!(detail.report["report_gate"]["items"]
+            .as_array()
+            .expect("gate items")
+            .iter()
+            .any(
+                |item| item["name"] == "real_model_claim_has_provider_rounds"
+                    && item["status"] == "failed"
+            ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

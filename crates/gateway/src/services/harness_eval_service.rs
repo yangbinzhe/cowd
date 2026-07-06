@@ -98,6 +98,7 @@ impl HarnessEvalService {
             "kind": "harness_eval.scenarios",
             "envelope": self.envelope("scenarios"),
             "scenarios": harness_eval::stable_ai_scenario_matrix(),
+            "next_gen_harness_closure": harness_eval::next_gen_harness_closure_specs(),
         })
     }
 

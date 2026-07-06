@@ -1315,6 +1315,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(scenarios.status(), StatusCode::OK);
+        let scenarios_body = to_bytes(scenarios.into_body(), usize::MAX).await.unwrap();
+        let scenarios_json: serde_json::Value = serde_json::from_slice(&scenarios_body).unwrap();
+        assert!(scenarios_json["next_gen_harness_closure"]
+            .as_array()
+            .is_some_and(|items| items.len() >= 7));
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(report_dir);

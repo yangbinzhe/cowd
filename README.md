@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.454`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.455`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -494,11 +494,13 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `GET /api/harness-eval/reports` | 历史评测报告列表 |
 | `GET /api/harness-eval/reports/latest` | 最新评测健康摘要 |
 | `GET /api/harness-eval/reports/:id` | 单份评测报告详情 |
-| `GET /api/harness-eval/scenarios` | stable AI 场景矩阵 |
+| `GET /api/harness-eval/scenarios` | stable AI 场景矩阵与 next-gen harness closure 场景 |
 | `GET /api/harness-eval/runs` | 评测 run 历史 |
 | `POST /api/harness-eval/runs` | 触发 quick/full deterministic smoke run |
 
 默认 Gateway/WebUI/TUI 只触发无真实 provider token 消耗的 deterministic smoke。deep/real model 路径必须显式授权，防止评测面板误耗 token。
+
+评测报告包会写入 `report.json`、`execution-trace.json`、`analysis-context.json`、`full-analysis-report-template.md`、`full-analysis-report-prompt.md`、`evidence/evidence-manifest.json` 和 `evidence/next-gen-harness-closure.json`。`report_gate` 会检查报告声称与证据是否一致：声称真实模型必须有 provider rounds，声称工具验证必须有工具调用，声称记忆/上下文治理必须有 Reality Context 证据，声称恢复/回放必须有 replay 或 recovery 证据。
 
 常用终端快捷键：
 
@@ -891,13 +893,14 @@ Live provider gates
 - Agent Capability Resolver 已能按 role capability 绑定工具白名单、权限策略和 evidence duties。
 - Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
 - Harness Eval 已新增 `mission_runtime_collaboration_closure`，用于证明能力合同、团队模板、WorkGraph、Agent 能力绑定、跨 session 命令、冲突仲裁和 MissionProjection v2 的闭环。
+- Harness Eval 已新增 `next_gen_harness_closure`，把简单快答、复杂策略选择、批量工具证据、多 Agent 团队执行、跨 session 派发、记忆/现实上下文治理、冲突恢复纳入同一评测门禁，并写入 evidence manifest 防止报告只给表层结论。
 - Gateway 已提供 `session.run_projection`，从持久 `session_events` 聚合 run graph、工具时间线、token/model telemetry、memory/context 证据、team/session 状态和 risk/approval 事件；TUI 启动时会拉取该投影并在 Runtime Activity 面板展示紧凑摘要，WebUI/报告可消费同一事实源。
 - Runtime 已在 provider usage 层接入 `ModelPerformanceRegistry`，能从 `RunModelTelemetry` 聚合首 token 延迟、输出速度、真实/估算 usage、失败率和质量评分，并按 quick/standard/deep/recovery 意图生成 `ModelRouteDecision`；`runtime_capabilities` 已暴露 `model_router`，模型能看到该能力并据此选择快答、深度或恢复策略。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.454`。
+- 版本标签：`v0.9.455`。
 
 ### 11.2 是否达到当前阶段目标
 

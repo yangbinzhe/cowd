@@ -253,6 +253,456 @@ pub struct RealityContextEvalReport {
     pub scenarios: Vec<RealityScenarioEvalResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextGenHarnessScenarioKind {
+    SimpleDirect,
+    ComplexStrategySelection,
+    ToolBatchEfficiency,
+    TeamAgentExecutionOutcome,
+    CrossSessionDispatch,
+    MemoryRealityContextGovernance,
+    ConflictRecovery,
+}
+
+impl NextGenHarnessScenarioKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SimpleDirect => "simple_direct",
+            Self::ComplexStrategySelection => "complex_strategy_selection",
+            Self::ToolBatchEfficiency => "tool_batch_efficiency",
+            Self::TeamAgentExecutionOutcome => "team_agent_execution_outcome",
+            Self::CrossSessionDispatch => "cross_session_dispatch",
+            Self::MemoryRealityContextGovernance => "memory_reality_context_governance",
+            Self::ConflictRecovery => "conflict_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NextGenHarnessScenarioSpec {
+    pub id: String,
+    pub kind: NextGenHarnessScenarioKind,
+    pub title: String,
+    pub objective: String,
+    pub expected_runtime_actions: Vec<String>,
+    pub required_evidence_kinds: Vec<String>,
+    pub min_tool_calls_for_full_eval: usize,
+    pub claims_orchestration: bool,
+    pub claims_memory_context: bool,
+    pub claims_replay: bool,
+    pub claims_external_access: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextGenHarnessEvalInput {
+    pub level: String,
+    pub runtime_action_count: usize,
+    pub tool_call_count: usize,
+    pub provider_rounds: usize,
+    pub total_tokens: u32,
+    pub real_model_authorized: bool,
+    pub mission_evidence_refs: Vec<String>,
+    pub reality_evidence_ref_total: usize,
+    pub source_fixture_status: String,
+    pub sidecar_fixture_status: String,
+    pub db_fixture_status: String,
+}
+
+impl Default for NextGenHarnessEvalInput {
+    fn default() -> Self {
+        Self {
+            level: "quick".to_string(),
+            runtime_action_count: 0,
+            tool_call_count: 0,
+            provider_rounds: 0,
+            total_tokens: 0,
+            real_model_authorized: false,
+            mission_evidence_refs: Vec::new(),
+            reality_evidence_ref_total: 0,
+            source_fixture_status: "not_requested".to_string(),
+            sidecar_fixture_status: "not_requested".to_string(),
+            db_fixture_status: "not_requested".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NextGenHarnessQualityRubric {
+    pub correctness: f32,
+    pub evidence_strength: String,
+    pub efficiency: f32,
+    pub governance: f32,
+    pub passed: bool,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NextGenHarnessScenarioResult {
+    pub scenario_id: String,
+    pub kind: NextGenHarnessScenarioKind,
+    pub status: String,
+    pub objective: String,
+    pub runtime_actions: Vec<String>,
+    pub tool_calls: usize,
+    pub provider_rounds: usize,
+    pub token_usage: Value,
+    pub latency: Value,
+    pub evidence_refs: Vec<String>,
+    pub quality_rubric: NextGenHarnessQualityRubric,
+    pub missing_capabilities: Vec<String>,
+    pub claims_orchestration: bool,
+    pub claims_tool_validation: bool,
+    pub claims_memory_context: bool,
+    pub claims_replay: bool,
+    pub claims_external_access: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NextGenHarnessClosureReport {
+    pub kind: String,
+    pub status: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub level: String,
+    pub scenarios: Vec<NextGenHarnessScenarioResult>,
+    pub missing_capabilities: Vec<String>,
+}
+
+#[must_use]
+pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
+    use NextGenHarnessScenarioKind::{
+        ComplexStrategySelection, ConflictRecovery, CrossSessionDispatch,
+        MemoryRealityContextGovernance, SimpleDirect, TeamAgentExecutionOutcome,
+        ToolBatchEfficiency,
+    };
+    [
+        (
+            "simple_direct",
+            SimpleDirect,
+            "简单问题一次性直接处理",
+            "简单问题应选择 direct answer，不启动团队、工具和复杂恢复链路。",
+            vec!["direct_answer"],
+            vec!["strategy"],
+            0,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "complex_strategy_selection",
+            ComplexStrategySelection,
+            "复杂任务策略选择",
+            "复杂目标应显式选择计划、团队或工作图策略，并留下模型可感知动作证据。",
+            vec!["strategy_decision", "runtime_capability_catalog"],
+            vec!["strategy", "runtime_action"],
+            0,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "tool_batch_efficiency",
+            ToolBatchEfficiency,
+            "幂等工具批量执行",
+            "读文件、搜索、证据收集等幂等工具应支持批量规划与并行执行证据。",
+            vec!["parallel_tool_batch"],
+            vec!["tool_call", "batch_plan"],
+            2,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "team_agent_execution_outcome",
+            TeamAgentExecutionOutcome,
+            "多 Agent 团队执行结果",
+            "复杂问题应能形成团队角色、工作图、进度证据和综合结果。",
+            vec!["team_template", "workgraph", "agent_capability_binding"],
+            vec!["team", "workgraph", "agent"],
+            0,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "cross_session_dispatch",
+            CrossSessionDispatch,
+            "跨 Session 派发与联动",
+            "主 session 应能派发、观察和引用其他 session 的命令与证据。",
+            vec!["session_command", "session_relation"],
+            vec!["session_command", "session_relation"],
+            0,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "memory_reality_context_governance",
+            MemoryRealityContextGovernance,
+            "记忆、知识、事实上下文治理",
+            "召回必须具备 selected/omitted/evidence 证据，避免无关记忆污染上下文。",
+            vec!["context_governance", "recall_report", "context_envelope"],
+            vec!["memory", "knowledge", "fact", "context"],
+            0,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "conflict_recovery",
+            ConflictRecovery,
+            "冲突与恢复闭环",
+            "冲突、失败和恢复必须进入可审计事件链，阻止无证据最终化。",
+            vec!["conflict_arbiter", "recovery_plan"],
+            vec!["conflict", "recovery", "replay"],
+            0,
+            true,
+            false,
+            true,
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            id,
+            kind,
+            title,
+            objective,
+            expected_runtime_actions,
+            required_evidence_kinds,
+            min_tool_calls_for_full_eval,
+            claims_orchestration,
+            claims_memory_context,
+            claims_replay,
+            claims_external_access,
+        )| NextGenHarnessScenarioSpec {
+            id: id.to_string(),
+            kind,
+            title: title.to_string(),
+            objective: objective.to_string(),
+            expected_runtime_actions: expected_runtime_actions
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required_evidence_kinds: required_evidence_kinds
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            min_tool_calls_for_full_eval,
+            claims_orchestration,
+            claims_memory_context,
+            claims_replay,
+            claims_external_access,
+        },
+    )
+    .collect()
+}
+
+#[must_use]
+pub fn evaluate_next_gen_harness_closure(
+    input: NextGenHarnessEvalInput,
+) -> NextGenHarnessClosureReport {
+    let scenarios = next_gen_harness_closure_specs()
+        .into_iter()
+        .map(|spec| evaluate_next_gen_harness_scenario(&spec, &input))
+        .collect::<Vec<_>>();
+    let total = scenarios.len();
+    let passed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status == "passed")
+        .count();
+    let missing_capabilities = scenarios
+        .iter()
+        .flat_map(|scenario| scenario.missing_capabilities.clone())
+        .collect::<Vec<_>>();
+    NextGenHarnessClosureReport {
+        kind: "next_gen_harness_closure".to_string(),
+        status: if missing_capabilities.is_empty() && passed == total {
+            "passed"
+        } else {
+            "failed"
+        }
+        .to_string(),
+        total,
+        passed,
+        failed: total.saturating_sub(passed),
+        level: input.level,
+        scenarios,
+        missing_capabilities,
+    }
+}
+
+fn evaluate_next_gen_harness_scenario(
+    spec: &NextGenHarnessScenarioSpec,
+    input: &NextGenHarnessEvalInput,
+) -> NextGenHarnessScenarioResult {
+    let full_or_deep = input.level != "quick";
+    let claims_tool_validation = full_or_deep
+        && spec.min_tool_calls_for_full_eval > 0
+        && spec.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency;
+    let runtime_ok = !spec.claims_orchestration || input.runtime_action_count >= 3;
+    let tool_ok =
+        !claims_tool_validation || input.tool_call_count >= spec.min_tool_calls_for_full_eval;
+    let memory_ok = !spec.claims_memory_context || input.reality_evidence_ref_total > 0;
+    let evidence_refs = next_gen_evidence_refs(spec, input);
+    let evidence_ok = !evidence_refs.is_empty();
+    let replay_ok = !spec.claims_replay
+        || evidence_refs.iter().any(|item| {
+            item.contains("session-relation")
+                || item.contains("conflict")
+                || item.contains("recovery")
+        });
+    let external_ok = !spec.claims_external_access
+        || input.sidecar_fixture_status == "connected"
+        || input.source_fixture_status == "connected"
+        || input.db_fixture_status == "connected";
+
+    let mut missing = Vec::new();
+    if !runtime_ok {
+        missing.push(format!("{}.runtime_action_evidence", spec.id));
+    }
+    if !tool_ok {
+        missing.push(format!("{}.tool_batch_execution", spec.id));
+    }
+    if !memory_ok {
+        missing.push(format!("{}.memory_context_evidence", spec.id));
+    }
+    if !evidence_ok {
+        missing.push(format!("{}.evidence_refs", spec.id));
+    }
+    if !replay_ok {
+        missing.push(format!("{}.replay_or_recovery_evidence", spec.id));
+    }
+    if !external_ok {
+        missing.push(format!("{}.external_access_health", spec.id));
+    }
+
+    let passed = missing.is_empty();
+    let evidence_strength = if claims_tool_validation {
+        "strong"
+    } else if input.level == "quick" {
+        "medium"
+    } else {
+        "strong"
+    };
+    NextGenHarnessScenarioResult {
+        scenario_id: spec.id.clone(),
+        kind: spec.kind,
+        status: if passed { "passed" } else { "failed" }.to_string(),
+        objective: spec.objective.clone(),
+        runtime_actions: spec.expected_runtime_actions.clone(),
+        tool_calls: if spec.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency {
+            input.tool_call_count
+        } else {
+            0
+        },
+        provider_rounds: input.provider_rounds,
+        token_usage: json!({
+            "total_tokens": input.total_tokens,
+            "usage_source": if input.total_tokens > 0 { "provider_or_tool_estimate" } else { "deterministic_contract" }
+        }),
+        latency: json!({
+            "elapsed_ms": 5 + spec.expected_runtime_actions.len() as u64 * 3,
+            "source": "deterministic_eval_clock"
+        }),
+        evidence_refs,
+        quality_rubric: NextGenHarnessQualityRubric {
+            correctness: if passed { 1.0 } else { 0.0 },
+            evidence_strength: evidence_strength.to_string(),
+            efficiency: if spec.kind == NextGenHarnessScenarioKind::SimpleDirect {
+                1.0
+            } else if claims_tool_validation && input.tool_call_count >= 2 {
+                0.95
+            } else {
+                0.85
+            },
+            governance: if spec.claims_memory_context || spec.claims_replay {
+                1.0
+            } else {
+                0.9
+            },
+            passed,
+            rationale: if passed {
+                "required runtime action, evidence refs, and level-scoped proof are present"
+                    .to_string()
+            } else {
+                format!("missing {}", missing.join(", "))
+            },
+        },
+        missing_capabilities: missing,
+        claims_orchestration: spec.claims_orchestration,
+        claims_tool_validation,
+        claims_memory_context: spec.claims_memory_context,
+        claims_replay: spec.claims_replay,
+        claims_external_access: spec.claims_external_access,
+    }
+}
+
+fn next_gen_evidence_refs(
+    spec: &NextGenHarnessScenarioSpec,
+    input: &NextGenHarnessEvalInput,
+) -> Vec<String> {
+    match spec.kind {
+        NextGenHarnessScenarioKind::SimpleDirect => {
+            vec!["strategy:direct_answer:no_over_orchestration".to_string()]
+        }
+        NextGenHarnessScenarioKind::ComplexStrategySelection => {
+            vec!["runtime-capability:use_team_template".to_string()]
+        }
+        NextGenHarnessScenarioKind::ToolBatchEfficiency => {
+            if input.level == "quick" {
+                vec!["tool-batch:contract-plan-only".to_string()]
+            } else {
+                (0..input.tool_call_count.max(1))
+                    .map(|index| format!("tool-call:{}", index + 1))
+                    .collect()
+            }
+        }
+        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => input
+            .mission_evidence_refs
+            .iter()
+            .filter(|item| item.contains("team") || item.contains("workgraph"))
+            .cloned()
+            .collect(),
+        NextGenHarnessScenarioKind::CrossSessionDispatch => input
+            .mission_evidence_refs
+            .iter()
+            .filter(|item| item.contains("session-command") || item.contains("session-relation"))
+            .cloned()
+            .collect(),
+        NextGenHarnessScenarioKind::MemoryRealityContextGovernance => {
+            if input.reality_evidence_ref_total > 0 {
+                vec![format!(
+                    "reality-context:evidence_refs:{}",
+                    input.reality_evidence_ref_total
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+        NextGenHarnessScenarioKind::ConflictRecovery => {
+            let mut refs = input
+                .mission_evidence_refs
+                .iter()
+                .filter(|item| item.contains("session-relation"))
+                .cloned()
+                .collect::<Vec<_>>();
+            refs.push("recovery:runtime-event-replay:candidates".to_string());
+            refs
+        }
+    }
+}
+
 #[must_use]
 pub fn reality_context_eval_specs() -> Vec<RealityScenarioEvalSpec> {
     vec![
@@ -2429,6 +2879,172 @@ mod tests {
                 .any(|item| item.name == "token_usage_nonzero_or_estimated"
                     && item.status == "failed")
         );
+    }
+
+    #[test]
+    fn next_gen_harness_closure_covers_terminal_capabilities() {
+        let report = evaluate_next_gen_harness_closure(NextGenHarnessEvalInput {
+            level: "full".to_string(),
+            runtime_action_count: 6,
+            tool_call_count: 3,
+            provider_rounds: 0,
+            total_tokens: 512,
+            real_model_authorized: false,
+            mission_evidence_refs: vec![
+                "team:demo".to_string(),
+                "workgraph:demo".to_string(),
+                "session-command:demo".to_string(),
+                "session-relation:demo".to_string(),
+            ],
+            reality_evidence_ref_total: 12,
+            source_fixture_status: "not_required_deterministic".to_string(),
+            sidecar_fixture_status: "not_required_deterministic".to_string(),
+            db_fixture_status: "not_required_deterministic".to_string(),
+        });
+
+        assert_eq!(report.status, "passed");
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.scenarios.len(), 7);
+        assert!(report.scenarios.iter().any(|scenario| {
+            scenario.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency
+                && scenario.claims_tool_validation
+                && scenario.tool_calls == 3
+        }));
+        assert!(report.scenarios.iter().any(|scenario| {
+            scenario.kind == NextGenHarnessScenarioKind::MemoryRealityContextGovernance
+                && scenario.claims_memory_context
+                && !scenario.evidence_refs.is_empty()
+        }));
+    }
+
+    #[test]
+    fn report_gate_rejects_claimed_tool_validation_without_tool_evidence() {
+        let report = serde_json::json!({
+            "level": "full",
+            "authorized_real_model": false,
+            "scenarios": [
+                {"capability": "stable_ai_scenario_matrix", "status": "passed"},
+                {"capability": "harness_capability_coverage", "status": "passed"},
+                {"capability": "knowledge_fabric_context_governance", "status": "passed"},
+                {"capability": "reality_context_eval", "status": "passed"},
+                {"capability": "mission_runtime_collaboration_closure", "status": "passed"},
+                {"capability": "next_gen_harness_closure", "status": "passed"}
+            ],
+            "complex_scenarios": {"failed": 0, "average_score": 1.0},
+            "real_tool_scenarios": {"tool_calls": 0},
+            "event_observation_parity": {"status": "passed"},
+            "reality_context_eval": {"failed": 0, "evidence_ref_total": 1},
+            "mission_runtime_collaboration": {
+                "status": "passed",
+                "mission_projection": {"schema_version": 2}
+            },
+            "next_gen_harness_closure": {
+                "status": "passed",
+                "failed": 0,
+                "scenarios": [{
+                    "scenario_id": "tool_batch_efficiency",
+                    "claims_tool_validation": true,
+                    "claims_orchestration": true,
+                    "claims_memory_context": false,
+                    "claims_replay": false,
+                    "claims_external_access": false,
+                    "evidence_refs": ["tool-batch:claimed"]
+                }]
+            },
+            "report_package": {
+                "status": "written",
+                "required_dirs": ["requests", "responses", "events", "run-evidence", "provider-rounds", "tool-calls", "model-speed", "quality-rubric", "evidence"]
+            },
+            "evidence_manifest": {
+                "kind": "harness_eval.evidence_manifest",
+                "repo": ".",
+                "commit": "test",
+                "version": "test",
+                "command": "harness-eval full",
+                "source_fixture_status": "not_required_deterministic",
+                "sidecar_fixture_status": "not_required_deterministic",
+                "db_fixture_status": "not_required_deterministic"
+            },
+            "execution_trace": {
+                "provider_rounds": 0,
+                "runtime_actions": 5,
+                "tool_calls": 0,
+                "tool_call_log": [],
+                "total_usage": {"total_tokens": 128, "usage_source": "deterministic_tool_estimate"}
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+
+        assert_eq!(gate.status, "failed");
+        assert!(gate.items.iter().any(|item| {
+            item.name == "claimed_tool_validation_has_tool_evidence" && item.status == "failed"
+        }));
+    }
+
+    #[test]
+    fn report_gate_rejects_real_model_claim_without_provider_rounds() {
+        let report = serde_json::json!({
+            "level": "deep",
+            "authorized_real_model": true,
+            "scenarios": [
+                {"capability": "stable_ai_scenario_matrix", "status": "passed"},
+                {"capability": "harness_capability_coverage", "status": "passed"},
+                {"capability": "knowledge_fabric_context_governance", "status": "passed"},
+                {"capability": "reality_context_eval", "status": "passed"},
+                {"capability": "mission_runtime_collaboration_closure", "status": "passed"},
+                {"capability": "next_gen_harness_closure", "status": "passed"}
+            ],
+            "complex_scenarios": {"failed": 0, "average_score": 1.0},
+            "real_tool_scenarios": {"tool_calls": 1},
+            "event_observation_parity": {"status": "passed"},
+            "reality_context_eval": {"failed": 0, "evidence_ref_total": 1},
+            "mission_runtime_collaboration": {
+                "status": "passed",
+                "mission_projection": {"schema_version": 2}
+            },
+            "next_gen_harness_closure": {
+                "status": "passed",
+                "failed": 0,
+                "scenarios": [{
+                    "scenario_id": "simple_direct",
+                    "claims_tool_validation": false,
+                    "claims_orchestration": false,
+                    "claims_memory_context": false,
+                    "claims_replay": false,
+                    "claims_external_access": false,
+                    "evidence_refs": ["strategy:direct"]
+                }]
+            },
+            "report_package": {
+                "status": "written",
+                "required_dirs": ["requests", "responses", "events", "run-evidence", "provider-rounds", "tool-calls", "model-speed", "quality-rubric", "evidence"]
+            },
+            "evidence_manifest": {
+                "kind": "harness_eval.evidence_manifest",
+                "repo": ".",
+                "commit": "test",
+                "version": "test",
+                "command": "harness-eval deep --allow-real-model",
+                "source_fixture_status": "not_required_deterministic",
+                "sidecar_fixture_status": "not_required_deterministic",
+                "db_fixture_status": "not_required_deterministic"
+            },
+            "execution_trace": {
+                "provider_rounds": 0,
+                "runtime_actions": 5,
+                "tool_calls": 1,
+                "tool_call_log": [{}],
+                "total_usage": {"total_tokens": 128, "usage_source": "provider_event"}
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+
+        assert_eq!(gate.status, "failed");
+        assert!(gate.items.iter().any(|item| {
+            item.name == "real_model_claim_has_provider_rounds" && item.status == "failed"
+        }));
     }
 
     #[test]

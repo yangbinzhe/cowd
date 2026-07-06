@@ -233,8 +233,31 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     let mission_runtime = report
         .get("mission_runtime_collaboration")
         .unwrap_or(&Value::Null);
+    let next_gen = report
+        .get("next_gen_harness_closure")
+        .unwrap_or(&Value::Null);
+    let next_gen_scenarios = next_gen
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let evidence_manifest = report.get("evidence_manifest").unwrap_or(&Value::Null);
     let package = report.get("report_package").unwrap_or(&Value::Null);
     let is_quick = level == "quick";
+    let claims_tool_validation = next_gen_claims(&next_gen_scenarios, "claims_tool_validation");
+    let claims_orchestration = next_gen_claims(&next_gen_scenarios, "claims_orchestration");
+    let claims_memory_context = next_gen_claims(&next_gen_scenarios, "claims_memory_context");
+    let claims_replay = next_gen_claims(&next_gen_scenarios, "claims_replay");
+    let claims_external_access = next_gen_claims(&next_gen_scenarios, "claims_external_access");
+    let real_model_claimed = report
+        .get("authorized_real_model")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || report
+            .get("stable_ai")
+            .and_then(|value| value.get("real_provider_enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
     let mut items = Vec::new();
     items.push(HarnessEvalReportGateItem::new(
@@ -318,6 +341,146 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ),
         "repair mission runtime collaboration closure before accepting the report",
     ));
+    items.push(HarnessEvalReportGateItem::new(
+        "next_gen_harness_closure_complete",
+        scenario_status(&scenarios, "next_gen_harness_closure") == Some("passed")
+            && next_gen.get("status").and_then(Value::as_str) == Some("passed")
+            && next_gen
+                .get("failed")
+                .and_then(Value::as_u64)
+                .is_some_and(|failed| failed == 0)
+            && next_gen_scenarios.len() >= 7,
+        true,
+        format!(
+            "status={}, scenarios={}, failed={}",
+            next_gen
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            next_gen_scenarios.len(),
+            next_gen
+                .get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ),
+        "run the next_gen_harness_closure suite and keep all terminal scenarios evidenced",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_orchestration_has_runtime_actions",
+        !claims_orchestration || runtime_actions >= 3,
+        true,
+        format!("claims_orchestration={claims_orchestration}, runtime_actions={runtime_actions}"),
+        "reports that claim orchestration must include runtime action trace evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_tool_validation_has_tool_evidence",
+        !claims_tool_validation || tool_calls > 0,
+        true,
+        format!("claims_tool_validation={claims_tool_validation}, tool_calls={tool_calls}"),
+        "reports that claim tool validation must include real local tool execution evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_memory_context_has_context_report",
+        !claims_memory_context
+            || (reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+                && next_gen_evidence_refs_total(&next_gen_scenarios) > 0),
+        true,
+        format!(
+            "claims_memory_context={}, reality_evidence_refs={}, next_gen_refs={}",
+            claims_memory_context,
+            reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            next_gen_evidence_refs_total(&next_gen_scenarios)
+        ),
+        "memory/context claims must include RecallReport/ContextEnvelope evidence refs",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_replay_has_evidence_refs",
+        !claims_replay || next_gen_claimed_evidence_refs(&next_gen_scenarios, "claims_replay") > 0,
+        true,
+        format!(
+            "claims_replay={}, replay_refs={}",
+            claims_replay,
+            next_gen_claimed_evidence_refs(&next_gen_scenarios, "claims_replay")
+        ),
+        "replay/recovery claims must include replay, conflict, or recovery evidence refs",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_external_access_has_health_evidence",
+        !claims_external_access || manifest_has_external_health(evidence_manifest),
+        true,
+        format!(
+            "claims_external_access={}, source={}, sidecar={}, db={}",
+            claims_external_access,
+            evidence_manifest
+                .get("source_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("sidecar_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("db_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ),
+        "external source/sidecar claims must include explicit connected or healthy fixture evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "real_model_claim_has_provider_rounds",
+        !real_model_claimed || runtime_provider_rounds(trace) > 0,
+        true,
+        format!(
+            "real_model_claimed={}, provider_rounds={}",
+            real_model_claimed,
+            runtime_provider_rounds(trace)
+        ),
+        "deep/real reports may not claim real model evidence with zero provider rounds",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "evidence_manifest_complete",
+        evidence_manifest.get("kind").and_then(Value::as_str)
+            == Some("harness_eval.evidence_manifest")
+            && evidence_manifest
+                .get("repo")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("commit")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+        true,
+        format!(
+            "repo={}, commit={}, version={}",
+            evidence_manifest
+                .get("repo")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("commit")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ),
+        "write a complete evidence manifest before accepting the report package",
+    ));
 
     if is_quick {
         items.push(HarnessEvalReportGateItem::new(
@@ -398,6 +561,67 @@ fn scenario_status<'a>(scenarios: &'a [Value], capability: &str) -> Option<&'a s
         .find(|item| item.get("capability").and_then(Value::as_str) == Some(capability))
         .and_then(|item| item.get("status"))
         .and_then(Value::as_str)
+}
+
+fn next_gen_claims(scenarios: &[Value], field: &str) -> bool {
+    scenarios.iter().any(|scenario| {
+        scenario
+            .get(field)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+fn next_gen_evidence_refs_total(scenarios: &[Value]) -> u64 {
+    scenarios
+        .iter()
+        .map(|scenario| {
+            scenario
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64
+        })
+        .sum()
+}
+
+fn next_gen_claimed_evidence_refs(scenarios: &[Value], claim_field: &str) -> u64 {
+    scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario
+                .get(claim_field)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|scenario| {
+            scenario
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64
+        })
+        .sum()
+}
+
+fn manifest_has_external_health(manifest: &Value) -> bool {
+    [
+        "source_fixture_status",
+        "sidecar_fixture_status",
+        "db_fixture_status",
+    ]
+    .iter()
+    .any(|key| {
+        manifest
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "connected" | "healthy" | "passed"))
+    })
+}
+
+fn runtime_provider_rounds(trace: &Value) -> u64 {
+    trace
+        .get("provider_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize)]
