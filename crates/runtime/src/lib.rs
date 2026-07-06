@@ -368,15 +368,15 @@ pub use evidence_planner::{
     evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
 };
 pub use execution_core::{
-    build_runtime_execution_decision, execution_mode_catalog_response, rewoo_plan_for_intent,
-    runtime_execution_guidance_prompt, runtime_orchestration_action_guidance,
-    runtime_orchestration_actions, tool_dag_from_rewoo, DeliberationMode, DeliberationPlan,
-    ExecutionModeCatalog, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
-    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
-    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionBinding,
-    RuntimeExecutionDecision, RuntimeExecutionModeCandidate, RuntimeExecutionModeSpec,
-    RuntimeExecutionReportSpec, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
-    ToolDagTask,
+    build_runtime_action_selection_report, build_runtime_execution_decision,
+    execution_mode_catalog_response, rewoo_plan_for_intent, runtime_execution_guidance_prompt,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+    DeliberationMode, DeliberationPlan, ExecutionModeCatalog, ReflexionRecord, ReflexionTrigger,
+    RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep, RewooObservation,
+    RewooSolverContract, RuntimeActionSelectionReport, RuntimeEvidenceSummary,
+    RuntimeExecutionActionHint, RuntimeExecutionBinding, RuntimeExecutionDecision,
+    RuntimeExecutionModeCandidate, RuntimeExecutionModeSpec, RuntimeExecutionReportSpec,
+    ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary, ToolDagTask,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -457,8 +457,8 @@ pub use mutation_plan::{
 };
 pub use orchestration::{
     handle_runtime_orchestration_request, plan_runtime_collaboration_decision,
-    runtime_orchestration_response, RuntimeOrchestrationAction, RuntimeOrchestrationDecision,
-    RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
+    runtime_orchestration_response, RuntimeOrchestrationAction, RuntimeOrchestrationConstraints,
+    RuntimeOrchestrationDecision, RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,

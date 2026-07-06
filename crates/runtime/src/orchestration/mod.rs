@@ -11,7 +11,9 @@ use serde_json::{json, Value};
 use crate::{global_mission_evidence_bus, MissionEvidenceRef};
 
 pub use planner::{plan_runtime_collaboration_decision, RuntimeOrchestrationPlan};
-pub use request::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
+pub use request::{
+    RuntimeOrchestrationAction, RuntimeOrchestrationConstraints, RuntimeOrchestrationRequest,
+};
 pub use result::{RuntimeOrchestrationDecision, RuntimeOrchestrationResult};
 
 #[must_use]

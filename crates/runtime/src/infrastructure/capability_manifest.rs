@@ -10,8 +10,9 @@ use crate::collaboration_template::CollaborationTemplateCatalog;
 use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::{plan_evidence, EvidencePlan};
 use crate::execution_core::{
-    build_runtime_execution_decision, execution_mode_catalog_response, rewoo_plan_for_intent,
-    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+    build_runtime_action_selection_report, build_runtime_execution_decision,
+    execution_mode_catalog_response, rewoo_plan_for_intent, runtime_orchestration_action_guidance,
+    runtime_orchestration_actions, tool_dag_from_rewoo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +422,8 @@ pub fn runtime_capabilities_response_with_detail(
     let evidence_plan: EvidencePlan = plan_evidence(intent);
     let execution_decision =
         build_runtime_execution_decision(intent, profile.and_then(parse_context_profile));
+    let action_selection =
+        build_runtime_action_selection_report(intent, profile.and_then(parse_context_profile));
     let rewoo_plan = rewoo_plan_for_intent(intent);
     let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
     let detail_value = detail.unwrap_or("summary");
@@ -436,6 +439,7 @@ pub fn runtime_capabilities_response_with_detail(
         "detail": detail_value,
         "evidence_plan": evidence_plan,
         "execution_decision": execution_decision,
+        "action_selection": action_selection,
         "backend_capabilities": backend_capabilities,
         "runtime_orchestrate": {
             "available": true,
@@ -443,7 +447,8 @@ pub fn runtime_capabilities_response_with_detail(
             "side_effects": ["mission_evidence", "team_runtime", "session_command", "approval_orchestration"],
             "actions": runtime_orchestration_actions(),
             "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
-            "recommendation": execution_decision.recommended_actions
+            "recommendation": execution_decision.recommended_actions,
+            "action_selection": action_selection
         },
         "action_plane": action_plane,
         "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
@@ -559,10 +564,12 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
         }),
         "orchestration_options" => json!({
             "decision": build_runtime_execution_decision(intent, None),
+            "action_selection": build_runtime_action_selection_report(intent, None),
             "execution_modes": execution_mode_catalog_response(),
             "collaboration_templates": templates,
             "runtime_action_contract": catalog.action_contracts,
         }),
+        "action_selection" => json!(build_runtime_action_selection_report(intent, None)),
         "capability_catalog" => json!(catalog),
         "runtime_action_contract" => json!({
             "contracts": catalog.action_contracts,

@@ -545,36 +545,12 @@ impl MissionService {
         session_id: &str,
         request: StartMissionTeamRuntimeHttpRequest,
     ) -> Result<serde_json::Value, String> {
-        if runtime::global_mission_runtime()
-            .get_session(session_id)
-            .is_none()
-        {
-            return Err(format!("mission session not found: {session_id}"));
-        }
-        if request.objective.trim().is_empty() {
-            return Err("team objective must not be empty".to_string());
-        }
-        let decision = runtime::plan_runtime_collaboration_decision(&request.objective);
-        let team = runtime::global_team_runtime_service().start_with_agent_spawner(
-            runtime::StartTeamRuntimeRequest {
-                session_id: session_id.to_string(),
-                objective: request.objective.clone(),
-                collaboration_decision: decision,
-            },
-            |agent_request| {
-                spawn_lifecycle_agent_for_team(
-                    &agent_request,
-                    request.model.as_deref(),
-                    request.execution_mode,
-                )
-            },
+        let team = start_team_runtime_with_spawner(
+            session_id,
+            request.objective.clone(),
+            request.model.as_deref(),
+            request.execution_mode,
         )?;
-        runtime::global_mission_runtime().attach_team(session_id, team.team_id.clone())?;
-        for agent in &team.agents {
-            if let Some(agent_id) = &agent.agent_id {
-                runtime::global_mission_runtime().attach_agent(session_id, agent_id.clone())?;
-            }
-        }
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
@@ -880,6 +856,39 @@ impl MissionService {
             "mission": runtime::global_mission_runtime().projection(),
         }))
     }
+}
+
+pub(crate) fn start_team_runtime_with_spawner(
+    session_id: &str,
+    objective: String,
+    model: Option<&str>,
+    execution_mode: MissionTeamExecutionMode,
+) -> Result<runtime::TeamRuntimeSnapshot, String> {
+    if runtime::global_mission_runtime()
+        .get_session(session_id)
+        .is_none()
+    {
+        return Err(format!("mission session not found: {session_id}"));
+    }
+    if objective.trim().is_empty() {
+        return Err("team objective must not be empty".to_string());
+    }
+    let decision = runtime::plan_runtime_collaboration_decision(&objective);
+    let team = runtime::global_team_runtime_service().start_with_agent_spawner(
+        runtime::StartTeamRuntimeRequest {
+            session_id: session_id.to_string(),
+            objective,
+            collaboration_decision: decision,
+        },
+        |agent_request| spawn_lifecycle_agent_for_team(&agent_request, model, execution_mode),
+    )?;
+    runtime::global_mission_runtime().attach_team(session_id, team.team_id.clone())?;
+    for agent in &team.agents {
+        if let Some(agent_id) = &agent.agent_id {
+            runtime::global_mission_runtime().attach_agent(session_id, agent_id.clone())?;
+        }
+    }
+    Ok(team)
 }
 
 fn current_time_ms() -> u64 {

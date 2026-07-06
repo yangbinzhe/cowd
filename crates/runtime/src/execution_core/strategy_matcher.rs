@@ -38,6 +38,20 @@ pub struct RuntimeExecutionActionHint {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeActionSelectionReport {
+    pub intent_preview: String,
+    pub profile: Option<ContextProfile>,
+    pub selected_action: String,
+    pub fallback_action: String,
+    pub recommended_mode: ExecutionMode,
+    pub recommended_template: Option<CollaborationTemplateId>,
+    pub expected_projection: Vec<String>,
+    pub stateful: bool,
+    pub reason: String,
+    pub confidence: f32,
+}
+
 #[must_use]
 pub fn build_runtime_execution_decision(
     user_input: &str,
@@ -89,6 +103,72 @@ pub fn build_runtime_execution_decision(
             .into_iter()
             .chain(recommended_spec.map(|spec| spec.summary.clone()))
             .collect(),
+    }
+}
+
+#[must_use]
+pub fn build_runtime_action_selection_report(
+    user_input: &str,
+    context_profile: Option<ContextProfile>,
+) -> RuntimeActionSelectionReport {
+    let decision = build_runtime_execution_decision(user_input, context_profile);
+    let selected = decision
+        .recommended_actions
+        .first()
+        .cloned()
+        .unwrap_or_else(|| RuntimeExecutionActionHint {
+            action: "plan_only".to_string(),
+            template_hint: decision
+                .recommended_template
+                .map(|template| template.as_str().to_string()),
+            reason: "direct answer or light plan is sufficient".to_string(),
+        });
+    let stateful = selected.action != "plan_only";
+    RuntimeActionSelectionReport {
+        intent_preview: user_input.chars().take(180).collect(),
+        profile: context_profile,
+        selected_action: selected.action.clone(),
+        fallback_action: fallback_action_for(&selected.action).to_string(),
+        recommended_mode: decision.recommended_mode,
+        recommended_template: decision.recommended_template,
+        expected_projection: expected_projection_for(&selected.action)
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect(),
+        stateful,
+        reason: selected.reason,
+        confidence: decision.confidence,
+    }
+}
+
+fn fallback_action_for(action: &str) -> &'static str {
+    match action {
+        "request_team" => "request_parallel_tools",
+        "request_parallel_tools" | "request_rewoo_evidence" => "plan_only",
+        "request_deliberation" => "plan_only",
+        "request_reflexion_retry" => "plan_only",
+        "request_risk_gate" => "plan_only",
+        _ => "plan_only",
+    }
+}
+
+fn expected_projection_for(action: &str) -> &'static [&'static str] {
+    match action {
+        "request_team" => &[
+            "mission.team_projection",
+            "mission.agent_projection",
+            "mission.workgraph_projection",
+            "mission.evidence_projection",
+        ],
+        "request_parallel_tools" | "request_rewoo_evidence" => &[
+            "runtime.tool_dag",
+            "runtime.tool_schedule",
+            "runtime.evidence_refs",
+        ],
+        "request_deliberation" => &["runtime.deliberation_plan", "mission.evidence_projection"],
+        "request_reflexion_retry" => &["runtime.reflexion_record", "runtime.supervisor_event"],
+        "request_risk_gate" => &["mission.conflict_projection", "mission.approval_projection"],
+        _ => &["runtime.execution_decision"],
     }
 }
 
@@ -172,5 +252,19 @@ mod tests {
                 | ExecutionMode::PlanExecute
         ));
         assert!(!decision.recommended_actions.is_empty());
+    }
+
+    #[test]
+    fn action_selection_report_exposes_stateful_runtime_choice() {
+        let report = build_runtime_action_selection_report(
+            "复杂架构重构需要多 Agent 协同、审查和回归",
+            Some(ContextProfile::DeepInvestigation),
+        );
+
+        assert!(matches!(
+            report.selected_action.as_str(),
+            "request_team" | "request_parallel_tools" | "request_rewoo_evidence"
+        ));
+        assert!(!report.expected_projection.is_empty());
     }
 }

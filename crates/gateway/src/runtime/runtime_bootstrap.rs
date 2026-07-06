@@ -365,7 +365,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "budget_controls", "policy_gates"]
+                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "action_selection", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],

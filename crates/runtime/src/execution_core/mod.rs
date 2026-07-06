@@ -33,7 +33,8 @@ pub use rewoo_plan::{
     RewooObservation, RewooSolverContract,
 };
 pub use strategy_matcher::{
-    build_runtime_execution_decision, RuntimeExecutionActionHint, RuntimeExecutionDecision,
+    build_runtime_action_selection_report, build_runtime_execution_decision,
+    RuntimeActionSelectionReport, RuntimeExecutionActionHint, RuntimeExecutionDecision,
     RuntimeExecutionModeCandidate,
 };
 pub use tool_dag::{
