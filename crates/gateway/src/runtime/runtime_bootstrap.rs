@@ -365,7 +365,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "budget_controls", "policy_gates"]
+                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],
@@ -376,7 +376,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled runtime orchestration request. Use plan_only first for complex work; runtime validates policy, risk, budget, and permissions before execution.".to_string(),
+                "Submit a controlled stateful runtime orchestration request. Use runtime_capabilities for read-only planning; runtime validates policy, risk, budget, and permissions before execution.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -421,7 +421,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["intent"],
                 "additionalProperties": false
             }),
-            required_permission: ToolPermissionMode::ReadOnly,
+            required_permission: ToolPermissionMode::WorkspaceWrite,
         },
     ]
 }

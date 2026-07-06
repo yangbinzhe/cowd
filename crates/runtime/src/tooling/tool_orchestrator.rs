@@ -97,7 +97,6 @@ impl ToolSafetyCategory {
             | "ask_user_question"
             | "tool_search"
             | "runtime_capabilities"
-            | "runtime_orchestrate"
             | "list_mcp_resources"
             | "read_mcp_resource" => Self::ReadOnly,
 
@@ -117,11 +116,34 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash" | "powershell" | "repl" | "mcp" | "mcp_auth" | "remote_trigger" | "agent"
-            | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
-            | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
-            | "team_delete" | "cron_create" | "cron_delete" | "config" | "notebook_edit"
-            | "structured_output" | "execute_code" | "rm" | "kill" | "sudo" | "truncate"
+            "bash"
+            | "powershell"
+            | "repl"
+            | "mcp"
+            | "mcp_auth"
+            | "remote_trigger"
+            | "agent"
+            | "runtime_orchestrate"
+            | "task_create"
+            | "run_task_packet"
+            | "task_stop"
+            | "task_update"
+            | "worker_create"
+            | "worker_send_prompt"
+            | "worker_restart"
+            | "worker_terminate"
+            | "team_create"
+            | "team_delete"
+            | "cron_create"
+            | "cron_delete"
+            | "config"
+            | "notebook_edit"
+            | "structured_output"
+            | "execute_code"
+            | "rm"
+            | "kill"
+            | "sudo"
+            | "truncate"
             | "drop" => Self::Destructive,
 
             // Default: treat unknown tools as WriteLocal (conservative)
@@ -714,6 +736,7 @@ mod tests {
             "WorkerCreate",
             "WorkerSendPrompt",
             "TeamCreate",
+            "RuntimeOrchestrate",
             "MCP",
             "McpAuth",
             "REPL",
@@ -863,19 +886,31 @@ mod tests {
     }
 
     #[test]
-    fn runtime_capabilities_is_readonly_runtime_query() {
+    fn runtime_capabilities_is_readonly_and_orchestrate_is_stateful_runtime_entry() {
         let direct = ToolSafetyCategory::from_tool_name("runtime_capabilities");
         let alias = ToolSafetyCategory::from_tool_name("RuntimeCapabilities");
+        let orchestrate = ToolSafetyCategory::from_tool_name("RuntimeOrchestrate");
         let registry = ToolSafetyRegistry::builtin();
         let profile = tool_execution_profile("runtime_capabilities");
+        let orchestrate_profile = tool_execution_profile("runtime_orchestrate");
 
         assert_eq!(direct, ToolSafetyCategory::ReadOnly);
         assert_eq!(alias, ToolSafetyCategory::ReadOnly);
+        assert_eq!(orchestrate, ToolSafetyCategory::Destructive);
         assert_eq!(
             registry.classify("runtime_capabilities"),
             ToolSafetyCategory::ReadOnly
         );
+        assert_eq!(
+            registry.classify("runtime_orchestrate"),
+            ToolSafetyCategory::Destructive
+        );
         assert_eq!(profile.safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            orchestrate_profile.safety_category,
+            ToolSafetyCategory::Destructive
+        );
         assert_eq!(profile.max_concurrency, usize::MAX);
+        assert_eq!(orchestrate_profile.max_concurrency, 1);
     }
 }

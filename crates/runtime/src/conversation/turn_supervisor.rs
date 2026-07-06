@@ -430,7 +430,7 @@ fn nudge_prompt() -> String {
 }
 
 fn replan_prompt() -> String {
-    "Runtime supervisor: repeated evidence gathering is no longer efficient. Stop range-by-range probing and re-plan. Choose one: call `runtime_orchestrate(request_parallel_tools)` for batch/DAG evidence, call `runtime_orchestrate(plan_only)` for a runtime plan, request runtime-owned subagent/team collaboration for independent analysis, or answer from current evidence with explicit residual risks.".to_string()
+    "Runtime supervisor: repeated evidence gathering is no longer efficient. Stop range-by-range probing and re-plan. Choose one: call `runtime_capabilities(detail=orchestration_options)` for a read-only plan, call `runtime_orchestrate(request_parallel_tools)` for stateful batch/DAG execution, request runtime-owned subagent/team collaboration for independent analysis, or answer from current evidence with explicit residual risks.".to_string()
 }
 
 fn fallback_prompt() -> String {

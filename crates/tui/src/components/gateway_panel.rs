@@ -680,6 +680,25 @@ impl Component for GatewayPanel {
                         }),
                     ),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Graphs/Conflicts: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} / {}", mission.workgraph_count, mission.conflict_count),
+                        Style::default().fg(if mission.conflict_count > 0 {
+                            Color::Red
+                        } else {
+                            Color::Cyan
+                        }),
+                    ),
+                    Span::styled("  Evidence/Actions: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} / {}",
+                            mission.evidence_count, mission.capability_action_count
+                        ),
+                        Style::default().fg(Color::Blue),
+                    ),
+                ]));
                 if let Some(active) = mission.active_session_id.as_ref() {
                     lines.push(Line::from(vec![
                         Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
@@ -1796,6 +1815,10 @@ mod tests {
             agent_count: 2,
             pending_approvals: 3,
             relation_count: 4,
+            workgraph_count: 2,
+            conflict_count: 1,
+            evidence_count: 5,
+            capability_action_count: 7,
             event_count: 5,
             command_pending: 2,
             command_claimed: 0,

@@ -119,6 +119,8 @@ pub use session::workspace_sessions_dir;
 pub mod agent;
 #[path = "agent/agent_backend.rs"]
 pub mod agent_backend;
+#[path = "agent/agent_capability.rs"]
+pub mod agent_capability;
 #[path = "agent/agent_collaboration.rs"]
 pub mod agent_collaboration;
 #[path = "agent/agent_discussion.rs"]
@@ -143,6 +145,8 @@ pub mod autonomy_profile;
 pub mod checkpoint;
 #[path = "agent/collaboration_template.rs"]
 pub mod collaboration_template;
+#[path = "conflict/conflict_arbiter.rs"]
+pub mod conflict_arbiter;
 #[path = "context/context_fanout.rs"]
 pub mod context_fanout;
 #[path = "infrastructure/cowd_event.rs"]
@@ -153,6 +157,7 @@ pub mod cross_plane_policy;
 pub mod eval_gate;
 #[path = "context/evidence_planner.rs"]
 pub mod evidence_planner;
+#[path = "execution_core/mod.rs"]
 pub mod execution_core;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
@@ -166,6 +171,7 @@ pub mod joint_problem_solving;
 pub mod lane_completion;
 #[path = "infrastructure/mutation_plan.rs"]
 pub mod mutation_plan;
+#[path = "orchestration/mod.rs"]
 pub mod orchestration;
 #[path = "agent/pairing.rs"]
 pub mod pairing;
@@ -261,6 +267,9 @@ pub use agent_backend::{
     AgentExecutionBackendKind, AgentExecutionCommand, AgentExecutionCommandKind,
     AgentExecutionCommandReceipt, AgentExecutionEventEnvelope, AgentProcessJsonlSpec,
 };
+pub use agent_capability::{
+    resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
+};
 pub use agent_collaboration::{
     AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationContextResult, CollaborationOps,
     CollaborationOrchestrator, CollaborationReviewPacket, CollaborationScorecard,
@@ -301,7 +310,8 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use capability_manifest::{
     runtime_capabilities_response, runtime_capabilities_response_with_detail,
-    runtime_capability_primer, RuntimeCapability, RuntimeCapabilityManifest,
+    runtime_capability_primer, RuntimeActionContract, RuntimeCapability, RuntimeCapabilityCatalog,
+    RuntimeCapabilityManifest, RuntimeOperation, RuntimeOperationGroup, RuntimeTemplateSummary,
 };
 pub use checkpoint::{
     checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
@@ -329,6 +339,10 @@ pub use config::{
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
+};
+pub use conflict_arbiter::{
+    global_conflict_arbiter, ConflictArbiter, ConflictDecisionKind, ConflictResolutionReceipt,
+    ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
 };
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use control_plane::{global_runtime_control_plane, global_task_registry, RuntimeControlPlane};

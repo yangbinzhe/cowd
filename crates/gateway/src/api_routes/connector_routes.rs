@@ -195,7 +195,27 @@ fn account_from_platform(
 }
 
 fn manifest_from_platform_capability(platform_type: &str, operation: &str) -> CapabilityManifest {
-    CapabilityManifest::channel(platform_type, operation)
+    CapabilityManifest::channel(
+        platform_type,
+        normalize_platform_capability_operation(operation),
+    )
+}
+
+fn normalize_platform_capability_operation(operation: &str) -> String {
+    match operation.trim() {
+        "message.ingress" => "ingress".to_string(),
+        "message.send.text" => "send_text".to_string(),
+        "message.send.image" => "send_image".to_string(),
+        "message.send.voice" => "send_voice".to_string(),
+        "message.send.document" => "send_file".to_string(),
+        "message.send.video" => "send_video".to_string(),
+        "message.send.card" => "send_card".to_string(),
+        "message.edit" => "edit".to_string(),
+        "message.delete" => "delete".to_string(),
+        "message.chat.info" => "chat_info".to_string(),
+        "message.callback" => "callback".to_string(),
+        other => other.replace('.', "_"),
+    }
 }
 
 fn auth_mode_for_platform(platform_type: &str) -> &'static str {

@@ -266,7 +266,7 @@ mod tests {
                     "required": ["intent"],
                     "additionalProperties": true
                 }),
-                required_permission: ToolPermissionMode::ReadOnly,
+                required_permission: ToolPermissionMode::WorkspaceWrite,
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -297,7 +297,7 @@ mod tests {
                     "required": ["intent"],
                     "additionalProperties": true
                 }),
-                required_permission: ToolPermissionMode::ReadOnly,
+                required_permission: ToolPermissionMode::WorkspaceWrite,
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None)

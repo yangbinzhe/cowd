@@ -19,5 +19,6 @@ pub struct RuntimeOrchestrationResult {
     pub status: String,
     pub decision: RuntimeOrchestrationDecision,
     pub execution: Value,
+    pub evidence: Value,
     pub next_model_guidance: String,
 }

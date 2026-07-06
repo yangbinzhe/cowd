@@ -23,7 +23,7 @@ use super::{GrowthService, MatrixService, MemoryService};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GatewayFactStore {
-    db_path: Option<std::path::PathBuf>,
+    db_handle: Option<storage::StorageHandle>,
     facts: BTreeMap<String, FactRecord>,
     evidence: BTreeMap<String, EvidencePacket>,
 }
@@ -65,17 +65,18 @@ impl GatewayFactStore {
         let facts = load_fact_records(&conn)?;
         let evidence = load_fact_evidence(&conn)?;
         Ok(Self {
-            db_path: Some(handle.path.clone()),
+            db_handle: Some(handle.clone()),
             facts,
             evidence,
         })
     }
 
     fn connection(&self) -> Result<Option<Connection>, String> {
-        let Some(path) = self.db_path.as_ref() else {
+        let Some(handle) = self.db_handle.as_ref() else {
             return Ok(None);
         };
-        Connection::open(path)
+        SqliteConnectionFactory::default()
+            .open_handle(handle)
             .map(Some)
             .map_err(|error| error.to_string())
     }

@@ -699,7 +699,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -727,7 +727,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -756,6 +756,7 @@ pub(crate) mod tests {
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
+        let config_home = isolated_test_config_home_with_config(&config);
         Arc::new(AppState {
             tool_registry: tools,
             config: Some(config),
@@ -764,7 +765,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root,
-            config_home: default_config_home(),
+            config_home,
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, surface_host),
@@ -775,6 +776,17 @@ pub(crate) mod tests {
     fn unique_test_workspace(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn isolated_test_config_home() -> PathBuf {
+        unique_test_workspace("config-home")
+    }
+
+    fn isolated_test_config_home_with_config(config: &serde_json::Value) -> PathBuf {
+        let path = isolated_test_config_home();
+        let rendered = serde_yaml::to_string(config).expect("test config renders as yaml");
+        std::fs::write(path.join("config.yaml"), rendered).expect("test config writes");
         path
     }
 
@@ -793,7 +805,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -857,7 +869,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -883,7 +895,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root,
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -914,7 +926,7 @@ pub(crate) mod tests {
             approval_gate: Some(gate.clone()),
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -8442,11 +8454,11 @@ providers:
             && item["capabilities"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("ingress"))
+                .contains(&serde_json::json!("message.ingress"))
             && item["capabilities"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("delivery"))));
+                .contains(&serde_json::json!("message.send.text"))));
     }
 
     #[tokio::test]
@@ -8578,7 +8590,7 @@ providers:
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "channel.feishu.delivery"));
+            .any(|item| item == "channel.feishu.send_text"));
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -12159,7 +12171,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12194,7 +12206,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12229,7 +12241,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12266,7 +12278,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12303,7 +12315,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12347,7 +12359,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),

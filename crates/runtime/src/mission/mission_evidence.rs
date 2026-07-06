@@ -73,6 +73,25 @@ impl MissionEvidenceBus {
             .cloned()
             .collect()
     }
+
+    #[must_use]
+    pub fn list_all(&self) -> Vec<MissionEvidenceRef> {
+        self.evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> serde_json::Value {
+        let mut evidence = self.list_all();
+        evidence.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        serde_json::json!({
+            "kind": "runtime.mission_evidence",
+            "count": evidence.len(),
+            "latest": evidence.into_iter().take(100).collect::<Vec<_>>(),
+        })
+    }
 }
 
 pub fn global_mission_evidence_bus() -> &'static MissionEvidenceBus {

@@ -11,8 +11,9 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cowd_dirs, global_session_relation_graph, record_runtime_event, RuntimeEventInput,
-    RuntimeEventScope,
+    cowd_dirs, global_conflict_arbiter, global_mission_evidence_bus, global_session_relation_graph,
+    record_runtime_event, RuntimeCapabilityCatalog, RuntimeEventInput, RuntimeEventScope,
+    StewardScheduler, TeamExecutionLoop,
 };
 use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
@@ -156,6 +157,7 @@ pub struct MissionSessionCommandSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionProjection {
     pub kind: String,
+    pub schema_version: u32,
     pub active_session_id: Option<String>,
     pub sessions: Vec<MissionSessionSnapshot>,
     pub events: Vec<MissionEvent>,
@@ -166,6 +168,12 @@ pub struct MissionProjection {
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
     pub relation_projection: serde_json::Value,
+    pub workgraph_projection: serde_json::Value,
+    pub conflict_projection: serde_json::Value,
+    pub evidence_projection: serde_json::Value,
+    pub steward_projection: serde_json::Value,
+    pub capability_projection: serde_json::Value,
+    pub health_projection: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,6 +663,7 @@ impl MissionRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         MissionProjection {
             kind: "mission.runtime".to_string(),
+            schema_version: 2,
             active_session_id: state.active_session_id.clone(),
             sessions: state.sessions.values().cloned().collect(),
             events: state.events.clone(),
@@ -665,6 +674,12 @@ impl MissionRuntime {
             agent_projection: global_agent_lifecycle_service().projection(),
             approval_projection: global_approval_queue().projection(),
             relation_projection: global_session_relation_graph().projection(),
+            workgraph_projection: mission_workgraph_projection(),
+            conflict_projection: global_conflict_arbiter().projection(),
+            evidence_projection: global_mission_evidence_bus().projection(),
+            steward_projection: serde_json::json!(StewardScheduler::projection()),
+            capability_projection: serde_json::json!(RuntimeCapabilityCatalog::current()),
+            health_projection: mission_health_projection(&state),
         }
     }
 
@@ -825,6 +840,68 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn mission_workgraph_projection() -> serde_json::Value {
+    let workgraphs = global_team_runtime_service()
+        .list()
+        .into_iter()
+        .map(|team| match TeamExecutionLoop::plan(&team.team_id) {
+            Ok(plan) => serde_json::json!({
+                "team_id": plan.team_id,
+                "session_id": plan.session_id,
+                "objective": plan.objective,
+                "workgraph_id": plan.workgraph.id,
+                "node_count": plan.workgraph.nodes.len(),
+                "edge_count": plan.workgraph.edges.len(),
+                "quality": plan.workgraph_quality,
+                "ready_node_ids": plan.ready_node_ids,
+                "blocked_node_ids": plan.blocked_node_ids,
+                "max_parallelism": plan.spec.max_parallelism,
+            }),
+            Err(error) => serde_json::json!({
+                "team_id": team.team_id,
+                "session_id": team.session_id,
+                "error": error,
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "runtime.mission_workgraphs",
+        "count": workgraphs.len(),
+        "workgraphs": workgraphs,
+    })
+}
+
+fn mission_health_projection(state: &MissionRuntimeState) -> serde_json::Value {
+    let summary = session_command_summary(&state.session_commands);
+    let degraded_reasons = [
+        (summary.failed > 0).then(|| format!("failed_session_commands:{}", summary.failed)),
+        (summary.interrupted > 0)
+            .then(|| format!("interrupted_session_commands:{}", summary.interrupted)),
+        (summary.running > 0).then(|| format!("running_session_commands:{}", summary.running)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "runtime.mission_health",
+        "ok": summary.failed == 0 && summary.interrupted == 0,
+        "status": if summary.failed > 0 || summary.interrupted > 0 {
+            "degraded"
+        } else {
+            "ready"
+        },
+        "degraded_reasons": degraded_reasons,
+        "session_count": state.sessions.len(),
+        "event_count": state.events.len(),
+        "session_command_summary": summary,
+        "reload": {
+            "supported": true,
+            "mode": "gateway_config_auto_hot_reload_and_edge_reload_need_projection",
+            "manual_reload_surface": "gateway/edge status surfaces"
+        }
+    })
+}
+
 fn session_command_summary(
     commands: &BTreeMap<String, MissionSessionCommand>,
 ) -> MissionSessionCommandSummary {
@@ -956,6 +1033,7 @@ mod tests {
         assert_eq!(session.active_agent_ids, vec!["agent-1".to_string()]);
         assert!(projection.events.len() >= 5);
         assert_eq!(projection.kind, "mission.runtime");
+        assert_eq!(projection.schema_version, 2);
         assert_eq!(projection.team_projection["kind"], "runtime.teams");
         assert_eq!(projection.agent_projection["kind"], "runtime.agents");
         assert_eq!(
@@ -965,6 +1043,45 @@ mod tests {
         assert_eq!(
             projection.relation_projection["kind"],
             "runtime.session_relations"
+        );
+    }
+
+    #[test]
+    fn mission_projection_v2_exposes_runtime_control_closure() {
+        let runtime = MissionRuntime::new();
+        runtime
+            .start_session(StartMissionSessionRequest {
+                title: "projection v2".to_string(),
+                session_id: Some("mission-projection-v2".to_string()),
+            })
+            .expect("session");
+
+        let projection = runtime.projection();
+
+        assert_eq!(projection.schema_version, 2);
+        assert_eq!(
+            projection.workgraph_projection["kind"],
+            "runtime.mission_workgraphs"
+        );
+        assert_eq!(projection.conflict_projection["kind"], "runtime.conflicts");
+        assert_eq!(
+            projection.evidence_projection["kind"],
+            "runtime.mission_evidence"
+        );
+        assert_eq!(
+            projection.steward_projection["kind"],
+            "runtime.steward_scheduler"
+        );
+        assert!(projection.capability_projection["action_contracts"]
+            .as_array()
+            .is_some_and(|actions| {
+                actions
+                    .iter()
+                    .any(|action| action["runtime_action"] == "use_team_template")
+            }));
+        assert_eq!(
+            projection.health_projection["kind"],
+            "runtime.mission_health"
         );
     }
 }

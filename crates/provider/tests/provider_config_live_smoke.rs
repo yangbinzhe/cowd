@@ -290,10 +290,11 @@ async fn send_live_probe(
 ) -> Result<MessageResponse, provider::ApiError> {
     let mut last_empty: Option<MessageResponse> = None;
     for attempt in 1..=3 {
+        let max_tokens = live_probe_max_tokens(requested_model, probe.max_tokens, attempt);
         let response = client
             .send_message(&MessageRequest {
                 model: requested_model.to_string(),
-                max_tokens: probe.max_tokens,
+                max_tokens,
                 messages: vec![InputMessage::user_text(probe.prompt)],
                 system: Some(
                     "You are validating an AI harness. Return strict JSON only; no markdown."
@@ -308,17 +309,41 @@ async fn send_live_probe(
             return Ok(response);
         }
         eprintln!(
-            "live_provider probe={} attempt={attempt} returned empty text response_id={} stop_reason={:?} total_tokens={}",
+            "live_provider probe={} attempt={attempt} max_tokens={} returned empty text response_id={} stop_reason={:?} total_tokens={}",
             probe.name,
+            max_tokens,
             response.id,
             response.stop_reason,
             response.total_tokens()
         );
         last_empty = Some(response);
-        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt))).await;
     }
 
     Ok(last_empty.expect("at least one live attempt should have run"))
+}
+
+fn live_probe_max_tokens(model: &str, requested: u32, attempt: u32) -> u32 {
+    if let Ok(value) = std::env::var("COWD_AI_HARNESS_LIVE_MAX_TOKENS") {
+        if let Ok(parsed) = value.parse::<u32>() {
+            if parsed > 0 {
+                return requested.max(parsed);
+            }
+        }
+    }
+
+    let model = model.to_ascii_lowercase();
+    let model_floor = if model.contains("deepseek")
+        || model.contains("qwen")
+        || model.contains("step")
+        || model.contains("glm")
+    {
+        512
+    } else {
+        requested
+    };
+    let retry_floor = model_floor.saturating_mul(attempt).min(1024);
+    requested.max(retry_floor)
 }
 
 fn response_text(response: &MessageResponse) -> String {

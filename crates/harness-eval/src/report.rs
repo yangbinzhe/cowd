@@ -230,6 +230,9 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         .get("event_observation_parity")
         .unwrap_or(&Value::Null);
     let reality_context = report.get("reality_context_eval").unwrap_or(&Value::Null);
+    let mission_runtime = report
+        .get("mission_runtime_collaboration")
+        .unwrap_or(&Value::Null);
     let package = report.get("report_package").unwrap_or(&Value::Null);
     let is_quick = level == "quick";
 
@@ -292,6 +295,28 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
                 .unwrap_or_default()
         ),
         "repair RecallReport/ContextEnvelope scenario evidence before accepting the report",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "mission_runtime_collaboration_closure",
+        scenario_status(&scenarios, "mission_runtime_collaboration_closure") == Some("passed")
+            && mission_runtime.get("status").and_then(Value::as_str) == Some("passed")
+            && mission_runtime
+                .pointer("/mission_projection/schema_version")
+                .and_then(Value::as_u64)
+                == Some(2),
+        true,
+        format!(
+            "status={}, projection_v={}",
+            mission_runtime
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            mission_runtime
+                .pointer("/mission_projection/schema_version")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ),
+        "repair mission runtime collaboration closure before accepting the report",
     ));
 
     if is_quick {

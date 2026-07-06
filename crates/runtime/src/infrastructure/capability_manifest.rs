@@ -28,6 +28,239 @@ pub struct RuntimeCapabilityManifest {
     pub capabilities: Vec<RuntimeCapability>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapabilityCatalog {
+    pub name: String,
+    pub templates: Vec<RuntimeTemplateSummary>,
+    pub operation_groups: Vec<RuntimeOperationGroup>,
+    pub action_contracts: Vec<RuntimeActionContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTemplateSummary {
+    pub template_id: String,
+    pub label: String,
+    pub role_count: usize,
+    pub max_parallelism: usize,
+    pub best_for: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeOperationGroup {
+    pub id: String,
+    pub summary: String,
+    pub operations: Vec<RuntimeOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeOperation {
+    pub id: String,
+    pub owner: String,
+    pub summary: String,
+    pub model_intent: String,
+    pub validation_gate: String,
+    pub output_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeActionContract {
+    pub runtime_action: String,
+    pub tool_action: String,
+    pub when_to_use: String,
+    pub required_intent_fields: Vec<String>,
+    pub validation: String,
+    pub expected_projection: Vec<String>,
+}
+
+impl RuntimeCapabilityCatalog {
+    #[must_use]
+    pub fn current() -> Self {
+        let templates = CollaborationTemplateCatalog::built_in()
+            .templates()
+            .iter()
+            .map(|template| RuntimeTemplateSummary {
+                template_id: template.template_id.as_str().to_string(),
+                label: template.label.clone(),
+                role_count: template.agent_roles.len(),
+                max_parallelism: template.max_parallelism,
+                best_for: template
+                    .agent_roles
+                    .iter()
+                    .map(|role| role.responsibility.clone())
+                    .take(3)
+                    .collect(),
+            })
+            .collect();
+        Self {
+            name: "cowd-runtime-capability-catalog".to_string(),
+            templates,
+            operation_groups: vec![
+                operation_group(
+                    "workgraph",
+                    "Build, validate, schedule, and inspect DAG-based team work.",
+                    vec![
+                        operation(
+                            "build_workgraph",
+                            "runtime.team_execution",
+                            "Convert a collaboration template into a validated WorkGraph with review and synthesis nodes.",
+                            "I need ordered or parallel team work with visible dependencies.",
+                            "WorkGraph quality report must be DAG-valid and policy-approved before dispatch.",
+                            &["workgraph_id", "ready_node_ids", "blocked_node_ids"],
+                        ),
+                        operation(
+                            "tick_ready_nodes",
+                            "runtime.team_execution",
+                            "Dispatch only ready WorkGraph nodes under max_parallelism.",
+                            "The team already exists and the next ready work should run.",
+                            "Paused/cancelled teams and blocked nodes are rejected.",
+                            &["ready_node_ids", "running_node_ids", "mission_evidence"],
+                        ),
+                    ],
+                ),
+                operation_group(
+                    "team",
+                    "Start, inspect, control, and synthesize runtime-owned agent teams.",
+                    vec![
+                        operation(
+                            "use_team_template",
+                            "runtime.team_runtime",
+                            "Start the lightest suitable built-in collaboration template.",
+                            "The task has independent roles, review needs, or multi-domain work.",
+                            "Runtime strategy, risk, session binding, and policy gates must accept the request.",
+                            &["team_id", "template_id", "agent_runs", "control_actions"],
+                        ),
+                        operation(
+                            "request_verification",
+                            "runtime.team_runtime",
+                            "Attach reviewer/background verification without turning tools into lifecycle owners.",
+                            "The result needs independent review or regression evidence.",
+                            "Read/write permissions are role-scoped through AgentCapabilityResolver.",
+                            &["review_required", "review_reason", "agent_runs"],
+                        ),
+                    ],
+                ),
+                operation_group(
+                    "session",
+                    "Coordinate parallel sessions, background turns, route commands, and bridge evidence.",
+                    vec![
+                        operation(
+                            "dispatch_session",
+                            "runtime.session_execution",
+                            "Turn a pending mission command into a runtime turn dispatch request.",
+                            "A background or parallel session should continue executing real work.",
+                            "Session lease state must be active/background and command idempotency must hold.",
+                            &["command_id", "turn_request", "session_command_summary"],
+                        ),
+                        operation(
+                            "link_sessions",
+                            "runtime.session_relation_graph",
+                            "Create or use session relations/proxies for cross-session collaboration.",
+                            "The answer needs to reference, review, or route work between sessions.",
+                            "ConflictsWith/Blocks relations are routed through ConflictArbiter.",
+                            &["relations", "proxies", "route_receipt"],
+                        ),
+                    ],
+                ),
+                operation_group(
+                    "conflict_approval_steward",
+                    "Handle conflicts, approvals, and long-running stewardship without silent drift.",
+                    vec![
+                        operation(
+                            "request_arbiter",
+                            "runtime.conflict_arbiter",
+                            "Record and resolve a conflict from WorkGraph, session, tool, memory, approval, or agent evidence.",
+                            "Evidence disagrees or a dependency/permission state blocks progress.",
+                            "Severity determines continue, review, pause, or approval.",
+                            &["conflict_id", "decision", "mission_evidence"],
+                        ),
+                        operation(
+                            "ask_approval",
+                            "runtime.approval",
+                            "Escalate high-risk or externally visible actions before execution.",
+                            "The next step is high risk, destructive, or requires human authority.",
+                            "Approval policy decides pending, timeout, auto-continue, or block.",
+                            &["approval_projection", "policy_gates"],
+                        ),
+                    ],
+                ),
+                operation_group(
+                    "tool_strategy",
+                    "Batch and schedule model-requested tools while keeping tools as hands and feet.",
+                    vec![
+                        operation(
+                            "parallel_tool_batch",
+                            "runtime.tool_scheduler",
+                            "Batch independent read-only tools and serialize write/destructive tools.",
+                            "Several evidence items can be gathered independently.",
+                            "Tool safety classes and dependency edges determine the schedule.",
+                            &["tool_dag", "schedule", "tool_evidence_refs"],
+                        ),
+                        operation(
+                            "continue_single",
+                            "runtime.conversation",
+                            "Continue as one executor when collaboration overhead is not justified.",
+                            "The task is simple, low risk, and evidence needs are small.",
+                            "Runtime still records trace, evidence, and policy decisions.",
+                            &["turn_summary", "runtime_trace"],
+                        ),
+                    ],
+                ),
+            ],
+            action_contracts: vec![
+                action_contract(
+                    "use_team_template",
+                    "request_team",
+                    "Complex implementation, audit, research, debate, incident, or long-running work benefits from role split.",
+                    &["intent", "template_hint optional", "reason optional"],
+                    &["team_projection", "agent_projection", "workgraph"],
+                ),
+                action_contract(
+                    "build_workgraph",
+                    "request_team",
+                    "The model wants explicit dependencies, parallel lanes, review, and synthesis for a team.",
+                    &["intent", "template_hint optional"],
+                    &["workgraph", "workgraph_quality", "ready_node_ids"],
+                ),
+                action_contract(
+                    "dispatch_session",
+                    "request_session_link",
+                    "A background or related session should run or receive work from the current mission.",
+                    &["intent", "session_id or target_ref"],
+                    &["session_commands", "relation_projection"],
+                ),
+                action_contract(
+                    "request_arbiter",
+                    "request_risk_gate",
+                    "Evidence conflicts, graph blocks, or policy disagreement require explicit resolution.",
+                    &["intent", "risk optional", "evidence_refs optional"],
+                    &["conflict_projection", "approval_projection"],
+                ),
+                action_contract(
+                    "parallel_tool_batch",
+                    "request_parallel_tools",
+                    "Independent read-only evidence can be gathered faster as a scheduler batch.",
+                    &["intent", "capabilities optional"],
+                    &["tool_dag", "schedule"],
+                ),
+                action_contract(
+                    "ask_approval",
+                    "request_risk_gate",
+                    "The next action is high-risk, destructive, external, or requires human authority.",
+                    &["intent", "risk", "reason optional"],
+                    &["approval_projection", "policy_gates"],
+                ),
+                action_contract(
+                    "continue_single",
+                    "plan_only",
+                    "The task is simple enough that team/session overhead would reduce efficiency.",
+                    &["intent"],
+                    &["execution_decision"],
+                ),
+            ],
+        }
+    }
+}
+
 impl RuntimeCapabilityManifest {
     #[must_use]
     pub fn current() -> Self {
@@ -120,6 +353,7 @@ impl RuntimeCapabilityManifest {
 #[must_use]
 pub fn runtime_capability_primer() -> String {
     let manifest = RuntimeCapabilityManifest::current();
+    let catalog = RuntimeCapabilityCatalog::current();
     let mut lines = vec![
         "# Runtime capability awareness".to_string(),
         "You run inside Cowd AI Harness. You are not limited to naive one-tool-at-a-time ReAct."
@@ -135,6 +369,18 @@ pub fn runtime_capability_primer() -> String {
 
     lines.extend([
         String::new(),
+        "Runtime action contract:".to_string(),
+        "When higher-order execution is useful, inspect options through read-only `runtime_capabilities`; use `runtime_orchestrate` only for stateful runtime orchestration that may create teams, session commands, approvals, or evidence records.".to_string(),
+    ]);
+    for action in &catalog.action_contracts {
+        lines.push(format!(
+            "- runtime_action=`{}` -> runtime_orchestrate action=`{}`: {}",
+            action.runtime_action, action.tool_action, action.when_to_use
+        ));
+    }
+
+    lines.extend([
+        String::new(),
         "Operational guidance:".to_string(),
         "- For README/docs/code review, prefer `workspace_snapshot`, `git diff` evidence, `read_many`, `grep_many`, or `tool_batch_readonly` before repeated `read_file`.".to_string(),
         "- For independent read-only facts, request them together so the runtime can batch or parallelize them.".to_string(),
@@ -145,8 +391,9 @@ pub fn runtime_capability_primer() -> String {
         "- For long or expensive work, produce an early staged answer with checked facts, then continue with batched evidence and runtime orchestration instead of serial probing.".to_string(),
         "- Prefer full-file or batched reads when the context window can hold the evidence; avoid artificial tiny range reads unless the target is genuinely large.".to_string(),
         "- Current user instructions override conflicting recalled memory or knowledge rules for this turn; if a recalled preference conflicts with the explicit current request, suppress that memory and follow the current request.".to_string(),
-        "- Use `runtime_capabilities` when you need a compact recommendation for available runtime affordances.".to_string(),
+        "- Use `runtime_capabilities` when you need a compact, read-only recommendation for available runtime affordances.".to_string(),
         "- Use `runtime_capabilities` with detail=`execution_modes`, `team_templates`, `agent_catalog`, `orchestration_options`, or `budget_controls` when deciding how to solve complex work.".to_string(),
+        "- Use `runtime_orchestrate` only when a runtime state change is intended; it is not a read-only query.".to_string(),
         format!("- {}", runtime_orchestration_action_guidance()),
     ]);
 
@@ -170,6 +417,7 @@ pub fn runtime_capabilities_response_with_detail(
     detail: Option<&str>,
 ) -> Value {
     let manifest = RuntimeCapabilityManifest::current();
+    let catalog = RuntimeCapabilityCatalog::current();
     let evidence_plan: EvidencePlan = plan_evidence(intent);
     let execution_decision =
         build_runtime_execution_decision(intent, profile.and_then(parse_context_profile));
@@ -181,6 +429,7 @@ pub fn runtime_capabilities_response_with_detail(
     json!({
         "type": "runtime_capabilities",
         "manifest": manifest,
+        "runtime_capability_catalog": catalog,
         "intent": intent,
         "surface": surface,
         "profile": profile,
@@ -190,10 +439,14 @@ pub fn runtime_capabilities_response_with_detail(
         "backend_capabilities": backend_capabilities,
         "runtime_orchestrate": {
             "available": true,
+            "required_permission": "workspace-write",
+            "side_effects": ["mission_evidence", "team_runtime", "session_command", "approval_orchestration"],
             "actions": runtime_orchestration_actions(),
+            "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
             "recommendation": execution_decision.recommended_actions
         },
         "action_plane": action_plane,
+        "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
         "model_router": runtime_model_router_capability(),
         "budget_controls": runtime_budget_controls(profile),
         "strategy": {
@@ -201,10 +454,11 @@ pub fn runtime_capabilities_response_with_detail(
             "prefer_full_or_batch_read_for_small_docs": true,
             "model_callable_tools": ["workspace_snapshot", "read_many", "grep_many", "glob_many", "tool_batch_readonly", "runtime_capabilities", "runtime_orchestrate", "ToolSearch"],
             "runtime_owned_affordances": ["execution_modes", "rewoo_evidence", "tool_dag", "subagent", "team", "mission", "session", "verification", "deliberation", "reflexion"],
+            "runtime_orchestrate_is_stateful": true,
             "use_or_request_subagents_for_independent_domains": true,
             "avoid_repeated_overlapping_reads": true,
             "current_turn_overrides_conflicting_memory": true,
-            "fallback_when_stalled": "switch execution mode through runtime_orchestrate plan_only/request_reflexion_retry or answer with checked evidence, current judgment, remaining risks, and next best step"
+            "fallback_when_stalled": "switch execution mode by querying runtime_capabilities first, then use runtime_orchestrate(request_reflexion_retry/request_parallel_tools) only when stateful runtime orchestration is intended, or answer with checked evidence, current judgment, remaining risks, and next best step"
         },
         "advanced_execution": {
             "rewoo_candidate": rewoo_plan,
@@ -215,9 +469,13 @@ pub fn runtime_capabilities_response_with_detail(
 
 fn runtime_action_plane<T: Serialize>(recommended_actions: &[T]) -> Value {
     json!({
-        "recommended_next_tool": "runtime_orchestrate",
+        "recommended_next_tool": "runtime_capabilities_or_runtime_orchestrate",
         "can_execute_now": true,
         "session_id_bound": "gateway_api_sessions_auto_bind_session_id",
+        "permissions": {
+            "runtime_capabilities": "read-only",
+            "runtime_orchestrate": "workspace-write"
+        },
         "required_args": {
             "runtime_capabilities": ["intent"],
             "runtime_orchestrate": ["intent", "action"],
@@ -266,6 +524,7 @@ fn runtime_action_plane<T: Serialize>(recommended_actions: &[T]) -> Value {
 }
 
 fn backend_capabilities(detail: &str, intent: &str) -> Value {
+    let catalog = RuntimeCapabilityCatalog::current();
     let templates = CollaborationTemplateCatalog::built_in()
         .templates()
         .iter()
@@ -302,6 +561,12 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
             "decision": build_runtime_execution_decision(intent, None),
             "execution_modes": execution_mode_catalog_response(),
             "collaboration_templates": templates,
+            "runtime_action_contract": catalog.action_contracts,
+        }),
+        "capability_catalog" => json!(catalog),
+        "runtime_action_contract" => json!({
+            "contracts": catalog.action_contracts,
+            "operation_groups": catalog.operation_groups,
         }),
         "model_router" => runtime_model_router_capability(),
         "budget_controls" => runtime_budget_controls(None),
@@ -429,6 +694,59 @@ fn capability(
     }
 }
 
+fn operation_group(
+    id: &str,
+    summary: &str,
+    operations: Vec<RuntimeOperation>,
+) -> RuntimeOperationGroup {
+    RuntimeOperationGroup {
+        id: id.to_string(),
+        summary: summary.to_string(),
+        operations,
+    }
+}
+
+fn operation(
+    id: &str,
+    owner: &str,
+    summary: &str,
+    model_intent: &str,
+    validation_gate: &str,
+    output_refs: &[&str],
+) -> RuntimeOperation {
+    RuntimeOperation {
+        id: id.to_string(),
+        owner: owner.to_string(),
+        summary: summary.to_string(),
+        model_intent: model_intent.to_string(),
+        validation_gate: validation_gate.to_string(),
+        output_refs: output_refs.iter().map(|item| (*item).to_string()).collect(),
+    }
+}
+
+fn action_contract(
+    runtime_action: &str,
+    tool_action: &str,
+    when_to_use: &str,
+    required_intent_fields: &[&str],
+    expected_projection: &[&str],
+) -> RuntimeActionContract {
+    RuntimeActionContract {
+        runtime_action: runtime_action.to_string(),
+        tool_action: tool_action.to_string(),
+        when_to_use: when_to_use.to_string(),
+        required_intent_fields: required_intent_fields
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect(),
+        validation: "Runtime validator applies strategy, risk, permission, session binding, and policy gates before changing state.".to_string(),
+        expected_projection: expected_projection
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +760,9 @@ mod tests {
         assert!(primer.contains("subagent, team"));
         assert!(primer.contains("runtime-owned"));
         assert!(primer.contains("runtime_capabilities"));
+        assert!(primer.contains("Runtime action contract"));
+        assert!(primer.contains("use_team_template"));
+        assert!(primer.contains("dispatch_session"));
         assert!(primer.contains("Slow model output is acceptable"));
         assert!(primer.contains("early staged answer"));
         assert!(primer.contains("batched reads"));
@@ -462,9 +783,15 @@ mod tests {
         assert!(response["runtime_orchestrate"]["available"]
             .as_bool()
             .unwrap_or(false));
+        assert!(response["runtime_capability_catalog"]["operation_groups"].is_array());
+        assert!(response["runtime_action_contract"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["runtime_action"] == "use_team_template")));
         assert_eq!(
             response["action_plane"]["recommended_next_tool"],
-            "runtime_orchestrate"
+            "runtime_capabilities_or_runtime_orchestrate"
         );
         assert!(response["action_plane"]["recipes"].is_array());
         assert!(response["execution_decision"]["recommended_mode"].is_string());
@@ -529,5 +856,43 @@ mod tests {
         assert!(router["backend_capabilities"]["intents"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "deep")));
+
+        let contract = runtime_capabilities_response_with_detail(
+            "需要模型主动选择团队和并行工具",
+            None,
+            None,
+            Some("runtime_action_contract"),
+        );
+        assert!(contract["backend_capabilities"]["contracts"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["runtime_action"] == "parallel_tool_batch")
+            }));
+    }
+
+    #[test]
+    fn runtime_capability_catalog_exposes_model_visible_actions() {
+        let catalog = RuntimeCapabilityCatalog::current();
+        assert!(catalog.templates.len() >= 7);
+        assert!(catalog
+            .operation_groups
+            .iter()
+            .any(|group| group.id == "workgraph"));
+        assert!(catalog
+            .operation_groups
+            .iter()
+            .any(|group| group.operations.iter().any(|op| op.id == "request_arbiter")));
+        assert!(catalog.action_contracts.iter().any(|contract| {
+            contract.runtime_action == "use_team_template" && contract.tool_action == "request_team"
+        }));
+        assert!(catalog.action_contracts.iter().any(|contract| {
+            contract.runtime_action == "dispatch_session"
+                && contract
+                    .expected_projection
+                    .iter()
+                    .any(|item| item == "session_commands")
+        }));
     }
 }

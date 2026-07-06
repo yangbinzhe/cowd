@@ -129,6 +129,11 @@ pub struct MissionControlProjection {
     pub approvals: Vec<MissionControlApprovalNode>,
     pub stewards: Vec<MissionControlStewardNode>,
     pub relations: serde_json::Value,
+    pub workgraphs: serde_json::Value,
+    pub conflicts: serde_json::Value,
+    pub evidence: serde_json::Value,
+    pub capabilities: serde_json::Value,
+    pub steward_scheduler: serde_json::Value,
     pub event_digest: MissionControlEventDigest,
     pub health: serde_json::Value,
 }
@@ -255,6 +260,12 @@ fn build_projection() -> MissionControlProjection {
     let agents = agent_nodes(&agent_projection, &mission);
     let approvals = approval_nodes(&approval_projection);
     let stewards = steward_nodes(&serde_json::to_value(&steward_projection).unwrap_or_default());
+    let workgraphs = mission.workgraph_projection.clone();
+    let conflicts = mission.conflict_projection.clone();
+    let evidence = mission.evidence_projection.clone();
+    let capabilities = mission.capability_projection.clone();
+    let steward_scheduler = mission.steward_projection.clone();
+    let mission_health = mission.health_projection.clone();
     let summary = summary(
         &mission,
         sessions.len(),
@@ -292,10 +303,16 @@ fn build_projection() -> MissionControlProjection {
         approvals,
         stewards,
         relations,
+        workgraphs,
+        conflicts,
+        evidence,
+        capabilities,
+        steward_scheduler,
         event_digest,
         health: serde_json::json!({
-            "ok": true,
-            "status": "ready",
+            "ok": mission_health["ok"].as_bool().unwrap_or(true),
+            "status": mission_health["status"].as_str().unwrap_or("ready"),
+            "mission": mission_health,
         }),
     }
 }

@@ -297,24 +297,24 @@ pub trait ApiClient {
 
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let stream = self.stream(request);
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("stream_collect rt")
-                .handle()
-                .clone()
-        });
-        handle.block_on(async {
+        let mut pinned = self.stream(request);
+        let collect = async move {
             use futures::StreamExt;
             let mut events = Vec::new();
-            let mut pinned = stream;
             while let Some(event) = pinned.next().await {
                 events.push(event?);
             }
             Ok(events)
-        })
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(collect)
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stream_collect rt")
+                .block_on(collect)
+        }
     }
 }
 
@@ -6550,11 +6550,15 @@ mod tests {
 
         let events = rt.block_on(async {
             let mut events = Vec::new();
-            for _ in 0..16 {
+            for _ in 0..128 {
                 if let Ok(Ok(event)) =
                     tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
                 {
+                    let turn_complete = matches!(event, CowdEvent::TurnComplete { .. });
                     events.push(event);
+                    if turn_complete {
+                        break;
+                    }
                 }
             }
             events

@@ -36,6 +36,8 @@ use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
 };
 
+pub mod config_reload;
+
 #[derive(Clone, Default)]
 struct RuntimeMcpServiceAdapter {
     registry: McpToolRegistry,
@@ -703,11 +705,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
-    crate::runtime_config_reload::initialize_config_reload_status(&app_state);
-    let _config_reload_watcher = crate::runtime_config_reload::spawn_config_reload_watcher(
-        app_state.clone(),
-        Duration::from_secs(2),
-    );
+    config_reload::initialize_config_reload_status(&app_state);
+    let _config_reload_watcher =
+        config_reload::spawn_config_reload_watcher(app_state.clone(), Duration::from_secs(2));
     crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)

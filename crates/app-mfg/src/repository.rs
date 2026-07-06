@@ -1407,21 +1407,28 @@ impl MfgRepository {
 }
 
 fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        r"CREATE TABLE IF NOT EXISTS matrix_schema (
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS matrix_schema (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             schema_version INTEGER NOT NULL,
             updated_at TEXT NOT NULL
-        );
-        INSERT INTO matrix_schema (id, schema_version, updated_at)
-        VALUES (1, 17, datetime('now'))
+        )",
+        [],
+    )?;
+    connection.execute(
+        r"INSERT INTO matrix_schema (id, schema_version, updated_at)
+        VALUES (1, ?1, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN matrix_schema.schema_version < excluded.schema_version
                 THEN excluded.schema_version
                 ELSE matrix_schema.schema_version
             END,
-            updated_at = excluded.updated_at;
+            updated_at = excluded.updated_at",
+        [matrix_core::MATRIX_SCHEMA_VERSION],
+    )?;
+    connection.execute_batch(
+        r"
 
         CREATE TABLE IF NOT EXISTS mfg_cockpit_profile (
             profile_id TEXT PRIMARY KEY,

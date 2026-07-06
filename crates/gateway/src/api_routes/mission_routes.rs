@@ -142,6 +142,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/mission/relations",
             get(mission_relations_handler).post(add_mission_relation_handler),
         )
+        .route("/api/mission/conflicts", get(mission_conflicts_handler))
         .route("/api/mission/proxies", post(upsert_mission_proxy_handler))
         .route(
             "/api/mission/stewards",
@@ -211,7 +212,131 @@ async fn dispatch_mission_sessions_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::SessionExecutionPolicy>,
 ) -> impl IntoResponse {
+    if body.dispatch_mode == runtime::SessionDispatchMode::StartRuntimeTurn {
+        return Json(dispatch_mission_sessions_as_turns(state, body).await);
+    }
     Json(state.services.mission.dispatch_mission_sessions(body))
+}
+
+async fn dispatch_mission_sessions_as_turns(
+    state: Arc<AppState>,
+    policy: runtime::SessionExecutionPolicy,
+) -> serde_json::Value {
+    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
+        return serde_json::json!({
+            "envelope": state.services.mission.session_control_contract(),
+            "kind": "mission_control.session_dispatch_result",
+            "ok": false,
+            "error": "runtime service unavailable",
+            "policy": policy,
+            "projection": runtime::MissionControlRuntime::projection(),
+        });
+    };
+    let report = runtime::SessionExecutionPlane::dispatch_pending(policy);
+    let mut turn_results = Vec::new();
+    for turn_request in report
+        .dispatched
+        .iter()
+        .filter_map(|receipt| receipt.turn_request.clone())
+    {
+        let session_runtime = match ensure_active_runtime_session_for_mission_command(
+            &state,
+            &turn_request.session_id,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err((status, error)) => {
+                let message = error.0.error;
+                let command = runtime::global_mission_runtime()
+                    .fail_session_command(
+                        &turn_request.session_id,
+                        &turn_request.command_id,
+                        message.clone(),
+                    )
+                    .ok();
+                turn_results.push(serde_json::json!({
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "session_id": turn_request.session_id,
+                    "command_id": turn_request.command_id,
+                    "error": message,
+                    "command": command,
+                }));
+                continue;
+            }
+        };
+        match runtime_service
+            .run_turn_with_options(
+                &turn_request.session_id,
+                None,
+                turn_request.prompt.clone(),
+                MISSION_COMMAND_WALL_CLOCK,
+                RuntimeTurnOptions {
+                    profile: runtime::ContextProfile::DeepInvestigation,
+                    max_iterations: Some(64),
+                    ..RuntimeTurnOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(execution) => {
+                let result_ref = format!("turn:{}", execution.receipt.turn_id);
+                let command = runtime::global_mission_runtime()
+                    .complete_session_command(
+                        &turn_request.session_id,
+                        &turn_request.command_id,
+                        Some(result_ref.clone()),
+                    )
+                    .ok();
+                turn_results.push(serde_json::json!({
+                    "ok": true,
+                    "session_id": turn_request.session_id,
+                    "command_id": turn_request.command_id,
+                    "turn": execution.receipt,
+                    "result_ref": result_ref,
+                    "session_runtime": session_runtime,
+                    "summary": {
+                        "iterations": execution.summary.iterations,
+                        "assistant_message_count": execution.summary.assistant_messages.len(),
+                        "tool_result_count": execution.summary.tool_results.len(),
+                    },
+                    "command": command,
+                }));
+            }
+            Err(error) => {
+                let message = error.message();
+                let command = runtime::global_mission_runtime()
+                    .fail_session_command(
+                        &turn_request.session_id,
+                        &turn_request.command_id,
+                        message.clone(),
+                    )
+                    .ok();
+                turn_results.push(serde_json::json!({
+                    "ok": false,
+                    "session_id": turn_request.session_id,
+                    "command_id": turn_request.command_id,
+                    "error": message,
+                    "session_runtime": session_runtime,
+                    "command": command,
+                }));
+            }
+        }
+    }
+    let ok = report.errors.is_empty()
+        && turn_results
+            .iter()
+            .all(|result| result["ok"].as_bool().unwrap_or(false));
+    serde_json::json!({
+        "envelope": state.services.mission.session_control_contract(),
+        "kind": "mission_control.session_dispatch_result",
+        "ok": ok,
+        "report": report,
+        "turn_results": turn_results,
+        "projection": runtime::MissionControlRuntime::projection(),
+        "mission": runtime::global_mission_runtime().projection(),
+    })
 }
 
 async fn bridge_mission_session_handler(
@@ -324,6 +449,12 @@ async fn mission_relations_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     Json(state.services.mission.relations())
+}
+
+async fn mission_conflicts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(state.services.mission.conflicts())
 }
 
 async fn mission_stewards_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

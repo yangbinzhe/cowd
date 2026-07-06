@@ -6,7 +6,8 @@ use crate::providers::openai_compat::{
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
-use model_protocol::provider_config::{ProviderConfig, ProviderProtocol};
+use model_protocol::provider_config::ProviderConfig;
+use model_protocol::provider_config::ProviderProtocol;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]

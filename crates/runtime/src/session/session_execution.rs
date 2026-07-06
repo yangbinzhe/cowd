@@ -1,9 +1,8 @@
 //! Multi-session execution plane.
 //!
 //! This module gives Mission Runtime an explicit dispatcher and cross-session
-//! bridge. It deliberately does not pretend to run provider turns; it claims or
-//! routes control-plane work and records auditable receipts for later Team/Agent
-//! execution stages.
+//! bridge. It owns leases and command dispatch receipts, while service adapters
+//! own the concrete provider turn execution.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +34,7 @@ impl Default for SessionExecutionPolicy {
 pub enum SessionDispatchMode {
     MarkClaimedOnly,
     ControlDispatchComplete,
+    StartRuntimeTurn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +55,16 @@ pub struct SessionCommandDispatchReceipt {
     pub status_after: MissionSessionCommandStatus,
     pub mode: SessionDispatchMode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_request: Option<SessionTurnDispatchRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTurnDispatchRequest {
+    pub session_id: String,
+    pub command_id: String,
+    pub prompt: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,10 +204,18 @@ fn dispatch_command(
     command: &MissionSessionCommand,
     mode: SessionDispatchMode,
 ) -> Result<SessionCommandDispatchReceipt, String> {
-    let claimed = global_mission_runtime()
-        .claim_session_command(&command.target_session_id, &command.command_id)?;
+    let status_before = command.status;
+    let claimed = match mode {
+        SessionDispatchMode::StartRuntimeTurn => global_mission_runtime()
+            .mark_session_command_running(&command.target_session_id, &command.command_id)?,
+        SessionDispatchMode::MarkClaimedOnly | SessionDispatchMode::ControlDispatchComplete => {
+            global_mission_runtime()
+                .claim_session_command(&command.target_session_id, &command.command_id)?
+        }
+    };
     let completed = match mode {
         SessionDispatchMode::MarkClaimedOnly => claimed,
+        SessionDispatchMode::StartRuntimeTurn => claimed,
         SessionDispatchMode::ControlDispatchComplete => global_mission_runtime()
             .complete_session_command(
                 &command.target_session_id,
@@ -208,7 +226,7 @@ fn dispatch_command(
     Ok(SessionCommandDispatchReceipt {
         command_id: command.command_id.clone(),
         session_id: command.target_session_id.clone(),
-        status_before: MissionSessionCommandStatus::Pending,
+        status_before,
         status_after: completed.status,
         mode,
         message: match mode {
@@ -218,7 +236,18 @@ fn dispatch_command(
             SessionDispatchMode::ControlDispatchComplete => {
                 "command completed by control-plane dispatch".to_string()
             }
+            SessionDispatchMode::StartRuntimeTurn => {
+                "command marked running for runtime turn dispatch".to_string()
+            }
         },
+        turn_request: (mode == SessionDispatchMode::StartRuntimeTurn).then(|| {
+            SessionTurnDispatchRequest {
+                session_id: command.target_session_id.clone(),
+                command_id: command.command_id.clone(),
+                prompt: command.command.clone(),
+                source: "session_execution_plane".to_string(),
+            }
+        }),
     })
 }
 
@@ -369,5 +398,56 @@ mod tests {
             "bridged command should be claimed by this dispatch report or by a concurrent global dispatcher"
         );
         assert_ne!(final_status, MissionSessionCommandStatus::Pending);
+    }
+
+    #[test]
+    fn session_execution_start_runtime_turn_marks_running_and_returns_turn_request() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_a = format!("session-turn-a-{suffix}");
+        let session_b = format!("session-turn-b-{suffix}");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "session turn a".to_string(),
+                session_id: Some(session_a.clone()),
+            })
+            .expect("session a");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "session turn b".to_string(),
+                session_id: Some(session_b.clone()),
+            })
+            .expect("session b");
+        let command = global_mission_runtime()
+            .enqueue_session_command(&session_a, &session_b, "analyze background task")
+            .expect("command");
+
+        let report = SessionExecutionPlane::dispatch_pending(SessionExecutionPolicy {
+            max_commands: 1_000,
+            dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+            allow_background: true,
+        });
+
+        let Some(receipt) = report
+            .dispatched
+            .iter()
+            .find(|receipt| receipt.command_id == command.command_id)
+        else {
+            let final_status = global_mission_runtime()
+                .get_session_command(&command.command_id)
+                .expect("command")
+                .status;
+            assert_ne!(
+                final_status,
+                MissionSessionCommandStatus::Pending,
+                "test command should be handled by this report or by a concurrent global dispatcher"
+            );
+            return;
+        };
+        assert_eq!(receipt.status_before, MissionSessionCommandStatus::Pending);
+        assert_eq!(receipt.status_after, MissionSessionCommandStatus::Running);
+        let turn_request = receipt.turn_request.as_ref().expect("turn request");
+        assert_eq!(turn_request.session_id, session_b);
+        assert_eq!(turn_request.command_id, command.command_id);
+        assert_eq!(turn_request.prompt, "analyze background task");
     }
 }

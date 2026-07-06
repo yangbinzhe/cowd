@@ -5,6 +5,10 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    global_conflict_arbiter, ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRelationKind {
@@ -97,6 +101,27 @@ impl SessionRelationGraph {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(relation.relation_id.clone(), relation.clone());
+        if matches!(
+            relation.kind,
+            SessionRelationKind::ConflictsWith | SessionRelationKind::Blocks
+        ) {
+            let severity = match relation.kind {
+                SessionRelationKind::Blocks => ConflictSeverity::High,
+                SessionRelationKind::ConflictsWith => ConflictSeverity::Medium,
+                _ => ConflictSeverity::Low,
+            };
+            let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
+                source: ConflictSourceKind::SessionRelation,
+                severity,
+                summary: relation.summary.clone(),
+                evidence_refs: relation.evidence_refs.clone(),
+                affected_scope: vec![
+                    format!("session:{}", relation.from_session_id),
+                    format!("session:{}", relation.to_session_id),
+                    format!("session_relation:{}", relation.relation_id),
+                ],
+            });
+        }
         Ok(relation)
     }
 
@@ -233,5 +258,26 @@ mod tests {
         });
         assert_eq!(receipt.resolved_session_id.as_deref(), Some("session-b"));
         assert_eq!(graph.projection()["relation_count"], 1);
+    }
+
+    #[test]
+    fn conflict_relation_emits_conflict_receipt() {
+        let before = global_conflict_arbiter().receipts().len();
+        let graph = SessionRelationGraph::new();
+        graph
+            .add_relation(
+                "source-session",
+                "target-session",
+                SessionRelationKind::ConflictsWith,
+                "two sessions reached incompatible decisions",
+                vec!["evidence:conflict".to_string()],
+            )
+            .expect("relation");
+        let receipts = global_conflict_arbiter().receipts();
+        assert!(receipts.len() > before);
+        assert!(receipts.iter().any(|receipt| {
+            receipt.source == ConflictSourceKind::SessionRelation
+                && receipt.summary.contains("incompatible decisions")
+        }));
     }
 }

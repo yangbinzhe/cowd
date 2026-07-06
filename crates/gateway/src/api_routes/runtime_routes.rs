@@ -404,17 +404,17 @@ pub(super) async fn get_runtime_effective_config(
 pub(super) async fn reload_runtime_providers(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    Json(crate::runtime_config_reload::reload_runtime_providers_from_disk(&state).await)
+    Json(crate::runtime_host::config_reload::reload_runtime_providers_from_disk(&state).await)
 }
 
 pub(super) async fn reload_runtime_config(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    Json(crate::runtime_config_reload::force_gateway_config_reload(&state, "manual").await)
+    Json(crate::runtime_host::config_reload::force_gateway_config_reload(&state, "manual").await)
 }
 
 pub(super) async fn get_runtime_config_reload_status() -> Json<Value> {
-    Json(crate::runtime_config_reload::status_value())
+    Json(crate::runtime_host::config_reload::status_value())
 }
 
 async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {

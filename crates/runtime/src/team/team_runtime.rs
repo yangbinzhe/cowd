@@ -6,7 +6,7 @@
 //! redefining team state.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -182,22 +182,44 @@ pub struct CollaborationRunProjection {
     pub control_actions: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TeamRuntimeRecord {
     snapshot: TeamRuntimeSnapshot,
     events: Vec<TeamRuntimeEvent>,
     next_sequence: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TeamRuntimePersistedState {
+    runs: BTreeMap<String, TeamRuntimeRecord>,
+}
+
 #[derive(Debug, Default)]
 pub struct TeamRuntimeService {
     runs: Mutex<BTreeMap<String, TeamRuntimeRecord>>,
+    state_path: Option<PathBuf>,
 }
 
 impl TeamRuntimeService {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn persistent() -> Self {
+        Self::persistent_at(team_runtime_state_path())
+    }
+
+    #[must_use]
+    fn persistent_at(state_path: PathBuf) -> Self {
+        let runs = load_team_runtime_state(&state_path)
+            .map(|state| state.runs)
+            .unwrap_or_default();
+        Self {
+            runs: Mutex::new(runs),
+            state_path: Some(state_path),
+        }
     }
 
     pub fn start(&self, request: StartTeamRuntimeRequest) -> Result<TeamRuntimeSnapshot, String> {
@@ -259,10 +281,12 @@ impl TeamRuntimeService {
             next_sequence: 0,
         };
         record.push_event("team.started", "team runtime started");
-        self.runs
+        let mut runs = self
+            .runs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(team_id, record);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runs.insert(team_id, record);
+        self.persist_runs(&runs)?;
         Ok(snapshot)
     }
 
@@ -638,6 +662,7 @@ impl TeamRuntimeService {
             "team deterministic execution summary finalized",
         );
         record.touch();
+        self.persist_runs(&runs)?;
         Ok(summary)
     }
 
@@ -724,6 +749,9 @@ impl TeamRuntimeService {
 
         if changed {
             record.touch();
+            let snapshot = record.snapshot.clone();
+            self.persist_runs(&runs)?;
+            return Ok(snapshot);
         }
         Ok(record.snapshot.clone())
     }
@@ -775,12 +803,22 @@ impl TeamRuntimeService {
             });
         }
         let message = update(record);
+        self.persist_runs(&runs)?;
         Ok(TeamRuntimeCommandReceipt {
             team_id: team_id.to_string(),
             command: command.to_string(),
             status: "accepted".to_string(),
             message,
         })
+    }
+
+    fn persist_runs(&self, runs: &BTreeMap<String, TeamRuntimeRecord>) -> Result<(), String> {
+        let Some(state_path) = &self.state_path else {
+            return Ok(());
+        };
+        let payload = serde_json::to_vec_pretty(&TeamRuntimePersistedState { runs: runs.clone() })
+            .map_err(|error| error.to_string())?;
+        write_team_runtime_state_file(state_path, &payload).map_err(|error| error.to_string())
     }
 }
 
@@ -804,7 +842,28 @@ impl TeamRuntimeRecord {
 
 pub fn global_team_runtime_service() -> &'static TeamRuntimeService {
     static SERVICE: OnceLock<TeamRuntimeService> = OnceLock::new();
-    SERVICE.get_or_init(TeamRuntimeService::new)
+    SERVICE.get_or_init(TeamRuntimeService::persistent)
+}
+
+fn team_runtime_state_path() -> PathBuf {
+    cowd_dirs::user_agents_dir()
+        .join("team-runtime")
+        .join("state.json")
+}
+
+fn load_team_runtime_state(path: &Path) -> Result<TeamRuntimePersistedState, String> {
+    if !path.exists() {
+        return Ok(TeamRuntimePersistedState::default());
+    }
+    let payload = std::fs::read(path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&payload).map_err(|error| error.to_string())
+}
+
+fn write_team_runtime_state_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, payload)
 }
 
 fn now_ms() -> u64 {
@@ -953,6 +1012,40 @@ mod tests {
     use super::*;
     use crate::CollaborationTemplateMatcher;
     use harness_contract::strategy::{decide_strategy, StrategyInput};
+
+    #[test]
+    fn persistent_team_runtime_restores_snapshot_and_events() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state_path = temp_dir.path().join("team-runtime-state.json");
+        let prompt = "coordinate implementation and review across runtime agents";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+
+        let service = TeamRuntimeService::persistent_at(state_path.clone());
+        let snapshot = service
+            .start(StartTeamRuntimeRequest {
+                session_id: "session-persisted-team-runtime".to_string(),
+                objective: prompt.to_string(),
+                collaboration_decision: decision,
+            })
+            .expect("team runtime starts");
+        service
+            .append_input(&snapshot.team_id, "persist this operator input")
+            .expect("input appended");
+
+        let restored = TeamRuntimeService::persistent_at(state_path);
+        let restored_snapshot = restored.get(&snapshot.team_id).expect("restored snapshot");
+        assert_eq!(
+            restored_snapshot.session_id,
+            "session-persisted-team-runtime"
+        );
+        assert_eq!(restored_snapshot.pending_inputs.len(), 1);
+        assert!(restored
+            .events(&snapshot.team_id)
+            .expect("events")
+            .iter()
+            .any(|event| event.event_type == "team.input_appended"));
+    }
 
     #[test]
     fn team_runtime_starts_from_collaboration_template_and_tracks_commands() {

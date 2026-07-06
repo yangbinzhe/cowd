@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.449`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.450`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -55,6 +55,113 @@ Fact/application layer
 - 非 TUI surface 不在 core workspace 编译，全部从 `cowd-edge` 按需独立构建和交付。
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据。
 - MFG 是应用层，不是 AI Harness 内核。
+
+### 1.3 当前核心闭环图
+
+当前代码已经把“模型可感知能力、Runtime 编排、Mission 控制、证据沉淀、前端投影、评测门禁”接成同一条主链路：
+
+```text
+Model / Agent
+  |
+  | system prompt + tool schema
+  |   - runtime_capabilities(detail=...)
+  |   - runtime_orchestrate(action=...)
+  v
+Gateway RuntimeHost
+  |
+  | GatewayToolExecutor 自动绑定 active session_id
+  | routes/service 只做薄编排
+  v
+Runtime AI Harness Core
+  |
+  +-- Execution Core
+  |     - execution mode catalog
+  |     - strategy matcher / ReWOO / Tool DAG / Reflexion
+  |     - model-visible action guidance
+  |
+  +-- Mission Runtime v2
+  |     - mission sessions / proxy / command queue
+  |     - WorkGraph projection
+  |     - conflict projection
+  |     - evidence projection
+  |     - steward/capability/health projection
+  |
+  +-- Team / Agent Runtime
+  |     - team templates
+  |     - role task dispatch
+  |     - agent capability binding
+  |     - mailbox / event bus / lifecycle
+  |
+  +-- Session Execution Plane
+  |     - cross-session command
+  |     - background/running/claimed lifecycle
+  |     - session relation graph
+  |
+  +-- Reality Core
+  |     - Memory: semantic recall, runtime context, experience
+  |     - Matrix: structured fact/entity/relation/evidence
+  |     - Fact Kernel: fact extraction and bridge contract
+  |
+  +-- Governance
+        - approval queue
+        - conflict arbiter
+        - event store / replay / recovery
+        - tool ledger / tool memory / budget policy
+```
+
+对外投影关系：
+
+```text
+Runtime Projection
+  |
+  +-- Gateway API
+  |     /api/runtime/*
+  |     /api/mission/*
+  |     /api/sessions/*
+  |     /api/harness-eval/*
+  |
+  +-- WebUI (cowd-edge)
+  |     Mission Control
+  |     Reality Core
+  |     Surface / Connector / Tool / Skill consoles
+  |
+  +-- TUI (core optional surface)
+  |     Gateway panel
+  |     Runtime Control Deck
+  |     Clean / Panorama terminal control
+  |
+  +-- Edge sidecars
+        message ingress / outbox / callback / health
+```
+
+### 1.4 模型主动使用 Runtime 能力的机制
+
+Cowd 不把多 Agent、团队、跨 session、审批和工具批处理硬编码成固定流程，而是把它们作为模型可感知的 Runtime 能力暴露出来：
+
+```text
+Prompt Builder
+  -> 注入 Runtime execution decision
+  -> 注入 runtime_capabilities / runtime_orchestrate 的使用说明
+  -> 注入“批量证据、并行工具、团队协同、低新颖度重规划”的策略提示
+
+Model
+  -> 普通问题：直接回答
+  -> 复杂问题：查询 runtime_capabilities
+  -> 需要编排：调用 runtime_orchestrate(action=...)
+
+Runtime
+  -> 校验 action contract
+  -> 选择 TeamTemplate / WorkGraph / session command / conflict gate
+  -> 记录 Mission Evidence 和 RuntimeEvent
+  -> 通过 Gateway 投影给 WebUI/TUI
+```
+
+关键点：
+
+- 模型看到的是“可用能力、适用场景、动作合同、降级策略”，不是一堆 UI 规则。
+- `runtime_capabilities` 是只读能力发现工具。
+- `runtime_orchestrate` 是受控编排入口，Gateway/API session 会自动绑定当前 `session_id`。
+- Runtime 最终负责校验、执行、降级和记录证据，模型不能绕过权限/审批/冲突治理。
 
 ## 2. 仓库边界
 
@@ -142,6 +249,72 @@ runtime
 ```
 
 当前实现已经把“多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复”这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。`runtime::module_map` 进一步把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
+
+#### Mission Runtime v2
+
+Mission Runtime v2 是当前多 Agent / 多 Session / 全局控制的核心投影，不再只是 session 列表：
+
+```text
+MissionProjection(schema_version=2)
+  |
+  +-- mission
+  |     sessions
+  |     proxies
+  |     session_commands
+  |
+  +-- workgraph_projection
+  |     selected template
+  |     role tasks
+  |     dependencies
+  |     ready/blocked/completed nodes
+  |
+  +-- conflict_projection
+  |     conflict receipts
+  |     severity
+  |     decision
+  |     affected scope
+  |
+  +-- evidence_projection
+  |     MissionEvidenceRef
+  |     runtime_orchestration evidence
+  |     team/session/conflict evidence
+  |
+  +-- steward_projection
+  |     steward state
+  |     scheduler ticks
+  |     approval action receipts
+  |
+  +-- capability_projection
+  |     RuntimeCapabilityCatalog
+  |     RuntimeActionContract
+  |     model-visible operation groups
+  |
+  +-- health_projection
+        readiness
+        degraded signals
+        projection freshness
+```
+
+WebUI 的 Mission Control 页面、TUI Gateway panel 和 harness-eval 都消费同一套 v2 投影，避免“能力已实现但前端看不到、测试也无法证明”的断裂。
+
+#### Agent / Team / Session 协同链路
+
+```text
+User turn / surface message
+  -> Gateway RuntimeService
+  -> ConversationRuntime
+  -> Model sees runtime_capabilities/runtime_orchestrate
+  -> RuntimeOrchestrationRequest
+  -> TeamRuntime selects template
+  -> TeamExecutionLoop creates role tasks
+  -> AgentCapabilityResolver binds tools/permissions/evidence duties
+  -> AgentMailbox / AgentLifecycle / AgentEventBus
+  -> WorkGraph + MissionEvidence + RuntimeEventStore
+  -> MissionProjection v2
+  -> WebUI/TUI control surfaces
+```
+
+当前阶段已经具备协同运行底座、任务投递、证据记录、冲突仲裁和投影闭环。更高阶的“长时间真实并行 Agent 执行、Agent 间互阅输出、自然语言全局调度、托管 Agent 汇报”仍属于后续增强方向，但不再缺核心承载位置。
 
 ### 3.3 Fact 层
 
@@ -642,6 +815,55 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 默认情况下第一条不应输出 TUI 渲染依赖；第二条不应输出平台 SDK。
 
+### 10.1 当前测试矩阵状态
+
+当前测试体系按“默认快速门禁、架构门禁、场景化门禁、真实 provider 门禁、人工/视觉门禁”分层：
+
+```text
+Default deterministic
+  cargo fmt / diff check
+  cargo check --workspace --all-targets
+  cargo test --workspace --all-targets
+  pnpm --dir ../cowd-edge/surfaces/webui test -- --run
+
+Architecture gates
+  gateway_runtimehost_architecture
+  runtime_module_architecture
+  module_map / dependency boundary checks
+
+Harness scenario gates
+  runtime ai_harness_deep_scenarios
+  runtime ai_harness_e2e
+  runtime mission_harness_e2e_eval
+  harness-eval quick/full/deep deterministic reports
+
+Surface / interactive gates
+  scripts/scenarios/*
+  tests/interactive/*
+  manual WebUI/TUI visual checks
+
+Live provider gates
+  COWD_AI_HARNESS_LIVE=1 scripts/ci/ai-harness-live-provider.sh
+  COWD_EVAL_REAL_MODEL=1 cargo test -p harness-eval real_ai_deep_scenarios -- --nocapture
+```
+
+本阶段最新全量回归证据：
+
+- `cargo fmt --all -- --check`：通过。
+- `git diff --check`：通过。
+- `cargo check --workspace --all-targets`：通过。
+- `cargo test --workspace --all-targets`：通过。
+- `pnpm --dir ../cowd-edge/surfaces/webui test -- --run`：通过。
+- 证据文件：`../plan/0706-MissionRuntime多Agent多Session智能协同闭环/evidence/全范围测试评价-证据.md`。
+
+测试治理判断：
+
+- 单元/合同测试已经覆盖核心 crate、架构边界、provider 协议、runtime 模块归属、TUI 状态和 WebUI 能力矩阵。
+- 场景化测试覆盖 Gateway/session/runtime/memory/tool permission/skill/matrix/surface 的主要黄金路径。
+- Live provider 和真实大模型评测仍是显式 opt-in，避免默认消耗 token。
+- 当前重复风险主要集中在 `scripts/scenarios/*` 与 `tests/interactive/*` 的历史手工场景；默认门禁应继续优先收敛成少量黄金路径，而不是追加相似长链路脚本。
+- 需要长期强化的测试方向是：真实多 Agent 长任务并行、跨 session 自然语言调度、surface 大量并发消息、sidecar 故障注入、provider stream 中断恢复、长期记忆污染/召回准确率。
+
 ## 11. 当前实现状态
 
 ### 11.1 已经落成的能力
@@ -662,18 +884,26 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
+- Runtime Capability Catalog 已把 execution modes、team templates、agent catalog、orchestration options、budget controls、policy gates 和 action contract 暴露为模型可感知能力。
+- `runtime_capabilities` 与 `runtime_orchestrate` 已进入 Gateway tool executor，支持无 MCP 状态执行，并能在 Gateway session 中自动绑定 `session_id`。
+- MissionProjection 已升级为 schema v2，包含 workgraph、conflict、evidence、steward、capability 和 health 投影。
+- Conflict Arbiter 已成为 Runtime 内核能力，team/session/relation 冲突可记录 conflict receipt、Mission Evidence 和 RuntimeEvent。
+- Agent Capability Resolver 已能按 role capability 绑定工具白名单、权限策略和 evidence duties。
 - Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
+- Harness Eval 已新增 `mission_runtime_collaboration_closure`，用于证明能力合同、团队模板、WorkGraph、Agent 能力绑定、跨 session 命令、冲突仲裁和 MissionProjection v2 的闭环。
 - Gateway 已提供 `session.run_projection`，从持久 `session_events` 聚合 run graph、工具时间线、token/model telemetry、memory/context 证据、team/session 状态和 risk/approval 事件；TUI 启动时会拉取该投影并在 Runtime Activity 面板展示紧凑摘要，WebUI/报告可消费同一事实源。
 - Runtime 已在 provider usage 层接入 `ModelPerformanceRegistry`，能从 `RunModelTelemetry` 聚合首 token 延迟、输出速度、真实/估算 usage、失败率和质量评分，并按 quick/standard/deep/recovery 意图生成 `ModelRouteDecision`；`runtime_capabilities` 已暴露 `model_router`，模型能看到该能力并据此选择快答、深度或恢复策略。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.449`。
+- 版本标签：`v0.9.450`。
 
 ### 11.2 是否达到当前阶段目标
 
-结论：当前代码已经达到“核心链路接线、可被 Gateway/TUI/WebUI 投影、可用 harness-eval 验证”的阶段目标，但还没有达到“完全自主、多 agent 深度协作、自我成长闭环完全成熟”的终局状态。
+结论：当前代码已经达到“核心链路接线、可被 Gateway/TUI/WebUI 投影、可用 harness-eval 验证”的阶段目标。它已经能证明当前规划中的 Mission Runtime v2、多 Agent/多 Session 协同底座、模型可感知 Runtime 编排、冲突仲裁、证据记录和前端投影闭环。
+
+它还没有达到“完全自主、多 Agent 长时间深度协作、自我成长闭环完全成熟”的终局状态。这个判断不是当前阶段失败，而是终局能力本身需要继续发展到更强的真实并行执行、长期自治、故障恢复和自我演进。
 
 更具体地说：
 

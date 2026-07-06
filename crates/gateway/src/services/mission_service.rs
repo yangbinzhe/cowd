@@ -1,8 +1,7 @@
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use super::{service_envelope, MissionService, ServiceEnvelope};
+use crate::gateway_tool_executor::GatewayToolExecutor;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct StartMissionSessionHttpRequest {
@@ -176,6 +175,10 @@ impl MissionService {
         self.envelope("relation_projection")
     }
 
+    pub(crate) fn conflict_projection_contract(&self) -> ServiceEnvelope {
+        self.envelope("conflict_projection")
+    }
+
     pub(crate) fn approval_command_contract(&self) -> ServiceEnvelope {
         self.envelope("approval_command")
     }
@@ -190,6 +193,7 @@ impl MissionService {
             self.session_control_contract(),
             self.approval_projection_contract(),
             self.relation_projection_contract(),
+            self.conflict_projection_contract(),
             self.approval_command_contract(),
             self.relation_command_contract(),
         ]
@@ -377,6 +381,13 @@ impl MissionService {
         serde_json::json!({
             "envelope": self.relation_projection_contract(),
             "relations": runtime::global_session_relation_graph().projection(),
+        })
+    }
+
+    pub(crate) fn conflicts(&self) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": self.conflict_projection_contract(),
+            "conflicts": runtime::global_conflict_arbiter().projection(),
         })
     }
 
@@ -900,15 +911,23 @@ fn spawn_provider_lifecycle_agent_for_team(
     request: &runtime::StartTeamRuntimeAgentRequest,
     model: Option<&str>,
 ) -> Result<runtime::AgentSnapshot, String> {
-    runtime::spawn_provider_agent(
-        build_spawn_request_for_team(
-            request,
-            model,
-            runtime::AgentExecutionBackendKind::InProcess,
-            None,
-        )?,
-        runtime::StaticToolExecutor::new(),
+    let runtime_state =
+        crate::runtime_bootstrap::assemble_runtime_state().map_err(|error| error.to_string())?;
+    let spawn_request = build_spawn_request_for_team(
+        request,
+        model,
+        runtime::AgentExecutionBackendKind::InProcess,
+        None,
+        &runtime_state.tool_registry,
+    )?;
+    let executor = GatewayToolExecutor::new(
+        Some(spawn_request.allowed_tools.clone()),
+        false,
+        runtime_state.tool_registry,
+        runtime_state.mcp_state,
     )
+    .with_runtime_session_id(request.session_id.clone());
+    runtime::spawn_provider_agent(spawn_request, executor)
 }
 
 fn spawn_process_jsonl_lifecycle_agent_for_team(
@@ -916,14 +935,23 @@ fn spawn_process_jsonl_lifecycle_agent_for_team(
     model: Option<&str>,
     spec: runtime::AgentProcessJsonlSpec,
 ) -> Result<runtime::AgentSnapshot, String> {
+    let runtime_state =
+        crate::runtime_bootstrap::assemble_runtime_state().map_err(|error| error.to_string())?;
     runtime::spawn_provider_agent(
         build_spawn_request_for_team(
             request,
             model,
             runtime::AgentExecutionBackendKind::ProcessJsonl,
             Some(spec),
+            &runtime_state.tool_registry,
         )?,
-        runtime::StaticToolExecutor::new(),
+        GatewayToolExecutor::new(
+            None,
+            false,
+            runtime_state.tool_registry,
+            runtime_state.mcp_state,
+        )
+        .with_runtime_session_id(request.session_id.clone()),
     )
 }
 
@@ -932,19 +960,29 @@ fn build_spawn_request_for_team(
     model: Option<&str>,
     backend: runtime::AgentExecutionBackendKind,
     process_jsonl: Option<runtime::AgentProcessJsonlSpec>,
+    tool_registry: &crate::runtime_bootstrap::GatewayToolRegistry,
 ) -> Result<runtime::SpawnAgentRequest, String> {
     let subagent_type = runtime::normalize_subagent_type(Some(&request.role_id));
     let prompt = team_role_prompt(request);
+    let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
+        role_id: request.role_id.clone(),
+        allowed_capabilities: request.allowed_tools.clone(),
+        evidence_duties: request.evidence_duties.clone(),
+    });
+    let tool_definitions = crate::filter_tool_specs(tool_registry, Some(&capability.allowed_tools));
     Ok(runtime::SpawnAgentRequest {
         description: format!("{}: {}", request.role_id, request.responsibility),
-        prompt,
+        prompt: format!(
+            "{}\nCapability binding: {}\n",
+            prompt, capability.capability_summary
+        ),
         subagent_type: Some(subagent_type.clone()),
         name: Some(format!("{}-{}", request.team_id, request.role_id)),
         model: Some(runtime::resolve_agent_model(model)),
         system_prompt: runtime::build_agent_system_prompt(&subagent_type)?,
-        allowed_tools: BTreeSet::new(),
-        tool_definitions: Vec::new(),
-        permission_policy: runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
+        allowed_tools: capability.allowed_tools,
+        tool_definitions,
+        permission_policy: capability.permission_policy,
         max_iterations: runtime::DEFAULT_AGENT_MAX_ITERATIONS,
         store_dir: None,
         backend,
@@ -1104,7 +1142,21 @@ mod tests {
             .background_session(&session_id)
             .expect("background session");
         assert_eq!(background["receipt"]["status"], "accepted");
-        assert_eq!(service.projection()["mission"]["kind"], "mission.runtime");
+        let projection = service.projection();
+        assert_eq!(projection["mission"]["kind"], "mission.runtime");
+        assert_eq!(projection["mission"]["schema_version"], 2);
+        assert_eq!(
+            projection["mission"]["workgraph_projection"]["kind"],
+            "runtime.mission_workgraphs"
+        );
+        assert_eq!(
+            projection["mission"]["conflict_projection"]["kind"],
+            "runtime.conflicts"
+        );
+        assert_eq!(
+            projection["mission"]["capability_projection"]["name"],
+            "cowd-runtime-capability-catalog"
+        );
         assert_eq!(
             service.approvals()["approvals"]["kind"],
             "runtime.global_approvals"
@@ -1113,5 +1165,51 @@ mod tests {
             service.relations()["relations"]["kind"],
             "runtime.session_relations"
         );
+        assert_eq!(
+            service.conflicts()["conflicts"]["kind"],
+            "runtime.conflicts"
+        );
+    }
+
+    #[test]
+    fn mission_team_spawn_request_binds_role_tools_and_permissions() {
+        let registry = crate::runtime_bootstrap::GatewayToolRegistry::builtin();
+        let request = runtime::StartTeamRuntimeAgentRequest {
+            team_id: "team-capability-test".to_string(),
+            session_id: "session-capability-test".to_string(),
+            objective: "implement and test a change".to_string(),
+            role_id: "implementer".to_string(),
+            responsibility: "Change code and validate it".to_string(),
+            allowed_tools: vec!["read".to_string(), "write".to_string(), "test".to_string()],
+            evidence_duties: vec!["diff_summary".to_string(), "test_results".to_string()],
+        };
+
+        let spawn = build_spawn_request_for_team(
+            &request,
+            Some("test-model"),
+            runtime::AgentExecutionBackendKind::InProcess,
+            None,
+            &registry,
+        )
+        .expect("spawn request");
+
+        assert!(spawn.allowed_tools.contains("read_file"));
+        assert!(spawn.allowed_tools.contains("write_file"));
+        assert!(spawn.allowed_tools.contains("edit_file"));
+        assert!(spawn.allowed_tools.contains("bash"));
+        assert!(!spawn.tool_definitions.is_empty());
+        assert!(spawn
+            .tool_definitions
+            .iter()
+            .any(|definition| definition.name == "write_file"));
+        assert_eq!(
+            spawn.permission_policy.active_mode(),
+            runtime::PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            spawn.permission_policy.required_mode_for("bash"),
+            runtime::PermissionMode::DangerFullAccess
+        );
+        assert!(spawn.prompt.contains("Capability binding:"));
     }
 }

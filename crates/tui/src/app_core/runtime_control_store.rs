@@ -251,6 +251,10 @@ pub struct MissionControlSummary {
     pub agent_count: u64,
     pub pending_approvals: u64,
     pub relation_count: u64,
+    pub workgraph_count: u64,
+    pub conflict_count: u64,
+    pub evidence_count: u64,
+    pub capability_action_count: u64,
     pub event_count: u64,
     pub command_pending: u64,
     pub command_claimed: u64,
@@ -824,6 +828,27 @@ impl RuntimeControlSnapshot {
                 .pointer("/relation_projection/relation_count")
                 .or_else(|| projection.pointer("/relations/relation_count"))
                 .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            workgraph_count: mission
+                .pointer("/workgraph_projection/count")
+                .or_else(|| projection.pointer("/workgraphs/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            conflict_count: mission
+                .pointer("/conflict_projection/count")
+                .or_else(|| projection.pointer("/conflicts/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            evidence_count: mission
+                .pointer("/evidence_projection/count")
+                .or_else(|| projection.pointer("/evidence/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            capability_action_count: mission
+                .pointer("/capability_projection/action_contracts")
+                .or_else(|| projection.pointer("/capabilities/action_contracts"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len() as u64)
                 .unwrap_or_default(),
             event_count: mission
                 .get("events")
@@ -2502,7 +2527,16 @@ mod tests {
                 },
                 "session_commands": [{"command_id": "a"}, {"command_id": "b"}],
                 "approval_projection": {"pending_count": 3},
-                "relation_projection": {"relation_count": 4}
+                "relation_projection": {"relation_count": 4},
+                "workgraph_projection": {"count": 2},
+                "conflict_projection": {"count": 1},
+                "evidence_projection": {"count": 5},
+                "capability_projection": {
+                    "action_contracts": [
+                        {"runtime_action": "use_team_template"},
+                        {"runtime_action": "parallel_tool_batch"}
+                    ]
+                }
             }
         }));
 
@@ -2518,6 +2552,10 @@ mod tests {
         assert_eq!(mission.agent_count, 2);
         assert_eq!(mission.pending_approvals, 3);
         assert_eq!(mission.relation_count, 4);
+        assert_eq!(mission.workgraph_count, 2);
+        assert_eq!(mission.conflict_count, 1);
+        assert_eq!(mission.evidence_count, 5);
+        assert_eq!(mission.capability_action_count, 2);
         assert_eq!(mission.event_count, 2);
         assert_eq!(mission.command_pending, 2);
         assert_eq!(mission.command_claimed, 1);
@@ -2580,6 +2618,10 @@ mod tests {
                 agent_count: 2,
                 pending_approvals: 0,
                 relation_count: 0,
+                workgraph_count: 0,
+                conflict_count: 0,
+                evidence_count: 0,
+                capability_action_count: 0,
                 event_count: 1,
                 command_pending: 0,
                 command_claimed: 0,
