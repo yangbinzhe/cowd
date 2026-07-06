@@ -9,9 +9,43 @@ pub enum AgentExecutionBackendKind {
     ProcessJsonl,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBackendCapability {
+    pub backend: AgentExecutionBackendKind,
+    pub supports_input: bool,
+    pub supports_interrupt: bool,
+    pub supports_cancel: bool,
+    pub supports_shutdown: bool,
+    pub supports_status: bool,
+    pub command_channel_attached: bool,
+    pub mode: String,
+}
+
 impl Default for AgentExecutionBackendKind {
     fn default() -> Self {
         Self::InProcess
+    }
+}
+
+impl AgentExecutionBackendKind {
+    #[must_use]
+    pub fn capability(self, command_channel_attached: bool) -> AgentBackendCapability {
+        AgentBackendCapability {
+            backend: self,
+            supports_input: command_channel_attached,
+            supports_interrupt: command_channel_attached,
+            supports_cancel: true,
+            supports_shutdown: command_channel_attached,
+            supports_status: true,
+            command_channel_attached,
+            mode: match (self, command_channel_attached) {
+                (Self::ProcessJsonl, true) => "process-jsonl-command-channel",
+                (Self::ProcessJsonl, false) => "process-jsonl-observe-only",
+                (Self::InProcess, true) => "in-process-command-channel",
+                (Self::InProcess, false) => "in-process-one-shot",
+            }
+            .to_string(),
+        }
     }
 }
 

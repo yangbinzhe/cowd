@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cowd_dirs, global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_mailbox,
     global_mission_evidence_bus, global_runtime_control_plane, AgentLifecycleEvent,
-    AgentProgressEvent, AgentSnapshot, AgentTask, CollaborationDecision, CollaborationPlan,
+    AgentProgressEvent, AgentSnapshot, AgentTask, AgentTaskCompletionReceipt,
+    AgentTaskQualityStatus, AgentTaskStatus, CollaborationDecision, CollaborationPlan,
     CollaborationTemplateId, MissionEvidenceRef,
 };
 
@@ -162,6 +163,8 @@ pub struct CollaborationAgentRunProjection {
     pub role_id: String,
     pub agent_id: Option<String>,
     pub status: TeamRuntimeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_capability: Option<crate::AgentBackendCapability>,
     pub latest_summary: Option<String>,
     pub output_file: Option<String>,
     pub evidence_refs: Vec<String>,
@@ -448,6 +451,9 @@ impl TeamRuntimeService {
                     role_id: agent.role_id.clone(),
                     agent_id: agent.agent_id.clone(),
                     status: agent.status.clone(),
+                    backend_capability: agent.agent_id.as_deref().and_then(|agent_id| {
+                        global_agent_lifecycle_service().command_capability(agent_id)
+                    }),
                     latest_summary: agent.latest_summary.clone(),
                     output_file: agent
                         .agent_id
@@ -461,11 +467,15 @@ impl TeamRuntimeService {
                 }
             })
             .collect::<Vec<_>>();
-        let synthesis_ready = !agent_runs.is_empty()
-            && agent_runs.iter().all(|agent| {
-                agent.status.is_terminal() || agent.status == TeamRuntimeStatus::Running
-            })
-            && (!team_tasks.is_empty() || !mission_evidence.is_empty());
+        let synthesis_ready = !team_tasks.is_empty()
+            && team_tasks
+                .iter()
+                .filter(|task| {
+                    team.agents
+                        .iter()
+                        .any(|agent| agent.role_id == task.role_id)
+                })
+                .all(|task| task.status == AgentTaskStatus::Completed);
         let mut control_actions = vec![
             "inspect".to_string(),
             "synthesis".to_string(),
@@ -664,6 +674,86 @@ impl TeamRuntimeService {
         record.touch();
         self.persist_runs(&runs)?;
         Ok(summary)
+    }
+
+    pub fn apply_agent_task_outcome(
+        &self,
+        receipt: &AgentTaskCompletionReceipt,
+    ) -> Result<TeamRuntimeCommandReceipt, String> {
+        self.with_record(&receipt.team_id, "agent_task_outcome", |record| {
+            if let Some(agent) = record
+                .snapshot
+                .agents
+                .iter_mut()
+                .find(|agent| agent.role_id == receipt.role_id)
+            {
+                agent.status = team_status_from_task_status(receipt.status);
+                if let Some(outcome) = &receipt.outcome {
+                    agent.latest_summary = Some(outcome.result_summary.clone());
+                }
+            }
+            if receipt.status == AgentTaskStatus::Failed {
+                let message = receipt
+                    .outcome
+                    .as_ref()
+                    .map(|outcome| outcome.result_summary.clone())
+                    .unwrap_or_else(|| receipt.message.clone());
+                record
+                    .snapshot
+                    .review_notes
+                    .push(format!("{} failed: {message}", receipt.role_id));
+            }
+            let team_tasks = global_agent_task_mailbox().list_for_team(&receipt.team_id);
+            let all_role_tasks_terminal = !team_tasks.is_empty()
+                && record.snapshot.agents.iter().all(|agent| {
+                    team_tasks
+                        .iter()
+                        .find(|task| task.role_id == agent.role_id)
+                        .is_some_and(|task| {
+                            matches!(
+                                task.status,
+                                AgentTaskStatus::Completed
+                                    | AgentTaskStatus::Failed
+                                    | AgentTaskStatus::Cancelled
+                            )
+                        })
+                });
+            if all_role_tasks_terminal {
+                let has_failure = team_tasks.iter().any(|task| {
+                    matches!(
+                        task.status,
+                        AgentTaskStatus::Failed | AgentTaskStatus::Cancelled
+                    ) || task.outcome.as_ref().is_some_and(|outcome| {
+                        matches!(
+                            outcome.quality_status,
+                            AgentTaskQualityStatus::Failed | AgentTaskQualityStatus::Degraded
+                        )
+                    })
+                });
+                record.snapshot.status = if has_failure {
+                    TeamRuntimeStatus::ReviewRequested
+                } else {
+                    TeamRuntimeStatus::Completed
+                };
+                let mut summary = build_execution_summary(&record.snapshot);
+                if has_failure {
+                    summary.review_required = true;
+                    summary.review_reason =
+                        Some("one or more agent task outcomes require review".to_string());
+                }
+                record.snapshot.execution_summary = Some(summary);
+            }
+            record.touch();
+            record.push_event(
+                "team.agent_task_outcome",
+                format!(
+                    "agent task {} recorded as {}",
+                    receipt.task_id,
+                    task_status_label(receipt.status)
+                ),
+            );
+            "agent task outcome applied to team runtime".to_string()
+        })
     }
 
     pub fn refresh_from_agent_lifecycle(
@@ -976,6 +1066,27 @@ fn team_status_from_agent_status(status: &str) -> TeamRuntimeStatus {
         "cancelled" | "canceled" => TeamRuntimeStatus::Cancelled,
         "queued" | "planned" => TeamRuntimeStatus::Planned,
         _ => TeamRuntimeStatus::Running,
+    }
+}
+
+fn team_status_from_task_status(status: AgentTaskStatus) -> TeamRuntimeStatus {
+    match status {
+        AgentTaskStatus::Pending => TeamRuntimeStatus::Planned,
+        AgentTaskStatus::Claimed | AgentTaskStatus::Running => TeamRuntimeStatus::Running,
+        AgentTaskStatus::Completed => TeamRuntimeStatus::Completed,
+        AgentTaskStatus::Failed => TeamRuntimeStatus::Failed,
+        AgentTaskStatus::Cancelled => TeamRuntimeStatus::Cancelled,
+    }
+}
+
+fn task_status_label(status: AgentTaskStatus) -> &'static str {
+    match status {
+        AgentTaskStatus::Pending => "pending",
+        AgentTaskStatus::Claimed => "claimed",
+        AgentTaskStatus::Running => "running",
+        AgentTaskStatus::Completed => "completed",
+        AgentTaskStatus::Failed => "failed",
+        AgentTaskStatus::Cancelled => "cancelled",
     }
 }
 

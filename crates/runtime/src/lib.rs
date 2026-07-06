@@ -264,8 +264,9 @@ pub use agent::{
     SubAgentResult, SubAgentToolMode,
 };
 pub use agent_backend::{
-    AgentExecutionBackendKind, AgentExecutionCommand, AgentExecutionCommandKind,
-    AgentExecutionCommandReceipt, AgentExecutionEventEnvelope, AgentProcessJsonlSpec,
+    AgentBackendCapability, AgentExecutionBackendKind, AgentExecutionCommand,
+    AgentExecutionCommandKind, AgentExecutionCommandReceipt, AgentExecutionEventEnvelope,
+    AgentProcessJsonlSpec,
 };
 pub use agent_capability::{
     resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
@@ -289,8 +290,8 @@ pub use agent_lifecycle::{
     DEFAULT_AGENT_MODEL, DEFAULT_AGENT_SYSTEM_DATE,
 };
 pub use agent_mailbox::{
-    global_agent_task_mailbox, AgentTask, AgentTaskMailboxService, AgentTaskReceipt,
-    AgentTaskStatus,
+    global_agent_task_mailbox, AgentTask, AgentTaskCompletionReceipt, AgentTaskMailboxService,
+    AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskReceipt, AgentTaskStatus,
 };
 pub use agent_protocol::{
     AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
@@ -570,7 +571,7 @@ pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
 pub use team_execution::{
     CollaborationTemplateRuntimeSpec, TeamExecutionDependency, TeamExecutionLoop,
-    TeamExecutionPlan, TeamExecutionReport, TeamExecutionRoleSpec,
+    TeamExecutionPlan, TeamExecutionReport, TeamExecutionRoleSpec, TeamSynthesisPacket,
 };
 pub use team_runtime::{
     global_team_runtime_service, CollaborationAgentRunProjection, CollaborationRunProjection,

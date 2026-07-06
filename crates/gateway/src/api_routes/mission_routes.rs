@@ -15,7 +15,8 @@ use crate::services::{
     InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
     MissionTeamHandoffHttpRequest, RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest,
     StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    SubmitAgentTaskOutcomeHttpRequest, SubmitMissionApprovalHttpRequest,
+    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 use memory::SessionRecord;
 
@@ -64,6 +65,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/mission/control/teams/:team_id/execution",
             get(team_execution_plan_handler).post(tick_team_execution_handler),
+        )
+        .route(
+            "/api/mission/control/teams/:team_id/tasks/:task_id/outcome",
+            post(submit_agent_task_outcome_handler),
         )
         .route(
             "/api/mission/control/teams/:team_id/evidence",
@@ -421,6 +426,19 @@ async fn tick_team_execution_handler(
         .services
         .mission
         .tick_team_execution(&team_id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn submit_agent_task_outcome_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((team_id, task_id)): Path<(String, String)>,
+    Json(body): Json<SubmitAgentTaskOutcomeHttpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .submit_agent_task_outcome(&team_id, &task_id, body)
         .map(Json)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }

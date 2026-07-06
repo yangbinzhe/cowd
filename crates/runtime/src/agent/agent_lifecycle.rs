@@ -221,6 +221,20 @@ impl AgentLifecycleService {
             .map(|record| record.events.clone())
     }
 
+    #[must_use]
+    pub fn command_capability(&self, agent_id: &str) -> Option<crate::AgentBackendCapability> {
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .map(|record| {
+                record
+                    .snapshot
+                    .backend
+                    .capability(record.command_tx.is_some())
+            })
+    }
+
     pub fn cancel(&self, agent_id: &str) -> Result<AgentCommandReceipt, String> {
         let mut agents = self
             .agents
@@ -321,7 +335,27 @@ impl AgentLifecycleService {
     }
 
     pub fn projection(&self) -> serde_json::Value {
-        let agents = self.list();
+        let records = self
+            .agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let agents = records
+            .values()
+            .map(|record| {
+                let mut value = serde_json::to_value(&record.snapshot)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "backend_capability".to_string(),
+                        serde_json::json!(record
+                            .snapshot
+                            .backend
+                            .capability(record.command_tx.is_some())),
+                    );
+                }
+                value
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
             "kind": "runtime.agents",
             "count": agents.len(),

@@ -55,8 +55,8 @@ pub(crate) use mission_service::{
     DecideMissionApprovalHttpRequest, InterruptMissionStewardHttpRequest,
     MissionSessionCommandConsumeMode, MissionTeamExecutionMode, MissionTeamHandoffHttpRequest,
     RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
-    StartMissionTeamRuntimeHttpRequest, SubmitMissionApprovalHttpRequest,
-    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    StartMissionTeamRuntimeHttpRequest, SubmitAgentTaskOutcomeHttpRequest,
+    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};

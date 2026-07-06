@@ -790,6 +790,7 @@ fn route_to_agent(
         context_refs,
         evidence_refs: command.evidence_refs.clone(),
         status: AgentTaskStatus::Pending,
+        outcome: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

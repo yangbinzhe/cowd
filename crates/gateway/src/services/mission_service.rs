@@ -37,6 +37,19 @@ pub(crate) struct MissionTeamHandoffHttpRequest {
     pub(crate) note: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SubmitAgentTaskOutcomeHttpRequest {
+    pub(crate) result_summary: String,
+    #[serde(default)]
+    pub(crate) evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub(crate) conflicts: Vec<String>,
+    #[serde(default)]
+    pub(crate) suggested_next_actions: Vec<String>,
+    #[serde(default)]
+    pub(crate) quality_status: runtime::AgentTaskQualityStatus,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MissionTeamExecutionMode {
@@ -280,6 +293,42 @@ impl MissionService {
             "kind": "mission_control.team_execution_tick",
             "ok": report.errors.is_empty(),
             "report": report,
+            "projection": runtime::MissionControlRuntime::projection(),
+        }))
+    }
+
+    pub(crate) fn submit_agent_task_outcome(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        request: SubmitAgentTaskOutcomeHttpRequest,
+    ) -> Result<serde_json::Value, String> {
+        let task = runtime::global_agent_task_mailbox()
+            .get(task_id)
+            .ok_or_else(|| format!("agent task not found: {task_id}"))?;
+        if task.team_id != team_id {
+            return Err(format!(
+                "agent task {task_id} belongs to team {}, not {team_id}",
+                task.team_id
+            ));
+        }
+        let report = runtime::TeamExecutionLoop::ingest_agent_outcome(
+            task_id,
+            runtime::AgentTaskOutcome {
+                result_summary: request.result_summary,
+                evidence_refs: request.evidence_refs,
+                conflicts: request.conflicts,
+                suggested_next_actions: request.suggested_next_actions,
+                quality_status: request.quality_status,
+                completed_at_ms: 0,
+            },
+        )?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.agent_task_outcome",
+            "ok": report.errors.is_empty(),
+            "report": report,
+            "run": runtime::global_team_runtime_service().collaboration_run(team_id).ok(),
             "projection": runtime::MissionControlRuntime::projection(),
         }))
     }
@@ -1220,5 +1269,56 @@ mod tests {
             runtime::PermissionMode::DangerFullAccess
         );
         assert!(spawn.prompt.contains("Capability binding:"));
+    }
+
+    #[test]
+    fn mission_service_accepts_agent_task_outcome_and_projects_synthesis() {
+        let service = MissionService::new();
+        let session_id = format!("mission-task-outcome-{}", uuid::Uuid::new_v4());
+        service
+            .start_session(StartMissionSessionHttpRequest {
+                title: "task outcome".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+        let started = service
+            .start_team_runtime(
+                &session_id,
+                StartMissionTeamRuntimeHttpRequest {
+                    objective: "answer one delegated question".to_string(),
+                    model: None,
+                    execution_mode: MissionTeamExecutionMode::RegisterOnly,
+                },
+            )
+            .expect("team");
+        let team_id = started["team"]["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+        let plan = runtime::TeamExecutionLoop::plan(&team_id).expect("plan");
+        let task = plan.tasks[0].clone();
+        runtime::global_agent_task_mailbox().assign(task.clone());
+
+        let response = service
+            .submit_agent_task_outcome(
+                &team_id,
+                &task.task_id,
+                SubmitAgentTaskOutcomeHttpRequest {
+                    result_summary: "completed via gateway outcome API".to_string(),
+                    evidence_refs: vec!["evidence:gateway-outcome".to_string()],
+                    conflicts: Vec::new(),
+                    suggested_next_actions: vec!["synthesize".to_string()],
+                    quality_status: runtime::AgentTaskQualityStatus::Accepted,
+                },
+            )
+            .expect("outcome");
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["report"]["completion_receipts"][0]["status"].as_str(),
+            Some("completed")
+        );
+        assert_eq!(response["report"]["synthesis_ready"], true);
+        assert_eq!(response["run"]["synthesis_ready"], true);
     }
 }

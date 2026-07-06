@@ -30,6 +30,8 @@ pub struct AgentTask {
     pub context_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub status: AgentTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AgentTaskOutcome>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -38,9 +40,56 @@ pub struct AgentTask {
 pub struct AgentTaskReceipt {
     pub task_id: String,
     pub team_id: String,
+    pub session_id: String,
+    pub role_id: String,
     pub agent_id: Option<String>,
     pub status: AgentTaskStatus,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskQualityStatus {
+    Accepted,
+    NeedsReview,
+    Degraded,
+    Failed,
+}
+
+impl Default for AgentTaskQualityStatus {
+    fn default() -> Self {
+        Self::Accepted
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskOutcome {
+    pub result_summary: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub suggested_next_actions: Vec<String>,
+    #[serde(default)]
+    pub quality_status: AgentTaskQualityStatus,
+    #[serde(default)]
+    pub completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskCompletionReceipt {
+    pub task_id: String,
+    pub team_id: String,
+    pub session_id: String,
+    pub role_id: String,
+    pub agent_id: Option<String>,
+    pub status: AgentTaskStatus,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AgentTaskOutcome>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +116,8 @@ impl AgentTaskMailboxService {
         let receipt = AgentTaskReceipt {
             task_id: task.task_id.clone(),
             team_id: task.team_id.clone(),
+            session_id: task.session_id.clone(),
+            role_id: task.role_id.clone(),
             agent_id: task.agent_id.clone(),
             status: task.status,
             message: "agent task assigned".to_string(),
@@ -101,10 +152,73 @@ impl AgentTaskMailboxService {
         Ok(AgentTaskReceipt {
             task_id: task.task_id,
             team_id: task.team_id,
+            session_id: task.session_id,
+            role_id: task.role_id,
             agent_id: task.agent_id,
             status,
             message,
         })
+    }
+
+    pub fn complete(
+        &self,
+        task_id: &str,
+        mut outcome: AgentTaskOutcome,
+    ) -> Result<AgentTaskCompletionReceipt, String> {
+        if outcome.result_summary.trim().is_empty() {
+            return Err("agent task outcome summary must not be empty".to_string());
+        }
+        if outcome.completed_at_ms == 0 {
+            outcome.completed_at_ms = now_ms();
+        }
+        self.finish(
+            task_id,
+            AgentTaskStatus::Completed,
+            "agent task completed",
+            Some(outcome),
+        )
+    }
+
+    pub fn fail(
+        &self,
+        task_id: &str,
+        message: impl Into<String>,
+        evidence_refs: Vec<String>,
+        conflicts: Vec<String>,
+    ) -> Result<AgentTaskCompletionReceipt, String> {
+        let message = message.into();
+        self.finish(
+            task_id,
+            AgentTaskStatus::Failed,
+            message.clone(),
+            Some(AgentTaskOutcome {
+                result_summary: message,
+                evidence_refs,
+                conflicts,
+                suggested_next_actions: vec![
+                    "inspect_failure".to_string(),
+                    "retry_or_replan".to_string(),
+                ],
+                quality_status: AgentTaskQualityStatus::Failed,
+                completed_at_ms: now_ms(),
+            }),
+        )
+    }
+
+    pub fn cancel(
+        &self,
+        task_id: &str,
+        message: impl Into<String>,
+    ) -> Result<AgentTaskCompletionReceipt, String> {
+        self.finish(task_id, AgentTaskStatus::Cancelled, message, None)
+    }
+
+    pub fn get(&self, task_id: &str) -> Option<AgentTask> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .cloned()
     }
 
     #[must_use]
@@ -127,6 +241,45 @@ impl AgentTaskMailboxService {
             .filter(|task| task.agent_id.as_deref() == Some(agent_id))
             .cloned()
             .collect()
+    }
+
+    fn finish(
+        &self,
+        task_id: &str,
+        status: AgentTaskStatus,
+        message: impl Into<String>,
+        outcome: Option<AgentTaskOutcome>,
+    ) -> Result<AgentTaskCompletionReceipt, String> {
+        let message = message.into();
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("agent task not found: {task_id}"))?;
+        task.status = status;
+        task.updated_at_ms = now_ms();
+        if let Some(outcome) = outcome {
+            task.evidence_refs.extend(outcome.evidence_refs.clone());
+            task.evidence_refs.sort();
+            task.evidence_refs.dedup();
+            task.outcome = Some(outcome);
+        }
+        let task = task.clone();
+        drop(tasks);
+        record_task_event(&task, format!("agent_task.{}", status_label(status)));
+        Ok(AgentTaskCompletionReceipt {
+            task_id: task.task_id,
+            team_id: task.team_id,
+            session_id: task.session_id,
+            role_id: task.role_id,
+            agent_id: task.agent_id,
+            status,
+            message,
+            outcome: task.outcome,
+            evidence_refs: task.evidence_refs,
+        })
     }
 }
 

@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_mailbox,
     global_conflict_arbiter, global_mission_evidence_bus, global_team_runtime_service,
-    AgentExecutionCommandKind, AgentProgressEvent, AgentTask, AgentTaskStatus,
-    CollaborationTemplateId, ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
-    MissionEvidenceRef, TeamRuntimeSnapshot,
+    AgentExecutionCommandKind, AgentProgressEvent, AgentTask, AgentTaskCompletionReceipt,
+    AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus, CollaborationTemplateId,
+    ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind, MissionEvidenceRef,
+    TeamRuntimeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +73,24 @@ pub struct TeamExecutionReport {
     pub running_node_ids: Vec<String>,
     pub completed_node_ids: Vec<String>,
     pub blocked_node_ids: Vec<String>,
+    pub review_ready: bool,
+    pub synthesis_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_packet: Option<TeamSynthesisPacket>,
+    #[serde(default)]
+    pub completion_receipts: Vec<AgentTaskCompletionReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamSynthesisPacket {
+    pub team_id: String,
+    pub session_id: String,
+    pub objective: String,
+    pub status: String,
+    pub task_outcomes: Vec<AgentTaskOutcome>,
+    pub evidence_refs: Vec<String>,
+    pub suggested_next_actions: Vec<String>,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +129,7 @@ impl TeamExecutionLoop {
                         context_refs: vec![format!("team:{}", team.team_id)],
                         evidence_refs: agent.evidence_duties.clone(),
                         status: AgentTaskStatus::Pending,
+                        outcome: None,
                         created_at_ms: 0,
                         updated_at_ms: 0,
                     })
@@ -199,21 +219,54 @@ impl TeamExecutionLoop {
                     "context_refs": assigned.context_refs,
                     "evidence_refs": assigned.evidence_refs,
                 });
-                match global_agent_lifecycle_service().command(
-                    agent_id,
-                    AgentExecutionCommandKind::Input,
-                    Some(payload),
-                ) {
-                    Ok(_) => {
-                        delivered_agent_inputs = delivered_agent_inputs.saturating_add(1);
-                        let _ = global_agent_task_mailbox().set_status(
-                            &assigned.task_id,
-                            AgentTaskStatus::Running,
-                            "task delivered to agent",
+                match global_agent_lifecycle_service().command_capability(agent_id) {
+                    Some(capability) if !capability.supports_input => {
+                        let message = format!(
+                            "agent backend {} does not support runtime input",
+                            capability.mode
                         );
+                        errors.push(format!("{}: {message}", assigned.task_id));
+                        if let Ok(receipt) = global_agent_task_mailbox().fail(
+                            &assigned.task_id,
+                            message.clone(),
+                            vec![format!("agent:{}", agent_id)],
+                            vec![message],
+                        ) {
+                            let _ =
+                                global_team_runtime_service().apply_agent_task_outcome(&receipt);
+                        }
                     }
-                    Err(error) => {
-                        errors.push(format!("{}: {error}", assigned.task_id));
+                    Some(_) => {
+                        match global_agent_lifecycle_service().command(
+                            agent_id,
+                            AgentExecutionCommandKind::Input,
+                            Some(payload),
+                        ) {
+                            Ok(_) => {
+                                delivered_agent_inputs = delivered_agent_inputs.saturating_add(1);
+                                let _ = global_agent_task_mailbox().set_status(
+                                    &assigned.task_id,
+                                    AgentTaskStatus::Running,
+                                    "task delivered to agent",
+                                );
+                            }
+                            Err(error) => {
+                                errors.push(format!("{}: {error}", assigned.task_id));
+                                if let Ok(receipt) = global_agent_task_mailbox().fail(
+                                    &assigned.task_id,
+                                    format!("agent command delivery degraded: {error}"),
+                                    vec![format!("agent:{}", agent_id)],
+                                    vec![error],
+                                ) {
+                                    let _ = global_team_runtime_service()
+                                        .apply_agent_task_outcome(&receipt);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let message = format!("agent {agent_id} not found");
+                        errors.push(format!("{}: {message}", assigned.task_id));
                     }
                 }
             }
@@ -236,6 +289,11 @@ impl TeamExecutionLoop {
         }
 
         let final_plan = Self::plan(team_id)?;
+        let synthesis_packet = synthesis_packet_for_plan(&final_plan);
+        evidence.extend(record_review_and_synthesis_evidence(
+            &final_plan,
+            synthesis_packet.as_ref(),
+        ));
         if !final_plan.blocked_node_ids.is_empty() {
             let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
                 source: ConflictSourceKind::WorkGraph,
@@ -273,7 +331,72 @@ impl TeamExecutionLoop {
                 harness_contract::workgraph::WorkNodeStatus::Completed,
             ),
             blocked_node_ids: final_plan.blocked_node_ids,
+            review_ready: synthesis_packet.is_some(),
+            synthesis_ready: synthesis_packet.is_some(),
+            synthesis_packet,
+            completion_receipts: Vec::new(),
         })
+    }
+
+    pub fn ingest_agent_outcome(
+        task_id: &str,
+        outcome: AgentTaskOutcome,
+    ) -> Result<TeamExecutionReport, String> {
+        let receipt = global_agent_task_mailbox().complete(task_id, outcome)?;
+        global_team_runtime_service().apply_agent_task_outcome(&receipt)?;
+        let progress = global_agent_event_bus().push(AgentProgressEvent {
+            event_id: String::new(),
+            team_id: receipt.team_id.clone(),
+            session_id: receipt.session_id.clone(),
+            agent_id: receipt.agent_id.clone(),
+            role_id: receipt.role_id.clone(),
+            task_id: Some(receipt.task_id.clone()),
+            event_type: "agent.task.completed".to_string(),
+            message: receipt
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.result_summary.clone())
+                .unwrap_or_else(|| receipt.message.clone()),
+            evidence_refs: receipt.evidence_refs.clone(),
+            created_at_ms: 0,
+        });
+        let task_evidence = global_mission_evidence_bus().record(MissionEvidenceRef {
+            evidence_id: String::new(),
+            mission_id: Some("mission-control".to_string()),
+            session_id: receipt.session_id.clone(),
+            team_id: Some(receipt.team_id.clone()),
+            agent_id: receipt.agent_id.clone(),
+            kind: "agent_task_outcome".to_string(),
+            summary: progress.message.clone(),
+            source_ref: Some(receipt.task_id.clone()),
+            created_at_ms: 0,
+        });
+        if let Some(outcome) = &receipt.outcome {
+            for conflict in &outcome.conflicts {
+                let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
+                    source: ConflictSourceKind::AgentReturn,
+                    severity: match outcome.quality_status {
+                        AgentTaskQualityStatus::Failed => ConflictSeverity::High,
+                        AgentTaskQualityStatus::Degraded | AgentTaskQualityStatus::NeedsReview => {
+                            ConflictSeverity::Medium
+                        }
+                        AgentTaskQualityStatus::Accepted => ConflictSeverity::Low,
+                    },
+                    summary: conflict.clone(),
+                    evidence_refs: receipt.evidence_refs.clone(),
+                    affected_scope: vec![
+                        format!("session:{}", receipt.session_id),
+                        format!("team:{}", receipt.team_id),
+                        format!("task:{}", receipt.task_id),
+                    ],
+                });
+            }
+        }
+        let mut report = Self::tick_ready(&receipt.team_id)?;
+        report.events.push(progress);
+        report.evidence.push(task_evidence);
+        report.completion_receipts.push(receipt);
+        Ok(report)
     }
 }
 
@@ -418,6 +541,92 @@ fn graph_nodes_with_status(
         .collect()
 }
 
+fn synthesis_packet_for_plan(plan: &TeamExecutionPlan) -> Option<TeamSynthesisPacket> {
+    if plan.tasks.is_empty()
+        || !plan
+            .tasks
+            .iter()
+            .all(|task| task.status == AgentTaskStatus::Completed && task.outcome.is_some())
+    {
+        return None;
+    }
+    let task_outcomes = plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.outcome.clone())
+        .collect::<Vec<_>>();
+    let evidence_refs = plan
+        .tasks
+        .iter()
+        .flat_map(|task| task.evidence_refs.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let suggested_next_actions = task_outcomes
+        .iter()
+        .flat_map(|outcome| outcome.suggested_next_actions.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Some(TeamSynthesisPacket {
+        team_id: plan.team_id.clone(),
+        session_id: plan.session_id.clone(),
+        objective: plan.objective.clone(),
+        status: "ready_for_synthesis".to_string(),
+        task_outcomes,
+        evidence_refs,
+        suggested_next_actions,
+        created_at_ms: now_ms(),
+    })
+}
+
+fn record_review_and_synthesis_evidence(
+    plan: &TeamExecutionPlan,
+    packet: Option<&TeamSynthesisPacket>,
+) -> Vec<MissionEvidenceRef> {
+    let Some(packet) = packet else {
+        return Vec::new();
+    };
+    let existing_sources = global_mission_evidence_bus()
+        .list_for_team(&plan.team_id)
+        .into_iter()
+        .filter_map(|item| item.source_ref)
+        .collect::<BTreeSet<_>>();
+    let mut evidence = Vec::new();
+    for (kind, source_ref, summary) in [
+        (
+            "team_review_ready",
+            format!("team:{}:review_ready", plan.team_id),
+            format!("team {} has completed upstream agent tasks", plan.team_id),
+        ),
+        (
+            "team_synthesis_ready",
+            format!("team:{}:synthesis_ready", plan.team_id),
+            format!(
+                "team {} synthesis packet is ready with {} task outcomes",
+                plan.team_id,
+                packet.task_outcomes.len()
+            ),
+        ),
+    ] {
+        if existing_sources.contains(&source_ref) {
+            continue;
+        }
+        evidence.push(global_mission_evidence_bus().record(MissionEvidenceRef {
+            evidence_id: String::new(),
+            mission_id: Some("mission-control".to_string()),
+            session_id: plan.session_id.clone(),
+            team_id: Some(plan.team_id.clone()),
+            agent_id: None,
+            kind: kind.to_string(),
+            summary,
+            source_ref: Some(source_ref),
+            created_at_ms: 0,
+        }));
+    }
+    evidence
+}
+
 fn make_task_id(team_id: &str, role_id: &str) -> String {
     format!("agent-task-{}-{}", stable_id(team_id), stable_id(role_id))
 }
@@ -438,6 +647,13 @@ fn stable_id(value: &str) -> String {
         })
         .collect::<String>();
     normalized.trim_matches('-').to_string()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn runtime_spec_for(team: &TeamRuntimeSnapshot) -> CollaborationTemplateRuntimeSpec {
@@ -503,7 +719,8 @@ fn runtime_spec_for(team: &TeamRuntimeSnapshot) -> CollaborationTemplateRuntimeS
 mod tests {
     use super::*;
     use crate::{
-        CollaborationTemplateMatcher, StartMissionSessionRequest, StartTeamRuntimeRequest,
+        AgentExecutionBackendKind, AgentSnapshot, CancellationToken, CollaborationTemplateMatcher,
+        StartMissionSessionRequest, StartTeamRuntimeRequest,
     };
     use harness_contract::strategy::{decide_strategy, StrategyInput};
 
@@ -648,5 +865,137 @@ mod tests {
             .iter()
             .any(|receipt| receipt.source == ConflictSourceKind::WorkGraph
                 && receipt.summary.contains("blocked nodes")));
+    }
+
+    #[test]
+    fn agent_outcome_ingestion_builds_synthesis_packet_and_evidence() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("team-outcome-session-{suffix}");
+        crate::global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "team outcome ingestion".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+        let prompt = "answer a simple delegated question";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let team = global_team_runtime_service()
+            .start(StartTeamRuntimeRequest {
+                session_id,
+                objective: prompt.to_string(),
+                collaboration_decision: decision,
+            })
+            .expect("team");
+
+        let first = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
+        assert_eq!(first.assigned_task_count, 1);
+        let task = global_agent_task_mailbox()
+            .list_for_team(&team.team_id)
+            .into_iter()
+            .next()
+            .expect("assigned task");
+        let report = TeamExecutionLoop::ingest_agent_outcome(
+            &task.task_id,
+            AgentTaskOutcome {
+                result_summary: "role completed with evidence".to_string(),
+                evidence_refs: vec!["evidence:role-output".to_string()],
+                conflicts: Vec::new(),
+                suggested_next_actions: vec!["synthesize".to_string()],
+                quality_status: AgentTaskQualityStatus::Accepted,
+                completed_at_ms: 0,
+            },
+        )
+        .expect("ingest outcome");
+
+        assert!(report.synthesis_ready);
+        assert!(report.review_ready);
+        assert_eq!(
+            report
+                .synthesis_packet
+                .as_ref()
+                .expect("synthesis packet")
+                .task_outcomes
+                .len(),
+            1
+        );
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.kind == "team_synthesis_ready"));
+        let run = global_team_runtime_service()
+            .collaboration_run(&team.team_id)
+            .expect("run");
+        assert!(run.synthesis_ready);
+    }
+
+    #[test]
+    fn commandless_agent_backend_records_degraded_task_receipt() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("team-degraded-session-{suffix}");
+        crate::global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "team degraded backend".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+        let prompt = "implement feature then review";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let team = global_team_runtime_service()
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id,
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| {
+                    let agent_id = format!("agent-commandless-{}-{}", request.role_id, suffix);
+                    let snapshot = AgentSnapshot {
+                        agent_id: agent_id.clone(),
+                        name: request.role_id.clone(),
+                        description: request.responsibility.clone(),
+                        subagent_type: Some("Explore".to_string()),
+                        model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
+                        status: "running".to_string(),
+                        backend: AgentExecutionBackendKind::InProcess,
+                        output_file: String::new(),
+                        manifest_file: String::new(),
+                        created_at: "1".to_string(),
+                        started_at: Some("1".to_string()),
+                        completed_at: None,
+                        lane_events: Vec::new(),
+                        current_blocker: None,
+                        derived_state: "working".to_string(),
+                        error: None,
+                    };
+                    crate::global_agent_lifecycle_service()
+                        .register_started(snapshot.clone(), CancellationToken::new());
+                    Ok(snapshot)
+                },
+            )
+            .expect("team");
+
+        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
+        assert_eq!(report.assigned_task_count, 1);
+        assert!(!report.errors.is_empty());
+        let task = global_agent_task_mailbox()
+            .list_for_team(&team.team_id)
+            .into_iter()
+            .next()
+            .expect("task");
+        assert_eq!(task.status, AgentTaskStatus::Failed);
+        assert_eq!(
+            task.outcome.as_ref().expect("outcome").quality_status,
+            AgentTaskQualityStatus::Failed
+        );
+        let run = global_team_runtime_service()
+            .collaboration_run(&team.team_id)
+            .expect("run");
+        let capability = run.agent_runs[0]
+            .backend_capability
+            .as_ref()
+            .expect("backend capability");
+        assert!(!capability.supports_input);
     }
 }
