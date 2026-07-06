@@ -8,11 +8,12 @@ use serde_json::Value;
 
 use crate::{
     evaluate_report_gate,
+    real_provider_runner::run_deep_real_provider_review,
     report::{
         HarnessEvalReportDetail, HarnessEvalReportSummary, HarnessEvalRunRecord,
         HarnessEvalUsageSummary,
     },
-    StableAiHealthReport,
+    HarnessEvalRunnerOptions, StableAiHealthReport,
 };
 
 const FULL_ANALYSIS_REPORT_TEMPLATE: &str =
@@ -167,7 +168,7 @@ impl HarnessEvalReportStore {
         .map_err(|error| error.to_string())?;
         fs::write(
             run_dir.join("full-analysis-report.md"),
-            render_full_analysis_placeholder(report),
+            render_full_analysis_report(report),
         )
         .map_err(|error| error.to_string())?;
         fs::write(
@@ -304,6 +305,55 @@ impl HarnessEvalReportStore {
 
     pub fn get_run(&self, id: &str) -> Result<Option<HarnessEvalRunRecord>, String> {
         Ok(self.list_runs()?.into_iter().find(|run| run.run_id == id))
+    }
+
+    pub fn review_report_dir(
+        run_dir: impl AsRef<Path>,
+        options: HarnessEvalRunnerOptions,
+    ) -> Result<PathBuf, String> {
+        let run_dir = run_dir.as_ref();
+        let report_path = run_dir.join("report.json");
+        let text = fs::read_to_string(&report_path).map_err(|error| error.to_string())?;
+        let mut report = serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+        if options.allow_real_model {
+            let provider_review = run_deep_real_provider_review(&options, &report);
+            let provider_round_count = provider_review.provider_rounds.len();
+            report["execution_trace"]["rounds"] =
+                serde_json::to_value(&provider_review.provider_rounds)
+                    .map_err(|error| error.to_string())?;
+            report["execution_trace"]["provider_rounds"] = serde_json::json!(provider_round_count);
+            report["execution_trace"]["total_usage"] =
+                serde_json::to_value(&provider_review.usage).map_err(|error| error.to_string())?;
+            report["provider_round_details"] =
+                serde_json::to_value(&provider_review.provider_round_details)
+                    .map_err(|error| error.to_string())?;
+            report["ai_reviewer"] = serde_json::json!({
+                "status": provider_review.status,
+                "report_source": "provider_round",
+                "provider_rounds": provider_round_count,
+                "error": provider_review.error,
+                "markdown_available": provider_review.reviewer_markdown.is_some()
+            });
+            if let Some(markdown) = provider_review.reviewer_markdown {
+                report["ai_reviewer_report_markdown"] = Value::String(markdown);
+            }
+            if let Some(parent) = report_path.parent() {
+                let provider_rounds_dir = parent.join("provider-rounds");
+                fs::create_dir_all(&provider_rounds_dir).map_err(|error| error.to_string())?;
+                write_provider_round_artifacts(&report, &provider_rounds_dir)?;
+            }
+        }
+        report["report_gate"] = serde_json::to_value(evaluate_report_gate(&report))
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let output = run_dir.join("full-analysis-report.md");
+        fs::write(&output, render_full_analysis_report(&report))
+            .map_err(|error| error.to_string())?;
+        Ok(output)
     }
 
     fn scan_report_files(&self) -> Result<Vec<HarnessEvalStoredReport>, String> {
@@ -615,7 +665,14 @@ fn render_summary_report(report: &Value) -> String {
     )
 }
 
-fn render_full_analysis_placeholder(report: &Value) -> String {
+fn render_full_analysis_report(report: &Value) -> String {
+    if let Some(markdown) = report
+        .get("ai_reviewer_report_markdown")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return markdown.to_string();
+    }
     let level = report
         .get("level")
         .and_then(Value::as_str)
@@ -624,8 +681,39 @@ fn render_full_analysis_placeholder(report: &Value) -> String {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let gate = report.get("report_gate").unwrap_or(&Value::Null);
+    let reviewer = report.get("ai_reviewer").unwrap_or(&Value::Null);
     format!(
-        "# Mission Harness {level} Full Analysis Report\n\nStatus: `{status}`.\n\nThis file is the AI-reviewer output target. Generate the final analysis by reading `full-analysis-report-prompt.md`, `full-analysis-report-template.md`, `analysis-context.json`, `report.json`, and the `evidence/` directory. The evaluator intentionally stores full evidence in JSON artifacts and keeps this file as the canonical human report target.\n"
+        "# Mission Harness {level} Full Analysis Report\n\n\
+         ## Status\n\n\
+         - report_status: `{status}`\n\
+         - gate_status: `{}`\n\
+         - ai_reviewer_status: `{}`\n\
+         - provider_rounds: `{}`\n\n\
+         ## Analysis\n\n\
+         This is a deterministic degraded analysis report generated because a real AI reviewer round was not available. \
+         The report is not a placeholder pass path: deep-real remains blocked unless `execution_trace.provider_rounds > 0` and the report gate passes.\n\n\
+         ## Evidence Package\n\n\
+         - report: `report.json`\n\
+         - trace: `execution-trace.json`\n\
+         - analysis context: `analysis-context.json`\n\
+         - evidence: `evidence/`\n\
+         - provider rounds: `provider-rounds/`\n\n\
+         ## Reviewer Error\n\n\
+         `{}`\n",
+        gate.get("status").and_then(Value::as_str).unwrap_or("missing"),
+        reviewer
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_required"),
+        report
+            .pointer("/execution_trace/provider_rounds")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reviewer
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
     )
 }
 
@@ -654,6 +742,29 @@ fn write_provider_round_artifacts(
     report: &Value,
     provider_rounds_dir: &Path,
 ) -> Result<(), String> {
+    if let Some(details) = report
+        .get("provider_round_details")
+        .and_then(Value::as_array)
+    {
+        for detail in details {
+            let index = detail
+                .get("summary")
+                .and_then(|summary| summary.get("round_index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if index == 0 {
+                continue;
+            }
+            fs::write(
+                provider_rounds_dir.join(format!("{index:03}-round.json")),
+                serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if !details.is_empty() {
+            return Ok(());
+        }
+    }
     let Some(rounds) = report
         .get("execution_trace")
         .and_then(|trace| trace.get("rounds"))

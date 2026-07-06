@@ -9,12 +9,12 @@ use harness_contract::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_mailbox,
-    global_conflict_arbiter, global_mission_evidence_bus, global_team_runtime_service,
-    AgentExecutionCommandKind, AgentProgressEvent, AgentTask, AgentTaskCompletionReceipt,
-    AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus, CollaborationTemplateId,
-    ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind, MissionEvidenceRef,
-    TeamRuntimeSnapshot,
+    global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_binding_registry,
+    global_agent_task_mailbox, global_conflict_arbiter, global_mission_evidence_bus,
+    global_team_runtime_service, AgentExecutionCommandKind, AgentProgressEvent, AgentTask,
+    AgentTaskCompletionReceipt, AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus,
+    CollaborationTemplateId, ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
+    MissionEvidenceRef, TeamRuntimeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +193,17 @@ impl TeamExecutionLoop {
             assigned_task_count = assigned_task_count.saturating_add(1);
             global_agent_task_mailbox().assign((*task).clone());
             let assigned = (*task).clone();
+            if let Some(agent_id) = assigned.agent_id.as_deref() {
+                let backend_mode = global_agent_lifecycle_service()
+                    .command_capability(agent_id)
+                    .map(|capability| capability.mode);
+                global_agent_task_binding_registry().bind_task(
+                    agent_id.to_string(),
+                    &assigned,
+                    node_id.clone(),
+                    backend_mode,
+                );
+            }
 
             let progress = global_agent_event_bus().push(AgentProgressEvent {
                 event_id: String::new(),
@@ -249,6 +260,8 @@ impl TeamExecutionLoop {
                                     AgentTaskStatus::Running,
                                     "task delivered to agent",
                                 );
+                                global_agent_task_binding_registry()
+                                    .mark_task_status(agent_id, AgentTaskStatus::Running);
                             }
                             Err(error) => {
                                 errors.push(format!("{}: {error}", assigned.task_id));
@@ -723,6 +736,7 @@ mod tests {
         StartMissionSessionRequest, StartTeamRuntimeRequest,
     };
     use harness_contract::strategy::{decide_strategy, StrategyInput};
+    use std::sync::mpsc;
 
     #[test]
     fn team_execution_uses_workgraph_ready_batch_for_sequential_roles() {
@@ -997,5 +1011,116 @@ mod tests {
             .as_ref()
             .expect("backend capability");
         assert!(!capability.supports_input);
+    }
+
+    #[test]
+    fn terminal_agent_lifecycle_event_flows_back_to_team_task_and_synthesis() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("team-terminal-bridge-session-{suffix}");
+        crate::global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "team terminal bridge".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+        let prompt = "answer a simple delegated terminal bridge question";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let team = global_team_runtime_service()
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id,
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| {
+                    let agent_id = format!("agent-terminal-{}-{}", request.role_id, suffix);
+                    let snapshot = AgentSnapshot {
+                        agent_id: agent_id.clone(),
+                        name: request.role_id.clone(),
+                        description: request.responsibility.clone(),
+                        subagent_type: Some("Explore".to_string()),
+                        model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
+                        status: "running".to_string(),
+                        backend: AgentExecutionBackendKind::ProcessJsonl,
+                        output_file: String::new(),
+                        manifest_file: String::new(),
+                        created_at: "1".to_string(),
+                        started_at: Some("1".to_string()),
+                        completed_at: None,
+                        lane_events: Vec::new(),
+                        current_blocker: None,
+                        derived_state: "working".to_string(),
+                        error: None,
+                    };
+                    crate::global_agent_lifecycle_service()
+                        .register_started(snapshot.clone(), CancellationToken::new());
+                    let (tx, rx) = mpsc::channel();
+                    let _receiver_guard = std::thread::spawn(move || {
+                        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+                    });
+                    crate::global_agent_lifecycle_service()
+                        .attach_command_channel(&agent_id, tx)
+                        .expect("attach command channel");
+                    Ok(snapshot)
+                },
+            )
+            .expect("team");
+
+        let tick = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
+        assert_eq!(tick.assigned_task_count, 1);
+        assert_eq!(tick.delivered_agent_inputs, 1);
+        let task = global_agent_task_mailbox()
+            .list_for_team(&team.team_id)
+            .into_iter()
+            .next()
+            .expect("task");
+        assert_eq!(task.status, AgentTaskStatus::Running);
+        let binding = crate::global_agent_task_binding_registry()
+            .get_by_task(&task.task_id)
+            .expect("binding");
+        let agent_id = binding.agent_id.clone();
+
+        let terminal = AgentSnapshot {
+            agent_id: agent_id.clone(),
+            name: "Explore".to_string(),
+            description: "terminal bridge".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
+            status: "completed".to_string(),
+            backend: AgentExecutionBackendKind::ProcessJsonl,
+            output_file: String::new(),
+            manifest_file: String::new(),
+            created_at: "1".to_string(),
+            started_at: Some("1".to_string()),
+            completed_at: Some("2".to_string()),
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "bridge completed with evidence".to_string(),
+            error: None,
+        };
+        crate::global_agent_lifecycle_service().update_snapshot(
+            terminal,
+            "agent.completed",
+            "Process JSONL agent completed".to_string(),
+        );
+
+        let completed = global_agent_task_mailbox()
+            .get(&task.task_id)
+            .expect("completed task");
+        assert_eq!(completed.status, AgentTaskStatus::Completed);
+        assert_eq!(
+            completed.outcome.as_ref().expect("outcome").result_summary,
+            "bridge completed with evidence"
+        );
+        let run = global_team_runtime_service()
+            .collaboration_run(&team.team_id)
+            .expect("run");
+        assert!(run.synthesis_ready);
+        assert_eq!(run.team.status, crate::TeamRuntimeStatus::Completed);
+        assert!(global_agent_event_bus()
+            .list_for_agent(&agent_id)
+            .iter()
+            .any(|event| event.event_type == "agent.task.completed"));
     }
 }

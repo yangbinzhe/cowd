@@ -13,6 +13,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StewardSchedulerConfig {
+    pub policy: StewardAutomationPolicy,
     pub max_session_commands_per_tick: usize,
     pub max_team_ticks: usize,
     pub allow_background_sessions: bool,
@@ -22,13 +23,105 @@ pub struct StewardSchedulerConfig {
 
 impl Default for StewardSchedulerConfig {
     fn default() -> Self {
+        let policy = StewardAutomationPolicy::Assisted;
         Self {
-            max_session_commands_per_tick: 10,
+            max_session_commands_per_tick: policy.default_max_session_commands(),
             max_team_ticks: 10,
             allow_background_sessions: true,
-            dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
+            dispatch_mode: policy.default_dispatch_mode(),
+            policy,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StewardAutomationPolicy {
+    Manual,
+    Assisted,
+    AutonomousBounded,
+    YoloLikeButEvidenced,
+}
+
+impl Default for StewardAutomationPolicy {
+    fn default() -> Self {
+        Self::Assisted
+    }
+}
+
+impl StewardAutomationPolicy {
+    #[must_use]
+    pub const fn default_dispatch_mode(self) -> SessionDispatchMode {
+        match self {
+            Self::Manual => SessionDispatchMode::MarkClaimedOnly,
+            Self::Assisted | Self::AutonomousBounded | Self::YoloLikeButEvidenced => {
+                SessionDispatchMode::StartRuntimeTurn
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn default_max_session_commands(self) -> usize {
+        match self {
+            Self::Manual => 5,
+            Self::Assisted => 10,
+            Self::AutonomousBounded => 20,
+            Self::YoloLikeButEvidenced => 50,
+        }
+    }
+
+    #[must_use]
+    pub fn spec(self) -> StewardAutomationPolicySpec {
+        match self {
+            Self::Manual => StewardAutomationPolicySpec {
+                policy: self,
+                can_dispatch_session_commands: true,
+                allow_provider_calls: false,
+                allow_start_agent_team: false,
+                budget_label: "manual_claim_only".to_string(),
+                approval_gate: "human_required".to_string(),
+                default_dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
+            },
+            Self::Assisted => StewardAutomationPolicySpec {
+                policy: self,
+                can_dispatch_session_commands: true,
+                allow_provider_calls: true,
+                allow_start_agent_team: false,
+                budget_label: "bounded_assisted".to_string(),
+                approval_gate: "approval_for_write_or_risk".to_string(),
+                default_dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+            },
+            Self::AutonomousBounded => StewardAutomationPolicySpec {
+                policy: self,
+                can_dispatch_session_commands: true,
+                allow_provider_calls: true,
+                allow_start_agent_team: true,
+                budget_label: "bounded_autonomy".to_string(),
+                approval_gate: "policy_budget_and_risk_gate".to_string(),
+                default_dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+            },
+            Self::YoloLikeButEvidenced => StewardAutomationPolicySpec {
+                policy: self,
+                can_dispatch_session_commands: true,
+                allow_provider_calls: true,
+                allow_start_agent_team: true,
+                budget_label: "high_autonomy_evidence_required".to_string(),
+                approval_gate: "evidence_required_sensitive_actions_gate".to_string(),
+                default_dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StewardAutomationPolicySpec {
+    pub policy: StewardAutomationPolicy,
+    pub can_dispatch_session_commands: bool,
+    pub allow_provider_calls: bool,
+    pub allow_start_agent_team: bool,
+    pub budget_label: String,
+    pub approval_gate: String,
+    pub default_dispatch_mode: SessionDispatchMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +153,8 @@ pub struct StewardSchedulerProjection {
     pub latest: Vec<StewardDecisionLedgerRecord>,
     pub supported_dispatch_modes: Vec<SessionDispatchMode>,
     pub default_dispatch_mode: SessionDispatchMode,
+    pub default_policy: StewardAutomationPolicy,
+    pub policies: Vec<StewardAutomationPolicySpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,7 +319,14 @@ impl StewardScheduler {
                 SessionDispatchMode::ControlDispatchComplete,
                 SessionDispatchMode::StartRuntimeTurn,
             ],
-            default_dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
+            default_dispatch_mode: StewardAutomationPolicy::Assisted.default_dispatch_mode(),
+            default_policy: StewardAutomationPolicy::Assisted,
+            policies: vec![
+                StewardAutomationPolicy::Manual.spec(),
+                StewardAutomationPolicy::Assisted.spec(),
+                StewardAutomationPolicy::AutonomousBounded.spec(),
+                StewardAutomationPolicy::YoloLikeButEvidenced.spec(),
+            ],
         }
     }
 
@@ -261,7 +363,7 @@ impl StewardScheduler {
 }
 
 const fn default_dispatch_mode() -> SessionDispatchMode {
-    SessionDispatchMode::MarkClaimedOnly
+    StewardAutomationPolicy::Assisted.default_dispatch_mode()
 }
 
 fn now_ms() -> u64 {
@@ -348,5 +450,22 @@ mod tests {
                 .status,
             crate::MissionSessionCommandStatus::Running
         );
+    }
+
+    #[test]
+    fn steward_scheduler_default_policy_is_assisted_not_manual_claim_only() {
+        let config = StewardSchedulerConfig::default();
+        assert_eq!(config.policy, StewardAutomationPolicy::Assisted);
+        assert_eq!(config.dispatch_mode, SessionDispatchMode::StartRuntimeTurn);
+        let projection = StewardScheduler::projection();
+        assert_eq!(
+            projection.default_dispatch_mode,
+            SessionDispatchMode::StartRuntimeTurn
+        );
+        assert!(projection
+            .policies
+            .iter()
+            .any(|policy| policy.policy == StewardAutomationPolicy::Manual
+                && policy.default_dispatch_mode == SessionDispatchMode::MarkClaimedOnly));
     }
 }

@@ -75,6 +75,7 @@ impl GatewayServices {
             system: SystemService::new(),
             audit: AuditService::new(),
             harness_eval: HarnessEvalService::new(),
+            evolution: EvolutionService::new(),
             provider: ProviderService::new(),
             reality: RealityService::new(),
             growth: GrowthService::new_for_config_home(config_home),
@@ -155,6 +156,7 @@ impl GatewayServices {
             self.system.label,
             self.audit.label,
             self.harness_eval.label,
+            self.evolution.label,
             self.provider.label,
             self.reality.label,
             self.growth.label,
@@ -181,6 +183,7 @@ impl GatewayServices {
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
         contracts.extend(self.harness_eval.contracts());
+        contracts.extend(self.evolution.contracts());
         contracts.extend(self.provider.contracts());
         contracts.extend(self.reality.contracts());
         contracts.extend(self.growth.contracts());
@@ -242,6 +245,9 @@ impl GatewayServices {
             ("harness_eval", "latest_report"),
             ("harness_eval", "runs"),
             ("harness_eval", "run_start"),
+            ("evolution", "signals"),
+            ("evolution", "proposals"),
+            ("evolution", "sandbox_evals"),
             ("provider", "config_projection"),
             ("provider", "model_routing"),
             ("reality", "status"),

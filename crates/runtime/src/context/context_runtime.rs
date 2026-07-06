@@ -2094,6 +2094,10 @@ fn default_source_lifecycle(source: ContextSourceKind) -> ContextSourceLifecycle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact_extraction::{
+        RuleFactExtractor, RuntimeFactExtractionInput, RuntimeFactExtractionTrigger,
+        RuntimeFactExtractor,
+    };
 
     fn request_with_dynamic(content: &str) -> ContextEnvelopeRequest {
         let identity = ContextIdentity::main("session-1");
@@ -2233,6 +2237,75 @@ mod tests {
                 .checkpoint_id,
             "checkpoint-a"
         );
+    }
+
+    #[test]
+    fn reality_runtime_decision_unifies_recall_knowledge_fact_and_checkpoint() {
+        let mut request = request_with_dynamic("FACT: deployment requires review");
+        request.omitted.push(ContextOmission {
+            source: ContextSourceKind::Memory,
+            reason: "suppressed_for_current_turn: cross-project stale deployment memory"
+                .to_string(),
+            token_estimate: 256,
+        });
+        let envelope = ContextRuntimeKernel::build_envelope(request);
+        let knowledge = KnowledgeTurnReport {
+            activation_plan_id: Some("plan-1".to_string()),
+            active_pack_ids: vec!["pack-a".to_string()],
+            blocked_namespaces: vec!["global/noisy".to_string()],
+            compliance_warnings: Vec::new(),
+            evidence_refs: vec![harness_contract::core::KernelRef::new(
+                "knowledge_pack",
+                "pack-a",
+            )],
+            usage_signals: Vec::new(),
+        };
+        let governance = ContextRuntimeKernel::governance_report(
+            &envelope,
+            Some(&knowledge),
+            Some(RuntimeContextFactDecision {
+                trigger: "TurnEnd".to_string(),
+                mode: "rule_only".to_string(),
+                degraded: false,
+                reason: "turn produced fact candidate".to_string(),
+                candidate_count: 1,
+                review_required: true,
+            }),
+            Some(RuntimeCompressionCheckpointRef {
+                checkpoint_id: "checkpoint-a".to_string(),
+                source: "summary_compression".to_string(),
+                summary: "checkpoint summary".to_string(),
+                evidence_refs: vec!["evidence-a".to_string()],
+            }),
+        );
+        let input = RuntimeFactExtractionInput::new(
+            RuntimeFactExtractionTrigger::TurnEnd,
+            "FACT: deployment requires review",
+        )
+        .with_session_id(Some(governance.session_id.clone()))
+        .with_evidence_refs(vec!["evidence-a".to_string()]);
+        let batch = RuleFactExtractor.extract(&input);
+        let mut fact_service = fact_kernel::FactKernelService::new();
+        let review = fact_service.review_candidates(batch.clone());
+
+        let decision = crate::RealityRuntimeDecision::from_governance(
+            &governance,
+            Some(&batch),
+            Some(&review),
+        );
+
+        assert_eq!(decision.kind, "runtime.reality_runtime_decision");
+        assert_eq!(decision.recall_quality.selected_count, 1);
+        assert_eq!(decision.recall_quality.suppressed_count, 1);
+        assert!(decision.recall_quality.cross_project_contamination);
+        assert_eq!(decision.knowledge.activated_pack_ids, vec!["pack-a"]);
+        assert_eq!(decision.fact_plan.candidate_count, 1);
+        assert_eq!(decision.fact_plan.promoted_count, 1);
+        assert!(decision.context_budget_plan.checkpoint_required);
+        assert!(decision
+            .resume_pointers
+            .iter()
+            .any(|pointer| pointer == "checkpoint:checkpoint-a"));
     }
 
     #[test]

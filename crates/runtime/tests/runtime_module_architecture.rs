@@ -27,6 +27,7 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         RuntimeDomain::Recovery,
         RuntimeDomain::Policy,
         RuntimeDomain::RealityBridge,
+        RuntimeDomain::Evolution,
         RuntimeDomain::Skill,
     ] {
         assert!(
@@ -138,6 +139,7 @@ fn runtime_source_files_are_grouped_by_architecture_domain() {
         "approval",
         "context",
         "conversation",
+        "evolution",
         "infrastructure",
         "mission",
         "policy",

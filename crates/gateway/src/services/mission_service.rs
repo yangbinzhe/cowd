@@ -56,7 +56,7 @@ pub(crate) enum MissionTeamExecutionMode {
     #[default]
     ProviderInProcess,
     ProcessJsonl,
-    RegisterOnly,
+    ManualMailbox,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,6 +105,22 @@ pub(crate) struct RouteMissionCommandHttpRequest {
     pub(crate) from_session_id: String,
     pub(crate) target_ref: String,
     pub(crate) command: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct InterpretMissionCommandHttpRequest {
+    pub(crate) current_session_id: String,
+    pub(crate) command_text: String,
+    #[serde(default)]
+    pub(crate) target_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) autonomy_policy: Option<runtime::StewardAutomationPolicy>,
+    #[serde(default)]
+    pub(crate) dispatch_mode: Option<runtime::SessionDispatchMode>,
+    #[serde(default)]
+    pub(crate) allow_background: Option<bool>,
+    #[serde(default)]
+    pub(crate) execute: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +288,34 @@ impl MissionService {
             "kind": "mission_control.session_bridge_result",
             "ok": ok,
             "receipt": receipt,
+            "projection": runtime::MissionControlRuntime::projection(),
+        })
+    }
+
+    pub(crate) fn interpret_mission_command(
+        &self,
+        request: InterpretMissionCommandHttpRequest,
+    ) -> serde_json::Value {
+        let interpretation = runtime::MissionCommandInterpreter::interpret(
+            runtime::MissionCommandInterpretRequest {
+                current_session_id: request.current_session_id,
+                command_text: request.command_text,
+                target_ref: request.target_ref,
+                autonomy_policy: request.autonomy_policy,
+                dispatch_mode: request.dispatch_mode,
+                allow_background: request.allow_background,
+            },
+        );
+        let execution = request
+            .execute
+            .then(|| runtime::MissionCommandInterpreter::execute(interpretation.clone()));
+        serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "kind": "mission_control.command_interpretation",
+            "ok": interpretation.status == "interpreted"
+                && execution.as_ref().map(|receipt| receipt.ok).unwrap_or(true),
+            "interpretation": interpretation,
+            "execution": execution,
             "projection": runtime::MissionControlRuntime::projection(),
         })
     }
@@ -961,7 +1005,9 @@ fn spawn_lifecycle_agent_for_team(
             model,
             resolve_team_process_jsonl_spec()?,
         ),
-        MissionTeamExecutionMode::RegisterOnly => register_lifecycle_agent_for_team(request, model),
+        MissionTeamExecutionMode::ManualMailbox => {
+            register_lifecycle_agent_for_team(request, model)
+        }
     }
 }
 
@@ -1287,7 +1333,7 @@ mod tests {
                 StartMissionTeamRuntimeHttpRequest {
                     objective: "answer one delegated question".to_string(),
                     model: None,
-                    execution_mode: MissionTeamExecutionMode::RegisterOnly,
+                    execution_mode: MissionTeamExecutionMode::ManualMailbox,
                 },
             )
             .expect("team");

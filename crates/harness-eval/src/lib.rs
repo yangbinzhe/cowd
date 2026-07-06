@@ -15,10 +15,16 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod evolution;
+mod provider_rounds;
+mod real_provider_runner;
 mod report;
 mod report_store;
 mod runner;
+mod terminal_gate;
+mod terminal_matrix;
 
+pub use evolution::{evaluate_evolution_closure, EvolutionClosureReport};
 pub use report::{
     evaluate_report_gate, CapabilityResult, ExecutionTrace, HarnessEvalLevel,
     HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
@@ -29,6 +35,11 @@ pub use report::{
 };
 pub use report_store::{default_report_root, HarnessEvalReportStore};
 pub use runner::{run_eval, HarnessEvalRunnerOptions};
+pub use terminal_gate::terminal_gate_report;
+pub use terminal_matrix::{
+    render_terminal_capability_matrix_markdown, terminal_capability_matrix,
+    TerminalCapabilityMatrixRow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

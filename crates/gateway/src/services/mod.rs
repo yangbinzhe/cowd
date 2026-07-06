@@ -19,6 +19,7 @@ mod context;
 mod context_service;
 mod cross_plane_service;
 mod error;
+mod evolution_service;
 mod growth_service;
 mod harness_eval_service;
 mod matrix_service;
@@ -41,6 +42,10 @@ pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
+pub(crate) use evolution_service::{
+    EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionSandboxEvalRequest,
+    EvolutionServiceError, EvolutionSignalCreateRequest,
+};
 pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
@@ -52,11 +57,12 @@ pub(crate) use mfg_service::{
 pub(crate) use mission_service::{
     start_team_runtime_with_spawner, AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest,
     AttachMissionTeamHttpRequest, ConsumeMissionSessionCommandHttpRequest,
-    DecideMissionApprovalHttpRequest, InterruptMissionStewardHttpRequest,
-    MissionSessionCommandConsumeMode, MissionTeamExecutionMode, MissionTeamHandoffHttpRequest,
-    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
-    StartMissionTeamRuntimeHttpRequest, SubmitAgentTaskOutcomeHttpRequest,
-    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
+    InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode, MissionTeamExecutionMode,
+    MissionTeamHandoffHttpRequest, RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest,
+    StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
+    SubmitAgentTaskOutcomeHttpRequest, SubmitMissionApprovalHttpRequest,
+    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -213,6 +219,12 @@ pub(crate) struct AuditService {
 
 #[derive(Clone)]
 pub(crate) struct HarnessEvalService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
+}
+
+#[derive(Clone)]
+pub(crate) struct EvolutionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
 }
@@ -528,6 +540,7 @@ pub(crate) struct GatewayServices {
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
     pub(crate) harness_eval: HarnessEvalService,
+    pub(crate) evolution: EvolutionService,
     pub(crate) provider: ProviderService,
     pub(crate) reality: RealityService,
     pub(crate) growth: GrowthService,
@@ -775,6 +788,7 @@ mod tests {
                 "system",
                 "audit",
                 "harness_eval",
+                "evolution",
                 "provider",
                 "reality",
                 "growth",
@@ -815,6 +829,19 @@ mod tests {
             services.harness_eval.envelope("reports").operation,
             "reports"
         );
+        let evolution_contracts = services.evolution.contracts();
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "signals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "proposals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "sandbox_evals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "sandbox_eval_start"));
         assert_eq!(
             services.provider.config_projection_contract().operation,
             "config_projection"

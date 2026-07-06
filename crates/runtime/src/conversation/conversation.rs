@@ -8789,9 +8789,21 @@ mod tests {
         )
         .without_memory();
         let prompt = rt.prepare_reality_context("test query").await;
-        // Without selected memories, stable head is followed by runtime header.
-        assert_eq!(prompt.len(), 2);
-        assert!(prompt[1].contains("profile:MainTurn"));
+        // Without selected memories, the prompt still includes the stable head and
+        // runtime governance context. Attachment/resource guidance may add more
+        // bounded sections, so this must remain a semantic budget assertion.
+        assert_eq!(prompt[0], "system prompt");
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("profile:MainTurn")));
+        assert!(!prompt
+            .iter()
+            .any(|segment| segment.contains("<memory_context>")));
+        let total_prompt_chars: usize = prompt.iter().map(|segment| segment.len()).sum();
+        assert!(
+            total_prompt_chars < 20_000,
+            "memory-free runtime prompt should stay bounded"
+        );
         // System prompt should be reasonably sized
         assert!(
             prompt[0].len() < 10000,

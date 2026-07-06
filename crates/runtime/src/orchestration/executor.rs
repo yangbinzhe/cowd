@@ -6,6 +6,9 @@ use crate::orchestration::planner::{
     plan_runtime_collaboration_decision, RuntimeOrchestrationPlan,
 };
 use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
+use crate::tool_host::{
+    execute_tool_dag_with_host, RuntimeActionExecutionReceipt, RuntimeToolExecutionHost,
+};
 use crate::{global_team_runtime_service, StartTeamRuntimeRequest};
 
 #[must_use]
@@ -13,45 +16,25 @@ pub fn execute_orchestration_request(
     request: &RuntimeOrchestrationRequest,
     plan: &RuntimeOrchestrationPlan,
     decision_status: &str,
+    tool_host: Option<&dyn RuntimeToolExecutionHost>,
 ) -> (Option<String>, Value) {
     let mode = plan.execution_decision.recommended_mode;
     match request.action {
-        RuntimeOrchestrationAction::RequestRewooEvidence => (
-            Some("ready".to_string()),
-            json!({
-                "type": "rewoo_executor",
-                "mode": mode.as_str(),
-                "status": "ready",
-                "execution_fidelity": "runtime_owned_evidence_packet",
-                "engine": {
-                    "name": "RewooExecutor",
-                    "owned_by": "runtime",
-                    "dispatch_surface": "conversation_tool_scheduler"
-                },
-                "next_step": "dispatch evidence steps through the conversation runtime tool scheduler when a tool executor is attached; keep evidence refs and summaries as the solver input",
-                "plan": plan.rewoo_plan,
-                "tool_dag": plan.tool_dag,
-                "observation_packet": plan.rewoo_plan.synthetic_result(),
-                "expected_events": ["ToolStart", "ToolComplete", "ContextEnvelope", "RunModelTelemetry"],
-            }),
+        RuntimeOrchestrationAction::RequestRewooEvidence => execute_tool_dag_action(
+            "request_rewoo_evidence",
+            "rewoo_executor",
+            mode,
+            &plan.tool_dag,
+            tool_host,
+            Some(json!(plan.rewoo_plan.synthetic_result())),
         ),
-        RuntimeOrchestrationAction::RequestParallelTools => (
-            Some("ready".to_string()),
-            json!({
-                "type": "tool_dag_executor",
-                "mode": mode.as_str(),
-                "status": "ready",
-                "execution_fidelity": "runtime_owned_executable_dag",
-                "engine": {
-                    "name": "ToolDagExecutor",
-                    "owned_by": "runtime",
-                    "dispatch_surface": "conversation_tool_scheduler"
-                },
-                "next_step": "execute independent read-only nodes as one scheduler batch; serialize write/destructive nodes through permission gates",
-                "tool_dag": plan.tool_dag,
-                "schedule": plan.tool_dag.safety_summary.schedule,
-                "expected_events": ["ToolStart", "ToolComplete", "ToolExecuted"],
-            }),
+        RuntimeOrchestrationAction::RequestParallelTools => execute_tool_dag_action(
+            "request_parallel_tools",
+            "tool_dag_executor",
+            mode,
+            &plan.tool_dag,
+            tool_host,
+            None,
         ),
         RuntimeOrchestrationAction::RequestDeliberation => (
             Some("ready".to_string()),
@@ -129,6 +112,49 @@ pub fn execute_orchestration_request(
             }),
         ),
     }
+}
+
+fn execute_tool_dag_action(
+    action: &str,
+    executor_type: &str,
+    mode: ExecutionMode,
+    dag: &crate::execution_core::tool_dag::ToolDagPlan,
+    tool_host: Option<&dyn RuntimeToolExecutionHost>,
+    observation_packet: Option<Value>,
+) -> (Option<String>, Value) {
+    let receipt = match tool_host {
+        Some(host) => execute_tool_dag_with_host(action, dag, host),
+        None => RuntimeActionExecutionReceipt::blocked_missing_executor(action, dag),
+    };
+    let status = receipt.status.clone();
+    let status_override = match status.as_str() {
+        "executed" | "degraded_permission_blocked" | "degraded_empty_dag" => {
+            Some("executed".to_string())
+        }
+        "blocked_missing_executor" | "blocked_permission" => Some(status.clone()),
+        "failed" => Some("failed".to_string()),
+        _ => Some(status.clone()),
+    };
+    let mut detail = json!({
+        "type": executor_type,
+        "mode": mode.as_str(),
+        "status": status,
+        "execution_fidelity": "runtime_owned_executable_dag",
+        "engine": {
+            "name": "RuntimeActionExecutor",
+            "owned_by": "runtime",
+            "dispatch_surface": "runtime_tool_host"
+        },
+        "tool_dag": dag,
+        "schedule": dag.safety_summary.schedule,
+        "receipt": receipt,
+    });
+    if let Some(packet) = observation_packet {
+        if let Some(object) = detail.as_object_mut() {
+            object.insert("observation_packet".to_string(), packet);
+        }
+    }
+    (status_override, detail)
 }
 
 fn execute_team_request(

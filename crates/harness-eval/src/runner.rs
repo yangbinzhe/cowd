@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    evaluate_complex_harness_scenarios, evaluate_knowledge_fabric_context_governance,
-    evaluate_next_gen_harness_closure, evaluate_reality_context_scenarios, evaluate_report_gate,
-    harness_capability_coverage_report,
+    evaluate_complex_harness_scenarios, evaluate_evolution_closure,
+    evaluate_knowledge_fabric_context_governance, evaluate_next_gen_harness_closure,
+    evaluate_reality_context_scenarios, evaluate_report_gate, harness_capability_coverage_report,
+    real_provider_runner::run_deep_real_provider_review,
     report::{
         HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, ToolCallDetail,
         ToolCallSummary,
@@ -75,11 +76,11 @@ pub fn run_eval(
     let started = Instant::now();
     let stable_ai = stable_ai_report_for(&options);
     let complex =
-        (options.level == HarnessEvalLevel::Full).then(evaluate_complex_harness_scenarios);
+        (options.level != HarnessEvalLevel::Quick).then(evaluate_complex_harness_scenarios);
     let knowledge = evaluate_knowledge_fabric_context_governance();
     let reality_context = evaluate_reality_context_scenarios();
     let mission_runtime = evaluate_mission_runtime_collaboration_closure();
-    let real_tool = (options.level == HarnessEvalLevel::Full).then(run_full_real_tool_scenarios);
+    let real_tool = (options.level != HarnessEvalLevel::Quick).then(run_full_real_tool_scenarios);
     let mut usage = empty_usage("deterministic_smoke");
     let mut tool_call_log = Vec::new();
     let mut tool_call_details = Vec::new();
@@ -197,10 +198,12 @@ pub fn run_eval(
         json!({"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"}),
         json!({"index": 4, "action": "reality_context_eval.evaluate", "evidence": "RecallReport and ContextEnvelope scenario matrix generated"}),
         json!({"index": 5, "action": "mission_runtime_collaboration_closure", "evidence": "team/workgraph/session/conflict/projection closure generated"}),
+        json!({"index": 6, "action": "evolution_closure", "evidence": "signal/proposal/sandbox/skill draft closure generated"}),
     ];
     if complex.is_some() {
-        runtime_action_log.push(json!({"index": 6, "action": "complex_harness_scenario_suite", "evidence": "full complex scenario suite generated"}));
+        runtime_action_log.push(json!({"index": 7, "action": "complex_harness_scenario_suite", "evidence": "full complex scenario suite generated"}));
     }
+    let evolution_closure = evaluate_evolution_closure();
     let mut report = json!({
         "kind": "mission_harness.eval_report",
         "level": options.level.as_str(),
@@ -213,13 +216,14 @@ pub fn run_eval(
         "stable_ai": stable_ai,
         "scenarios": scenarios,
         "metrics": [
-            {"name": "provider_rounds", "value": "0", "notes": "default gateway run is deterministic and does not consume provider tokens"},
+            {"name": "provider_rounds", "value": "0", "notes": if options.level == HarnessEvalLevel::Deep { "deep-real requires an explicit provider round; report gate fails when none is recorded" } else { "quick/full gateway runs do not consume provider tokens" }},
             {"name": "runtime_actions", "value": runtime_actions.to_string(), "notes": "library runner exercised scenario, coverage, and knowledge fabric checks"},
             {"name": "tool_calls", "value": tool_calls.to_string(), "notes": if options.level == HarnessEvalLevel::Full { "full eval executed local read-only tool evidence" } else { "quick smoke lane intentionally does not execute tools" }}
         ],
         "complex_scenarios": complex,
         "reality_context_eval": reality_context,
         "mission_runtime_collaboration": mission_runtime,
+        "evolution_closure": evolution_closure,
         "next_gen_harness_closure": next_gen_harness,
         "real_tool_scenarios": real_tool_scenarios,
         "event_observation_parity": event_observation_parity,
@@ -241,9 +245,48 @@ pub fn run_eval(
             "runtime_action_log": runtime_action_log
         },
         "tool_call_details": tool_call_details,
+        "provider_round_details": [],
+        "ai_reviewer": {
+            "status": if options.level == HarnessEvalLevel::Deep { "pending" } else { "not_required" },
+            "report_source": if options.level == HarnessEvalLevel::Deep { "provider_round" } else { "deterministic_analysis" }
+        },
         "evidence_manifest": build_evidence_manifest(&options, requested_at_ms, tool_calls, usage.total_tokens),
         "result_package_dir": null
     });
+    if options.level == HarnessEvalLevel::Deep && options.allow_real_model {
+        let provider_review = run_deep_real_provider_review(&options, &report);
+        let provider_round_count = provider_review.provider_rounds.len();
+        let provider_rounds = serde_json::to_value(&provider_review.provider_rounds)
+            .map_err(|error| error.to_string())?;
+        let provider_round_details = serde_json::to_value(&provider_review.provider_round_details)
+            .map_err(|error| error.to_string())?;
+        report["execution_trace"]["rounds"] = provider_rounds;
+        report["execution_trace"]["provider_rounds"] = json!(provider_round_count);
+        report["execution_trace"]["total_usage"] =
+            serde_json::to_value(&provider_review.usage).map_err(|error| error.to_string())?;
+        report["provider_round_details"] = provider_round_details;
+        report["ai_reviewer"] = json!({
+            "status": provider_review.status,
+            "report_source": "provider_round",
+            "provider_rounds": provider_round_count,
+            "error": provider_review.error,
+            "markdown_available": provider_review.reviewer_markdown.is_some()
+        });
+        if let Some(markdown) = provider_review.reviewer_markdown {
+            report["ai_reviewer_report_markdown"] = Value::String(markdown);
+        }
+        report["metrics"][0]["value"] = Value::String(provider_round_count.to_string());
+        report["evidence_manifest"]["token_usage"] = json!({
+            "total_tokens": provider_review.usage.total_tokens,
+            "source": provider_review.usage.usage_source
+        });
+        report["next_gen_harness_closure"]["provider_rounds"] = json!(provider_round_count);
+        if let Some(scenarios) = report["next_gen_harness_closure"]["scenarios"].as_array_mut() {
+            for scenario in scenarios {
+                scenario["provider_rounds"] = json!(provider_round_count);
+            }
+        }
+    }
     let gate = evaluate_report_gate(&report);
     report["report_gate"] = serde_json::to_value(&gate).map_err(|error| error.to_string())?;
     report["status"] = Value::String(gate.status.clone());

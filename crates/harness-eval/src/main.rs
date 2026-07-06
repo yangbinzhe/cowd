@@ -1,5 +1,5 @@
 use harness_eval::{
-    default_report_root, run_eval, HarnessEvalLevel, HarnessEvalReportStore,
+    default_report_root, run_eval, terminal_gate_report, HarnessEvalLevel, HarnessEvalReportStore,
     HarnessEvalRunnerOptions,
 };
 use std::path::PathBuf;
@@ -12,6 +12,40 @@ fn main() {
     ) {
         print_help();
         return;
+    }
+    match args.first().map(String::as_str) {
+        Some("review-report") => {
+            let run_dir = option_value(&args[1..], "--run-dir")
+                .or_else(|| option_value(&args[1..], "--report-dir"))
+                .unwrap_or_else(|| {
+                    eprintln!("review-report requires --run-dir <path>");
+                    std::process::exit(2);
+                });
+            let options = HarnessEvalRunnerOptions {
+                level: HarnessEvalLevel::Deep,
+                provider: option_value(&args[1..], "--provider"),
+                budget: option_value(&args[1..], "--budget").or_else(|| Some("review".to_string())),
+                allow_real_model: args.iter().any(|value| value == "--allow-real-model"),
+            };
+            let output = HarnessEvalReportStore::review_report_dir(run_dir, options)
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to review harness eval report: {error}");
+                    std::process::exit(1);
+                });
+            println!("full-analysis-report: {}", output.display());
+            return;
+        }
+        Some("terminal-gate") => {
+            let evidence_dir = option_value(&args[1..], "--evidence-dir")
+                .unwrap_or_else(|| "../plan/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
+            let gate = terminal_gate_report(PathBuf::from(evidence_dir));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&gate).expect("terminal gate json")
+            );
+            return;
+        }
+        _ => {}
     }
 
     let level = match args.first().map(String::as_str) {
@@ -65,7 +99,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Usage: harness-eval [quick|full|deep] [--provider configured] [--budget low] [--allow-real-model]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>]"
     );
 }
 

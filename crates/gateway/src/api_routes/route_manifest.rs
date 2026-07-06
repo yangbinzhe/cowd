@@ -48,6 +48,7 @@ const ROUTE_SOURCES: &[GatewayRouteSource] = &[
         include_str!("cross_plane_routes.rs"),
     ),
     source("edge_routes.rs", include_str!("edge_routes.rs")),
+    source("evolution_routes.rs", include_str!("evolution_routes.rs")),
     source("growth_routes.rs", include_str!("growth_routes.rs")),
     source(
         "harness_eval_routes.rs",

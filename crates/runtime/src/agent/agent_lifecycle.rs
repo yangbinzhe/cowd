@@ -162,16 +162,23 @@ impl AgentLifecycleService {
             agent_id: snapshot.agent_id.clone(),
             event_type: event_type.to_string(),
             emitted_at: iso8601_now(),
-            message,
+            message: message.clone(),
         };
-        if let Some(record) = self
-            .agents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(&snapshot.agent_id)
+        let mut updated = false;
         {
-            record.snapshot = snapshot;
-            record.events.push(event);
+            if let Some(record) = self
+                .agents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&snapshot.agent_id)
+            {
+                record.snapshot = snapshot.clone();
+                record.events.push(event);
+                updated = true;
+            }
+        }
+        if updated {
+            let _ = crate::bridge_agent_terminal_snapshot(&snapshot, event_type, message);
         }
     }
 

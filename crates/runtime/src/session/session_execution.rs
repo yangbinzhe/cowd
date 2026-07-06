@@ -7,9 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_mission_runtime, global_session_relation_graph, record_runtime_event,
-    MissionSessionCommand, MissionSessionCommandStatus, MissionSessionStatus, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventScope, SessionRouteCommand, SessionRouteReceipt,
+    global_agent_lifecycle_service, global_agent_task_binding_registry, global_mission_runtime,
+    global_session_relation_graph, record_runtime_event, AgentExecutionCommandKind,
+    AgentExecutionCommandReceipt, MissionSessionCommand, MissionSessionCommandStatus,
+    MissionSessionStatus, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
+    SessionRouteCommand, SessionRouteReceipt,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +93,22 @@ pub struct CrossSessionBridgeReceipt {
     pub status: String,
     pub route: SessionRouteReceipt,
     pub command: Option<MissionSessionCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<AgentExecutionCommandReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_candidate: Option<SessionRecoveryCandidate>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecoveryCandidate {
+    pub scope: String,
+    pub session_id: Option<String>,
+    pub command_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub status: String,
+    pub reason: String,
+    pub suggested_action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +177,7 @@ impl SessionExecutionPlane {
             target_ref: message.target_ref.clone(),
             command: message.command.clone(),
         });
-        let (status, command, bridge_message) =
+        let (status, command, agent_command, recovery_candidate, bridge_message) =
             if let Some(target_session_id) = route.resolved_session_id.clone() {
                 match global_mission_runtime().enqueue_session_command(
                     &message.from_session_id,
@@ -170,24 +187,30 @@ impl SessionExecutionPlane {
                     Ok(command) => (
                         "routed".to_string(),
                         Some(command),
+                        None,
+                        None,
                         "cross-session command enqueued".to_string(),
                     ),
-                    Err(error) => ("failed".to_string(), None, error),
+                    Err(error) => ("failed".to_string(), None, None, None, error),
                 }
             } else if route.resolved_agent_id.is_some() {
-                (
-                    "deferred".to_string(),
-                    None,
-                    "agent target routing belongs to TeamExecutionLoop stage".to_string(),
-                )
+                route_agent_command(&message, &route)
             } else {
-                ("rejected".to_string(), None, route.message.clone())
+                (
+                    "rejected".to_string(),
+                    None,
+                    None,
+                    None,
+                    route.message.clone(),
+                )
             };
         let receipt = CrossSessionBridgeReceipt {
             kind: "runtime.cross_session_bridge_receipt".to_string(),
             status,
             route,
             command,
+            agent_command,
+            recovery_candidate,
             message: bridge_message,
         };
         record_bridge_event(&message, &receipt);
@@ -197,6 +220,96 @@ impl SessionExecutionPlane {
     #[must_use]
     pub fn lease_state(session_id: &str, allow_background: bool) -> SessionLeaseState {
         lease_state(session_id, allow_background)
+    }
+}
+
+fn route_agent_command(
+    message: &CrossSessionMessage,
+    route: &SessionRouteReceipt,
+) -> (
+    String,
+    Option<MissionSessionCommand>,
+    Option<AgentExecutionCommandReceipt>,
+    Option<SessionRecoveryCandidate>,
+    String,
+) {
+    let Some(agent_id) = route.resolved_agent_id.as_deref() else {
+        return (
+            "rejected".to_string(),
+            None,
+            None,
+            None,
+            "agent route missing resolved agent id".to_string(),
+        );
+    };
+    let binding = global_agent_task_binding_registry().get_by_agent(agent_id);
+    let Some(capability) = global_agent_lifecycle_service().command_capability(agent_id) else {
+        return (
+            "blocked_missing_agent_binding".to_string(),
+            None,
+            None,
+            Some(SessionRecoveryCandidate {
+                scope: "agent".to_string(),
+                session_id: Some(message.from_session_id.clone()),
+                command_id: None,
+                agent_id: Some(agent_id.to_string()),
+                status: "blocked_missing_agent_binding".to_string(),
+                reason: format!("agent {agent_id} is not active in lifecycle registry"),
+                suggested_action: "inspect team binding or restart delegated agent".to_string(),
+            }),
+            format!("agent target {agent_id} has no active lifecycle binding"),
+        );
+    };
+    if !capability.supports_input {
+        return (
+            "blocked_agent_input_unavailable".to_string(),
+            None,
+            None,
+            Some(SessionRecoveryCandidate {
+                scope: "agent".to_string(),
+                session_id: Some(message.from_session_id.clone()),
+                command_id: None,
+                agent_id: Some(agent_id.to_string()),
+                status: "blocked_agent_input_unavailable".to_string(),
+                reason: format!("agent backend {} does not accept runtime input", capability.mode),
+                suggested_action: "handoff through team task outcome or restart with process-jsonl command channel".to_string(),
+            }),
+            format!("agent {agent_id} backend does not accept runtime input"),
+        );
+    }
+    match global_agent_lifecycle_service().command(
+        agent_id,
+        AgentExecutionCommandKind::Input,
+        Some(serde_json::json!({
+            "from_session_id": message.from_session_id,
+            "target_ref": message.target_ref,
+            "text": message.command,
+            "team_binding": binding,
+        })),
+    ) {
+        Ok(receipt) => (
+            "routed".to_string(),
+            None,
+            Some(receipt),
+            None,
+            "cross-session command delivered to agent runtime".to_string(),
+        ),
+        Err(error) => (
+            "blocked_agent_command_failed".to_string(),
+            None,
+            None,
+            Some(SessionRecoveryCandidate {
+                scope: "agent".to_string(),
+                session_id: Some(message.from_session_id.clone()),
+                command_id: None,
+                agent_id: Some(agent_id.to_string()),
+                status: "blocked_agent_command_failed".to_string(),
+                reason: error.clone(),
+                suggested_action: "retry, inspect agent lifecycle, or takeover manually"
+                    .to_string(),
+            }),
+            error,
+        ),
     }
 }
 
@@ -336,7 +449,10 @@ fn record_bridge_event(message: &CrossSessionMessage, receipt: &CrossSessionBrid
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionProxy, StartMissionSessionRequest};
+    use crate::{
+        MissionCommandInterpretRequest, MissionCommandInterpreter, MissionInterpretedCommand,
+        SessionProxy, StartMissionSessionRequest,
+    };
 
     #[test]
     fn session_execution_dispatches_pending_and_bridges_sessions() {
@@ -449,5 +565,130 @@ mod tests {
         assert_eq!(turn_request.session_id, session_b);
         assert_eq!(turn_request.command_id, command.command_id);
         assert_eq!(turn_request.prompt, "analyze background task");
+    }
+
+    #[test]
+    fn bridge_agent_target_returns_runtime_block_instead_of_deferred_placeholder() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("session-agent-bridge-{suffix}");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "agent bridge source".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+
+        let receipt = SessionExecutionPlane::bridge(CrossSessionMessage {
+            from_session_id: session_id,
+            target_ref: format!("@agent-missing-{suffix}"),
+            command: "inspect current task".to_string(),
+            actor: Some("test".to_string()),
+            evidence_refs: Vec::new(),
+        });
+
+        assert_eq!(receipt.status, "blocked_missing_agent_binding");
+        assert!(!receipt.message.contains("TeamExecutionLoop stage"));
+        assert!(receipt.recovery_candidate.is_some());
+    }
+
+    #[test]
+    fn mission_command_interpreter_executes_session_bridge_without_gateway_logic() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_a = format!("session-interpreter-a-{suffix}");
+        let session_b = format!("session-interpreter-b-{suffix}");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "interpreter source".to_string(),
+                session_id: Some(session_a.clone()),
+            })
+            .expect("session a");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "interpreter target".to_string(),
+                session_id: Some(session_b.clone()),
+            })
+            .expect("session b");
+        global_session_relation_graph()
+            .upsert_proxy(SessionProxy {
+                session_id: session_b.clone(),
+                summary: "target proxy".to_string(),
+                evidence_refs: Vec::new(),
+                decisions: Vec::new(),
+                open_questions: Vec::new(),
+                updated_at_ms: 1,
+            })
+            .expect("proxy");
+
+        let interpretation = MissionCommandInterpreter::interpret(MissionCommandInterpretRequest {
+            current_session_id: session_a,
+            command_text: format!("@{session_b} review this branch"),
+            target_ref: None,
+            autonomy_policy: None,
+            dispatch_mode: None,
+            allow_background: Some(true),
+        });
+        assert_eq!(interpretation.status, "interpreted");
+        assert!(matches!(
+            interpretation.command,
+            MissionInterpretedCommand::BridgeSession { .. }
+        ));
+        let receipt = MissionCommandInterpreter::execute(interpretation);
+        assert!(receipt.ok);
+        assert!(receipt.result["command"].is_object());
+    }
+
+    #[test]
+    fn recovery_marks_running_interrupted_and_claimed_pending_not_completed() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_a = format!("session-recovery-a-{suffix}");
+        let session_b = format!("session-recovery-b-{suffix}");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "recovery source".to_string(),
+                session_id: Some(session_a.clone()),
+            })
+            .expect("session a");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "recovery target".to_string(),
+                session_id: Some(session_b.clone()),
+            })
+            .expect("session b");
+        let claimed = global_mission_runtime()
+            .enqueue_session_command(&session_a, &session_b, "claimed command")
+            .expect("claimed");
+        let running = global_mission_runtime()
+            .enqueue_session_command(&session_a, &session_b, "running command")
+            .expect("running");
+        global_mission_runtime()
+            .claim_session_command(&session_b, &claimed.command_id)
+            .expect("claim");
+        global_mission_runtime()
+            .mark_session_command_running(&session_b, &running.command_id)
+            .expect("running");
+
+        let report = global_mission_runtime().recover_interrupted_work();
+        assert!(report
+            .recovered
+            .iter()
+            .any(|candidate| candidate.command_id.as_deref() == Some(claimed.command_id.as_str())));
+        assert!(report
+            .recovered
+            .iter()
+            .any(|candidate| candidate.command_id.as_deref() == Some(running.command_id.as_str())));
+        assert_eq!(
+            global_mission_runtime()
+                .get_session_command(&claimed.command_id)
+                .expect("claimed after")
+                .status,
+            MissionSessionCommandStatus::Pending
+        );
+        assert_eq!(
+            global_mission_runtime()
+                .get_session_command(&running.command_id)
+                .expect("running after")
+                .status,
+            MissionSessionCommandStatus::Interrupted
+        );
     }
 }

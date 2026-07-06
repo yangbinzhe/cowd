@@ -1235,18 +1235,136 @@ impl GatewayApiClient {
         self.get_json("/api/harness-eval/reports").await
     }
 
+    pub async fn harness_eval_report(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/harness-eval/reports/{}", url_encode(id)))
+            .await
+    }
+
+    pub async fn harness_eval_report_artifacts(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/harness-eval/reports/{}/artifacts",
+            url_encode(id)
+        ))
+        .await
+    }
+
+    pub async fn harness_eval_report_gate(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/harness-eval/reports/{}/gate",
+            url_encode(id)
+        ))
+        .await
+    }
+
+    pub async fn harness_eval_run_status(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/harness-eval/runs/{}", url_encode(id)))
+            .await
+    }
+
     pub async fn harness_eval_run_smoke(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.harness_eval_run(
+            "quick",
+            "low",
+            false,
+            "operator requested harness eval smoke",
+        )
+        .await
+    }
+
+    pub async fn harness_eval_run(
+        &self,
+        level: &str,
+        budget: &str,
+        allow_real_model: bool,
+        objective: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/harness-eval/runs",
             serde_json::json!({
-                "level": "quick",
-                "budget": "low",
+                "level": level,
+                "budget": budget,
                 "actor": "tui.gateway_panel",
-                "objective": "operator requested harness eval smoke",
-                "allow_real_model": false
+                "objective": objective,
+                "allow_real_model": allow_real_model
             }),
         )
         .await
+    }
+
+    pub async fn harness_eval_cancel_run(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/harness-eval/runs/{}/cancel", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_signals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/signals").await
+    }
+
+    pub async fn evolution_proposals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/proposals").await
+    }
+
+    pub async fn evolution_create_proposal(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/evolution/proposals",
+            serde_json::json!({ "signal_ids": signal_ids }),
+        )
+        .await
+    }
+
+    pub async fn evolution_skill_draft(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/proposals/{}/skill-draft",
+            url_encode(proposal_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_sandbox_eval(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/proposals/{}/sandbox-eval",
+                url_encode(proposal_id)
+            ),
+            serde_json::json!({
+                "baseline_ref": "baseline:current",
+                "candidate_ref": "candidate:sandbox",
+                "baseline_score": 60,
+                "candidate_score": 80
+            }),
+        )
+        .await
+    }
+
+    pub async fn evolution_sandbox_evals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/sandbox-evals").await
     }
 
     pub async fn connector_service_tools(
@@ -1955,7 +2073,19 @@ mod tests {
             "skill_action",
             "harness_eval_latest_report",
             "harness_eval_reports",
+            "harness_eval_report",
+            "harness_eval_report_artifacts",
+            "harness_eval_report_gate",
             "harness_eval_run_smoke",
+            "harness_eval_run",
+            "harness_eval_run_status",
+            "harness_eval_cancel_run",
+            "evolution_signals",
+            "evolution_proposals",
+            "evolution_create_proposal",
+            "evolution_skill_draft",
+            "evolution_sandbox_eval",
+            "evolution_sandbox_evals",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
             "cross_plane_policy_simulate",
@@ -1975,10 +2105,26 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 105);
+        assert_eq!(migrated.len(), 117);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
+    }
+
+    #[test]
+    fn evolution_gateway_api_inventory_exposes_runtime_evolution_controls() {
+        let evolution_methods = [
+            "evolution_signals",
+            "evolution_proposals",
+            "evolution_create_proposal",
+            "evolution_skill_draft",
+            "evolution_sandbox_eval",
+            "evolution_sandbox_evals",
+        ];
+        assert_eq!(evolution_methods.len(), 6);
+        assert!(evolution_methods
+            .iter()
+            .all(|method| method.starts_with("evolution_")));
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ impl HarnessEvalLevel {
         match value.trim().to_ascii_lowercase().as_str() {
             "quick" | "smoke" | "lightweight" => Some(Self::Quick),
             "full" => Some(Self::Full),
-            "deep" | "real" => Some(Self::Deep),
+            "deep" | "real" | "deep-real" | "deep_real" => Some(Self::Deep),
             _ => None,
         }
     }

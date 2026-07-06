@@ -57,6 +57,7 @@ mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
 mod edge_routes;
+mod evolution_routes;
 mod growth_routes;
 mod harness_eval_routes;
 mod matrix_outcomes;
@@ -359,6 +360,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
         .merge(edge_routes::router())
+        .merge(evolution_routes::router())
         .merge(growth_routes::router())
         .merge(harness_eval_routes::router())
         .merge(matrix_routes::router())
@@ -1304,6 +1306,40 @@ pub(crate) mod tests {
         let latest_json: serde_json::Value = serde_json::from_slice(&latest_body).unwrap();
         assert_eq!(latest_json["kind"], "harness_eval.latest_report");
         assert_eq!(latest_json["report"]["status"], "passed");
+        let report_id = latest_json["report"]["id"].as_str().unwrap();
+
+        let artifacts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/reports/{report_id}/artifacts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifacts.status(), StatusCode::OK);
+        let artifacts_body = to_bytes(artifacts.into_body(), usize::MAX).await.unwrap();
+        let artifacts_json: serde_json::Value = serde_json::from_slice(&artifacts_body).unwrap();
+        assert_eq!(artifacts_json["kind"], "harness_eval.artifacts");
+        assert_eq!(artifacts_json["report_id"], report_id);
+        assert!(artifacts_json["count"].as_u64().unwrap_or_default() > 0);
+
+        let gate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/reports/{report_id}/gate"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate.status(), StatusCode::OK);
+        let gate_body = to_bytes(gate.into_body(), usize::MAX).await.unwrap();
+        let gate_json: serde_json::Value = serde_json::from_slice(&gate_body).unwrap();
+        assert_eq!(gate_json["kind"], "harness_eval.report_gate");
+        assert_eq!(gate_json["report_gate"]["status"], "passed");
 
         let scenarios = app
             .oneshot(
@@ -1323,6 +1359,135 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(report_dir);
+    }
+
+    #[tokio::test]
+    async fn evolution_routes_link_signal_proposal_skill_draft_and_sandbox_eval() {
+        let workspace = test_temp_dir("evolution-route-workspace");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace.clone(),
+        ));
+
+        let signal = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/evolution/signals")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "signal_type": "memory_noise",
+                            "source": {
+                                "owner": "runtime",
+                                "session_id": "session-1",
+                                "agent_id": null,
+                                "team_id": null,
+                                "run_id": null
+                            },
+                            "evidence_refs": ["memory:packet:noise"],
+                            "severity": "warning",
+                            "summary": "memory packet contained unrelated context",
+                            "suggested_action": "tighten scope and salience gates",
+                            "immediate_task_can_continue": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signal.status(), StatusCode::OK);
+        let signal_body = to_bytes(signal.into_body(), usize::MAX).await.unwrap();
+        let signal_json: serde_json::Value = serde_json::from_slice(&signal_body).unwrap();
+        assert_eq!(signal_json["kind"], "evolution.signal");
+
+        let proposal = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/evolution/proposals")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"signal_ids":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal.status(), StatusCode::OK);
+        let proposal_body = to_bytes(proposal.into_body(), usize::MAX).await.unwrap();
+        let proposal_json: serde_json::Value = serde_json::from_slice(&proposal_body).unwrap();
+        let proposal_id = proposal_json["proposal"]["proposal_id"].as_str().unwrap();
+        assert_eq!(proposal_json["plan_draft"]["blocked_mainline_write"], true);
+
+        let draft = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/evolution/proposals/{proposal_id}/skill-draft"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draft.status(), StatusCode::OK);
+        let draft_body = to_bytes(draft.into_body(), usize::MAX).await.unwrap();
+        let draft_json: serde_json::Value = serde_json::from_slice(&draft_body).unwrap();
+        assert_eq!(draft_json["kind"], "skills.evolution_draft");
+        assert!(draft_json["draft"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Acceptance Gates"));
+
+        let sandbox = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/evolution/proposals/{proposal_id}/sandbox-eval"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "baseline_ref": "baseline:main",
+                            "candidate_ref": "candidate:worktree",
+                            "baseline_score": 50,
+                            "candidate_score": 75
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sandbox.status(), StatusCode::OK);
+        let sandbox_body = to_bytes(sandbox.into_body(), usize::MAX).await.unwrap();
+        let sandbox_json: serde_json::Value = serde_json::from_slice(&sandbox_body).unwrap();
+        assert_eq!(sandbox_json["eval"]["mainline_modified"], false);
+
+        let decision = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/proposals/{proposal_id}/decision"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"decision":"approved"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision.status(), StatusCode::OK);
+        let decision_body = to_bytes(decision.into_body(), usize::MAX).await.unwrap();
+        let decision_json: serde_json::Value = serde_json::from_slice(&decision_body).unwrap();
+        assert_eq!(decision_json["proposal"]["status"], "approved");
+        assert_eq!(decision_json["mainline_modified"], false);
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
@@ -1730,6 +1895,7 @@ pub(crate) mod tests {
             ));
 
         let projection = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/mission/projection")
@@ -1748,6 +1914,39 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+
+        let interpreted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/interpret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "current_session_id": session_id,
+                            "command_text": "dispatch pending mission work",
+                            "execute": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interpreted.status(), StatusCode::OK);
+        let interpreted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(interpreted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            interpreted["kind"],
+            "mission_control.command_interpretation"
+        );
+        assert_eq!(interpreted["ok"], true);
+        assert_eq!(interpreted["interpretation"]["status"], "interpreted");
+        assert_eq!(
+            interpreted["interpretation"]["target_kind"].as_str(),
+            Some("dispatch")
+        );
     }
 
     #[tokio::test]
@@ -2041,7 +2240,7 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "objective": "research architecture and review implementation",
-                            "execution_mode": "register_only"
+                            "execution_mode": "manual_mailbox"
                         })
                         .to_string(),
                     ))

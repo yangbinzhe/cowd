@@ -113,6 +113,13 @@ impl RealityService {
             },
             "capabilities": capabilities,
             "engines": {
+                "runtime_reality_decision": {
+                    "status": "ready",
+                    "role": "Turn-level RealityRuntimeDecision over recall quality, knowledge activation, fact promotion plan, contamination, checkpoint and recovery pointers.",
+                    "owner": "runtime.context.reality_decision",
+                    "writes": false,
+                    "api": "/api/reality/status",
+                },
                 "fact_kernel": {
                     "status": "ready",
                     "role": "internal semantic rules",
@@ -895,7 +902,7 @@ fn reality_capabilities(
         },
         "fact_runtime": {
             "status": RealityCapabilityStatus::EnabledAndWired.as_str(),
-            "reason": "GrowthService injects a gateway-owned durable FactStore into FactKernelService, persists promoted facts/evidence in storage/fact.sqlite, and exposes fact recall to Reality reports/context projections",
+            "reason": "GrowthService uses GatewayFactStore only as a durable FactStore adapter for FactKernelService persistence; fact review and promotion policy remain owned by fact-kernel, while gateway exposes projections/context refs",
         },
         "context_envelope": memory_status
             .pointer("/capabilities/context_envelope")

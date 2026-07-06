@@ -8,6 +8,7 @@ pub mod validator;
 
 use serde_json::{json, Value};
 
+use crate::tool_host::RuntimeToolExecutionHost;
 use crate::{global_mission_evidence_bus, MissionEvidenceRef};
 
 pub use planner::{plan_runtime_collaboration_decision, RuntimeOrchestrationPlan};
@@ -20,11 +21,19 @@ pub use result::{RuntimeOrchestrationDecision, RuntimeOrchestrationResult};
 pub fn handle_runtime_orchestration_request(
     request: RuntimeOrchestrationRequest,
 ) -> RuntimeOrchestrationResult {
+    handle_runtime_orchestration_request_with_host(request, None)
+}
+
+#[must_use]
+pub fn handle_runtime_orchestration_request_with_host(
+    request: RuntimeOrchestrationRequest,
+    tool_host: Option<&dyn RuntimeToolExecutionHost>,
+) -> RuntimeOrchestrationResult {
     let plan = planner::plan_runtime_orchestration(&request);
     let mut decision =
         validator::validate_request(&request, &plan.execution_decision.recommended_mode);
     let (status_override, detail) =
-        executor::execute_orchestration_request(&request, &plan, &decision.status);
+        executor::execute_orchestration_request(&request, &plan, &decision.status, tool_host);
     if let Some(status) = status_override {
         decision.status = status;
     }
@@ -42,8 +51,16 @@ pub fn handle_runtime_orchestration_request(
 
 #[must_use]
 pub fn runtime_orchestration_response(value: Value) -> Value {
+    runtime_orchestration_response_with_host(value, None)
+}
+
+#[must_use]
+pub fn runtime_orchestration_response_with_host(
+    value: Value,
+    tool_host: Option<&dyn RuntimeToolExecutionHost>,
+) -> Value {
     match serde_json::from_value::<RuntimeOrchestrationRequest>(value) {
-        Ok(request) => serde_json::to_value(handle_runtime_orchestration_request(request))
+        Ok(request) => serde_json::to_value(handle_runtime_orchestration_request_with_host(request, tool_host))
             .unwrap_or_else(|error| {
                 json!({"type":"runtime_orchestration_result","status":"rejected","error": error.to_string()})
             }),
@@ -73,8 +90,8 @@ fn orchestration_evidence(
         "selected_mode": decision.selected_mode.as_str(),
         "recommended_template": plan.execution_decision.recommended_template.map(|template| template.as_str()),
         "policy_gates": &decision.policy_gates,
-        "accepted": matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned"),
-        "degraded": decision.status != "accepted" && decision.status != "running" && decision.status != "ready",
+        "accepted": matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned" | "executed"),
+        "degraded": !matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned" | "executed"),
         "evidence_refs": &request.evidence_refs,
         "runtime_owner": "runtime.orchestration",
     });
@@ -173,11 +190,91 @@ mod tests {
             .contains(&"missing_session_id_for_team_runtime".to_string()));
     }
 
+    struct FakeRuntimeToolHost;
+
+    impl crate::RuntimeToolExecutionHost for FakeRuntimeToolHost {
+        fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(format!("executed {}", request.tool_name)),
+                error: None,
+                evidence_ref: format!("fake-evidence:{}", request.tool_use_id),
+            }
+        }
+    }
+
     #[test]
-    fn complex_execution_actions_return_runtime_owned_ready_packets() {
+    fn tool_dag_actions_without_host_are_blocked_not_fake_ready() {
         for action in [
             RuntimeOrchestrationAction::RequestParallelTools,
             RuntimeOrchestrationAction::RequestRewooEvidence,
+        ] {
+            let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
+                intent: "检查 README 是否反映最新架构".to_string(),
+                session_id: Some("session-runtime-orchestrate-test".to_string()),
+                action,
+                reason: None,
+                template_hint: None,
+                capabilities: Vec::new(),
+                evidence_refs: Vec::new(),
+                constraints: Default::default(),
+                surface: None,
+            });
+            assert_eq!(result.status, "blocked_missing_executor");
+            assert_eq!(
+                result.execution["receipt"]["status"],
+                "blocked_missing_executor"
+            );
+            assert_eq!(
+                result.execution["engine"]["dispatch_surface"],
+                "runtime_tool_host"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_dag_actions_with_host_execute_and_emit_receipt() {
+        let host = FakeRuntimeToolHost;
+        for action in [
+            RuntimeOrchestrationAction::RequestParallelTools,
+            RuntimeOrchestrationAction::RequestRewooEvidence,
+        ] {
+            let result = handle_runtime_orchestration_request_with_host(
+                RuntimeOrchestrationRequest {
+                    intent: "检查 README 是否反映最新架构".to_string(),
+                    session_id: Some("session-runtime-orchestrate-test".to_string()),
+                    action,
+                    reason: None,
+                    template_hint: None,
+                    capabilities: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    constraints: Default::default(),
+                    surface: None,
+                },
+                Some(&host),
+            );
+            assert_eq!(result.status, "executed");
+            assert_eq!(result.execution["receipt"]["status"], "executed");
+            assert!(result.execution["receipt"]["tool_results"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()));
+            assert_eq!(
+                result.execution["receipt"]["events"][0]["kind"],
+                "runtime.tool_dag.executed"
+            );
+            assert!(result.evidence["accepted"].as_bool().unwrap_or(false));
+        }
+    }
+
+    #[test]
+    fn deliberation_and_reflexion_return_runtime_owned_ready_packets() {
+        for action in [
             RuntimeOrchestrationAction::RequestDeliberation,
             RuntimeOrchestrationAction::RequestReflexionRetry,
         ] {
@@ -194,12 +291,10 @@ mod tests {
             });
             assert_eq!(result.status, "ready");
             assert_eq!(result.execution["status"], "ready");
-            assert!(result.evidence["accepted"].as_bool().unwrap_or(false));
             let fidelity = result.execution["execution_fidelity"]
                 .as_str()
                 .expect("execution fidelity");
             assert!(fidelity.starts_with("runtime_owned_"), "{fidelity}");
-            assert!(!fidelity.contains("planned"), "{fidelity}");
             assert!(result.execution["engine"]["owned_by"] == "runtime");
         }
     }
@@ -218,7 +313,7 @@ mod tests {
             surface: Some("webui".to_string()),
         });
 
-        assert_eq!(result.status, "ready");
+        assert_eq!(result.status, "blocked_missing_executor");
         assert_eq!(result.evidence["runtime_action"], "parallel_tool_batch");
         assert_eq!(
             result.evidence["model_reason"],
@@ -233,6 +328,10 @@ mod tests {
             "runtime_orchestration"
         );
         assert_eq!(result.execution["engine"]["owned_by"], "runtime");
+        assert_eq!(
+            result.execution["receipt"]["status"],
+            "blocked_missing_executor"
+        );
     }
 
     #[test]

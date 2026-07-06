@@ -17,6 +17,7 @@ pub enum RuntimeDomain {
     Policy,
     ExecutionCore,
     RealityBridge,
+    Evolution,
     Configuration,
     Infrastructure,
     Skill,
@@ -40,6 +41,7 @@ impl RuntimeDomain {
             Self::Policy => "policy",
             Self::ExecutionCore => "execution_core",
             Self::RealityBridge => "reality_bridge",
+            Self::Evolution => "evolution",
             Self::Configuration => "configuration",
             Self::Infrastructure => "infrastructure",
             Self::Skill => "skill",
@@ -76,8 +78,9 @@ impl RuntimeModuleDescriptor {
 #[must_use]
 pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
     use RuntimeDomain::{
-        Agent, Approval, Configuration, Context, Conversation, ExecutionCore, Infrastructure,
-        Mission, Policy, Provider, RealityBridge, Recovery, Session, Skill, Steward, Team, Tooling,
+        Agent, Approval, Configuration, Context, Conversation, Evolution, ExecutionCore,
+        Infrastructure, Mission, Policy, Provider, RealityBridge, Recovery, Session, Skill,
+        Steward, Team, Tooling,
     };
     vec![
         RuntimeModuleDescriptor::public("conversation", Conversation, "runtime", true),
@@ -95,6 +98,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("tool_cache", Tooling, "runtime", false),
         RuntimeModuleDescriptor::public("tool_dispatch", Tooling, "runtime", true),
         RuntimeModuleDescriptor::public("tool_execution_plan", Tooling, "runtime", false),
+        RuntimeModuleDescriptor::public("tool_host", Tooling, "runtime", true),
         RuntimeModuleDescriptor::public("tool_invocation", Tooling, "runtime", false),
         RuntimeModuleDescriptor::public("tool_ledger", Tooling, "runtime", false),
         RuntimeModuleDescriptor::public("tool_memory", Tooling, "runtime", false),
@@ -107,6 +111,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("task_registry", Mission, "runtime", true),
         RuntimeModuleDescriptor::public("session_execution", Session, "runtime", true),
         RuntimeModuleDescriptor::public("session_lifecycle", Session, "runtime", true),
+        RuntimeModuleDescriptor::public("mission_command_interpreter", Session, "runtime", true),
         RuntimeModuleDescriptor::public("session_relation_graph", Session, "runtime", false),
         RuntimeModuleDescriptor::public("agent", Agent, "runtime", true),
         RuntimeModuleDescriptor::public("agent_backend", Agent, "runtime", true),
@@ -126,6 +131,8 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("team_cron_registry", Team, "runtime", false),
         RuntimeModuleDescriptor::public("team_discovery", Team, "runtime", false),
         RuntimeModuleDescriptor::public("team_execution", Team, "runtime", true),
+        RuntimeModuleDescriptor::public("agent_outcome_bridge", Team, "runtime", true),
+        RuntimeModuleDescriptor::public("agent_task_binding", Team, "runtime", true),
         RuntimeModuleDescriptor::public("team_runtime", Team, "runtime", true),
         RuntimeModuleDescriptor::public("conflict_arbiter", Mission, "runtime", true),
         RuntimeModuleDescriptor::public("steward_agent", Steward, "runtime", false),
@@ -145,6 +152,8 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("skill", Skill, "runtime", true),
         RuntimeModuleDescriptor::public("structured_data", RealityBridge, "runtime", false),
         RuntimeModuleDescriptor::public("fact_extraction", RealityBridge, "runtime", true),
+        RuntimeModuleDescriptor::public("reality_decision", RealityBridge, "runtime", true),
+        RuntimeModuleDescriptor::public("evolution", Evolution, "runtime", true),
         RuntimeModuleDescriptor::public("recovery", Recovery, "runtime", true),
         RuntimeModuleDescriptor::public("recovery_recipes", Recovery, "runtime", false),
         RuntimeModuleDescriptor::public("runtime_event_replay", Recovery, "runtime", false),

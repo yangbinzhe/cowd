@@ -28,6 +28,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(harness_eval_report_detail_handler),
         )
         .route(
+            "/api/harness-eval/reports/:id/artifacts",
+            get(harness_eval_report_artifacts_handler),
+        )
+        .route(
+            "/api/harness-eval/reports/:id/gate",
+            get(harness_eval_report_gate_handler),
+        )
+        .route(
             "/api/harness-eval/scenarios",
             get(harness_eval_scenarios_handler),
         )
@@ -79,6 +87,32 @@ async fn harness_eval_report_detail_handler(
         .services
         .harness_eval
         .report_detail(&state.config_home, config.as_ref(), &id)
+        .map(Json)
+        .map_err(harness_eval_error)
+}
+
+async fn harness_eval_report_artifacts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let config = state.runtime_config_json_snapshot();
+    state
+        .services
+        .harness_eval
+        .report_artifacts(&state.config_home, config.as_ref(), &id)
+        .map(Json)
+        .map_err(harness_eval_error)
+}
+
+async fn harness_eval_report_gate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let config = state.runtime_config_json_snapshot();
+    state
+        .services
+        .harness_eval
+        .report_gate(&state.config_home, config.as_ref(), &id)
         .map(Json)
         .map_err(harness_eval_error)
 }

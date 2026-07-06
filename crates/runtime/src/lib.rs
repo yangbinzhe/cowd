@@ -133,8 +133,12 @@ pub mod agent_kernel;
 pub mod agent_lifecycle;
 #[path = "agent/agent_mailbox.rs"]
 pub mod agent_mailbox;
+#[path = "team/agent_outcome_bridge.rs"]
+pub mod agent_outcome_bridge;
 #[path = "agent/agent_protocol.rs"]
 pub mod agent_protocol;
+#[path = "team/agent_task_binding.rs"]
+pub mod agent_task_binding;
 #[path = "agent/agent_workgraph.rs"]
 pub mod agent_workgraph;
 #[path = "approval/approval_gate.rs"]
@@ -157,6 +161,8 @@ pub mod cross_plane_policy;
 pub mod eval_gate;
 #[path = "context/evidence_planner.rs"]
 pub mod evidence_planner;
+#[path = "evolution/mod.rs"]
+pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
 #[path = "infrastructure/execution_scheduler.rs"]
@@ -169,6 +175,8 @@ pub mod intent_planner;
 pub mod joint_problem_solving;
 #[path = "infrastructure/lane_completion.rs"]
 pub mod lane_completion;
+#[path = "session/mission_command_interpreter.rs"]
+pub mod mission_command_interpreter;
 #[path = "infrastructure/mutation_plan.rs"]
 pub mod mutation_plan;
 #[path = "orchestration/mod.rs"]
@@ -185,6 +193,8 @@ pub mod provider_registry;
 pub mod provider_runtime_client;
 #[path = "infrastructure/quality_gate.rs"]
 pub mod quality_gate;
+#[path = "context/reality_decision.rs"]
+pub mod reality_decision;
 #[path = "infrastructure/release_gate.rs"]
 pub mod release_gate;
 #[path = "recovery/runtime_event_replay.rs"]
@@ -242,6 +252,8 @@ pub mod tool_cache;
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plan.rs"]
 pub mod tool_execution_plan;
+#[path = "tooling/tool_host.rs"]
+pub mod tool_host;
 #[path = "tooling/tool_invocation.rs"]
 pub mod tool_invocation;
 #[path = "tooling/tool_ledger.rs"]
@@ -293,9 +305,14 @@ pub use agent_mailbox::{
     global_agent_task_mailbox, AgentTask, AgentTaskCompletionReceipt, AgentTaskMailboxService,
     AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskReceipt, AgentTaskStatus,
 };
+pub use agent_outcome_bridge::{bridge_agent_terminal_snapshot, AgentRuntimeOutcomeBridgeReceipt};
 pub use agent_protocol::{
     AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
     AgentTaskNode, ReviewVerdict,
+};
+pub use agent_task_binding::{
+    global_agent_task_binding_registry, AgentTaskBinding, AgentTaskBindingRegistry,
+    AgentTaskBindingStatus,
 };
 pub use agent_workgraph::{
     AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
@@ -413,6 +430,12 @@ pub use lane_events::{
 };
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
+pub use evolution::{
+    EvolutionPlanDraft, EvolutionProposal, EvolutionProposalKind, EvolutionProposalRisk,
+    EvolutionProposalStore, EvolutionSandboxEval, EvolutionSandboxRecommendation,
+    EvolutionSandboxStore, EvolutionSignal, EvolutionSignalInput, EvolutionSignalSeverity,
+    EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType, EvolutionSkillDraft,
+};
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
@@ -435,6 +458,10 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
+pub use mission_command_interpreter::{
+    MissionCommandExecutionReceipt, MissionCommandInterpretRequest, MissionCommandInterpretation,
+    MissionCommandInterpreter, MissionCommandTargetKind, MissionInterpretedCommand,
+};
 pub use mission_control::{
     MissionControlAction, MissionControlAgentNode, MissionControlApprovalNode,
     MissionControlCommand, MissionControlCommandReceipt, MissionControlCommandStatus,
@@ -445,9 +472,9 @@ pub use mission_control::{
 pub use mission_evidence::{global_mission_evidence_bus, MissionEvidenceBus, MissionEvidenceRef};
 pub use mission_runtime::{
     global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection,
-    MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
-    MissionSessionCommandStatus, MissionSessionCommandSummary, MissionSessionSnapshot,
-    MissionSessionStatus, StartMissionSessionRequest,
+    MissionRecoveryReport, MissionRoutedCommand, MissionRuntime, MissionSessionCommand,
+    MissionSessionCommandKind, MissionSessionCommandStatus, MissionSessionCommandSummary,
+    MissionSessionSnapshot, MissionSessionStatus, StartMissionSessionRequest,
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
@@ -457,9 +484,11 @@ pub use mutation_plan::{
     MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
 };
 pub use orchestration::{
-    handle_runtime_orchestration_request, plan_runtime_collaboration_decision,
-    runtime_orchestration_response, RuntimeOrchestrationAction, RuntimeOrchestrationConstraints,
-    RuntimeOrchestrationDecision, RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
+    handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_host,
+    plan_runtime_collaboration_decision, runtime_orchestration_response,
+    runtime_orchestration_response_with_host, RuntimeOrchestrationAction,
+    RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationRequest,
+    RuntimeOrchestrationResult,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
@@ -486,6 +515,10 @@ pub use provider_registry::{
 pub use provider_runtime_client::{
     push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
     ProviderToolDefinition,
+};
+pub use reality_decision::{
+    RealityContextBudgetPlan, RealityFactPlan, RealityFactPlanItem, RealityKnowledgeDecision,
+    RealityMemoryDecision, RealityRecallQualityReport, RealityRuntimeDecision,
 };
 pub use recovery::{
     RecoveryAppliedAction, RecoveryExecutionReport, RecoveryExecutor, RecoveryFailedAction,
@@ -526,7 +559,7 @@ pub use session::{
 pub use session_execution::{
     CrossSessionBridgeReceipt, CrossSessionMessage, SessionCommandDispatchReceipt,
     SessionDispatchMode, SessionExecutionPlane, SessionExecutionPolicy, SessionExecutionReport,
-    SessionExecutionSkip, SessionLeaseState,
+    SessionExecutionSkip, SessionLeaseState, SessionRecoveryCandidate,
 };
 pub use session_relation_graph::{
     global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
@@ -557,9 +590,9 @@ pub use steward_runtime::{
     StewardStatus, TickStewardRuntimeRequest,
 };
 pub use steward_scheduler::{
-    global_steward_decision_ledger, StewardDecisionLedger, StewardDecisionLedgerRecord,
-    StewardScheduler, StewardSchedulerConfig, StewardSchedulerHandoffSummary,
-    StewardSchedulerProjection, StewardSchedulerTickReport,
+    global_steward_decision_ledger, StewardAutomationPolicy, StewardAutomationPolicySpec,
+    StewardDecisionLedger, StewardDecisionLedgerRecord, StewardScheduler, StewardSchedulerConfig,
+    StewardSchedulerHandoffSummary, StewardSchedulerProjection, StewardSchedulerTickReport,
 };
 pub use subagent_turn::{
     final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
@@ -581,6 +614,10 @@ pub use team_runtime::{
     TeamRuntimeStatus,
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
+pub use tool_host::{
+    RuntimeActionExecutionReceipt, RuntimeToolExecutionHost, RuntimeToolExecutionOutcome,
+    RuntimeToolExecutionRequest, RuntimeToolExecutionStatus,
+};
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
     ToolOutputRef, DEFAULT_OUTPUT_REF_MIN_LINES,

@@ -93,6 +93,45 @@ impl HarnessEvalService {
         }))
     }
 
+    pub(crate) fn report_artifacts(
+        &self,
+        config_home: &Path,
+        config: Option<&Value>,
+        id: &str,
+    ) -> Result<Value, HarnessEvalServiceError> {
+        let detail = self.report_detail_model(config_home, config, id)?;
+        let count = detail.artifacts.len();
+        Ok(json!({
+            "kind": "harness_eval.artifacts",
+            "envelope": self.envelope("artifacts"),
+            "report_id": id,
+            "summary": detail.summary,
+            "artifacts": detail.artifacts,
+            "count": count,
+        }))
+    }
+
+    pub(crate) fn report_gate(
+        &self,
+        config_home: &Path,
+        config: Option<&Value>,
+        id: &str,
+    ) -> Result<Value, HarnessEvalServiceError> {
+        let detail = self.report_detail_model(config_home, config, id)?;
+        let report_gate = detail
+            .report
+            .get("report_gate")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "kind": "harness_eval.report_gate",
+            "envelope": self.envelope("report_gate"),
+            "report_id": id,
+            "summary": detail.summary,
+            "report_gate": report_gate,
+        }))
+    }
+
     pub(crate) fn scenarios(&self) -> Value {
         json!({
             "kind": "harness_eval.scenarios",
@@ -161,11 +200,6 @@ impl HarnessEvalService {
             .map_err(HarnessEvalServiceError::Internal)?;
             return Ok(run_response(self.envelope("run_start"), record));
         }
-        if level == HarnessEvalLevel::Deep && request.allow_real_model {
-            return Err(HarnessEvalServiceError::BadRequest(
-                "deep/real model run remains CLI-only in this version; use quick/full Gateway smoke or explicit harness-eval CLI for token-consuming deep scenarios".to_string(),
-            ));
-        }
         let store = self.store(config_home, config);
         let record = run_eval(
             &store,
@@ -209,8 +243,12 @@ impl HarnessEvalService {
         vec![
             self.envelope("reports"),
             self.envelope("latest_report"),
+            self.envelope("report_detail"),
+            self.envelope("artifacts"),
+            self.envelope("report_gate"),
             self.envelope("scenarios"),
             self.envelope("runs"),
+            self.envelope("run_detail"),
             self.envelope("run_start"),
             self.envelope("run_cancel"),
         ]
@@ -218,6 +256,21 @@ impl HarnessEvalService {
 
     fn store(&self, config_home: &Path, config: Option<&Value>) -> HarnessEvalReportStore {
         HarnessEvalReportStore::new(report_root(config_home, config))
+    }
+
+    fn report_detail_model(
+        &self,
+        config_home: &Path,
+        config: Option<&Value>,
+        id: &str,
+    ) -> Result<harness_eval::HarnessEvalReportDetail, HarnessEvalServiceError> {
+        let store = self.store(config_home, config);
+        store
+            .get_report(id)
+            .map_err(HarnessEvalServiceError::Internal)?
+            .ok_or_else(|| {
+                HarnessEvalServiceError::NotFound("harness eval report not found".to_string())
+            })
     }
 }
 
@@ -282,6 +335,23 @@ mod tests {
             )
             .expect("gated");
         assert_eq!(gated["run"]["status"], "gated");
+        let deep_real = service
+            .start_run(
+                &config_home,
+                None,
+                HarnessEvalRunRequest {
+                    level: HarnessEvalLevel::Deep,
+                    provider: Some("configured".to_string()),
+                    budget: Some("full".to_string()),
+                    allow_real_model: true,
+                    actor: None,
+                    objective: Some("deep real should be delegated to harness-eval".to_string()),
+                },
+            )
+            .expect("deep real delegated");
+        assert_eq!(deep_real["kind"], "harness_eval.run");
+        assert_ne!(deep_real["run"]["status"], "gated");
+        assert!(deep_real["run"]["report_path"].is_string());
         let _ = std::fs::remove_dir_all(config_home);
     }
 }

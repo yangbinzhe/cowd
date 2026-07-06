@@ -155,8 +155,10 @@ impl GatewayToolExecutor {
             if let Some(output) = self.try_execute_gateway_runtime_orchestration(&value)? {
                 return Ok(output);
             }
-            return serde_json::to_string_pretty(&runtime::runtime_orchestration_response(value))
-                .map_err(|error| ToolError::new(error.to_string()));
+            return serde_json::to_string_pretty(
+                &runtime::runtime_orchestration_response_with_host(value, Some(self)),
+            )
+            .map_err(|error| ToolError::new(error.to_string()));
         }
 
         let Some(mcp_state) = &self.mcp_state else {
@@ -218,7 +220,7 @@ impl GatewayToolExecutor {
                     session_id,
                     request.intent.clone(),
                     None,
-                    MissionTeamExecutionMode::RegisterOnly,
+                    MissionTeamExecutionMode::ProviderInProcess,
                 )
                 .map_err(ToolError::new)?;
                 let workgraph = runtime::TeamExecutionLoop::plan(&team.team_id)
@@ -244,9 +246,9 @@ impl GatewayToolExecutor {
                         "selected_mode": action_selection.recommended_mode,
                         "selected_template": selected_template,
                         "reason": request.reason.unwrap_or_else(|| action_selection.reason.clone()),
-                        "policy_gates": ["gateway_session_auto_bound", "mission_session_ensured", "team_spawner_register_only"],
+                        "policy_gates": ["gateway_session_auto_bound", "mission_session_ensured", "team_spawner_provider_in_process"],
                         "budget": {},
-                        "permission": {"mode": "workspace_write", "team_execution_mode": "register_only"},
+                        "permission": {"mode": "workspace_write", "team_execution_mode": "provider_in_process"},
                         "status": "accepted"
                     },
                     "execution": {
@@ -257,7 +259,7 @@ impl GatewayToolExecutor {
                         "workgraph": workgraph,
                         "mission": runtime::global_mission_runtime().projection(),
                         "control_actions": ["inspect", "tick_ready", "synthesis", "handoff", "cancel", "pause"],
-                        "note": "Gateway-bound runtime_orchestrate used MissionService spawner semantics; register_only avoids implicit paid subagent model calls during planning."
+                        "note": "Gateway-bound runtime_orchestrate used MissionService spawner semantics and starts provider-backed lifecycle agents for real team execution."
                     },
                     "evidence": {
                         "type": "runtime_orchestration_evidence",
@@ -381,6 +383,35 @@ impl ToolExecutor for GatewayToolExecutor {
     }
 }
 
+impl runtime::RuntimeToolExecutionHost for GatewayToolExecutor {
+    fn execute_runtime_tool(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> runtime::RuntimeToolExecutionOutcome {
+        let evidence_ref = format!("gateway-tool:{}", request.tool_use_id);
+        match <Self as ToolExecutor>::execute(self, &request.tool_name, &request.input) {
+            Ok(output) => runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(output),
+                error: None,
+                evidence_ref,
+            },
+            Err(error) => runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::Failed,
+                category: request.category,
+                output: None,
+                error: Some(error.to_string()),
+                evidence_ref,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +514,39 @@ mod tests {
         assert!(output.contains("\"type\": \"team_runtime\""), "{output}");
         assert!(output.contains("gateway-session-v26"), "{output}");
         assert!(!output.contains("missing_session_id_for_team_runtime"));
+    }
+
+    #[test]
+    fn runtime_orchestrate_parallel_tools_injects_gateway_tool_host() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_orchestrate".to_string(),
+                description: Some("runtime orchestration".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": { "type": "string" },
+                        "action": { "type": "string" }
+                    },
+                    "required": ["intent"],
+                    "additionalProperties": true
+                }),
+                required_permission: ToolPermissionMode::WorkspaceWrite,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None)
+            .with_runtime_session_id("gateway-session-v6-tool-host");
+
+        let output = executor
+            .execute(
+                "runtime_orchestrate",
+                r#"{"intent":"检查 README 是否反映最新架构","action":"request_parallel_tools"}"#,
+            )
+            .expect("gateway-bound runtime orchestrate should inject a tool host");
+
+        assert!(output.contains("\"status\": \"executed\""), "{output}");
+        assert!(output.contains("runtime.tool_dag.executed"), "{output}");
+        assert!(output.contains("gateway-tool:"), "{output}");
+        assert!(!output.contains("blocked_missing_executor"), "{output}");
     }
 }

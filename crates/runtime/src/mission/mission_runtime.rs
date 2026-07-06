@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cowd_dirs, global_conflict_arbiter, global_mission_evidence_bus, global_session_relation_graph,
     record_runtime_event, RuntimeCapabilityCatalog, RuntimeEventInput, RuntimeEventScope,
-    StewardScheduler, TeamExecutionLoop,
+    SessionRecoveryCandidate, StewardScheduler, TeamExecutionLoop,
 };
 use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
@@ -174,6 +174,7 @@ pub struct MissionProjection {
     pub steward_projection: serde_json::Value,
     pub capability_projection: serde_json::Value,
     pub health_projection: serde_json::Value,
+    pub recovery_projection: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +681,70 @@ impl MissionRuntime {
             steward_projection: serde_json::json!(StewardScheduler::projection()),
             capability_projection: serde_json::json!(RuntimeCapabilityCatalog::current()),
             health_projection: mission_health_projection(&state),
+            recovery_projection: mission_recovery_projection(&state),
+        }
+    }
+
+    #[must_use]
+    pub fn recovery_candidates(&self) -> Vec<SessionRecoveryCandidate> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery_candidates_for_state(&state)
+    }
+
+    pub fn recover_interrupted_work(&self) -> MissionRecoveryReport {
+        let mut recovered = Vec::new();
+        let mut errors = Vec::new();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let candidates = recovery_candidates_for_state(&state);
+        let now = now_ms();
+        for candidate in &candidates {
+            let Some(command_id) = candidate.command_id.as_deref() else {
+                continue;
+            };
+            let Some(command) = state.session_commands.get_mut(command_id) else {
+                errors.push(format!("recovery candidate command missing: {command_id}"));
+                continue;
+            };
+            match command.status {
+                MissionSessionCommandStatus::Claimed => {
+                    command.status = MissionSessionCommandStatus::Pending;
+                    command.claimed_at_ms = None;
+                    command.error = Some("recovered claimed command for redispatch".to_string());
+                    command.attempt = command.attempt.saturating_add(1);
+                    recovered.push(candidate.clone());
+                }
+                MissionSessionCommandStatus::Running => {
+                    command.status = MissionSessionCommandStatus::Interrupted;
+                    command.completed_at_ms = Some(now);
+                    command.error = Some(
+                        "runtime turn interrupted before completion; retry required".to_string(),
+                    );
+                    recovered.push(candidate.clone());
+                }
+                _ => {}
+            }
+        }
+        if !recovered.is_empty() {
+            state.push_event(
+                "mission.recovery.applied",
+                format!("{} mission recovery candidates applied", recovered.len()),
+                None,
+            );
+        }
+        if let Err(error) = self.persist_if_enabled(&state) {
+            errors.push(error);
+        }
+        MissionRecoveryReport {
+            kind: "runtime.mission_recovery_report".to_string(),
+            candidates,
+            recovered,
+            errors,
         }
     }
 
@@ -900,6 +965,67 @@ fn mission_health_projection(state: &MissionRuntimeState) -> serde_json::Value {
             "manual_reload_surface": "gateway/edge status surfaces"
         }
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionRecoveryReport {
+    pub kind: String,
+    pub candidates: Vec<SessionRecoveryCandidate>,
+    pub recovered: Vec<SessionRecoveryCandidate>,
+    pub errors: Vec<String>,
+}
+
+fn mission_recovery_projection(state: &MissionRuntimeState) -> serde_json::Value {
+    let candidates = recovery_candidates_for_state(state);
+    serde_json::json!({
+        "kind": "runtime.mission_recovery",
+        "candidate_count": candidates.len(),
+        "candidates": candidates,
+    })
+}
+
+fn recovery_candidates_for_state(state: &MissionRuntimeState) -> Vec<SessionRecoveryCandidate> {
+    state
+        .session_commands
+        .values()
+        .filter_map(|command| match command.status {
+            MissionSessionCommandStatus::Claimed => Some(SessionRecoveryCandidate {
+                scope: "session_command".to_string(),
+                session_id: Some(command.target_session_id.clone()),
+                command_id: Some(command.command_id.clone()),
+                agent_id: None,
+                status: command.status.as_str().to_string(),
+                reason: "claimed command may have been interrupted before dispatch".to_string(),
+                suggested_action: "reset_to_pending_and_redispatch".to_string(),
+            }),
+            MissionSessionCommandStatus::Running => Some(SessionRecoveryCandidate {
+                scope: "session_command".to_string(),
+                session_id: Some(command.target_session_id.clone()),
+                command_id: Some(command.command_id.clone()),
+                agent_id: None,
+                status: command.status.as_str().to_string(),
+                reason: "running command has no durable turn completion result".to_string(),
+                suggested_action: "mark_interrupted_then_retry_or_takeover".to_string(),
+            }),
+            MissionSessionCommandStatus::Interrupted | MissionSessionCommandStatus::Failed => {
+                Some(SessionRecoveryCandidate {
+                    scope: "session_command".to_string(),
+                    session_id: Some(command.target_session_id.clone()),
+                    command_id: Some(command.command_id.clone()),
+                    agent_id: None,
+                    status: command.status.as_str().to_string(),
+                    reason: command
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "command requires review".to_string()),
+                    suggested_action: "review_then_retry_or_cancel".to_string(),
+                })
+            }
+            MissionSessionCommandStatus::Pending
+            | MissionSessionCommandStatus::Completed
+            | MissionSessionCommandStatus::Cancelled => None,
+        })
+        .collect()
 }
 
 fn session_command_summary(

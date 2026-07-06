@@ -12,11 +12,11 @@ use crate::runtime_service::RuntimeTurnOptions;
 use crate::services::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
-    InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
-    MissionTeamHandoffHttpRequest, RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest,
-    StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitAgentTaskOutcomeHttpRequest, SubmitMissionApprovalHttpRequest,
-    TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    InterpretMissionCommandHttpRequest, InterruptMissionStewardHttpRequest,
+    MissionSessionCommandConsumeMode, MissionTeamHandoffHttpRequest,
+    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
+    StartMissionTeamRuntimeHttpRequest, SubmitAgentTaskOutcomeHttpRequest,
+    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 use memory::SessionRecord;
 
@@ -41,6 +41,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/mission/control/sessions/bridge",
             post(bridge_mission_session_handler),
+        )
+        .route(
+            "/api/mission/control/interpret",
+            post(interpret_mission_command_handler),
         )
         .route(
             "/api/mission/control/teams",
@@ -378,6 +382,13 @@ async fn bridge_mission_session_handler(
     Json(body): Json<runtime::CrossSessionMessage>,
 ) -> impl IntoResponse {
     Json(state.services.mission.bridge_mission_session(body))
+}
+
+async fn interpret_mission_command_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<InterpretMissionCommandHttpRequest>,
+) -> impl IntoResponse {
+    Json(state.services.mission.interpret_mission_command(body))
 }
 
 async fn collaboration_runs_handler(
