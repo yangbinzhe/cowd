@@ -185,12 +185,15 @@ async fn recover_runtime_events(
 
 fn runtime_replay_report(limit: usize) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
     let store = runtime::global_runtime_event_store();
-    let report = runtime::RuntimeEventReplayer::report(store, limit)
+    let plan = runtime::RecoveryPlanner::plan(limit)
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(serde_json::json!({
         "kind": "runtime.events.replay_report",
         "store_path": store.path(),
-        "report": report,
+        "report": plan.report,
+        "actions": plan.actions,
+        "candidates": plan.candidates,
+        "plan": plan,
     }))
 }
 

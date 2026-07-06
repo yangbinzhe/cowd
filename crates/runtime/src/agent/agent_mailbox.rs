@@ -222,6 +222,16 @@ impl AgentTaskMailboxService {
     }
 
     #[must_use]
+    pub fn list(&self) -> Vec<AgentTask> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
     pub fn list_for_team(&self, team_id: &str) -> Vec<AgentTask> {
         self.tasks
             .lock()

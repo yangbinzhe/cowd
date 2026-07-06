@@ -506,7 +506,8 @@ pub use resources::{
     ResourceStore, MAX_RESOURCE_BYTES,
 };
 pub use runtime_event_replay::{
-    RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeReplayReport,
+    candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
+    RuntimeRecoveryCandidate, RuntimeReplayReport,
 };
 pub use runtime_event_store::{
     global_runtime_event_store, record_runtime_event, DurableRuntimeEvent, RuntimeEventInput,

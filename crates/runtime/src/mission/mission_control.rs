@@ -122,6 +122,7 @@ pub struct MissionControlProjection {
     pub kind: String,
     pub workspace: MissionWorkspace,
     pub summary: MissionControlSummary,
+    pub control_readiness: MissionControlControlReadiness,
     pub mission: MissionProjection,
     pub sessions: Vec<MissionControlSessionNode>,
     pub teams: Vec<MissionControlTeamNode>,
@@ -136,6 +137,24 @@ pub struct MissionControlProjection {
     pub steward_scheduler: serde_json::Value,
     pub event_digest: MissionControlEventDigest,
     pub health: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlControlReadiness {
+    pub kind: String,
+    pub ready_count: usize,
+    pub blocked_count: usize,
+    pub actions: Vec<MissionControlActionReadiness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlActionReadiness {
+    pub action: String,
+    pub available: bool,
+    pub reason: String,
+    pub requires_approval: bool,
+    pub policy_marker: Option<String>,
+    pub target_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,11 +310,21 @@ fn build_projection() -> MissionControlProjection {
         steward_count: summary.steward_count,
         recovery_required_count: summary.recovery_required_count,
     };
+    let control_readiness = control_readiness(
+        &summary,
+        &sessions,
+        &teams,
+        &agents,
+        &approvals,
+        &stewards,
+        &mission.conflict_projection,
+    );
 
     MissionControlProjection {
         kind: "mission_control.projection".to_string(),
         workspace,
         summary,
+        control_readiness,
         mission,
         sessions,
         teams,
@@ -315,6 +344,221 @@ fn build_projection() -> MissionControlProjection {
             "mission": mission_health,
         }),
     }
+}
+
+fn control_readiness(
+    summary: &MissionControlSummary,
+    sessions: &[MissionControlSessionNode],
+    teams: &[MissionControlTeamNode],
+    agents: &[MissionControlAgentNode],
+    approvals: &[MissionControlApprovalNode],
+    stewards: &[MissionControlStewardNode],
+    conflicts: &serde_json::Value,
+) -> MissionControlControlReadiness {
+    let pending_approvals = approvals
+        .iter()
+        .filter(|approval| approval.status == "pending")
+        .count();
+    let runnable_commands = summary.pending_session_command_count;
+    let runnable_teams = teams
+        .iter()
+        .filter(|team| {
+            team.status
+                .as_deref()
+                .map(|status| matches!(status, "running" | "ready" | "active" | "planned"))
+                .unwrap_or(true)
+        })
+        .count();
+    let routable_agents = agents
+        .iter()
+        .filter(|agent| {
+            agent
+                .status
+                .as_deref()
+                .map(|status| matches!(status, "running" | "ready" | "working"))
+                .unwrap_or(false)
+        })
+        .count();
+    let active_or_background_sessions = sessions
+        .iter()
+        .filter(|session| {
+            matches!(
+                session.session.status,
+                crate::MissionSessionStatus::Active | crate::MissionSessionStatus::Background
+            )
+        })
+        .count();
+    let high_conflict_count = high_or_critical_conflict_count(conflicts);
+    let critical_conflict_count = critical_conflict_count(conflicts);
+
+    let mut actions = vec![
+        readiness(
+            "session.dispatch",
+            runnable_commands > 0,
+            if runnable_commands > 0 {
+                "pending session commands can be dispatched"
+            } else {
+                "no pending session command"
+            },
+            false,
+            Some("runtime.session_execution_plane"),
+            runnable_commands,
+        ),
+        readiness(
+            "session.dispatch_runtime_turn",
+            runnable_commands > 0,
+            if runnable_commands > 0 {
+                "pending commands can request runtime turn execution through Gateway adapter"
+            } else {
+                "no pending command to start as runtime turn"
+            },
+            false,
+            Some("runtime.session_execution_plane.start_runtime_turn"),
+            runnable_commands,
+        ),
+        readiness(
+            "team.execution.tick",
+            runnable_teams > 0,
+            if runnable_teams > 0 {
+                "teams are available for execution tick"
+            } else {
+                "no team runtime is available"
+            },
+            false,
+            Some("runtime.team_execution_loop"),
+            runnable_teams,
+        ),
+        readiness(
+            "agent.route",
+            routable_agents > 0 && active_or_background_sessions > 0,
+            if routable_agents > 0 && active_or_background_sessions > 0 {
+                "running agents and dispatchable sessions are available"
+            } else {
+                "requires a running agent and active/background session"
+            },
+            false,
+            Some("runtime.agent_task_mailbox"),
+            routable_agents,
+        ),
+        readiness(
+            "approval.decide",
+            pending_approvals > 0,
+            if pending_approvals > 0 {
+                "pending approval requests can be decided"
+            } else {
+                "no pending approval request"
+            },
+            true,
+            Some("runtime.global_approval_queue"),
+            pending_approvals,
+        ),
+        readiness(
+            "steward.scheduler.tick",
+            !stewards.is_empty() || runnable_commands > 0 || runnable_teams > 0,
+            if !stewards.is_empty() || runnable_commands > 0 || runnable_teams > 0 {
+                "scheduler can tick stewards, session commands, and teams"
+            } else {
+                "no steward, pending command, or team to tick"
+            },
+            false,
+            Some("runtime.steward_scheduler"),
+            stewards.len() + runnable_commands + runnable_teams,
+        ),
+        readiness(
+            "recovery.plan",
+            summary.recovery_required_count > 0 || summary.running_session_command_count > 0,
+            if summary.recovery_required_count > 0 || summary.running_session_command_count > 0 {
+                "runtime events contain recoverable or running work"
+            } else {
+                "no recovery candidate currently visible"
+            },
+            false,
+            Some("runtime.recovery_planner"),
+            summary.recovery_required_count + summary.running_session_command_count,
+        ),
+        readiness(
+            "conflict.resolve",
+            high_conflict_count > 0,
+            if high_conflict_count > 0 {
+                "high or critical conflicts require control action"
+            } else {
+                "no high or critical conflict"
+            },
+            critical_conflict_count > 0,
+            Some("runtime.conflict_arbiter"),
+            high_conflict_count,
+        ),
+    ];
+    let ready_count = actions.iter().filter(|action| action.available).count();
+    let blocked_count = actions.len().saturating_sub(ready_count);
+    actions.sort_by(|left, right| left.action.cmp(&right.action));
+    MissionControlControlReadiness {
+        kind: "mission_control.control_readiness".to_string(),
+        ready_count,
+        blocked_count,
+        actions,
+    }
+}
+
+fn readiness(
+    action: &str,
+    available: bool,
+    reason: &str,
+    requires_approval: bool,
+    policy_marker: Option<&str>,
+    target_count: usize,
+) -> MissionControlActionReadiness {
+    MissionControlActionReadiness {
+        action: action.to_string(),
+        available,
+        reason: reason.to_string(),
+        requires_approval,
+        policy_marker: policy_marker.map(str::to_string),
+        target_count,
+    }
+}
+
+fn high_or_critical_conflict_count(conflicts: &serde_json::Value) -> usize {
+    conflict_receipts(conflicts)
+        .filter(|receipt| {
+            matches!(
+                lower_value(receipt, "severity").as_deref(),
+                Some("high" | "critical")
+            ) || matches!(
+                lower_value(receipt, "decision").as_deref(),
+                Some("pause_affected_scope" | "require_approval")
+            )
+        })
+        .count()
+}
+
+fn critical_conflict_count(conflicts: &serde_json::Value) -> usize {
+    conflict_receipts(conflicts)
+        .filter(|receipt| {
+            matches!(
+                lower_value(receipt, "severity").as_deref(),
+                Some("critical")
+            ) || matches!(
+                lower_value(receipt, "decision").as_deref(),
+                Some("require_approval")
+            )
+        })
+        .count()
+}
+
+fn conflict_receipts(conflicts: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    conflicts
+        .get("receipts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn lower_value(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
 }
 
 fn session_node(
@@ -932,7 +1176,10 @@ fn payload_string_array(payload: &serde_json::Value, key: &str) -> Option<Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentExecutionBackendKind, AgentSnapshot, CancellationToken, DEFAULT_AGENT_MODEL};
+    use crate::{
+        global_conflict_arbiter, AgentExecutionBackendKind, AgentSnapshot, CancellationToken,
+        ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind, DEFAULT_AGENT_MODEL,
+    };
 
     #[test]
     fn mission_control_projection_and_command_cover_runtime_state() {
@@ -1009,6 +1256,15 @@ mod tests {
             "runtime.global_approvals"
         );
         assert_eq!(projection.relations["kind"], "runtime.session_relations");
+        assert_eq!(
+            projection.control_readiness.kind,
+            "mission_control.control_readiness"
+        );
+        assert!(projection
+            .control_readiness
+            .actions
+            .iter()
+            .any(|action| action.action == "session.dispatch" && action.available));
         assert!(projection.event_digest.total_recent_events > 0);
     }
 
@@ -1082,5 +1338,70 @@ mod tests {
         assert!(!global_mission_evidence_bus()
             .list_for_team("route-team")
             .is_empty());
+    }
+
+    #[test]
+    fn mission_control_readiness_surfaces_conflict_and_approval_actions() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("mission-control-readiness-{suffix}");
+        MissionControlRuntime::execute(MissionControlCommand {
+            target: MissionControlCommandTarget::Mission,
+            action: MissionControlAction::StartSession,
+            actor: Some("test-human".to_string()),
+            payload: serde_json::json!({
+                "title": "readiness",
+                "session_id": session_id,
+            }),
+            evidence_refs: Vec::new(),
+        });
+        let approval = global_approval_queue()
+            .submit(SubmitGlobalApprovalRequest {
+                source: ApprovalSource {
+                    kind: ApprovalSourceKind::Session,
+                    session_id: Some(session_id.clone()),
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: Some("mission-control".to_string()),
+                },
+                action: "dangerous-test-action".to_string(),
+                summary: "needs approval".to_string(),
+                risk: TaskRisk::Critical,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval");
+        let conflict = global_conflict_arbiter().resolve(ConflictResolutionRequest {
+            source: ConflictSourceKind::SessionRelation,
+            severity: ConflictSeverity::Critical,
+            summary: "critical readiness conflict".to_string(),
+            evidence_refs: vec![approval.approval_id.clone()],
+            affected_scope: vec![format!("session:{session_id}")],
+        });
+
+        let projection = MissionControlRuntime::projection();
+        assert!(projection
+            .control_readiness
+            .actions
+            .iter()
+            .any(|action| action.action == "approval.decide"
+                && action.available
+                && action.requires_approval));
+        assert!(projection
+            .control_readiness
+            .actions
+            .iter()
+            .any(|action| action.action == "conflict.resolve"
+                && action.available
+                && action.requires_approval
+                && action.target_count > 0));
+        let conflict_receipts = projection
+            .conflicts
+            .get("receipts")
+            .and_then(serde_json::Value::as_array)
+            .expect("conflict receipts");
+        assert!(conflict_receipts.iter().any(|item| {
+            item.get("conflict_id").and_then(serde_json::Value::as_str)
+                == Some(conflict.conflict_id.as_str())
+        }));
     }
 }

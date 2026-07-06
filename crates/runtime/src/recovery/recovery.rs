@@ -3,10 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_lifecycle_service, global_mission_runtime, global_runtime_event_store,
-    global_steward_runtime_service, global_team_runtime_service, record_runtime_event,
-    AgentExecutionCommandKind, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeReplayReport,
+    candidate_from_action, global_agent_lifecycle_service, global_agent_task_mailbox,
+    global_mission_runtime, global_runtime_event_store, global_steward_runtime_service,
+    global_team_runtime_service, record_runtime_event, AgentExecutionCommandKind, AgentTaskStatus,
+    MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
+    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
+    RuntimeReplayReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +16,7 @@ pub struct RecoveryPlan {
     pub kind: String,
     pub report: RuntimeReplayReport,
     pub actions: Vec<RuntimeRecoveryAction>,
+    pub candidates: Vec<RuntimeRecoveryCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,13 +55,99 @@ pub struct RecoveryPlanner;
 
 impl RecoveryPlanner {
     pub fn plan(limit: usize) -> Result<RecoveryPlan, String> {
-        let report = RuntimeEventReplayer::report(global_runtime_event_store(), limit)?;
+        let mut report = RuntimeEventReplayer::report(global_runtime_event_store(), limit)?;
+        let candidates = augmented_candidates(&report);
+        report.candidates = candidates.clone();
         Ok(RecoveryPlan {
             kind: "runtime.recovery_plan".to_string(),
             actions: report.actions.clone(),
+            candidates,
             report,
         })
     }
+}
+
+fn augmented_candidates(report: &RuntimeReplayReport) -> Vec<RuntimeRecoveryCandidate> {
+    let mut candidates = report
+        .actions
+        .iter()
+        .filter_map(candidate_from_action)
+        .collect::<Vec<_>>();
+    for command in global_mission_runtime().projection().session_commands {
+        let (action, risk, precondition) = match command.status {
+            MissionSessionCommandStatus::Pending => (
+                RuntimeRecoveryActionKind::PreservePending,
+                "low",
+                "pending command must remain queued until dispatch policy accepts it",
+            ),
+            MissionSessionCommandStatus::Claimed | MissionSessionCommandStatus::Running => (
+                RuntimeRecoveryActionKind::MarkInterrupted,
+                "medium",
+                "claimed or running session command needs explicit recovery before retry",
+            ),
+            MissionSessionCommandStatus::Failed => (
+                RuntimeRecoveryActionKind::MarkInterrupted,
+                "medium",
+                "failed session command can be retried only after operator or steward review",
+            ),
+            MissionSessionCommandStatus::Completed
+            | MissionSessionCommandStatus::Cancelled
+            | MissionSessionCommandStatus::Interrupted => continue,
+        };
+        candidates.push(RuntimeRecoveryCandidate {
+            candidate_id: format!("recovery-candidate-session-command-{}", command.command_id),
+            owner: "runtime.session".to_string(),
+            source_stream_id: format!("session-command:{}", command.command_id),
+            scope: RuntimeEventScope::SessionCommand,
+            action,
+            risk: risk.to_string(),
+            precondition: precondition.to_string(),
+            reason: command.error.clone().unwrap_or_else(|| {
+                format!("session command status is {}", command.status.as_str())
+            }),
+            evidence_refs: command.evidence_refs.clone(),
+        });
+    }
+    for task in global_agent_task_mailbox().list() {
+        let (action, risk, precondition) = match task.status {
+            AgentTaskStatus::Pending | AgentTaskStatus::Claimed | AgentTaskStatus::Running => (
+                RuntimeRecoveryActionKind::MarkInterrupted,
+                "medium",
+                "agent task is not terminal and must be confirmed before retry or synthesis",
+            ),
+            AgentTaskStatus::Failed => (
+                RuntimeRecoveryActionKind::MarkInterrupted,
+                "medium",
+                "failed agent task needs retry, cancellation, or synthesis exclusion",
+            ),
+            AgentTaskStatus::Completed | AgentTaskStatus::Cancelled => continue,
+        };
+        candidates.push(RuntimeRecoveryCandidate {
+            candidate_id: format!("recovery-candidate-agent-task-{}", task.task_id),
+            owner: "runtime.agent_task_mailbox".to_string(),
+            source_stream_id: format!("agent-task:{}", task.task_id),
+            scope: RuntimeEventScope::Agent,
+            action,
+            risk: risk.to_string(),
+            precondition: precondition.to_string(),
+            reason: format!("agent task status is {:?}", task.status).to_ascii_lowercase(),
+            evidence_refs: task.evidence_refs.clone(),
+        });
+    }
+    dedupe_candidates(candidates)
+}
+
+fn dedupe_candidates(candidates: Vec<RuntimeRecoveryCandidate>) -> Vec<RuntimeRecoveryCandidate> {
+    let mut seen = std::collections::BTreeSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            seen.insert((
+                candidate.source_stream_id.clone(),
+                format!("{:?}", candidate.action),
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -251,6 +340,22 @@ mod tests {
             .expect("append steward event");
 
         let report = RecoveryExecutor::execute(1_000).expect("recover");
+        assert!(report
+            .plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.owner == "runtime.session"
+                && candidate
+                    .source_stream_id
+                    .contains(command.command_id.as_str())));
+        assert!(report
+            .plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.owner == "runtime.steward_runtime"
+                && candidate
+                    .source_stream_id
+                    .contains(steward.steward_id.as_str())));
         assert!(report.applied.iter().any(|action| {
             action.stream_id == format!("session-command:{}", command.command_id)
         }));

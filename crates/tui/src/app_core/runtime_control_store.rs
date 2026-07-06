@@ -263,6 +263,9 @@ pub struct MissionControlSummary {
     pub command_failed: u64,
     pub command_cancelled: u64,
     pub command_total: u64,
+    pub control_ready_count: u64,
+    pub control_blocked_count: u64,
+    pub control_requires_approval_count: u64,
     pub sessions: Vec<MissionSessionSummary>,
 }
 
@@ -889,6 +892,29 @@ impl RuntimeControlSnapshot {
                 .get("session_commands")
                 .and_then(serde_json::Value::as_array)
                 .map(|commands| commands.len() as u64)
+                .unwrap_or_default(),
+            control_ready_count: projection
+                .pointer("/control_readiness/ready_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            control_blocked_count: projection
+                .pointer("/control_readiness/blocked_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            control_requires_approval_count: projection
+                .pointer("/control_readiness/actions")
+                .and_then(serde_json::Value::as_array)
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("requires_approval")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                        .count() as u64
+                })
                 .unwrap_or_default(),
             sessions,
         });
@@ -2497,6 +2523,14 @@ mod tests {
         let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.ingest_mission_projection(&serde_json::json!({
             "envelope": {"service": "mission"},
+            "control_readiness": {
+                "ready_count": 5,
+                "blocked_count": 2,
+                "actions": [
+                    {"action": "session.dispatch", "requires_approval": false},
+                    {"action": "approval.decide", "requires_approval": true}
+                ]
+            },
             "mission": {
                 "kind": "mission.runtime",
                 "active_session_id": "session-a",
@@ -2564,6 +2598,9 @@ mod tests {
         assert_eq!(mission.command_failed, 1);
         assert_eq!(mission.command_cancelled, 0);
         assert_eq!(mission.command_total, 2);
+        assert_eq!(mission.control_ready_count, 5);
+        assert_eq!(mission.control_blocked_count, 2);
+        assert_eq!(mission.control_requires_approval_count, 1);
     }
 
     #[test]
@@ -2630,6 +2667,9 @@ mod tests {
                 command_failed: 0,
                 command_cancelled: 0,
                 command_total: 0,
+                control_ready_count: 2,
+                control_blocked_count: 1,
+                control_requires_approval_count: 0,
                 sessions: vec![MissionSessionSummary {
                     session_id: "session-cowd-structured".to_string(),
                     title: "structured task".to_string(),

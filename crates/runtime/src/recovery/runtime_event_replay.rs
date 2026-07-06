@@ -30,11 +30,25 @@ pub struct RuntimeRecoveryAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRecoveryCandidate {
+    pub candidate_id: String,
+    pub owner: String,
+    pub source_stream_id: String,
+    pub scope: RuntimeEventScope,
+    pub action: RuntimeRecoveryActionKind,
+    pub risk: String,
+    pub precondition: String,
+    pub reason: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeReplayReport {
     pub kind: String,
     pub total_events: usize,
     pub scope_counts: BTreeMap<String, usize>,
     pub actions: Vec<RuntimeRecoveryAction>,
+    pub candidates: Vec<RuntimeRecoveryCandidate>,
     pub recovery_required: usize,
 }
 
@@ -87,15 +101,74 @@ impl RuntimeEventReplayer {
                 )
             })
             .count();
+        let candidates = actions
+            .iter()
+            .filter_map(candidate_from_action)
+            .collect::<Vec<_>>();
 
         Ok(RuntimeReplayReport {
             kind: "runtime.replay_report".to_string(),
             total_events: scope_counts.values().sum(),
             scope_counts,
             actions,
+            candidates,
             recovery_required,
         })
     }
+}
+
+#[must_use]
+pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRecoveryCandidate> {
+    let owner = match action.scope {
+        RuntimeEventScope::Session | RuntimeEventScope::SessionCommand => "runtime.session",
+        RuntimeEventScope::Team => "runtime.team_execution",
+        RuntimeEventScope::Agent => "runtime.agent_lifecycle",
+        RuntimeEventScope::Approval => "runtime.approval_queue",
+        RuntimeEventScope::Steward => "runtime.steward_runtime",
+        RuntimeEventScope::Tool => "runtime.tool_host",
+        RuntimeEventScope::Recovery => "runtime.recovery",
+        RuntimeEventScope::Mission
+        | RuntimeEventScope::Relation
+        | RuntimeEventScope::Task
+        | RuntimeEventScope::Worker
+        | RuntimeEventScope::Schedule => "runtime.mission_control",
+    }
+    .to_string();
+    let (risk, precondition) = match action.action {
+        RuntimeRecoveryActionKind::PreservePending => (
+            "low",
+            "preserve pending state; do not auto-complete without owner confirmation",
+        ),
+        RuntimeRecoveryActionKind::ReplayOnly => (
+            "low",
+            "replay event stream only; no state mutation required",
+        ),
+        RuntimeRecoveryActionKind::MarkInterrupted => (
+            "medium",
+            "latest stream status is running or claimed and cannot be assumed complete",
+        ),
+        RuntimeRecoveryActionKind::PauseRecoveryRequired => (
+            "high",
+            "running autonomous work must be paused before human or steward review",
+        ),
+    };
+    Some(RuntimeRecoveryCandidate {
+        candidate_id: format!(
+            "recovery-candidate-{}",
+            stable_id(&format!(
+                "{}:{}:{:?}",
+                action.stream_id, action.latest_kind, action.action
+            ))
+        ),
+        owner,
+        source_stream_id: action.stream_id.clone(),
+        scope: action.scope,
+        action: action.action.clone(),
+        risk: risk.to_string(),
+        precondition: precondition.to_string(),
+        reason: action.reason.clone(),
+        evidence_refs: vec![format!("runtime-stream:{}", action.stream_id)],
+    })
 }
 
 fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryActionKind, String) {
@@ -120,6 +193,15 @@ fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryAc
             "event stream can be replayed for projection evidence".to_string(),
         ),
     }
+}
+
+fn stable_id(input: &str) -> String {
+    let mut hash: u64 = 14_695_981_039_346_656_037;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -155,6 +237,10 @@ mod tests {
 
         let report = RuntimeEventReplayer::report(&store, 100).expect("report");
         assert_eq!(report.total_events, 2);
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.owner == "runtime.approval_queue"
+                && candidate.action == RuntimeRecoveryActionKind::PreservePending
+        }));
         assert!(report.actions.iter().any(|action| {
             action.stream_id == "approval:a"
                 && action.action == RuntimeRecoveryActionKind::PreservePending

@@ -11,10 +11,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StewardSchedulerConfig {
     pub max_session_commands_per_tick: usize,
     pub max_team_ticks: usize,
     pub allow_background_sessions: bool,
+    #[serde(default = "default_dispatch_mode")]
+    pub dispatch_mode: SessionDispatchMode,
 }
 
 impl Default for StewardSchedulerConfig {
@@ -23,6 +26,7 @@ impl Default for StewardSchedulerConfig {
             max_session_commands_per_tick: 10,
             max_team_ticks: 10,
             allow_background_sessions: true,
+            dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
         }
     }
 }
@@ -54,6 +58,8 @@ pub struct StewardSchedulerProjection {
     pub kind: String,
     pub ledger_count: usize,
     pub latest: Vec<StewardDecisionLedgerRecord>,
+    pub supported_dispatch_modes: Vec<SessionDispatchMode>,
+    pub default_dispatch_mode: SessionDispatchMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +142,7 @@ impl StewardScheduler {
 
         let session_dispatch = SessionExecutionPlane::dispatch_pending(SessionExecutionPolicy {
             max_commands: config.max_session_commands_per_tick,
-            dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
+            dispatch_mode: config.dispatch_mode,
             allow_background: config.allow_background_sessions,
         });
         if !session_dispatch.dispatched.is_empty() {
@@ -213,6 +219,12 @@ impl StewardScheduler {
             kind: "runtime.steward_scheduler".to_string(),
             ledger_count: latest.len(),
             latest: latest.into_iter().take(20).collect(),
+            supported_dispatch_modes: vec![
+                SessionDispatchMode::MarkClaimedOnly,
+                SessionDispatchMode::ControlDispatchComplete,
+                SessionDispatchMode::StartRuntimeTurn,
+            ],
+            default_dispatch_mode: SessionDispatchMode::MarkClaimedOnly,
         }
     }
 
@@ -246,6 +258,10 @@ impl StewardScheduler {
             ledger,
         }
     }
+}
+
+const fn default_dispatch_mode() -> SessionDispatchMode {
+    SessionDispatchMode::MarkClaimedOnly
 }
 
 fn now_ms() -> u64 {
@@ -289,5 +305,48 @@ mod tests {
         let handoff = StewardScheduler::handoff_summary(&steward.steward_id);
         assert_eq!(handoff.steward_id, steward.steward_id);
         assert!(!handoff.next_actions.is_empty());
+    }
+
+    #[test]
+    fn steward_scheduler_can_dispatch_session_commands_as_runtime_turns() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_a = format!("steward-scheduler-turn-a-{suffix}");
+        let session_b = format!("steward-scheduler-turn-b-{suffix}");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "steward scheduler turn a".to_string(),
+                session_id: Some(session_a.clone()),
+            })
+            .expect("session a");
+        global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "steward scheduler turn b".to_string(),
+                session_id: Some(session_b.clone()),
+            })
+            .expect("session b");
+        let command = global_mission_runtime()
+            .enqueue_session_command(&session_a, &session_b, "run deep background analysis")
+            .expect("command");
+
+        let report = StewardScheduler::tick(StewardSchedulerConfig {
+            dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+            ..StewardSchedulerConfig::default()
+        });
+
+        let receipt = report
+            .session_dispatch
+            .dispatched
+            .iter()
+            .find(|receipt| receipt.command_id == command.command_id)
+            .expect("dispatched command");
+        assert_eq!(receipt.mode, SessionDispatchMode::StartRuntimeTurn);
+        assert!(receipt.turn_request.is_some());
+        assert_eq!(
+            global_mission_runtime()
+                .get_session_command(&command.command_id)
+                .expect("command after")
+                .status,
+            crate::MissionSessionCommandStatus::Running
+        );
     }
 }

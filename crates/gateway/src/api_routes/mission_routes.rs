@@ -227,7 +227,7 @@ async fn dispatch_mission_sessions_as_turns(
     state: Arc<AppState>,
     policy: runtime::SessionExecutionPolicy,
 ) -> serde_json::Value {
-    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
+    if state.services.runtime.is_none() {
         return serde_json::json!({
             "envelope": state.services.mission.session_control_contract(),
             "kind": "mission_control.session_dispatch_result",
@@ -236,8 +236,33 @@ async fn dispatch_mission_sessions_as_turns(
             "policy": policy,
             "projection": runtime::MissionControlRuntime::projection(),
         });
-    };
+    }
     let report = runtime::SessionExecutionPlane::dispatch_pending(policy);
+    execute_session_turn_dispatch_report(
+        state,
+        report,
+        "mission_control.session_dispatch_result",
+        None,
+    )
+    .await
+}
+
+async fn execute_session_turn_dispatch_report(
+    state: Arc<AppState>,
+    report: runtime::SessionExecutionReport,
+    kind: &'static str,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
+        return serde_json::json!({
+            "envelope": state.services.mission.session_control_contract(),
+            "kind": kind,
+            "ok": false,
+            "error": "runtime service unavailable",
+            "report": report,
+            "projection": runtime::MissionControlRuntime::projection(),
+        });
+    };
     let mut turn_results = Vec::new();
     for turn_request in report
         .dispatched
@@ -333,15 +358,19 @@ async fn dispatch_mission_sessions_as_turns(
         && turn_results
             .iter()
             .all(|result| result["ok"].as_bool().unwrap_or(false));
-    serde_json::json!({
+    let mut response = serde_json::json!({
         "envelope": state.services.mission.session_control_contract(),
-        "kind": "mission_control.session_dispatch_result",
+        "kind": kind,
         "ok": ok,
         "report": report,
         "turn_results": turn_results,
         "projection": runtime::MissionControlRuntime::projection(),
         "mission": runtime::global_mission_runtime().projection(),
-    })
+    });
+    if let Some(extra) = extra {
+        response["extra"] = extra;
+    }
+    response
 }
 
 async fn bridge_mission_session_handler(
@@ -495,6 +524,33 @@ async fn tick_mission_steward_scheduler_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::StewardSchedulerConfig>,
 ) -> impl IntoResponse {
+    if body.dispatch_mode == runtime::SessionDispatchMode::StartRuntimeTurn {
+        if state.services.runtime.is_none() {
+            return Json(serde_json::json!({
+                "envelope": state.services.mission.session_control_contract(),
+                "kind": "mission_control.steward_scheduler_tick",
+                "ok": false,
+                "error": "runtime service unavailable",
+                "config": body,
+                "scheduler": runtime::StewardScheduler::projection(),
+                "projection": runtime::MissionControlRuntime::projection(),
+            }));
+        }
+        let report = runtime::StewardScheduler::tick(body);
+        let session_dispatch = report.session_dispatch.clone();
+        return Json(
+            execute_session_turn_dispatch_report(
+                state,
+                session_dispatch,
+                "mission_control.steward_scheduler_tick",
+                Some(serde_json::json!({
+                    "scheduler_report": report,
+                    "scheduler": runtime::StewardScheduler::projection(),
+                })),
+            )
+            .await,
+        );
+    }
     Json(state.services.mission.tick_steward_scheduler(body))
 }
 

@@ -699,6 +699,22 @@ impl Component for GatewayPanel {
                         Style::default().fg(Color::Blue),
                     ),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Control: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} ready, {} blocked, {} approval-gated",
+                            mission.control_ready_count,
+                            mission.control_blocked_count,
+                            mission.control_requires_approval_count
+                        ),
+                        Style::default().fg(if mission.control_blocked_count > 0 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    ),
+                ]));
                 if let Some(active) = mission.active_session_id.as_ref() {
                     lines.push(Line::from(vec![
                         Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
@@ -1827,6 +1843,9 @@ mod tests {
             command_failed: 0,
             command_cancelled: 0,
             command_total: 3,
+            control_ready_count: 4,
+            control_blocked_count: 1,
+            control_requires_approval_count: 1,
             sessions: vec![MissionSessionSummary {
                 session_id: "mission-a".to_string(),
                 title: "Primary mission control task".to_string(),
@@ -1854,6 +1873,10 @@ mod tests {
         assert!(
             joined.contains("1 / 2") && joined.contains("3 / 4"),
             "Should show team/agent and approval/relation counts, got: {joined}"
+        );
+        assert!(
+            joined.contains("4 ready, 1 blocked, 1 approval-gated"),
+            "Should show mission control readiness, got: {joined}"
         );
     }
 
