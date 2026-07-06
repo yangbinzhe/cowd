@@ -5,6 +5,7 @@
 //! system instructions stay ahead of runtime and dynamic packets.
 
 use chrono::{DateTime, Utc};
+use harness_contract::knowledge::KnowledgeTurnReport;
 use serde::{Deserialize, Serialize};
 
 use model_protocol::prompt_cache::stable_hash_bytes;
@@ -569,6 +570,60 @@ pub struct ContextEpochReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeContextMemoryDecision {
+    pub item_id: String,
+    pub source_kind: ContextSourceKind,
+    pub role: Option<ContextRole>,
+    pub selected: bool,
+    pub reason: String,
+    pub token_estimate: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeContextKnowledgeDecision {
+    pub activated_pack_ids: Vec<String>,
+    pub suppressed_namespaces: Vec<String>,
+    pub compliance_warnings: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeContextFactDecision {
+    pub trigger: String,
+    pub mode: String,
+    pub degraded: bool,
+    pub reason: String,
+    pub candidate_count: usize,
+    pub review_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCompressionCheckpointRef {
+    pub checkpoint_id: String,
+    pub source: String,
+    pub summary: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeContextGovernanceReport {
+    pub report_id: String,
+    pub envelope_id: String,
+    pub context_epoch: String,
+    pub session_id: String,
+    pub profile: ContextProfile,
+    pub selected_memory: Vec<RuntimeContextMemoryDecision>,
+    pub omitted_memory: Vec<RuntimeContextMemoryDecision>,
+    pub knowledge: RuntimeContextKnowledgeDecision,
+    pub fact_extraction: Option<RuntimeContextFactDecision>,
+    pub compression_checkpoint: Option<RuntimeCompressionCheckpointRef>,
+    pub contamination_notes: Vec<String>,
+    pub conflict_notes: Vec<String>,
+    pub source_registry: Vec<ContextSourceRef>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
     pub runtime_header: Vec<String>,
@@ -670,6 +725,14 @@ impl ContextRuntimeKernel {
             identity.mode,
             profile
         )]
+    }
+
+    #[must_use]
+    pub fn governance_report_id(session_id: &str, intent: &str) -> String {
+        format!(
+            "ctx-governance-{}",
+            stable_hash_bytes(format!("{session_id}:{intent}").as_bytes())
+        )
     }
 
     pub fn build_envelope(request: ContextEnvelopeRequest) -> ContextEnvelope {
@@ -784,6 +847,96 @@ impl ContextRuntimeKernel {
                 &envelope.diagnostics.degraded_sources,
             ),
             degraded_sources: envelope.diagnostics.degraded_sources.clone(),
+        }
+    }
+
+    pub fn governance_report(
+        envelope: &ContextEnvelope,
+        knowledge: Option<&KnowledgeTurnReport>,
+        fact_extraction: Option<RuntimeContextFactDecision>,
+        compression_checkpoint: Option<RuntimeCompressionCheckpointRef>,
+    ) -> RuntimeContextGovernanceReport {
+        let selected_memory = envelope
+            .selected
+            .iter()
+            .filter(|item| item.source == ContextSourceKind::Memory)
+            .map(|item| RuntimeContextMemoryDecision {
+                item_id: item.id.clone(),
+                source_kind: item.source,
+                role: Some(item.role),
+                selected: true,
+                reason: item
+                    .source_reason
+                    .clone()
+                    .unwrap_or_else(|| "selected_for_current_turn".to_string()),
+                token_estimate: item.token_estimate,
+            })
+            .collect::<Vec<_>>();
+        let omitted_memory = envelope
+            .omitted
+            .iter()
+            .filter(|item| item.source == ContextSourceKind::Memory)
+            .map(|item| RuntimeContextMemoryDecision {
+                item_id: format!("omitted:{}", stable_hash_bytes(item.reason.as_bytes())),
+                source_kind: item.source,
+                role: None,
+                selected: false,
+                reason: item.reason.clone(),
+                token_estimate: item.token_estimate,
+            })
+            .collect::<Vec<_>>();
+        let knowledge = knowledge
+            .map(|report| RuntimeContextKnowledgeDecision {
+                activated_pack_ids: report.active_pack_ids.clone(),
+                suppressed_namespaces: report.blocked_namespaces.clone(),
+                compliance_warnings: report
+                    .compliance_warnings
+                    .iter()
+                    .map(|warning| {
+                        format!(
+                            "{:?}:{}:{}",
+                            warning.level, warning.pack_id, warning.summary
+                        )
+                    })
+                    .collect(),
+                evidence_refs: report
+                    .evidence_refs
+                    .iter()
+                    .map(|reference| format!("{}/{}", reference.ref_type, reference.id))
+                    .collect(),
+            })
+            .unwrap_or_default();
+        let contamination_notes = envelope
+            .omitted
+            .iter()
+            .filter(|item| item.reason.contains("suppressed_for_current_turn"))
+            .map(|item| item.reason.clone())
+            .collect::<Vec<_>>();
+        let conflict_notes = envelope
+            .selected
+            .iter()
+            .flat_map(|item| item.conflict_with.clone())
+            .chain(envelope.omitted.iter().filter_map(|item| {
+                item.reason
+                    .contains("conflict")
+                    .then(|| item.reason.clone())
+            }))
+            .collect::<Vec<_>>();
+        RuntimeContextGovernanceReport {
+            report_id: Self::governance_report_id(&envelope.identity.session_id, &envelope.intent),
+            envelope_id: envelope.id.clone(),
+            context_epoch: envelope.epoch_id.clone(),
+            session_id: envelope.identity.session_id.clone(),
+            profile: envelope.profile,
+            selected_memory,
+            omitted_memory,
+            knowledge,
+            fact_extraction,
+            compression_checkpoint,
+            contamination_notes,
+            conflict_notes,
+            source_registry: envelope.source_registry.clone(),
+            created_at: Utc::now(),
         }
     }
 
@@ -2013,6 +2166,73 @@ mod tests {
         assert_eq!(prompt[0], "system: stable instructions");
         assert_eq!(prompt[1], "runtime: main session");
         assert!(prompt[2].contains("dynamic memory"));
+    }
+
+    #[test]
+    fn governance_report_explains_memory_knowledge_and_fact_decisions() {
+        let mut request = request_with_dynamic("FACT: deployment requires review");
+        request.omitted.push(ContextOmission {
+            source: ContextSourceKind::Memory,
+            reason: "suppressed_for_current_turn: current user rule overrides stale memory"
+                .to_string(),
+            token_estimate: 12,
+        });
+        let envelope = ContextRuntimeKernel::build_envelope(request);
+        let knowledge = KnowledgeTurnReport {
+            activation_plan_id: Some("plan-1".to_string()),
+            active_pack_ids: vec!["pack-a".to_string()],
+            blocked_namespaces: vec!["global/noisy".to_string()],
+            compliance_warnings: Vec::new(),
+            evidence_refs: vec![harness_contract::core::KernelRef::new(
+                "knowledge_pack",
+                "pack-a",
+            )],
+            usage_signals: Vec::new(),
+        };
+        let report = ContextRuntimeKernel::governance_report(
+            &envelope,
+            Some(&knowledge),
+            Some(RuntimeContextFactDecision {
+                trigger: "TurnEnd".to_string(),
+                mode: "rule_only".to_string(),
+                degraded: false,
+                reason: "user rule update".to_string(),
+                candidate_count: 1,
+                review_required: true,
+            }),
+            Some(RuntimeCompressionCheckpointRef {
+                checkpoint_id: "checkpoint-a".to_string(),
+                source: "summary_compression".to_string(),
+                summary: "checkpoint summary".to_string(),
+                evidence_refs: vec!["evidence-a".to_string()],
+            }),
+        );
+
+        assert_eq!(report.envelope_id, envelope.id);
+        assert_eq!(report.context_epoch, envelope.epoch_id);
+        assert_eq!(report.selected_memory.len(), 1);
+        assert_eq!(report.omitted_memory.len(), 1);
+        assert_eq!(report.knowledge.activated_pack_ids, vec!["pack-a"]);
+        assert_eq!(
+            report
+                .fact_extraction
+                .as_ref()
+                .expect("fact decision")
+                .candidate_count,
+            1
+        );
+        assert!(report
+            .contamination_notes
+            .iter()
+            .any(|note| note.contains("suppressed_for_current_turn")));
+        assert_eq!(
+            report
+                .compression_checkpoint
+                .as_ref()
+                .expect("checkpoint")
+                .checkpoint_id,
+            "checkpoint-a"
+        );
     }
 
     #[test]

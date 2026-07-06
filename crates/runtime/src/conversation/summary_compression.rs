@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use model_protocol::prompt_cache::stable_hash_bytes;
+use serde::{Deserialize, Serialize};
+
 const DEFAULT_MAX_CHARS: usize = 1_200;
 const DEFAULT_MAX_LINES: usize = 24;
 const DEFAULT_MAX_LINE_CHARS: usize = 160;
@@ -31,6 +34,70 @@ pub struct SummaryCompressionResult {
     pub removed_duplicate_lines: usize,
     pub omitted_lines: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryCompressionCheckpoint {
+    pub checkpoint_id: String,
+    pub summary: String,
+    pub key_user_rules: Vec<String>,
+    pub current_goal: Option<String>,
+    pub pending_work: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub omitted_lines: usize,
+    pub truncated: bool,
+}
+
+impl SummaryCompressionCheckpoint {
+    #[must_use]
+    pub fn from_result(
+        session_id: &str,
+        result: &SummaryCompressionResult,
+        evidence_refs: Vec<String>,
+    ) -> Self {
+        let key_user_rules = result
+            .summary
+            .lines()
+            .filter(|line| {
+                contains_any_case_insensitive(
+                    line,
+                    &["rule", "principle", "must", "必须", "规则", "原则", "约定"],
+                )
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let current_goal = result
+            .summary
+            .lines()
+            .find(|line| {
+                contains_any_case_insensitive(
+                    line,
+                    &["current work", "current goal", "当前", "目标"],
+                )
+            })
+            .map(str::to_string);
+        let pending_work = result
+            .summary
+            .lines()
+            .filter(|line| {
+                contains_any_case_insensitive(line, &["pending", "todo", "未完成", "待办"])
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        Self {
+            checkpoint_id: format!(
+                "summary-checkpoint-{}",
+                stable_hash_bytes(format!("{session_id}:{}", result.summary).as_bytes())
+            ),
+            summary: result.summary.clone(),
+            key_user_rules,
+            current_goal,
+            pending_work,
+            evidence_refs,
+            omitted_lines: result.omitted_lines,
+            truncated: result.truncated,
+        }
+    }
 }
 
 #[must_use]
@@ -231,9 +298,19 @@ fn dedupe_key(line: &str) -> String {
     line.to_ascii_lowercase()
 }
 
+fn contains_any_case_insensitive(text: &str, needles: &[&str]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| lower.contains(&needle.to_ascii_lowercase()) || text.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compress_summary, compress_summary_text, SummaryCompressionBudget};
+    use super::{
+        compress_summary, compress_summary_text, SummaryCompressionBudget,
+        SummaryCompressionCheckpoint,
+    };
 
     #[test]
     fn collapses_whitespace_and_duplicate_lines() {
@@ -296,5 +373,35 @@ mod tests {
 
         // then
         assert_eq!(compressed, "Summary:\nA short line.");
+    }
+
+    #[test]
+    fn summary_compression_checkpoint_preserves_rules_goal_and_pending_work() {
+        let result = compress_summary(
+            &[
+                "Conversation summary:",
+                "- Current work: finish runtime context governance.",
+                "- User rule: do not lose important context.",
+                "- Pending work: run regression tests.",
+                "- Evidence: context-envelope-1.",
+            ]
+            .join("\n"),
+            SummaryCompressionBudget::default(),
+        );
+
+        let checkpoint = SummaryCompressionCheckpoint::from_result(
+            "session-a",
+            &result,
+            vec!["context-envelope-1".to_string()],
+        );
+
+        assert!(checkpoint
+            .current_goal
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Current work"));
+        assert_eq!(checkpoint.key_user_rules.len(), 1);
+        assert_eq!(checkpoint.pending_work.len(), 1);
+        assert_eq!(checkpoint.evidence_refs, vec!["context-envelope-1"]);
     }
 }

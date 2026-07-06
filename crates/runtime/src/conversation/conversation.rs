@@ -36,6 +36,7 @@ use harness_contract::{
         EvidenceRef, ToolObservation,
     },
     core::KernelRef,
+    knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
 };
@@ -66,10 +67,13 @@ use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSession
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
+    ContextVisibility, ResumeContextPacket, RuntimeContextFactDecision,
+    RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
 };
 use crate::fact_extraction::{
-    FactExtractionRuntimeEvent, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
+    FactExtractionRuntimeEvent, RuleFactExtractor, RuntimeFactExtractionInput,
+    RuntimeFactExtractionPolicy, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
+    RuntimeFactExtractor,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
@@ -89,6 +93,7 @@ use crate::tool_invocation::{
 use crate::tool_ledger::{tool_event_idempotency_key, TurnToolLedger};
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
+use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
 use model_protocol::usage::TokenUsage;
 
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
@@ -1204,6 +1209,153 @@ where
         });
     }
 
+    fn finalize_context_prompt(
+        &self,
+        user_input: &str,
+        envelope: ContextEnvelope,
+        knowledge: Option<KnowledgeTurnReport>,
+    ) -> Vec<String> {
+        let fact_decision = self.runtime_fact_decision_for_context(user_input, &envelope);
+        let report = ContextRuntimeKernel::governance_report(
+            &envelope,
+            knowledge.as_ref(),
+            fact_decision,
+            None,
+        );
+        self.remember_context_governance_report(report);
+        let prompt = Self::provider_prompt_from_envelope(&envelope, None);
+        self.remember_context_envelope(envelope);
+        prompt
+    }
+
+    fn remember_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("session:{}", report.session_id),
+            scope: RuntimeEventScope::Session,
+            kind: "context.governance_report".to_string(),
+            status: Some("recorded".to_string()),
+            actor: Some("conversation_runtime".to_string()),
+            refs: vec![
+                RuntimeEventRef {
+                    kind: "context_envelope".to_string(),
+                    id: report.envelope_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "context_epoch".to_string(),
+                    id: report.context_epoch.clone(),
+                },
+            ],
+            payload: serde_json::json!(report),
+        });
+        self.persist_context_governance_report(report);
+    }
+
+    fn persist_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let session_id = report.session_id.clone();
+        let payload = serde_json::json!({
+            "type": "RuntimeContextGovernanceReport",
+            "report": report,
+        });
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let sequence = match store.next_event_sequence(&session_id).await {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "context governance report sequence allocation failed");
+                    return;
+                }
+            };
+            let created_at_ms = now_ms();
+            let event = memory::SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "RuntimeContextGovernanceReport".to_string(),
+                event_json: payload.to_string(),
+                sequence,
+                created_at_ms,
+            };
+            if let Err(error) = store.append_event(&event).await {
+                tracing::warn!(%error, session_id, sequence, "context governance report append failed");
+            }
+            let runtime_event = memory::RuntimeEvent::new(
+                session_id.clone(),
+                sequence.saturating_add(1),
+                memory::RuntimeEventScope::Context,
+                "context.governance_report",
+                payload,
+                created_at_ms,
+            );
+            if let Err(error) = store.append_runtime_event(&runtime_event).await {
+                tracing::warn!(%error, session_id, sequence, "context governance runtime event append failed");
+            }
+        });
+    }
+
+    fn runtime_fact_decision_for_context(
+        &self,
+        user_input: &str,
+        envelope: &ContextEnvelope,
+    ) -> Option<RuntimeContextFactDecision> {
+        let trigger = fact_extraction_trigger_for_turn(user_input, envelope.profile)?;
+        let policy = RuntimeFactExtractionPolicy {
+            provider_available: false,
+            ..RuntimeFactExtractionPolicy::default()
+        };
+        let scheduler = RuntimeFactExtractionScheduler::new(policy);
+        let decision = scheduler.decide(trigger);
+        let evidence_refs = envelope
+            .source_registry
+            .iter()
+            .map(|source| source.source_id.clone())
+            .take(32)
+            .collect::<Vec<_>>();
+        let input = RuntimeFactExtractionInput::new(trigger, user_input)
+            .with_session_id(Some(envelope.identity.session_id.clone()))
+            .with_project_id(envelope.identity.project_id.clone())
+            .with_task_id(envelope.identity.task_id.clone())
+            .with_team_id(envelope.identity.team_id.clone())
+            .with_agent_id(Some(envelope.identity.agent_id.clone()))
+            .with_evidence_refs(evidence_refs)
+            .with_token_budget(Some(envelope.budget.total_tokens));
+        let extractor = RuleFactExtractor;
+        let batch = extractor.extract(&input);
+        let event = FactExtractionRuntimeEvent::from_decision(
+            &decision,
+            extractor.extractor_version(),
+            batch.candidates.len(),
+            batch.source_evidence.len(),
+            batch.token_usage,
+        );
+        let _ = record_runtime_event(RuntimeEventInput {
+            stream_id: format!("session:{}", envelope.identity.session_id),
+            scope: RuntimeEventScope::Session,
+            kind: "context.fact_candidate_review".to_string(),
+            status: Some("reviewable".to_string()),
+            actor: Some("conversation_runtime".to_string()),
+            refs: vec![RuntimeEventRef {
+                kind: "context_envelope".to_string(),
+                id: envelope.id.clone(),
+            }],
+            payload: serde_json::json!({
+                "event": event,
+                "batch_id": batch.batch_id.as_str(),
+                "candidate_count": batch.candidates.len(),
+                "candidates": batch.candidates,
+                "promotion": "review_required",
+            }),
+        });
+        Some(RuntimeContextFactDecision {
+            trigger: format!("{:?}", decision.trigger),
+            mode: decision.mode.as_str().to_string(),
+            degraded: decision.degraded,
+            reason: decision.reason,
+            candidate_count: batch.candidates.len(),
+            review_required: true,
+        })
+    }
+
     fn context_budget_tokens(&self) -> u64 {
         self.runtime_budget_plan().effective_context_budget
     }
@@ -1303,12 +1455,18 @@ where
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
         identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
+        let governance_report_id =
+            ContextRuntimeKernel::governance_report_id(&session_id, user_input);
+        let mut runtime_header = ContextRuntimeKernel::runtime_header(&identity, profile);
+        runtime_header.push(format!(
+            "context_governance_report_id:{governance_report_id}"
+        ));
         let mut selected_items = self.external_context_items();
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile,
-            runtime_header: ContextRuntimeKernel::runtime_header(&identity, profile),
+            runtime_header,
             identity,
             intent: user_input.to_string(),
             stable_head: self.system_prompt.clone(),
@@ -4243,9 +4401,7 @@ where
                 Vec::new(),
                 vec![ContextSourceKind::Memory],
             );
-            let prompt = Self::provider_prompt_from_envelope(&envelope, None);
-            self.remember_context_envelope(envelope);
-            return prompt;
+            return self.finalize_context_prompt(user_input, envelope, None);
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -4348,9 +4504,7 @@ where
                         .collect();
                     let envelope =
                         self.build_context_envelope(user_input, Vec::new(), omissions, Vec::new());
-                    let prompt = Self::provider_prompt_from_envelope(&envelope, None);
-                    self.remember_context_envelope(envelope);
-                    return prompt;
+                    return self.finalize_context_prompt(user_input, envelope, None);
                 }
 
                 use crate::cached_prompt::CacheLayer;
@@ -4448,6 +4602,13 @@ where
                         context_item.authority = ContextAuthority::Session;
                         context_item.visibility = ContextVisibility::Private;
                         context_item.score = item.atom.confidence;
+                        context_item.source_id = Some(item.atom.id.to_string());
+                        context_item.source_reason = Some(item.reason.clone());
+                        context_item.source_version = item
+                            .atom
+                            .evidence_pointer
+                            .as_ref()
+                            .map(|evidence| format!("evidence:{evidence}"));
                         if let Some(evidence) = item.atom.evidence_pointer.as_ref() {
                             context_item.evidence.push(evidence.clone());
                         }
@@ -4478,15 +4639,15 @@ where
                     })
                     .collect::<Vec<_>>();
                 let mut dynamic_items = dynamic_items;
+                let mut knowledge_report = None;
                 if let Some(activation) = knowledge_activation {
+                    knowledge_report = Some(activation.report.clone());
                     dynamic_items.extend(activation.items);
                     self.set_turn_knowledge_report(activation.report);
                 }
                 let envelope =
                     self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
-                let prompt = Self::provider_prompt_from_envelope(&envelope, None);
-                self.remember_context_envelope(envelope);
-                prompt
+                self.finalize_context_prompt(user_input, envelope, knowledge_report)
             }
             Err(err) => {
                 tracing::warn!(%err, "memory: prepare_context failed, using base system prompt");
@@ -4499,9 +4660,7 @@ where
                     Vec::new(),
                     vec![ContextSourceKind::Memory],
                 );
-                let prompt = Self::provider_prompt_from_envelope(&envelope, None);
-                self.remember_context_envelope(envelope);
-                prompt
+                self.finalize_context_prompt(user_input, envelope, None)
             }
         }
     }
@@ -5508,6 +5667,41 @@ fn memory_project_id_for_session(session: &Session) -> Option<String> {
         })
         .collect::<String>();
     Some(format!("{name}-{hash:016x}"))
+}
+
+fn fact_extraction_trigger_for_turn(
+    user_input: &str,
+    profile: ContextProfile,
+) -> Option<RuntimeFactExtractionTrigger> {
+    if profile == ContextProfile::DeepInvestigation {
+        return Some(RuntimeFactExtractionTrigger::DeepInvestigation);
+    }
+    let lowered = user_input.to_ascii_lowercase();
+    let normalized = user_input.replace(char::is_whitespace, " ");
+    let contains = |needle: &str| lowered.contains(needle) || normalized.contains(needle);
+    if [
+        "FACT:",
+        "事实",
+        "记忆",
+        "规则",
+        "原则",
+        "约定",
+        "偏好",
+        "冲突",
+        "矛盾",
+        "更新",
+        "remember",
+        "rule",
+        "preference",
+        "conflict",
+        "contradiction",
+    ]
+    .iter()
+    .any(|needle| contains(needle))
+    {
+        return Some(RuntimeFactExtractionTrigger::TurnEnd);
+    }
+    None
 }
 
 fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize {
@@ -8319,6 +8513,9 @@ mod tests {
 
         assert_eq!(prompt[0], "stable system");
         assert!(prompt[1].contains("profile:MainTurn"));
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("context_governance_report_id:")));
         assert_eq!(envelope.intent, "remember this");
         assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
         assert_eq!(
