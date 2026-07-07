@@ -1376,12 +1376,18 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
         "pub async fn surface_health_check",
         "pub async fn surface_repair",
         "pub async fn surface_events",
+        "pub async fn surface_messages",
+        "pub async fn surface_archive_messages",
+        "pub async fn surface_purge_archived_events",
         "pub async fn surface_send",
         "pub async fn surface_action",
         "/api/surfaces",
         "/api/surfaces/{}/status",
         "/api/surfaces/{}/health-check",
         "/api/surfaces/{}/repair",
+        "/api/surfaces/{}/messages",
+        "/api/surfaces/{}/messages/archive",
+        "/api/surfaces/{}/messages/purge-archived-events",
         "/api/surfaces/{}/send",
         "/api/surfaces/{}/action",
         "pub async fn message_connectors",
@@ -1455,8 +1461,11 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
         gateway_panel.contains("Message Plane")
             && gateway_panel.contains("message_connectors")
             && surface_panel.contains("Message Plane")
-            && surface_panel.contains("message_connectors"),
-        "TUI Gateway and Surface panels must display Message Plane state"
+            && surface_panel.contains("message_connectors")
+            && surface_panel.contains("g ledger")
+            && surface_panel.contains("A archive")
+            && surface_panel.contains("P purge"),
+        "TUI Gateway and Surface panels must display Message Plane and Surface ledger state"
     );
 }
 

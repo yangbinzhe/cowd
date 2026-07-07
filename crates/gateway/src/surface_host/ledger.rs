@@ -111,6 +111,26 @@ impl SurfaceHost {
         self.messages.snapshot(surface)
     }
 
+    pub(crate) fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.messages
+            .archive_dead_letters(surface, older_than_ms, limit)
+    }
+
+    pub(crate) fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        self.messages
+            .purge_archived_events(surface, older_than_ms, limit)
+    }
+
     pub(crate) fn replay_inbox_message(
         &self,
         surface: &str,

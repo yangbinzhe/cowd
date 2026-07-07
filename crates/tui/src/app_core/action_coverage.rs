@@ -84,6 +84,30 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         receipt_marker: "record_action_result",
     },
     TuiActionCoverage {
+        action_id: "surface.messages",
+        gateway_route: "/api/surfaces/:id/messages",
+        client_method: "surface_messages",
+        panel_key: "g ledger",
+        state_dispatch: "surface_messages",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.messages.archive",
+        gateway_route: "/api/surfaces/:id/messages/archive",
+        client_method: "surface_archive_messages",
+        panel_key: "A archive",
+        state_dispatch: "surface_archive_messages",
+        receipt_marker: "require_confirmation",
+    },
+    TuiActionCoverage {
+        action_id: "surface.messages.purge_archived_events",
+        gateway_route: "/api/surfaces/:id/messages/purge-archived-events",
+        client_method: "surface_purge_archived_events",
+        panel_key: "P purge",
+        state_dispatch: "surface_purge_archived_events",
+        receipt_marker: "require_confirmation",
+    },
+    TuiActionCoverage {
         action_id: "surface.deliveries",
         gateway_route: "/api/surfaces/:id/deliveries",
         client_method: "surface_deliveries",
@@ -244,12 +268,14 @@ mod tests {
         assert!(ids.contains(&"surface.start"));
         assert!(ids.contains(&"surface.stop"));
         assert!(ids.contains(&"surface.outbox.retry"));
+        assert!(ids.contains(&"surface.messages.archive"));
+        assert!(ids.contains(&"surface.messages.purge_archived_events"));
         assert!(ids.contains(&"skill.validate"));
         assert!(ids.contains(&"skill.run"));
         assert!(ids.contains(&"mission.session_command.consume"));
         assert!(ids.contains(&"agent.interrupt"));
         assert!(ids.contains(&"harness_eval.run_smoke"));
-        assert!(ids.len() >= 19);
+        assert!(ids.len() >= 22);
     }
 
     #[test]

@@ -1111,6 +1111,38 @@ impl GatewayApiClient {
             .await
     }
 
+    pub async fn surface_messages(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/messages", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_archive_messages(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/messages/archive", url_encode(id)),
+            serde_json::json!({ "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn surface_purge_archived_events(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/surfaces/{}/messages/purge-archived-events",
+                url_encode(id)
+            ),
+            serde_json::json!({ "limit": limit }),
+        )
+        .await
+    }
+
     pub async fn surface_deliveries(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/surfaces/{}/deliveries", url_encode(id)))
             .await
@@ -2064,6 +2096,9 @@ mod tests {
             "surface_restart",
             "surface_inbox",
             "surface_outbox",
+            "surface_messages",
+            "surface_archive_messages",
+            "surface_purge_archived_events",
             "surface_deliveries",
             "surface_replay_inbox",
             "surface_retry_outbox",

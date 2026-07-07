@@ -189,6 +189,30 @@ impl SurfaceService {
         self.host.message_snapshot(surface)
     }
 
+    pub(crate) fn message_store_root(&self) -> std::path::PathBuf {
+        self.host.message_store_root().to_path_buf()
+    }
+
+    pub(crate) fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.host
+            .archive_dead_letters(surface, older_than_ms, limit)
+    }
+
+    pub(crate) fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        self.host
+            .purge_archived_events(surface, older_than_ms, limit)
+    }
+
     pub(crate) fn replay_inbox_message(
         &self,
         surface: &str,

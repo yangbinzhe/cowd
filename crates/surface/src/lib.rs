@@ -198,6 +198,8 @@ pub enum SurfaceSupervisorAction {
     Restart,
     Repair,
     HealthCheck,
+    ArchiveDeadLetters,
+    PurgeArchivedEvents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -71,13 +71,17 @@ pub(crate) struct SurfaceDeliveryEvent {
 pub(crate) struct SurfaceMessageSnapshot {
     pub kind: &'static str,
     pub surface: String,
+    pub message_root: PathBuf,
     pub inbox: Vec<SurfaceInboxRecord>,
     pub active_inbox: Vec<SurfaceInboxRecord>,
     pub terminal_inbox: Vec<SurfaceInboxRecord>,
     pub outbox: Vec<SurfaceOutboxRecord>,
     pub active_outbox: Vec<SurfaceOutboxRecord>,
+    pub terminal_outbox: Vec<SurfaceOutboxRecord>,
     pub deliveries: Vec<SurfaceDeliveryEvent>,
     pub dead_letters: Vec<SurfaceOutboxRecord>,
+    pub archived_outbox: Vec<SurfaceOutboxRecord>,
+    pub archived_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +278,9 @@ impl SurfaceMessageStore {
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
         let updated = self.update_outbox_by_delivery(delivery_id, |record| {
+            if is_terminal_outbox_status(&record.status) {
+                return;
+            }
             record.status = "sending".to_string();
             record.attempts = record.attempts.saturating_add(1);
             record.updated_at_ms = now_ms();
@@ -423,8 +430,18 @@ impl SurfaceMessageStore {
         &self,
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
+        let current = self
+            .get_outbox_by_delivery(delivery_id)
+            .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
+        if current.status != "dead_letter" {
+            return Err(format!(
+                "operator retry is only allowed for dead_letter deliveries; current status is {}",
+                current.status
+            ));
+        }
         let updated = self.update_outbox_by_delivery(delivery_id, |record| {
             record.status = "queued".to_string();
+            record.attempts = 0;
             record.updated_at_ms = now_ms();
             record.next_retry_at_ms = None;
             record.last_error = None;
@@ -434,12 +451,113 @@ impl SurfaceMessageStore {
             surface: updated.surface.clone(),
             delivery_id: Some(updated.delivery_id.clone()),
             message_id: updated.reply_to_message_id.clone(),
-            kind: "outbox.replayed".to_string(),
+            kind: "outbox.operator_retry_requested".to_string(),
             status: "queued".to_string(),
-            detail_json: serde_json::json!({"attempts": updated.attempts}),
+            detail_json: serde_json::json!({"attempts": updated.attempts, "operator_action": "retry"}),
             created_at_ms: now_ms(),
         })?;
         Ok(updated)
+    }
+
+    pub(crate) fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        let surface = normalize_surface_id(surface);
+        let now = now_ms();
+        let mut state = self.lock_state()?;
+        let mut archived = Vec::new();
+        let keys = state
+            .outbox
+            .iter()
+            .filter(|(_, record)| {
+                record.surface == surface
+                    && record.status == "dead_letter"
+                    && older_than_ms.is_none_or(|threshold| record.updated_at_ms <= threshold)
+            })
+            .take(limit.max(1))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(record) = state.outbox.get_mut(&key) {
+                record.status = "archived".to_string();
+                record.updated_at_ms = now;
+                record.next_retry_at_ms = None;
+                archived.push(record.clone());
+            }
+        }
+        for record in &archived {
+            self.append_record(OUTBOX_FILE, record)?;
+        }
+        drop(state);
+        for record in &archived {
+            self.push_event(SurfaceDeliveryEvent {
+                event_id: new_event_id(),
+                surface: record.surface.clone(),
+                delivery_id: Some(record.delivery_id.clone()),
+                message_id: record.reply_to_message_id.clone(),
+                kind: "outbox.dead_letter_archived".to_string(),
+                status: "archived".to_string(),
+                detail_json: serde_json::json!({
+                    "attempts": record.attempts,
+                    "max_attempts": record.max_attempts,
+                    "last_error": record.last_error,
+                }),
+                created_at_ms: now_ms(),
+            })?;
+        }
+        Ok(archived)
+    }
+
+    pub(crate) fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let surface = normalize_surface_id(surface);
+        let limit = limit.max(1);
+        let mut state = self.lock_state()?;
+        let archived_delivery_ids = state
+            .outbox
+            .values()
+            .filter(|record| {
+                record.surface == surface
+                    && record.status == "archived"
+                    && older_than_ms.is_none_or(|threshold| record.updated_at_ms <= threshold)
+            })
+            .map(|record| record.delivery_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if archived_delivery_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let purged_event_ids = state
+            .events
+            .iter()
+            .filter(|(_, event)| {
+                event.surface == surface
+                    && event
+                        .delivery_id
+                        .as_ref()
+                        .is_some_and(|delivery_id| archived_delivery_ids.contains(delivery_id))
+                    && older_than_ms.is_none_or(|threshold| event.created_at_ms <= threshold)
+            })
+            .take(limit)
+            .map(|(event_id, _)| event_id.clone())
+            .collect::<Vec<_>>();
+
+        for event_id in &purged_event_ids {
+            state.events.remove(event_id);
+        }
+        let remaining = state.events.values().cloned().collect::<Vec<_>>();
+        drop(state);
+        if !purged_event_ids.is_empty() {
+            self.rewrite_records(EVENT_FILE, &remaining)?;
+        }
+        Ok(purged_event_ids.len())
     }
 
     pub(crate) fn get_outbox_by_delivery(&self, delivery_id: &str) -> Option<SurfaceOutboxRecord> {
@@ -567,21 +685,36 @@ impl SurfaceMessageStore {
             .filter(|record| is_active_outbox_status(&record.status))
             .cloned()
             .collect();
+        let terminal_outbox = outbox
+            .iter()
+            .filter(|record| is_terminal_outbox_status(&record.status))
+            .cloned()
+            .collect();
         let dead_letters = outbox
             .iter()
             .filter(|record| record.status == "dead_letter")
             .cloned()
             .collect();
+        let archived_outbox = outbox
+            .iter()
+            .filter(|record| record.status == "archived")
+            .cloned()
+            .collect::<Vec<_>>();
+        let archived_count = archived_outbox.len();
         SurfaceMessageSnapshot {
             kind: "surface.message_snapshot",
             surface: surface.clone(),
+            message_root: self.root.clone(),
             inbox,
             active_inbox,
             terminal_inbox,
             outbox,
             active_outbox,
+            terminal_outbox,
             deliveries: self.list_delivery_events(&surface),
             dead_letters,
+            archived_outbox,
+            archived_count,
         }
     }
 
@@ -703,6 +836,22 @@ impl SurfaceMessageStore {
         writer.write_all(b"\n").map_err(|error| error.to_string())
     }
 
+    fn rewrite_records<T: Serialize>(&self, file: &str, records: &[T]) -> Result<(), String> {
+        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+        let path = self.root.join(file);
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        for record in records {
+            serde_json::to_writer(&mut writer, record).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, SurfaceMessageState>, String> {
         self.state
             .lock()
@@ -741,8 +890,20 @@ fn load_state(root: &Path) -> Result<SurfaceMessageState, String> {
             record.event_id.clone()
         })?,
     };
+    normalize_terminal_outbox_state(&mut state);
     reconcile_inbox_with_outbox(&mut state);
     Ok(state)
+}
+
+fn normalize_terminal_outbox_state(state: &mut SurfaceMessageState) {
+    for record in state.outbox.values_mut() {
+        if is_terminal_outbox_status(&record.status) {
+            record.next_retry_at_ms = None;
+        }
+        if record.status == "dead_letter" && record.attempts > record.max_attempts {
+            record.attempts = record.max_attempts;
+        }
+    }
 }
 
 fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
@@ -812,6 +973,10 @@ fn is_active_inbox_status(status: &str) -> bool {
 
 fn is_active_outbox_status(status: &str) -> bool {
     matches!(status, "queued" | "sending" | "retry_scheduled")
+}
+
+fn is_terminal_outbox_status(status: &str) -> bool {
+    matches!(status, "sent" | "dead_letter" | "cancelled" | "archived")
 }
 
 fn read_latest<T>(
@@ -967,7 +1132,68 @@ mod tests {
             .mark_delivery_dead_letter(&queued.delivery_id, "operator closed")
             .unwrap();
         assert_eq!(dead.status, "dead_letter");
+        let sending_after_terminal = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        assert_eq!(sending_after_terminal.status, "dead_letter");
+        assert_eq!(sending_after_terminal.attempts, dead.attempts);
         assert_eq!(store.snapshot("feishu").dead_letters.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_retry_dead_letter_requires_operator_action() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-retry-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let active_retry = store.mark_delivery_replayed(&queued.delivery_id);
+        assert!(active_retry.is_err());
+
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "transport timeout", false)
+            .unwrap();
+        let replayed = store.mark_delivery_replayed(&queued.delivery_id).unwrap();
+        assert_eq!(replayed.status, "queued");
+        assert_eq!(replayed.attempts, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_archive_dead_letters_preserves_audit_state() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-archive-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "permanent failure", false)
+            .unwrap();
+        let archived = store.archive_dead_letters("feishu", None, 10).unwrap();
+        assert_eq!(archived.len(), 1);
+        let snapshot = store.snapshot("feishu");
+        assert!(snapshot.dead_letters.is_empty());
+        assert_eq!(snapshot.archived_count, 1);
+        assert_eq!(snapshot.archived_outbox[0].status, "archived");
+        assert!(snapshot
+            .deliveries
+            .iter()
+            .any(|event| event.kind == "outbox.dead_letter_archived"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1132,6 +1358,47 @@ mod tests {
             snapshot.inbox[0].last_error.as_deref(),
             Some("surface processing was interrupted by gateway restart before a reply was queued")
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_purge_archived_events_keeps_outbox_terminal_state() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-purge-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "transport timeout", false)
+            .unwrap();
+        let archived = store.archive_dead_letters("feishu", None, 10).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(!store.list_delivery_events("feishu").is_empty());
+
+        let purged = store.purge_archived_events("feishu", None, 100).unwrap();
+        assert!(purged > 0);
+        let snapshot = store.snapshot("feishu");
+        assert_eq!(snapshot.archived_count, 1);
+        assert_eq!(snapshot.archived_outbox[0].delivery_id, queued.delivery_id);
+        assert!(store
+            .list_delivery_events("feishu")
+            .iter()
+            .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        assert_eq!(reloaded.snapshot("feishu").archived_count, 1);
+        assert!(reloaded
+            .list_delivery_events("feishu")
+            .iter()
+            .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
 
         let _ = std::fs::remove_dir_all(root);
     }

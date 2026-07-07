@@ -196,7 +196,7 @@ impl Component for SurfacePanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k  h health  s start  x stop  r restart  R repair  m send  a action  i inbox  o outbox  v deliveries  p replay  d retry  D dlq",
+            "Keys: j/k  h health  s start  x stop  r restart  R repair  m send  a action  g ledger  i inbox  o outbox  v deliveries  p replay  d retry  D dlq  A archive  P purge",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.last_status {
@@ -497,6 +497,31 @@ fn receipt_summary(receipt: &serde_json::Value) -> String {
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("receipt");
+    if kind == "surface.messages" {
+        let snapshot = receipt.get("snapshot").unwrap_or(receipt);
+        let root = receipt
+            .get("message_root")
+            .or_else(|| snapshot.get("message_root"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let active_outbox = snapshot
+            .get("active_outbox")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let dead_letters = snapshot
+            .get("dead_letters")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let archived = snapshot
+            .get("archived_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return format!(
+            "{kind} active_outbox={active_outbox} dead_letters={dead_letters} archived={archived} root={root}"
+        );
+    }
     let status = receipt
         .get("status")
         .or_else(|| receipt.get("ok"))

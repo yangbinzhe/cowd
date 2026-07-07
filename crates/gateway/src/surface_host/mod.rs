@@ -57,7 +57,15 @@ impl SurfaceHost {
         let message_root = roots
             .first()
             .map(|root| root.join(".cowd-edge-messages"))
-            .unwrap_or_else(|| SurfaceMessageStore::default_root(Path::new(".")));
+            .unwrap_or_else(isolated_message_root);
+        Self::with_configs_and_message_root(roots, configs, message_root)
+    }
+
+    pub(crate) fn with_configs_and_message_root(
+        roots: Vec<PathBuf>,
+        configs: BTreeMap<String, serde_json::Value>,
+        message_root: PathBuf,
+    ) -> Self {
         Self::with_configs_and_message_store(
             roots,
             configs,
@@ -132,6 +140,19 @@ fn edge_manifest_roots(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+fn cowd_config_home() -> PathBuf {
+    std::env::var_os("COWD_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cowd")))
+        .unwrap_or_else(|| PathBuf::from(".cowd"))
+}
+
+fn isolated_message_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("cowd-surface-messages")
+        .join(uuid::Uuid::new_v4().to_string())
+}
+
 impl Default for SurfaceHost {
     fn default() -> Self {
         Self::new(Vec::new())
@@ -158,6 +179,20 @@ mod tests {
         assert!(roots.contains(&root.join("connectors").join("message")));
         assert!(roots.contains(&root.join("connectors").join("source")));
         assert!(roots.contains(&root.join("connectors").join("automation")));
+    }
+
+    #[test]
+    fn surface_host_empty_roots_message_store_does_not_use_current_directory() {
+        let host = SurfaceHost::with_configs(Vec::new(), BTreeMap::new());
+        assert_ne!(
+            host.message_store_root(),
+            Path::new("."),
+            "surface message store must not default to the source/current directory"
+        );
+        assert!(host
+            .message_store_root()
+            .components()
+            .any(|component| component.as_os_str() == "cowd-surface-messages"));
     }
 
     #[tokio::test]

@@ -2485,12 +2485,15 @@ impl TuiState {
                     | KeyCode::Char('R')
                     | KeyCode::Char('m')
                     | KeyCode::Char('a')
+                    | KeyCode::Char('g')
                     | KeyCode::Char('i')
                     | KeyCode::Char('o')
                     | KeyCode::Char('v')
                     | KeyCode::Char('p')
                     | KeyCode::Char('d')
                     | KeyCode::Char('D')
+                    | KeyCode::Char('A')
+                    | KeyCode::Char('P')
             );
         };
         match key.code {
@@ -2587,6 +2590,16 @@ impl TuiState {
                 );
                 true
             }
+            KeyCode::Char('g') => {
+                let label = format!("surface.messages:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_messages(&surface_id).await
+                    }),
+                );
+                true
+            }
             KeyCode::Char('i') => {
                 let label = format!("surface.inbox:{surface_id}");
                 self.surface_panel.record_action_result(
@@ -2667,6 +2680,38 @@ impl TuiState {
                                 "operator moved delivery from TUI",
                             )
                             .await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('A') => {
+                if !self
+                    .surface_panel
+                    .require_confirmation("surface.messages.archive", "A")
+                {
+                    return true;
+                }
+                let label = format!("surface.messages.archive:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_archive_messages(&surface_id, 100).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('P') => {
+                if !self
+                    .surface_panel
+                    .require_confirmation("surface.messages.purge_archived_events", "P")
+                {
+                    return true;
+                }
+                let label = format!("surface.messages.purge_archived_events:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_purge_archived_events(&surface_id, 100).await
                     }),
                 );
                 true
