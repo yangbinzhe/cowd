@@ -288,6 +288,28 @@ impl HarnessEvalReportStore {
             .map_err(|error| error.to_string())
     }
 
+    pub fn upsert_run(&self, record: &HarnessEvalRunRecord) -> Result<(), String> {
+        self.ensure_root()?;
+        let path = self.root.join("runs.jsonl");
+        let mut records = if path.exists() {
+            let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<HarnessEvalRunRecord>(line).ok())
+                .filter(|item| item.run_id != record.run_id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        records.push(record.clone());
+        let mut text = String::new();
+        for item in records {
+            text.push_str(&serde_json::to_string(&item).map_err(|error| error.to_string())?);
+            text.push('\n');
+        }
+        fs::write(path, text).map_err(|error| error.to_string())
+    }
+
     pub fn list_runs(&self) -> Result<Vec<HarnessEvalRunRecord>, String> {
         let path = self.root.join("runs.jsonl");
         if !path.exists() {

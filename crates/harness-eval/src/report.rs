@@ -42,6 +42,9 @@ impl Default for HarnessEvalLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessEvalRunStatus {
+    Queued,
+    Running,
+    CancelRequested,
     Completed,
     Gated,
     Cancelled,
@@ -52,6 +55,9 @@ impl HarnessEvalRunStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
             Self::Gated => "gated",
             Self::Cancelled => "cancelled",

@@ -993,6 +993,41 @@ pub(crate) mod tests {
         path
     }
 
+    async fn wait_for_harness_eval_route_status(
+        app: axum::Router,
+        run_id: &str,
+        expected: &str,
+    ) -> serde_json::Value {
+        for _ in 0..40 {
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/harness-eval/runs/{run_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if json["run"]["status"] == expected {
+                return json;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let detail = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/runs/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let state = test_state();
@@ -1289,7 +1324,11 @@ pub(crate) mod tests {
         let run_body = to_bytes(run.into_body(), usize::MAX).await.unwrap();
         let run_json: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
         assert_eq!(run_json["kind"], "harness_eval.run");
-        assert_eq!(run_json["run"]["status"], "completed");
+        assert_eq!(run_json["run"]["status"], "running");
+        let run_id = run_json["run"]["run_id"].as_str().unwrap();
+        let completed_run =
+            wait_for_harness_eval_route_status(app.clone(), run_id, "completed").await;
+        assert_eq!(completed_run["run"]["status"], "completed");
 
         let latest = app
             .clone()

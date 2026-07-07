@@ -1,6 +1,6 @@
 use harness_eval::{
-    default_report_root, run_eval, terminal_gate_report, HarnessEvalLevel, HarnessEvalReportStore,
-    HarnessEvalRunnerOptions,
+    default_report_root, run_eval, terminal_gate_report_with_report, HarnessEvalLevel,
+    HarnessEvalReportStore, HarnessEvalRunnerOptions,
 };
 use std::path::PathBuf;
 
@@ -38,7 +38,8 @@ fn main() {
         Some("terminal-gate") => {
             let evidence_dir = option_value(&args[1..], "--evidence-dir")
                 .unwrap_or_else(|| "../plan/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
-            let gate = terminal_gate_report(PathBuf::from(evidence_dir));
+            let report_json = option_value(&args[1..], "--report-json").map(PathBuf::from);
+            let gate = terminal_gate_report_with_report(PathBuf::from(evidence_dir), report_json);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&gate).expect("terminal gate json")
@@ -99,7 +100,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
     );
 }
 

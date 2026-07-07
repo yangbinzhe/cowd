@@ -371,7 +371,9 @@ impl Component for GatewayPanel {
         if let Some(summary) = &self.harness_eval_summary {
             let color = match self.harness_eval_status.as_deref() {
                 Some("passed" | "completed") => Color::Green,
-                Some("failed" | "gated") => Color::Yellow,
+                Some("running" | "queued") => Color::Cyan,
+                Some("cancel_requested") => Color::Yellow,
+                Some("failed" | "gated" | "cancelled") => Color::Yellow,
                 Some("empty") | None => Color::DarkGray,
                 _ => Color::Cyan,
             };

@@ -33,9 +33,9 @@ pub use report::{
     ProviderRoundSummary, RealToolScenarioReport, RealToolScenarioResult, ToolCallDetail,
     ToolCallSummary, UsageSummary,
 };
-pub use report_store::{default_report_root, HarnessEvalReportStore};
-pub use runner::{run_eval, HarnessEvalRunnerOptions};
-pub use terminal_gate::terminal_gate_report;
+pub use report_store::{default_report_root, now_ms, HarnessEvalReportStore};
+pub use runner::{run_eval, run_eval_controlled, HarnessEvalRunControl, HarnessEvalRunnerOptions};
+pub use terminal_gate::{terminal_gate_report, terminal_gate_report_with_report};
 pub use terminal_matrix::{
     render_terminal_capability_matrix_markdown, terminal_capability_matrix,
     TerminalCapabilityMatrixRow,
@@ -316,6 +316,13 @@ pub struct NextGenHarnessEvalInput {
     pub real_model_authorized: bool,
     pub mission_evidence_refs: Vec<String>,
     pub reality_evidence_ref_total: usize,
+    pub agent_terminal_count: usize,
+    pub mailbox_completed_count: usize,
+    pub synthesis_receipt_id: Option<String>,
+    pub session_relation_count: usize,
+    pub runtime_turn_result_count: usize,
+    pub recovery_applied_count: usize,
+    pub recovery_verified_count: usize,
     pub source_fixture_status: String,
     pub sidecar_fixture_status: String,
     pub db_fixture_status: String,
@@ -332,6 +339,13 @@ impl Default for NextGenHarnessEvalInput {
             real_model_authorized: false,
             mission_evidence_refs: Vec::new(),
             reality_evidence_ref_total: 0,
+            agent_terminal_count: 0,
+            mailbox_completed_count: 0,
+            synthesis_receipt_id: None,
+            session_relation_count: 0,
+            runtime_turn_result_count: 0,
+            recovery_applied_count: 0,
+            recovery_verified_count: 0,
             source_fixture_status: "not_requested".to_string(),
             sidecar_fixture_status: "not_requested".to_string(),
             db_fixture_status: "not_requested".to_string(),
@@ -361,6 +375,7 @@ pub struct NextGenHarnessScenarioResult {
     pub token_usage: Value,
     pub latency: Value,
     pub evidence_refs: Vec<String>,
+    pub terminal_evidence: Value,
     pub quality_rubric: NextGenHarnessQualityRubric,
     pub missing_capabilities: Vec<String>,
     pub claims_orchestration: bool,
@@ -573,6 +588,8 @@ fn evaluate_next_gen_harness_scenario(
                 || item.contains("conflict")
                 || item.contains("recovery")
         });
+    let terminal_evidence = next_gen_terminal_evidence(spec, input);
+    let terminal_ok = terminal_evidence_ok(spec, &terminal_evidence);
     let external_ok = !spec.claims_external_access
         || input.sidecar_fixture_status == "connected"
         || input.source_fixture_status == "connected"
@@ -593,6 +610,9 @@ fn evaluate_next_gen_harness_scenario(
     }
     if !replay_ok {
         missing.push(format!("{}.replay_or_recovery_evidence", spec.id));
+    }
+    if !terminal_ok {
+        missing.push(format!("{}.terminal_evidence", spec.id));
     }
     if !external_ok {
         missing.push(format!("{}.external_access_health", spec.id));
@@ -627,6 +647,7 @@ fn evaluate_next_gen_harness_scenario(
             "source": "deterministic_eval_clock"
         }),
         evidence_refs,
+        terminal_evidence,
         quality_rubric: NextGenHarnessQualityRubric {
             correctness: if passed { 1.0 } else { 0.0 },
             evidence_strength: evidence_strength.to_string(),
@@ -656,6 +677,106 @@ fn evaluate_next_gen_harness_scenario(
         claims_memory_context: spec.claims_memory_context,
         claims_replay: spec.claims_replay,
         claims_external_access: spec.claims_external_access,
+    }
+}
+
+fn next_gen_terminal_evidence(
+    spec: &NextGenHarnessScenarioSpec,
+    input: &NextGenHarnessEvalInput,
+) -> Value {
+    match spec.kind {
+        NextGenHarnessScenarioKind::SimpleDirect => json!({
+            "direct_answer_selected": true,
+            "team_started": false,
+            "source": "strategy_contract"
+        }),
+        NextGenHarnessScenarioKind::ComplexStrategySelection => json!({
+            "runtime_action_count": input.runtime_action_count,
+            "model_visible_capability_catalog": input.runtime_action_count >= 3,
+            "source": "runtime_capability_contract"
+        }),
+        NextGenHarnessScenarioKind::ToolBatchEfficiency => json!({
+            "tool_calls": input.tool_call_count,
+            "batch_plan_present": input.level == "quick" || input.tool_call_count >= spec.min_tool_calls_for_full_eval,
+            "source": if input.level == "quick" { "contract_plan" } else { "real_local_tool_evidence" }
+        }),
+        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => json!({
+            "agent_terminal_count": input.agent_terminal_count,
+            "mailbox_completed_count": input.mailbox_completed_count,
+            "synthesis_receipt_id": input.synthesis_receipt_id,
+            "source": "mission_runtime_collaboration"
+        }),
+        NextGenHarnessScenarioKind::CrossSessionDispatch => json!({
+            "session_relation_count": input.session_relation_count,
+            "runtime_turn_result_count": input.runtime_turn_result_count,
+            "source": "mission_runtime_session_graph"
+        }),
+        NextGenHarnessScenarioKind::MemoryRealityContextGovernance => json!({
+            "reality_evidence_ref_total": input.reality_evidence_ref_total,
+            "selected_omitted_context_evidenced": input.reality_evidence_ref_total > 0,
+            "source": "reality_context_eval"
+        }),
+        NextGenHarnessScenarioKind::ConflictRecovery => json!({
+            "recovery_applied_count": input.recovery_applied_count,
+            "recovery_verified_count": input.recovery_verified_count,
+            "source": "runtime_recovery_contract"
+        }),
+    }
+}
+
+fn terminal_evidence_ok(spec: &NextGenHarnessScenarioSpec, evidence: &Value) -> bool {
+    match spec.kind {
+        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => {
+            evidence
+                .get("agent_terminal_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                >= 2
+                && evidence
+                    .get("mailbox_completed_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    >= 1
+                && evidence
+                    .get("synthesis_receipt_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        NextGenHarnessScenarioKind::CrossSessionDispatch => {
+            evidence
+                .get("session_relation_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                >= 1
+                && evidence
+                    .get("runtime_turn_result_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    >= 1
+        }
+        NextGenHarnessScenarioKind::ConflictRecovery => {
+            evidence
+                .get("recovery_applied_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                + evidence
+                    .get("recovery_verified_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                >= 1
+        }
+        NextGenHarnessScenarioKind::ToolBatchEfficiency => {
+            let tool_calls = evidence
+                .get("tool_calls")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+            let source = evidence
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            source == "contract_plan" || tool_calls >= spec.min_tool_calls_for_full_eval
+        }
+        _ => true,
     }
 }
 
@@ -2908,6 +3029,13 @@ mod tests {
                 "session-relation:demo".to_string(),
             ],
             reality_evidence_ref_total: 12,
+            agent_terminal_count: 3,
+            mailbox_completed_count: 2,
+            synthesis_receipt_id: Some("synthesis:demo".to_string()),
+            session_relation_count: 1,
+            runtime_turn_result_count: 1,
+            recovery_applied_count: 1,
+            recovery_verified_count: 1,
             source_fixture_status: "not_required_deterministic".to_string(),
             sidecar_fixture_status: "not_required_deterministic".to_string(),
             db_fixture_status: "not_required_deterministic".to_string(),

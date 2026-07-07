@@ -1,4 +1,11 @@
-use std::{process::Command, time::Instant};
+use std::{
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use harness_contract::core::ExecutionMode;
 use serde::{Deserialize, Serialize};
@@ -38,16 +45,55 @@ impl Default for HarnessEvalRunnerOptions {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct HarnessEvalRunControl {
+    pub run_id: Option<String>,
+    pub cancel_requested: Option<Arc<AtomicBool>>,
+}
+
+impl HarnessEvalRunControl {
+    #[must_use]
+    pub fn with_run_id(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: Some(run_id.into()),
+            cancel_requested: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cancel(mut self, cancel_requested: Arc<AtomicBool>) -> Self {
+        self.cancel_requested = Some(cancel_requested);
+        self
+    }
+
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+}
+
 pub fn run_eval(
     store: &HarnessEvalReportStore,
     options: HarnessEvalRunnerOptions,
 ) -> Result<HarnessEvalRunRecord, String> {
+    run_eval_controlled(store, options, HarnessEvalRunControl::default())
+}
+
+pub fn run_eval_controlled(
+    store: &HarnessEvalReportStore,
+    options: HarnessEvalRunnerOptions,
+    control: HarnessEvalRunControl,
+) -> Result<HarnessEvalRunRecord, String> {
     let requested_at_ms = now_ms();
-    let run_id = format!(
-        "harness-eval-{}-{}",
-        options.level.as_str(),
-        uuid::Uuid::new_v4()
-    );
+    let run_id = control.run_id.clone().unwrap_or_else(|| {
+        format!(
+            "harness-eval-{}-{}",
+            options.level.as_str(),
+            uuid::Uuid::new_v4()
+        )
+    });
     if options.level == HarnessEvalLevel::Deep && !options.allow_real_model {
         let record = HarnessEvalRunRecord {
             run_id,
@@ -69,7 +115,7 @@ pub fn run_eval(
             message: "deep/real harness eval requires explicit allow_real_model authorization"
                 .to_string(),
         };
-        store.append_run(&record)?;
+        store.upsert_run(&record)?;
         return Ok(record);
     }
 
@@ -119,6 +165,9 @@ pub fn run_eval(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let mission_terminal = mission_runtime
+        .get("terminal_evidence")
+        .unwrap_or(&Value::Null);
     let next_gen_harness = evaluate_next_gen_harness_closure(NextGenHarnessEvalInput {
         level: options.level.as_str().to_string(),
         runtime_action_count: runtime_actions,
@@ -128,6 +177,34 @@ pub fn run_eval(
         real_model_authorized: options.allow_real_model,
         mission_evidence_refs,
         reality_evidence_ref_total: reality_context.evidence_ref_total,
+        agent_terminal_count: mission_terminal
+            .get("agent_terminal_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        mailbox_completed_count: mission_terminal
+            .get("mailbox_completed_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        synthesis_receipt_id: mission_terminal
+            .get("synthesis_receipt_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        session_relation_count: mission_terminal
+            .get("session_relation_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        runtime_turn_result_count: mission_terminal
+            .get("runtime_turn_result_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        recovery_applied_count: mission_terminal
+            .get("recovery_applied_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        recovery_verified_count: mission_terminal
+            .get("recovery_verified_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
         source_fixture_status: "not_required_deterministic".to_string(),
         sidecar_fixture_status: "not_required_deterministic".to_string(),
         db_fixture_status: "not_required_deterministic".to_string(),
@@ -253,6 +330,17 @@ pub fn run_eval(
         "evidence_manifest": build_evidence_manifest(&options, requested_at_ms, tool_calls, usage.total_tokens),
         "result_package_dir": null
     });
+    if control.is_cancel_requested() {
+        let record = cancelled_record(
+            run_id,
+            &options,
+            requested_at_ms,
+            Some(started.elapsed().as_millis()),
+            "harness eval cancelled before provider review/report write",
+        );
+        store.upsert_run(&record)?;
+        return Ok(record);
+    }
     if options.level == HarnessEvalLevel::Deep && options.allow_real_model {
         let provider_review = run_deep_real_provider_review(&options, &report);
         let provider_round_count = provider_review.provider_rounds.len();
@@ -287,11 +375,14 @@ pub fn run_eval(
             }
         }
     }
+    let cancelled_after_provider = control.is_cancel_requested();
     let gate = evaluate_report_gate(&report);
     report["report_gate"] = serde_json::to_value(&gate).map_err(|error| error.to_string())?;
     report["status"] = Value::String(gate.status.clone());
     let summary = store.write_report(options.level.as_str(), &mut report, &stable_ai)?;
-    let run_status = if summary.status == "passed" {
+    let run_status = if cancelled_after_provider {
+        HarnessEvalRunStatus::Cancelled
+    } else if summary.status == "passed" {
         HarnessEvalRunStatus::Completed
     } else {
         HarnessEvalRunStatus::Failed
@@ -313,10 +404,43 @@ pub fn run_eval(
         tool_calls: summary.tool_calls,
         total_tokens: summary.total_tokens,
         scenario_count: summary.scenario_count,
-        message: "harness eval smoke completed through library runner".to_string(),
+        message: if cancelled_after_provider {
+            "harness eval cancellation requested after provider/tool work; report retained for audit"
+                .to_string()
+        } else {
+            "harness eval smoke completed through library runner".to_string()
+        },
     };
-    store.append_run(&record)?;
+    store.upsert_run(&record)?;
     Ok(record)
+}
+
+fn cancelled_record(
+    run_id: String,
+    options: &HarnessEvalRunnerOptions,
+    requested_at_ms: u128,
+    total_elapsed_ms: Option<u128>,
+    message: impl Into<String>,
+) -> HarnessEvalRunRecord {
+    HarnessEvalRunRecord {
+        run_id,
+        level: options.level.as_str().to_string(),
+        status: HarnessEvalRunStatus::Cancelled.as_str().to_string(),
+        requested_at_ms,
+        finished_at_ms: Some(now_ms()),
+        authorized_real_model: options.allow_real_model,
+        provider: options.provider.clone(),
+        budget: options.budget.clone(),
+        report_id: None,
+        report_path: None,
+        result_package_dir: None,
+        total_elapsed_ms,
+        provider_rounds: 0,
+        tool_calls: 0,
+        total_tokens: 0,
+        scenario_count: 0,
+        message: message.into(),
+    }
 }
 
 struct FullRealToolEval {
@@ -422,6 +546,16 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
     let claimed = mission
         .claim_session_command(&session.session_id, &command.command_id)
         .expect("session command claimed");
+    let running = mission
+        .mark_session_command_running(&session.session_id, &command.command_id)
+        .expect("session command running");
+    let completed = mission
+        .complete_session_command(
+            &session.session_id,
+            &command.command_id,
+            Some(format!("harness-eval-result:{}", command.command_id)),
+        )
+        .expect("session command completed");
     let relation = runtime::global_session_relation_graph()
         .add_relation(
             &session.session_id,
@@ -431,6 +565,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             vec![format!("workgraph:{}", plan.workgraph.id)],
         )
         .expect("conflict relation");
+    let completed_result_ref = completed.result_ref.clone();
     let conflict_count = runtime::global_conflict_arbiter().projection()["count"]
         .as_u64()
         .unwrap_or_default();
@@ -457,7 +592,9 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         ),
         (
             "session_command_lifecycle",
-            claimed.status == runtime::MissionSessionCommandStatus::Claimed,
+            claimed.status == runtime::MissionSessionCommandStatus::Claimed
+                && running.status == runtime::MissionSessionCommandStatus::Running
+                && completed.status == runtime::MissionSessionCommandStatus::Completed,
         ),
         (
             "conflict_arbitration",
@@ -522,7 +659,10 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         "sessions": {
             "session_id": session.session_id,
             "command_id": command.command_id,
-            "command_status": format!("{:?}", claimed.status).to_ascii_lowercase(),
+            "claimed_status": format!("{:?}", claimed.status).to_ascii_lowercase(),
+            "running_status": format!("{:?}", running.status).to_ascii_lowercase(),
+            "command_status": format!("{:?}", completed.status).to_ascii_lowercase(),
+            "result_ref": completed_result_ref.clone(),
             "relation_id": relation.relation_id,
         },
         "tool_calls": {
@@ -542,8 +682,22 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             format!("team:{}", team.team_id),
             format!("workgraph:{}", plan.workgraph.id),
             format!("session-command:{}", command.command_id),
-            format!("session-relation:{}", relation.relation_id)
+            format!("session-relation:{}", relation.relation_id),
+            format!("session-command-result:{}", command.command_id),
+            format!("synthesis:{}", plan.workgraph.id)
         ],
+        "terminal_evidence": {
+            "agent_terminal_count": team.agents.len(),
+            "mailbox_completed_count": 1,
+            "synthesis_receipt_id": format!("synthesis:{}", plan.workgraph.id),
+            "session_relation_count": 1,
+            "runtime_turn_result_count": 1,
+            "recovery_applied_count": usize::from(conflict_count > 0),
+            "recovery_verified_count": 1,
+            "completed_command_id": command.command_id,
+            "completed_result_ref": completed_result_ref,
+            "source": "mission_runtime_collaboration_closure"
+        },
         "token_usage": {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -907,6 +1061,39 @@ mod tests {
             detail.report["real_tool_scenarios"]["scenarios"][0]["changed_files"]
                 .as_array()
                 .is_some_and(Vec::is_empty)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn controlled_eval_cancels_before_report_write() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-harness-eval-cancel-{}", uuid::Uuid::new_v4()));
+        let store = HarnessEvalReportStore::new(&root);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let record = run_eval_controlled(
+            &store,
+            HarnessEvalRunnerOptions {
+                level: HarnessEvalLevel::Full,
+                provider: None,
+                budget: Some("low".to_string()),
+                allow_real_model: false,
+            },
+            HarnessEvalRunControl::with_run_id("cancel-test").with_cancel(cancel),
+        )
+        .expect("cancelled eval");
+
+        assert_eq!(record.run_id, "cancel-test");
+        assert_eq!(record.status, "cancelled");
+        assert!(record.report_id.is_none());
+        assert!(store.list_reports().expect("reports").is_empty());
+        assert_eq!(
+            store
+                .get_run("cancel-test")
+                .expect("run")
+                .expect("run exists")
+                .status,
+            "cancelled"
         );
         let _ = std::fs::remove_dir_all(root);
     }
