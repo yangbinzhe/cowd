@@ -300,6 +300,124 @@ mod tests {
     }
 
     #[test]
+    fn runtime_orchestrate_request_subagent_starts_agent_lifecycle() {
+        let session_id = format!("session-subagent-{}", uuid::Uuid::new_v4());
+        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
+            title: "subagent orchestration test".to_string(),
+            session_id: Some(session_id.clone()),
+        });
+        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
+            intent: "分析 Runtime 编排链路".to_string(),
+            session_id: Some(session_id),
+            action: RuntimeOrchestrationAction::RequestSubagent,
+            reason: None,
+            template_hint: Some("explorer".to_string()),
+            capabilities: Vec::new(),
+            evidence_refs: vec!["evidence:runtime".to_string()],
+            constraints: Default::default(),
+            surface: None,
+        });
+
+        assert!(matches!(
+            result.status.as_str(),
+            "running" | "running_degraded"
+        ));
+        assert_eq!(result.execution["type"], "runtime_orchestration_result");
+        assert_eq!(
+            result.execution["execution_fidelity"],
+            "runtime_owned_agent_lifecycle"
+        );
+        assert!(result.execution["agent_id"].is_string());
+        assert!(result.execution["event_refs"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        let obsolete_gate = ["planning_only_until", "_runtime_context_attached"].concat();
+        assert!(!result.decision.policy_gates.contains(&obsolete_gate));
+    }
+
+    #[test]
+    fn runtime_orchestrate_request_verification_starts_verifier() {
+        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
+            intent: "验证 V15 是否真的接线".to_string(),
+            session_id: None,
+            action: RuntimeOrchestrationAction::RequestVerification,
+            reason: None,
+            template_hint: None,
+            capabilities: Vec::new(),
+            evidence_refs: vec!["plan:v15".to_string()],
+            constraints: Default::default(),
+            surface: None,
+        });
+
+        assert_eq!(result.status, "running");
+        assert_eq!(
+            result.execution["execution_fidelity"],
+            "runtime_owned_verification_lifecycle"
+        );
+        assert_eq!(result.execution["agent"]["subagentType"], "Verification");
+    }
+
+    #[test]
+    fn runtime_orchestrate_background_review_starts_steward() {
+        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
+            intent: "持续监督复杂重构风险".to_string(),
+            session_id: Some(format!("session-review-{}", uuid::Uuid::new_v4())),
+            action: RuntimeOrchestrationAction::RequestBackgroundReview,
+            reason: None,
+            template_hint: None,
+            capabilities: Vec::new(),
+            evidence_refs: vec!["risk:architecture".to_string()],
+            constraints: Default::default(),
+            surface: None,
+        });
+
+        assert_eq!(result.status, "running");
+        assert_eq!(
+            result.execution["execution_fidelity"],
+            "runtime_owned_steward_lifecycle"
+        );
+        assert!(result.execution["steward_id"].is_string());
+        assert!(result.execution["control_actions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "pause")));
+    }
+
+    #[test]
+    fn runtime_orchestrate_session_link_generic_path_routes_command() {
+        let from_session = format!("session-link-from-{}", uuid::Uuid::new_v4());
+        let target_session = format!("session-link-target-{}", uuid::Uuid::new_v4());
+        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
+            title: "source session".to_string(),
+            session_id: Some(from_session.clone()),
+        });
+        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
+            title: "target session".to_string(),
+            session_id: Some(target_session.clone()),
+        });
+        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
+            intent: "同步检查结果".to_string(),
+            session_id: Some(from_session),
+            action: RuntimeOrchestrationAction::RequestSessionLink,
+            reason: None,
+            template_hint: Some(target_session),
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: Default::default(),
+            surface: None,
+        });
+
+        assert!(matches!(result.status.as_str(), "routed" | "rejected"));
+        assert_eq!(
+            result.execution["execution_fidelity"],
+            "runtime_owned_session_bridge"
+        );
+        assert_eq!(
+            result.execution["bridge"]["kind"],
+            "runtime.cross_session_bridge_receipt"
+        );
+    }
+
+    #[test]
     fn strategy_orchestration_records_model_visible_evidence() {
         let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
             intent: "复杂代码审计需要并行证据和团队审查".to_string(),

@@ -376,7 +376,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled stateful runtime orchestration request. Use runtime_capabilities for read-only planning; runtime validates policy, risk, budget, and permissions before execution.".to_string(),
+                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned team/subagent/verification/background/session receipts; deliberation/reflexion return strategy packets; risk_gate returns an approval packet. Use runtime_capabilities for read-only planning first.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -388,6 +388,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     },
                     "action": {
                         "type": "string",
+                        "description": "executable_lifecycle: request_team, request_subagent, request_verification, request_background_review, request_session_link; executable_tool_dag: request_parallel_tools, request_rewoo_evidence; strategy_packet: request_deliberation, request_reflexion_retry; approval_packet: request_risk_gate",
                         "enum": [
                             "plan_only",
                             "request_team",

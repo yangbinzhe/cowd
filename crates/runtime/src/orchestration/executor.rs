@@ -1,4 +1,6 @@
 use harness_contract::core::ExecutionMode;
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 use crate::execution_core::reflexion::ReflexionRecord;
@@ -9,7 +11,13 @@ use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestra
 use crate::tool_host::{
     execute_tool_dag_with_host, RuntimeActionExecutionReceipt, RuntimeToolExecutionHost,
 };
-use crate::{global_team_runtime_service, StartTeamRuntimeRequest};
+use crate::{
+    global_agent_lifecycle_service, global_mission_runtime, global_steward_runtime_service,
+    global_team_runtime_service, prepare_agent_job, AgentExecutionBackendKind, AutonomyProfileId,
+    CrossSessionMessage, PermissionMode, PermissionPolicy, SessionExecutionPlane,
+    SpawnAgentRequest, StartStewardRuntimeRequest, StartTeamRuntimeRequest,
+    DEFAULT_AGENT_MAX_ITERATIONS,
+};
 
 #[must_use]
 pub fn execute_orchestration_request(
@@ -97,20 +105,18 @@ pub fn execute_orchestration_request(
                 "next_step": "request approval or provide a lower-risk alternative before execution",
             }),
         ),
-        RuntimeOrchestrationAction::RequestSubagent
-        | RuntimeOrchestrationAction::RequestVerification
-        | RuntimeOrchestrationAction::RequestBackgroundReview
-        | RuntimeOrchestrationAction::RequestSessionLink => (
-            None,
-            json!({
-                "type": "runtime_lifecycle_request",
-                "mode": mode.as_str(),
-                "action": request.action,
-                "template_hint": request.template_hint,
-                "execution_target": "runtime-owned team/session/approval lifecycle",
-                "status": decision_status,
-            }),
-        ),
+        RuntimeOrchestrationAction::RequestSubagent => {
+            execute_agent_lifecycle_request(request, mode, decision_status, "request_subagent")
+        }
+        RuntimeOrchestrationAction::RequestVerification => {
+            execute_agent_lifecycle_request(request, mode, decision_status, "request_verification")
+        }
+        RuntimeOrchestrationAction::RequestBackgroundReview => {
+            execute_background_review_request(request, mode, decision_status)
+        }
+        RuntimeOrchestrationAction::RequestSessionLink => {
+            execute_session_link_request(request, mode, decision_status)
+        }
     }
 }
 
@@ -225,6 +231,259 @@ fn execute_team_request(
             }),
         ),
     }
+}
+
+fn execute_agent_lifecycle_request(
+    request: &RuntimeOrchestrationRequest,
+    mode: ExecutionMode,
+    decision_status: &str,
+    action: &str,
+) -> (Option<String>, Value) {
+    if decision_status != "accepted" {
+        return lifecycle_not_started(action, mode, decision_status);
+    }
+    let template = match action {
+        "request_verification" => Some("verifier".to_string()),
+        _ => request.template_hint.clone(),
+    };
+    let permission_mode = if action == "request_verification"
+        || !request.constraints.requires_write.unwrap_or(false)
+    {
+        PermissionMode::ReadOnly
+    } else {
+        PermissionMode::WorkspaceWrite
+    };
+    let description = match action {
+        "request_verification" => format!("Verify: {}", request.intent),
+        _ => format!("Subagent: {}", request.intent),
+    };
+    let prompt = agent_prompt_for(action, request);
+    let job = match prepare_agent_job(SpawnAgentRequest {
+        description,
+        prompt,
+        subagent_type: template,
+        name: Some(action.replace("request_", "")),
+        model: None,
+        system_prompt: Vec::new(),
+        allowed_tools: BTreeSet::new(),
+        tool_definitions: Vec::new(),
+        permission_policy: PermissionPolicy::new(permission_mode),
+        max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+        store_dir: None,
+        backend: AgentExecutionBackendKind::InProcess,
+        process_jsonl: None,
+    }) {
+        Ok(job) => job,
+        Err(error) => {
+            return (
+                Some("failed".to_string()),
+                json!({
+                    "type": "runtime_orchestration_result",
+                    "mode": mode.as_str(),
+                    "action": action,
+                    "status": "failed",
+                    "execution_fidelity": "runtime_owned_agent_lifecycle",
+                    "error": error,
+                }),
+            );
+        }
+    };
+    let manifest = job.manifest.clone();
+    global_agent_lifecycle_service()
+        .register_started(manifest.clone(), job.cancellation_token.clone());
+    global_agent_lifecycle_service().record_event(
+        &manifest.agent_id,
+        "agent.waiting_executor",
+        "Runtime orchestration created a lifecycle job; provider execution may be attached by the runtime host.",
+    );
+    let attach_status = request
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(|session_id| {
+            match global_mission_runtime().attach_agent(session_id, &manifest.agent_id) {
+                Ok(receipt) => json!({"status": "attached", "receipt": receipt}),
+                Err(error) => json!({"status": "failed", "error": error}),
+            }
+        });
+    let status = if attach_status
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("failed")
+    {
+        "running_degraded"
+    } else {
+        "running"
+    };
+    let agent_id = manifest.agent_id.clone();
+    (
+        Some(status.to_string()),
+        json!({
+            "type": "runtime_orchestration_result",
+            "mode": mode.as_str(),
+            "action": action,
+            "status": status,
+            "execution_fidelity": if action == "request_verification" {
+                "runtime_owned_verification_lifecycle"
+            } else {
+                "runtime_owned_agent_lifecycle"
+            },
+            "agent_id": agent_id,
+            "agent": manifest,
+            "session_id": request.session_id,
+            "attach_status": attach_status,
+            "event_refs": [format!("agent:{agent_id}")],
+            "control_actions": ["inspect", "cancel", "request_report"],
+            "evidence_refs": request.evidence_refs,
+        }),
+    )
+}
+
+fn execute_background_review_request(
+    request: &RuntimeOrchestrationRequest,
+    mode: ExecutionMode,
+    decision_status: &str,
+) -> (Option<String>, Value) {
+    if decision_status != "accepted" {
+        return lifecycle_not_started("request_background_review", mode, decision_status);
+    }
+    let mission_id = request
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(|session_id| format!("mission:{session_id}"))
+        .unwrap_or_else(|| format!("mission-background-{}", uuid::Uuid::new_v4()));
+    match global_steward_runtime_service().start(StartStewardRuntimeRequest {
+        mission_id,
+        root_session_id: request.session_id.clone(),
+        profile_id: AutonomyProfileId::Stewarded,
+        objective: request.intent.clone(),
+    }) {
+        Ok(steward) => (Some("running".to_string()), {
+            let steward_id = steward.steward_id.clone();
+            json!({
+            "type": "runtime_orchestration_result",
+            "mode": mode.as_str(),
+            "action": "request_background_review",
+            "status": "running",
+            "execution_fidelity": "runtime_owned_steward_lifecycle",
+            "steward_id": steward.steward_id,
+            "steward": steward,
+            "watch_scope": {
+                "session_id": request.session_id,
+                "evidence_refs": request.evidence_refs,
+            },
+            "event_refs": [format!("steward:{steward_id}")],
+            "control_actions": ["pause", "resume", "takeover", "cancel", "request_report"],
+            })
+        }),
+        Err(error) => (
+            Some("failed".to_string()),
+            json!({
+                "type": "runtime_orchestration_result",
+                "mode": mode.as_str(),
+                "action": "request_background_review",
+                "status": "failed",
+                "execution_fidelity": "runtime_owned_steward_lifecycle",
+                "error": error,
+            }),
+        ),
+    }
+}
+
+fn execute_session_link_request(
+    request: &RuntimeOrchestrationRequest,
+    mode: ExecutionMode,
+    decision_status: &str,
+) -> (Option<String>, Value) {
+    if decision_status != "accepted" {
+        return lifecycle_not_started("request_session_link", mode, decision_status);
+    }
+    let Some(session_id) = request
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())
+    else {
+        return (
+            Some("rejected".to_string()),
+            json!({
+                "type": "runtime_orchestration_result",
+                "mode": mode.as_str(),
+                "action": "request_session_link",
+                "status": "rejected",
+                "execution_fidelity": "runtime_owned_session_bridge",
+                "reason": "request_session_link requires session_id",
+            }),
+        );
+    };
+    let target_ref = request
+        .template_hint
+        .as_deref()
+        .or(request.surface.as_deref())
+        .unwrap_or("primary");
+    let receipt = SessionExecutionPlane::bridge(CrossSessionMessage {
+        from_session_id: session_id.to_string(),
+        target_ref: target_ref.to_string(),
+        command: request.intent.clone(),
+        actor: Some("runtime_orchestrate".to_string()),
+        evidence_refs: request.evidence_refs.clone(),
+    });
+    let status = match receipt.status.as_str() {
+        "routed" => "routed",
+        "failed" => "failed",
+        _ => "rejected",
+    };
+    (
+        Some(status.to_string()),
+        json!({
+            "type": "runtime_orchestration_result",
+            "mode": mode.as_str(),
+            "action": "request_session_link",
+            "status": status,
+            "execution_fidelity": "runtime_owned_session_bridge",
+            "bridge": receipt,
+            "event_refs": [format!("session:{}", session_id)],
+            "control_actions": ["inspect", "dispatch_pending", "recover_route"],
+        }),
+    )
+}
+
+fn lifecycle_not_started(
+    action: &str,
+    mode: ExecutionMode,
+    decision_status: &str,
+) -> (Option<String>, Value) {
+    (
+        None,
+        json!({
+            "type": "runtime_orchestration_result",
+            "mode": mode.as_str(),
+            "action": action,
+            "status": decision_status,
+            "execution_fidelity": "runtime_owned_lifecycle_guard",
+            "reason": "runtime lifecycle was not started because validation did not accept the request",
+        }),
+    )
+}
+
+fn agent_prompt_for(action: &str, request: &RuntimeOrchestrationRequest) -> String {
+    let mut prompt = String::new();
+    match action {
+        "request_verification" => prompt.push_str("Verify the current work and report concrete risks, missing tests, and evidence-backed conclusions.\n\n"),
+        _ => prompt.push_str("Execute the delegated runtime subtask and report progress, evidence, and residual risk.\n\n"),
+    }
+    prompt.push_str("Intent:\n");
+    prompt.push_str(&request.intent);
+    if !request.evidence_refs.is_empty() {
+        prompt.push_str("\n\nEvidence refs:\n");
+        for evidence_ref in &request.evidence_refs {
+            prompt.push_str("- ");
+            prompt.push_str(evidence_ref);
+            prompt.push('\n');
+        }
+    }
+    prompt
 }
 
 #[must_use]

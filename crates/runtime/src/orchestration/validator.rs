@@ -11,7 +11,11 @@ pub fn validate_request(
 ) -> RuntimeOrchestrationDecision {
     let mut policy_gates = Vec::new();
     let mut status = match request.action {
-        RuntimeOrchestrationAction::RequestTeam => "accepted",
+        RuntimeOrchestrationAction::RequestTeam
+        | RuntimeOrchestrationAction::RequestSubagent
+        | RuntimeOrchestrationAction::RequestVerification
+        | RuntimeOrchestrationAction::RequestBackgroundReview
+        | RuntimeOrchestrationAction::RequestSessionLink => "accepted",
         RuntimeOrchestrationAction::RequestRiskGate => "needs_approval",
         _ => "planned",
     }
@@ -44,15 +48,25 @@ pub fn validate_request(
         status = "rejected".to_string();
         policy_gates.push("missing_session_id_for_team_runtime".to_string());
     }
+    if request.intent.trim().is_empty()
+        && matches!(
+            request.action,
+            RuntimeOrchestrationAction::RequestSubagent
+                | RuntimeOrchestrationAction::RequestVerification
+                | RuntimeOrchestrationAction::RequestBackgroundReview
+                | RuntimeOrchestrationAction::RequestSessionLink
+        )
+    {
+        status = "rejected".to_string();
+        policy_gates.push("empty_intent_rejected".to_string());
+    }
     if matches!(
         request.action,
-        RuntimeOrchestrationAction::RequestSubagent
-            | RuntimeOrchestrationAction::RequestVerification
-            | RuntimeOrchestrationAction::RequestBackgroundReview
-            | RuntimeOrchestrationAction::RequestSessionLink
-    ) {
-        status = "planned".to_string();
-        policy_gates.push("planning_only_until_runtime_context_attached".to_string());
+        RuntimeOrchestrationAction::RequestSessionLink
+    ) && request.session_id.as_deref().is_none_or(str::is_empty)
+    {
+        status = "rejected".to_string();
+        policy_gates.push("missing_session_id_for_session_link".to_string());
     }
     RuntimeOrchestrationDecision {
         selected_mode: *recommended_mode,
