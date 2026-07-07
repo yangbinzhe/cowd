@@ -168,6 +168,122 @@ pub struct SourceRecordBatch {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceWatermark {
+    pub adapter_id: String,
+    pub resource_ref: String,
+    #[serde(default)]
+    pub table: Option<String>,
+    pub strategy: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub high_watermark: Option<String>,
+    #[serde(default)]
+    pub checksum: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceIncrementalRunRequest {
+    pub adapter_id: String,
+    pub resource_ref: String,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub watermark: Option<SourceWatermark>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+impl SourceIncrementalRunRequest {
+    #[must_use]
+    pub fn read_plan(&self) -> SourceReadPlan {
+        SourceReadPlan {
+            adapter_id: self.adapter_id.clone(),
+            resource_ref: self.resource_ref.clone(),
+            table: self.table.clone(),
+            fields: Vec::new(),
+            limit: self.limit,
+            offset: self
+                .watermark
+                .as_ref()
+                .and_then(|watermark| watermark.offset),
+            cursor: self.watermark.as_ref().and_then(|watermark| {
+                watermark
+                    .cursor
+                    .clone()
+                    .or_else(|| watermark.high_watermark.clone())
+            }),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceIncrementalRunResult {
+    pub status: String,
+    #[serde(default)]
+    pub batch: Option<SourceRecordBatch>,
+    #[serde(default)]
+    pub watermark_before: Option<SourceWatermark>,
+    #[serde(default)]
+    pub watermark_after: Option<SourceWatermark>,
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+    #[serde(default)]
+    pub receipt: Option<SourceIngestionReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceEventBatch {
+    pub adapter_id: String,
+    #[serde(default)]
+    pub resource_ref: Option<String>,
+    #[serde(default)]
+    pub events: Vec<Value>,
+    pub event_count: usize,
+    #[serde(default)]
+    pub watermark_after: Option<SourceWatermark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceIngestionReceipt {
+    pub receipt_id: String,
+    pub adapter_id: String,
+    pub resource_ref: String,
+    pub row_count: usize,
+    pub checksum: String,
+    #[serde(default)]
+    pub watermark_before: Option<SourceWatermark>,
+    #[serde(default)]
+    pub watermark_after: Option<SourceWatermark>,
+    #[serde(default)]
+    pub matrix_refs: Vec<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceConnectorState {
+    pub adapter_id: String,
+    pub surface_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub last_run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+    #[serde(default)]
+    pub watermarks: Vec<SourceWatermark>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceAdapterError {
     #[error("unsupported source adapter: {0}")]
@@ -669,6 +785,53 @@ mod tests {
             assert!(manifest.supports_event_subscription);
             assert!(manifest.refresh_modes.iter().any(|mode| mode == "event"));
             assert_eq!(manifest.access_mode, "database_service");
+        }
+    }
+
+    #[test]
+    fn source_contract_serializes_watermark_and_run_result() {
+        let watermark = SourceWatermark {
+            adapter_id: "postgres".to_string(),
+            resource_ref: "postgres://***/orders".to_string(),
+            table: Some("orders".to_string()),
+            strategy: "updated_at_field".to_string(),
+            cursor: None,
+            offset: None,
+            high_watermark: Some("2026-07-07T00:00:00Z".to_string()),
+            checksum: Some("sha256:test".to_string()),
+            updated_at_ms: 1_783_440_000_000,
+        };
+        let result = SourceIncrementalRunResult {
+            status: "ingested".to_string(),
+            batch: None,
+            watermark_before: Some(watermark.clone()),
+            watermark_after: Some(watermark.clone()),
+            degraded_reason: None,
+            receipt: Some(SourceIngestionReceipt {
+                receipt_id: "receipt-postgres-orders".to_string(),
+                adapter_id: "postgres".to_string(),
+                resource_ref: watermark.resource_ref.clone(),
+                row_count: 2,
+                checksum: "sha256:test".to_string(),
+                watermark_before: None,
+                watermark_after: Some(watermark),
+                matrix_refs: vec!["matrix:source_pack:postgres-orders".to_string()],
+                created_at_ms: 1_783_440_000_000,
+            }),
+        };
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["status"], "ingested");
+        assert_eq!(value["receipt"]["row_count"], 2);
+        assert_eq!(value["watermark_after"]["strategy"], "updated_at_field");
+    }
+
+    #[test]
+    fn builtin_source_manifests_explain_event_degraded_modes() {
+        for adapter_id in ["postgres", "mysql", "mariadb"] {
+            let manifest = source_adapter_manifest(adapter_id).unwrap();
+            let notes = manifest.notes.join(" ");
+            assert!(notes.contains("event payloads are normalized"));
+            assert!(notes.contains("sidecar"));
         }
     }
 

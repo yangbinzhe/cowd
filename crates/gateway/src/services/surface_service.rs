@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use connector::{SourceReadPlan, SourceRecordBatch};
+use connector::{
+    SourceConnectorState, SourceEventBatch, SourceIncrementalRunRequest,
+    SourceIncrementalRunResult, SourceReadPlan, SourceRecordBatch, SourceWatermark,
+};
 use surface::{
     SurfaceActionRequest, SurfaceFrame, SurfaceOperationResult, SurfaceRegistrySnapshot,
     SurfaceRuntimeSnapshot, SurfaceSendRequest, SurfaceSupervisorEvent,
@@ -285,6 +288,106 @@ impl SurfaceService {
             ));
         }
         Ok(batch)
+    }
+
+    pub(crate) async fn source_state(
+        &self,
+        adapter_id: &str,
+    ) -> Result<SourceConnectorState, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.state".to_string(),
+                payload: serde_json::json!({ "adapter_id": adapter_id }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceConnectorState>(
+            payload
+                .get("state")
+                .cloned()
+                .unwrap_or_else(|| payload.clone()),
+        )
+        .map_err(|error| format!("source connector `{surface}` returned invalid state: {error}"))
+    }
+
+    pub(crate) async fn source_incremental_run(
+        &self,
+        request: &SourceIncrementalRunRequest,
+    ) -> Result<SourceIncrementalRunResult, String> {
+        let surface = source_connector_surface_id(&request.adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.incremental.run".to_string(),
+                payload: serde_json::json!({ "request": request }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceIncrementalRunResult>(payload).map_err(|error| {
+            format!("source connector `{surface}` returned invalid incremental result: {error}")
+        })
+    }
+
+    pub(crate) async fn source_event_poll(
+        &self,
+        adapter_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<SourceEventBatch, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.event.poll".to_string(),
+                payload,
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceEventBatch>(payload).map_err(|error| {
+            format!("source connector `{surface}` returned invalid event batch: {error}")
+        })
+    }
+
+    pub(crate) async fn commit_source_watermark(
+        &self,
+        adapter_id: &str,
+        watermark: &SourceWatermark,
+    ) -> Result<SourceWatermark, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.watermark.commit".to_string(),
+                payload: serde_json::json!({ "watermark": watermark }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceWatermark>(
+            payload
+                .get("watermark")
+                .cloned()
+                .unwrap_or_else(|| payload.clone()),
+        )
+        .map_err(|error| {
+            format!("source connector `{surface}` returned invalid committed watermark: {error}")
+        })
+    }
+
+    fn source_action_payload(
+        &self,
+        surface: &str,
+        result: SurfaceOperationResult,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(error) = result.error {
+            return Err(format!(
+                "source connector `{surface}` failed: {}",
+                error.message
+            ));
+        }
+        result
+            .payload
+            .ok_or_else(|| format!("source connector `{surface}` returned no payload"))
     }
 
     pub(crate) async fn callback(

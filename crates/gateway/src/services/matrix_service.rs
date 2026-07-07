@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
+use connector::{SourceIngestionReceipt, SourceRecordBatch, SourceWatermark};
 use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
     MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlaneHealth,
@@ -199,6 +201,128 @@ impl MatrixService {
     ) -> Result<MatrixSourceSnapshotApplyReport, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .apply_source_snapshot_rows(source_pack_id, snapshot, rows)
+    }
+
+    pub(crate) fn ingest_source_record_batch(
+        &self,
+        config_home: impl AsRef<Path>,
+        batch: &SourceRecordBatch,
+        watermark_before: Option<SourceWatermark>,
+        watermark_after: Option<SourceWatermark>,
+    ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
+        let repository = self.sqlite_repository(&config_home)?;
+        let source_pack_id = source_pack_id_for_batch(batch);
+        let table = batch
+            .table
+            .clone()
+            .unwrap_or_else(|| batch.schema.table_name.clone());
+        let now = Utc::now();
+        let source_pack = MatrixSourcePack {
+            source_pack_id: source_pack_id.clone(),
+            source_name: format!("edge_source_{}", batch.adapter_id),
+            owner: "gateway.connector_source".to_string(),
+            access_mode: source_access_mode(&batch.adapter_id).to_string(),
+            refresh_mode: "incremental".to_string(),
+            entity_mappings: Vec::new(),
+            fact_mappings: vec![MatrixSourceFactMapping {
+                source_table: table.clone(),
+                fact_type: format!("source.{}.row", batch.adapter_id),
+                metric_key: format!("source_{}_rows", batch.adapter_id),
+                entity_ref_fields: batch.schema.primary_key.clone(),
+                measure_fields: Vec::new(),
+                event_time_field: None,
+                dedup_key: batch
+                    .schema
+                    .primary_key
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "_row_hash".to_string()),
+                delta_signature: batch.checksum.clone(),
+            }],
+            relation_mappings: Vec::new(),
+            reconciliation_rules: vec!["source_row_checksum_is_idempotency_key".to_string()],
+            quality_rules: vec![
+                "resource_ref_required".to_string(),
+                "row_checksum_required".to_string(),
+            ],
+            freshness_sla: Some("watermark_driven".to_string()),
+            security_policy: Some("edge_source_connector_contract".to_string()),
+            metadata: serde_json::json!({
+                "adapter_id": batch.adapter_id,
+                "resource_ref": batch.resource_ref,
+                "table": table,
+                "schema": batch.schema,
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+        repository.upsert_source_pack(source_pack)?;
+        let snapshot = repository.create_source_snapshot(MatrixSourceSnapshotInput {
+            snapshot_id: None,
+            source_pack_id: Some(source_pack_id.clone()),
+            source_system: batch.adapter_id.clone(),
+            source_kind: source_kind_for_batch(&batch.adapter_id),
+            resource_ref: Some(batch.resource_ref.clone()),
+            business_period: None,
+            captured_at: Some(now),
+            schema_version: Some(format!(
+                "source:{}:{}",
+                batch.adapter_id, batch.schema.table_name
+            )),
+            row_count: Some(batch.rows.len() as u64),
+            checksum: Some(batch.checksum.clone()),
+            confidence: Some(0.95),
+            metadata: serde_json::json!({
+                "delivery": "connector_source_incremental_run",
+                "cursor": batch.cursor,
+                "watermark_before": watermark_before,
+                "watermark_after": watermark_after,
+            }),
+        })?;
+        let apply_report = repository.apply_source_snapshot_rows(
+            &source_pack_id,
+            snapshot.clone(),
+            &batch.rows,
+        )?;
+        let plan = repository.plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
+            source_ref: batch.resource_ref.clone(),
+            fact_type: format!("source.{}.row", batch.adapter_id),
+            partition_ref: batch.table.clone(),
+            high_watermark: watermark_after
+                .as_ref()
+                .and_then(|watermark| {
+                    watermark
+                        .high_watermark
+                        .clone()
+                        .or_else(|| watermark.cursor.clone())
+                })
+                .or_else(|| Some(batch.checksum.clone())),
+            estimated_rows: Some(batch.rows.len() as u64),
+            raw_checksum: Some(batch.checksum.clone()),
+            metric_ids: Vec::new(),
+        })?;
+        let receipt_id = stable_receipt_id(&[
+            batch.adapter_id.as_str(),
+            batch.resource_ref.as_str(),
+            batch.table.as_deref().unwrap_or(""),
+            batch.checksum.as_str(),
+        ]);
+        Ok(SourceIngestionReceipt {
+            receipt_id: format!("source-receipt-{receipt_id}"),
+            adapter_id: batch.adapter_id.clone(),
+            resource_ref: batch.resource_ref.clone(),
+            row_count: batch.rows.len(),
+            checksum: batch.checksum.clone(),
+            watermark_before,
+            watermark_after,
+            matrix_refs: vec![
+                format!("matrix:source_pack:{source_pack_id}"),
+                format!("matrix:source_snapshot:{}", snapshot.snapshot_id),
+                format!("matrix:apply_report:{}", apply_report.fact_count),
+                format!("matrix:data_plane_batch:{}", plan.batch_id),
+            ],
+            created_at_ms: Utc::now().timestamp_millis(),
+        })
     }
 
     pub(crate) fn plan_data_plane_ingest(
@@ -621,6 +745,71 @@ impl MatrixService {
     }
 }
 
+fn source_pack_id_for_batch(batch: &SourceRecordBatch) -> String {
+    let table = batch
+        .table
+        .as_deref()
+        .unwrap_or(batch.schema.table_name.as_str());
+    format!(
+        "edge-source-{}-{}-{}",
+        sanitize_id(&batch.adapter_id),
+        sanitize_id(&batch.resource_ref),
+        sanitize_id(table)
+    )
+}
+
+fn source_access_mode(adapter_id: &str) -> &'static str {
+    match adapter_id {
+        "postgres" | "mysql" | "mariadb" | "sqlite" => "database_service",
+        "feishu_bitable" | "lark_bitable" => "api",
+        "csv" | "jsonl" | "local_file_batch" => "file",
+        _ => "connector",
+    }
+}
+
+fn source_kind_for_batch(adapter_id: &str) -> matrix_core::MatrixSourceKind {
+    match adapter_id {
+        "csv" | "jsonl" | "local_file_batch" => matrix_core::MatrixSourceKind::File,
+        "sqlite" | "postgres" | "mysql" | "mariadb" => matrix_core::MatrixSourceKind::Db,
+        "feishu_bitable" | "lark_bitable" => matrix_core::MatrixSourceKind::Api,
+        _ => matrix_core::MatrixSourceKind::Connector,
+    }
+}
+
+fn sanitize_id(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn stable_receipt_id(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+        .chars()
+        .take(16)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +852,69 @@ mod tests {
             .expect("facts")
             .iter()
             .any(|fact| fact.fact_type.starts_with("knowledge_")));
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn source_record_batch_ingests_to_source_pack_and_watermark() {
+        let config_home =
+            std::env::temp_dir().join(format!("cowd-source-record-batch-{}", uuid::Uuid::new_v4()));
+        let service = MatrixService::new();
+        let batch = SourceRecordBatch {
+            adapter_id: "csv".to_string(),
+            resource_ref: "file:///tmp/orders.csv".to_string(),
+            table: Some("orders".to_string()),
+            schema: connector::SourceTableSchema {
+                table_name: "orders".to_string(),
+                fields: vec![connector::SourceFieldSchema {
+                    name: "order_id".to_string(),
+                    data_type: "text".to_string(),
+                    nullable: false,
+                }],
+                primary_key: vec!["order_id".to_string()],
+            },
+            rows: vec![serde_json::json!({"order_id": "O-1", "qty": 3})],
+            cursor: connector::SourceBatchCursor {
+                offset: 0,
+                limit: 10,
+                next_offset: None,
+            },
+            row_count: 1,
+            checksum: "sha256:test".to_string(),
+            truncated: false,
+        };
+        let watermark_after = SourceWatermark {
+            adapter_id: "csv".to_string(),
+            resource_ref: batch.resource_ref.clone(),
+            table: batch.table.clone(),
+            strategy: "offset".to_string(),
+            cursor: Some("1".to_string()),
+            offset: Some(1),
+            high_watermark: None,
+            checksum: Some(batch.checksum.clone()),
+            updated_at_ms: Utc::now().timestamp_millis(),
+        };
+        let receipt = service
+            .ingest_source_record_batch(&config_home, &batch, None, Some(watermark_after))
+            .expect("source batch receipt");
+
+        assert_eq!(receipt.row_count, 1);
+        assert!(receipt
+            .matrix_refs
+            .iter()
+            .any(|value| value.starts_with("matrix:source_pack:")));
+        assert!(!service
+            .list_source_packs(&config_home, 10)
+            .expect("source packs")
+            .is_empty());
+        assert!(!service
+            .list_source_snapshots(&config_home, None, 10)
+            .expect("snapshots")
+            .is_empty());
+        assert!(!service
+            .list_data_plane_watermarks(&config_home, 10)
+            .expect("watermarks")
+            .is_empty());
         let _ = std::fs::remove_dir_all(config_home);
     }
 }

@@ -1772,6 +1772,89 @@ fn knowledge_governance_projection_is_exposed_to_reality_and_webui() {
 }
 
 #[test]
+fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
+    let connector_routes = read_repo("crates/gateway/src/api_routes/connector_routes.rs");
+    let surface_service = read_repo("crates/gateway/src/services/surface_service.rs");
+    let matrix_service = read_repo("crates/gateway/src/services/matrix_service.rs");
+    let connector_source = read_repo("crates/connector/src/source.rs");
+    let edge_root = std::path::Path::new("/media/yi/Datas/workspace/cowd-edge");
+    let edge_sidecar =
+        std::fs::read_to_string(edge_root.join("crates/edge-adapters/src/source_sidecar.rs"))
+            .expect("edge source sidecar should read");
+    let edge_db = std::fs::read_to_string(edge_root.join("crates/edge-adapters/src/source_db.rs"))
+        .expect("edge source db should read");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+    let gateway_page =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/GatewayPage.vue"))
+            .expect("gateway page should read");
+
+    for route in [
+        "/api/connectors/sources/:adapter_id/state",
+        "/api/connectors/sources/:adapter_id/run-incremental",
+        "/api/connectors/sources/:adapter_id/poll-events",
+        "/api/connectors/sources/:adapter_id/commit-watermark",
+    ] {
+        assert!(
+            connector_routes.contains(route),
+            "connector source route `{route}` must be exposed"
+        );
+    }
+    for dto in [
+        "SourceWatermark",
+        "SourceIncrementalRunRequest",
+        "SourceIncrementalRunResult",
+        "SourceEventBatch",
+        "SourceIngestionReceipt",
+        "SourceConnectorState",
+    ] {
+        assert!(
+            connector_source.contains(dto),
+            "connector source contract missing `{dto}`"
+        );
+    }
+    assert!(
+        surface_service.contains("source_incremental_run")
+            && surface_service.contains("source_event_poll")
+            && surface_service.contains("commit_source_watermark")
+            && surface_service.contains("\"source.incremental.run\""),
+        "SurfaceService must expose typed source action helpers"
+    );
+    assert!(
+        matrix_service.contains("ingest_source_record_batch")
+            && matrix_service.contains("SourceIngestionReceipt")
+            && matrix_service.contains("plan_data_plane_ingest"),
+        "MatrixService must turn source batches into source pack, snapshot, watermark, and receipt"
+    );
+    for action in [
+        "\"source.state\"",
+        "\"source.watermark.get\"",
+        "\"source.watermark.commit\"",
+        "\"source.incremental.run\"",
+        "\"source.event.poll\"",
+    ] {
+        assert!(
+            edge_sidecar.contains(action),
+            "edge source sidecar missing action {action}"
+        );
+    }
+    assert!(
+        edge_db.contains("updated_at_field")
+            && edge_db.contains("cursor_field")
+            && edge_db.contains("degraded_incremental_offset_only"),
+        "edge DB source must implement updated_at/cursor/offset incremental semantics"
+    );
+    assert!(
+        webui_client.contains("connectorSourceRunIncremental")
+            && webui_client.contains("connectorSourcePollEvents")
+            && gateway_page.contains("sourceRuntimeRows")
+            && gateway_page.contains("runEdgeSourceIncremental")
+            && gateway_page.contains("pollEdgeSourceEvents"),
+        "WebUI must manage source runtime state, watermark, incremental run, and event poll"
+    );
+}
+
+#[test]
 fn api_route_direct_dependencies_are_closed() {
     let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 
