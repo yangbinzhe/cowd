@@ -10,7 +10,9 @@ use memory::{
 use runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 use serde::{Deserialize, Serialize};
 
-use super::{AuditService, ContextService, GrowthService, MatrixService, MemoryService};
+use super::{
+    AuditService, ContextService, GrowthService, MatrixService, MemoryService, SessionService,
+};
 use crate::services::{service_envelope, ServiceEnvelope};
 
 #[derive(Clone)]
@@ -87,9 +89,18 @@ impl RealityService {
         matrix: &MatrixService,
         growth: &GrowthService,
         context: &ContextService,
+        session: &SessionService,
         audit: &AuditService,
     ) -> RealityStatusProjection {
-        let memory_status = memory.status_projection().await;
+        let mut memory_status = memory.status_projection().await;
+        let context_envelope_projection = if memory.is_available() {
+            context
+                .context_envelope_projection(session, None, &session.list_active_session_ids(), 20)
+                .await
+        } else {
+            disabled_context_envelope_projection()
+        };
+        inject_context_envelope_projection(&mut memory_status, &context_envelope_projection);
         let knowledge_status = memory.knowledge_projection(config_home).await;
         let matrix_health = matrix_health_value(matrix, config_home);
         let growth_events = growth
@@ -100,6 +111,7 @@ impl RealityService {
             .unwrap_or_default();
         let degraded_reasons = degraded_reasons(&memory_status, &matrix_health);
         let capabilities = reality_capabilities(&memory_status, &knowledge_status, &matrix_health);
+        let context_runtime = context_runtime_projection(&context_envelope_projection);
 
         serde_json::json!({
             "kind": "reality.status",
@@ -112,6 +124,7 @@ impl RealityService {
                 "degraded_reasons": degraded_reasons,
             },
             "capabilities": capabilities,
+            "context_runtime": context_runtime,
             "engines": {
                 "runtime_reality_decision": {
                     "status": "ready",
@@ -141,8 +154,12 @@ impl RealityService {
                     "envelope": growth.event_log_contract(),
                 },
                 "context": {
-                    "status": "ready",
+                    "status": context_runtime
+                        .get("envelope_status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("ready"),
                     "envelope": context.snapshot(),
+                    "projection": context_runtime,
                 },
                 "audit": {
                     "status": "ready",
@@ -907,10 +924,104 @@ fn reality_capabilities(
         "context_envelope": memory_status
             .pointer("/capabilities/context_envelope")
             .cloned()
-            .unwrap_or_else(|| serde_json::json!({
-                "status": RealityCapabilityStatus::ConfiguredButUnwired.as_str(),
-                "reason": "ContextEnvelope status is not exposed by memory projection",
-            })),
+            .unwrap_or_else(|| context_envelope_capability_json(&serde_json::json!({
+                "status": "degraded",
+                "degraded_reason": "memory status missing context_envelope projection",
+            }))),
+    })
+}
+
+fn inject_context_envelope_projection(
+    memory_status: &mut serde_json::Value,
+    projection: &serde_json::Value,
+) {
+    if let Some(object) = memory_status.as_object_mut() {
+        object.insert(
+            "context_envelope_projection".to_string(),
+            projection.clone(),
+        );
+        if let Some(capabilities) = object
+            .get_mut("capabilities")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            capabilities.insert(
+                "context_envelope".to_string(),
+                context_envelope_capability_json(projection),
+            );
+        }
+    }
+}
+
+fn context_envelope_capability_json(projection: &serde_json::Value) -> serde_json::Value {
+    let status = projection
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("degraded");
+    let capability_status = match status {
+        "ready" => RealityCapabilityStatus::EnabledAndWired.as_str(),
+        "disabled" => RealityCapabilityStatus::Disabled.as_str(),
+        "degraded" => RealityCapabilityStatus::Degraded.as_str(),
+        _ => RealityCapabilityStatus::ConfiguredButUnwired.as_str(),
+    };
+    serde_json::json!({
+        "status": capability_status,
+        "reason": projection
+            .get("degraded_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ContextEnvelope projection is backed by persisted session events and exposed through Memory/Reality read models"),
+        "latest_envelope_id": projection.get("latest_envelope_id").cloned().unwrap_or(serde_json::Value::Null),
+        "compression_status": projection.get("compression_status").cloned().unwrap_or(serde_json::Value::Null),
+        "recall_quality_status": projection.get("recall_quality_status").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn context_runtime_projection(projection: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "envelope_status": projection.get("status").cloned().unwrap_or_else(|| serde_json::json!("degraded")),
+        "compression_status": projection.get("compression_status").cloned().unwrap_or_else(|| serde_json::json!("degraded")),
+        "recall_quality_status": projection.get("recall_quality_status").cloned().unwrap_or_else(|| serde_json::json!("degraded")),
+        "latest_checkpoint": projection.get("latest_checkpoint_id").cloned().unwrap_or(serde_json::Value::Null),
+        "latest_envelope_id": projection.get("latest_envelope_id").cloned().unwrap_or(serde_json::Value::Null),
+        "latest_session_id": projection.get("latest_session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "used_ratio": projection.get("used_ratio").cloned().unwrap_or_else(|| serde_json::json!(0.0)),
+        "omission_summary": {
+            "selected_count": projection.get("selected_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "omitted_count": projection.get("omitted_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "protected_count": projection.get("protected_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "reasons": projection.get("omission_reasons").cloned().unwrap_or_else(|| serde_json::json!([])),
+        },
+        "degraded_reason": projection.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn disabled_context_envelope_projection() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "memory.context_envelope_projection",
+        "status": "disabled",
+        "enabled": false,
+        "latest_envelope_id": null,
+        "latest_session_id": null,
+        "latest_event_id": null,
+        "latest_checkpoint_id": null,
+        "last_written_at": null,
+        "last_restored_at": null,
+        "token_budget": 0,
+        "used_tokens": 0,
+        "used_ratio": 0.0,
+        "pressure_bp": 0,
+        "compression_threshold": 0.70,
+        "compression_status": "degraded",
+        "recall_quality_status": "disabled",
+        "selected_count": 0,
+        "omitted_count": 0,
+        "protected_count": 0,
+        "omission_reasons": [],
+        "restore_pointer": null,
+        "degraded_reason": "memory not configured",
+        "summaries": [],
+        "events": [],
+        "total": 0,
+        "limit": 20,
     })
 }
 

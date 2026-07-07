@@ -1635,6 +1635,75 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
 }
 
 #[test]
+fn context_envelope_projection_is_exposed_to_reality_and_surfaces() {
+    let memory_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/memory_routes.rs")).to_string();
+    let reality_service =
+        production_part(&read_repo("crates/gateway/src/services/reality_service.rs")).to_string();
+    let context_history = production_part(&read_repo(
+        "crates/gateway/src/services/context_service/history.rs",
+    ))
+    .to_string();
+    let tui_gateway_panel =
+        production_part(&read_repo("crates/tui/src/components/gateway_panel.rs")).to_string();
+    let tui_runtime_store = production_part(&read_repo(
+        "crates/tui/src/app_core/runtime_control_store.rs",
+    ))
+    .to_string();
+    let edge_root = repo_root().join("../cowd-edge");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+    let webui_memory =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/MemoryPage.vue"))
+            .expect("webui memory page should read");
+    let webui_reality =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/RealityCorePage.vue"))
+            .expect("webui reality page should read");
+
+    assert!(
+        memory_routes.contains("/api/memory/context-envelope")
+            && memory_routes.contains("/api/memory/context-envelope/:session_id")
+            && memory_routes.contains("memory_context_envelope_projection_value")
+            && memory_routes.contains("context_envelope_capability_from_projection"),
+        "memory routes must expose real ContextEnvelope projection APIs and capability status"
+    );
+    assert!(
+        context_history.contains("context_envelope_projection(")
+            && context_history.contains("stored_events_by_type_page")
+            && context_history.contains("\"ContextEnvelope\"")
+            && context_history.contains("memory.context_envelope_projection")
+            && context_history.contains("compression_status")
+            && context_history.contains("recall_quality_status"),
+        "ContextService must derive ContextEnvelope projection from persisted session events"
+    );
+    let stale_context_envelope_fallback = [
+        "ContextEnvelope status is not exposed by ",
+        "memory projection",
+    ]
+    .concat();
+    assert!(
+        reality_service.contains("\"context_runtime\"")
+            && reality_service.contains("context_runtime_projection")
+            && reality_service.contains("inject_context_envelope_projection")
+            && !reality_service.contains(&stale_context_envelope_fallback),
+        "Reality status must consume ContextEnvelope projection instead of a stale fallback"
+    );
+    assert!(
+        tui_gateway_panel.contains("ContextEnvelope:")
+            && tui_runtime_store.contains("context_envelope_projection")
+            && tui_runtime_store.contains("memory_context_envelope_used_ratio"),
+        "TUI Gateway status panel must render ContextEnvelope runtime projection from Gateway status"
+    );
+    assert!(
+        webui_client.contains("memoryContextEnvelope")
+            && webui_client.contains("/api/memory/context-envelope")
+            && webui_memory.contains("data-section=\"context-envelope\"")
+            && webui_reality.contains("data-section=\"context-runtime\""),
+        "WebUI must consume and render ContextEnvelope and Reality context-runtime sections"
+    );
+}
+
+#[test]
 fn api_route_direct_dependencies_are_closed() {
     let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 

@@ -30,6 +30,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/memory/packet", get(memory_packet_handler))
         .route("/api/memory/links", get(memory_links_handler))
         .route("/api/memory/runtime", get(memory_runtime_handler))
+        .route(
+            "/api/memory/context-envelope",
+            get(memory_context_envelope_handler),
+        )
+        .route(
+            "/api/memory/context-envelope/:session_id",
+            get(memory_context_envelope_session_handler),
+        )
         .route("/api/memory/knowledge", get(memory_knowledge_handler))
         .route(
             "/api/memory/knowledge/health",
@@ -66,7 +74,24 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 }
 
 pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {
-    state.services.memory.status_projection().await
+    let mut status = state.services.memory.status_projection().await;
+    let projection = memory_context_envelope_projection_value(state, None, 20).await;
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "context_envelope_projection".to_string(),
+            projection.clone(),
+        );
+        if let Some(capabilities) = object
+            .get_mut("capabilities")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            capabilities.insert(
+                "context_envelope".to_string(),
+                context_envelope_capability_from_projection(&projection),
+            );
+        }
+    }
+    status
 }
 
 async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -75,6 +100,106 @@ async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl Into
 
 async fn memory_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(memory_status_value(&state).await)
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextEnvelopeQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn memory_context_envelope_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<ContextEnvelopeQuery>,
+) -> impl IntoResponse {
+    Json(memory_context_envelope_projection_value(&state, None, query.limit.unwrap_or(20)).await)
+}
+
+async fn memory_context_envelope_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<ContextEnvelopeQuery>,
+) -> impl IntoResponse {
+    Json(
+        memory_context_envelope_projection_value(
+            &state,
+            Some(session_id.as_str()),
+            query.limit.unwrap_or(20),
+        )
+        .await,
+    )
+}
+
+pub(crate) async fn memory_context_envelope_projection_value(
+    state: &AppState,
+    session_id: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    if !state.services.memory.is_available() {
+        return serde_json::json!({
+            "kind": "memory.context_envelope_projection",
+            "status": "disabled",
+            "enabled": false,
+            "latest_envelope_id": null,
+            "latest_session_id": null,
+            "latest_event_id": null,
+            "latest_checkpoint_id": null,
+            "last_written_at": null,
+            "last_restored_at": null,
+            "token_budget": 0,
+            "used_tokens": 0,
+            "used_ratio": 0.0,
+            "pressure_bp": 0,
+            "compression_threshold": 0.70,
+            "compression_status": "degraded",
+            "recall_quality_status": "disabled",
+            "selected_count": 0,
+            "omitted_count": 0,
+            "protected_count": 0,
+            "omission_reasons": [],
+            "restore_pointer": null,
+            "degraded_reason": "memory not configured",
+            "summaries": [],
+            "events": [],
+            "total": 0,
+            "limit": limit.clamp(1, 100),
+        });
+    }
+    state
+        .services
+        .context
+        .context_envelope_projection(
+            &state.services.session,
+            session_id,
+            &state.services.session.list_active_session_ids(),
+            limit,
+        )
+        .await
+}
+
+pub(crate) fn context_envelope_capability_from_projection(
+    projection: &serde_json::Value,
+) -> serde_json::Value {
+    let status = projection
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("degraded");
+    let capability_status = match status {
+        "ready" => "enabled_and_wired",
+        "disabled" => "disabled",
+        "degraded" => "degraded",
+        _ => "configured_but_unwired",
+    };
+    serde_json::json!({
+        "status": capability_status,
+        "reason": projection
+            .get("degraded_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ContextEnvelope projection is backed by persisted session events and Reality status"),
+        "latest_envelope_id": projection.get("latest_envelope_id").cloned().unwrap_or(serde_json::Value::Null),
+        "compression_status": projection.get("compression_status").cloned().unwrap_or(serde_json::Value::Null),
+        "recall_quality_status": projection.get("recall_quality_status").cloned().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

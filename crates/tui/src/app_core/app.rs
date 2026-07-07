@@ -221,6 +221,10 @@ pub struct App {
     pub memory_total_entries: Option<usize>,
     pub memory_vector_count: Option<usize>,
     pub memory_layer_counts: [usize; 5],
+    pub memory_context_envelope_status: Option<String>,
+    pub memory_context_envelope_compression: Option<String>,
+    pub memory_context_envelope_used_ratio: Option<u64>,
+    pub memory_context_envelope_checkpoint: Option<String>,
 
     /// Reputation score of the currently selected agent (if any).
     pub selected_agent_reputation: Option<f64>,
@@ -544,6 +548,10 @@ impl App {
             memory_total_entries: None,
             memory_vector_count: None,
             memory_layer_counts: [0; 5],
+            memory_context_envelope_status: None,
+            memory_context_envelope_compression: None,
+            memory_context_envelope_used_ratio: None,
+            memory_context_envelope_checkpoint: None,
 
             selected_agent_reputation: None,
             mcp_count: 0,

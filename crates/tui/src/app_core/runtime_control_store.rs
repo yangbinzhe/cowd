@@ -287,6 +287,10 @@ pub struct RuntimeControlSnapshot {
     pub memory_total_entries: Option<usize>,
     pub memory_vector_count: Option<usize>,
     pub memory_layer_counts: [usize; 5],
+    pub memory_context_envelope_status: Option<String>,
+    pub memory_context_envelope_compression: Option<String>,
+    pub memory_context_envelope_used_ratio: Option<u64>,
+    pub memory_context_envelope_checkpoint: Option<String>,
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
     pub connector_accounts: Vec<ConnectorAccountSummary>,
@@ -364,6 +368,10 @@ impl RuntimeControlSnapshot {
             memory_total_entries: app.memory_total_entries,
             memory_vector_count: app.memory_vector_count,
             memory_layer_counts: app.memory_layer_counts,
+            memory_context_envelope_status: app.memory_context_envelope_status.clone(),
+            memory_context_envelope_compression: app.memory_context_envelope_compression.clone(),
+            memory_context_envelope_used_ratio: app.memory_context_envelope_used_ratio,
+            memory_context_envelope_checkpoint: app.memory_context_envelope_checkpoint.clone(),
             cross_plane_grants_active: app.gateway_cross_plane_grants_active,
             cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
             connector_accounts: app.gateway_connector_accounts.clone(),
@@ -414,6 +422,10 @@ impl RuntimeControlSnapshot {
         app.memory_total_entries = self.memory_total_entries;
         app.memory_vector_count = self.memory_vector_count;
         app.memory_layer_counts = self.memory_layer_counts;
+        app.memory_context_envelope_status = self.memory_context_envelope_status.clone();
+        app.memory_context_envelope_compression = self.memory_context_envelope_compression.clone();
+        app.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
+        app.memory_context_envelope_checkpoint = self.memory_context_envelope_checkpoint.clone();
         app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
         app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.gateway_connector_accounts = self.connector_accounts.clone();
@@ -531,6 +543,25 @@ impl RuntimeControlSnapshot {
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize);
         self.memory_layer_counts = memory_layer_counts_from_json(value);
+        let envelope = value
+            .get("context_envelope_projection")
+            .or_else(|| value.pointer("/memory/context_envelope_projection"));
+        self.memory_context_envelope_status = envelope
+            .and_then(|item| item.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        self.memory_context_envelope_compression = envelope
+            .and_then(|item| item.get("compression_status"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        self.memory_context_envelope_used_ratio = envelope
+            .and_then(|item| item.get("used_ratio"))
+            .and_then(serde_json::Value::as_f64)
+            .map(|ratio| (ratio * 100.0).round().clamp(0.0, 100.0) as u64);
+        self.memory_context_envelope_checkpoint = envelope
+            .and_then(|item| item.get("latest_checkpoint_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
     }
 
     pub fn ingest_cross_plane_summary(&mut self, value: &serde_json::Value) {

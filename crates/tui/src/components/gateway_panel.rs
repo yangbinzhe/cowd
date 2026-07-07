@@ -57,6 +57,11 @@ pub struct GatewayPanel {
     pub lease_mode: Option<String>,
     /// Memory/kernel status visible through runtime control.
     pub memory_status: Option<String>,
+    /// ContextEnvelope runtime status projected through Memory/Reality.
+    pub memory_context_envelope_status: Option<String>,
+    pub memory_context_envelope_compression: Option<String>,
+    pub memory_context_envelope_used_ratio: Option<u64>,
+    pub memory_context_envelope_checkpoint: Option<String>,
     /// Recent cross-plane execution receipts.
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
     /// Cowd kernel capability and release-gate summary.
@@ -123,6 +128,10 @@ impl GatewayPanel {
             lease_owner: None,
             lease_mode: None,
             memory_status: None,
+            memory_context_envelope_status: None,
+            memory_context_envelope_compression: None,
+            memory_context_envelope_used_ratio: None,
+            memory_context_envelope_checkpoint: None,
             execution_receipts: Vec::new(),
             cowd_kernel: None,
             gateway_capability_contract: None,
@@ -165,6 +174,10 @@ impl GatewayPanel {
         self.lease_owner = app.gateway_lease_owner.clone();
         self.lease_mode = app.gateway_lease_mode.clone();
         self.memory_status = app.memory_status.clone();
+        self.memory_context_envelope_status = app.memory_context_envelope_status.clone();
+        self.memory_context_envelope_compression = app.memory_context_envelope_compression.clone();
+        self.memory_context_envelope_used_ratio = app.memory_context_envelope_used_ratio;
+        self.memory_context_envelope_checkpoint = app.memory_context_envelope_checkpoint.clone();
         self.connector_accounts = app.gateway_connector_accounts.clone();
         self.connector_capabilities = app.gateway_connector_capabilities.clone();
         self.connector_resources = app.gateway_connector_resources.clone();
@@ -544,6 +557,27 @@ impl Component for GatewayPanel {
                 lines.push(Line::from(vec![
                     Span::styled("Memory: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(memory_status.clone(), Style::default().fg(Color::Green)),
+                ]));
+            }
+            if let Some(envelope_status) = self.memory_context_envelope_status.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("ContextEnvelope: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(envelope_status.clone(), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(
+                            " compression {} used {} checkpoint {}",
+                            self.memory_context_envelope_compression
+                                .as_deref()
+                                .unwrap_or("-"),
+                            self.memory_context_envelope_used_ratio
+                                .map(|value| format!("{value}%"))
+                                .unwrap_or_else(|| "-".to_string()),
+                            self.memory_context_envelope_checkpoint
+                                .as_deref()
+                                .unwrap_or("-")
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
 
