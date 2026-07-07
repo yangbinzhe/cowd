@@ -1187,6 +1187,16 @@ pub fn evaluate_knowledge_fabric_context_governance() -> KnowledgeFabricEvalRepo
     let blocked_namespace_count = plan.blocked_namespaces.len();
     let conflict_count = conflict_pack.conflicts.len();
     let evidence_count = plan.evidence_refs.len();
+    let projection = fabric.projection();
+    let has_namespace_projection = projection["namespace_tree"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty());
+    let has_maintenance_projection = projection["maintenance_candidates"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty());
+    let has_recall_quality_projection = projection["recall_quality"]
+        .as_object()
+        .is_some_and(|object| object.contains_key("precision_estimate"));
     let passed = plan.active_pack_ids.contains(&default_pack.pack.pack_id)
         && !plan.active_pack_ids.contains(&irrelevant_pack.pack.pack_id)
         && active_pack_count >= 1
@@ -1194,7 +1204,10 @@ pub fn evaluate_knowledge_fabric_context_governance() -> KnowledgeFabricEvalRepo
         && conflict_count >= 1
         && evidence_count >= 1
         && !canon.is_empty()
-        && !warnings.is_empty();
+        && !warnings.is_empty()
+        && has_namespace_projection
+        && has_maintenance_projection
+        && has_recall_quality_projection;
 
     KnowledgeFabricEvalReport {
         kind: "knowledge_fabric_context_governance".to_string(),
@@ -1207,6 +1220,9 @@ pub fn evaluate_knowledge_fabric_context_governance() -> KnowledgeFabricEvalRepo
             format!("active_packs={:?}", plan.active_pack_ids),
             format!("blocked_namespaces={:?}", plan.blocked_namespaces),
             format!("warnings={}", warnings.len()),
+            format!("namespace_projection={has_namespace_projection}"),
+            format!("maintenance_projection={has_maintenance_projection}"),
+            format!("recall_quality_projection={has_recall_quality_projection}"),
         ],
     }
 }

@@ -43,6 +43,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/memory/knowledge/health",
             get(memory_knowledge_health_handler),
         )
+        .route(
+            "/api/memory/knowledge/namespaces",
+            get(memory_knowledge_namespaces_handler),
+        )
+        .route(
+            "/api/memory/knowledge/conflicts",
+            get(memory_knowledge_conflicts_handler),
+        )
+        .route(
+            "/api/memory/knowledge/maintenance",
+            get(memory_knowledge_maintenance_handler),
+        )
         .route("/api/memory/clusters", get(memory_clusters_handler))
         .route("/api/memory/lifecycle/:id", get(memory_lifecycle_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
@@ -282,6 +294,73 @@ async fn memory_knowledge_health_handler(
             .and_then(|value| value.get("health"))
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+async fn memory_knowledge_namespaces_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let projection = state
+        .services
+        .memory
+        .knowledge_projection(&state.config_home)
+        .await;
+    Json(serde_json::json!({
+        "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "namespace_tree": projection
+            .pointer("/projection/namespace_tree")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "activation_policy_distribution": projection
+            .pointer("/projection/activation_policy_distribution")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "governance_distribution": projection
+            .pointer("/projection/governance_distribution")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    }))
+}
+
+async fn memory_knowledge_conflicts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let projection = state
+        .services
+        .memory
+        .knowledge_projection(&state.config_home)
+        .await;
+    Json(serde_json::json!({
+        "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "conflict_projection": projection
+            .pointer("/projection/conflict_projection")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({
+                "total": 0,
+                "unresolved": 0,
+                "conflicts": [],
+            })),
+    }))
+}
+
+async fn memory_knowledge_maintenance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let projection = state
+        .services
+        .memory
+        .knowledge_projection(&state.config_home)
+        .await;
+    Json(serde_json::json!({
+        "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "maintenance_candidates": projection
+            .pointer("/projection/maintenance_candidates")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "recall_quality": projection
+            .pointer("/projection/recall_quality")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
     }))
 }
 

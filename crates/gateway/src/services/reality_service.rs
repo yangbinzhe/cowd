@@ -144,6 +144,14 @@ impl RealityService {
                     "role": "Universal knowledge corpus governance, canon packs, activation policy, compliance warnings, and evidence routing over Memory.",
                     "writes": false,
                     "api": "/api/memory/knowledge",
+                    "recall_quality": knowledge_status
+                        .pointer("/projection/recall_quality")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({
+                            "precision_estimate": null,
+                            "cross_project_contamination_warnings": [],
+                            "degraded_reason": "knowledge recall quality projection unavailable",
+                        })),
                     "projection": knowledge_status,
                 },
                 "matrix": engine_summary("matrix", &matrix.health(), matrix_health),

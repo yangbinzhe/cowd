@@ -1704,6 +1704,74 @@ fn context_envelope_projection_is_exposed_to_reality_and_surfaces() {
 }
 
 #[test]
+fn knowledge_governance_projection_is_exposed_to_reality_and_webui() {
+    let memory_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/memory_routes.rs")).to_string();
+    let memory_service =
+        production_part(&read_repo("crates/gateway/src/services/memory_service.rs")).to_string();
+    let reality_service =
+        production_part(&read_repo("crates/gateway/src/services/reality_service.rs")).to_string();
+    let runtime_activation = read_repo("crates/runtime/src/context/knowledge_activation.rs");
+    let memory_knowledge =
+        production_part(&read_repo("crates/memory/src/knowledge/mod.rs")).to_string();
+    let edge_root = repo_root().join("../cowd-edge");
+    let webui_memory =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/MemoryPage.vue"))
+            .expect("webui memory page should read");
+    let webui_reality =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/RealityCorePage.vue"))
+            .expect("webui reality page should read");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+
+    for route in [
+        "/api/memory/knowledge",
+        "/api/memory/knowledge/namespaces",
+        "/api/memory/knowledge/conflicts",
+        "/api/memory/knowledge/maintenance",
+    ] {
+        assert!(
+            memory_routes.contains(route),
+            "memory knowledge governance route `{route}` must be exposed"
+        );
+    }
+    for field in [
+        "namespace_tree",
+        "activation_policy_distribution",
+        "governance_distribution",
+        "conflict_projection",
+        "maintenance_candidates",
+        "recall_quality",
+    ] {
+        assert!(
+            memory_knowledge.contains(field),
+            "KnowledgeFabric projection missing `{field}`"
+        );
+    }
+    assert!(
+        memory_service.contains("knowledge_projection"),
+        "MemoryService must expose knowledge_projection"
+    );
+    assert!(
+        reality_service.contains("recall_quality"),
+        "RealityService must surface knowledge recall quality"
+    );
+    assert!(
+        runtime_activation.contains("Knowledge pointer only")
+            && runtime_activation.contains("is_generic_knowledge_relevance_term"),
+        "Runtime knowledge activation must keep low relevance knowledge pointer-only"
+    );
+    assert!(
+        webui_client.contains("memoryKnowledgeNamespaces")
+            && webui_client.contains("memoryKnowledgeConflicts")
+            && webui_client.contains("memoryKnowledgeMaintenance")
+            && webui_memory.contains("data-section=\"knowledge-governance\"")
+            && webui_reality.contains("knowledgeRecallQuality"),
+        "WebUI must consume knowledge governance APIs and render Memory/Reality projections"
+    );
+}
+
+#[test]
 fn api_route_direct_dependencies_are_closed() {
     let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 
