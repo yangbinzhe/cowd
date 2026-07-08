@@ -141,7 +141,7 @@ impl ExecutionModeCatalog {
                     ],
                     &["first attempt with no evidence"],
                     &["implementation_review_fix"],
-                    &["growth", "turn_supervisor"],
+                    &["growth", "self_regulation"],
                     &[StrategyDecorator::WithReflection],
                     false,
                     RuntimeExecutionBinding::Reflexion,

@@ -43,6 +43,7 @@ pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use evolution_service::{
+    EvolutionCandidateCreateRequest, EvolutionCandidateDecisionRequest,
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionSandboxEvalRequest,
     EvolutionServiceError, EvolutionSignalCreateRequest,
 };
@@ -836,6 +837,12 @@ mod tests {
         assert!(evolution_contracts
             .iter()
             .any(|contract| contract.operation == "proposals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "candidates"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "candidate_create"));
         assert!(evolution_contracts
             .iter()
             .any(|contract| contract.operation == "sandbox_evals"));

@@ -1482,6 +1482,71 @@ pub(crate) mod tests {
             .unwrap()
             .contains("Acceptance Gates"));
 
+        let candidate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/proposals/{proposal_id}/candidates"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "baseline_ref": "baseline:main",
+                            "candidate_ref": "candidate:worktree"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidate.status(), StatusCode::OK);
+        let candidate_body = to_bytes(candidate.into_body(), usize::MAX).await.unwrap();
+        let candidate_json: serde_json::Value = serde_json::from_slice(&candidate_body).unwrap();
+        let candidate_id = candidate_json["candidate"]["candidate_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(candidate_json["candidate"]["mainline_modified"], false);
+
+        let candidates = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evolution/candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidates.status(), StatusCode::OK);
+        let candidates_body = to_bytes(candidates.into_body(), usize::MAX).await.unwrap();
+        let candidates_json: serde_json::Value = serde_json::from_slice(&candidates_body).unwrap();
+        assert_eq!(candidates_json["count"], 1);
+
+        let candidate_decision = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/candidates/{candidate_id}/decision"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"status":"approved_for_adoption"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidate_decision.status(), StatusCode::OK);
+        let candidate_decision_body = to_bytes(candidate_decision.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let candidate_decision_json: serde_json::Value =
+            serde_json::from_slice(&candidate_decision_body).unwrap();
+        assert_eq!(
+            candidate_decision_json["candidate"]["status"],
+            "approved_for_adoption"
+        );
+
         let sandbox = app
             .clone()
             .oneshot(

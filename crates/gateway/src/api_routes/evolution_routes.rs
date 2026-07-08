@@ -9,6 +9,7 @@ use axum::{
 };
 
 use crate::services::{
+    EvolutionCandidateCreateRequest, EvolutionCandidateDecisionRequest,
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionSandboxEvalRequest,
     EvolutionServiceError, EvolutionSignalCreateRequest,
 };
@@ -38,6 +39,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/evolution/proposals/:id/skill-draft",
             get(evolution_skill_draft_handler),
+        )
+        .route(
+            "/api/evolution/proposals/:id/candidates",
+            post(evolution_candidate_create_handler),
+        )
+        .route(
+            "/api/evolution/candidates",
+            get(evolution_candidates_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/decision",
+            post(evolution_candidate_decision_handler),
         )
         .route(
             "/api/evolution/proposals/:id/sandbox-eval",
@@ -130,6 +143,43 @@ async fn evolution_skill_draft_handler(
         .proposal_model(&state.config_home, &id)
         .map_err(evolution_error)?;
     Ok(Json(state.services.skill.evolution_skill_draft(&proposal)))
+}
+
+async fn evolution_candidates_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .candidates(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_create_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<EvolutionCandidateCreateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .create_candidate(&state.config_home, &id, request)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_decision_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<EvolutionCandidateDecisionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .decide_candidate(&state.config_home, &id, request)
+        .map(Json)
+        .map_err(evolution_error)
 }
 
 async fn evolution_sandbox_eval_start_handler(

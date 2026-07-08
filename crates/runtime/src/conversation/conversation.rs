@@ -2191,8 +2191,8 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
-        let mut turn_supervisor = crate::turn_supervisor::TurnSupervisor::new();
-        let mut supervisor_final_answer_deadline: Option<usize> = None;
+        let mut adaptive_controller = crate::self_regulation::AdaptiveController::new();
+        let mut self_regulation_final_answer_deadline: Option<usize> = None;
 
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
@@ -2202,8 +2202,11 @@ where
             iterations += 1;
             if iterations > self.max_iterations {
                 let reason = "max iterations exceeded";
-                tracing::warn!(iterations, "turn supervisor returned partial answer");
-                let partial_text = turn_supervisor.partial_answer_text(reason);
+                tracing::warn!(
+                    iterations,
+                    "runtime self-regulation returned partial answer"
+                );
+                let partial_text = adaptive_controller.partial_answer_text(reason);
                 let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
                     text: partial_text.clone(),
                 }]);
@@ -2221,7 +2224,7 @@ where
                         message: format!(
                             "tool governance returned partial answer: {}; {}",
                             reason,
-                            turn_supervisor.ledger().compact_summary()
+                            adaptive_controller.tool_ledger().compact_summary()
                         ),
                     });
                 }
@@ -2252,6 +2255,31 @@ where
             }
             if self.model_context_window > 0 {
                 let used = estimate_session_tokens(&*self.session.read().await);
+                let context_decision = adaptive_controller
+                    .observe_context_pressure(used, self.model_context_window as usize);
+                if context_decision.should_inject() {
+                    if let Some(prompt) = context_decision.prompt() {
+                        effective_system_prompt
+                            .push(format!("\n## Runtime self-regulation guidance\n{prompt}"));
+                    }
+                    self.record_context_event(
+                        "self_regulation",
+                        "runtime",
+                        context_decision
+                            .reason()
+                            .unwrap_or(context_decision.kind_str()),
+                        8,
+                    );
+                    self.record_self_regulation_signal(
+                        &context_decision,
+                        vec![format!(
+                            "session:{}:context_pressure:{}:{}",
+                            self.session().session_id,
+                            used,
+                            self.model_context_window
+                        )],
+                    );
+                }
                 if used as f64 / self.model_context_window as f64 > 0.85 {
                     tracing::warn!(used, "context window pressure critical");
                 }
@@ -2650,7 +2678,7 @@ where
                                 .find(|(pending_id, _, _)| pending_id == id)
                                 .map(|(_, name, input)| (name.as_str(), input.as_str()))
                                 .unwrap_or((tool_name_str, "{}"));
-                            let (observation, decision) = turn_supervisor.observe_tool_result(
+                            let (observation, decision) = adaptive_controller.observe_tool_result(
                                 supervisor_tool_name,
                                 supervisor_input,
                                 output,
@@ -2658,41 +2686,53 @@ where
                             );
                             if decision.should_inject() {
                                 if matches!(
-                                    decision,
-                                    crate::turn_supervisor::SupervisorDecision::FallbackAnswer { .. }
-                                ) && supervisor_final_answer_deadline.is_none()
+                                    decision.kind,
+                                    crate::self_regulation::RuntimeAdaptiveDecisionKind::FallbackAnswerWithCheckedEvidence
+                                ) && self_regulation_final_answer_deadline.is_none()
                                 {
-                                    supervisor_final_answer_deadline =
+                                    self_regulation_final_answer_deadline =
                                         Some(iterations.saturating_add(1));
                                 }
                                 if let Some(prompt) = decision.prompt() {
                                     effective_system_prompt.push(format!(
-                                        "\n## Runtime supervisor guidance\n{prompt}"
+                                        "\n## Runtime self-regulation guidance\n{prompt}"
                                     ));
                                 }
                                 self.record_context_event(
-                                    "turn_supervisor",
+                                    "self_regulation",
                                     "runtime",
-                                    decision.reason().unwrap_or(decision.kind()),
+                                    decision.reason().unwrap_or(decision.kind_str()),
                                     8,
                                 );
                                 self.push_runtime_context_observation(
-                                    "runtime.turn_supervisor",
+                                    "runtime.self_regulation",
                                     format!(
-                                        "turn-supervisor-{}-{}",
+                                        "self-regulation-{}-{}",
                                         self.session().messages.len(),
-                                        observation.fingerprint.input_hash
+                                        observation.fingerprint().input_hash
                                     ),
                                     format!(
                                         "{}: {}",
-                                        decision.kind(),
-                                        decision.reason().unwrap_or("runtime supervisor guidance")
+                                        decision.kind_str(),
+                                        decision
+                                            .reason()
+                                            .unwrap_or("runtime self-regulation guidance")
                                     ),
                                 );
-                                self.record_turn_supervisor_decision(
+                                self.record_self_regulation_decision(
                                     &observation,
                                     &decision,
                                     self.session().messages.len(),
+                                );
+                                let fingerprint = observation.fingerprint();
+                                self.record_self_regulation_signal(
+                                    &decision,
+                                    vec![format!(
+                                        "tool:{}:{}:{}",
+                                        fingerprint.tool_name,
+                                        fingerprint.target,
+                                        fingerprint.input_hash
+                                    )],
                                 );
                             }
                         }
@@ -2723,14 +2763,15 @@ where
             // final no-tool assistant message so runtime supervisor guidance,
             // tool evidence, and callback-injected context all have a chance to
             // influence the answer.
-            if supervisor_final_answer_deadline.is_some_and(|deadline| iterations >= deadline) {
+            if self_regulation_final_answer_deadline.is_some_and(|deadline| iterations >= deadline)
+            {
                 let reason =
-                    "turn supervisor stopped repeated low-novelty tool loop after fallback guidance was ignored";
+                    "runtime self-regulation stopped repeated low-novelty tool loop after fallback guidance was ignored";
                 tracing::warn!(
                     iterations,
-                    "turn supervisor stopped repeated low-novelty tool loop"
+                    "runtime self-regulation stopped repeated low-novelty tool loop"
                 );
-                let partial_text = turn_supervisor.partial_answer_text(reason);
+                let partial_text = adaptive_controller.partial_answer_text(reason);
                 let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
                     text: partial_text.clone(),
                 }]);
@@ -2748,7 +2789,7 @@ where
                         message: format!(
                             "tool governance returned partial answer: {}; {}",
                             reason,
-                            turn_supervisor.ledger().compact_summary()
+                            adaptive_controller.tool_ledger().compact_summary()
                         ),
                     });
                 }
@@ -5020,39 +5061,30 @@ where
         self.append_tool_runtime_events(sequence, "tool.schedule.created", vec![event]);
     }
 
-    fn record_turn_supervisor_decision(
+    fn record_self_regulation_decision(
         &self,
-        observation: &crate::turn_supervisor::ToolProgressObservation,
-        decision: &crate::turn_supervisor::SupervisorDecision,
+        observation: &crate::self_regulation::ToolProgressObservation,
+        decision: &crate::self_regulation::RuntimeAdaptiveDecision,
         sequence: usize,
     ) {
         let Some(ref store) = self.session_store else {
             return;
         };
         let session_id = self.session().session_id;
-        let payload = serde_json::json!({
-            "decision": decision.kind(),
-            "reason": decision.reason(),
-            "tool": {
-                "name": &observation.fingerprint.tool_name,
-                "target": &observation.fingerprint.target,
-                "range": observation.fingerprint.range,
-                "input_hash": observation.fingerprint.input_hash,
-                "output_hash": observation.fingerprint.output_hash,
-                "is_error": observation.is_error,
-            },
-            "prompt_injected": decision.prompt(),
-            "source": "conversation_runtime.turn_supervisor",
-        });
+        let self_regulation_event =
+            crate::self_regulation::RuntimeSelfRegulationEvent::from_tool_decision(
+                observation,
+                decision,
+            );
         let mut event = memory::RuntimeEvent::new(
             session_id.clone(),
             sequence,
             memory::RuntimeEventScope::Policy,
-            "runtime.turn_supervisor.decision",
-            payload,
+            self_regulation_event.event_type,
+            self_regulation_event.payload,
             now_ms(),
         );
-        event.status = Some(decision.kind().to_string());
+        event.status = Some(self_regulation_event.status);
         let store = Arc::clone(store);
         tokio::spawn(async move {
             if let Err(error) = store.append_runtime_event(&event).await {
@@ -5060,10 +5092,31 @@ where
                     %error,
                     session_id,
                     sequence,
-                    "turn supervisor runtime event append failed"
+                    "runtime self-regulation event append failed"
                 );
             }
         });
+    }
+
+    fn record_self_regulation_signal(
+        &self,
+        decision: &crate::self_regulation::RuntimeAdaptiveDecision,
+        evidence_refs: Vec<String>,
+    ) {
+        let session_id = self.session().session_id;
+        let collector = crate::EvolutionSignalCollector::default_for_config_home(
+            crate::cowd_dirs::config_home_dir(),
+        );
+        if let Err(error) =
+            collector.append_self_regulation_signal(session_id.clone(), decision, evidence_refs)
+        {
+            tracing::warn!(
+                %error,
+                session_id,
+                decision = decision.kind_str(),
+                "runtime self-regulation evolution signal append failed"
+            );
+        }
     }
 
     fn record_ai_kernel_trace_event(&self, trace: &RuntimeAiKernelTrace, sequence: usize) {
@@ -8020,8 +8073,8 @@ mod tests {
                     request
                         .system_prompt
                         .iter()
-                        .any(|section| section.contains("Runtime supervisor guidance")),
-                    "second provider request should contain supervisor guidance"
+                        .any(|section| section.contains("Runtime self-regulation guidance")),
+                    "second provider request should contain self-regulation guidance"
                 );
                 to_stream(vec![
                     AssistantEvent::TextDelta("staged answer".to_string()),
@@ -8050,7 +8103,7 @@ mod tests {
             .observations
             .iter()
             .any(
-                |observation| observation.tool_name == "runtime.turn_supervisor"
+                |observation| observation.tool_name == "runtime.self_regulation"
                     && observation.model_summary.contains("nudge")
             ));
     }

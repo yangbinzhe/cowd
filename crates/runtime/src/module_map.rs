@@ -16,6 +16,7 @@ pub enum RuntimeDomain {
     Recovery,
     Policy,
     ExecutionCore,
+    SelfRegulation,
     RealityBridge,
     Evolution,
     Configuration,
@@ -40,6 +41,7 @@ impl RuntimeDomain {
             Self::Recovery => "recovery",
             Self::Policy => "policy",
             Self::ExecutionCore => "execution_core",
+            Self::SelfRegulation => "self_regulation",
             Self::RealityBridge => "reality_bridge",
             Self::Evolution => "evolution",
             Self::Configuration => "configuration",
@@ -79,12 +81,13 @@ impl RuntimeModuleDescriptor {
 pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
     use RuntimeDomain::{
         Agent, Approval, Configuration, Context, Conversation, Evolution, ExecutionCore,
-        Infrastructure, Mission, Policy, Provider, RealityBridge, Recovery, Session, Skill,
-        Steward, Team, Tooling,
+        Infrastructure, Mission, Policy, Provider, RealityBridge, Recovery, SelfRegulation,
+        Session, Skill, Steward, Team, Tooling,
     };
     vec![
         RuntimeModuleDescriptor::public("conversation", Conversation, "runtime", true),
-        RuntimeModuleDescriptor::public("turn_supervisor", Conversation, "runtime", false),
+        RuntimeModuleDescriptor::public("self_regulation", SelfRegulation, "runtime", true),
+        RuntimeModuleDescriptor::public("turn_supervisor", SelfRegulation, "runtime", false),
         RuntimeModuleDescriptor::public("host", Conversation, "runtime", true),
         RuntimeModuleDescriptor::public("cowd_event", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("runtime_control", Infrastructure, "runtime", true),

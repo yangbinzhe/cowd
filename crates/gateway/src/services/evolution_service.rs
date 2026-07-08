@@ -41,6 +41,19 @@ pub(crate) struct EvolutionSandboxEvalRequest {
     pub(crate) candidate_score: i32,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct EvolutionCandidateCreateRequest {
+    #[serde(default = "default_baseline_ref")]
+    pub(crate) baseline_ref: String,
+    #[serde(default = "default_candidate_ref")]
+    pub(crate) candidate_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EvolutionCandidateDecisionRequest {
+    pub(crate) status: runtime::EvolutionCandidateStatus,
+}
+
 #[derive(Debug)]
 pub(crate) enum EvolutionServiceError {
     BadRequest(String),
@@ -234,6 +247,62 @@ impl EvolutionService {
         }))
     }
 
+    pub(crate) fn candidates(&self, config_home: &Path) -> Result<Value, EvolutionServiceError> {
+        let candidates = candidate_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.candidates",
+            "envelope": self.envelope("candidates"),
+            "count": candidates.len(),
+            "candidates": candidates,
+        }))
+    }
+
+    pub(crate) fn create_candidate(
+        &self,
+        config_home: &Path,
+        proposal_id: &str,
+        request: EvolutionCandidateCreateRequest,
+    ) -> Result<Value, EvolutionServiceError> {
+        let proposal = find_proposal(config_home, proposal_id)?;
+        let candidate = runtime::EvolutionCandidate::from_proposal(
+            &proposal,
+            request.baseline_ref,
+            request.candidate_ref,
+        );
+        candidate_store(config_home)
+            .append(&candidate)
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.candidate",
+            "envelope": self.envelope("candidate_create"),
+            "candidate": candidate,
+        }))
+    }
+
+    pub(crate) fn decide_candidate(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+        request: EvolutionCandidateDecisionRequest,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = candidate_store(config_home)
+            .update_status(candidate_id, request.status)
+            .map_err(|error| {
+                if error.contains("not found") {
+                    EvolutionServiceError::NotFound(error)
+                } else {
+                    EvolutionServiceError::Internal(error)
+                }
+            })?;
+        Ok(json!({
+            "kind": "evolution.candidate_decision",
+            "envelope": self.envelope("candidate_decision"),
+            "candidate": candidate,
+        }))
+    }
+
     pub(crate) fn start_sandbox_eval(
         &self,
         config_home: &Path,
@@ -279,6 +348,9 @@ impl EvolutionService {
             self.envelope("proposal_detail"),
             self.envelope("proposal_decision"),
             self.envelope("skill_draft"),
+            self.envelope("candidates"),
+            self.envelope("candidate_create"),
+            self.envelope("candidate_decision"),
             self.envelope("sandbox_evals"),
             self.envelope("sandbox_eval_start"),
         ]
@@ -299,6 +371,10 @@ fn proposal_store(config_home: &Path) -> runtime::EvolutionProposalStore {
 
 fn sandbox_store(config_home: &Path) -> runtime::EvolutionSandboxStore {
     runtime::EvolutionSandboxStore::new(evolution_root(config_home))
+}
+
+fn candidate_store(config_home: &Path) -> runtime::EvolutionCandidateStore {
+    runtime::EvolutionCandidateStore::new(evolution_root(config_home))
 }
 
 fn find_proposal(

@@ -1376,6 +1376,42 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn evolution_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/candidates").await
+    }
+
+    pub async fn evolution_create_candidate(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/proposals/{}/candidates",
+                url_encode(proposal_id)
+            ),
+            serde_json::json!({
+                "baseline_ref": "baseline:current",
+                "candidate_ref": "candidate:sandbox"
+            }),
+        )
+        .await
+    }
+
+    pub async fn evolution_candidate_decision(
+        &self,
+        candidate_id: &str,
+        status: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/candidates/{}/decision",
+                url_encode(candidate_id)
+            ),
+            serde_json::json!({ "status": status }),
+        )
+        .await
+    }
+
     pub async fn evolution_sandbox_eval(
         &self,
         proposal_id: &str,
@@ -2119,6 +2155,9 @@ mod tests {
             "evolution_proposals",
             "evolution_create_proposal",
             "evolution_skill_draft",
+            "evolution_candidates",
+            "evolution_create_candidate",
+            "evolution_candidate_decision",
             "evolution_sandbox_eval",
             "evolution_sandbox_evals",
             "preflight_cross_plane_action",
@@ -2140,7 +2179,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 117);
+        assert_eq!(migrated.len(), 120);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -2153,10 +2192,13 @@ mod tests {
             "evolution_proposals",
             "evolution_create_proposal",
             "evolution_skill_draft",
+            "evolution_candidates",
+            "evolution_create_candidate",
+            "evolution_candidate_decision",
             "evolution_sandbox_eval",
             "evolution_sandbox_evals",
         ];
-        assert_eq!(evolution_methods.len(), 6);
+        assert_eq!(evolution_methods.len(), 9);
         assert!(evolution_methods
             .iter()
             .all(|method| method.starts_with("evolution_")));

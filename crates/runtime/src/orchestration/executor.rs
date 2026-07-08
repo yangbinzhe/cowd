@@ -75,7 +75,7 @@ pub fn execute_orchestration_request(
                 "engine": {
                     "name": "ReflexionExecutor",
                     "owned_by": "runtime",
-                    "dispatch_surface": "turn_supervisor"
+                    "dispatch_surface": "self_regulation"
                 },
                 "next_step": "switch strategy before retrying; stop after bounded retry budget or answer from checked evidence with residual risks",
                 "record": ReflexionRecord::low_novelty_tool_loop("model requested reflexion retry"),

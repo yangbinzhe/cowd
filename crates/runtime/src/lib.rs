@@ -203,6 +203,8 @@ pub mod runtime_event_replay;
 pub mod runtime_event_store;
 #[path = "mission/runtime_harness.rs"]
 pub mod runtime_harness;
+#[path = "self_regulation/mod.rs"]
+pub mod self_regulation;
 #[path = "session/session_execution.rs"]
 pub mod session_execution;
 #[path = "session/session_lifecycle.rs"]
@@ -431,10 +433,12 @@ pub use lane_events::{
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
 pub use evolution::{
+    EvolutionCandidate, EvolutionCandidateKind, EvolutionCandidateStatus, EvolutionCandidateStore,
     EvolutionPlanDraft, EvolutionProposal, EvolutionProposalKind, EvolutionProposalRisk,
     EvolutionProposalStore, EvolutionSandboxEval, EvolutionSandboxRecommendation,
-    EvolutionSandboxStore, EvolutionSignal, EvolutionSignalInput, EvolutionSignalSeverity,
-    EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType, EvolutionSkillDraft,
+    EvolutionSandboxStore, EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput,
+    EvolutionSignalSeverity, EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType,
+    EvolutionSkillDraft,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -551,6 +555,11 @@ pub use sandbox::{
     resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
     FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
     SandboxRequest, SandboxStatus,
+};
+pub use self_regulation::{
+    AdaptiveController, RuntimeAdaptiveDecision, RuntimeAdaptiveDecisionKind,
+    RuntimeCorrectiveAction, RuntimeProgressLedger, RuntimeSelfRegulationEvent,
+    RuntimeSelfRegulationPolicy, RuntimeStepObservation,
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
