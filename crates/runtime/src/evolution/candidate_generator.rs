@@ -1,7 +1,10 @@
 use super::{
     artifact_builder::EvolutionArtifactBuilder,
     candidate::{EvolutionCandidate, EvolutionCandidateStatus},
-    candidate_kind::{candidate_kind_from_proposal, EvolutionCandidateKind},
+    candidate_kind::{
+        candidate_kind_from_goal_ids, candidate_kind_from_proposal,
+        candidate_kinds_from_root_cause, EvolutionCandidateKind,
+    },
     planner::EvolutionProposal,
 };
 
@@ -18,7 +21,12 @@ impl EvolutionCandidateGenerator {
         let kind = proposal
             .root_cause_kind
             .as_ref()
-            .map(|_| candidate_kind_from_proposal(&proposal.kind))
+            .and_then(|root_cause| {
+                candidate_kinds_from_root_cause(root_cause)
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| candidate_kind_from_goal_ids(&proposal.goal_ids))
             .unwrap_or_else(|| candidate_kind_from_proposal(&proposal.kind));
         Self::generate_kind(proposal, kind, baseline_ref, candidate_ref)
     }
@@ -117,4 +125,108 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        EvolutionDiagnosisEngine, EvolutionSignal, EvolutionSignalSource, EvolutionSignalType,
+    };
+
+    fn signal(signal_type: EvolutionSignalType) -> EvolutionSignal {
+        EvolutionSignal::new(crate::EvolutionSignalInput {
+            signal_type,
+            source: EvolutionSignalSource {
+                owner: "runtime".to_string(),
+                session_id: Some("session-kind".to_string()),
+                agent_id: None,
+                team_id: None,
+                run_id: None,
+            },
+            evidence_refs: vec!["scenario:candidate-kind".to_string()],
+            severity: crate::EvolutionSignalSeverity::Warning,
+            summary: "candidate kind scenario".to_string(),
+            suggested_action: "generate terminal typed candidate".to_string(),
+            immediate_task_can_continue: true,
+        })
+    }
+
+    #[test]
+    fn generator_prefers_root_cause_over_plan_draft_fallback() {
+        let cases = [
+            (
+                EvolutionSignalType::LowNoveltyToolLoop,
+                EvolutionCandidateKind::RuntimePolicy,
+            ),
+            (
+                EvolutionSignalType::ContextPressure,
+                EvolutionCandidateKind::ContextPolicy,
+            ),
+            (
+                EvolutionSignalType::AgentFailurePattern,
+                EvolutionCandidateKind::TeamTemplate,
+            ),
+            (
+                EvolutionSignalType::EvalFailure,
+                EvolutionCandidateKind::EvalScenario,
+            ),
+            (
+                EvolutionSignalType::MissingToolCapability,
+                EvolutionCandidateKind::ToolContract,
+            ),
+            (
+                EvolutionSignalType::MemoryNoise,
+                EvolutionCandidateKind::MemoryGovernance,
+            ),
+        ];
+
+        for (signal_type, expected_kind) in cases {
+            let signals = vec![signal(signal_type)];
+            let diagnosis = EvolutionDiagnosisEngine::diagnose(&signals);
+            let proposal = EvolutionProposal::from_diagnosis(&diagnosis, &signals);
+            let candidate =
+                EvolutionCandidateGenerator::generate(&proposal, "baseline", "candidate");
+
+            assert_eq!(candidate.kind, expected_kind);
+            assert_eq!(
+                candidate.promotion_adapter,
+                expected_kind.promotion_adapter()
+            );
+        }
+    }
+
+    #[test]
+    fn generator_uses_goal_ids_before_generic_proposal_kind() {
+        let mut proposal = EvolutionProposal {
+            proposal_id: "proposal-goal".to_string(),
+            kind: crate::EvolutionProposalKind::PlanDraft,
+            mission_id: Some("mission-goal".to_string()),
+            goal_ids: vec!["context_precision".to_string()],
+            diagnosis_id: None,
+            root_cause_kind: None,
+            target_owner: "runtime".to_string(),
+            candidate_scope: vec!["crates/runtime/src/context".to_string()],
+            problem_statement: "context precision drift".to_string(),
+            current_evidence: vec!["context:pressure".to_string()],
+            target_improvement: "reduce context noise".to_string(),
+            expected_benefit: "better recall precision".to_string(),
+            risk: crate::EvolutionProposalRisk {
+                level: "medium".to_string(),
+                boundaries: vec!["sandbox_eval_required".to_string()],
+                approval_required: true,
+            },
+            acceptance_gates: vec!["context candidate has evidence".to_string()],
+            rollback_strategy: "archive sandbox".to_string(),
+            source_signal_ids: vec!["signal-goal".to_string()],
+            created_at_ms: 1,
+            status: "draft".to_string(),
+        };
+        let candidate = EvolutionCandidateGenerator::generate(&proposal, "baseline", "candidate");
+        assert_eq!(candidate.kind, EvolutionCandidateKind::ContextPolicy);
+
+        proposal.goal_ids = vec!["unknown-goal".to_string()];
+        let fallback = EvolutionCandidateGenerator::generate(&proposal, "baseline", "candidate");
+        assert_eq!(fallback.kind, EvolutionCandidateKind::ArchitecturePlan);
+    }
 }

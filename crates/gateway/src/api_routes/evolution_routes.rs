@@ -100,8 +100,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/evolution/adoptions", get(evolution_adoptions_handler))
         .route(
-            "/api/evolution/adoptions/:id/rollback",
-            post(evolution_adoption_rollback_handler),
+            "/api/evolution/versions/:id/rollback",
+            post(evolution_version_rollback_handler),
         )
         .route("/api/evolution/memory", get(evolution_memory_handler))
         .route(
@@ -396,14 +396,14 @@ async fn evolution_adoptions_handler(
         .map_err(evolution_error)
 }
 
-async fn evolution_adoption_rollback_handler(
+async fn evolution_version_rollback_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .evolution
-        .rollback_adoption(&state.config_home, &id)
+        .rollback_version(&state.config_home, &id)
         .map(Json)
         .map_err(evolution_error)
 }

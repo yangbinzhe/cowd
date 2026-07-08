@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,7 +69,7 @@ impl EvolutionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "evolution",
-            owner: "0.9.464 Runtime evolution service boundary",
+            owner: "0.9.465 Runtime evolution service boundary",
         }
     }
 
@@ -191,13 +191,42 @@ impl EvolutionService {
             .into_iter()
             .filter(|candidate| candidate.mission_id.as_deref() == Some(mission_id))
             .collect::<Vec<_>>();
+        let candidate_ids = candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id.clone())
+            .collect::<BTreeSet<_>>();
         let comparisons =
-            read_jsonl::<runtime::EvolutionComparisonReport>(&comparison_store_path(config_home))?;
+            read_jsonl::<runtime::EvolutionComparisonReport>(&comparison_store_path(config_home))?
+                .into_iter()
+                .filter(|comparison| candidate_ids.contains(&comparison.candidate_id))
+                .collect::<Vec<_>>();
         let promotions =
-            read_jsonl::<runtime::EvolutionPromotionReceipt>(&promotion_store_path(config_home))?;
+            read_jsonl::<runtime::EvolutionPromotionReceipt>(&promotion_store_path(config_home))?
+                .into_iter()
+                .filter(|promotion| candidate_ids.contains(&promotion.candidate_id))
+                .collect::<Vec<_>>();
+        let version_ids = promotions
+            .iter()
+            .filter_map(|promotion| promotion.version_record.as_ref())
+            .map(|version| version.version_id.clone())
+            .chain(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.version_record_ref.clone()),
+            )
+            .collect::<BTreeSet<_>>();
         let memories = read_jsonl::<runtime::EvolutionMemoryRecord>(&evolution_memory_store_path(
             config_home,
-        ))?;
+        ))?
+        .into_iter()
+        .filter(|memory| {
+            candidate_ids.contains(&memory.candidate_id)
+                || memory
+                    .version_id
+                    .as_ref()
+                    .is_some_and(|version_id| version_ids.contains(version_id))
+        })
+        .collect::<Vec<_>>();
         Ok(json!({
             "kind": "evolution.mission_detail",
             "envelope": self.envelope("mission_detail"),
@@ -678,7 +707,7 @@ impl EvolutionService {
         }))
     }
 
-    pub(crate) fn rollback_adoption(
+    pub(crate) fn rollback_version(
         &self,
         config_home: &Path,
         version_id: &str,
@@ -697,7 +726,7 @@ impl EvolutionService {
         append_jsonl(&evolution_memory_store_path(config_home), &memory)?;
         Ok(json!({
             "kind": "evolution.rollback",
-            "envelope": self.envelope("adoption_rollback"),
+            "envelope": self.envelope("version_rollback"),
             "rollback": receipt,
             "memory": memory,
         }))
@@ -758,7 +787,7 @@ impl EvolutionService {
             self.envelope("candidate_decision"),
             self.envelope("candidate_promote"),
             self.envelope("adoptions"),
-            self.envelope("adoption_rollback"),
+            self.envelope("version_rollback"),
             self.envelope("evolution_memory"),
             self.envelope("sandbox_evals"),
             self.envelope("candidate_sandbox_run"),
@@ -1038,6 +1067,16 @@ mod tests {
             .expect("promotion");
         assert_eq!(promotion["promotion"]["accepted"], true);
         assert!(promotion["promotion"]["version_record"].is_object());
+        let version_id = promotion["promotion"]["version_record"]["version_id"]
+            .as_str()
+            .expect("version id");
+
+        let rollback = service
+            .rollback_version(&config_home, version_id)
+            .expect("rollback");
+        assert_eq!(rollback["kind"], "evolution.rollback");
+        assert_eq!(rollback["rollback"]["accepted"], true);
+        assert_eq!(rollback["memory"]["kind"], "recovery_pattern");
 
         let decision = service
             .decide_proposal(
@@ -1052,5 +1091,143 @@ mod tests {
         assert_eq!(decision["mainline_modified"], false);
 
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mission_detail_filters_comparisons_promotions_and_memory_by_mission() {
+        let service = EvolutionService::new();
+        let config_home =
+            std::env::temp_dir().join(format!("cowd-evolution-filter-{}", uuid::Uuid::new_v4()));
+
+        let first = create_candidate_chain(
+            &service,
+            &config_home,
+            runtime::EvolutionSignalType::MemoryNoise,
+            "first mission memory noise",
+        );
+        service
+            .run_candidate_sandbox(&config_home, &first.candidate_id)
+            .expect("first run");
+        service
+            .evaluate_candidate(&config_home, &first.candidate_id)
+            .expect("first comparison");
+        let promotion = service
+            .promote_candidate(&config_home, &first.candidate_id)
+            .expect("first promotion");
+        let first_version_id = promotion["promotion"]["version_record"]["version_id"]
+            .as_str()
+            .expect("first version")
+            .to_string();
+        service
+            .rollback_version(&config_home, &first_version_id)
+            .expect("first rollback");
+
+        let second = create_candidate_chain(
+            &service,
+            &config_home,
+            runtime::EvolutionSignalType::EvalFailure,
+            "second mission eval failure",
+        );
+
+        let first_detail = service
+            .mission_detail(&config_home, &first.mission_id)
+            .expect("first detail");
+        assert_eq!(first_detail["proposals"].as_array().unwrap().len(), 1);
+        assert_eq!(first_detail["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(first_detail["comparisons"].as_array().unwrap().len(), 1);
+        assert_eq!(first_detail["promotions"].as_array().unwrap().len(), 1);
+        assert_eq!(first_detail["memory"].as_array().unwrap().len(), 2);
+        assert!(first_detail["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["candidate_id"] == first.candidate_id));
+        assert!(first_detail["memory"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|memory| memory["candidate_id"] == first.candidate_id));
+
+        let second_detail = service
+            .mission_detail(&config_home, &second.mission_id)
+            .expect("second detail");
+        assert_eq!(second_detail["proposals"].as_array().unwrap().len(), 1);
+        assert_eq!(second_detail["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(second_detail["comparisons"].as_array().unwrap().len(), 0);
+        assert_eq!(second_detail["promotions"].as_array().unwrap().len(), 0);
+        assert_eq!(second_detail["memory"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            second_detail["candidates"][0]["candidate_id"],
+            second.candidate_id
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    struct TestChainIds {
+        mission_id: String,
+        candidate_id: String,
+    }
+
+    fn create_candidate_chain(
+        service: &EvolutionService,
+        config_home: &Path,
+        signal_type: runtime::EvolutionSignalType,
+        summary: &str,
+    ) -> TestChainIds {
+        let signal = service
+            .create_signal(
+                config_home,
+                EvolutionSignalCreateRequest {
+                    signal_type,
+                    source: runtime::EvolutionSignalSource {
+                        owner: "runtime".to_string(),
+                        session_id: Some("session-filter".to_string()),
+                        agent_id: None,
+                        team_id: None,
+                        run_id: None,
+                    },
+                    evidence_refs: vec![format!("evidence:{summary}")],
+                    severity: runtime::EvolutionSignalSeverity::Warning,
+                    summary: summary.to_string(),
+                    suggested_action: "create typed evolution candidate".to_string(),
+                    immediate_task_can_continue: true,
+                },
+            )
+            .expect("signal");
+        let signal_id = signal["signal"]["signal_id"].as_str().unwrap().to_string();
+        let proposal = service
+            .create_proposal(
+                config_home,
+                EvolutionProposalCreateRequest {
+                    signal_ids: vec![signal_id],
+                },
+            )
+            .expect("proposal");
+        let mission_id = proposal["proposal"]["mission_id"]
+            .as_str()
+            .expect("mission id")
+            .to_string();
+        let proposal_id = proposal["proposal"]["proposal_id"]
+            .as_str()
+            .expect("proposal id")
+            .to_string();
+        let candidate = service
+            .create_candidate(
+                config_home,
+                &proposal_id,
+                EvolutionCandidateCreateRequest {
+                    baseline_ref: "baseline:test".to_string(),
+                    candidate_ref: "candidate:test".to_string(),
+                },
+            )
+            .expect("candidate");
+        TestChainIds {
+            mission_id,
+            candidate_id: candidate["candidate"]["candidate_id"]
+                .as_str()
+                .expect("candidate id")
+                .to_string(),
+        }
     }
 }

@@ -1526,13 +1526,13 @@ impl GatewayApiClient {
         self.get_json("/api/evolution/adoptions").await
     }
 
-    pub async fn evolution_adoption_rollback(
+    pub async fn evolution_version_rollback(
         &self,
         version_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!(
-                "/api/evolution/adoptions/{}/rollback",
+                "/api/evolution/versions/{}/rollback",
                 url_encode(version_id)
             ),
             serde_json::json!({}),
@@ -2283,7 +2283,7 @@ mod tests {
             "evolution_candidate_comparison",
             "evolution_candidate_promote",
             "evolution_adoptions",
-            "evolution_adoption_rollback",
+            "evolution_version_rollback",
             "evolution_memory",
             "evolution_sandbox_evals",
             "preflight_cross_plane_action",
@@ -2333,7 +2333,7 @@ mod tests {
             "evolution_candidate_comparison",
             "evolution_candidate_promote",
             "evolution_adoptions",
-            "evolution_adoption_rollback",
+            "evolution_version_rollback",
             "evolution_memory",
             "evolution_sandbox_evals",
         ];

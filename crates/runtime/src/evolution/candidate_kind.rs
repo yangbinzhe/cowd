@@ -133,3 +133,30 @@ pub fn candidate_kinds_from_root_cause(
         }
     }
 }
+
+#[must_use]
+pub fn candidate_kind_from_goal_id(goal_id: &str) -> Option<EvolutionCandidateKind> {
+    match goal_id {
+        "execution_efficiency" => Some(EvolutionCandidateKind::RuntimePolicy),
+        "context_precision" => Some(EvolutionCandidateKind::ContextPolicy),
+        "memory_pollution_control" => Some(EvolutionCandidateKind::MemoryGovernance),
+        "fact_consistency" => Some(EvolutionCandidateKind::RealityGovernance),
+        "tool_success_rate" => Some(EvolutionCandidateKind::ToolContract),
+        "workflow_reuse" => Some(EvolutionCandidateKind::SkillPackage),
+        "complex_task_success" => Some(EvolutionCandidateKind::TeamTemplate),
+        "task_continuity" => Some(EvolutionCandidateKind::SessionPolicy),
+        "model_fit" => Some(EvolutionCandidateKind::ProviderProfile),
+        "regression_coverage" => Some(EvolutionCandidateKind::EvalScenario),
+        "observability" => Some(EvolutionCandidateKind::SurfaceProjection),
+        "defect_resolution" => Some(EvolutionCandidateKind::CodePatch),
+        "future_evolvability" => Some(EvolutionCandidateKind::ArchitecturePlan),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn candidate_kind_from_goal_ids(goal_ids: &[String]) -> Option<EvolutionCandidateKind> {
+    goal_ids
+        .iter()
+        .find_map(|goal_id| candidate_kind_from_goal_id(goal_id))
+}

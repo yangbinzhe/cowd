@@ -1600,6 +1600,61 @@ pub(crate) mod tests {
         let adopted_json: serde_json::Value = serde_json::from_slice(&adopted_body).unwrap();
         assert_eq!(adopted_json["receipt"]["accepted"], true);
 
+        let comparison = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/candidates/{candidate_id}/evaluate"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(comparison.status(), StatusCode::OK);
+        let comparison_body = to_bytes(comparison.into_body(), usize::MAX).await.unwrap();
+        let comparison_json: serde_json::Value = serde_json::from_slice(&comparison_body).unwrap();
+        assert_eq!(comparison_json["comparison"]["regression_count"], 0);
+
+        let promotion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/candidates/{candidate_id}/promote"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promotion.status(), StatusCode::OK);
+        let promotion_body = to_bytes(promotion.into_body(), usize::MAX).await.unwrap();
+        let promotion_json: serde_json::Value = serde_json::from_slice(&promotion_body).unwrap();
+        assert_eq!(promotion_json["promotion"]["accepted"], true);
+        let version_id = promotion_json["promotion"]["version_record"]["version_id"]
+            .as_str()
+            .expect("version id");
+
+        let rollback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/versions/{version_id}/rollback"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback.status(), StatusCode::OK);
+        let rollback_body = to_bytes(rollback.into_body(), usize::MAX).await.unwrap();
+        let rollback_json: serde_json::Value = serde_json::from_slice(&rollback_body).unwrap();
+        assert_eq!(rollback_json["rollback"]["accepted"], true);
+        assert_eq!(rollback_json["memory"]["kind"], "recovery_pattern");
+
         let chain = app
             .clone()
             .oneshot(
