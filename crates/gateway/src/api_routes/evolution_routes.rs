@@ -9,9 +9,9 @@ use axum::{
 };
 
 use crate::services::{
-    EvolutionCandidateCreateRequest, EvolutionCandidateDecisionRequest,
-    EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionSandboxEvalRequest,
-    EvolutionServiceError, EvolutionSignalCreateRequest,
+    EvolutionCandidateAdoptionRequest, EvolutionCandidateCreateRequest,
+    EvolutionCandidateDecisionRequest, EvolutionProposalCreateRequest,
+    EvolutionProposalDecisionRequest, EvolutionServiceError, EvolutionSignalCreateRequest,
 };
 
 use super::{api_error, AppState, ErrorResponse};
@@ -23,6 +23,19 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/evolution/signals",
             post(evolution_signal_create_handler),
         )
+        .route("/api/evolution/diagnoses", get(evolution_diagnoses_handler))
+        .route(
+            "/api/evolution/diagnoses",
+            post(evolution_diagnosis_create_handler),
+        )
+        .route(
+            "/api/evolution/missions/summary",
+            get(evolution_missions_summary_handler),
+        )
+        .route(
+            "/api/evolution/missions/:id/detail",
+            get(evolution_mission_detail_handler),
+        )
         .route("/api/evolution/proposals", get(evolution_proposals_handler))
         .route(
             "/api/evolution/proposals",
@@ -32,6 +45,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/evolution/proposals/:id",
             get(evolution_proposal_detail_handler),
         )
+        .route("/api/evolution/chain/:id", get(evolution_chain_handler))
         .route(
             "/api/evolution/proposals/:id/decision",
             post(evolution_proposal_decision_handler),
@@ -49,17 +63,74 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(evolution_candidates_handler),
         )
         .route(
+            "/api/evolution/candidates/:id",
+            get(evolution_candidate_detail_handler),
+        )
+        .route(
             "/api/evolution/candidates/:id/decision",
             post(evolution_candidate_decision_handler),
         )
         .route(
-            "/api/evolution/proposals/:id/sandbox-eval",
-            post(evolution_sandbox_eval_start_handler),
+            "/api/evolution/candidates/:id/run",
+            post(evolution_candidate_sandbox_run_handler),
         )
+        .route(
+            "/api/evolution/candidates/:id/artifacts",
+            get(evolution_candidate_artifacts_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/evaluate",
+            post(evolution_candidate_evaluate_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/comparison",
+            get(evolution_candidate_comparison_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/sandbox-eval",
+            get(evolution_candidate_sandbox_eval_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/adoption",
+            post(evolution_candidate_adoption_handler),
+        )
+        .route(
+            "/api/evolution/candidates/:id/promote",
+            post(evolution_candidate_promote_handler),
+        )
+        .route("/api/evolution/adoptions", get(evolution_adoptions_handler))
+        .route(
+            "/api/evolution/adoptions/:id/rollback",
+            post(evolution_adoption_rollback_handler),
+        )
+        .route("/api/evolution/memory", get(evolution_memory_handler))
         .route(
             "/api/evolution/sandbox-evals",
             get(evolution_sandbox_evals_handler),
         )
+}
+
+async fn evolution_missions_summary_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .mission_summary(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_mission_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .mission_detail(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
 }
 
 async fn evolution_signals_handler(
@@ -96,6 +167,29 @@ async fn evolution_proposals_handler(
         .map_err(evolution_error)
 }
 
+async fn evolution_diagnoses_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .diagnoses(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_diagnosis_create_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<EvolutionProposalCreateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .create_diagnosis(&state.config_home, request)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
 async fn evolution_proposal_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<EvolutionProposalCreateRequest>,
@@ -116,6 +210,18 @@ async fn evolution_proposal_detail_handler(
         .services
         .evolution
         .proposal_detail(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_chain_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .chain(&state.config_home, &id)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -169,6 +275,18 @@ async fn evolution_candidate_create_handler(
         .map_err(evolution_error)
 }
 
+async fn evolution_candidate_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .candidate_detail(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
 async fn evolution_candidate_decision_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -182,15 +300,121 @@ async fn evolution_candidate_decision_handler(
         .map_err(evolution_error)
 }
 
-async fn evolution_sandbox_eval_start_handler(
+async fn evolution_candidate_sandbox_run_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<EvolutionSandboxEvalRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .evolution
-        .start_sandbox_eval(&state.config_home, &id, request)
+        .run_candidate_sandbox(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_artifacts_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .candidate_artifacts(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_evaluate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .evaluate_candidate(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_comparison_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .candidate_comparison(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_sandbox_eval_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .candidate_sandbox_eval(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_adoption_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<EvolutionCandidateAdoptionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .adopt_candidate(&state.config_home, &id, request)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_candidate_promote_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .promote_candidate(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_adoptions_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .adoptions(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_adoption_rollback_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .rollback_adoption(&state.config_home, &id)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_memory_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .evolution_memory(&state.config_home)
         .map(Json)
         .map_err(evolution_error)
 }

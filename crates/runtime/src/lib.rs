@@ -433,12 +433,23 @@ pub use lane_events::{
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
 pub use evolution::{
-    EvolutionCandidate, EvolutionCandidateKind, EvolutionCandidateStatus, EvolutionCandidateStore,
-    EvolutionPlanDraft, EvolutionProposal, EvolutionProposalKind, EvolutionProposalRisk,
-    EvolutionProposalStore, EvolutionSandboxEval, EvolutionSandboxRecommendation,
+    candidate_kind_from_proposal, candidate_kinds_from_root_cause, EvolutionAdoptionManager,
+    EvolutionAdoptionReceipt, EvolutionArtifactBuilder, EvolutionCandidate,
+    EvolutionCandidateGenerator, EvolutionCandidateKind, EvolutionCandidatePlan,
+    EvolutionCandidateStatus, EvolutionCandidateStore, EvolutionCapabilityGoal,
+    EvolutionComparisonReport, EvolutionDiagnosis, EvolutionDiagnosisEngine,
+    EvolutionDiagnosisStore, EvolutionEvaluationRequest, EvolutionGeneratedArtifact,
+    EvolutionLifecycleDraft, EvolutionLifecycleService, EvolutionMemoryBridge,
+    EvolutionMemoryRecord, EvolutionMemoryScope, EvolutionMetric, EvolutionMission,
+    EvolutionMissionStatus, EvolutionMissionStore, EvolutionPlanDraft, EvolutionPromotionAdapter,
+    EvolutionPromotionManager, EvolutionPromotionReceipt, EvolutionProposal, EvolutionProposalKind,
+    EvolutionProposalRisk, EvolutionProposalStore, EvolutionRollbackManager,
+    EvolutionRollbackReceipt, EvolutionRootCauseKind, EvolutionRunnerPolicy, EvolutionRunnerResult,
+    EvolutionSandboxEval, EvolutionSandboxOrchestrator, EvolutionSandboxRecommendation,
     EvolutionSandboxStore, EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput,
     EvolutionSignalSeverity, EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType,
-    EvolutionSkillDraft,
+    EvolutionSkillDraft, EvolutionTriageCluster, EvolutionTriageService,
+    EvolutionVerificationResult, EvolutionVersionRecord, IsolatedRunner, WorktreeRunner,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,

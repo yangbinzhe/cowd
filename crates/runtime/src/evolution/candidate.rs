@@ -5,19 +5,21 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use super::planner::{EvolutionProposal, EvolutionProposalKind};
+use super::{artifact_builder::EvolutionGeneratedArtifact, candidate_kind::EvolutionCandidateKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvolutionCandidateKind {
-    Plan,
-    Skill,
-    ToolContract,
-    ConnectorContract,
-    MemoryGovernance,
-    RuntimePolicy,
+pub struct EvolutionCandidatePlan {
+    pub target_owner: String,
+    pub target_files_or_modules: Vec<String>,
+    pub artifact_root: String,
+    pub baseline_command: String,
+    pub candidate_command: String,
+    pub verification_command: String,
+    pub acceptance_gates: Vec<String>,
+    pub rollback_plan: String,
+    pub mainline_write_allowed: bool,
+    pub approval_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +36,46 @@ pub enum EvolutionCandidateStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionCandidate {
     pub candidate_id: String,
+    #[serde(default)]
+    pub mission_id: Option<String>,
     pub proposal_id: String,
+    #[serde(default)]
+    pub goal_ids: Vec<String>,
     pub kind: EvolutionCandidateKind,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub trigger_signal_ids: Vec<String>,
+    #[serde(default)]
+    pub affected_files_or_modules: Vec<String>,
+    #[serde(default)]
+    pub generated_artifacts: Vec<EvolutionGeneratedArtifact>,
+    #[serde(default)]
+    pub eval_scenario_ids: Vec<String>,
+    #[serde(default)]
+    pub promotion_adapter: String,
+    #[serde(default)]
+    pub autonomy_level: String,
+    #[serde(default)]
+    pub risk_boundaries: Vec<String>,
+    #[serde(default)]
+    pub approval_required: bool,
     pub baseline_ref: String,
     pub candidate_ref: String,
+    #[serde(default)]
+    pub target_owner: String,
+    #[serde(default)]
+    pub target_files_or_modules: Vec<String>,
+    #[serde(default)]
+    pub artifact_root: Option<String>,
+    #[serde(default)]
+    pub baseline_command: String,
+    #[serde(default)]
+    pub candidate_command: String,
+    #[serde(default)]
+    pub verification_command: String,
     pub artifact_path: Option<String>,
     pub expected_change: String,
     pub adoption_gate: Vec<String>,
@@ -45,47 +83,42 @@ pub struct EvolutionCandidate {
     pub status: EvolutionCandidateStatus,
     pub mainline_modified: bool,
     pub human_approval_required: bool,
+    #[serde(default)]
+    pub comparison_report_ref: Option<String>,
+    #[serde(default)]
+    pub version_record_ref: Option<String>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
 }
 
 impl EvolutionCandidate {
     #[must_use]
-    pub fn from_proposal(
-        proposal: &EvolutionProposal,
-        baseline_ref: impl Into<String>,
-        candidate_ref: impl Into<String>,
-    ) -> Self {
-        let now = now_ms();
-        Self {
-            candidate_id: format!("evo-candidate-{}", Uuid::new_v4()),
-            proposal_id: proposal.proposal_id.clone(),
-            kind: candidate_kind(&proposal.kind),
-            baseline_ref: baseline_ref.into(),
-            candidate_ref: candidate_ref.into(),
-            artifact_path: None,
-            expected_change: proposal.target_improvement.clone(),
-            adoption_gate: vec![
-                "sandbox evaluation passed".to_string(),
-                "mainline was not modified by candidate generation".to_string(),
-                "human approval granted before adoption".to_string(),
-                "rollback strategy recorded".to_string(),
-            ],
-            rollback_strategy: proposal.rollback_strategy.clone(),
-            status: EvolutionCandidateStatus::Draft,
-            mainline_modified: false,
-            human_approval_required: true,
-            created_at_ms: now,
-            updated_at_ms: now,
-        }
-    }
-
-    #[must_use]
     pub fn with_artifact(mut self, artifact_path: impl Into<String>) -> Self {
-        self.artifact_path = Some(artifact_path.into());
+        let artifact_path = artifact_path.into();
+        self.artifact_path = Some(artifact_path.clone());
+        self.artifact_root = Some(artifact_path);
         self.status = EvolutionCandidateStatus::SandboxReady;
         self.updated_at_ms = now_ms();
         self
+    }
+
+    #[must_use]
+    pub fn plan(&self) -> EvolutionCandidatePlan {
+        EvolutionCandidatePlan {
+            target_owner: self.target_owner.clone(),
+            target_files_or_modules: self.target_files_or_modules.clone(),
+            artifact_root: self
+                .artifact_root
+                .clone()
+                .unwrap_or_else(|| format!("evolution/sandboxes/{}", self.candidate_id)),
+            baseline_command: self.baseline_command.clone(),
+            candidate_command: self.candidate_command.clone(),
+            verification_command: self.verification_command.clone(),
+            acceptance_gates: self.adoption_gate.clone(),
+            rollback_plan: self.rollback_strategy.clone(),
+            mainline_write_allowed: false,
+            approval_required: self.human_approval_required,
+        }
     }
 }
 
@@ -144,6 +177,16 @@ impl EvolutionCandidateStore {
         candidate_id: &str,
         status: EvolutionCandidateStatus,
     ) -> Result<EvolutionCandidate, String> {
+        self.update_candidate(candidate_id, |candidate| {
+            candidate.status = status;
+        })
+    }
+
+    pub fn update_candidate(
+        &self,
+        candidate_id: &str,
+        update: impl FnOnce(&mut EvolutionCandidate),
+    ) -> Result<EvolutionCandidate, String> {
         let mut candidates = self.list()?;
         let Some(candidate) = candidates
             .iter_mut()
@@ -151,7 +194,7 @@ impl EvolutionCandidateStore {
         else {
             return Err("evolution candidate not found".to_string());
         };
-        candidate.status = status;
+        update(candidate);
         candidate.updated_at_ms = now_ms();
         let updated = candidate.clone();
         candidates.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
@@ -169,21 +212,12 @@ impl EvolutionCandidateStore {
         }
         Ok(updated)
     }
-}
 
-fn candidate_kind(kind: &EvolutionProposalKind) -> EvolutionCandidateKind {
-    match kind {
-        EvolutionProposalKind::PlanDraft | EvolutionProposalKind::TestScenario => {
-            EvolutionCandidateKind::Plan
-        }
-        EvolutionProposalKind::SkillDraft => EvolutionCandidateKind::Skill,
-        EvolutionProposalKind::ToolCapabilityRequest => EvolutionCandidateKind::ToolContract,
-        EvolutionProposalKind::ConnectorCapabilityRequest => {
-            EvolutionCandidateKind::ConnectorContract
-        }
-        EvolutionProposalKind::MemoryGovernanceAdjustment => {
-            EvolutionCandidateKind::MemoryGovernance
-        }
+    pub fn find(&self, candidate_id: &str) -> Result<Option<EvolutionCandidate>, String> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|candidate| candidate.candidate_id == candidate_id))
     }
 }
 
@@ -197,7 +231,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evolution::{EvolutionProposal, EvolutionSignal};
+    use crate::evolution::{EvolutionCandidateGenerator, EvolutionProposal, EvolutionSignal};
 
     #[test]
     fn candidate_starts_sandboxed_without_mainline_write() {
@@ -205,15 +239,54 @@ mod tests {
             EvolutionSignal::memory_noise("runtime", "session-1", vec!["memory:noise".to_string()]);
         let proposal = EvolutionProposal::from_signals(&[signal]);
         let candidate =
-            EvolutionCandidate::from_proposal(&proposal, "baseline:main", "candidate:sandbox");
+            EvolutionCandidateGenerator::generate(&proposal, "baseline:main", "candidate:sandbox");
 
         assert_eq!(candidate.kind, EvolutionCandidateKind::MemoryGovernance);
         assert_eq!(candidate.status, EvolutionCandidateStatus::Draft);
+        assert_eq!(candidate.target_owner, "reality_core");
+        assert!(candidate
+            .baseline_command
+            .contains("deterministic-artifact-check"));
         assert!(!candidate.mainline_modified);
         assert!(candidate.human_approval_required);
         assert!(candidate
             .adoption_gate
             .iter()
-            .any(|gate| gate.contains("sandbox")));
+            .any(|gate| gate.contains("candidate artifact")));
+    }
+
+    #[test]
+    fn adoption_policy_blocks_adoption_without_sandbox_eval() {
+        let signal =
+            EvolutionSignal::memory_noise("runtime", "session-1", vec!["memory:noise".to_string()]);
+        let proposal = EvolutionProposal::from_signals(&[signal]);
+        let candidate =
+            EvolutionCandidateGenerator::generate(&proposal, "baseline:main", "candidate:sandbox");
+
+        let receipt = crate::evolution::EvolutionAdoptionManager::evaluate(
+            &candidate,
+            EvolutionCandidateStatus::ApprovedForAdoption,
+            None,
+        );
+
+        assert!(!receipt.accepted);
+        assert!(receipt.reason.contains("requires comparison report"));
+    }
+
+    #[test]
+    fn all_candidate_kinds_have_artifact_mapping() {
+        let signal = EvolutionSignal::eval_failure("run-1", vec!["harness".to_string()]);
+        let proposal = EvolutionProposal::from_signals(&[signal]);
+        for kind in EvolutionCandidateKind::ALL {
+            let candidate = crate::evolution::EvolutionCandidateGenerator::generate_kind(
+                &proposal,
+                kind,
+                "baseline",
+                "candidate",
+            );
+            assert_eq!(candidate.kind, kind);
+            assert_eq!(candidate.promotion_adapter, kind.promotion_adapter());
+            assert!(!candidate.eval_scenario_ids.is_empty());
+        }
     }
 }

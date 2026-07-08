@@ -1350,6 +1350,36 @@ impl GatewayApiClient {
         self.get_json("/api/evolution/signals").await
     }
 
+    pub async fn evolution_diagnoses(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/diagnoses").await
+    }
+
+    pub async fn evolution_missions_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/missions/summary").await
+    }
+
+    pub async fn evolution_mission_detail(
+        &self,
+        mission_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/missions/{}/detail",
+            url_encode(mission_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_create_diagnosis(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/evolution/diagnoses",
+            serde_json::json!({ "signal_ids": signal_ids }),
+        )
+        .await
+    }
+
     pub async fn evolution_proposals(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/evolution/proposals").await
     }
@@ -1376,8 +1406,27 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn evolution_chain(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/evolution/chain/{}", url_encode(proposal_id)))
+            .await
+    }
+
     pub async fn evolution_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/evolution/candidates").await
+    }
+
+    pub async fn evolution_candidate_detail(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/candidates/{}",
+            url_encode(candidate_id)
+        ))
+        .await
     }
 
     pub async fn evolution_create_candidate(
@@ -1412,23 +1461,87 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn evolution_sandbox_eval(
+    pub async fn evolution_candidate_sandbox_run(
         &self,
-        proposal_id: &str,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/evolution/candidates/{}/run", url_encode(candidate_id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_candidate_artifacts(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/candidates/{}/artifacts",
+            url_encode(candidate_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_candidate_evaluate(
+        &self,
+        candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!(
-                "/api/evolution/proposals/{}/sandbox-eval",
-                url_encode(proposal_id)
+                "/api/evolution/candidates/{}/evaluate",
+                url_encode(candidate_id)
             ),
-            serde_json::json!({
-                "baseline_ref": "baseline:current",
-                "candidate_ref": "candidate:sandbox",
-                "baseline_score": 60,
-                "candidate_score": 80
-            }),
+            serde_json::json!({}),
         )
         .await
+    }
+
+    pub async fn evolution_candidate_comparison(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/candidates/{}/comparison",
+            url_encode(candidate_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_candidate_promote(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/candidates/{}/promote",
+                url_encode(candidate_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_adoptions(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/adoptions").await
+    }
+
+    pub async fn evolution_adoption_rollback(
+        &self,
+        version_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/adoptions/{}/rollback",
+                url_encode(version_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_memory(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/memory").await
     }
 
     pub async fn evolution_sandbox_evals(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -2152,13 +2265,26 @@ mod tests {
             "harness_eval_run_status",
             "harness_eval_cancel_run",
             "evolution_signals",
+            "evolution_diagnoses",
+            "evolution_missions_summary",
+            "evolution_mission_detail",
+            "evolution_create_diagnosis",
             "evolution_proposals",
             "evolution_create_proposal",
             "evolution_skill_draft",
+            "evolution_chain",
             "evolution_candidates",
+            "evolution_candidate_detail",
             "evolution_create_candidate",
             "evolution_candidate_decision",
-            "evolution_sandbox_eval",
+            "evolution_candidate_sandbox_run",
+            "evolution_candidate_artifacts",
+            "evolution_candidate_evaluate",
+            "evolution_candidate_comparison",
+            "evolution_candidate_promote",
+            "evolution_adoptions",
+            "evolution_adoption_rollback",
+            "evolution_memory",
             "evolution_sandbox_evals",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
@@ -2179,7 +2305,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 120);
+        assert_eq!(migrated.len(), 128);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -2189,16 +2315,29 @@ mod tests {
     fn evolution_gateway_api_inventory_exposes_runtime_evolution_controls() {
         let evolution_methods = [
             "evolution_signals",
+            "evolution_diagnoses",
+            "evolution_missions_summary",
+            "evolution_mission_detail",
+            "evolution_create_diagnosis",
             "evolution_proposals",
             "evolution_create_proposal",
             "evolution_skill_draft",
+            "evolution_chain",
             "evolution_candidates",
+            "evolution_candidate_detail",
             "evolution_create_candidate",
             "evolution_candidate_decision",
-            "evolution_sandbox_eval",
+            "evolution_candidate_sandbox_run",
+            "evolution_candidate_artifacts",
+            "evolution_candidate_evaluate",
+            "evolution_candidate_comparison",
+            "evolution_candidate_promote",
+            "evolution_adoptions",
+            "evolution_adoption_rollback",
+            "evolution_memory",
             "evolution_sandbox_evals",
         ];
-        assert_eq!(evolution_methods.len(), 9);
+        assert_eq!(evolution_methods.len(), 22);
         assert!(evolution_methods
             .iter()
             .all(|method| method.starts_with("evolution_")));

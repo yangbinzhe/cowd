@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{service_envelope, EvolutionService, ServiceEnvelope};
@@ -30,18 +30,6 @@ pub(crate) struct EvolutionProposalDecisionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct EvolutionSandboxEvalRequest {
-    #[serde(default = "default_baseline_ref")]
-    pub(crate) baseline_ref: String,
-    #[serde(default = "default_candidate_ref")]
-    pub(crate) candidate_ref: String,
-    #[serde(default)]
-    pub(crate) baseline_score: i32,
-    #[serde(default = "default_candidate_score")]
-    pub(crate) candidate_score: i32,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct EvolutionCandidateCreateRequest {
     #[serde(default = "default_baseline_ref")]
     pub(crate) baseline_ref: String,
@@ -51,6 +39,12 @@ pub(crate) struct EvolutionCandidateCreateRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EvolutionCandidateDecisionRequest {
+    pub(crate) status: runtime::EvolutionCandidateStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EvolutionCandidateAdoptionRequest {
+    #[serde(default = "default_adoption_status")]
     pub(crate) status: runtime::EvolutionCandidateStatus,
 }
 
@@ -75,7 +69,7 @@ impl EvolutionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "evolution",
-            owner: "0.9.463 Runtime evolution service boundary",
+            owner: "0.9.464 Runtime evolution service boundary",
         }
     }
 
@@ -136,34 +130,130 @@ impl EvolutionService {
         }))
     }
 
+    pub(crate) fn diagnoses(&self, config_home: &Path) -> Result<Value, EvolutionServiceError> {
+        let diagnoses = diagnosis_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.diagnoses",
+            "envelope": self.envelope("diagnoses"),
+            "store": diagnosis_store(config_home).path().display().to_string(),
+            "count": diagnoses.len(),
+            "diagnoses": diagnoses,
+        }))
+    }
+
+    pub(crate) fn mission_summary(
+        &self,
+        config_home: &Path,
+    ) -> Result<Value, EvolutionServiceError> {
+        let missions = mission_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.missions_summary",
+            "envelope": self.envelope("missions_summary"),
+            "count": missions.len(),
+            "missions": missions.iter().map(|mission| json!({
+                "mission_id": mission.mission_id,
+                "status": mission.status,
+                "owner": mission.owner,
+                "scope": mission.scope,
+                "goal_ids": mission.goal_ids,
+                "signal_count": mission.signal_ids.len(),
+                "proposal_count": mission.proposal_ids.len(),
+                "candidate_count": mission.candidate_ids.len(),
+                "updated_at_ms": mission.updated_at_ms,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    pub(crate) fn mission_detail(
+        &self,
+        config_home: &Path,
+        mission_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let mission = mission_store(config_home)
+            .find(mission_id)
+            .map_err(EvolutionServiceError::Internal)?
+            .ok_or_else(|| {
+                EvolutionServiceError::NotFound("evolution mission not found".to_string())
+            })?;
+        let proposals = proposal_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|proposal| proposal.mission_id.as_deref() == Some(mission_id))
+            .collect::<Vec<_>>();
+        let candidates = candidate_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|candidate| candidate.mission_id.as_deref() == Some(mission_id))
+            .collect::<Vec<_>>();
+        let comparisons =
+            read_jsonl::<runtime::EvolutionComparisonReport>(&comparison_store_path(config_home))?;
+        let promotions =
+            read_jsonl::<runtime::EvolutionPromotionReceipt>(&promotion_store_path(config_home))?;
+        let memories = read_jsonl::<runtime::EvolutionMemoryRecord>(&evolution_memory_store_path(
+            config_home,
+        ))?;
+        Ok(json!({
+            "kind": "evolution.mission_detail",
+            "envelope": self.envelope("mission_detail"),
+            "mission": mission,
+            "proposals": proposals,
+            "candidates": candidates,
+            "comparisons": comparisons,
+            "promotions": promotions,
+            "memory": memories,
+        }))
+    }
+
+    pub(crate) fn create_diagnosis(
+        &self,
+        config_home: &Path,
+        request: EvolutionProposalCreateRequest,
+    ) -> Result<Value, EvolutionServiceError> {
+        let selected = select_signals(config_home, request.signal_ids)?;
+        let diagnosis = runtime::EvolutionDiagnosisEngine::diagnose(&selected);
+        diagnosis_store(config_home)
+            .append(&diagnosis)
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.diagnosis",
+            "envelope": self.envelope("diagnosis_create"),
+            "diagnosis": diagnosis,
+        }))
+    }
+
     pub(crate) fn create_proposal(
         &self,
         config_home: &Path,
         request: EvolutionProposalCreateRequest,
     ) -> Result<Value, EvolutionServiceError> {
-        let signals = signal_store(config_home)
-            .list()
-            .map_err(EvolutionServiceError::Internal)?;
-        let selected = if request.signal_ids.is_empty() {
-            signals.into_iter().take(3).collect::<Vec<_>>()
-        } else {
-            signals
-                .into_iter()
-                .filter(|signal| request.signal_ids.contains(&signal.signal_id))
-                .collect::<Vec<_>>()
-        };
-        if selected.is_empty() {
-            return Err(EvolutionServiceError::BadRequest(
+        let selected = select_signals(config_home, request.signal_ids)?;
+        let mut drafts = runtime::EvolutionLifecycleService::open_from_signals(&selected);
+        let draft = drafts.pop().ok_or_else(|| {
+            EvolutionServiceError::BadRequest(
                 "at least one existing signal is required".to_string(),
-            ));
-        }
-        let proposal = runtime::EvolutionProposal::from_signals(&selected);
+            )
+        })?;
+        let diagnosis = runtime::EvolutionDiagnosisEngine::diagnose(&selected);
+        diagnosis_store(config_home)
+            .append(&diagnosis)
+            .map_err(EvolutionServiceError::Internal)?;
+        mission_store(config_home)
+            .append(&draft.mission)
+            .map_err(EvolutionServiceError::Internal)?;
+        let proposal = draft.proposal;
         proposal_store(config_home)
             .append(&proposal)
             .map_err(EvolutionServiceError::Internal)?;
         Ok(json!({
             "kind": "evolution.proposal",
             "envelope": self.envelope("proposal_create"),
+            "diagnosis": diagnosis,
             "proposal": proposal,
             "plan_draft": proposal.to_plan_draft(),
         }))
@@ -175,11 +265,48 @@ impl EvolutionService {
         id: &str,
     ) -> Result<Value, EvolutionServiceError> {
         let proposal = find_proposal(config_home, id)?;
+        let diagnosis = proposal
+            .diagnosis_id
+            .as_ref()
+            .and_then(|diagnosis_id| find_diagnosis(config_home, diagnosis_id).ok().flatten());
         Ok(json!({
             "kind": "evolution.proposal_detail",
             "envelope": self.envelope("proposal_detail"),
+            "diagnosis": diagnosis,
             "proposal": proposal,
             "plan_draft": proposal.to_plan_draft(),
+        }))
+    }
+
+    pub(crate) fn chain(
+        &self,
+        config_home: &Path,
+        id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let proposal = find_proposal(config_home, id)?;
+        let diagnosis = proposal
+            .diagnosis_id
+            .as_ref()
+            .and_then(|diagnosis_id| find_diagnosis(config_home, diagnosis_id).ok().flatten());
+        let candidates = candidate_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|candidate| candidate.proposal_id == proposal.proposal_id)
+            .collect::<Vec<_>>();
+        let evals = sandbox_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|eval| eval.proposal_id == proposal.proposal_id)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "kind": "evolution.chain",
+            "envelope": self.envelope("chain"),
+            "diagnosis": diagnosis,
+            "proposal": proposal,
+            "candidates": candidates,
+            "sandbox_evals": evals,
         }))
     }
 
@@ -266,18 +393,48 @@ impl EvolutionService {
         request: EvolutionCandidateCreateRequest,
     ) -> Result<Value, EvolutionServiceError> {
         let proposal = find_proposal(config_home, proposal_id)?;
-        let candidate = runtime::EvolutionCandidate::from_proposal(
+        let artifact_root = evolution_root(config_home).join("candidate-artifacts");
+        let candidate = runtime::EvolutionCandidateGenerator::generate_with_artifacts(
+            &artifact_root,
             &proposal,
             request.baseline_ref,
             request.candidate_ref,
-        );
+        )
+        .map_err(EvolutionServiceError::Internal)?;
         candidate_store(config_home)
             .append(&candidate)
             .map_err(EvolutionServiceError::Internal)?;
+        if let Some(mission_id) = candidate.mission_id.as_deref() {
+            let _ = mission_store(config_home).update(mission_id, |mission| {
+                mission.attach_candidate(candidate.candidate_id.clone())
+            });
+        }
         Ok(json!({
             "kind": "evolution.candidate",
             "envelope": self.envelope("candidate_create"),
             "candidate": candidate,
+            "plan": candidate.plan(),
+        }))
+    }
+
+    pub(crate) fn candidate_detail(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = find_candidate(config_home, candidate_id)?;
+        let evals = sandbox_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|eval| eval.candidate_id.as_deref() == Some(candidate_id))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "kind": "evolution.candidate_detail",
+            "envelope": self.envelope("candidate_detail"),
+            "candidate": candidate,
+            "plan": candidate.plan(),
+            "sandbox_evals": evals,
         }))
     }
 
@@ -287,6 +444,15 @@ impl EvolutionService {
         candidate_id: &str,
         request: EvolutionCandidateDecisionRequest,
     ) -> Result<Value, EvolutionServiceError> {
+        if request.status == runtime::EvolutionCandidateStatus::ApprovedForAdoption {
+            return self.adopt_candidate(
+                config_home,
+                candidate_id,
+                EvolutionCandidateAdoptionRequest {
+                    status: request.status,
+                },
+            );
+        }
         let candidate = candidate_store(config_home)
             .update_status(candidate_id, request.status)
             .map_err(|error| {
@@ -303,39 +469,272 @@ impl EvolutionService {
         }))
     }
 
-    pub(crate) fn start_sandbox_eval(
+    pub(crate) fn adopt_candidate(
         &self,
         config_home: &Path,
-        id: &str,
-        request: EvolutionSandboxEvalRequest,
+        candidate_id: &str,
+        request: EvolutionCandidateAdoptionRequest,
     ) -> Result<Value, EvolutionServiceError> {
-        let proposal = find_proposal(config_home, id)?;
-        let artifact_root = evolution_root(config_home).join("sandbox-artifacts");
-        fs::create_dir_all(&artifact_root)
-            .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
-        let artifact_path =
-            artifact_root.join(format!("{}-sandbox-eval.json", proposal.proposal_id));
-        let eval = runtime::EvolutionSandboxEval::compare(
-            &proposal,
-            request.baseline_ref,
-            request.candidate_ref,
-            artifact_path.display().to_string(),
-            request.baseline_score,
-            request.candidate_score,
+        let candidate = find_candidate(config_home, candidate_id)?;
+        let passed_eval = passed_eval_for_candidate(config_home, candidate_id)?;
+        let receipt = runtime::EvolutionAdoptionManager::evaluate(
+            &candidate,
+            request.status.clone(),
+            passed_eval.as_ref().map(|eval| eval.eval_id.clone()),
         );
+        if !receipt.accepted {
+            return Err(EvolutionServiceError::BadRequest(receipt.reason));
+        }
+        let candidate = candidate_store(config_home)
+            .update_status(candidate_id, request.status)
+            .map_err(EvolutionServiceError::Internal)?;
+        let receipt_path = evolution_root(config_home)
+            .join("adoption-receipts")
+            .join(format!("{}.json", receipt.receipt_id));
+        if let Some(parent) = receipt_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+        }
         fs::write(
-            &artifact_path,
-            serde_json::to_string_pretty(&eval)
+            &receipt_path,
+            serde_json::to_string_pretty(&receipt)
                 .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?,
         )
         .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+        Ok(json!({
+            "kind": "evolution.candidate_adoption",
+            "envelope": self.envelope("candidate_adoption"),
+            "candidate": candidate,
+            "receipt": receipt,
+            "receipt_path": receipt_path.display().to_string(),
+            "sandbox_eval": passed_eval,
+        }))
+    }
+
+    pub(crate) fn run_candidate_sandbox(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = find_candidate(config_home, candidate_id)?;
+        let proposal = find_proposal(config_home, &candidate.proposal_id)?;
+        let sandbox_root = evolution_root(config_home).join("runner");
+        let policy = runtime::EvolutionRunnerPolicy::default();
+        let runner = runtime::IsolatedRunner::new(&sandbox_root, policy);
+        let runner_result = runner
+            .run_artifact_check(&candidate)
+            .map_err(EvolutionServiceError::Internal)?;
+        append_jsonl(&runner_store_path(config_home), &runner_result)?;
+        let eval = runtime::EvolutionSandboxOrchestrator::new(
+            evolution_root(config_home).join("sandboxes"),
+        )
+        .run(&proposal, &candidate)
+        .map_err(EvolutionServiceError::Internal)?;
         sandbox_store(config_home)
             .append(&eval)
             .map_err(EvolutionServiceError::Internal)?;
+        let updated = candidate_store(config_home)
+            .update_candidate(candidate_id, |candidate| {
+                candidate.status = runtime::EvolutionCandidateStatus::Evaluated;
+                candidate.artifact_root =
+                    Some(sandbox_root.join(candidate_id).display().to_string());
+                candidate.artifact_path = Some(eval.artifact_path.clone());
+            })
+            .map_err(EvolutionServiceError::Internal)?;
         Ok(json!({
             "kind": "evolution.sandbox_eval",
-            "envelope": self.envelope("sandbox_eval_start"),
+            "envelope": self.envelope("candidate_sandbox_run"),
+            "candidate": updated,
+            "runner_result": runner_result,
             "eval": eval,
+        }))
+    }
+
+    pub(crate) fn candidate_artifacts(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = find_candidate(config_home, candidate_id)?;
+        Ok(json!({
+            "kind": "evolution.candidate_artifacts",
+            "envelope": self.envelope("candidate_artifacts"),
+            "candidate_id": candidate_id,
+            "artifact_root": candidate.artifact_root,
+            "artifacts": candidate.generated_artifacts,
+            "artifact_path": candidate.artifact_path,
+        }))
+    }
+
+    pub(crate) fn evaluate_candidate(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = find_candidate(config_home, candidate_id)?;
+        let runner_results =
+            read_jsonl::<runtime::EvolutionRunnerResult>(&runner_store_path(config_home))?;
+        let runner_result = runner_results
+            .iter()
+            .rev()
+            .find(|result| result.candidate_id == candidate_id);
+        let request =
+            runtime::EvolutionEvaluationRequest::from_candidate(&candidate, runner_result);
+        let evidence_path = evolution_root(config_home)
+            .join("comparisons")
+            .join(format!("{}.json", request.request_id));
+        if let Some(parent) = evidence_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+        }
+        let runner_exit = runner_result.map(|result| result.exit_code).unwrap_or(0);
+        let report = runtime::EvolutionComparisonReport::deterministic_from_request(
+            &request,
+            evidence_path.display().to_string(),
+            runner_exit,
+        );
+        fs::write(
+            &evidence_path,
+            serde_json::to_string_pretty(&json!({"request": request, "report": report}))
+                .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?,
+        )
+        .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+        append_jsonl(&comparison_store_path(config_home), &report)?;
+        let updated = candidate_store(config_home)
+            .update_candidate(candidate_id, |candidate| {
+                candidate.comparison_report_ref = Some(report.comparison_id.clone());
+                candidate.status = runtime::EvolutionCandidateStatus::Evaluated;
+            })
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.candidate_comparison",
+            "envelope": self.envelope("candidate_evaluate"),
+            "candidate": updated,
+            "comparison": report,
+        }))
+    }
+
+    pub(crate) fn candidate_comparison(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let reports =
+            read_jsonl::<runtime::EvolutionComparisonReport>(&comparison_store_path(config_home))?
+                .into_iter()
+                .filter(|report| report.candidate_id == candidate_id)
+                .collect::<Vec<_>>();
+        Ok(json!({
+            "kind": "evolution.candidate_comparison",
+            "envelope": self.envelope("candidate_comparison"),
+            "candidate_id": candidate_id,
+            "count": reports.len(),
+            "comparisons": reports,
+        }))
+    }
+
+    pub(crate) fn promote_candidate(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let candidate = find_candidate(config_home, candidate_id)?;
+        let receipt = runtime::EvolutionPromotionManager::promote(&candidate);
+        if !receipt.accepted {
+            return Err(EvolutionServiceError::BadRequest(receipt.reason));
+        }
+        append_jsonl(&promotion_store_path(config_home), &receipt)?;
+        if let Some(version) = receipt.version_record.as_ref() {
+            append_jsonl(&version_store_path(config_home), version)?;
+        }
+        let memory = runtime::EvolutionMemoryBridge::from_promotion(&candidate, &receipt);
+        append_jsonl(&evolution_memory_store_path(config_home), &memory)?;
+        let updated = candidate_store(config_home)
+            .update_candidate(candidate_id, |candidate| {
+                candidate.status = runtime::EvolutionCandidateStatus::ApprovedForAdoption;
+                candidate.version_record_ref = receipt
+                    .version_record
+                    .as_ref()
+                    .map(|record| record.version_id.clone());
+            })
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.candidate_promotion",
+            "envelope": self.envelope("candidate_promote"),
+            "candidate": updated,
+            "promotion": receipt,
+            "memory": memory,
+        }))
+    }
+
+    pub(crate) fn adoptions(&self, config_home: &Path) -> Result<Value, EvolutionServiceError> {
+        let promotions =
+            read_jsonl::<runtime::EvolutionPromotionReceipt>(&promotion_store_path(config_home))?;
+        Ok(json!({
+            "kind": "evolution.adoptions",
+            "envelope": self.envelope("adoptions"),
+            "count": promotions.len(),
+            "adoptions": promotions,
+        }))
+    }
+
+    pub(crate) fn rollback_adoption(
+        &self,
+        config_home: &Path,
+        version_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let versions =
+            read_jsonl::<runtime::EvolutionVersionRecord>(&version_store_path(config_home))?;
+        let version = versions
+            .into_iter()
+            .find(|version| version.version_id == version_id)
+            .ok_or_else(|| {
+                EvolutionServiceError::NotFound("evolution version not found".to_string())
+            })?;
+        let receipt = runtime::EvolutionRollbackManager::rollback(&version);
+        append_jsonl(&rollback_store_path(config_home), &receipt)?;
+        let memory = runtime::EvolutionMemoryBridge::from_rollback(&receipt);
+        append_jsonl(&evolution_memory_store_path(config_home), &memory)?;
+        Ok(json!({
+            "kind": "evolution.rollback",
+            "envelope": self.envelope("adoption_rollback"),
+            "rollback": receipt,
+            "memory": memory,
+        }))
+    }
+
+    pub(crate) fn evolution_memory(
+        &self,
+        config_home: &Path,
+    ) -> Result<Value, EvolutionServiceError> {
+        let records = read_jsonl::<runtime::EvolutionMemoryRecord>(&evolution_memory_store_path(
+            config_home,
+        ))?;
+        Ok(json!({
+            "kind": "evolution.memory",
+            "envelope": self.envelope("evolution_memory"),
+            "count": records.len(),
+            "records": records,
+        }))
+    }
+
+    pub(crate) fn candidate_sandbox_eval(
+        &self,
+        config_home: &Path,
+        candidate_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let evals = sandbox_store(config_home)
+            .list()
+            .map_err(EvolutionServiceError::Internal)?
+            .into_iter()
+            .filter(|eval| eval.candidate_id.as_deref() == Some(candidate_id))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "kind": "evolution.candidate_sandbox_eval",
+            "envelope": self.envelope("candidate_sandbox_eval"),
+            "candidate_id": candidate_id,
+            "count": evals.len(),
+            "evals": evals,
         }))
     }
 
@@ -343,16 +742,30 @@ impl EvolutionService {
         vec![
             self.envelope("signals"),
             self.envelope("signal_create"),
+            self.envelope("diagnoses"),
+            self.envelope("diagnosis_create"),
+            self.envelope("missions_summary"),
+            self.envelope("mission_detail"),
             self.envelope("proposals"),
             self.envelope("proposal_create"),
             self.envelope("proposal_detail"),
+            self.envelope("chain"),
             self.envelope("proposal_decision"),
             self.envelope("skill_draft"),
             self.envelope("candidates"),
             self.envelope("candidate_create"),
+            self.envelope("candidate_detail"),
             self.envelope("candidate_decision"),
+            self.envelope("candidate_promote"),
+            self.envelope("adoptions"),
+            self.envelope("adoption_rollback"),
+            self.envelope("evolution_memory"),
             self.envelope("sandbox_evals"),
-            self.envelope("sandbox_eval_start"),
+            self.envelope("candidate_sandbox_run"),
+            self.envelope("candidate_sandbox_eval"),
+            self.envelope("candidate_artifacts"),
+            self.envelope("candidate_evaluate"),
+            self.envelope("candidate_comparison"),
         ]
     }
 }
@@ -369,12 +782,88 @@ fn proposal_store(config_home: &Path) -> runtime::EvolutionProposalStore {
     runtime::EvolutionProposalStore::new(evolution_root(config_home))
 }
 
+fn diagnosis_store(config_home: &Path) -> runtime::EvolutionDiagnosisStore {
+    runtime::EvolutionDiagnosisStore::new(evolution_root(config_home))
+}
+
+fn mission_store(config_home: &Path) -> runtime::EvolutionMissionStore {
+    runtime::EvolutionMissionStore::new(evolution_root(config_home))
+}
+
 fn sandbox_store(config_home: &Path) -> runtime::EvolutionSandboxStore {
     runtime::EvolutionSandboxStore::new(evolution_root(config_home))
 }
 
 fn candidate_store(config_home: &Path) -> runtime::EvolutionCandidateStore {
     runtime::EvolutionCandidateStore::new(evolution_root(config_home))
+}
+
+fn runner_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("runner-results.jsonl")
+}
+
+fn comparison_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("comparison-reports.jsonl")
+}
+
+fn promotion_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("promotion-receipts.jsonl")
+}
+
+fn version_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("version-records.jsonl")
+}
+
+fn rollback_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("rollback-receipts.jsonl")
+}
+
+fn evolution_memory_store_path(config_home: &Path) -> std::path::PathBuf {
+    evolution_root(config_home).join("evolution-memory.jsonl")
+}
+
+fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<(), EvolutionServiceError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+    }
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(value)
+            .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?
+    )
+    .map_err(|error| EvolutionServiceError::Internal(error.to_string()))
+}
+
+fn read_jsonl<T>(path: &Path) -> Result<Vec<T>, EvolutionServiceError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    use std::io::{BufRead, BufReader};
+    let file =
+        fs::File::open(path).map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+    let mut records = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(
+            serde_json::from_str(&line)
+                .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?,
+        );
+    }
+    Ok(records)
 }
 
 fn find_proposal(
@@ -389,6 +878,67 @@ fn find_proposal(
         .ok_or_else(|| EvolutionServiceError::NotFound("evolution proposal not found".to_string()))
 }
 
+fn select_signals(
+    config_home: &Path,
+    signal_ids: Vec<String>,
+) -> Result<Vec<runtime::EvolutionSignal>, EvolutionServiceError> {
+    let signals = signal_store(config_home)
+        .list()
+        .map_err(EvolutionServiceError::Internal)?;
+    let selected = if signal_ids.is_empty() {
+        signals.into_iter().take(3).collect::<Vec<_>>()
+    } else {
+        signals
+            .into_iter()
+            .filter(|signal| signal_ids.contains(&signal.signal_id))
+            .collect::<Vec<_>>()
+    };
+    if selected.is_empty() {
+        return Err(EvolutionServiceError::BadRequest(
+            "at least one existing signal is required".to_string(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn find_diagnosis(
+    config_home: &Path,
+    id: &str,
+) -> Result<Option<runtime::EvolutionDiagnosis>, EvolutionServiceError> {
+    Ok(diagnosis_store(config_home)
+        .list()
+        .map_err(EvolutionServiceError::Internal)?
+        .into_iter()
+        .find(|diagnosis| diagnosis.diagnosis_id == id))
+}
+
+fn find_candidate(
+    config_home: &Path,
+    id: &str,
+) -> Result<runtime::EvolutionCandidate, EvolutionServiceError> {
+    candidate_store(config_home)
+        .find(id)
+        .map_err(EvolutionServiceError::Internal)?
+        .ok_or_else(|| EvolutionServiceError::NotFound("evolution candidate not found".to_string()))
+}
+
+fn passed_eval_for_candidate(
+    config_home: &Path,
+    id: &str,
+) -> Result<Option<runtime::EvolutionSandboxEval>, EvolutionServiceError> {
+    Ok(sandbox_store(config_home)
+        .list()
+        .map_err(EvolutionServiceError::Internal)?
+        .into_iter()
+        .find(|eval| {
+            eval.candidate_id.as_deref() == Some(id)
+                && eval.recommendation
+                    == runtime::EvolutionSandboxRecommendation::AdoptAfterHumanApproval
+                && !eval.mainline_modified
+                && eval.regression_count == 0
+        }))
+}
+
 fn default_continue() -> bool {
     true
 }
@@ -401,8 +951,8 @@ fn default_candidate_ref() -> String {
     "candidate:sandbox".to_string()
 }
 
-fn default_candidate_score() -> i32 {
-    1
+fn default_adoption_status() -> runtime::EvolutionCandidateStatus {
+    runtime::EvolutionCandidateStatus::ApprovedForAdoption
 }
 
 #[cfg(test)]
@@ -445,6 +995,10 @@ mod tests {
             )
             .expect("proposal");
         let proposal_id = proposal["proposal"]["proposal_id"].as_str().unwrap();
+        assert_eq!(
+            proposal["diagnosis"]["root_cause_kind"],
+            "memory_governance_gap"
+        );
         assert_eq!(proposal["plan_draft"]["blocked_mainline_write"], true);
 
         let draft = service
@@ -456,23 +1010,34 @@ mod tests {
             .unwrap()
             .contains("Acceptance Gates"));
 
-        let eval = service
-            .start_sandbox_eval(
+        let candidate = service
+            .create_candidate(
                 &config_home,
                 proposal_id,
-                EvolutionSandboxEvalRequest {
+                EvolutionCandidateCreateRequest {
                     baseline_ref: "baseline:main".to_string(),
                     candidate_ref: "candidate:worktree".to_string(),
-                    baseline_score: 50,
-                    candidate_score: 70,
                 },
             )
-            .expect("sandbox eval");
-        assert_eq!(eval["eval"]["mainline_modified"], false);
-        assert!(eval["eval"]["artifact_path"]
-            .as_str()
-            .unwrap()
-            .contains("sandbox"));
+            .expect("candidate");
+        let candidate_id = candidate["candidate"]["candidate_id"].as_str().unwrap();
+        let run = service
+            .run_candidate_sandbox(&config_home, candidate_id)
+            .expect("candidate run");
+        assert_eq!(run["eval"]["mainline_modified"], false);
+        assert_eq!(run["eval"]["regression_count"], 0);
+        assert!(run["runner_result"]["artifact_paths"].is_array());
+
+        let comparison = service
+            .evaluate_candidate(&config_home, candidate_id)
+            .expect("comparison");
+        assert_eq!(comparison["comparison"]["regression_count"], 0);
+
+        let promotion = service
+            .promote_candidate(&config_home, candidate_id)
+            .expect("promotion");
+        assert_eq!(promotion["promotion"]["accepted"], true);
+        assert!(promotion["promotion"]["version_record"].is_object());
 
         let decision = service
             .decide_proposal(

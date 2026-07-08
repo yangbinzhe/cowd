@@ -43,9 +43,9 @@ pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use evolution_service::{
-    EvolutionCandidateCreateRequest, EvolutionCandidateDecisionRequest,
-    EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionSandboxEvalRequest,
-    EvolutionServiceError, EvolutionSignalCreateRequest,
+    EvolutionCandidateAdoptionRequest, EvolutionCandidateCreateRequest,
+    EvolutionCandidateDecisionRequest, EvolutionProposalCreateRequest,
+    EvolutionProposalDecisionRequest, EvolutionServiceError, EvolutionSignalCreateRequest,
 };
 pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;

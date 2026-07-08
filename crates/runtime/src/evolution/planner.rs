@@ -7,7 +7,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::signal::{EvolutionSignal, EvolutionSignalSeverity, EvolutionSignalType};
+use super::{
+    diagnosis::{EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionRootCauseKind},
+    signal::{EvolutionSignal, EvolutionSignalSeverity, EvolutionSignalType},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +34,18 @@ pub struct EvolutionProposalRisk {
 pub struct EvolutionProposal {
     pub proposal_id: String,
     pub kind: EvolutionProposalKind,
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub goal_ids: Vec<String>,
+    #[serde(default)]
+    pub diagnosis_id: Option<String>,
+    #[serde(default)]
+    pub root_cause_kind: Option<EvolutionRootCauseKind>,
+    #[serde(default)]
+    pub target_owner: String,
+    #[serde(default)]
+    pub candidate_scope: Vec<String>,
     pub problem_statement: String,
     pub current_evidence: Vec<String>,
     pub target_improvement: String,
@@ -64,15 +79,29 @@ pub struct EvolutionSkillDraft {
 impl EvolutionProposal {
     #[must_use]
     pub fn from_signals(signals: &[EvolutionSignal]) -> Self {
-        let kind = proposal_kind(signals);
-        let source_signal_ids = signals
-            .iter()
-            .map(|signal| signal.signal_id.clone())
-            .collect::<Vec<_>>();
-        let current_evidence = signals
-            .iter()
-            .flat_map(|signal| signal.evidence_refs.clone())
-            .collect::<Vec<_>>();
+        let diagnosis = EvolutionDiagnosisEngine::diagnose(signals);
+        Self::from_diagnosis(&diagnosis, signals)
+    }
+
+    #[must_use]
+    pub fn from_diagnosis(diagnosis: &EvolutionDiagnosis, signals: &[EvolutionSignal]) -> Self {
+        let kind = proposal_kind_from_diagnosis(diagnosis, signals);
+        let source_signal_ids = if diagnosis.source_signal_ids.is_empty() {
+            signals
+                .iter()
+                .map(|signal| signal.signal_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            diagnosis.source_signal_ids.clone()
+        };
+        let current_evidence = if diagnosis.evidence_refs.is_empty() {
+            signals
+                .iter()
+                .flat_map(|signal| signal.evidence_refs.clone())
+                .collect::<Vec<_>>()
+        } else {
+            diagnosis.evidence_refs.clone()
+        };
         let problem_statement = signals
             .iter()
             .map(|signal| signal.summary.clone())
@@ -93,17 +122,22 @@ impl EvolutionProposal {
         Self {
             proposal_id: format!("evo-proposal-{}", Uuid::new_v4()),
             kind,
-            problem_statement,
+            mission_id: None,
+            goal_ids: Vec::new(),
+            diagnosis_id: Some(diagnosis.diagnosis_id.clone()),
+            root_cause_kind: Some(diagnosis.root_cause_kind.clone()),
+            target_owner: diagnosis.affected_owner.clone(),
+            candidate_scope: diagnosis.affected_files_or_modules.clone(),
+            problem_statement: if problem_statement.trim().is_empty() {
+                diagnosis.symptoms.join("; ")
+            } else {
+                problem_statement
+            },
             current_evidence,
-            target_improvement: target_improvement(signals),
-            expected_benefit: expected_benefit(signals),
+            target_improvement: target_improvement(signals, diagnosis),
+            expected_benefit: expected_benefit(signals, diagnosis),
             risk,
-            acceptance_gates: vec![
-                "source evidence exists".to_string(),
-                "sandbox eval produces artifact".to_string(),
-                "proposal does not mutate mainline automatically".to_string(),
-                "human approval boundary is explicit".to_string(),
-            ],
+            acceptance_gates: diagnosis.acceptance_gates.clone(),
             rollback_strategy: "archive proposal and discard sandbox worktree/artifacts"
                 .to_string(),
             source_signal_ids,
@@ -118,6 +152,7 @@ impl EvolutionProposal {
             proposal: self.clone(),
             implementation_steps: vec![
                 "collect source evidence".to_string(),
+                "confirm diagnosis owner, affected modules, and risk boundaries".to_string(),
                 "draft isolated candidate change or skill".to_string(),
                 "run sandbox evaluation".to_string(),
                 "compare baseline and candidate".to_string(),
@@ -133,7 +168,12 @@ impl EvolutionProposal {
         let markdown = format!(
             "# {}\n\n## Purpose\n{}\n\n## Evidence\n{}\n\n## Operating Rules\n- Do not mutate mainline code without explicit approval.\n- Use sandbox evaluation before adoption.\n- Record rollback metadata.\n\n## Acceptance Gates\n{}\n",
             skill_id,
-            self.target_improvement,
+            format!(
+                "{}\n\nTarget owner: {}\nCandidate scope: {}",
+                self.target_improvement,
+                self.target_owner,
+                self.candidate_scope.join(", ")
+            ),
             self.current_evidence
                 .iter()
                 .map(|item| format!("- {item}"))
@@ -262,25 +302,44 @@ fn proposal_kind(signals: &[EvolutionSignal]) -> EvolutionProposalKind {
     EvolutionProposalKind::PlanDraft
 }
 
-fn target_improvement(signals: &[EvolutionSignal]) -> String {
+fn proposal_kind_from_diagnosis(
+    diagnosis: &EvolutionDiagnosis,
+    signals: &[EvolutionSignal],
+) -> EvolutionProposalKind {
+    match diagnosis.root_cause_kind {
+        EvolutionRootCauseKind::MemoryGovernanceGap => {
+            EvolutionProposalKind::MemoryGovernanceAdjustment
+        }
+        EvolutionRootCauseKind::ToolContractGap => EvolutionProposalKind::ToolCapabilityRequest,
+        EvolutionRootCauseKind::EvalCoverageGap => EvolutionProposalKind::TestScenario,
+        _ => proposal_kind(signals),
+    }
+}
+
+fn target_improvement(signals: &[EvolutionSignal], diagnosis: &EvolutionDiagnosis) -> String {
     let actions = signals
         .iter()
         .map(|signal| signal.suggested_action.clone())
         .collect::<Vec<_>>();
     format!(
-        "Convert observed runtime gaps into governed improvements: {}",
+        "Convert {} into governed improvements for {}: {}",
+        diagnosis.root_cause_kind.as_str(),
+        diagnosis.affected_owner,
         actions.join("; ")
     )
 }
 
-fn expected_benefit(signals: &[EvolutionSignal]) -> String {
+fn expected_benefit(signals: &[EvolutionSignal], diagnosis: &EvolutionDiagnosis) -> String {
     if signals
         .iter()
         .any(|signal| signal.signal_type == EvolutionSignalType::LowNoveltyToolLoop)
     {
         return "Reduce repeated tool calls by steering the model toward batch evidence, DAG execution, or delegation".to_string();
     }
-    "Increase harness reliability without bypassing approval boundaries".to_string()
+    format!(
+        "Increase {} reliability without bypassing approval boundaries",
+        diagnosis.affected_owner
+    )
 }
 
 fn slug(input: &str) -> String {
@@ -330,11 +389,14 @@ mod tests {
         assert!(proposal
             .acceptance_gates
             .iter()
-            .any(|gate| gate.contains("sandbox eval produces artifact")));
+            .any(|gate| gate.contains("candidate artifact")));
+        assert!(proposal.diagnosis_id.is_some());
+        assert_eq!(proposal.target_owner, "reality_core");
 
         let draft = proposal.to_skill_draft();
         assert_eq!(draft.source_proposal_id, proposal.proposal_id);
         assert!(draft.markdown.contains("Do not mutate mainline code"));
+        assert!(draft.markdown.contains("Target owner: reality_core"));
         assert!(draft.permissions_note.contains("inert"));
     }
 }

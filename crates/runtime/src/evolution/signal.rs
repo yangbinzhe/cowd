@@ -146,6 +146,43 @@ impl EvolutionSignal {
             immediate_task_can_continue: false,
         })
     }
+
+    #[must_use]
+    pub fn signal_type_label(&self) -> &'static str {
+        match self.signal_type {
+            EvolutionSignalType::LowNoveltyToolLoop => "low_novelty_tool_loop",
+            EvolutionSignalType::MissingToolCapability => "missing_tool_capability",
+            EvolutionSignalType::MemoryNoise => "memory_noise",
+            EvolutionSignalType::AgentFailurePattern => "agent_failure_pattern",
+            EvolutionSignalType::RecoveryGap => "recovery_gap",
+            EvolutionSignalType::EvalFailure => "eval_failure",
+            EvolutionSignalType::SlowProgress => "slow_progress",
+            EvolutionSignalType::ContextPressure => "context_pressure",
+        }
+    }
+
+    #[must_use]
+    pub fn severity_label(&self) -> &'static str {
+        match self.severity {
+            EvolutionSignalSeverity::Info => "info",
+            EvolutionSignalSeverity::Warning => "warning",
+            EvolutionSignalSeverity::Critical => "critical",
+        }
+    }
+
+    #[must_use]
+    pub fn aggregate_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.source.owner,
+            self.source
+                .session_id
+                .as_deref()
+                .or(self.source.run_id.as_deref())
+                .unwrap_or("global"),
+            self.signal_type_label()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

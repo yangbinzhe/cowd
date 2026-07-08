@@ -235,6 +235,14 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         state_dispatch: "harness_eval_run_smoke",
         receipt_marker: "record_action_result",
     },
+    TuiActionCoverage {
+        action_id: "evolution.overview",
+        gateway_route: "/api/evolution/diagnoses",
+        client_method: "evolution_diagnoses",
+        panel_key: "v evolution",
+        state_dispatch: "evolution_diagnoses",
+        receipt_marker: "record_evolution_overview",
+    },
 ];
 
 pub fn action_coverage_summary() -> Vec<&'static str> {
@@ -260,6 +268,8 @@ mod tests {
     const MISSION_ROUTES: &str = include_str!("../../../gateway/src/api_routes/mission_routes.rs");
     const HARNESS_EVAL_ROUTES: &str =
         include_str!("../../../gateway/src/api_routes/harness_eval_routes.rs");
+    const EVOLUTION_ROUTES: &str =
+        include_str!("../../../gateway/src/api_routes/evolution_routes.rs");
 
     #[test]
     fn action_coverage_has_expected_core_actions() {
@@ -275,7 +285,8 @@ mod tests {
         assert!(ids.contains(&"mission.session_command.consume"));
         assert!(ids.contains(&"agent.interrupt"));
         assert!(ids.contains(&"harness_eval.run_smoke"));
-        assert!(ids.len() >= 22);
+        assert!(ids.contains(&"evolution.overview"));
+        assert!(ids.len() >= 23);
     }
 
     #[test]
@@ -286,6 +297,7 @@ mod tests {
             RUNTIME_ROUTES,
             MISSION_ROUTES,
             HARNESS_EVAL_ROUTES,
+            EVOLUTION_ROUTES,
         ]
         .join("\n");
         let panel_sources =

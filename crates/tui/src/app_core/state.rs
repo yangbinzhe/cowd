@@ -2410,6 +2410,27 @@ impl TuiState {
                     .record_action_result("harness_eval.run_smoke", result);
                 true
             }
+            KeyCode::Char('v') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    let signals = client.evolution_signals().await?;
+                    let diagnoses = client.evolution_diagnoses().await?;
+                    let missions = client.evolution_missions_summary().await?;
+                    let proposals = client.evolution_proposals().await?;
+                    let candidates = client.evolution_candidates().await?;
+                    let sandbox_evals = client.evolution_sandbox_evals().await?;
+                    Ok(serde_json::json!({
+                        "kind": "evolution.overview",
+                        "signals": signals,
+                        "diagnoses": diagnoses,
+                        "missions": missions,
+                        "proposals": proposals,
+                        "candidates": candidates,
+                        "sandbox_evals": sandbox_evals,
+                    }))
+                });
+                self.gateway_panel.record_evolution_overview(result);
+                true
+            }
             KeyCode::Char('t') => {
                 let result = run_gateway_api_blocking(move |client| async move {
                     client

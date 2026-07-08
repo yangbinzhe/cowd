@@ -106,6 +106,9 @@ pub struct GatewayPanel {
     pub harness_eval_status: Option<String>,
     /// Latest harness eval compact summary for terminal operators.
     pub harness_eval_summary: Option<String>,
+    /// Latest evolution governance compact summary for terminal operators.
+    pub evolution_status: Option<String>,
+    pub evolution_summary: Option<String>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -154,6 +157,8 @@ impl GatewayPanel {
             action_receipt: None,
             harness_eval_status: None,
             harness_eval_summary: None,
+            evolution_status: None,
+            evolution_summary: None,
             scroll_offset: 0,
         }
     }
@@ -301,6 +306,61 @@ impl GatewayPanel {
         }
     }
 
+    pub fn record_evolution_overview(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                let signals = payload
+                    .get("signals")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let diagnoses = payload
+                    .get("diagnoses")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let proposals = payload
+                    .get("proposals")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let missions = payload
+                    .get("missions")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let candidates = payload
+                    .get("candidates")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let evals = payload
+                    .get("sandbox_evals")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                self.evolution_status = Some(
+                    if signals + diagnoses + missions + proposals + candidates + evals > 0 {
+                        "active".to_string()
+                    } else {
+                        "empty".to_string()
+                    },
+                );
+                self.evolution_summary = Some(format!(
+                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} sandbox={evals}"
+                ));
+                self.action_status = Some("evolution.overview succeeded".to_string());
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.evolution_status = Some("unavailable".to_string());
+                self.evolution_summary = Some(error.clone());
+                self.action_status = Some(format!("evolution.overview failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
     // ── Rendering helpers ────────────────────────────────────────
 
     /// Build the title string for the block border.
@@ -366,7 +426,7 @@ impl Component for GatewayPanel {
             status,
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop  e eval  E smoke",
+            "Keys: r refresh  h health  s start/stop  e eval  E smoke  v evolution",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.action_status {
@@ -392,6 +452,18 @@ impl Component for GatewayPanel {
             };
             lines.push(Line::from(vec![
                 Span::styled("HarnessEval: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if let Some(summary) = &self.evolution_summary {
+            let color = match self.evolution_status.as_deref() {
+                Some("active") => Color::Magenta,
+                Some("empty") => Color::DarkGray,
+                Some("unavailable") => Color::Yellow,
+                _ => Color::Cyan,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Evolution: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(summary.clone(), Style::default().fg(color)),
             ]));
         }
