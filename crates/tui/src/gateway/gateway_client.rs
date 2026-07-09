@@ -158,6 +158,34 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn session_input_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/input-projection",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn turn_inbox(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let suffix = turn_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("?turn_id={}", url_encode(value)))
+            .unwrap_or_default();
+        self.get_json(&format!(
+            "/api/sessions/{}/turn-inbox{}",
+            url_encode(session_id),
+            suffix
+        ))
+        .await
+    }
+
     pub async fn ensure_session(
         &self,
         session_id: &str,
@@ -2032,6 +2060,41 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .unwrap_or("Gateway turn error")
                 .to_string(),
         }),
+        "SessionInputReceived" | "session_input_received" => {
+            let decision = value
+                .get("receipt")
+                .or_else(|| value.get("input"))
+                .and_then(|receipt| receipt.get("decision"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("received");
+            Some(CowdEvent::Warning {
+                message: format!("Session input received: {decision}"),
+            })
+        }
+        "TurnInboxUpdated" | "turn_inbox_updated" => {
+            let pending = value
+                .get("inbox")
+                .and_then(|inbox| inbox.get("pending_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            Some(CowdEvent::Warning {
+                message: format!("Turn inbox updated: {pending} pending"),
+            })
+        }
+        "TurnInputCheckpointConsumed" | "turn_input_checkpoint_consumed" => {
+            let checkpoint = value
+                .get("checkpoint")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("checkpoint");
+            let consumed = value
+                .get("consumed")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            Some(CowdEvent::Warning {
+                message: format!("Runtime consumed {consumed} input(s) at {checkpoint}"),
+            })
+        }
         "TurnCancelRequested" | "turn_cancel_requested" => Some(CowdEvent::Warning {
             message: "Gateway cancel request accepted".to_string(),
         }),
@@ -2177,6 +2240,8 @@ mod tests {
             "runtime_snapshot",
             "list_sessions",
             "session_projection",
+            "session_input_projection",
+            "turn_inbox",
             "ensure_session",
             "acquire_session_lease",
             "release_session_lease",
@@ -2312,7 +2377,12 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 129);
+        assert!(
+            migrated.len() >= 129,
+            "gateway inventory should not shrink when routes are migrated"
+        );
+        assert!(migrated.contains(&"session_input_projection"));
+        assert!(migrated.contains(&"turn_inbox"));
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));

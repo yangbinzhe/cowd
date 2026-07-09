@@ -11,14 +11,16 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::{stream::Stream, StreamExt};
+use harness_contract::turn::{
+    InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
+};
 use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -41,6 +43,27 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/sessions/:id/messages",
             get(get_session_messages).post(send_message),
         )
+        .route(
+            "/api/sessions/:id/input-projection",
+            get(get_session_input_projection),
+        )
+        .route(
+            "/api/sessions/:id/inputs",
+            get(get_session_input_projection),
+        )
+        .route("/api/sessions/:id/turn-inbox", get(get_turn_inbox))
+        .route(
+            "/api/sessions/:id/turns/:turn_id/inbox",
+            get(get_turn_inbox_by_path),
+        )
+        .route(
+            "/api/sessions/:id/inputs/:input_id/cancel",
+            post(cancel_session_input),
+        )
+        .route(
+            "/api/sessions/:id/inputs/:input_id/reclassify",
+            post(reclassify_session_input),
+        )
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
 }
 
@@ -49,6 +72,8 @@ struct SendMessageRequest {
     content: String,
     #[serde(default)]
     resource_ids: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +84,25 @@ struct GetMessagesParams {
     from_seq: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct TurnInboxParams {
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionInputCancelRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionInputReclassifyRequest {
+    decision: InputRoutingDecision,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn current_time_ms() -> u64 {
@@ -548,6 +592,70 @@ async fn send_message(
     } else {
         ContextProfile::MainTurn
     };
+    let active_projection = runtime_service
+        .session_input_projection(&session_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    if active_projection.active_turn_id.is_some() {
+        let mut envelope =
+            SessionInputEnvelope::text(session_id.clone(), InputSourceKind::Webui, runtime_content)
+                .with_source_ref(format!("api:/api/sessions/{session_id}/messages"));
+        if let Some(idempotency_key) = body
+            .idempotency_key
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            envelope = envelope.with_idempotency_key(idempotency_key.trim().to_string());
+        }
+        let admission = runtime_service
+            .admit_session_input_with_materialized(envelope)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: error.message(),
+                    }),
+                )
+            })?;
+        let receipt = admission.receipt;
+        let projection = runtime_service
+            .session_input_projection(&session_id)
+            .await
+            .ok();
+        let inbox = runtime_service
+            .active_turn_inbox(&session_id, receipt.active_turn_id.clone())
+            .await
+            .ok();
+        let response = serde_json::json!({
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": "accepted",
+            "mode": "attached_to_active_turn",
+            "input": receipt,
+            "materialized": admission.materialized,
+            "input_projection": projection,
+            "turn_inbox": inbox,
+        });
+        event_bus
+            .broadcast(&session_id, &response.to_string())
+            .await;
+        append_session_timeline_event(
+            &state.services.session,
+            &session_id,
+            "SessionInputReceived",
+            response.clone(),
+        )
+        .await;
+        return Ok(Json(response));
+    }
     append_session_timeline_event(
         &state.services.session,
         &session_id,
@@ -708,6 +816,70 @@ async fn send_message(
                         )
                         .await;
                     }
+                    runtime::CowdEvent::SessionInputReceived { receipt } => {
+                        let json = serde_json::json!({
+                            "type": "SessionInputReceived",
+                            "run_id": active_run_id.clone(),
+                            "receipt": receipt,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "SessionInputReceived",
+                            json,
+                        )
+                        .await;
+                    }
+                    runtime::CowdEvent::SessionInputProjection { projection } => {
+                        let json = serde_json::json!({
+                            "type": "SessionInputProjection",
+                            "run_id": active_run_id.clone(),
+                            "projection": projection,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "SessionInputProjection",
+                            json,
+                        )
+                        .await;
+                    }
+                    runtime::CowdEvent::TurnInboxUpdated { inbox } => {
+                        let json = serde_json::json!({
+                            "type": "TurnInboxUpdated",
+                            "run_id": active_run_id.clone(),
+                            "inbox": inbox,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "TurnInboxUpdated",
+                            json,
+                        )
+                        .await;
+                    }
+                    runtime::CowdEvent::TurnInputCheckpointConsumed {
+                        checkpoint,
+                        consumed,
+                    } => {
+                        let json = serde_json::json!({
+                            "type": "TurnInputCheckpointConsumed",
+                            "run_id": active_run_id.clone(),
+                            "checkpoint": checkpoint,
+                            "consumed": consumed,
+                        });
+                        eb.broadcast(&sid, &json.to_string()).await;
+                        append_session_timeline_event(
+                            &session_service,
+                            &sid,
+                            "TurnInputCheckpointConsumed",
+                            json,
+                        )
+                        .await;
+                    }
                     runtime::CowdEvent::Warning { .. }
                     | runtime::CowdEvent::CompactionNotice { .. } => {}
                     _ => {}
@@ -767,6 +939,17 @@ async fn send_message(
                 }),
             )
         })?;
+    let accepted_turn = runtime_service
+        .accept_turn_with_options(&session_id, active_task_id, content.clone())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
     register_active_turn_control(
         session_id.clone(),
         run_id.clone(),
@@ -774,17 +957,17 @@ async fn send_message(
         hook_abort_signal,
     );
     register_active_turn_partial(session_id.clone(), run_id.clone());
-    let (completion_tx, completion_rx) = oneshot::channel();
     let worker_state = state.clone();
     let worker_runtime_service = runtime_service.clone();
     let worker_event_bus = event_bus.clone();
     let worker_session_id = session_id.clone();
     let worker_run_id = run_id.clone();
+    let worker_turn_id = accepted_turn.turn_id.clone();
     tokio::spawn(async move {
         let turn_result = worker_runtime_service
-            .run_turn_with_options(
+            .run_accepted_turn_with_options(
                 &worker_session_id,
-                active_task_id,
+                worker_turn_id,
                 content,
                 turn_timeout,
                 RuntimeTurnOptions {
@@ -840,19 +1023,189 @@ async fn send_message(
                 Err((status, error_msg))
             }
         };
-        let _ = completion_tx.send(completion);
+        if let Err((status, error_msg)) = completion {
+            tracing::warn!(
+                %worker_session_id,
+                %worker_run_id,
+                status = status.as_u16(),
+                error = %error_msg,
+                "background runtime turn failed"
+            );
+        }
     });
 
-    match completion_rx.await {
-        Ok(Ok(response)) => Ok(Json(response)),
-        Ok(Err((status, error_msg))) => Err((status, Json(ErrorResponse { error: error_msg }))),
-        Err(_) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "run_id": run_id,
+        "status": "running",
+        "mode": "started_new_turn",
+        "turn": accepted_turn,
+    })))
+}
+
+async fn get_session_input_projection(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: "runtime turn worker stopped before completion".to_string(),
+                error: "runtime service unavailable".to_string(),
             }),
-        )),
-    }
+        )
+    })?;
+    let projection = runtime_service
+        .session_input_projection(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(projection))
+}
+
+async fn get_turn_inbox(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<TurnInboxParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let turn_id = params.turn_id.map(TurnId::from_string);
+    let inbox = runtime_service
+        .active_turn_inbox(&id, turn_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(inbox))
+}
+
+async fn get_turn_inbox_by_path(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let inbox = runtime_service
+        .active_turn_inbox(&id, Some(TurnId::from_string(turn_id)))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(inbox))
+}
+
+async fn cancel_session_input(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, input_id)): Path<(String, String)>,
+    Json(body): Json<SessionInputCancelRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let reason = body
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("cancelled by user");
+    let input = runtime_service
+        .cancel_session_input(&id, SessionInputId::from_string(input_id), reason)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let projection = runtime_service.session_input_projection(&id).await.ok();
+    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    Ok(Json(serde_json::json!({
+        "kind": "session_input.cancel",
+        "session_id": id,
+        "input": input,
+        "input_projection": projection,
+        "turn_inbox": inbox,
+    })))
+}
+
+async fn reclassify_session_input(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, input_id)): Path<(String, String)>,
+    Json(body): Json<SessionInputReclassifyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let reason = body
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("manual route override");
+    let input = runtime_service
+        .reclassify_session_input(
+            &id,
+            SessionInputId::from_string(input_id),
+            body.decision,
+            reason,
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let projection = runtime_service.session_input_projection(&id).await.ok();
+    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    Ok(Json(serde_json::json!({
+        "kind": "session_input.reclassify",
+        "session_id": id,
+        "input": input,
+        "input_projection": projection,
+        "turn_inbox": inbox,
+    })))
 }
 
 fn render_message_resource_context(

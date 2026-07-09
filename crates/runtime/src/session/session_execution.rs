@@ -456,6 +456,7 @@ mod tests {
 
     #[test]
     fn session_execution_dispatches_pending_and_bridges_sessions() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("session-exec-a-{suffix}");
         let session_b = format!("session-exec-b-{suffix}");
@@ -518,6 +519,7 @@ mod tests {
 
     #[test]
     fn session_execution_start_runtime_turn_marks_running_and_returns_turn_request() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("session-turn-a-{suffix}");
         let session_b = format!("session-turn-b-{suffix}");
@@ -569,6 +571,7 @@ mod tests {
 
     #[test]
     fn bridge_agent_target_returns_runtime_block_instead_of_deferred_placeholder() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("session-agent-bridge-{suffix}");
         global_mission_runtime()
@@ -593,6 +596,7 @@ mod tests {
 
     #[test]
     fn mission_command_interpreter_executes_session_bridge_without_gateway_logic() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("session-interpreter-a-{suffix}");
         let session_b = format!("session-interpreter-b-{suffix}");
@@ -639,6 +643,7 @@ mod tests {
 
     #[test]
     fn recovery_marks_running_interrupted_and_claimed_pending_not_completed() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("session-recovery-a-{suffix}");
         let session_b = format!("session-recovery-b-{suffix}");

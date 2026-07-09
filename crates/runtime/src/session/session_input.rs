@@ -1,0 +1,633 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use harness_contract::turn::{
+    InputRoutingDecision, InputRoutingReason, SessionInputEnvelope, SessionInputId,
+    SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnId, TurnInboxItem,
+    TurnInboxSnapshot, TurnInputCheckpoint,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::input_classifier::{classify_session_input, RuntimeInputState};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionInputRecord {
+    pub envelope: SessionInputEnvelope,
+    pub status: SessionInputStatus,
+    pub decision: InputRoutingDecision,
+    pub reason: InputRoutingReason,
+    pub active_turn_id: Option<TurnId>,
+    pub evidence_refs: Vec<String>,
+    pub checkpoint: Option<TurnInputCheckpoint>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+impl SessionInputRecord {
+    #[must_use]
+    pub fn to_receipt(&self) -> SessionInputReceipt {
+        SessionInputReceipt {
+            input_id: self.envelope.input_id.clone(),
+            session_id: self.envelope.session_id.clone(),
+            status: self.status,
+            decision: self.decision,
+            reason: Some(self.reason.clone()),
+            active_turn_id: self.active_turn_id.clone(),
+            evidence_refs: self.evidence_refs.clone(),
+            created_at: self.envelope.created_at,
+        }
+    }
+
+    #[must_use]
+    pub fn to_inbox_item(&self) -> TurnInboxItem {
+        TurnInboxItem {
+            input_id: self.envelope.input_id.clone(),
+            session_id: self.envelope.session_id.clone(),
+            status: self.status,
+            decision: self.decision,
+            content_preview: self.envelope.content_preview.clone(),
+            checkpoint: self.checkpoint,
+            created_at: self.envelope.created_at,
+            consumed_at: self.consumed_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionInputStateInner {
+    session_id: String,
+    active_turn_id: Option<TurnId>,
+    records: Vec<SessionInputRecord>,
+    idempotency: HashMap<String, SessionInputId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionInputStream {
+    inner: Arc<Mutex<SessionInputStateInner>>,
+}
+
+#[derive(Debug)]
+pub struct ActiveTurnLease {
+    stream: SessionInputStream,
+    turn_id: TurnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionInputMutationError {
+    NotFound,
+    AlreadyConsumed,
+}
+
+impl std::fmt::Display for SessionInputMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("session input not found"),
+            Self::AlreadyConsumed => f.write_str("session input has already been consumed"),
+        }
+    }
+}
+
+impl std::error::Error for SessionInputMutationError {}
+
+impl Drop for ActiveTurnLease {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.stream.inner.lock() {
+            if inner.active_turn_id.as_ref() == Some(&self.turn_id) {
+                inner.active_turn_id = None;
+            }
+        }
+    }
+}
+
+impl SessionInputStream {
+    #[must_use]
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SessionInputStateInner {
+                session_id: session_id.into(),
+                active_turn_id: None,
+                records: Vec::new(),
+                idempotency: HashMap::new(),
+            })),
+        }
+    }
+
+    pub fn set_active_turn(&self, active_turn_id: Option<TurnId>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active_turn_id = active_turn_id;
+        }
+    }
+
+    #[must_use]
+    pub fn begin_turn(&self, turn_id: TurnId) -> ActiveTurnLease {
+        self.set_active_turn(Some(turn_id.clone()));
+        ActiveTurnLease {
+            stream: self.clone(),
+            turn_id,
+        }
+    }
+
+    #[must_use]
+    pub fn active_turn_id(&self) -> Option<TurnId> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.active_turn_id.clone())
+    }
+
+    #[must_use]
+    pub fn runtime_state(&self) -> RuntimeInputState {
+        RuntimeInputState {
+            active_turn_id: self.active_turn_id(),
+            waiting_for_approval: false,
+            waiting_for_clarification: false,
+        }
+    }
+
+    pub fn admit(
+        &self,
+        envelope: SessionInputEnvelope,
+        state: RuntimeInputState,
+    ) -> SessionInputReceipt {
+        let now = Utc::now();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+
+        if let Some(existing) = inner.idempotency.get(&envelope.idempotency_key) {
+            return SessionInputReceipt {
+                input_id: existing.clone(),
+                session_id: envelope.session_id,
+                status: SessionInputStatus::RejectedDuplicate,
+                decision: InputRoutingDecision::RejectDuplicate,
+                reason: Some(InputRoutingReason::new(
+                    "duplicate_idempotency_key",
+                    "input with the same idempotency key was already accepted",
+                    10_000,
+                )),
+                active_turn_id: inner.active_turn_id.clone(),
+                evidence_refs: vec![format!("session-input:duplicate:{}", existing.as_str())],
+                created_at: now,
+            };
+        }
+
+        let (decision, reason) = classify_session_input(&envelope, &state);
+        let status = status_for_decision(decision);
+        let active_turn_id = match decision {
+            InputRoutingDecision::SupplementCurrentTurn
+            | InputRoutingDecision::InterruptAndReplan
+            | InputRoutingDecision::ControlOrApproval => state
+                .active_turn_id
+                .clone()
+                .or_else(|| inner.active_turn_id.clone()),
+            _ => None,
+        };
+        let evidence_refs = vec![format!("session-input:{}", envelope.input_id.as_str())];
+        let receipt = SessionInputReceipt {
+            input_id: envelope.input_id.clone(),
+            session_id: envelope.session_id.clone(),
+            status,
+            decision,
+            reason: Some(reason.clone()),
+            active_turn_id: active_turn_id.clone(),
+            evidence_refs: evidence_refs.clone(),
+            created_at: now,
+        };
+        inner
+            .idempotency
+            .insert(envelope.idempotency_key.clone(), envelope.input_id.clone());
+        inner.records.push(SessionInputRecord {
+            envelope,
+            status,
+            decision,
+            reason,
+            active_turn_id,
+            evidence_refs,
+            checkpoint: None,
+            consumed_at: None,
+        });
+        receipt
+    }
+
+    pub fn cancel_input(
+        &self,
+        input_id: &SessionInputId,
+        reason: impl Into<String>,
+    ) -> Result<SessionInputRecord, SessionInputMutationError> {
+        self.mutate_input(input_id, |record, _active_turn| {
+            if record.consumed_at.is_some() {
+                return Err(SessionInputMutationError::AlreadyConsumed);
+            }
+            record.status = SessionInputStatus::Cancelled;
+            record.reason = InputRoutingReason::new("input_cancelled", reason.into(), 10_000);
+            record
+                .evidence_refs
+                .push("session-input:cancelled".to_string());
+            record.checkpoint = None;
+            Ok(())
+        })
+    }
+
+    pub fn reclassify_input(
+        &self,
+        input_id: &SessionInputId,
+        decision: InputRoutingDecision,
+        reason: impl Into<String>,
+    ) -> Result<SessionInputRecord, SessionInputMutationError> {
+        self.mutate_input(input_id, |record, active_turn| {
+            if record.consumed_at.is_some() {
+                return Err(SessionInputMutationError::AlreadyConsumed);
+            }
+            record.decision = decision;
+            record.status = status_for_decision(decision);
+            record.reason = InputRoutingReason::new("manual_reclassify", reason.into(), 10_000);
+            record.active_turn_id = match decision {
+                InputRoutingDecision::SupplementCurrentTurn
+                | InputRoutingDecision::InterruptAndReplan
+                | InputRoutingDecision::ControlOrApproval => active_turn.clone(),
+                _ => None,
+            };
+            record.checkpoint = None;
+            record
+                .evidence_refs
+                .push(format!("session-input:reclassified:{}", decision.as_str()));
+            Ok(())
+        })
+    }
+
+    fn mutate_input(
+        &self,
+        input_id: &SessionInputId,
+        mutate: impl FnOnce(
+            &mut SessionInputRecord,
+            &Option<TurnId>,
+        ) -> Result<(), SessionInputMutationError>,
+    ) -> Result<SessionInputRecord, SessionInputMutationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        let active_turn = inner.active_turn_id.clone();
+        let record = inner
+            .records
+            .iter_mut()
+            .find(|record| &record.envelope.input_id == input_id)
+            .ok_or(SessionInputMutationError::NotFound)?;
+        mutate(record, &active_turn)?;
+        Ok(record.clone())
+    }
+
+    pub fn consume_for_checkpoint(
+        &self,
+        turn_id: &TurnId,
+        checkpoint: TurnInputCheckpoint,
+        limit: usize,
+    ) -> Vec<SessionInputRecord> {
+        let mut consumed = Vec::new();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        for record in &mut inner.records {
+            if consumed.len() >= limit {
+                break;
+            }
+            if !is_checkpoint_consumable(record, turn_id) {
+                continue;
+            }
+            record.status = SessionInputStatus::Consumed;
+            record.checkpoint = Some(checkpoint);
+            record.consumed_at = Some(Utc::now());
+            record
+                .evidence_refs
+                .push(format!("checkpoint:{}", checkpoint.as_str()));
+            consumed.push(record.clone());
+        }
+        consumed
+    }
+
+    pub fn promote_queued_next(&self, turn_id: &TurnId, limit: usize) -> Vec<SessionInputRecord> {
+        let mut promoted = Vec::new();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        for record in &mut inner.records {
+            if promoted.len() >= limit {
+                break;
+            }
+            if record.consumed_at.is_some()
+                || record.decision != InputRoutingDecision::EnqueueNextStep
+            {
+                continue;
+            }
+            record.status = SessionInputStatus::AttachedToTurn;
+            record.active_turn_id = Some(turn_id.clone());
+            promoted.push(record.clone());
+        }
+        promoted
+    }
+
+    pub fn drain_queued_next_for_dispatch(&self, limit: usize) -> Vec<SessionInputRecord> {
+        let mut drained = Vec::new();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        for record in &mut inner.records {
+            if drained.len() >= limit {
+                break;
+            }
+            if record.consumed_at.is_some()
+                || record.decision != InputRoutingDecision::EnqueueNextStep
+            {
+                continue;
+            }
+            record.status = SessionInputStatus::Consumed;
+            record.checkpoint = Some(TurnInputCheckpoint::BeforeFinalAnswer);
+            record.consumed_at = Some(Utc::now());
+            record
+                .evidence_refs
+                .push("dispatch:queued-next".to_string());
+            drained.push(record.clone());
+        }
+        drained
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> SessionInputProjection {
+        let inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        let total = inner.records.len();
+        let pending_count = inner
+            .records
+            .iter()
+            .filter(|record| is_pending_status(record.status))
+            .count();
+        let queued_next_count = inner
+            .records
+            .iter()
+            .filter(|record| {
+                record.decision == InputRoutingDecision::EnqueueNextStep
+                    && record.consumed_at.is_none()
+            })
+            .count();
+        let consumed_count = inner
+            .records
+            .iter()
+            .filter(|record| record.status == SessionInputStatus::Consumed)
+            .count();
+        SessionInputProjection {
+            session_id: inner.session_id.clone(),
+            active_turn_id: inner.active_turn_id.clone(),
+            total,
+            pending_count,
+            queued_next_count,
+            consumed_count,
+            last_decision: inner.records.last().map(|record| record.decision),
+            inputs: inner
+                .records
+                .iter()
+                .rev()
+                .take(50)
+                .map(SessionInputRecord::to_inbox_item)
+                .collect(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn inbox_snapshot(&self, turn_id: Option<TurnId>) -> TurnInboxSnapshot {
+        let inner = self
+            .inner
+            .lock()
+            .expect("session input stream lock poisoned");
+        let selected_turn_id = turn_id.or_else(|| inner.active_turn_id.clone());
+        let items: Vec<TurnInboxItem> = inner
+            .records
+            .iter()
+            .filter(|record| {
+                selected_turn_id.as_ref().map_or(true, |turn_id| {
+                    record.active_turn_id.as_ref() == Some(turn_id)
+                })
+            })
+            .map(SessionInputRecord::to_inbox_item)
+            .collect();
+        let pending_count = items
+            .iter()
+            .filter(|item| is_pending_status(item.status))
+            .count();
+        let consumed_count = items
+            .iter()
+            .filter(|item| item.status == SessionInputStatus::Consumed)
+            .count();
+        TurnInboxSnapshot {
+            session_id: inner.session_id.clone(),
+            turn_id: selected_turn_id,
+            pending_count,
+            consumed_count,
+            items,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn record_snapshot(&self, input_id: &SessionInputId) -> Option<SessionInputRecord> {
+        self.inner
+            .lock()
+            .expect("session input stream lock poisoned")
+            .records
+            .iter()
+            .find(|record| &record.envelope.input_id == input_id)
+            .cloned()
+    }
+}
+
+fn status_for_decision(decision: InputRoutingDecision) -> SessionInputStatus {
+    match decision {
+        InputRoutingDecision::StartNewTurn => SessionInputStatus::QueuedNext,
+        InputRoutingDecision::SupplementCurrentTurn => SessionInputStatus::AttachedToTurn,
+        InputRoutingDecision::InterruptAndReplan => SessionInputStatus::InterruptRequested,
+        InputRoutingDecision::EnqueueNextStep => SessionInputStatus::QueuedNext,
+        InputRoutingDecision::SpawnSubtask => SessionInputStatus::DispatchedSubtask,
+        InputRoutingDecision::RouteCrossSession => SessionInputStatus::DispatchedSession,
+        InputRoutingDecision::CreateNewSession => SessionInputStatus::NewSessionCreated,
+        InputRoutingDecision::ControlOrApproval => SessionInputStatus::ControlResolved,
+        InputRoutingDecision::RejectDuplicate => SessionInputStatus::RejectedDuplicate,
+        InputRoutingDecision::RejectPolicy => SessionInputStatus::RejectedPolicy,
+    }
+}
+
+trait InputRoutingDecisionExt {
+    fn as_str(self) -> &'static str;
+}
+
+impl InputRoutingDecisionExt for InputRoutingDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            InputRoutingDecision::StartNewTurn => "start_new_turn",
+            InputRoutingDecision::SupplementCurrentTurn => "supplement_current_turn",
+            InputRoutingDecision::InterruptAndReplan => "interrupt_and_replan",
+            InputRoutingDecision::EnqueueNextStep => "enqueue_next_step",
+            InputRoutingDecision::SpawnSubtask => "spawn_subtask",
+            InputRoutingDecision::RouteCrossSession => "route_cross_session",
+            InputRoutingDecision::CreateNewSession => "create_new_session",
+            InputRoutingDecision::ControlOrApproval => "control_or_approval",
+            InputRoutingDecision::RejectDuplicate => "reject_duplicate",
+            InputRoutingDecision::RejectPolicy => "reject_policy",
+        }
+    }
+}
+
+fn is_pending_status(status: SessionInputStatus) -> bool {
+    matches!(
+        status,
+        SessionInputStatus::Received
+            | SessionInputStatus::Persisted
+            | SessionInputStatus::Classified
+            | SessionInputStatus::AttachedToTurn
+            | SessionInputStatus::QueuedNext
+            | SessionInputStatus::InterruptRequested
+            | SessionInputStatus::ControlResolved
+    )
+}
+
+fn is_checkpoint_consumable(record: &SessionInputRecord, turn_id: &TurnId) -> bool {
+    if record.consumed_at.is_some() {
+        return false;
+    }
+    if !is_pending_status(record.status) {
+        return false;
+    }
+    if record.status == SessionInputStatus::AttachedToTurn
+        && record.active_turn_id.as_ref() == Some(turn_id)
+    {
+        return true;
+    }
+    matches!(
+        record.decision,
+        InputRoutingDecision::SupplementCurrentTurn
+            | InputRoutingDecision::InterruptAndReplan
+            | InputRoutingDecision::ControlOrApproval
+    ) && record.active_turn_id.as_ref() == Some(turn_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
+
+    #[test]
+    fn stream_rejects_duplicate_idempotency_key() {
+        let stream = SessionInputStream::new("s1");
+        let state = RuntimeInputState::default();
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Api, "hello")
+            .with_idempotency_key("idem-1");
+
+        let first = stream.admit(envelope.clone(), state.clone());
+        let second = stream.admit(envelope, state);
+
+        assert_eq!(first.decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(second.decision, InputRoutingDecision::RejectDuplicate);
+        assert_eq!(stream.projection().total, 1);
+    }
+
+    #[test]
+    fn active_supplement_is_consumed_at_checkpoint() {
+        let stream = SessionInputStream::new("s1");
+        let turn_id = TurnId::from_string("turn-1");
+        stream.set_active_turn(Some(turn_id.clone()));
+        let state = RuntimeInputState::active(turn_id.clone());
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "more context");
+
+        let receipt = stream.admit(envelope, state);
+        let consumed =
+            stream.consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 4);
+
+        assert_eq!(
+            receipt.decision,
+            InputRoutingDecision::SupplementCurrentTurn
+        );
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(stream.projection().consumed_count, 1);
+    }
+
+    #[test]
+    fn queued_next_can_be_drained_for_dispatch_once() {
+        let stream = SessionInputStream::new("s1");
+        let state = RuntimeInputState::active(TurnId::from_string("turn-1"));
+        let envelope =
+            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "next, write tests");
+
+        let receipt = stream.admit(envelope, state);
+        let drained = stream.drain_queued_next_for_dispatch(4);
+        let drained_again = stream.drain_queued_next_for_dispatch(4);
+
+        assert_eq!(receipt.decision, InputRoutingDecision::EnqueueNextStep);
+        assert_eq!(drained.len(), 1);
+        assert!(drained_again.is_empty());
+        assert_eq!(stream.projection().consumed_count, 1);
+    }
+
+    #[test]
+    fn pending_input_can_be_cancelled_before_checkpoint() {
+        let stream = SessionInputStream::new("s1");
+        let turn_id = TurnId::from_string("turn-1");
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "more context");
+        let receipt = stream.admit(envelope, RuntimeInputState::active(turn_id.clone()));
+
+        let record = stream
+            .cancel_input(&receipt.input_id, "user changed direction")
+            .expect("cancel pending input");
+        let consumed =
+            stream.consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 4);
+
+        assert_eq!(record.status, SessionInputStatus::Cancelled);
+        assert!(consumed.is_empty());
+        assert_eq!(stream.projection().pending_count, 0);
+    }
+
+    #[test]
+    fn pending_input_can_be_reclassified_to_next_queue() {
+        let stream = SessionInputStream::new("s1");
+        let turn_id = TurnId::from_string("turn-1");
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "more context");
+        let receipt = stream.admit(envelope, RuntimeInputState::active(turn_id));
+
+        let record = stream
+            .reclassify_input(
+                &receipt.input_id,
+                InputRoutingDecision::EnqueueNextStep,
+                "user marked as follow-up",
+            )
+            .expect("reclassify pending input");
+
+        assert_eq!(record.decision, InputRoutingDecision::EnqueueNextStep);
+        assert_eq!(record.status, SessionInputStatus::QueuedNext);
+        assert_eq!(stream.projection().queued_next_count, 1);
+    }
+
+    #[test]
+    fn consumed_input_cannot_be_reclassified() {
+        let stream = SessionInputStream::new("s1");
+        let turn_id = TurnId::from_string("turn-1");
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "more context");
+        let receipt = stream.admit(envelope, RuntimeInputState::active(turn_id.clone()));
+        let consumed =
+            stream.consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 4);
+
+        let error = stream
+            .reclassify_input(
+                &receipt.input_id,
+                InputRoutingDecision::EnqueueNextStep,
+                "too late",
+            )
+            .expect_err("consumed input cannot be mutated");
+
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(error, SessionInputMutationError::AlreadyConsumed);
+    }
+}

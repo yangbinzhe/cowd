@@ -95,6 +95,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     runtime_plugin_state: RuntimeBootstrapState,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
+    session.session_id = session_id.to_string();
     if session.model.is_none() {
         session.model = Some(model.clone());
     }

@@ -877,6 +877,7 @@ impl EvolutionService {
             self.envelope("version_rollback"),
             self.envelope("evolution_memory"),
             self.envelope("sandbox_evals"),
+            self.envelope("sandbox_eval_start"),
             self.envelope("candidate_sandbox_run"),
             self.envelope("candidate_sandbox_eval"),
             self.envelope("candidate_artifacts"),

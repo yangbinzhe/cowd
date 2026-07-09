@@ -383,6 +383,7 @@ mod tests {
 
     #[test]
     fn steward_scheduler_ticks_stewards_dispatches_and_records_ledger() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("steward-scheduler-session-{suffix}");
         global_mission_runtime()
@@ -411,6 +412,7 @@ mod tests {
 
     #[test]
     fn steward_scheduler_can_dispatch_session_commands_as_runtime_turns() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("steward-scheduler-turn-a-{suffix}");
         let session_b = format!("steward-scheduler-turn-b-{suffix}");

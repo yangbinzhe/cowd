@@ -7982,6 +7982,7 @@ gateway:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(provider_registry)]
     async fn runtime_config_reload_rejects_invalid_config_without_replacing_running_state() {
         runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let root = test_temp_dir("runtime-config-reload-invalid-preserve");
@@ -8062,6 +8063,7 @@ providers:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(trace_capture)]
     async fn runtime_control_plane_emits_structured_trace_event() {
         use tracing_subscriber::prelude::*;
 
@@ -8436,6 +8438,7 @@ providers:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(trace_capture)]
     async fn session_context_history_emits_structured_trace_events() {
         use tracing_subscriber::prelude::*;
 

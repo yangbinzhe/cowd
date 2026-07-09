@@ -160,7 +160,8 @@ impl RecoveryExecutor {
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
 
-        for action in &plan.actions {
+        let actions = executable_recovery_actions(&plan);
+        for action in &actions {
             match apply_action(action) {
                 RecoveryApplyOutcome::Applied(summary) => {
                     applied.push(RecoveryAppliedAction {
@@ -197,6 +198,35 @@ impl RecoveryExecutor {
         record_recovery_event(&report);
         Ok(report)
     }
+}
+
+fn executable_recovery_actions(plan: &RecoveryPlan) -> Vec<RuntimeRecoveryAction> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut actions = Vec::new();
+
+    for action in &plan.actions {
+        if seen.insert((action.stream_id.clone(), format!("{:?}", action.action))) {
+            actions.push(action.clone());
+        }
+    }
+
+    for candidate in &plan.candidates {
+        if seen.insert((
+            candidate.source_stream_id.clone(),
+            format!("{:?}", candidate.action),
+        )) {
+            actions.push(RuntimeRecoveryAction {
+                stream_id: candidate.source_stream_id.clone(),
+                scope: candidate.scope,
+                latest_kind: format!("recovery.candidate.{}", candidate.owner),
+                latest_status: None,
+                action: candidate.action.clone(),
+                reason: candidate.reason.clone(),
+            });
+        }
+    }
+
+    actions
 }
 
 enum RecoveryApplyOutcome {
@@ -294,6 +324,7 @@ mod tests {
 
     #[test]
     fn recovery_executor_marks_session_command_and_steward() {
+        let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("recovery-session-{suffix}");
         global_mission_runtime()

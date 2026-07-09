@@ -1119,8 +1119,7 @@ fn register_lifecycle_agent_for_team(
     model: Option<&str>,
 ) -> Result<runtime::AgentSnapshot, String> {
     let agent_id = format!("agent-{}", uuid::Uuid::new_v4());
-    let agent_dir = runtime::cowd_dirs::user_agents_dir();
-    std::fs::create_dir_all(&agent_dir).map_err(|error| error.to_string())?;
+    let agent_dir = writable_team_agent_dir(&agent_id)?;
     let output_file = agent_dir.join(format!("{agent_id}.md"));
     let manifest_file = agent_dir.join(format!("{agent_id}.json"));
     let prompt = team_role_prompt(request);
@@ -1156,6 +1155,31 @@ fn register_lifecycle_agent_for_team(
     runtime::global_agent_lifecycle_service()
         .register_started(snapshot.clone(), runtime::CancellationToken::new());
     Ok(snapshot)
+}
+
+fn writable_team_agent_dir(agent_id: &str) -> Result<std::path::PathBuf, String> {
+    let primary = runtime::cowd_dirs::user_agents_dir();
+    match ensure_writable_dir(&primary, agent_id) {
+        Ok(()) => return Ok(primary),
+        Err(error) => {
+            tracing::warn!(
+                path = %primary.display(),
+                error = %error,
+                "team agent directory is not writable; using temporary agent directory"
+            );
+        }
+    }
+    let fallback = std::env::temp_dir().join("cowd-team-agents").join(agent_id);
+    ensure_writable_dir(&fallback, agent_id)?;
+    Ok(fallback)
+}
+
+fn ensure_writable_dir(path: &std::path::Path, probe_id: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    let probe = path.join(format!(".{probe_id}.write-test"));
+    std::fs::write(&probe, b"ok").map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(probe);
+    Ok(())
 }
 
 fn team_role_prompt(request: &runtime::StartTeamRuntimeAgentRequest) -> String {

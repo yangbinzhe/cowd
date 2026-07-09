@@ -217,13 +217,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         );
                                         continue;
                                     }
-                                    if state.is_loading || state.turn_active {
-                                        state.add_system_notice(
-                                            SystemNoticeKind::Warning,
-                                            "Already processing, please wait...",
-                                        );
-                                        continue;
-                                    }
                                     state.add_message("user", &text);
                                     state.is_loading = true;
                                     let resource_ids = state
@@ -571,6 +564,34 @@ fn dispatch_gateway_message(
                     let _ = event_tx.send(CowdEvent::ResourcesCommitted {
                         ids: resource_ids.clone(),
                     });
+                }
+                let mode = value
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if mode == "started_new_turn" {
+                    let turn_id = value
+                        .get("turn")
+                        .and_then(|turn| turn.get("turn_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("turn");
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Gateway accepted turn {turn_id}; streaming will continue via SSE"
+                        ),
+                    });
+                    return;
+                }
+                if mode == "attached_to_active_turn" {
+                    let decision = value
+                        .get("input")
+                        .and_then(|input| input.get("decision"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("attached");
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!("Input attached to active turn: {decision}"),
+                    });
+                    return;
                 }
                 if let Some(response) = value
                     .get("response")

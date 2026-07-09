@@ -10,6 +10,9 @@ use crate::{
     ToolCallback, ToolExecutor, TurnSummary,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
+use harness_contract::turn::{
+    SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId, TurnInboxSnapshot,
+};
 
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
@@ -54,13 +57,14 @@ where
     T: ToolExecutor,
 {
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
+        let active_model = config.model.clone();
         let model_context_window = config.model_context_window.unwrap_or_else(|| {
             let overrides = config.feature_config.model_context_windows();
-            model_context_window_with_overrides(&config.model, Some(&overrides))
+            model_context_window_with_overrides(&active_model, Some(&overrides))
         });
         let mut runtime = crate::ConversationRuntime::new_with_features(
             config.session,
-            ProviderRuntimeClient::new(config.model, config.tool_definitions)?
+            ProviderRuntimeClient::new(active_model.clone(), config.tool_definitions)?
                 .with_emit_output(config.emit_output)
                 .with_stream_callback(config.stream_callback.clone()),
             config.tool_executor.clone(),
@@ -71,6 +75,7 @@ where
         .with_model_context_window(model_context_window)
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile);
+        runtime.set_active_model(active_model);
 
         if let Some(store) = config.session_store {
             runtime = runtime.with_session_store(store);
@@ -142,6 +147,26 @@ where
         self.runtime_ref().cowd_bus()
     }
 
+    pub fn admit_session_input(
+        &self,
+        envelope: SessionInputEnvelope,
+        state: crate::RuntimeInputState,
+    ) -> SessionInputReceipt {
+        self.runtime_ref().admit_session_input(envelope, state)
+    }
+
+    pub fn session_input_projection(&self) -> SessionInputProjection {
+        self.runtime_ref().session_input_projection()
+    }
+
+    pub fn active_turn_inbox(&self, turn_id: Option<TurnId>) -> TurnInboxSnapshot {
+        self.runtime_ref().active_turn_inbox(turn_id)
+    }
+
+    pub fn session_input_stream(&self) -> crate::SessionInputStream {
+        self.runtime_ref().session_input_stream()
+    }
+
     pub fn set_context_profile(&self, profile: ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
     }
@@ -208,7 +233,9 @@ where
     }
 
     pub async fn update_session_model(&mut self, model: &str) {
-        let mut session = self.runtime_mut().session_mut_async().await;
+        let runtime = self.runtime_mut();
+        runtime.set_active_model(model.to_string());
+        let mut session = runtime.session_mut_async().await;
         session.model = Some(model.to_string());
     }
 

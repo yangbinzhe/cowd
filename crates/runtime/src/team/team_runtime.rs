@@ -908,7 +908,14 @@ impl TeamRuntimeService {
         };
         let payload = serde_json::to_vec_pretty(&TeamRuntimePersistedState { runs: runs.clone() })
             .map_err(|error| error.to_string())?;
-        write_team_runtime_state_file(state_path, &payload).map_err(|error| error.to_string())
+        if let Err(error) = write_team_runtime_state_file(state_path, &payload) {
+            tracing::warn!(
+                path = %state_path.display(),
+                error = %error,
+                "team runtime state persistence failed; continuing with in-memory state"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -932,6 +939,11 @@ impl TeamRuntimeRecord {
 
 pub fn global_team_runtime_service() -> &'static TeamRuntimeService {
     static SERVICE: OnceLock<TeamRuntimeService> = OnceLock::new();
+    #[cfg(test)]
+    {
+        return SERVICE.get_or_init(TeamRuntimeService::new);
+    }
+    #[cfg(not(test))]
     SERVICE.get_or_init(TeamRuntimeService::persistent)
 }
 

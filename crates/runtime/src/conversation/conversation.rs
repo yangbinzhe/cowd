@@ -39,6 +39,10 @@ use harness_contract::{
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
+    turn::{
+        SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
+        TurnInboxSnapshot, TurnInputCheckpoint,
+    },
 };
 use memory::cognitive::CognitiveContextManager;
 use memory::compression::session::{
@@ -572,6 +576,7 @@ fn normalize_image_media_type(path: &Path, media_type: &str) -> Option<String> {
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
+    session_input_stream: crate::session_input::SessionInputStream,
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
@@ -789,11 +794,13 @@ where
         } else {
             (None, None)
         };
+        let session_id = session.session_id.clone();
         let session = Arc::new(RwLock::new(session));
         let mut runtime_control_policy = feature_config.runtime_control().policy.clone();
         apply_runtime_budget_to_control_policy(&mut runtime_control_policy, &initial_budget_plan);
         Self {
             session,
+            session_input_stream: crate::session_input::SessionInputStream::new(session_id),
             api_client,
             tool_executor,
             permission_policy,
@@ -1546,6 +1553,13 @@ where
         self
     }
 
+    pub fn set_active_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        if !model.trim().is_empty() {
+            self.model = Some(model);
+        }
+    }
+
     pub fn with_cached_prompt(
         mut self,
         config_path: std::path::PathBuf,
@@ -1701,6 +1715,84 @@ where
     /// Get a reference to the attached CowdEventBus, if any.
     pub fn cowd_bus(&self) -> Option<&crate::cowd_event::CowdEventBus> {
         self.cowd_bus.as_deref()
+    }
+
+    pub fn admit_session_input(
+        &self,
+        envelope: SessionInputEnvelope,
+        state: crate::input_classifier::RuntimeInputState,
+    ) -> SessionInputReceipt {
+        let mut state = state;
+        if state.active_turn_id.is_none() {
+            state.active_turn_id = self.session_input_stream.active_turn_id();
+        }
+        let receipt = self.session_input_stream.admit(envelope, state);
+        self.emit_session_input_projection(Some(receipt.clone()));
+        receipt
+    }
+
+    #[must_use]
+    pub fn session_input_projection(&self) -> SessionInputProjection {
+        self.session_input_stream.projection()
+    }
+
+    #[must_use]
+    pub fn active_turn_inbox(&self, turn_id: Option<TurnId>) -> TurnInboxSnapshot {
+        self.session_input_stream.inbox_snapshot(turn_id)
+    }
+
+    #[must_use]
+    pub fn session_input_stream(&self) -> crate::session_input::SessionInputStream {
+        self.session_input_stream.clone()
+    }
+
+    fn emit_session_input_projection(&self, receipt: Option<SessionInputReceipt>) {
+        if let Some(ref cowd) = self.cowd_bus {
+            if let Some(receipt) = receipt {
+                cowd.emit(crate::cowd_event::CowdEvent::SessionInputReceived { receipt });
+            }
+            cowd.emit(crate::cowd_event::CowdEvent::SessionInputProjection {
+                projection: self.session_input_stream.projection(),
+            });
+            cowd.emit(crate::cowd_event::CowdEvent::TurnInboxUpdated {
+                inbox: self.session_input_stream.inbox_snapshot(None),
+            });
+        }
+    }
+
+    fn consume_runtime_inputs_at_checkpoint(
+        &self,
+        turn_id: &TurnId,
+        checkpoint: TurnInputCheckpoint,
+        effective_system_prompt: &mut Vec<String>,
+    ) -> usize {
+        let consumed = self
+            .session_input_stream
+            .consume_for_checkpoint(turn_id, checkpoint, 32);
+        if let Some(instruction) = crate::turn_inbox::checkpoint_instruction(checkpoint, &consumed)
+        {
+            effective_system_prompt.push(instruction);
+        }
+        if let Some(ref cowd) = self.cowd_bus {
+            if !consumed.is_empty() {
+                cowd.emit(crate::cowd_event::CowdEvent::TurnInputCheckpointConsumed {
+                    checkpoint,
+                    consumed: consumed
+                        .iter()
+                        .map(crate::session_input::SessionInputRecord::to_inbox_item)
+                        .collect(),
+                });
+            }
+            cowd.emit(crate::cowd_event::CowdEvent::SessionInputProjection {
+                projection: self.session_input_stream.projection(),
+            });
+            cowd.emit(crate::cowd_event::CowdEvent::TurnInboxUpdated {
+                inbox: self
+                    .session_input_stream
+                    .inbox_snapshot(Some(turn_id.clone())),
+            });
+        }
+        consumed.len()
     }
 
     /// T36: Set a custom tool orchestrator for result budgeting.
@@ -2079,6 +2171,19 @@ where
         let mut provider_usage_seen = false;
         let mut models_used: Vec<String> = Vec::new();
         let user_input = user_input.into();
+        let runtime_turn_id = self
+            .session_input_stream
+            .active_turn_id()
+            .unwrap_or_else(TurnId::new);
+        let _active_turn_lease = self
+            .session_input_stream
+            .begin_turn(runtime_turn_id.clone());
+        let promoted_queued = self
+            .session_input_stream
+            .promote_queued_next(&runtime_turn_id, 32);
+        if !promoted_queued.is_empty() {
+            self.emit_session_input_projection(None);
+        }
         tracing::info!(session_id = %self.session().session_id, "turn started");
         self.clear_collaboration_result();
         self.clear_turn_tool_observations();
@@ -2158,6 +2263,11 @@ where
         let mut effective_system_prompt = self.prepare_reality_context(&user_input).await;
         effective_system_prompt.push(evidence_plan_guidance.clone());
         effective_system_prompt.push(execution_decision_guidance);
+        self.consume_runtime_inputs_at_checkpoint(
+            &runtime_turn_id,
+            TurnInputCheckpoint::TurnStart,
+            &mut effective_system_prompt,
+        );
         if knowledge_hard_gate_active(&effective_system_prompt) {
             let error = RuntimeError::new("knowledge compliance hard gate blocked turn");
             self.record_turn_failed(0, &error);
@@ -2285,6 +2395,11 @@ where
                 }
             }
 
+            self.consume_runtime_inputs_at_checkpoint(
+                &runtime_turn_id,
+                TurnInputCheckpoint::BeforeProviderRequest,
+                &mut effective_system_prompt,
+            );
             let request = ApiRequest {
                 system_prompt: effective_system_prompt.clone(),
                 messages: self.session.read().await.messages.clone(),
@@ -2600,6 +2715,14 @@ where
             assistant_messages.push(assistant_msg);
 
             if pending_tool_uses.is_empty() {
+                let consumed = self.consume_runtime_inputs_at_checkpoint(
+                    &runtime_turn_id,
+                    TurnInputCheckpoint::BeforeFinalAnswer,
+                    &mut effective_system_prompt,
+                );
+                if consumed > 0 {
+                    continue;
+                }
                 break;
             }
 
@@ -2743,6 +2866,11 @@ where
                     }
                 }
             }
+            self.consume_runtime_inputs_at_checkpoint(
+                &runtime_turn_id,
+                TurnInputCheckpoint::AfterToolResult,
+                &mut effective_system_prompt,
+            );
             if let Some(inject) = callback_inject {
                 let inject_text = inject.clone();
                 self.session
@@ -3904,39 +4032,51 @@ where
     }
 
     fn model_candidates_for_turn(&self, user_input: &str) -> Vec<String> {
-        let mut configured_models: Vec<String> =
-            std::iter::once(self.model.as_deref().unwrap_or("").to_string())
-                .chain(self.fallbacks.clone())
-                .collect();
-        if configured_models
+        let primary = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+        let mut fallback_models: Vec<String> = self
+            .fallbacks
             .iter()
-            .any(|model| !model.trim().is_empty())
-        {
-            configured_models.retain(|model| !model.trim().is_empty());
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        fallback_models.dedup();
+        if let Some(primary) = primary.as_ref() {
+            fallback_models.retain(|model| model != primary);
         }
-        configured_models.dedup();
 
         let Ok(registry) = self.model_performance_registry.lock() else {
-            return configured_models;
+            return primary
+                .into_iter()
+                .chain(fallback_models)
+                .collect::<Vec<_>>();
         };
-        let decision = registry.route(ModelRouteIntent::from_task(user_input), &configured_models);
-        let mut routed = Vec::with_capacity(configured_models.len());
-        if configured_models
+        let routable = fallback_models.clone();
+        let decision = registry.route(ModelRouteIntent::from_task(user_input), &routable);
+        let mut routed = Vec::with_capacity(fallback_models.len() + usize::from(primary.is_some()));
+        if let Some(primary) = primary {
+            routed.push(primary);
+        }
+        if routable
             .iter()
             .any(|model| model == &decision.selected_model)
+            && !routed.iter().any(|known| known == &decision.selected_model)
         {
             routed.push(decision.selected_model);
         }
         for candidate in decision.candidates {
-            if configured_models
-                .iter()
-                .any(|model| model == &candidate.model)
+            if routable.iter().any(|model| model == &candidate.model)
                 && !routed.iter().any(|model| model == &candidate.model)
             {
                 routed.push(candidate.model);
             }
         }
-        for model in configured_models {
+        for model in fallback_models {
             if !routed.iter().any(|known| known == &model) {
                 routed.push(model);
             }
@@ -6646,7 +6786,7 @@ mod tests {
     }
 
     #[test]
-    fn model_router_reorders_actual_turn_candidate_chain() {
+    fn model_router_keeps_primary_model_first_and_routes_fallbacks() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -6718,10 +6858,10 @@ mod tests {
         let quick = runtime.model_candidates_for_turn("快速回答这个简单问题");
         let deep = runtime.model_candidates_for_turn("深度审计复杂架构方案");
 
-        assert_eq!(quick.first().map(String::as_str), Some("stepfun-fast"));
-        assert_eq!(deep.first().map(String::as_str), Some("deepseek-depth"));
-        assert!(quick.contains(&"balanced-model".to_string()));
-        assert!(deep.contains(&"balanced-model".to_string()));
+        assert_eq!(quick.first().map(String::as_str), Some("balanced-model"));
+        assert_eq!(deep.first().map(String::as_str), Some("balanced-model"));
+        assert_eq!(quick.get(1).map(String::as_str), Some("stepfun-fast"));
+        assert_eq!(deep.get(1).map(String::as_str), Some("deepseek-depth"));
     }
 
     #[test]

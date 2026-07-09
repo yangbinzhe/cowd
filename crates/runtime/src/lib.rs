@@ -169,6 +169,8 @@ pub mod execution_core;
 pub mod execution_scheduler;
 #[path = "context/fact_extraction.rs"]
 pub mod fact_extraction;
+#[path = "session/input_classifier.rs"]
+pub mod input_classifier;
 #[path = "agent/intent_planner.rs"]
 pub mod intent_planner;
 #[path = "agent/joint_problem_solving.rs"]
@@ -207,6 +209,8 @@ pub mod runtime_harness;
 pub mod self_regulation;
 #[path = "session/session_execution.rs"]
 pub mod session_execution;
+#[path = "session/session_input.rs"]
+pub mod session_input;
 #[path = "session/session_lifecycle.rs"]
 pub mod session_lifecycle;
 #[path = "session/session_relation_graph.rs"]
@@ -266,6 +270,8 @@ pub mod tool_memory;
 pub mod tool_orchestrator;
 #[path = "policy/trust_resolver.rs"]
 pub mod trust_resolver;
+#[path = "conversation/turn_inbox.rs"]
+pub mod turn_inbox;
 #[path = "conversation/turn_supervisor.rs"]
 pub mod turn_supervisor;
 #[path = "provider/usage.rs"]
@@ -424,6 +430,7 @@ pub use hooks::{
 #[path = "conversation/host.rs"]
 pub mod host;
 pub use host::{StandardRuntimeHost, StandardRuntimeHostConfig};
+pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,
@@ -585,6 +592,7 @@ pub use session_execution::{
     SessionDispatchMode, SessionExecutionPlane, SessionExecutionPolicy, SessionExecutionReport,
     SessionExecutionSkip, SessionLeaseState, SessionRecoveryCandidate,
 };
+pub use session_input::{SessionInputRecord, SessionInputStream};
 pub use session_relation_graph::{
     global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
     SessionRelationKind, SessionRouteCommand, SessionRouteReceipt,

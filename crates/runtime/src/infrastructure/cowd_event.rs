@@ -131,6 +131,19 @@ pub enum CowdEvent {
     WorkGraphSummary {
         summary: RuntimeWorkGraphSummary,
     },
+    SessionInputReceived {
+        receipt: harness_contract::turn::SessionInputReceipt,
+    },
+    SessionInputProjection {
+        projection: harness_contract::turn::SessionInputProjection,
+    },
+    TurnInboxUpdated {
+        inbox: harness_contract::turn::TurnInboxSnapshot,
+    },
+    TurnInputCheckpointConsumed {
+        checkpoint: harness_contract::turn::TurnInputCheckpoint,
+        consumed: Vec<harness_contract::turn::TurnInboxItem>,
+    },
     // System
     Warning {
         message: String,

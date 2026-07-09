@@ -17,6 +17,7 @@ use crate::{
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
 
+#[derive(Clone)]
 struct ProviderEntry {
     model: String,
     client: ProviderClient,
@@ -187,7 +188,7 @@ impl ProviderRuntimeClient {
         let tool_choice = (!self.tool_definitions.is_empty()).then_some(ToolChoice::Auto);
 
         let needs_vision = request_has_image_input(&messages);
-        let chain = self.candidate_chain(needs_vision);
+        let chain = self.candidate_chain(&request.model, needs_vision);
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
@@ -239,20 +240,40 @@ impl ProviderRuntimeClient {
         )))
     }
 
-    fn candidate_chain(&self, needs_vision: bool) -> Vec<&ProviderEntry> {
-        if !needs_vision {
-            return self.chain.iter().collect();
-        }
-        let filtered = self
+    fn candidate_chain(&self, requested_model: &str, needs_vision: bool) -> Vec<ProviderEntry> {
+        let base = self
             .chain
             .iter()
-            .filter(|entry| !model_is_known_without_vision(&entry.model))
+            .filter(|entry| !needs_vision || !model_is_known_without_vision(&entry.model))
+            .cloned()
             .collect::<Vec<_>>();
-        if filtered.is_empty() {
-            self.chain.iter().collect()
+        let base = if base.is_empty() {
+            self.chain.clone()
         } else {
-            filtered
+            base
+        };
+
+        let requested_model = requested_model.trim();
+        let mut ordered = Vec::with_capacity(base.len() + usize::from(!requested_model.is_empty()));
+        if !requested_model.is_empty() {
+            if let Some(existing) = base.iter().find(|entry| entry.model == requested_model) {
+                ordered.push(existing.clone());
+            } else if !needs_vision || !model_is_known_without_vision(requested_model) {
+                match build_provider_entry(requested_model) {
+                    Ok(entry) => ordered.push(entry),
+                    Err(error) => tracing::warn!(
+                        "skipping requested provider model {requested_model}: {error}"
+                    ),
+                }
+            }
         }
+
+        for entry in base {
+            if !ordered.iter().any(|known| known.model == entry.model) {
+                ordered.push(entry);
+            }
+        }
+        ordered
     }
 }
 

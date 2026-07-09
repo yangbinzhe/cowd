@@ -4,6 +4,7 @@ use provider::{
     ProviderClient, StreamEvent,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
@@ -262,6 +263,61 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
     })
 }
 
+fn cowd_config_path() -> PathBuf {
+    std::env::var_os("COWD_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cowd")
+                .join("config.yaml")
+        })
+}
+
+fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
+    let contents = std::fs::read_to_string(cowd_config_path()).ok()?;
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let root = value.as_mapping()?;
+    let providers = root
+        .get(&serde_yaml::Value::String("providers".to_string()))?
+        .as_mapping()?;
+    for (name, provider) in providers {
+        let name = name.as_str()?.to_string();
+        let provider = provider.as_mapping()?;
+        let models = provider
+            .get(&serde_yaml::Value::String("models".to_string()))
+            .and_then(serde_yaml::Value::as_sequence)?
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !models.iter().any(|candidate| candidate == model) {
+            continue;
+        }
+        let base_url = provider
+            .get(&serde_yaml::Value::String("base_url".to_string()))
+            .and_then(serde_yaml::Value::as_str)?
+            .to_string();
+        let api_key = provider
+            .get(&serde_yaml::Value::String("api_key".to_string()))
+            .and_then(serde_yaml::Value::as_str)?
+            .to_string();
+        let protocol = provider
+            .get(&serde_yaml::Value::String("protocol".to_string()))
+            .and_then(serde_yaml::Value::as_str)
+            .map(ToString::to_string);
+        return Some(ProviderConfig {
+            base_url,
+            api_key,
+            models,
+            name,
+            protocol,
+        });
+    }
+    None
+}
+
 fn live_env() -> Option<LiveEnv> {
     if std::env::var("COWD_AI_HARNESS_LIVE").ok().as_deref() != Some("1") {
         eprintln!("skipping live provider test; set COWD_AI_HARNESS_LIVE=1");
@@ -272,7 +328,8 @@ fn live_env() -> Option<LiveEnv> {
         .ok()
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
         .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or OPENAI_MODEL");
-    let provider = fallback_provider_from_env(&model)
+    let provider = provider_from_cowd_config(&model)
+        .or_else(|| fallback_provider_from_env(&model))
         .unwrap_or_else(|| panic!("no provider configured for live model {model:?}"));
     let provider_name = provider.name.clone();
     let client = ProviderClient::from_config(&provider).expect("provider client should build");

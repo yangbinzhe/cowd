@@ -10,13 +10,14 @@ use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
 };
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
-use crate::session_kernel::SessionKernel;
+use crate::session_kernel::{RuntimeCommand, SessionKernel};
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use harness_contract::{
     task::{TaskId, TaskTurnBinding},
     turn::{
-        TurnEvent, TurnId, TurnInput, TurnJournalEnvelope, TurnJournalPhase, TurnReceipt,
-        TurnStatus,
+        InputRoutingDecision, SessionInputEnvelope, SessionInputId, SessionInputProjection,
+        SessionInputReceipt, TurnEvent, TurnId, TurnInboxSnapshot, TurnInput, TurnJournalEnvelope,
+        TurnJournalPhase, TurnReceipt, TurnStatus,
     },
 };
 use runtime::agent_collaboration::CollaborationContextResult;
@@ -105,6 +106,17 @@ fn restore_scoped_max_iterations<T: RuntimeTurnBudgetTarget>(
     }
 }
 
+fn extract_session_target_ref(content: &str) -> Option<&str> {
+    let marker = "@session:";
+    let start = content.find(marker)? + marker.len();
+    let rest = content[start..].trim_start();
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+        .unwrap_or(rest.len());
+    let target = rest[..end].trim();
+    (!target.is_empty()).then_some(target)
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<ActiveSessions>,
@@ -114,6 +126,15 @@ pub(crate) struct RuntimeService {
     started_at: Instant,
     turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
     turn_bindings: Arc<Mutex<BTreeMap<String, TaskTurnBinding>>>,
+    session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
+    session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
+    session_models: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionInputAdmission {
+    pub(crate) receipt: SessionInputReceipt,
+    pub(crate) materialized: Option<serde_json::Value>,
 }
 
 impl RuntimeService {
@@ -133,6 +154,9 @@ impl RuntimeService {
             started_at,
             turns: Arc::new(Mutex::new(BTreeMap::new())),
             turn_bindings: Arc::new(Mutex::new(BTreeMap::new())),
+            session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
+            session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
+            session_models: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -422,13 +446,60 @@ impl RuntimeService {
         runtime: crate::runtime_entry::GatewayRuntimeEntry,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>>, String>
     {
-        self.sessions.register(session_id, runtime)
+        let input_stream = runtime.session_input_stream();
+        let cowd_bus = runtime.cowd_bus().cloned();
+        let model = runtime
+            .session()
+            .model
+            .filter(|model| !model.trim().is_empty());
+        let result = self.sessions.register(session_id.clone(), runtime);
+        if result.is_ok() {
+            self.session_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.clone(), input_stream);
+            if let Some(model) = model {
+                self.session_models
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(session_id.clone(), model);
+            } else {
+                self.session_models
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session_id);
+            }
+            if let Some(cowd_bus) = cowd_bus {
+                self.session_event_buses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(session_id, cowd_bus);
+            } else {
+                self.session_event_buses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session_id);
+            }
+        }
+        result
     }
 
     pub(crate) fn remove_active_runtime(
         &self,
         session_id: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>> {
+        self.session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.session_event_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         self.sessions.remove(session_id)
     }
 
@@ -443,6 +514,518 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
         runtime_guard.cowd_bus().map(|bus| bus.subscribe())
+    }
+
+    pub(crate) async fn admit_session_input(
+        &self,
+        envelope: SessionInputEnvelope,
+    ) -> Result<SessionInputReceipt, RuntimeTurnExecutionError> {
+        self.admit_session_input_with_materialized(envelope)
+            .await
+            .map(|admission| admission.receipt)
+    }
+
+    pub(crate) async fn admit_session_input_with_materialized(
+        &self,
+        envelope: SessionInputEnvelope,
+    ) -> Result<SessionInputAdmission, RuntimeTurnExecutionError> {
+        let session_id = envelope.session_id.clone();
+        let content = envelope.content.clone();
+        let stream = self.session_input_stream_for(&session_id).await?;
+        let receipt = stream.admit(envelope, stream.runtime_state());
+        let materialized = self
+            .materialize_session_input_decision(&session_id, &receipt, &content)
+            .await;
+        let materialized_for_event = materialized.clone();
+        let record_for_event = stream.record_snapshot(&receipt.input_id);
+        self.emit_session_input_events(&session_id, &stream, Some(receipt.clone()));
+        if let Some(materialized) = materialized {
+            self.emit_session_input_materialized(&session_id, materialized);
+        }
+        self.persist_session_input_runtime_event(
+            &session_id,
+            "SessionInputReceived",
+            Some(&receipt),
+            record_for_event.as_ref(),
+            &stream,
+            materialized_for_event.as_ref(),
+        )
+        .await;
+        Ok(SessionInputAdmission {
+            receipt,
+            materialized: materialized_for_event,
+        })
+    }
+
+    pub(crate) async fn cancel_session_input(
+        &self,
+        session_id: &str,
+        input_id: SessionInputId,
+        reason: &str,
+    ) -> Result<SessionInputReceipt, RuntimeTurnExecutionError> {
+        let stream = self.session_input_stream_for(session_id).await?;
+        let record = stream
+            .cancel_input(&input_id, reason)
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+        let receipt = record.to_receipt();
+        self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
+        self.persist_session_input_runtime_event(
+            session_id,
+            "SessionInputCancelled",
+            Some(&receipt),
+            Some(&record),
+            &stream,
+            None,
+        )
+        .await;
+        Ok(receipt)
+    }
+
+    pub(crate) async fn reclassify_session_input(
+        &self,
+        session_id: &str,
+        input_id: SessionInputId,
+        decision: InputRoutingDecision,
+        reason: &str,
+    ) -> Result<SessionInputReceipt, RuntimeTurnExecutionError> {
+        let stream = self.session_input_stream_for(session_id).await?;
+        let record = stream
+            .reclassify_input(&input_id, decision, reason)
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+        let receipt = record.to_receipt();
+        let materialized = self
+            .materialize_session_input_decision(session_id, &receipt, &record.envelope.content)
+            .await;
+        let materialized_for_event = materialized.clone();
+        self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
+        if let Some(materialized) = materialized {
+            self.emit_session_input_materialized(session_id, materialized);
+        }
+        self.persist_session_input_runtime_event(
+            session_id,
+            "SessionInputReclassified",
+            Some(&receipt),
+            Some(&record),
+            &stream,
+            materialized_for_event.as_ref(),
+        )
+        .await;
+        Ok(receipt)
+    }
+
+    async fn materialize_session_input_decision(
+        &self,
+        session_id: &str,
+        receipt: &SessionInputReceipt,
+        content: &str,
+    ) -> Option<serde_json::Value> {
+        match receipt.decision {
+            InputRoutingDecision::SpawnSubtask => {
+                let task = runtime::AgentTask {
+                    task_id: String::new(),
+                    team_id: format!("session-input-team-{session_id}"),
+                    session_id: session_id.to_string(),
+                    role_id: "runtime-delegated-agent".to_string(),
+                    agent_id: None,
+                    objective: content.to_string(),
+                    expected_output:
+                        "Inspect the delegated request and report progress back to the parent session."
+                            .to_string(),
+                    context_refs: receipt.evidence_refs.clone(),
+                    evidence_refs: receipt.evidence_refs.clone(),
+                    status: runtime::AgentTaskStatus::Pending,
+                    outcome: None,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                };
+                let task_receipt = runtime::global_agent_task_mailbox().assign(task);
+                Some(serde_json::json!({
+                    "kind": "session_input.spawn_subtask",
+                    "input_id": receipt.input_id.to_string(),
+                    "task_receipt": task_receipt,
+                }))
+            }
+            InputRoutingDecision::RouteCrossSession => {
+                let target_ref = extract_session_target_ref(content).unwrap_or("active");
+                let bridge = runtime::SessionExecutionPlane::bridge(runtime::CrossSessionMessage {
+                    from_session_id: session_id.to_string(),
+                    target_ref: target_ref.to_string(),
+                    command: content.to_string(),
+                    actor: Some("session_input_stream".to_string()),
+                    evidence_refs: receipt.evidence_refs.clone(),
+                });
+                Some(serde_json::json!({
+                    "kind": "session_input.route_cross_session",
+                    "input_id": receipt.input_id.to_string(),
+                    "bridge": bridge,
+                }))
+            }
+            InputRoutingDecision::CreateNewSession => {
+                let session = self
+                    .create_session_from_input(session_id, receipt, content)
+                    .await;
+                Some(serde_json::json!({
+                    "kind": "session_input.create_new_session",
+                    "input_id": receipt.input_id.to_string(),
+                    "status": "created",
+                    "session": session,
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    async fn create_session_from_input(
+        &self,
+        parent_session_id: &str,
+        receipt: &SessionInputReceipt,
+        content: &str,
+    ) -> serde_json::Value {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let model = self
+            .model_for_session(parent_session_id)
+            .await
+            .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+        let runtime = match self.build_session_runtime_entry(&session_id, &model) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(
+                    %parent_session_id,
+                    %session_id,
+                    error = %error,
+                    "failed to build input-created session runtime"
+                );
+                let lifecycle = match self
+                    .persist_input_created_session_lifecycle(&session_id, Some(model.clone()))
+                    .await
+                {
+                    Ok(lifecycle) => lifecycle,
+                    Err(lifecycle_error) => {
+                        return serde_json::json!({
+                            "created": false,
+                            "session_id": session_id,
+                            "model": model,
+                            "runtime_registered": false,
+                            "error": format!("failed to build runtime: {error}"),
+                            "lifecycle_error": lifecycle_error,
+                        });
+                    }
+                };
+                return serde_json::json!({
+                    "created": true,
+                    "session_id": session_id,
+                    "model": model,
+                    "runtime_registered": false,
+                    "degraded_reason": format!("failed to build runtime: {error}"),
+                    "lifecycle": lifecycle,
+                    "error": format!("failed to build runtime: {error}"),
+                });
+            }
+        };
+
+        if let Err(error) = self.register_runtime(session_id.clone(), runtime) {
+            tracing::warn!(
+                %parent_session_id,
+                %session_id,
+                error = %error,
+                "failed to register input-created session runtime"
+            );
+            return serde_json::json!({
+                "created": false,
+                "session_id": session_id,
+                "error": format!("failed to register runtime: {error}"),
+            });
+        }
+
+        let lifecycle = match self
+            .persist_input_created_session_lifecycle(&session_id, Some(model.clone()))
+            .await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                self.remove_active_runtime_if_present(&session_id);
+                tracing::warn!(
+                    %parent_session_id,
+                    %session_id,
+                    error = %error,
+                    "failed to persist input-created session lifecycle"
+                );
+                return serde_json::json!({
+                    "created": false,
+                    "session_id": session_id,
+                    "error": format!("failed to persist session lifecycle: {error}"),
+                });
+            }
+        };
+
+        let event_sequence = self
+            .session_kernel
+            .append_runtime_event(
+                &session_id,
+                memory::RuntimeEventScope::Session,
+                "SessionInputCreatedSession",
+                serde_json::json!({
+                    "parent_session_id": parent_session_id,
+                    "source_input_id": receipt.input_id.to_string(),
+                    "source_evidence_refs": receipt.evidence_refs.clone(),
+                    "initial_content_preview": content.chars().take(240).collect::<String>(),
+                }),
+            )
+            .await
+            .ok()
+            .flatten();
+        let lifecycle_event = self.lifecycle_kernel.mark_active(&session_id).await.ok();
+        let lifecycle_snapshot = self.lifecycle_kernel.snapshot(&session_id).await;
+
+        serde_json::json!({
+            "created": true,
+            "session_id": session_id,
+            "parent_session_id": parent_session_id,
+            "model": model,
+            "runtime_registered": true,
+            "lifecycle": lifecycle,
+            "lifecycle_event": lifecycle_event,
+            "lifecycle_snapshot": lifecycle_snapshot,
+            "event_sequence": event_sequence,
+        })
+    }
+
+    async fn persist_input_created_session_lifecycle(
+        &self,
+        session_id: &str,
+        model: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.session_kernel
+            .execute_runtime_command(RuntimeCommand::CreateSession {
+                session_id: session_id.to_string(),
+                model,
+            })
+            .await
+            .map(|result| {
+                serde_json::json!({
+                    "persisted": result.persisted,
+                    "runtime_event_sequence": result.runtime_event_sequence,
+                    "kind": result.kind,
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn build_session_runtime_entry(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
+        let session = runtime::Session::new();
+        if let Some(store) = self.session_kernel.unified_store() {
+            crate::runtime_factory::create_runtime_entry_with_session_store(
+                store,
+                session,
+                session_id,
+                model.to_string(),
+                vec![],
+                true,
+                true,
+                None,
+                runtime::PermissionMode::WorkspaceWrite,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())
+        } else {
+            crate::runtime_factory::create_runtime_entry(
+                session,
+                session_id,
+                model.to_string(),
+                vec![],
+                true,
+                true,
+                None,
+                runtime::PermissionMode::WorkspaceWrite,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    async fn model_for_session(&self, session_id: &str) -> Option<String> {
+        if let Some(model) = self
+            .session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .filter(|model| !model.trim().is_empty())
+        {
+            return Some(model);
+        }
+        let runtime_entry = self.sessions.get(session_id)?;
+        let runtime_guard = runtime_entry.lock().await;
+        let model = runtime_guard
+            .session()
+            .model
+            .filter(|model| !model.trim().is_empty());
+        if let Some(model) = model.as_ref() {
+            self.session_models
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), model.clone());
+        }
+        model
+    }
+
+    fn emit_session_input_materialized(&self, session_id: &str, materialized: serde_json::Value) {
+        let Some(bus) = self
+            .session_event_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        else {
+            return;
+        };
+        bus.emit(runtime::CowdEvent::Warning {
+            message: format!("session input materialized: {materialized}"),
+        });
+    }
+
+    pub(crate) async fn session_input_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionInputProjection, RuntimeTurnExecutionError> {
+        let stream = self.session_input_stream_for(session_id).await?;
+        Ok(stream.projection())
+    }
+
+    pub(crate) async fn active_turn_inbox(
+        &self,
+        session_id: &str,
+        turn_id: Option<TurnId>,
+    ) -> Result<TurnInboxSnapshot, RuntimeTurnExecutionError> {
+        let stream = self.session_input_stream_for(session_id).await?;
+        Ok(stream.inbox_snapshot(turn_id))
+    }
+
+    async fn session_input_stream_for(
+        &self,
+        session_id: &str,
+    ) -> Result<runtime::SessionInputStream, RuntimeTurnExecutionError> {
+        if let Some(stream) = self
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        {
+            return Ok(stream);
+        }
+        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
+            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
+        })?;
+        let runtime_guard = runtime_entry.lock().await;
+        let stream = runtime_guard.session_input_stream();
+        self.session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), stream.clone());
+        if let Some(bus) = runtime_guard.cowd_bus().cloned() {
+            self.session_event_buses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), bus);
+        }
+        Ok(stream)
+    }
+
+    fn emit_session_input_events(
+        &self,
+        session_id: &str,
+        stream: &runtime::SessionInputStream,
+        receipt: Option<SessionInputReceipt>,
+    ) {
+        let Some(bus) = self
+            .session_event_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(receipt) = receipt {
+            bus.emit(runtime::CowdEvent::SessionInputReceived { receipt });
+        }
+        bus.emit(runtime::CowdEvent::SessionInputProjection {
+            projection: stream.projection(),
+        });
+        bus.emit(runtime::CowdEvent::TurnInboxUpdated {
+            inbox: stream.inbox_snapshot(None),
+        });
+    }
+
+    async fn persist_session_input_runtime_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        receipt: Option<&SessionInputReceipt>,
+        record: Option<&runtime::SessionInputRecord>,
+        stream: &runtime::SessionInputStream,
+        materialized: Option<&serde_json::Value>,
+    ) {
+        if let Err(error) = self.ensure_runtime_event_session(session_id).await {
+            tracing::warn!(
+                %session_id,
+                %kind,
+                error = %error,
+                "failed to ensure session before persisting session input runtime event"
+            );
+            return;
+        }
+        if let Err(error) = self
+            .session_kernel
+            .append_runtime_event(
+                session_id,
+                memory::RuntimeEventScope::Turn,
+                kind,
+                serde_json::json!({
+                    "input": receipt,
+                    "record": record,
+                    "input_projection": stream.projection(),
+                    "turn_inbox": stream.inbox_snapshot(None),
+                    "materialized": materialized,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                %session_id,
+                %kind,
+                error = %error,
+                "failed to persist session input runtime event"
+            );
+        }
+    }
+
+    async fn ensure_runtime_event_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), memory::MemoryError> {
+        if self
+            .session_kernel
+            .stored_session(session_id)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let model = self.model_for_session(session_id).await;
+        let command = RuntimeCommand::CreateSession {
+            session_id: session_id.to_string(),
+            model,
+        };
+        self.session_kernel.execute_runtime_command(command).await?;
+        Ok(())
     }
 
     pub(crate) async fn configure_turn_context(
@@ -509,10 +1092,31 @@ impl RuntimeService {
         turn_timeout: Duration,
         options: RuntimeTurnOptions,
     ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
-        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
-            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
-        })?;
-        let input = Self::turn_input_for(Some(session_id.to_string()), task_id, content.clone());
+        let receipt = self
+            .accept_turn_with_options(session_id, task_id, content.clone())
+            .await?;
+        self.run_accepted_turn_with_options(
+            session_id,
+            receipt.turn_id.clone(),
+            content,
+            turn_timeout,
+            options,
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_turn_with_options(
+        &self,
+        session_id: &str,
+        task_id: Option<String>,
+        content: String,
+    ) -> Result<TurnReceipt, RuntimeTurnExecutionError> {
+        if self.sessions.get(session_id).is_none() {
+            return Err(RuntimeTurnExecutionError::NotFound(format!(
+                "session {session_id} not found"
+            )));
+        }
+        let input = Self::turn_input_for(Some(session_id.to_string()), task_id, content);
         self.record_turn_from_input(&input, TurnStatus::Pending);
         if let Some(Err(error)) = self
             .persist_turn_input_journal(&input, TurnJournalPhase::Submitted, None)
@@ -531,7 +1135,25 @@ impl RuntimeService {
                 "failed to persist running turn journal: {error}"
             )));
         }
-        let turn_id = receipt.turn_id.clone();
+        if let Ok(stream) = self.session_input_stream_for(session_id).await {
+            stream.set_active_turn(Some(receipt.turn_id.clone()));
+            self.emit_session_input_events(session_id, &stream, None);
+        }
+        Ok(receipt)
+    }
+
+    pub(crate) async fn run_accepted_turn_with_options(
+        &self,
+        session_id: &str,
+        turn_id: TurnId,
+        content: String,
+        turn_timeout: Duration,
+        options: RuntimeTurnOptions,
+    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
+        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
+            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
+        })?;
+        let queued_next_options = options.clone();
         let turn_result = tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -576,10 +1198,27 @@ impl RuntimeService {
                         "failed to persist completed turn journal"
                     );
                 }
+                if let Some(stream) = self
+                    .session_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(session_id)
+                    .cloned()
+                {
+                    let queued_next = stream.drain_queued_next_for_dispatch(4);
+                    self.emit_session_input_events(session_id, &stream, None);
+                    self.dispatch_queued_next_turns(
+                        session_id.to_string(),
+                        queued_next,
+                        turn_timeout,
+                        queued_next_options,
+                    );
+                }
                 Ok(RuntimeTurnExecution { summary, receipt })
             }
             Ok(Err(error)) => {
                 let message = error.to_string();
+                self.clear_session_input_turn_if_current(session_id, &turn_id);
                 let receipt = self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
                 if let Some(Err(error)) = self
                     .persist_turn_receipt_journal(
@@ -599,6 +1238,7 @@ impl RuntimeService {
             }
             Err(_) => {
                 let message = format!("turn timed out after {}s", turn_timeout.as_secs());
+                self.clear_session_input_turn_if_current(session_id, &turn_id);
                 let receipt = self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
                 if let Some(Err(error)) = self
                     .persist_turn_receipt_journal(
@@ -618,6 +1258,63 @@ impl RuntimeService {
                     seconds: turn_timeout.as_secs(),
                 })
             }
+        }
+    }
+
+    fn clear_session_input_turn_if_current(&self, session_id: &str, turn_id: &TurnId) {
+        let Some(stream) = self
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        else {
+            return;
+        };
+        if stream.active_turn_id().as_ref() == Some(turn_id) {
+            stream.set_active_turn(None);
+            self.emit_session_input_events(session_id, &stream, None);
+        }
+    }
+
+    fn dispatch_queued_next_turns(
+        &self,
+        session_id: String,
+        records: Vec<runtime::SessionInputRecord>,
+        turn_timeout: Duration,
+        options: RuntimeTurnOptions,
+    ) {
+        for record in records {
+            let service = self.clone();
+            let prompt = record.envelope.content.clone();
+            let task_id = None;
+            let session_id = session_id.clone();
+            let options = options.clone();
+            tokio::spawn(async move {
+                let Ok(receipt) = service
+                    .accept_turn_with_options(&session_id, task_id, prompt.clone())
+                    .await
+                else {
+                    return;
+                };
+                if let Err(error) = service
+                    .run_accepted_turn_with_options(
+                        &session_id,
+                        receipt.turn_id.clone(),
+                        prompt,
+                        turn_timeout,
+                        options,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %session_id,
+                        turn_id = %receipt.turn_id,
+                        error = %error.message(),
+                        "queued next turn failed"
+                    );
+                }
+            });
         }
     }
 
@@ -922,6 +1619,10 @@ impl RuntimeService {
         };
         let mut runtime_guard = runtime_entry.lock().await;
         runtime_guard.update_session_model(model).await;
+        self.session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), model.to_string());
         true
     }
 
@@ -1132,6 +1833,150 @@ mod tests {
         assert_eq!(payload["phase"], "submitted");
         assert_eq!(payload["payload"]["prompt"], "persist this turn");
         assert_eq!(payload["payload"]["task_id"], "task-a");
+    }
+
+    #[tokio::test]
+    async fn runtime_service_persists_session_input_runtime_event() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let active_sessions = Arc::new(ActiveSessions::default());
+        let service = RuntimeService::new(
+            active_sessions.clone(),
+            Arc::new(SessionLeaseRegistry::default()),
+            Arc::new(SessionKernel::new(
+                active_sessions,
+                Some(store.clone()),
+                crate::event_bus::SessionEventBus::new(),
+            )),
+            Arc::new(SessionLifecycleKernel::new()),
+            Instant::now(),
+        );
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                "input-session".to_string(),
+                runtime::SessionInputStream::new("input-session"),
+            );
+
+        let receipt = service
+            .admit_session_input(harness_contract::turn::SessionInputEnvelope::text(
+                "input-session",
+                harness_contract::turn::InputSourceKind::Api,
+                "remember this during the current work",
+            ))
+            .await
+            .expect("admit input");
+
+        assert_eq!(receipt.session_id, "input-session");
+        let page = store
+            .runtime_events_page("input-session", 0, 10)
+            .await
+            .expect("runtime events page");
+        let event = page
+            .events
+            .iter()
+            .find(|event| event.kind == "SessionInputReceived")
+            .expect("session input event persisted");
+        assert_eq!(
+            event.payload["input"]["input_id"],
+            receipt.input_id.to_string()
+        );
+        assert_eq!(
+            event.payload["record"]["envelope"]["content"],
+            "remember this during the current work"
+        );
+        assert_eq!(event.payload["input_projection"]["total"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_new_session_input_materializes_real_session() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let active_sessions = Arc::new(ActiveSessions::default());
+        let service = RuntimeService::new(
+            active_sessions.clone(),
+            Arc::new(SessionLeaseRegistry::default()),
+            Arc::new(SessionKernel::new(
+                active_sessions,
+                Some(store.clone()),
+                crate::event_bus::SessionEventBus::new(),
+            )),
+            Arc::new(SessionLifecycleKernel::new()),
+            Instant::now(),
+        );
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                "parent-session".to_string(),
+                runtime::SessionInputStream::new("parent-session"),
+            );
+        service
+            .session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("parent-session".to_string(), "qwen3.6-plus".to_string());
+
+        let admission = service
+            .admit_session_input_with_materialized(
+                harness_contract::turn::SessionInputEnvelope::text(
+                    "parent-session",
+                    harness_contract::turn::InputSourceKind::Api,
+                    "start a new session for independent follow-up work",
+                ),
+            )
+            .await
+            .expect("admit input");
+        let receipt = admission.receipt;
+
+        assert_eq!(
+            receipt.decision,
+            harness_contract::turn::InputRoutingDecision::CreateNewSession
+        );
+        assert_eq!(
+            receipt.status,
+            harness_contract::turn::SessionInputStatus::NewSessionCreated
+        );
+        let admission_materialized = admission
+            .materialized
+            .as_ref()
+            .expect("admission should include materialized session payload");
+        assert_eq!(
+            admission_materialized["kind"],
+            "session_input.create_new_session"
+        );
+        assert_eq!(admission_materialized["session"]["model"], "qwen3.6-plus");
+        let page = store
+            .runtime_events_page("parent-session", 0, 10)
+            .await
+            .expect("parent runtime events page");
+        let session_input_event = page
+            .events
+            .iter()
+            .find(|event| event.kind == "SessionInputReceived")
+            .expect("session input event persisted");
+        let materialized = &session_input_event.payload["materialized"]["session"];
+        assert_eq!(materialized["created"], true);
+        assert_eq!(materialized["lifecycle_snapshot"]["state"], "active");
+        let new_session_id = materialized["session_id"]
+            .as_str()
+            .expect("materialized session id");
+        assert_ne!(new_session_id, "parent-session");
+        assert!(store
+            .get_session(new_session_id)
+            .await
+            .expect("read created session")
+            .is_some());
+        if materialized["runtime_registered"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            assert!(service
+                .sessions
+                .list()
+                .contains(&new_session_id.to_string()));
+        }
     }
 
     #[test]

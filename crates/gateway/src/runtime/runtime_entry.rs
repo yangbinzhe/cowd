@@ -97,6 +97,10 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().cowd_bus()
     }
 
+    pub(crate) fn session_input_stream(&self) -> runtime::SessionInputStream {
+        self.runtime_ref().session_input_stream()
+    }
+
     pub(crate) fn set_context_profile(&self, profile: runtime::ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
     }

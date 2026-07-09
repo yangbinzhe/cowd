@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
 use memory::SessionRecord;
 use sha2::{Digest, Sha256};
 use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
@@ -82,7 +83,7 @@ async fn handle_surface_message(
         .ok_or_else(|| "surface message has no text content".to_string())?;
     let session_id = surface_session_id(&surface, &payload);
     let session_lock = surface_session_lock(&session_locks, &session_id).await;
-    let _session_guard = session_lock.lock().await;
+    let session_guard = session_lock.lock().await;
     let user_id = payload_string(&payload, "user_id");
     let thread_id = payload_string(&payload, "thread_id");
     let metadata = payload
@@ -158,10 +159,67 @@ async fn handle_surface_message(
     let pre_messages = surface_runtime_pre_messages(&content, &current_media, &recent_media);
     let runtime_content = surface_runtime_content(&content, &current_resources, &recent_resources);
     let turn_policy = surface_turn_policy(&runtime_content);
-    let execution = match runtime_service
-        .run_turn_with_options(
+    if runtime_service
+        .session_input_projection(&session_id)
+        .await
+        .map_err(|error| error.message())?
+        .active_turn_id
+        .is_some()
+    {
+        let receipt = runtime_service
+            .admit_session_input(
+                SessionInputEnvelope::text(
+                    session_id.clone(),
+                    InputSourceKind::Surface,
+                    runtime_content,
+                )
+                .with_source_ref(format!("surface:{surface}"))
+                .with_source_message_id(message_id.clone())
+                .with_idempotency_key(inbox.record.idempotency_key.clone())
+                .with_metadata(serde_json::json!({
+                    "surface": surface.clone(),
+                    "thread_id": thread_id.clone(),
+                    "user_id": user_id.clone(),
+                    "payload_metadata": metadata,
+                })),
+            )
+            .await
+            .map_err(|error| error.message())?;
+        state.services.surface.mark_inbox_processed(
+            &inbox.record.idempotency_key,
+            receipt.active_turn_id.as_ref().map(ToString::to_string),
+        )?;
+        append_surface_timeline_event(
+            &state,
             &session_id,
+            "SurfaceMessageAttachedToActiveTurn",
+            serde_json::json!({
+                "type": "SurfaceMessageAttachedToActiveTurn",
+                "surface": surface.clone(),
+                "message_id": message_id.clone(),
+                "input_receipt": receipt,
+            }),
+        )
+        .await?;
+        notify_surface_processing_lifecycle(
+            &state,
+            &surface,
+            MessageActionKind::ProcessingComplete.as_str(),
+            &message_id,
             None,
+        )
+        .await;
+        return Ok(());
+    }
+    drop(session_guard);
+    let accepted_turn = runtime_service
+        .accept_turn_with_options(&session_id, None, runtime_content.clone())
+        .await
+        .map_err(|error| error.message())?;
+    let execution = match runtime_service
+        .run_accepted_turn_with_options(
+            &session_id,
+            accepted_turn.turn_id.clone(),
             runtime_content,
             turn_policy.timeout,
             RuntimeTurnOptions {
