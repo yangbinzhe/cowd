@@ -339,15 +339,26 @@ impl GatewayPanel {
                     .and_then(|value| value.get("count"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or_default();
+                let active = payload
+                    .get("active_capabilities")
+                    .and_then(|value| value.get("active_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let installed = payload
+                    .get("active_capabilities")
+                    .and_then(|value| value.get("count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
                 self.evolution_status = Some(
-                    if signals + diagnoses + missions + proposals + candidates + evals > 0 {
+                    if signals + diagnoses + missions + proposals + candidates + evals + active > 0
+                    {
                         "active".to_string()
                     } else {
                         "empty".to_string()
                     },
                 );
                 self.evolution_summary = Some(format!(
-                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} sandbox={evals}"
+                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} sandbox={evals} active={active}/{installed}"
                 ));
                 self.action_status = Some("evolution.overview succeeded".to_string());
                 self.action_receipt = Some(gateway_receipt_summary(&payload));
@@ -1642,6 +1653,28 @@ mod tests {
             joined.contains("Lease") && joined.contains("tui:42"),
             "Should show runtime lease summary, got: {joined}"
         );
+    }
+
+    #[test]
+    fn evolution_overview_summary_includes_active_capabilities() {
+        let mut panel = GatewayPanel::new();
+        panel.record_evolution_overview(Ok(serde_json::json!({
+            "kind": "evolution.overview",
+            "signals": {"count": 1},
+            "diagnoses": {"count": 1},
+            "missions": {"count": 1},
+            "proposals": {"count": 1},
+            "candidates": {"count": 1},
+            "sandbox_evals": {"count": 1},
+            "active_capabilities": {"count": 2, "active_count": 1}
+        })));
+
+        assert_eq!(panel.evolution_status.as_deref(), Some("active"));
+        assert!(panel
+            .evolution_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("active=1/2"));
     }
 
     #[test]

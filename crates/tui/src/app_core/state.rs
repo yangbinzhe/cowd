@@ -2418,6 +2418,7 @@ impl TuiState {
                     let proposals = client.evolution_proposals().await?;
                     let candidates = client.evolution_candidates().await?;
                     let sandbox_evals = client.evolution_sandbox_evals().await?;
+                    let active_capabilities = client.evolution_active_capabilities().await?;
                     Ok(serde_json::json!({
                         "kind": "evolution.overview",
                         "signals": signals,
@@ -2426,6 +2427,7 @@ impl TuiState {
                         "proposals": proposals,
                         "candidates": candidates,
                         "sandbox_evals": sandbox_evals,
+                        "active_capabilities": active_capabilities,
                     }))
                 });
                 self.gateway_panel.record_evolution_overview(result);

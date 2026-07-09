@@ -1,4 +1,5 @@
 pub mod adoption;
+pub mod applied_registry;
 pub mod artifact_builder;
 pub mod candidate;
 pub mod candidate_generator;
@@ -24,6 +25,7 @@ pub mod versioning;
 pub mod worktree_runner;
 
 pub use adoption::{EvolutionAdoptionManager, EvolutionAdoptionReceipt};
+pub use applied_registry::{EvolutionAppliedCapabilityRecord, EvolutionAppliedCapabilityRegistry};
 pub use artifact_builder::{EvolutionArtifactBuilder, EvolutionGeneratedArtifact};
 pub use candidate::{
     EvolutionCandidate, EvolutionCandidatePlan, EvolutionCandidateStatus, EvolutionCandidateStore,

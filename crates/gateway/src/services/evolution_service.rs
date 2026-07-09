@@ -676,6 +676,9 @@ impl EvolutionService {
         if let Some(version) = receipt.version_record.as_ref() {
             append_jsonl(&version_store_path(config_home), version)?;
         }
+        let applied_capability = active_capability_registry(config_home)
+            .apply_promotion(&candidate, &receipt)
+            .map_err(EvolutionServiceError::Internal)?;
         let memory = runtime::EvolutionMemoryBridge::from_promotion(&candidate, &receipt);
         append_jsonl(&evolution_memory_store_path(config_home), &memory)?;
         let updated = candidate_store(config_home)
@@ -692,6 +695,7 @@ impl EvolutionService {
             "envelope": self.envelope("candidate_promote"),
             "candidate": updated,
             "promotion": receipt,
+            "applied_capability": applied_capability,
             "memory": memory,
         }))
     }
@@ -704,6 +708,26 @@ impl EvolutionService {
             "envelope": self.envelope("adoptions"),
             "count": promotions.len(),
             "adoptions": promotions,
+        }))
+    }
+
+    pub(crate) fn active_capabilities(
+        &self,
+        config_home: &Path,
+    ) -> Result<Value, EvolutionServiceError> {
+        let registry = active_capability_registry(config_home);
+        let capabilities = registry.list().map_err(EvolutionServiceError::Internal)?;
+        let active_count = capabilities
+            .iter()
+            .filter(|capability| capability.status == "active")
+            .count();
+        Ok(json!({
+            "kind": "evolution.active_capabilities",
+            "envelope": self.envelope("active_capabilities"),
+            "store": registry.path().display().to_string(),
+            "count": capabilities.len(),
+            "active_count": active_count,
+            "capabilities": capabilities,
         }))
     }
 
@@ -722,12 +746,16 @@ impl EvolutionService {
             })?;
         let receipt = runtime::EvolutionRollbackManager::rollback(&version);
         append_jsonl(&rollback_store_path(config_home), &receipt)?;
+        let applied_capability = active_capability_registry(config_home)
+            .rollback_version(&receipt)
+            .map_err(EvolutionServiceError::Internal)?;
         let memory = runtime::EvolutionMemoryBridge::from_rollback(&receipt);
         append_jsonl(&evolution_memory_store_path(config_home), &memory)?;
         Ok(json!({
             "kind": "evolution.rollback",
             "envelope": self.envelope("version_rollback"),
             "rollback": receipt,
+            "applied_capability": applied_capability,
             "memory": memory,
         }))
     }
@@ -787,6 +815,7 @@ impl EvolutionService {
             self.envelope("candidate_decision"),
             self.envelope("candidate_promote"),
             self.envelope("adoptions"),
+            self.envelope("active_capabilities"),
             self.envelope("version_rollback"),
             self.envelope("evolution_memory"),
             self.envelope("sandbox_evals"),
@@ -825,6 +854,10 @@ fn sandbox_store(config_home: &Path) -> runtime::EvolutionSandboxStore {
 
 fn candidate_store(config_home: &Path) -> runtime::EvolutionCandidateStore {
     runtime::EvolutionCandidateStore::new(evolution_root(config_home))
+}
+
+fn active_capability_registry(config_home: &Path) -> runtime::EvolutionAppliedCapabilityRegistry {
+    runtime::EvolutionAppliedCapabilityRegistry::new(evolution_root(config_home))
 }
 
 fn runner_store_path(config_home: &Path) -> std::path::PathBuf {
@@ -1067,16 +1100,26 @@ mod tests {
             .expect("promotion");
         assert_eq!(promotion["promotion"]["accepted"], true);
         assert!(promotion["promotion"]["version_record"].is_object());
+        assert_eq!(promotion["applied_capability"]["status"], "active");
         let version_id = promotion["promotion"]["version_record"]["version_id"]
             .as_str()
             .expect("version id");
+        let active = service
+            .active_capabilities(&config_home)
+            .expect("active capabilities");
+        assert_eq!(active["active_count"], 1);
 
         let rollback = service
             .rollback_version(&config_home, version_id)
             .expect("rollback");
         assert_eq!(rollback["kind"], "evolution.rollback");
         assert_eq!(rollback["rollback"]["accepted"], true);
+        assert_eq!(rollback["applied_capability"]["status"], "rolled_back");
         assert_eq!(rollback["memory"]["kind"], "recovery_pattern");
+        let active = service
+            .active_capabilities(&config_home)
+            .expect("active capabilities after rollback");
+        assert_eq!(active["active_count"], 0);
 
         let decision = service
             .decide_proposal(

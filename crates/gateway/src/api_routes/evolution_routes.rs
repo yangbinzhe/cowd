@@ -100,6 +100,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/evolution/adoptions", get(evolution_adoptions_handler))
         .route(
+            "/api/evolution/active-capabilities",
+            get(evolution_active_capabilities_handler),
+        )
+        .route(
             "/api/evolution/versions/:id/rollback",
             post(evolution_version_rollback_handler),
         )
@@ -392,6 +396,17 @@ async fn evolution_adoptions_handler(
         .services
         .evolution
         .adoptions(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_active_capabilities_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .evolution
+        .active_capabilities(&state.config_home)
         .map(Json)
         .map_err(evolution_error)
 }

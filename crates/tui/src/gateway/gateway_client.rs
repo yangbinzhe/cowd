@@ -1526,6 +1526,12 @@ impl GatewayApiClient {
         self.get_json("/api/evolution/adoptions").await
     }
 
+    pub async fn evolution_active_capabilities(
+        &self,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/active-capabilities").await
+    }
+
     pub async fn evolution_version_rollback(
         &self,
         version_id: &str,
@@ -2283,6 +2289,7 @@ mod tests {
             "evolution_candidate_comparison",
             "evolution_candidate_promote",
             "evolution_adoptions",
+            "evolution_active_capabilities",
             "evolution_version_rollback",
             "evolution_memory",
             "evolution_sandbox_evals",
@@ -2305,7 +2312,7 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 128);
+        assert_eq!(migrated.len(), 129);
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
@@ -2333,11 +2340,12 @@ mod tests {
             "evolution_candidate_comparison",
             "evolution_candidate_promote",
             "evolution_adoptions",
+            "evolution_active_capabilities",
             "evolution_version_rollback",
             "evolution_memory",
             "evolution_sandbox_evals",
         ];
-        assert_eq!(evolution_methods.len(), 22);
+        assert_eq!(evolution_methods.len(), 23);
         assert!(evolution_methods
             .iter()
             .all(|method| method.starts_with("evolution_")));
