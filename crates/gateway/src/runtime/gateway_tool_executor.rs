@@ -126,12 +126,14 @@ impl GatewayToolExecutor {
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            let active_evolution = crate::current_active_evolution_capability_overlay();
             return serde_json::to_string_pretty(
-                &runtime::runtime_capabilities_response_with_detail(
+                &runtime::runtime_capabilities_response_with_detail_and_overlay(
                     &input.intent,
                     input.surface.as_deref(),
                     input.profile.as_deref(),
                     input.detail.as_deref(),
+                    &active_evolution,
                 ),
             )
             .map_err(|error| ToolError::new(error.to_string()));

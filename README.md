@@ -1,6 +1,6 @@
 # Cowd
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.467`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.468`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -896,11 +896,12 @@ Live provider gates
 - Harness Eval 已新增 `next_gen_harness_closure`，把简单快答、复杂策略选择、批量工具证据、多 Agent 团队执行、跨 session 派发、记忆/现实上下文治理、冲突恢复纳入同一评测门禁，并写入 evidence manifest 防止报告只给表层结论。
 - Gateway 已提供 `session.run_projection`，从持久 `session_events` 聚合 run graph、工具时间线、token/model telemetry、memory/context 证据、team/session 状态和 risk/approval 事件；TUI 启动时会拉取该投影并在 Runtime Activity 面板展示紧凑摘要，WebUI/报告可消费同一事实源。
 - Runtime 已在 provider usage 层接入 `ModelPerformanceRegistry`，能从 `RunModelTelemetry` 聚合首 token 延迟、输出速度、真实/估算 usage、失败率和质量评分，并按 quick/standard/deep/recovery 意图生成 `ModelRouteDecision`；`runtime_capabilities` 已暴露 `model_router`，模型能看到该能力并据此选择快答、深度或恢复策略。
+- 自进化闭环已进入运行时：`signal -> diagnosis -> proposal -> candidate -> sandbox runner -> comparison -> promotion -> active registry -> runtime_capabilities/context -> rollback`。晋升能力会写入 active registry，被 Gateway 注入启动上下文和 `runtime_capabilities` 能力图；对应 evolution memory 会在自进化/运行时治理类任务中激活，回滚后 active projection 会立即失效并保留 rolled_back 证据。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.467`。
+- 版本标签：`v0.9.468`。
 
 ### 11.2 是否达到当前阶段目标
 

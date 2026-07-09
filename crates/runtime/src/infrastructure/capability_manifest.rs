@@ -14,6 +14,7 @@ use crate::execution_core::{
     execution_mode_catalog_response, rewoo_plan_for_intent, runtime_orchestration_action_guidance,
     runtime_orchestration_actions, tool_dag_from_rewoo,
 };
+use crate::EvolutionAppliedCapabilityRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -71,6 +72,79 @@ pub struct RuntimeActionContract {
     pub required_intent_fields: Vec<String>,
     pub validation: String,
     pub expected_projection: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveEvolutionCapabilityOverlay {
+    pub active_count: usize,
+    pub rolled_back_count: usize,
+    pub capabilities: Vec<ActiveEvolutionCapabilitySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveEvolutionCapabilitySummary {
+    pub version_id: String,
+    pub candidate_id: String,
+    pub kind: String,
+    pub adapter: String,
+    pub owner: String,
+    pub status: String,
+    pub goal_ids: Vec<String>,
+    pub policy_effects: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+impl ActiveEvolutionCapabilityOverlay {
+    #[must_use]
+    pub fn from_records(records: &[EvolutionAppliedCapabilityRecord]) -> Self {
+        let capabilities = records
+            .iter()
+            .map(|record| ActiveEvolutionCapabilitySummary {
+                version_id: record.version_id.clone(),
+                candidate_id: record.candidate_id.clone(),
+                kind: record.kind.clone(),
+                adapter: record.adapter.clone(),
+                owner: record.owner.clone(),
+                status: record.status.clone(),
+                goal_ids: record.goal_ids.clone(),
+                policy_effects: record.policy_effects.clone(),
+                evidence_refs: record.artifact_refs.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            active_count: capabilities
+                .iter()
+                .filter(|capability| capability.status == "active")
+                .count(),
+            rolled_back_count: capabilities
+                .iter()
+                .filter(|capability| capability.status == "rolled_back")
+                .count(),
+            capabilities,
+        }
+    }
+
+    #[must_use]
+    pub fn active_summaries(&self, limit: usize) -> Vec<String> {
+        self.capabilities
+            .iter()
+            .filter(|capability| capability.status == "active")
+            .take(limit)
+            .map(|capability| {
+                format!(
+                    "{}:{} via {} effects={}",
+                    capability.kind,
+                    capability.version_id,
+                    capability.adapter,
+                    if capability.policy_effects.is_empty() {
+                        "none".to_string()
+                    } else {
+                        capability.policy_effects.join("|")
+                    }
+                )
+            })
+            .collect()
+    }
 }
 
 impl RuntimeCapabilityCatalog {
@@ -353,6 +427,13 @@ impl RuntimeCapabilityManifest {
 
 #[must_use]
 pub fn runtime_capability_primer() -> String {
+    runtime_capability_primer_with_overlay(&ActiveEvolutionCapabilityOverlay::default())
+}
+
+#[must_use]
+pub fn runtime_capability_primer_with_overlay(
+    active_evolution: &ActiveEvolutionCapabilityOverlay,
+) -> String {
     let manifest = RuntimeCapabilityManifest::current();
     let catalog = RuntimeCapabilityCatalog::current();
     let mut lines = vec![
@@ -366,6 +447,13 @@ pub fn runtime_capability_primer() -> String {
 
     for capability in &manifest.capabilities {
         lines.push(format!("- `{}`: {}", capability.id, capability.summary));
+    }
+    if active_evolution.active_count > 0 {
+        lines.push(String::new());
+        lines.push("Active self-evolution overlays:".to_string());
+        for summary in active_evolution.active_summaries(5) {
+            lines.push(format!("- {summary}"));
+        }
     }
 
     lines.extend([
@@ -417,6 +505,23 @@ pub fn runtime_capabilities_response_with_detail(
     profile: Option<&str>,
     detail: Option<&str>,
 ) -> Value {
+    runtime_capabilities_response_with_detail_and_overlay(
+        intent,
+        surface,
+        profile,
+        detail,
+        &ActiveEvolutionCapabilityOverlay::default(),
+    )
+}
+
+#[must_use]
+pub fn runtime_capabilities_response_with_detail_and_overlay(
+    intent: &str,
+    surface: Option<&str>,
+    profile: Option<&str>,
+    detail: Option<&str>,
+    active_evolution: &ActiveEvolutionCapabilityOverlay,
+) -> Value {
     let manifest = RuntimeCapabilityManifest::current();
     let catalog = RuntimeCapabilityCatalog::current();
     let evidence_plan: EvidencePlan = plan_evidence(intent);
@@ -437,6 +542,7 @@ pub fn runtime_capabilities_response_with_detail(
         "surface": surface,
         "profile": profile,
         "detail": detail_value,
+        "active_evolution_capabilities": active_evolution,
         "evidence_plan": evidence_plan,
         "execution_decision": execution_decision,
         "action_selection": action_selection,
@@ -815,6 +921,41 @@ mod tests {
                 .as_bool()
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn capabilities_response_accepts_explicit_active_evolution_overlay() {
+        let overlay = ActiveEvolutionCapabilityOverlay {
+            active_count: 1,
+            rolled_back_count: 0,
+            capabilities: vec![ActiveEvolutionCapabilitySummary {
+                version_id: "version-runtime-policy".to_string(),
+                candidate_id: "candidate-runtime-policy".to_string(),
+                kind: "runtime_policy".to_string(),
+                adapter: "runtime_policy_overlay".to_string(),
+                owner: "runtime".to_string(),
+                status: "active".to_string(),
+                goal_ids: vec!["runtime_efficiency".to_string()],
+                policy_effects: vec!["prefer_parallel_tool_batch".to_string()],
+                evidence_refs: vec!["artifact-policy".to_string()],
+            }],
+        };
+        let response = runtime_capabilities_response_with_detail_and_overlay(
+            "需要自进化策略影响后续运行",
+            Some("webui"),
+            Some("DeepInvestigation"),
+            Some("summary"),
+            &overlay,
+        );
+
+        assert_eq!(response["active_evolution_capabilities"]["active_count"], 1);
+        assert_eq!(
+            response["active_evolution_capabilities"]["capabilities"][0]["policy_effects"][0],
+            "prefer_parallel_tool_batch"
+        );
+        let primer = runtime_capability_primer_with_overlay(&overlay);
+        assert!(primer.contains("Active self-evolution overlays"));
+        assert!(primer.contains("prefer_parallel_tool_batch"));
     }
 
     #[test]

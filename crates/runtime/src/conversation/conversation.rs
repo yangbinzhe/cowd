@@ -4429,6 +4429,18 @@ where
 
         // P5.2: Global invalidation (file changes, max age).
         self.cached_prompt.check_global();
+        let evolution_context_items = match crate::evolution_memory_context_items(
+            crate::cowd_dirs::config_home_dir(),
+            user_input,
+            &[],
+            4,
+        ) {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!(%error, "evolution memory activation unavailable");
+                Vec::new()
+            }
+        };
 
         let Some(mgr) = self.memory_manager.as_ref() else {
             // No memory manager — cache empty for all layers, return base prompt.
@@ -4436,11 +4448,16 @@ where
             for &layer in &CacheLayer::all() {
                 self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
             }
+            let unavailable_sources = if evolution_context_items.is_empty() {
+                vec![ContextSourceKind::Memory]
+            } else {
+                Vec::new()
+            };
             let envelope = self.build_context_envelope(
                 user_input,
+                evolution_context_items,
                 Vec::new(),
-                Vec::new(),
-                vec![ContextSourceKind::Memory],
+                unavailable_sources,
             );
             return self.finalize_context_prompt(user_input, envelope, None);
         };
@@ -4543,8 +4560,12 @@ where
                             token_estimate: 0,
                         })
                         .collect();
-                    let envelope =
-                        self.build_context_envelope(user_input, Vec::new(), omissions, Vec::new());
+                    let envelope = self.build_context_envelope(
+                        user_input,
+                        evolution_context_items,
+                        omissions,
+                        Vec::new(),
+                    );
                     return self.finalize_context_prompt(user_input, envelope, None);
                 }
 
@@ -4680,6 +4701,7 @@ where
                     })
                     .collect::<Vec<_>>();
                 let mut dynamic_items = dynamic_items;
+                dynamic_items.extend(evolution_context_items);
                 let mut knowledge_report = None;
                 if let Some(activation) = knowledge_activation {
                     knowledge_report = Some(activation.report.clone());
@@ -4695,11 +4717,16 @@ where
                 if let Some(cb) = &self.memory_callback {
                     cb.on_memory_update(Vec::new(), &format!("memory error: {err}"));
                 }
+                let unavailable_sources = if evolution_context_items.is_empty() {
+                    vec![ContextSourceKind::Memory]
+                } else {
+                    Vec::new()
+                };
                 let envelope = self.build_context_envelope(
                     user_input,
+                    evolution_context_items,
                     Vec::new(),
-                    Vec::new(),
-                    vec![ContextSourceKind::Memory],
+                    unavailable_sources,
                 );
                 self.finalize_context_prompt(user_input, envelope, None)
             }

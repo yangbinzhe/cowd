@@ -117,8 +117,13 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let skill_profiles = runtime_skill_profiles_for_workspace(&workspace_root);
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
-    let capability_item =
-        runtime_capability_context_item(&tool_definitions, allowed_tools.as_ref(), model_ctx);
+    let active_evolution = crate::current_active_evolution_capability_overlay();
+    let capability_item = runtime_capability_context_item(
+        &tool_definitions,
+        allowed_tools.as_ref(),
+        model_ctx,
+        &active_evolution,
+    );
     let runtime_session_id = session.session_id.clone();
     let subagent_model = model.clone();
     let subagent_tool_definitions = tool_definitions.clone();

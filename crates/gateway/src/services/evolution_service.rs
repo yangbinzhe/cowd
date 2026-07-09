@@ -69,7 +69,7 @@ impl EvolutionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "evolution",
-            owner: "0.9.467 Runtime evolution service boundary",
+            owner: "0.9.468 Runtime evolution service boundary",
         }
     }
 
@@ -742,16 +742,33 @@ impl EvolutionService {
     ) -> Result<Value, EvolutionServiceError> {
         let registry = active_capability_registry(config_home);
         let capabilities = registry.list().map_err(EvolutionServiceError::Internal)?;
+        let memories = read_jsonl::<runtime::EvolutionMemoryRecord>(&evolution_memory_store_path(
+            config_home,
+        ))?;
         let active_count = capabilities
             .iter()
             .filter(|capability| capability.status == "active")
             .count();
+        let rolled_back_count = capabilities
+            .iter()
+            .filter(|capability| capability.status == "rolled_back")
+            .count();
+        let overlay = runtime::ActiveEvolutionCapabilityOverlay::from_records(&capabilities);
         Ok(json!({
             "kind": "evolution.active_capabilities",
             "envelope": self.envelope("active_capabilities"),
             "store": registry.path().display().to_string(),
             "count": capabilities.len(),
             "active_count": active_count,
+            "rolled_back_count": rolled_back_count,
+            "overlay": overlay,
+            "memory_refs": memories.iter().map(|record| serde_json::json!({
+                "record_id": record.record_id,
+                "kind": record.kind,
+                "candidate_id": record.candidate_id,
+                "version_id": record.version_id,
+                "evidence_refs": record.evidence_refs,
+            })).collect::<Vec<_>>(),
             "capabilities": capabilities,
         }))
     }
@@ -797,6 +814,22 @@ impl EvolutionService {
             "envelope": self.envelope("evolution_memory"),
             "count": records.len(),
             "records": records,
+        }))
+    }
+
+    pub(crate) fn evolution_memory_activation(
+        &self,
+        config_home: &Path,
+        task: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let items = runtime::evolution_memory_context_items(config_home, task, &[], 4)
+            .map_err(EvolutionServiceError::Internal)?;
+        Ok(json!({
+            "kind": "evolution.memory_activation",
+            "envelope": self.envelope("evolution_memory_activation"),
+            "task": task,
+            "count": items.len(),
+            "items": items,
         }))
     }
 

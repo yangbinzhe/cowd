@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, State as AxumState},
+    extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -109,9 +109,19 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/evolution/memory", get(evolution_memory_handler))
         .route(
+            "/api/evolution/memory/activation",
+            get(evolution_memory_activation_handler),
+        )
+        .route(
             "/api/evolution/sandbox-evals",
             get(evolution_sandbox_evals_handler),
         )
+}
+
+#[derive(serde::Deserialize)]
+struct EvolutionMemoryActivationParams {
+    #[serde(default)]
+    task: Option<String>,
 }
 
 async fn evolution_missions_summary_handler(
@@ -430,6 +440,22 @@ async fn evolution_memory_handler(
         .services
         .evolution
         .evolution_memory(&state.config_home)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_memory_activation_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<EvolutionMemoryActivationParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = params
+        .task
+        .as_deref()
+        .unwrap_or("inspect self evolution runtime capability");
+    state
+        .services
+        .evolution
+        .evolution_memory_activation(&state.config_home, task)
         .map(Json)
         .map_err(evolution_error)
 }

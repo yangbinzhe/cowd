@@ -3513,10 +3513,27 @@ pub(crate) fn workspace_context_item(session: &Session, model_ctx: u32) -> runti
     runtime::ContextRuntimeKernel::workspace_item(&packet)
 }
 
+pub(crate) fn active_evolution_capability_overlay_for_config_home(
+    config_home: impl AsRef<std::path::Path>,
+) -> runtime::ActiveEvolutionCapabilityOverlay {
+    let registry =
+        runtime::EvolutionAppliedCapabilityRegistry::new(config_home.as_ref().join("evolution"));
+    registry
+        .list()
+        .map(|records| runtime::ActiveEvolutionCapabilityOverlay::from_records(&records))
+        .unwrap_or_default()
+}
+
+pub(crate) fn current_active_evolution_capability_overlay(
+) -> runtime::ActiveEvolutionCapabilityOverlay {
+    active_evolution_capability_overlay_for_config_home(runtime::cowd_dirs::config_home_dir())
+}
+
 pub(crate) fn runtime_capability_context_item(
     tool_definitions: &[runtime::ProviderToolDefinition],
     allowed_tools: Option<&AllowedToolSet>,
     model_ctx: u32,
+    active_evolution: &runtime::ActiveEvolutionCapabilityOverlay,
 ) -> runtime::ContextItem {
     let tool_names = tool_definitions
         .iter()
@@ -3551,12 +3568,22 @@ pub(crate) fn runtime_capability_context_item(
         || "allowed_tools=all available registry tools".to_string(),
         |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
     );
+    let active_evolution_summary = if active_evolution.active_count == 0 {
+        "active_evolution_capabilities=none".to_string()
+    } else {
+        format!(
+            "active_evolution_capabilities={}; overlays={}",
+            active_evolution.active_count,
+            active_evolution.active_summaries(3).join(" || ")
+        )
+    };
     let content = format!(
         "# Active runtime capability map\n\
 model_context_window={model_ctx}\n\
 available_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
+{active_evolution_summary}\n\
 batch_readonly_tools={}\n\
 prepared_readonly_tools={}\n\
 Guidance: for independent read-only evidence, request multiple tool calls together or use tool_batch_readonly/read_many/grep_many when available; distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex architecture or validation work, shape the task so runtime orchestration can attach collaborators when available; when a path repeats, query runtime_capabilities or re-plan before continuing.",
@@ -6764,11 +6791,28 @@ mod tests {
             },
         ];
 
-        let item = runtime_capability_context_item(&tools, None, 1_000_000);
+        let overlay = runtime::ActiveEvolutionCapabilityOverlay {
+            active_count: 1,
+            rolled_back_count: 0,
+            capabilities: vec![runtime::ActiveEvolutionCapabilitySummary {
+                version_id: "version-test".to_string(),
+                candidate_id: "candidate-test".to_string(),
+                kind: "runtime_policy".to_string(),
+                adapter: "runtime_policy_overlay".to_string(),
+                owner: "runtime".to_string(),
+                status: "active".to_string(),
+                goal_ids: vec!["runtime_efficiency".to_string()],
+                policy_effects: vec!["prefer_parallel_tools".to_string()],
+                evidence_refs: vec!["artifact-test".to_string()],
+            }],
+        };
+        let item = runtime_capability_context_item(&tools, None, 1_000_000, &overlay);
 
         assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
         assert_eq!(item.role, runtime::ContextRole::Orientation);
         assert!(item.content.contains("runtime_capabilities=available"));
+        assert!(item.content.contains("active_evolution_capabilities=1"));
+        assert!(item.content.contains("prefer_parallel_tools"));
         assert!(item.content.contains("read_many"));
         assert!(item.content.contains("tool_batch_readonly"));
     }

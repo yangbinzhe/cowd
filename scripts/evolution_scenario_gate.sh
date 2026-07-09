@@ -131,7 +131,16 @@ post_json "/api/evolution/candidates/$CANDIDATE_ID/run" '{}' >"$RESPONSES_DIR/04
 post_json "/api/evolution/candidates/$CANDIDATE_ID/evaluate" '{}' >"$RESPONSES_DIR/05-memory-comparison.json"
 post_json "/api/evolution/candidates/$CANDIDATE_ID/promote" '{}' >"$RESPONSES_DIR/06-memory-promotion.json"
 VERSION_ID="$(jq -r '.promotion.version_record.version_id' "$RESPONSES_DIR/06-memory-promotion.json")"
+curl -sf "$BASE_URL/api/evolution/active-capabilities" >"$RESPONSES_DIR/06a-active-before-rollback.json"
+curl -G -sf \
+  --data-urlencode "intent=请分析自我进化 runtime policy" \
+  --data-urlencode "detail=summary" \
+  "$BASE_URL/api/runtime/capabilities" >"$RESPONSES_DIR/06b-runtime-capabilities.json"
+curl -G -sf \
+  --data-urlencode "task=请分析自我进化 runtime policy" \
+  "$BASE_URL/api/evolution/memory/activation" >"$RESPONSES_DIR/06c-memory-activation.json"
 post_json "/api/evolution/versions/$VERSION_ID/rollback" '{}' >"$RESPONSES_DIR/07-memory-rollback.json"
+curl -sf "$BASE_URL/api/evolution/active-capabilities" >"$RESPONSES_DIR/07a-active-after-rollback.json"
 curl -sf "$BASE_URL/api/evolution/memory" >"$RESPONSES_DIR/08-evolution-memory.json"
 curl -sf "$BASE_URL/api/evolution/missions/$MISSION_ID/detail" >"$RESPONSES_DIR/09-memory-mission-detail.json"
 
@@ -192,7 +201,11 @@ jq -n \
   --slurpfile run "$RESPONSES_DIR/04-memory-run.json" \
   --slurpfile comparison "$RESPONSES_DIR/05-memory-comparison.json" \
   --slurpfile promotion "$RESPONSES_DIR/06-memory-promotion.json" \
+  --slurpfile activeBefore "$RESPONSES_DIR/06a-active-before-rollback.json" \
+  --slurpfile runtimeCaps "$RESPONSES_DIR/06b-runtime-capabilities.json" \
+  --slurpfile memoryActivation "$RESPONSES_DIR/06c-memory-activation.json" \
   --slurpfile rollback "$RESPONSES_DIR/07-memory-rollback.json" \
+  --slurpfile activeAfter "$RESPONSES_DIR/07a-active-after-rollback.json" \
   --slurpfile memory "$RESPONSES_DIR/08-evolution-memory.json" \
   --slurpfile detail "$RESPONSES_DIR/09-memory-mission-detail.json" \
   --slurpfile matrix "$REPORT_DIR/signal-kind-matrix.json" \
@@ -221,8 +234,15 @@ jq -n \
       ),
       mainline_modified: ([$run[0].runner_results[].mainline_modified] | any(. == true)),
       regression_count: $comparison[0].comparison.regression_count,
+      comparison_recommendation: $comparison[0].comparison.recommendation,
       promotion_accepted: $promotion[0].promotion.accepted,
+      active_before_rollback: $activeBefore[0].active_count,
+      active_overlay_before_rollback: $activeBefore[0].overlay.active_count,
+      runtime_capabilities_active_count: $runtimeCaps[0].active_evolution_capabilities.active_count,
+      memory_activation_count: $memoryActivation[0].count,
       rollback_accepted: $rollback[0].rollback.accepted,
+      active_after_rollback: $activeAfter[0].active_count,
+      rolled_back_after_rollback: $activeAfter[0].rolled_back_count,
       memory_count: $memory[0].count,
       mission_detail_counts: {
         proposals: ($detail[0].proposals | length),
@@ -241,8 +261,15 @@ jq -e '
   and .checks.runner_has_required_modes == true
   and .checks.mainline_modified == false
   and .checks.regression_count == 0
+  and .checks.comparison_recommendation == "promote_after_human_approval"
   and .checks.promotion_accepted == true
+  and .checks.active_before_rollback >= 1
+  and .checks.active_overlay_before_rollback >= 1
+  and .checks.runtime_capabilities_active_count >= 1
+  and .checks.memory_activation_count >= 1
   and .checks.rollback_accepted == true
+  and .checks.active_after_rollback == 0
+  and .checks.rolled_back_after_rollback >= 1
   and .checks.memory_count >= 2
   and .checks.mission_detail_counts.proposals == 1
   and .checks.mission_detail_counts.candidates == 1

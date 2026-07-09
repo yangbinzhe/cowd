@@ -50,6 +50,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/source-repair-plan",
             get(get_runtime_source_repair_plan),
         )
+        .route("/api/runtime/capabilities", get(get_runtime_capabilities))
         .route("/api/runtime/control-plane", get(get_runtime_control_plane))
         .route(
             "/api/runtime/turns",
@@ -128,6 +129,34 @@ struct RuntimeEventsParams {
     scope: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeCapabilitiesParams {
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+async fn get_runtime_capabilities(Query(params): Query<RuntimeCapabilitiesParams>) -> Json<Value> {
+    let intent = params
+        .intent
+        .unwrap_or_else(|| "inspect active runtime capability map".to_string());
+    let active_evolution = crate::current_active_evolution_capability_overlay();
+    Json(
+        runtime::runtime_capabilities_response_with_detail_and_overlay(
+            &intent,
+            params.surface.as_deref(),
+            params.profile.as_deref(),
+            params.detail.as_deref(),
+            &active_evolution,
+        ),
+    )
 }
 
 #[derive(Deserialize)]

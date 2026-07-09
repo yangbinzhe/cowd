@@ -9,6 +9,7 @@ pub mod diagnosis;
 pub mod evaluation_request;
 pub mod isolated_runner;
 pub mod lifecycle;
+pub mod memory_activation;
 pub mod memory_bridge;
 pub mod memory_scope;
 pub mod mission;
@@ -43,6 +44,7 @@ pub use evaluation_request::{
 };
 pub use isolated_runner::IsolatedRunner;
 pub use lifecycle::{EvolutionLifecycleDraft, EvolutionLifecycleService};
+pub use memory_activation::evolution_memory_context_items;
 pub use memory_bridge::{EvolutionMemoryBridge, EvolutionMemoryRecord};
 pub use memory_scope::EvolutionMemoryScope;
 pub use mission::{EvolutionMission, EvolutionMissionStatus, EvolutionMissionStore};

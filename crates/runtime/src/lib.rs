@@ -330,8 +330,11 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use capability_manifest::{
     runtime_capabilities_response, runtime_capabilities_response_with_detail,
-    runtime_capability_primer, RuntimeActionContract, RuntimeCapability, RuntimeCapabilityCatalog,
-    RuntimeCapabilityManifest, RuntimeOperation, RuntimeOperationGroup, RuntimeTemplateSummary,
+    runtime_capabilities_response_with_detail_and_overlay, runtime_capability_primer,
+    runtime_capability_primer_with_overlay, ActiveEvolutionCapabilityOverlay,
+    ActiveEvolutionCapabilitySummary, RuntimeActionContract, RuntimeCapability,
+    RuntimeCapabilityCatalog, RuntimeCapabilityManifest, RuntimeOperation, RuntimeOperationGroup,
+    RuntimeTemplateSummary,
 };
 pub use checkpoint::{
     checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
@@ -433,24 +436,24 @@ pub use lane_events::{
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
 pub use evolution::{
-    candidate_kind_from_proposal, candidate_kinds_from_root_cause, EvolutionAdoptionManager,
-    EvolutionAdoptionReceipt, EvolutionAppliedCapabilityRecord, EvolutionAppliedCapabilityRegistry,
-    EvolutionArtifactBuilder, EvolutionCandidate, EvolutionCandidateGenerator,
-    EvolutionCandidateKind, EvolutionCandidatePlan, EvolutionCandidateStatus,
-    EvolutionCandidateStore, EvolutionCapabilityGoal, EvolutionComparisonReport,
-    EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionDiagnosisStore,
-    EvolutionEvaluationRequest, EvolutionGeneratedArtifact, EvolutionLifecycleDraft,
-    EvolutionLifecycleService, EvolutionMemoryBridge, EvolutionMemoryRecord, EvolutionMemoryScope,
-    EvolutionMetric, EvolutionMission, EvolutionMissionStatus, EvolutionMissionStore,
-    EvolutionPlanDraft, EvolutionPromotionAdapter, EvolutionPromotionManager,
-    EvolutionPromotionReceipt, EvolutionProposal, EvolutionProposalKind, EvolutionProposalRisk,
-    EvolutionProposalStore, EvolutionRollbackManager, EvolutionRollbackReceipt,
-    EvolutionRootCauseKind, EvolutionRunnerPolicy, EvolutionRunnerResult, EvolutionSandboxEval,
-    EvolutionSandboxOrchestrator, EvolutionSandboxRecommendation, EvolutionSandboxStore,
-    EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput, EvolutionSignalSeverity,
-    EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType, EvolutionSkillDraft,
-    EvolutionTriageCluster, EvolutionTriageService, EvolutionVerificationResult,
-    EvolutionVersionRecord, IsolatedRunner, WorktreeRunner,
+    candidate_kind_from_proposal, candidate_kinds_from_root_cause, evolution_memory_context_items,
+    EvolutionAdoptionManager, EvolutionAdoptionReceipt, EvolutionAppliedCapabilityRecord,
+    EvolutionAppliedCapabilityRegistry, EvolutionArtifactBuilder, EvolutionCandidate,
+    EvolutionCandidateGenerator, EvolutionCandidateKind, EvolutionCandidatePlan,
+    EvolutionCandidateStatus, EvolutionCandidateStore, EvolutionCapabilityGoal,
+    EvolutionComparisonReport, EvolutionDiagnosis, EvolutionDiagnosisEngine,
+    EvolutionDiagnosisStore, EvolutionEvaluationRequest, EvolutionGeneratedArtifact,
+    EvolutionLifecycleDraft, EvolutionLifecycleService, EvolutionMemoryBridge,
+    EvolutionMemoryRecord, EvolutionMemoryScope, EvolutionMetric, EvolutionMission,
+    EvolutionMissionStatus, EvolutionMissionStore, EvolutionPlanDraft, EvolutionPromotionAdapter,
+    EvolutionPromotionManager, EvolutionPromotionReceipt, EvolutionProposal, EvolutionProposalKind,
+    EvolutionProposalRisk, EvolutionProposalStore, EvolutionRollbackManager,
+    EvolutionRollbackReceipt, EvolutionRootCauseKind, EvolutionRunnerPolicy, EvolutionRunnerResult,
+    EvolutionSandboxEval, EvolutionSandboxOrchestrator, EvolutionSandboxRecommendation,
+    EvolutionSandboxStore, EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput,
+    EvolutionSignalSeverity, EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType,
+    EvolutionSkillDraft, EvolutionTriageCluster, EvolutionTriageService,
+    EvolutionVerificationResult, EvolutionVersionRecord, IsolatedRunner, WorktreeRunner,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
