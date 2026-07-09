@@ -69,7 +69,7 @@ impl EvolutionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "evolution",
-            owner: "0.9.465 Runtime evolution service boundary",
+            owner: "0.9.467 Runtime evolution service boundary",
         }
     }
 
@@ -550,10 +550,23 @@ impl EvolutionService {
         let sandbox_root = evolution_root(config_home).join("runner");
         let policy = runtime::EvolutionRunnerPolicy::default();
         let runner = runtime::IsolatedRunner::new(&sandbox_root, policy);
-        let runner_result = runner
+        let mut runner_results = Vec::new();
+        let artifact_result = runner
             .run_artifact_check(&candidate)
             .map_err(EvolutionServiceError::Internal)?;
-        append_jsonl(&runner_store_path(config_home), &runner_result)?;
+        append_jsonl(&runner_store_path(config_home), &artifact_result)?;
+        runner_results.push(artifact_result);
+        for (mode, command) in [
+            ("baseline", candidate.baseline_command.as_str()),
+            ("candidate", candidate.candidate_command.as_str()),
+            ("verification", candidate.verification_command.as_str()),
+        ] {
+            let result = runner
+                .run_named_command(&candidate, mode, command)
+                .map_err(EvolutionServiceError::Internal)?;
+            append_jsonl(&runner_store_path(config_home), &result)?;
+            runner_results.push(result);
+        }
         let eval = runtime::EvolutionSandboxOrchestrator::new(
             evolution_root(config_home).join("sandboxes"),
         )
@@ -562,9 +575,16 @@ impl EvolutionService {
         sandbox_store(config_home)
             .append(&eval)
             .map_err(EvolutionServiceError::Internal)?;
+        let runner_passed = runner_results
+            .iter()
+            .all(|result| result.exit_code == 0 && result.policy_violations.is_empty());
         let updated = candidate_store(config_home)
             .update_candidate(candidate_id, |candidate| {
-                candidate.status = runtime::EvolutionCandidateStatus::Evaluated;
+                candidate.status = if runner_passed && eval.regression_count == 0 {
+                    runtime::EvolutionCandidateStatus::Evaluated
+                } else {
+                    runtime::EvolutionCandidateStatus::Rejected
+                };
                 candidate.artifact_root =
                     Some(sandbox_root.join(candidate_id).display().to_string());
                 candidate.artifact_path = Some(eval.artifact_path.clone());
@@ -574,7 +594,7 @@ impl EvolutionService {
             "kind": "evolution.sandbox_eval",
             "envelope": self.envelope("candidate_sandbox_run"),
             "candidate": updated,
-            "runner_result": runner_result,
+            "runner_results": runner_results,
             "eval": eval,
         }))
     }
@@ -602,13 +622,12 @@ impl EvolutionService {
     ) -> Result<Value, EvolutionServiceError> {
         let candidate = find_candidate(config_home, candidate_id)?;
         let runner_results =
-            read_jsonl::<runtime::EvolutionRunnerResult>(&runner_store_path(config_home))?;
-        let runner_result = runner_results
-            .iter()
-            .rev()
-            .find(|result| result.candidate_id == candidate_id);
+            read_jsonl::<runtime::EvolutionRunnerResult>(&runner_store_path(config_home))?
+                .into_iter()
+                .filter(|result| result.candidate_id == candidate_id)
+                .collect::<Vec<_>>();
         let request =
-            runtime::EvolutionEvaluationRequest::from_candidate(&candidate, runner_result);
+            runtime::EvolutionEvaluationRequest::from_candidate(&candidate, &runner_results);
         let evidence_path = evolution_root(config_home)
             .join("comparisons")
             .join(format!("{}.json", request.request_id));
@@ -616,23 +635,28 @@ impl EvolutionService {
             fs::create_dir_all(parent)
                 .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
         }
-        let runner_exit = runner_result.map(|result| result.exit_code).unwrap_or(0);
-        let report = runtime::EvolutionComparisonReport::deterministic_from_request(
+        let report = runtime::EvolutionComparisonReport::from_request_and_runner_results(
             &request,
             evidence_path.display().to_string(),
-            runner_exit,
+            &runner_results,
         );
         fs::write(
             &evidence_path,
-            serde_json::to_string_pretty(&json!({"request": request, "report": report}))
-                .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?,
+            serde_json::to_string_pretty(
+                &json!({"request": &request, "report": &report, "runner_results": &runner_results}),
+            )
+            .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?,
         )
         .map_err(|error| EvolutionServiceError::Internal(error.to_string()))?;
         append_jsonl(&comparison_store_path(config_home), &report)?;
         let updated = candidate_store(config_home)
             .update_candidate(candidate_id, |candidate| {
                 candidate.comparison_report_ref = Some(report.comparison_id.clone());
-                candidate.status = runtime::EvolutionCandidateStatus::Evaluated;
+                candidate.status = if report.regression_count == 0 {
+                    runtime::EvolutionCandidateStatus::Evaluated
+                } else {
+                    runtime::EvolutionCandidateStatus::Rejected
+                };
             })
             .map_err(EvolutionServiceError::Internal)?;
         Ok(json!({
@@ -640,6 +664,7 @@ impl EvolutionService {
             "envelope": self.envelope("candidate_evaluate"),
             "candidate": updated,
             "comparison": report,
+            "runner_results": runner_results,
         }))
     }
 
@@ -1088,7 +1113,15 @@ mod tests {
             .expect("candidate run");
         assert_eq!(run["eval"]["mainline_modified"], false);
         assert_eq!(run["eval"]["regression_count"], 0);
-        assert!(run["runner_result"]["artifact_paths"].is_array());
+        let runner_results = run["runner_results"].as_array().expect("runner results");
+        let runner_modes = runner_results
+            .iter()
+            .map(|result| result["mode"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(runner_modes.len(), 4);
+        for mode in ["artifact", "baseline", "candidate", "verification"] {
+            assert!(runner_modes.contains(mode), "missing runner mode {mode}");
+        }
 
         let comparison = service
             .evaluate_candidate(&config_home, candidate_id)

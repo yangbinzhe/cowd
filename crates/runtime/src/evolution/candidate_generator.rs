@@ -74,9 +74,9 @@ impl EvolutionCandidateGenerator {
             target_owner,
             target_files_or_modules,
             artifact_root: None,
-            baseline_command: deterministic_command("baseline", kind),
-            candidate_command: deterministic_command("candidate", kind),
-            verification_command: deterministic_command("verify", kind),
+            baseline_command: baseline_command_for(kind),
+            candidate_command: candidate_command_for(kind),
+            verification_command: verification_command_for(kind),
             artifact_path: None,
             expected_change: proposal.target_improvement.clone(),
             adoption_gate: proposal.acceptance_gates.clone(),
@@ -113,11 +113,16 @@ impl EvolutionCandidateGenerator {
     }
 }
 
-fn deterministic_command(kind: &str, candidate_kind: EvolutionCandidateKind) -> String {
-    format!(
-        "cowd-evolution-{kind} --candidate-kind {} --deterministic-artifact-check",
-        candidate_kind.as_str()
-    )
+fn baseline_command_for(_kind: EvolutionCandidateKind) -> String {
+    "cargo metadata --format-version 1 --no-deps".to_string()
+}
+
+fn candidate_command_for(_kind: EvolutionCandidateKind) -> String {
+    "cargo metadata --format-version 1 --no-deps".to_string()
+}
+
+fn verification_command_for(_kind: EvolutionCandidateKind) -> String {
+    "cargo metadata --format-version 1 --no-deps".to_string()
 }
 
 fn now_ms() -> u128 {
@@ -193,6 +198,9 @@ mod tests {
                 candidate.promotion_adapter,
                 expected_kind.promotion_adapter()
             );
+            assert!(!candidate.baseline_command.contains("cowd-evolution"));
+            assert!(!candidate.candidate_command.contains("cowd-evolution"));
+            assert_ne!(candidate.candidate_command.trim(), "true");
         }
     }
 

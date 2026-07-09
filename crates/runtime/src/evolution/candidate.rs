@@ -244,9 +244,15 @@ mod tests {
         assert_eq!(candidate.kind, EvolutionCandidateKind::MemoryGovernance);
         assert_eq!(candidate.status, EvolutionCandidateStatus::Draft);
         assert_eq!(candidate.target_owner, "reality_core");
-        assert!(candidate
-            .baseline_command
-            .contains("deterministic-artifact-check"));
+        for command in [
+            &candidate.baseline_command,
+            &candidate.candidate_command,
+            &candidate.verification_command,
+        ] {
+            assert!(command.starts_with("cargo metadata "));
+            assert!(!command.contains("deterministic-artifact-check"));
+            assert_ne!(command.trim(), "true");
+        }
         assert!(!candidate.mainline_modified);
         assert!(candidate.human_approval_required);
         assert!(candidate

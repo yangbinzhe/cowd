@@ -53,18 +53,28 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
     let skill_draft = proposal.to_skill_draft();
     let sandbox_root =
         std::env::temp_dir().join(format!("cowd-evolution-eval-{}", uuid::Uuid::new_v4()));
-    let runner_result = runtime::IsolatedRunner::new(
+    let runner = runtime::IsolatedRunner::new(
         sandbox_root.join("runner"),
         runtime::EvolutionRunnerPolicy::default(),
-    )
-    .run_artifact_check(&candidate)
-    .expect("runner");
+    );
+    let mut runner_results = vec![runner.run_artifact_check(&candidate).expect("runner")];
+    for (mode, command) in [
+        ("baseline", candidate.baseline_command.as_str()),
+        ("candidate", candidate.candidate_command.as_str()),
+        ("verification", candidate.verification_command.as_str()),
+    ] {
+        runner_results.push(
+            runner
+                .run_named_command(&candidate, mode, command)
+                .expect("runner command"),
+        );
+    }
     let eval_request =
-        runtime::EvolutionEvaluationRequest::from_candidate(&candidate, Some(&runner_result));
-    let comparison = runtime::EvolutionComparisonReport::deterministic_from_request(
+        runtime::EvolutionEvaluationRequest::from_candidate(&candidate, &runner_results);
+    let comparison = runtime::EvolutionComparisonReport::from_request_and_runner_results(
         &eval_request,
         sandbox_root.join("comparison.json").display().to_string(),
-        runner_result.exit_code,
+        &runner_results,
     );
     let mut candidate = candidate;
     candidate.comparison_report_ref = Some(comparison.comparison_id.clone());

@@ -22,13 +22,7 @@ impl WorktreeRunner {
         &self,
         candidate: &EvolutionCandidate,
     ) -> Result<EvolutionRunnerResult, String> {
-        let command = if candidate.candidate_command.trim().is_empty()
-            || candidate.candidate_command.contains("cowd-evolution")
-        {
-            "true"
-        } else {
-            candidate.candidate_command.as_str()
-        };
-        self.inner.run_command(candidate, command)
+        self.inner
+            .run_named_command(candidate, "candidate", &candidate.candidate_command)
     }
 }

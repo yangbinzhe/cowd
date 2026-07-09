@@ -210,8 +210,16 @@ jq -n \
     checks: {
       initial_missions: $initial[0].count,
       memory_candidate_kind: $candidate[0].candidate.kind,
-      run_exit: $run[0].runner_result.exit_code,
-      mainline_modified: $run[0].runner_result.mainline_modified,
+      runner_modes: [$run[0].runner_results[].mode],
+      runner_exit_codes: [$run[0].runner_results[] | {mode, exit_code}],
+      runner_all_passed: ([$run[0].runner_results[] | select(.exit_code != 0 or ((.policy_violations // []) | length > 0))] | length == 0),
+      runner_has_required_modes: (
+        ([$run[0].runner_results[].mode] | index("artifact")) != null
+        and ([$run[0].runner_results[].mode] | index("baseline")) != null
+        and ([$run[0].runner_results[].mode] | index("candidate")) != null
+        and ([$run[0].runner_results[].mode] | index("verification")) != null
+      ),
+      mainline_modified: ([$run[0].runner_results[].mainline_modified] | any(. == true)),
       regression_count: $comparison[0].comparison.regression_count,
       promotion_accepted: $promotion[0].promotion.accepted,
       rollback_accepted: $rollback[0].rollback.accepted,
@@ -229,7 +237,8 @@ jq -n \
 
 jq -e '
   .checks.memory_candidate_kind == "memory_governance"
-  and .checks.run_exit == 0
+  and .checks.runner_all_passed == true
+  and .checks.runner_has_required_modes == true
   and .checks.mainline_modified == false
   and .checks.regression_count == 0
   and .checks.promotion_accepted == true

@@ -21,11 +21,11 @@ impl Default for EvolutionRunnerPolicy {
         Self {
             allowed_roots: vec!["target/evolution".to_string(), "/tmp".to_string()],
             allowed_commands: vec![
+                "cargo metadata".to_string(),
                 "cargo check".to_string(),
                 "cargo test".to_string(),
                 "cargo fmt".to_string(),
                 "npm test".to_string(),
-                "true".to_string(),
             ],
             blocked_commands: vec![
                 "rm -rf".to_string(),
@@ -51,6 +51,9 @@ impl EvolutionRunnerPolicy {
     #[must_use]
     pub fn allows_command(&self, command: &str) -> bool {
         let command = command.trim();
+        if command.is_empty() || command == "true" {
+            return false;
+        }
         !self
             .blocked_commands
             .iter()
@@ -59,5 +62,19 @@ impl EvolutionRunnerPolicy {
                 .allowed_commands
                 .iter()
                 .any(|allowed| command == allowed || command.starts_with(&format!("{allowed} ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_rejects_empty_true_and_destructive_commands() {
+        let policy = EvolutionRunnerPolicy::default();
+        assert!(!policy.allows_command(""));
+        assert!(!policy.allows_command("true"));
+        assert!(!policy.allows_command("cargo check && git reset --hard"));
+        assert!(policy.allows_command("cargo metadata --format-version 1 --no-deps"));
     }
 }
