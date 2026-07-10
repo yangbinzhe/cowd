@@ -1,10 +1,10 @@
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationDecision {
-    pub selected_mode: ExecutionMode,
+    pub selected_pattern: ExecutionPattern,
     pub selected_template: Option<String>,
     pub reason: String,
     pub policy_gates: Vec<String>,

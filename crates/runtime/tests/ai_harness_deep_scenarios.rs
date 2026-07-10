@@ -1,4 +1,4 @@
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use harness_contract::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
@@ -44,7 +44,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
         .workgraph_quality
         .as_ref()
         .expect("complex closure should produce workgraph quality");
-    assert_eq!(trace.strategy.mode, ExecutionMode::PlanExecute);
+    assert_eq!(trace.strategy.pattern, ExecutionPattern::Execute);
     assert!(
         trace.workgraph.is_some(),
         "complex task should allocate workgraph"
@@ -69,7 +69,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
     );
 
     let spec = ScenarioSpec::new("deep_task_closure", "complex closure")
-        .expect_mode(ExecutionMode::PlanExecute)
+        .expect_mode(ExecutionPattern::Execute)
         .require(ScenarioCheck::bool(
             "workgraph.present",
             ScenarioCheckKind::WorkgraphPresent,
@@ -93,7 +93,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
         ));
     let observation = runtime::eval_gate::ScenarioObservation {
         scenario_id: "deep_task_closure".to_string(),
-        strategy_mode: trace.strategy.mode,
+        strategy_pattern: trace.strategy.pattern,
         finalization_blocked: trace.finalization_blocked,
         regression_allowed: trace.regression_gate.allowed,
         has_workgraph: trace.workgraph.is_some(),
@@ -274,7 +274,7 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
             domain: understanding.domain,
             complexity: understanding.complexity,
             risk: understanding.risk,
-            selected_mode: harness_contract::core::ExecutionMode::SupervisorSubagents,
+            selected_pattern: harness_contract::core::ExecutionPattern::Collaborate,
             succeeded: idx == 0,
             verification_blocked: false,
             context_pressure: false,
@@ -285,8 +285,8 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
 
     let adapted = decide_strategy(&store.enrich_input(StrategyInput::from_prompt(prompt)));
     assert_eq!(
-        adapted.mode,
-        harness_contract::core::ExecutionMode::PlanExecute
+        adapted.pattern,
+        harness_contract::core::ExecutionPattern::Execute
     );
     assert!(adapted
         .reasons

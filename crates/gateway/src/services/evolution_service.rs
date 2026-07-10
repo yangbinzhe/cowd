@@ -69,7 +69,7 @@ impl EvolutionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "evolution",
-            owner: "0.9.468 Runtime evolution service boundary",
+            owner: "Runtime evolution service boundary",
         }
     }
 

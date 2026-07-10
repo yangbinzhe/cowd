@@ -298,7 +298,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ],
             &[
                 CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::ExecuteReview,
                 CollaborationTemplateId::ImplementationReviewFix,
                 CollaborationTemplateId::DebateConsensus,
                 CollaborationTemplateId::FanoutResearchSynthesis,
@@ -326,7 +326,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ],
             &[
                 CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::ExecuteReview,
                 CollaborationTemplateId::ImplementationReviewFix,
                 CollaborationTemplateId::DebateConsensus,
                 CollaborationTemplateId::FanoutResearchSynthesis,
@@ -354,7 +354,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ],
             &[
                 CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::ExecuteReview,
                 CollaborationTemplateId::ImplementationReviewFix,
                 CollaborationTemplateId::DebateConsensus,
                 CollaborationTemplateId::FanoutResearchSynthesis,
@@ -387,7 +387,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             &["high risk action", "policy conflict", "budget pressure"],
             &[
                 CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::ExecuteReview,
                 CollaborationTemplateId::ImplementationReviewFix,
                 CollaborationTemplateId::DebateConsensus,
                 CollaborationTemplateId::FanoutResearchSynthesis,
@@ -496,7 +496,7 @@ mod tests {
             profile_id: AutonomyProfileId::Stewarded,
             requested_risk: TaskRisk::Low,
             requested_tool: Some("read_file".to_string()),
-            template_id: Some(CollaborationTemplateId::PlanExecuteReview),
+            template_id: Some(CollaborationTemplateId::ExecuteReview),
             requires_write: false,
             is_critical_operation: false,
         });

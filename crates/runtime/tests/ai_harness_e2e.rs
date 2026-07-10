@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use futures::Stream;
-use harness_contract::core::{ExecutionMode, TaskComplexity, TaskRisk};
+use harness_contract::core::{ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
@@ -22,7 +22,7 @@ use runtime::{
 #[derive(Debug)]
 struct HarnessObservation {
     scenario_id: String,
-    strategy_mode: ExecutionMode,
+    strategy_pattern: ExecutionPattern,
     finalization_blocked: bool,
     regression_allowed: bool,
     has_workgraph: bool,
@@ -47,7 +47,7 @@ impl HarnessObservation {
             .unwrap_or(false);
         Self {
             scenario_id: scenario_id.into(),
-            strategy_mode: trace.strategy.mode,
+            strategy_pattern: trace.strategy.pattern,
             finalization_blocked: trace.finalization_blocked,
             regression_allowed: trace.regression_gate.allowed,
             has_workgraph: trace.workgraph.is_some(),
@@ -85,7 +85,7 @@ impl HarnessObservation {
     fn into_scenario_observation(self) -> ScenarioObservation {
         ScenarioObservation {
             scenario_id: self.scenario_id,
-            strategy_mode: self.strategy_mode,
+            strategy_pattern: self.strategy_pattern,
             finalization_blocked: self.finalization_blocked,
             regression_allowed: self.regression_allowed,
             has_workgraph: self.has_workgraph,
@@ -102,7 +102,7 @@ impl HarnessObservation {
 #[test]
 fn simple_question_stays_direct_and_clean() {
     let spec = ScenarioSpec::new("simple_question", "explain this function")
-        .expect_mode(ExecutionMode::DirectAnswer)
+        .expect_mode(ExecutionPattern::Direct)
         .require(ScenarioCheck::bool(
             "verification.finalization_blocked",
             ScenarioCheckKind::FinalizationBlocked,
@@ -153,7 +153,7 @@ fn complex_task_builds_plan_execute_workgraph() {
         "complex_workgraph",
         "全面规划 runtime gateway service crate 的复杂架构演进",
     )
-    .expect_mode(ExecutionMode::PlanExecute)
+    .expect_mode(ExecutionPattern::Execute)
     .require(ScenarioCheck::bool(
         "workgraph.present",
         ScenarioCheckKind::WorkgraphPresent,
@@ -193,7 +193,7 @@ fn complex_task_builds_plan_execute_workgraph() {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_answer_is_blocked_by_finalization_gate() {
     let spec = ScenarioSpec::new("empty_answer_gate", "answer this")
-        .expect_mode(ExecutionMode::DirectAnswer)
+        .expect_mode(ExecutionPattern::Direct)
         .require(ScenarioCheck::bool(
             "verification.finalization_blocked",
             ScenarioCheckKind::FinalizationBlocked,
@@ -252,7 +252,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
 fn low_value_multi_agent_experience_downgrades_next_route() {
     let prompt = "使用多 Agent 协同完成复杂架构分析";
     let initial = decide_strategy(&StrategyInput::from_prompt(prompt));
-    assert_eq!(initial.mode, ExecutionMode::SupervisorSubagents);
+    assert_eq!(initial.pattern, ExecutionPattern::Collaborate);
 
     let understanding = understand(&StrategyInput::from_prompt(prompt));
     let mut store = StrategyExperienceStore::new();
@@ -261,7 +261,7 @@ fn low_value_multi_agent_experience_downgrades_next_route() {
             domain: understanding.domain,
             complexity: understanding.complexity,
             risk: understanding.risk,
-            selected_mode: ExecutionMode::SupervisorSubagents,
+            selected_pattern: ExecutionPattern::Collaborate,
             succeeded: created_at_ms == 0,
             verification_blocked: false,
             context_pressure: false,
@@ -273,7 +273,7 @@ fn low_value_multi_agent_experience_downgrades_next_route() {
     let enriched = store.enrich_input(StrategyInput::from_prompt(prompt));
     let adapted = decide_strategy(&enriched);
 
-    assert_eq!(adapted.mode, ExecutionMode::PlanExecute);
+    assert_eq!(adapted.pattern, ExecutionPattern::Execute);
     assert!(adapted
         .reasons
         .iter()
@@ -283,7 +283,7 @@ fn low_value_multi_agent_experience_downgrades_next_route() {
 #[test]
 fn matrix_quality_failure_becomes_growth_signal() {
     let spec = ScenarioSpec::new("matrix_quality_failure", "quality gate failure")
-        .expect_mode(ExecutionMode::PlanExecute)
+        .expect_mode(ExecutionPattern::Execute)
         .require(ScenarioCheck::growth_signal(
             "growth.matrix_quality_gate",
             "MatrixQualityGate",
@@ -325,7 +325,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
     let event = GrowthEvent::from_input(GrowthEventInput {
         session_id: "harness-matrix-quality".to_string(),
         source_event_kind: "matrix.quality_gate".to_string(),
-        strategy_mode: ExecutionMode::PlanExecute,
+        strategy_pattern: ExecutionPattern::Execute,
         learning_record: record,
         evidence_refs: vec![GrowthEvidenceRef::new(
             "matrix_quality_gate",
@@ -340,7 +340,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
         .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate));
     let observation = ScenarioObservation {
         scenario_id: "matrix_quality_failure".to_string(),
-        strategy_mode: event.strategy_mode,
+        strategy_pattern: event.strategy_pattern,
         finalization_blocked: false,
         regression_allowed: false,
         has_workgraph: false,
@@ -367,7 +367,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
 #[test]
 fn underspecified_complex_trace_exposes_improvement_signal() {
     let record = LearningRecord::from_input(harness_contract::growth::GrowthInput {
-        selected_mode: ExecutionMode::DirectAnswer,
+        selected_pattern: ExecutionPattern::Direct,
         complexity: TaskComplexity::Complex,
         risk: TaskRisk::Medium,
         context_omitted: 0,

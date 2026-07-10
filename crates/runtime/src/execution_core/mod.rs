@@ -7,24 +7,24 @@
 
 pub mod deliberation;
 pub mod evidence;
-pub mod mode_catalog;
 pub mod model_affordance;
 pub mod orchestration_binding;
+pub mod pattern_catalog;
 pub mod reflexion;
 pub mod report;
 pub mod rewoo_plan;
-pub mod strategy_matcher;
+pub mod strategy_decision;
 pub mod tool_dag;
 
 pub use deliberation::{DeliberationMode, DeliberationPlan};
 pub use evidence::RuntimeEvidenceSummary;
-pub use mode_catalog::{
-    execution_mode_catalog_response, ExecutionModeCatalog, RuntimeExecutionBinding,
-    RuntimeExecutionModeSpec,
-};
 pub use model_affordance::runtime_execution_guidance_prompt;
 pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,
+};
+pub use pattern_catalog::{
+    execution_pattern_catalog_response, ExecutionPatternCatalog, RuntimeCompileTarget,
+    RuntimeExecutionPatternSpec,
 };
 pub use reflexion::{ReflexionRecord, ReflexionTrigger};
 pub use report::RuntimeExecutionReportSpec;
@@ -32,10 +32,10 @@ pub use rewoo_plan::{
     rewoo_plan_for_intent, RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep,
     RewooObservation, RewooSolverContract,
 };
-pub use strategy_matcher::{
+pub use strategy_decision::{
     build_runtime_action_selection_report, build_runtime_execution_decision,
     RuntimeActionSelectionReport, RuntimeExecutionActionHint, RuntimeExecutionDecision,
-    RuntimeExecutionModeCandidate,
+    RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
 };
 pub use tool_dag::{
     tool_dag_from_rewoo, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,

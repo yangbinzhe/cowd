@@ -22,6 +22,6 @@ pub mod verification;
 pub mod workgraph;
 
 pub use core::{
-    AiKernelError, AiKernelResult, ExecutionMode, KernelCapability, KernelRef, StrategyDecorator,
-    TaskComplexity, TaskRisk,
+    AiKernelError, AiKernelResult, ExecutionModifier, ExecutionPattern, ExecutionPolicyGate,
+    KernelCapability, KernelRef, TaskComplexity, TaskRisk,
 };

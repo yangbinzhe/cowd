@@ -398,13 +398,13 @@ pub use evidence_planner::{
 };
 pub use execution_core::{
     build_runtime_action_selection_report, build_runtime_execution_decision,
-    execution_mode_catalog_response, rewoo_plan_for_intent, runtime_execution_guidance_prompt,
+    execution_pattern_catalog_response, rewoo_plan_for_intent, runtime_execution_guidance_prompt,
     runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
-    DeliberationMode, DeliberationPlan, ExecutionModeCatalog, ReflexionRecord, ReflexionTrigger,
+    DeliberationMode, DeliberationPlan, ExecutionPatternCatalog, ReflexionRecord, ReflexionTrigger,
     RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep, RewooObservation,
-    RewooSolverContract, RuntimeActionSelectionReport, RuntimeEvidenceSummary,
-    RuntimeExecutionActionHint, RuntimeExecutionBinding, RuntimeExecutionDecision,
-    RuntimeExecutionModeCandidate, RuntimeExecutionModeSpec, RuntimeExecutionReportSpec,
+    RewooSolverContract, RuntimeActionSelectionReport, RuntimeCompileTarget,
+    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionDecision,
+    RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec,
     ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary, ToolDagTask,
 };
 pub use file_ops::{
@@ -699,9 +699,8 @@ pub use context_runtime::{
     ToolTracePacket, ToolTraceStatus, WorkspacePacket,
 };
 pub use runtime_control::{
-    AgentControlPolicy, AgentMode, ComplexityLevel, ComplexitySignal, ComplexityThresholds,
-    ContextControlPolicy, MemoryControlPolicy, ObservabilityPolicy, PermissionControlPolicy,
-    RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile, TaskControlPolicy,
+    AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, ObservabilityPolicy,
+    PermissionControlPolicy, RuntimeControlPolicy, TaskControlPolicy,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -3,7 +3,7 @@
 //! This crate does not mutate strategy policy directly. It converts execution
 //! traces into structured learning records that later policy layers may inspect.
 
-use crate::core::{ExecutionMode, TaskComplexity, TaskRisk};
+use crate::core::{ExecutionPattern, TaskComplexity, TaskRisk};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +100,7 @@ impl GrowthSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrowthInput {
-    pub selected_mode: ExecutionMode,
+    pub selected_pattern: ExecutionPattern,
     pub complexity: TaskComplexity,
     pub risk: TaskRisk,
     pub context_omitted: usize,
@@ -171,7 +171,7 @@ pub struct GrowthEvent {
     pub id: String,
     pub session_id: String,
     pub source_event_kind: String,
-    pub strategy_mode: ExecutionMode,
+    pub strategy_pattern: ExecutionPattern,
     pub learning_record_id: String,
     pub signals: Vec<GrowthSignal>,
     pub evidence_refs: Vec<GrowthEvidenceRef>,
@@ -184,7 +184,7 @@ pub struct GrowthEvent {
 pub struct GrowthEventInput {
     pub session_id: String,
     pub source_event_kind: String,
-    pub strategy_mode: ExecutionMode,
+    pub strategy_pattern: ExecutionPattern,
     pub learning_record: LearningRecord,
     pub evidence_refs: Vec<GrowthEvidenceRef>,
 }
@@ -199,8 +199,8 @@ impl LearningRecord {
             input.complexity,
             TaskComplexity::Complex | TaskComplexity::Strategic
         ) && matches!(
-            input.selected_mode,
-            ExecutionMode::DirectAnswer | ExecutionMode::FastEdit
+            input.selected_pattern,
+            ExecutionPattern::Direct | ExecutionPattern::Execute
         ) {
             signals.push(GrowthSignal::new(
                 GrowthSignalKind::StrategyFit,
@@ -317,7 +317,7 @@ impl GrowthEvent {
             id: format!("growth-event-{}", uuid::Uuid::new_v4()),
             session_id: input.session_id,
             source_event_kind: input.source_event_kind,
-            strategy_mode: input.strategy_mode,
+            strategy_pattern: input.strategy_pattern,
             learning_record_id: input.learning_record.id,
             signals: input.learning_record.signals,
             evidence_refs: input.evidence_refs,
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn unsupported_verification_creates_blocker_signal() {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::PlanExecute,
+            selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
             risk: TaskRisk::Medium,
             context_omitted: 0,
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn clean_trace_records_positive_policy_signal() {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::DirectAnswer,
+            selected_pattern: ExecutionPattern::Direct,
             complexity: TaskComplexity::Simple,
             risk: TaskRisk::Low,
             context_omitted: 0,
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn growth_event_turns_blocker_into_memory_and_matrix_signals() {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::PlanExecute,
+            selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
             risk: TaskRisk::Medium,
             context_omitted: 0,
@@ -420,7 +420,7 @@ mod tests {
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: "session-1".to_string(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_mode: ExecutionMode::PlanExecute,
+            strategy_pattern: ExecutionPattern::Execute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
                 "runtime_event",

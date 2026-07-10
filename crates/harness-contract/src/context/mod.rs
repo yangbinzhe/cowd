@@ -8,10 +8,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
     MainTurn,
-    DirectAnswer,
-    FastEdit,
-    PlanExecute,
-    SubAgent,
+    Goal,
+    Agent,
     Review,
     Resume,
 }

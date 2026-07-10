@@ -31,7 +31,7 @@ pub fn handle_runtime_orchestration_request_with_host(
 ) -> RuntimeOrchestrationResult {
     let plan = planner::plan_runtime_orchestration(&request);
     let mut decision =
-        validator::validate_request(&request, &plan.execution_decision.recommended_mode);
+        validator::validate_request(&request, &plan.execution_decision.recommended_pattern);
     let (status_override, detail) =
         executor::execute_orchestration_request(&request, &plan, &decision.status, tool_host);
     if let Some(status) = status_override {
@@ -87,7 +87,7 @@ fn orchestration_evidence(
         "model_intent": &request.intent,
         "model_reason": &request.reason,
         "template_hint": &request.template_hint,
-        "selected_mode": decision.selected_mode.as_str(),
+        "selected_pattern": decision.selected_pattern.as_str(),
         "recommended_template": plan.execution_decision.recommended_template.map(|template| template.as_str()),
         "policy_gates": &decision.policy_gates,
         "accepted": matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned" | "executed"),

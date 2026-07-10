@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -573,7 +573,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
     let checks = vec![
         (
             "simple_question_direct",
-            simple_decision.recommended_mode == ExecutionMode::DirectAnswer,
+            simple_decision.recommended_pattern == ExecutionPattern::Direct,
         ),
         (
             "template_selected",
@@ -634,8 +634,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         "model_provider": "deterministic_runtime_contract",
         "profile": "DeepInvestigation",
         "selected_strategy": {
-            "simple_mode": simple_decision.recommended_mode.as_str(),
-            "complex_mode": strategy.mode.as_str(),
+            "simple_mode": simple_decision.recommended_pattern.as_str(),
+            "complex_mode": strategy.pattern.as_str(),
             "template": collaboration.template_id.as_str(),
             "runtime_actions": ["continue_single", "use_team_template", "build_workgraph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
         },
@@ -915,7 +915,7 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
         .iter()
         .map(|item| ScenarioObservation {
             scenario_id: item.id.clone(),
-            strategy_mode: mode_for_scenario(item.kind),
+            strategy_pattern: mode_for_scenario(item.kind),
             finalization_blocked: item.kind == E2eScenarioKind::Recovery,
             regression_allowed: item.kind != E2eScenarioKind::Recovery,
             has_workgraph: matches!(
@@ -940,15 +940,15 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
     ScenarioSuite::new(specs).evaluate(&observations)
 }
 
-fn mode_for_scenario(kind: E2eScenarioKind) -> ExecutionMode {
+fn mode_for_scenario(kind: E2eScenarioKind) -> ExecutionPattern {
     match kind {
-        E2eScenarioKind::SimpleOnce => ExecutionMode::DirectAnswer,
-        E2eScenarioKind::TeamParallel => ExecutionMode::SupervisorSubagents,
-        E2eScenarioKind::GovernedConnector => ExecutionMode::RiskGate,
+        E2eScenarioKind::SimpleOnce => ExecutionPattern::Direct,
+        E2eScenarioKind::TeamParallel => ExecutionPattern::Collaborate,
+        E2eScenarioKind::GovernedConnector => ExecutionPattern::Execute,
         E2eScenarioKind::ComplexPlan
         | E2eScenarioKind::RealityMemory
         | E2eScenarioKind::ToolLsp
-        | E2eScenarioKind::Recovery => ExecutionMode::PlanExecute,
+        | E2eScenarioKind::Recovery => ExecutionPattern::Execute,
     }
 }
 

@@ -453,7 +453,7 @@ pub struct TurnInput {
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub prompt: String,
-    pub mode_hint: Option<crate::core::ExecutionMode>,
+    pub mode_hint: Option<crate::core::ExecutionPattern>,
     pub created_at: DateTime<Utc>,
 }
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 use harness_contract::{
-    core::{ExecutionMode, TaskComplexity, TaskRisk},
+    core::{ExecutionPattern, TaskComplexity, TaskRisk},
     growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     policy::{PolicyDecisionKind, RiskGateReceipt},
 };
@@ -404,10 +404,10 @@ impl GrowthService {
         receipt: &RiskGateReceipt,
     ) -> serde_json::Value {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: if receipt.approval_required {
-                ExecutionMode::HumanConfirm
+            selected_pattern: if receipt.approval_required {
+                ExecutionPattern::Execute
             } else {
-                ExecutionMode::RiskGate
+                ExecutionPattern::Execute
             },
             complexity: TaskComplexity::Moderate,
             risk: if receipt.approval_required {
@@ -424,10 +424,10 @@ impl GrowthService {
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: session_id.into(),
             source_event_kind: "approval.risk_receipt".to_string(),
-            strategy_mode: if receipt.approval_required {
-                ExecutionMode::HumanConfirm
+            strategy_pattern: if receipt.approval_required {
+                ExecutionPattern::Execute
             } else {
-                ExecutionMode::RiskGate
+                ExecutionPattern::Execute
             },
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
@@ -911,7 +911,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::PlanExecute,
+            selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
             risk: TaskRisk::Medium,
             context_omitted: 0,
@@ -923,7 +923,7 @@ mod tests {
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: "growth-session-1".to_string(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_mode: ExecutionMode::PlanExecute,
+            strategy_pattern: ExecutionPattern::Execute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
                 "runtime_trace",

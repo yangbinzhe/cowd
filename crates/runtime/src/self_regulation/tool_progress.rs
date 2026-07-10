@@ -90,7 +90,7 @@ impl ToolProgressObservation {
             "decision": decision.kind_str(),
             "reason": decision.reason(),
             "recommended_action": decision.recommended_action(),
-            "recommended_mode": decision.recommended_mode().map(|mode| format!("{mode:?}")),
+            "recommended_pattern": decision.recommended_pattern().map(|mode| format!("{mode:?}")),
         }))
     }
 }
@@ -102,42 +102,42 @@ fn runtime_decision_from_supervisor(decision: SupervisorDecision) -> RuntimeAdap
             reason,
             prompt,
             reason_code,
-            recommended_mode,
+            recommended_pattern,
             recommended_action,
         } => RuntimeAdaptiveDecision::with_action(
             RuntimeAdaptiveDecisionKind::NudgeModel,
             reason,
             recommended_action,
             reason_code,
-            Some(recommended_mode),
+            Some(recommended_pattern),
             Some(prompt),
         ),
         SupervisorDecision::Replan {
             reason,
             prompt,
             reason_code,
-            recommended_mode,
+            recommended_pattern,
             recommended_action,
         } => RuntimeAdaptiveDecision::with_action(
             RuntimeAdaptiveDecisionKind::ReplanExecution,
             reason,
             recommended_action,
             reason_code,
-            Some(recommended_mode),
+            Some(recommended_pattern),
             Some(prompt),
         ),
         SupervisorDecision::FallbackAnswer {
             reason,
             prompt,
             reason_code,
-            recommended_mode,
+            recommended_pattern,
             recommended_action,
         } => RuntimeAdaptiveDecision::with_action(
             RuntimeAdaptiveDecisionKind::FallbackAnswerWithCheckedEvidence,
             reason,
             recommended_action,
             reason_code,
-            Some(recommended_mode),
+            Some(recommended_pattern),
             Some(prompt),
         ),
     }

@@ -11,8 +11,8 @@ use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::{plan_evidence, EvidencePlan};
 use crate::execution_core::{
     build_runtime_action_selection_report, build_runtime_execution_decision,
-    execution_mode_catalog_response, rewoo_plan_for_intent, runtime_orchestration_action_guidance,
-    runtime_orchestration_actions, tool_dag_from_rewoo,
+    execution_pattern_catalog_response, rewoo_plan_for_intent,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
 };
 use crate::EvolutionAppliedCapabilityRecord;
 
@@ -657,7 +657,7 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
         })
         .collect::<Vec<_>>();
     match detail {
-        "execution_modes" => execution_mode_catalog_response(),
+        "execution_modes" => execution_pattern_catalog_response(),
         "team_templates" => json!({ "collaboration_templates": templates }),
         "agent_catalog" => json!({
             "role_intents": ["planner", "researcher", "executor", "reviewer", "merger", "memory_curator", "human"],
@@ -671,7 +671,7 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
         "orchestration_options" => json!({
             "decision": build_runtime_execution_decision(intent, None),
             "action_selection": build_runtime_action_selection_report(intent, None),
-            "execution_modes": execution_mode_catalog_response(),
+            "execution_modes": execution_pattern_catalog_response(),
             "collaboration_templates": templates,
             "runtime_action_contract": catalog.action_contracts,
         }),
@@ -690,7 +690,7 @@ fn backend_capabilities(detail: &str, intent: &str) -> Value {
         }),
         _ => json!({
             "summary": "Use detail=execution_modes/team_templates/agent_catalog/orchestration_options/model_router/budget_controls/policy_gates for concrete runtime affordances.",
-            "execution_modes": execution_mode_catalog_response()["execution_modes"],
+            "execution_modes": execution_pattern_catalog_response()["execution_modes"],
             "collaboration_template_count": templates.len(),
         }),
     }
@@ -907,7 +907,7 @@ mod tests {
             "runtime_capabilities_or_runtime_orchestrate"
         );
         assert!(response["action_plane"]["recipes"].is_array());
-        assert!(response["execution_decision"]["recommended_mode"].is_string());
+        assert!(response["execution_decision"]["recommended_pattern"].is_string());
         assert!(response["budget_controls"]["turn"]["max_iterations"].is_object());
         assert_eq!(
             response["model_router"]["registry"],

@@ -83,7 +83,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::knowledge_activation::KnowledgeActivationRuntime;
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
-use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
+use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
@@ -1930,11 +1930,16 @@ where
 
     /// Determine whether the current user message warrants multi-agent collaboration.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
-        self.runtime_control_policy
-            .should_collaborate(&TaskComplexityInput::new(
-                user_message,
-                self.context_profile(),
-            ))
+        if !self.runtime_control_policy.enabled || !self.runtime_control_policy.agent.enabled {
+            return false;
+        }
+        let decision = crate::execution_core::build_runtime_execution_decision(
+            user_message,
+            Some(self.context_profile()),
+        );
+        decision.recommended_pattern == harness_contract::core::ExecutionPattern::Collaborate
+            && (!self.runtime_control_policy.agent.require_positive_lift
+                || decision.collaboration_lift.accepted)
     }
 
     /// Infer required capability keywords from a task description.
@@ -2217,20 +2222,13 @@ where
             &ConversationMessage::user_text(user_input.clone()),
             user_sequence,
         );
-        let complexity = self
-            .runtime_control_policy
-            .profile_task(&TaskComplexityInput::new(
-                user_input.clone(),
-                self.context_profile(),
-            ));
-        self.record_runtime_policy_decision(&complexity, user_sequence);
-
         let evidence_plan = crate::evidence_planner::plan_evidence(&user_input);
         let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
         let execution_decision = crate::execution_core::build_runtime_execution_decision(
             &user_input,
             Some(self.context_profile()),
         );
+        self.record_runtime_policy_decision(&execution_decision, user_sequence);
         let execution_decision_guidance =
             crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
         self.record_context_event(
@@ -2249,7 +2247,7 @@ where
             "runtime",
             &format!(
                 "{}: {:?}",
-                execution_decision.recommended_mode.as_str(),
+                execution_decision.recommended_pattern.as_str(),
                 execution_decision.recommended_actions
             ),
             8,
@@ -5390,14 +5388,14 @@ where
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "strategy": {
-                "mode": trace.strategy.mode.as_str(),
+                "mode": trace.strategy.pattern.as_str(),
                 "confidence": trace.strategy.confidence,
                 "policy_version": trace.strategy.policy_version,
                 "reasons": trace.strategy.reasons,
                 "required_capabilities": trace.strategy.required_capabilities.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>(),
                 "complexity": format!("{:?}", trace.strategy.understanding.complexity),
                 "risk": format!("{:?}", trace.strategy.understanding.risk),
-                "decorators": trace.strategy.decorators.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
+                "modifiers": trace.strategy.modifiers.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
             },
             "collaboration": {
                 "template_id": trace.collaboration_decision.template_id.as_str(),
@@ -5434,7 +5432,7 @@ where
                 "receipt_id": trace.harness_receipt.id,
                 "harness_id": trace.harness_receipt.harness_id,
                 "agent_spec_id": trace.harness_receipt.agent_spec_id,
-                "strategy_mode": trace.harness_receipt.strategy_mode,
+                "strategy_pattern": trace.harness_receipt.strategy_pattern,
                 "context_epoch_id": trace.harness_receipt.context_epoch_id,
                 "tool_transaction_id": trace.harness_receipt.tool_transaction_id,
                 "verification_can_finalize": trace.harness_receipt.verification_can_finalize,
@@ -5511,7 +5509,7 @@ where
                 "packet_contract": {
                     "problem_statement": "AI harness execution quality",
                     "trace_ref": format!("runtime:event:{sequence}"),
-                    "strategy_mode": trace.strategy.mode.as_str(),
+                    "strategy_pattern": trace.strategy.pattern.as_str(),
                     "verification_can_finalize": trace.verification_report.can_finalize,
                     "regression_allowed": trace.regression_gate.allowed,
                     "harness_receipt_id": trace.harness_receipt.id,
@@ -5630,16 +5628,29 @@ where
         }
     }
 
-    fn record_runtime_policy_decision(&self, profile: &TaskComplexityProfile, sequence: usize) {
+    fn record_runtime_policy_decision(
+        &self,
+        decision: &crate::execution_core::RuntimeExecutionDecision,
+        sequence: usize,
+    ) {
+        let requires_review = decision.selected_modifiers.iter().any(|modifier| {
+            matches!(
+                modifier,
+                harness_contract::core::ExecutionModifier::WithVerifier
+                    | harness_contract::core::ExecutionModifier::WithReviewer
+            )
+        }) || decision
+            .selected_gates
+            .contains(&harness_contract::core::ExecutionPolicyGate::Approval);
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::RuntimePolicyDecision {
                 summary: crate::cowd_event::RuntimePolicyDecisionSummary {
-                    level: format!("{:?}", profile.level),
-                    score: profile.score,
-                    recommended_profile: format!("{:?}", profile.recommended_profile),
-                    agent_mode: format!("{:?}", profile.recommended_agent_mode),
-                    requires_review: profile.requires_review,
-                    signal_count: profile.signals.len(),
+                    level: format!("{:?}", decision.complexity),
+                    score: (decision.confidence * 100.0).round() as u16,
+                    recommended_profile: format!("{:?}", self.context_profile()),
+                    agent_mode: decision.recommended_pattern.as_str().to_string(),
+                    requires_review,
+                    signal_count: decision.reasons.len(),
                 },
             });
         }
@@ -5649,14 +5660,16 @@ where
         };
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
-            "complexity": {
-                "level": format!("{:?}", profile.level),
-                "score": profile.score,
-                "signals": profile.signals,
-            },
-            "recommended_profile": format!("{:?}", profile.recommended_profile),
-            "agent_mode": format!("{:?}", profile.recommended_agent_mode),
-            "requires_review": profile.requires_review,
+            "decision_id": decision.decision_id,
+            "pattern": decision.recommended_pattern,
+            "complexity": decision.complexity,
+            "risk": decision.risk,
+            "confidence": decision.confidence,
+            "modifiers": decision.selected_modifiers,
+            "gates": decision.selected_gates,
+            "collaboration_lift": decision.collaboration_lift,
+            "requires_review": requires_review,
+            "reasons": decision.reasons,
         });
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6095,7 +6108,7 @@ fn strategy_experience_projection(trace: &RuntimeAiKernelTrace) -> serde_json::V
         "domain": format!("{:?}", record.domain),
         "complexity": format!("{:?}", record.complexity),
         "risk": format!("{:?}", record.risk),
-        "selected_mode": record.selected_mode.as_str(),
+        "selected_pattern": record.selected_pattern.as_str(),
         "succeeded": record.succeeded,
         "verification_blocked": record.verification_blocked,
         "context_pressure": record.context_pressure,
@@ -7014,8 +7027,8 @@ mod tests {
         assert!(summary.model_telemetry.tokens_per_second.is_some());
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(
-            summary.ai_kernel_trace.strategy.mode,
-            harness_contract::core::ExecutionMode::DirectAnswer
+            summary.ai_kernel_trace.strategy.pattern,
+            harness_contract::core::ExecutionPattern::Direct
         );
         assert!(summary.ai_kernel_trace.verification_report.can_finalize);
         assert!(summary.ai_kernel_trace.tool_transaction.is_some());

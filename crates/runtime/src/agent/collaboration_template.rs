@@ -4,7 +4,7 @@
 //! TeamRuntime/MissionRuntime execution. It decides how a task should be
 //! organized without spawning agents or executing tools.
 
-use harness_contract::core::{ExecutionMode, StrategyDecorator, TaskComplexity, TaskRisk};
+use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::strategy::{StrategyDecision, TaskDomain};
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationTemplateId {
     SingleExecutor,
-    PlanExecuteReview,
+    ExecuteReview,
     FanoutResearchSynthesis,
     DebateConsensus,
     ImplementationReviewFix,
@@ -25,7 +25,7 @@ impl CollaborationTemplateId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SingleExecutor => "single_executor",
-            Self::PlanExecuteReview => "plan_execute_review",
+            Self::ExecuteReview => "execute_review",
             Self::FanoutResearchSynthesis => "fanout_research_synthesis",
             Self::DebateConsensus => "debate_consensus",
             Self::ImplementationReviewFix => "implementation_review_fix",
@@ -259,8 +259,8 @@ impl CollaborationTemplateMatcher {
                 "对比",
                 "分析",
             ],
-        ) || strategy.mode == ExecutionMode::ParallelReadFanout
-            || strategy.uses_decorator(StrategyDecorator::WithExternalResearch)
+        ) || strategy.pattern == ExecutionPattern::Explore
+            || strategy.uses_modifier(ExecutionModifier::WithExternalResearch)
         {
             (
                 CollaborationTemplateId::FanoutResearchSynthesis,
@@ -292,12 +292,12 @@ impl CollaborationTemplateMatcher {
                 "write-oriented task needs implementation, review, and fix ownership",
             )
         } else if matches!(
-            strategy.mode,
-            ExecutionMode::PlanExecute | ExecutionMode::SupervisorSubagents
-        ) || strategy.uses_decorator(StrategyDecorator::WithVerifier)
+            strategy.pattern,
+            ExecutionPattern::Execute | ExecutionPattern::Collaborate
+        ) || strategy.uses_modifier(ExecutionModifier::WithVerifier)
         {
             (
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::ExecuteReview,
                 "planned task should keep planner/executor/reviewer responsibilities explicit",
             )
         } else {
@@ -342,7 +342,7 @@ fn built_in_templates() -> Vec<CollaborationTemplate> {
             1,
         ),
         template(
-            CollaborationTemplateId::PlanExecuteReview,
+            CollaborationTemplateId::ExecuteReview,
             "Plan, execute, review",
             vec![
                 role(
@@ -665,7 +665,7 @@ mod tests {
 
         assert_eq!(ids.len(), 7);
         assert!(ids.contains(&CollaborationTemplateId::SingleExecutor));
-        assert!(ids.contains(&CollaborationTemplateId::PlanExecuteReview));
+        assert!(ids.contains(&CollaborationTemplateId::ExecuteReview));
         assert!(ids.contains(&CollaborationTemplateId::FanoutResearchSynthesis));
         assert!(ids.contains(&CollaborationTemplateId::DebateConsensus));
         assert!(ids.contains(&CollaborationTemplateId::ImplementationReviewFix));

@@ -1,4 +1,4 @@
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use serde_json::json;
 
 use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
@@ -7,7 +7,7 @@ use crate::orchestration::result::RuntimeOrchestrationDecision;
 #[must_use]
 pub fn validate_request(
     request: &RuntimeOrchestrationRequest,
-    recommended_mode: &ExecutionMode,
+    recommended_pattern: &ExecutionPattern,
 ) -> RuntimeOrchestrationDecision {
     let mut policy_gates = Vec::new();
     let mut status = match request.action {
@@ -69,7 +69,7 @@ pub fn validate_request(
         policy_gates.push("missing_session_id_for_session_link".to_string());
     }
     RuntimeOrchestrationDecision {
-        selected_mode: *recommended_mode,
+        selected_pattern: *recommended_pattern,
         selected_template: request.template_hint.clone(),
         reason: request.reason.clone().unwrap_or_else(|| {
             "runtime accepted model intent after policy and budget validation".to_string()

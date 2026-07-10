@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallFingerprint {
@@ -79,21 +79,21 @@ pub enum SupervisorDecision {
         reason: String,
         prompt: String,
         reason_code: String,
-        recommended_mode: ExecutionMode,
+        recommended_pattern: ExecutionPattern,
         recommended_action: String,
     },
     Replan {
         reason: String,
         prompt: String,
         reason_code: String,
-        recommended_mode: ExecutionMode,
+        recommended_pattern: ExecutionPattern,
         recommended_action: String,
     },
     FallbackAnswer {
         reason: String,
         prompt: String,
         reason_code: String,
-        recommended_mode: ExecutionMode,
+        recommended_pattern: ExecutionPattern,
         recommended_action: String,
     },
 }
@@ -151,18 +151,21 @@ impl SupervisorDecision {
     }
 
     #[must_use]
-    pub fn recommended_mode(&self) -> Option<ExecutionMode> {
+    pub fn recommended_pattern(&self) -> Option<ExecutionPattern> {
         match self {
             Self::Continue => None,
             Self::Nudge {
-                recommended_mode, ..
+                recommended_pattern,
+                ..
             }
             | Self::Replan {
-                recommended_mode, ..
+                recommended_pattern,
+                ..
             }
             | Self::FallbackAnswer {
-                recommended_mode, ..
-            } => Some(*recommended_mode),
+                recommended_pattern,
+                ..
+            } => Some(*recommended_pattern),
         }
     }
 }
@@ -284,7 +287,7 @@ impl TurnSupervisor {
                 reason: "many tool calls after repeated replanning guidance".to_string(),
                 prompt: fallback_prompt(),
                 reason_code: "replan_budget_exhausted".to_string(),
-                recommended_mode: ExecutionMode::DirectAnswer,
+                recommended_pattern: ExecutionPattern::Direct,
                 recommended_action: "answer_with_checked_evidence".to_string(),
             };
         }
@@ -297,7 +300,7 @@ impl TurnSupervisor {
                     ),
                     prompt: fallback_prompt(),
                     reason_code: "repeated_evidence_target_after_guidance".to_string(),
-                    recommended_mode: ExecutionMode::DirectAnswer,
+                    recommended_pattern: ExecutionPattern::Direct,
                     recommended_action: "answer_with_checked_evidence".to_string(),
                 };
             }
@@ -307,7 +310,7 @@ impl TurnSupervisor {
                 ),
                 prompt: replan_prompt(),
                 reason_code: "repeated_evidence_target".to_string(),
-                recommended_mode: ExecutionMode::ParallelReadFanout,
+                recommended_pattern: ExecutionPattern::Explore,
                 recommended_action: "runtime_orchestrate(request_parallel_tools)".to_string(),
             };
         }
@@ -319,7 +322,7 @@ impl TurnSupervisor {
                 ),
                 prompt: nudge_prompt(),
                 reason_code: "repeated_tool_failure".to_string(),
-                recommended_mode: ExecutionMode::ReflexionRetry,
+                recommended_pattern: ExecutionPattern::Execute,
                 recommended_action: "runtime_orchestrate(request_reflexion_retry)".to_string(),
             };
         }
@@ -336,7 +339,7 @@ impl TurnSupervisor {
                     ),
                     prompt: fallback_prompt(),
                     reason_code: "low_novelty_tool_loop_after_guidance".to_string(),
-                    recommended_mode: ExecutionMode::DirectAnswer,
+                    recommended_pattern: ExecutionPattern::Direct,
                     recommended_action: "answer_with_checked_evidence".to_string(),
                 };
             }
@@ -346,7 +349,7 @@ impl TurnSupervisor {
                 ),
                 prompt: nudge_prompt(),
                 reason_code: "low_novelty_tool_loop".to_string(),
-                recommended_mode: ExecutionMode::ReflexionRetry,
+                recommended_pattern: ExecutionPattern::Execute,
                 recommended_action: "runtime_orchestrate(request_reflexion_retry)".to_string(),
             };
         }

@@ -1,4 +1,4 @@
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
@@ -26,7 +26,7 @@ pub fn execute_orchestration_request(
     decision_status: &str,
     tool_host: Option<&dyn RuntimeToolExecutionHost>,
 ) -> (Option<String>, Value) {
-    let mode = plan.execution_decision.recommended_mode;
+    let mode = plan.execution_decision.recommended_pattern;
     match request.action {
         RuntimeOrchestrationAction::RequestRewooEvidence => execute_tool_dag_action(
             "request_rewoo_evidence",
@@ -87,7 +87,7 @@ pub fn execute_orchestration_request(
             json!({
                 "type": "plan_only",
                 "mode": mode.as_str(),
-                "execution_modes": plan.mode_catalog.summary(),
+                "execution_modes": plan.pattern_catalog.summary(),
                 "rewoo_candidate": plan.rewoo_plan,
                 "tool_dag_candidate": plan.tool_dag,
             }),
@@ -123,7 +123,7 @@ pub fn execute_orchestration_request(
 fn execute_tool_dag_action(
     action: &str,
     executor_type: &str,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     dag: &crate::execution_core::tool_dag::ToolDagPlan,
     tool_host: Option<&dyn RuntimeToolExecutionHost>,
     observation_packet: Option<Value>,
@@ -165,7 +165,7 @@ fn execute_tool_dag_action(
 
 fn execute_team_request(
     request: &RuntimeOrchestrationRequest,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     decision_status: &str,
 ) -> (Option<String>, Value) {
     if decision_status != "accepted" {
@@ -235,7 +235,7 @@ fn execute_team_request(
 
 fn execute_agent_lifecycle_request(
     request: &RuntimeOrchestrationRequest,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     decision_status: &str,
     action: &str,
 ) -> (Option<String>, Value) {
@@ -342,7 +342,7 @@ fn execute_agent_lifecycle_request(
 
 fn execute_background_review_request(
     request: &RuntimeOrchestrationRequest,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     decision_status: &str,
 ) -> (Option<String>, Value) {
     if decision_status != "accepted" {
@@ -394,7 +394,7 @@ fn execute_background_review_request(
 
 fn execute_session_link_request(
     request: &RuntimeOrchestrationRequest,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     decision_status: &str,
 ) -> (Option<String>, Value) {
     if decision_status != "accepted" {
@@ -451,7 +451,7 @@ fn execute_session_link_request(
 
 fn lifecycle_not_started(
     action: &str,
-    mode: ExecutionMode,
+    mode: ExecutionPattern,
     decision_status: &str,
 ) -> (Option<String>, Value) {
     (

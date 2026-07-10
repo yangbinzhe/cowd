@@ -3,7 +3,7 @@
 //! This crate describes what an agent is allowed and expected to do. It does
 //! not execute tools, spawn processes, or own runtime orchestration.
 
-use crate::core::{ExecutionMode, TaskRisk};
+use crate::core::{ExecutionPattern, TaskRisk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -139,35 +139,37 @@ impl AgentSpec {
     }
 
     #[must_use]
-    pub fn for_turn(prompt: &str, mode: ExecutionMode, risk: TaskRisk) -> Self {
+    pub fn for_turn(prompt: &str, mode: ExecutionPattern, risk: TaskRisk) -> Self {
         let mut spec = match mode {
-            ExecutionMode::DirectAnswer => Self::cowd_native(
-                "agent-spec-direct-answer",
-                "direct-answer",
+            ExecutionPattern::Direct => Self::cowd_native(
+                "agent-spec-direct",
+                "direct",
                 "Answer directly from the provided context and cite limitations.",
             ),
-            ExecutionMode::FastEdit => Self::cowd_native(
-                "agent-spec-fast-edit",
-                "fast-edit",
-                "Make a minimal workspace edit with verification evidence.",
+            ExecutionPattern::Explore => Self::cowd_native(
+                "agent-spec-explore",
+                "explore",
+                "Acquire and compare evidence before returning a synthesis.",
             )
-            .with_tool(AgentToolPermission::WriteWorkspace),
-            ExecutionMode::ExploreThenAnswer
-            | ExecutionMode::PlanExecute
-            | ExecutionMode::ReActLoop
-            | ExecutionMode::ReflexionRetry => Self::cowd_native(
-                "agent-spec-plan-execute",
-                "plan-execute",
+            .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
+            .with_matrix_requirement("runtime_ai_kernel_trace"),
+            ExecutionPattern::Execute => Self::cowd_native(
+                "agent-spec-execute",
+                "execute",
                 "Plan, execute, verify, and return evidence-backed output.",
             )
             .with_tool(AgentToolPermission::WriteWorkspace)
             .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
             .with_matrix_requirement("runtime_ai_kernel_trace"),
-            ExecutionMode::SupervisorSubagents
-            | ExecutionMode::ParallelReadFanout
-            | ExecutionMode::ParallelWorktree
-            | ExecutionMode::DeliberationSearch
-            | ExecutionMode::BackgroundReview => Self::cowd_native(
+            ExecutionPattern::Deliberate => Self::cowd_native(
+                "agent-spec-deliberate",
+                "deliberate",
+                "Compare conflicting proposals and synthesize an evidence-backed decision.",
+            )
+            .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
+            .with_policy(AgentPolicyRequirement::RequiresHumanReview)
+            .with_matrix_requirement("deliberation_evidence"),
+            ExecutionPattern::Collaborate | ExecutionPattern::Supervise => Self::cowd_native(
                 "agent-spec-workgraph",
                 "workgraph",
                 "Coordinate decomposed work with review and synthesis evidence.",
@@ -177,14 +179,6 @@ impl AgentSpec {
             .with_policy(AgentPolicyRequirement::RequiresHumanReview)
             .with_matrix_requirement("workgraph_quality")
             .with_matrix_requirement("synthesis_evidence"),
-            ExecutionMode::RiskGate | ExecutionMode::HumanConfirm => Self::cowd_native(
-                "agent-spec-risk-gate",
-                "risk-gate",
-                "Gate risky execution through approval and verification receipts.",
-            )
-            .with_tool(AgentToolPermission::WriteWorkspace)
-            .with_policy(AgentPolicyRequirement::RequiresApproval)
-            .with_policy(AgentPolicyRequirement::RequiresHumanReview),
         };
         spec.context_profile = mode.as_str().to_string();
         spec.instructions = format!(
@@ -201,7 +195,7 @@ impl AgentSpec {
                 .with_policy(AgentPolicyRequirement::RequiresApproval)
                 .with_policy(AgentPolicyRequirement::RequiresHumanReview);
         }
-        if matches!(mode, ExecutionMode::ParallelWorktree) {
+        if matches!(mode, ExecutionPattern::Collaborate) {
             spec = spec.with_policy(AgentPolicyRequirement::RequiresWorktreeIsolation);
         }
         spec
@@ -273,8 +267,7 @@ mod tests {
 
     #[test]
     fn plan_execute_spec_declares_matrix_and_memory_contracts() {
-        let spec =
-            AgentSpec::for_turn("重构 runtime", ExecutionMode::PlanExecute, TaskRisk::Medium);
+        let spec = AgentSpec::for_turn("重构 runtime", ExecutionPattern::Execute, TaskRisk::Medium);
 
         assert!(spec.tools.contains(&AgentToolPermission::WriteWorkspace));
         assert!(spec

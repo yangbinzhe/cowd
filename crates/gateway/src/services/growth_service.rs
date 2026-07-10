@@ -346,10 +346,10 @@ impl GrowthService {
     ) -> GrowthEvent {
         let record = harness_contract::growth::LearningRecord::from_input(
             harness_contract::growth::GrowthInput {
-                selected_mode: if receipt.approval_required {
-                    harness_contract::core::ExecutionMode::HumanConfirm
+                selected_pattern: if receipt.approval_required {
+                    harness_contract::core::ExecutionPattern::Execute
                 } else {
-                    harness_contract::core::ExecutionMode::RiskGate
+                    harness_contract::core::ExecutionPattern::Execute
                 },
                 complexity: harness_contract::core::TaskComplexity::Moderate,
                 risk: if receipt.approval_required {
@@ -370,10 +370,10 @@ impl GrowthService {
         GrowthEvent::from_input(harness_contract::growth::GrowthEventInput {
             session_id: session_id.into(),
             source_event_kind: "approval.risk_receipt".to_string(),
-            strategy_mode: if receipt.approval_required {
-                harness_contract::core::ExecutionMode::HumanConfirm
+            strategy_pattern: if receipt.approval_required {
+                harness_contract::core::ExecutionPattern::Execute
             } else {
-                harness_contract::core::ExecutionMode::RiskGate
+                harness_contract::core::ExecutionPattern::Execute
             },
             learning_record: record,
             evidence_refs: vec![harness_contract::growth::GrowthEvidenceRef::new(
@@ -797,7 +797,7 @@ fn growth_memory_slot_key(
         "growth-slot:{}:{}:{}:{}",
         event.source_event_kind,
         format!("{:?}", candidate.kind).to_ascii_lowercase(),
-        format!("{:?}", event.strategy_mode).to_ascii_lowercase(),
+        format!("{:?}", event.strategy_pattern).to_ascii_lowercase(),
         memory_scope_key(scope)
     )
 }
@@ -1009,7 +1009,7 @@ mod tests {
     use std::sync::Arc;
 
     use harness_contract::{
-        core::{ExecutionMode, TaskComplexity, TaskRisk},
+        core::{ExecutionPattern, TaskComplexity, TaskRisk},
         growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     };
     use memory::{
@@ -1038,7 +1038,7 @@ mod tests {
 
     fn sample_growth_event(session_id: &str) -> GrowthEvent {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::PlanExecute,
+            selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
             risk: TaskRisk::Medium,
             context_omitted: 0,
@@ -1050,7 +1050,7 @@ mod tests {
         GrowthEvent::from_input(GrowthEventInput {
             session_id: session_id.to_string(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_mode: ExecutionMode::PlanExecute,
+            strategy_pattern: ExecutionPattern::Execute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
                 "runtime_trace",

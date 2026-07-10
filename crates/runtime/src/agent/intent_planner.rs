@@ -88,8 +88,8 @@ fn reason_for(intent: TaskIntent, decision: &StrategyDecision) -> String {
         TaskIntent::Explore => "exploration starts with workspace snapshot and fanout search/read",
     };
     format!(
-        "{base}; strategy_mode={}; complexity={:?}; risk={:?}",
-        decision.mode.as_str(),
+        "{base}; strategy_pattern={}; complexity={:?}; risk={:?}",
+        decision.pattern.as_str(),
         decision.understanding.complexity,
         decision.understanding.risk
     )
@@ -174,7 +174,7 @@ fn path_related(previous: Option<&str>, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::core::ExecutionMode;
+    use harness_contract::core::ExecutionPattern;
 
     fn request(id: &str, name: &str, input: &str) -> ToolRequest {
         ToolRequest {
@@ -198,7 +198,7 @@ mod tests {
     fn exposes_strategy_decision_for_runtime_callers() {
         let decision = classify_strategy("全面规划 runtime gateway service 的架构演进");
 
-        assert_eq!(decision.mode, ExecutionMode::PlanExecute);
+        assert_eq!(decision.pattern, ExecutionPattern::Execute);
         assert!(decision.confidence >= 70);
     }
 

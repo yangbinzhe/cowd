@@ -108,7 +108,7 @@ impl MatrixEvidencePacket {
     pub fn add_ai_kernel_trace_source(
         &mut self,
         trace_ref: &str,
-        strategy_mode: &str,
+        strategy_pattern: &str,
         verification_can_finalize: bool,
         regression_allowed: bool,
         summary: &str,
@@ -120,7 +120,7 @@ impl MatrixEvidencePacket {
         });
         self.attribution_candidates.push(serde_json::json!({
             "kind": "ai_kernel_trace",
-            "strategy_mode": strategy_mode,
+            "strategy_pattern": strategy_pattern,
             "verification_can_finalize": verification_can_finalize,
             "regression_allowed": regression_allowed,
             "source_ref": trace_ref,

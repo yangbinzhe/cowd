@@ -128,7 +128,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     );
 
     let scenario = ScenarioSpec::new("mission_harness_quick", prompt)
-        .expect_mode(strategy.mode)
+        .expect_mode(strategy.pattern)
         .require(ScenarioCheck::bool(
             "workgraph.present",
             ScenarioCheckKind::WorkgraphPresent,
@@ -138,7 +138,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
         ));
     let observation = ScenarioObservation {
         scenario_id: "mission_harness_quick".to_string(),
-        strategy_mode: strategy.mode,
+        strategy_pattern: strategy.pattern,
         finalization_blocked: false,
         regression_allowed: true,
         has_workgraph: true,

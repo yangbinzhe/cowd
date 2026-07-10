@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,7 +32,7 @@ impl RuntimeAdaptiveDecisionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCorrectiveAction {
     pub name: String,
-    pub mode: Option<ExecutionMode>,
+    pub mode: Option<ExecutionPattern>,
     pub reason_code: String,
     pub prompt: Option<String>,
 }
@@ -60,7 +60,7 @@ impl RuntimeAdaptiveDecision {
         reason: impl Into<String>,
         action_name: impl Into<String>,
         reason_code: impl Into<String>,
-        mode: Option<ExecutionMode>,
+        mode: Option<ExecutionPattern>,
         prompt: Option<String>,
     ) -> Self {
         Self {
@@ -110,7 +110,7 @@ impl RuntimeAdaptiveDecision {
     }
 
     #[must_use]
-    pub fn recommended_mode(&self) -> Option<ExecutionMode> {
+    pub fn recommended_pattern(&self) -> Option<ExecutionPattern> {
         self.corrective_action
             .as_ref()
             .and_then(|action| action.mode)

@@ -1,4 +1,4 @@
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::ExecutionPattern;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,8 +16,8 @@ pub enum ReflexionTrigger {
 pub struct ReflexionRecord {
     pub record_id: String,
     pub trigger: ReflexionTrigger,
-    pub failed_mode: Option<ExecutionMode>,
-    pub recommended_mode: ExecutionMode,
+    pub failed_pattern: Option<ExecutionPattern>,
+    pub recommended_pattern: ExecutionPattern,
     pub reason_code: String,
     pub evidence_refs: Vec<String>,
     pub retry_budget: usize,
@@ -30,8 +30,8 @@ impl ReflexionRecord {
         Self {
             record_id: format!("reflexion-{}", Uuid::new_v4()),
             trigger: ReflexionTrigger::LowNoveltyToolLoop,
-            failed_mode: Some(ExecutionMode::ReActLoop),
-            recommended_mode: ExecutionMode::ReflexionRetry,
+            failed_pattern: Some(ExecutionPattern::Execute),
+            recommended_pattern: ExecutionPattern::Execute,
             reason_code: reason.into(),
             evidence_refs: Vec::new(),
             retry_budget: 1,
@@ -50,7 +50,7 @@ mod tests {
     #[test]
     fn reflexion_record_recommends_retry_mode_with_budget() {
         let record = ReflexionRecord::low_novelty_tool_loop("repeated read");
-        assert_eq!(record.recommended_mode, ExecutionMode::ReflexionRetry);
+        assert_eq!(record.recommended_pattern, ExecutionPattern::Execute);
         assert_eq!(record.retry_budget, 1);
         assert!(record.growth_candidate.is_some());
     }

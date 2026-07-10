@@ -245,7 +245,7 @@ impl GatewayToolExecutor {
                     "request_id": format!("runtime-orch-{}", uuid::Uuid::new_v4()),
                     "status": "running",
                     "decision": {
-                        "selected_mode": action_selection.recommended_mode,
+                        "selected_pattern": action_selection.recommended_pattern,
                         "selected_template": selected_template,
                         "reason": request.reason.unwrap_or_else(|| action_selection.reason.clone()),
                         "policy_gates": ["gateway_session_auto_bound", "mission_session_ensured", "team_spawner_provider_in_process"],

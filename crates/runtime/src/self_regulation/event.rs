@@ -35,7 +35,7 @@ impl RuntimeSelfRegulationEvent {
                 "reason": decision.reason(),
                 "reason_code": decision.reason_code(),
                 "recommended_action": decision.recommended_action(),
-                "recommended_mode": decision.recommended_mode().map(|mode| format!("{mode:?}")),
+                "recommended_pattern": decision.recommended_pattern().map(|mode| format!("{mode:?}")),
                 "tool": {
                     "name": fingerprint.tool_name,
                     "target": fingerprint.target,

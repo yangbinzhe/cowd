@@ -9,7 +9,7 @@ use harness_contract::context::{
     ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
-use harness_contract::core::{ExecutionMode, StrategyDecorator};
+use harness_contract::core::{ExecutionModifier, ExecutionPattern};
 use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
@@ -210,10 +210,11 @@ impl RuntimeAiKernel {
                 )
             });
         let mut bench_case = CowdBenchCase::new(
-            bench_kind_for_mode(self.strategy.mode),
+            bench_kind_for_mode(self.strategy.pattern),
             self.user_input.clone(),
-            self.strategy.mode,
+            self.strategy.pattern,
         );
+        bench_case.expected_modifiers = self.strategy.modifiers.clone();
         bench_case
             .required_checks
             .push("verification_report".to_string());
@@ -221,14 +222,18 @@ impl RuntimeAiKernel {
             .required_checks
             .extend(self.behavior_policy.eval_checks.clone());
         let trajectory = if verification_report.can_finalize {
-            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.mode)
+            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.pattern)
                 .pass("verification_report");
+            trajectory.selected_modifiers = self.strategy.modifiers.clone();
             for check in &self.behavior_policy.eval_checks {
                 trajectory = trajectory.pass(check.clone());
             }
             trajectory
         } else {
-            Trajectory::new(bench_case.id.clone(), self.strategy.mode).fail("verification_report")
+            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.pattern)
+                .fail("verification_report");
+            trajectory.selected_modifiers = self.strategy.modifiers.clone();
+            trajectory
         };
         let bench_result = score_case(&bench_case, &trajectory);
         let bench_report = score_report(
@@ -256,7 +261,7 @@ impl RuntimeAiKernel {
             .map(harness_contract::workgraph::WorkGraph::quality_report);
         let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
-            self.strategy.mode,
+            self.strategy.pattern,
             self.strategy.understanding.risk,
         );
         let mut policy_receipts = agent_spec_policy_receipts(&agent_spec);
@@ -272,7 +277,7 @@ impl RuntimeAiKernel {
             &self.behavior_policy.overengineering_risks,
         ));
         let mut learning_record = LearningRecord::from_input(GrowthInput {
-            selected_mode: self.strategy.mode,
+            selected_pattern: self.strategy.pattern,
             complexity: self.strategy.understanding.complexity,
             risk: self.strategy.understanding.risk,
             context_omitted: self.context_epoch.omitted.len(),
@@ -343,7 +348,7 @@ impl RuntimeAiKernel {
         let growth_event = GrowthEvent::from_input(GrowthEventInput {
             session_id: self.context_epoch.identity.session_id.clone(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_mode: self.strategy.mode,
+            strategy_pattern: self.strategy.pattern,
             learning_record: learning_record.clone(),
             evidence_refs,
         });
@@ -371,7 +376,7 @@ impl RuntimeAiKernel {
                 id: format!("harness-receipt-degraded-{}", uuid::Uuid::new_v4()),
                 harness_id: "cowd-native".to_string(),
                 agent_spec_id: agent_spec.id.clone(),
-                strategy_mode: self.strategy.mode.as_str().to_string(),
+                strategy_pattern: self.strategy.pattern.as_str().to_string(),
                 context_epoch_id: self.context_epoch.epoch_id.clone(),
                 tool_transaction_id: self.tool_transaction.as_ref().map(|plan| plan.id.clone()),
                 verification_can_finalize: verification_report.can_finalize,
@@ -443,8 +448,8 @@ fn build_context_epoch(
             ContextAuthority::Derived,
             ContextRole::TaskState,
             format!(
-                "strategy_mode={} complexity={:?} risk={:?}",
-                strategy.mode.as_str(),
+                "strategy_pattern={} complexity={:?} risk={:?}",
+                strategy.pattern.as_str(),
                 strategy.understanding.complexity,
                 strategy.understanding.risk
             ),
@@ -466,14 +471,15 @@ fn build_context_epoch(
 
 fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Option<WorkGraph> {
     if !matches!(
-        strategy.mode,
-        ExecutionMode::PlanExecute
-            | ExecutionMode::SupervisorSubagents
-            | ExecutionMode::ParallelReadFanout
-            | ExecutionMode::ParallelWorktree
+        strategy.pattern,
+        ExecutionPattern::Explore
+            | ExecutionPattern::Execute
+            | ExecutionPattern::Deliberate
+            | ExecutionPattern::Collaborate
+            | ExecutionPattern::Supervise
     ) && !strategy
-        .decorators
-        .contains(&StrategyDecorator::WithVerifier)
+        .modifiers
+        .contains(&ExecutionModifier::WithVerifier)
     {
         return None;
     }
@@ -560,8 +566,8 @@ fn extract_path(input: &str) -> Option<String> {
 
 fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     match profile {
-        ContextProfile::SoloGoal | ContextProfile::YoloGoal => ContextMode::PlanExecute,
-        ContextProfile::SubAgent | ContextProfile::Collaboration => ContextMode::SubAgent,
+        ContextProfile::SoloGoal | ContextProfile::YoloGoal => ContextMode::Goal,
+        ContextProfile::SubAgent | ContextProfile::Collaboration => ContextMode::Agent,
         ContextProfile::Review | ContextProfile::DeepInvestigation => ContextMode::Review,
         ContextProfile::Resume => ContextMode::Resume,
         ContextProfile::MainTurn
@@ -571,16 +577,14 @@ fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     }
 }
 
-fn bench_kind_for_mode(mode: ExecutionMode) -> BenchCaseKind {
+fn bench_kind_for_mode(mode: ExecutionPattern) -> BenchCaseKind {
     match mode {
-        ExecutionMode::DirectAnswer => BenchCaseKind::SimpleAnswer,
-        ExecutionMode::FastEdit => BenchCaseKind::FastEdit,
-        ExecutionMode::PlanExecute => BenchCaseKind::ArchitecturePlan,
-        ExecutionMode::ParallelReadFanout | ExecutionMode::SupervisorSubagents => {
-            BenchCaseKind::WorkGraphFanout
+        ExecutionPattern::Direct => BenchCaseKind::SimpleAnswer,
+        ExecutionPattern::Execute => BenchCaseKind::ArchitecturePlan,
+        ExecutionPattern::Explore | ExecutionPattern::Collaborate => BenchCaseKind::WorkGraphFanout,
+        ExecutionPattern::Deliberate | ExecutionPattern::Supervise => {
+            BenchCaseKind::VerificationGuard
         }
-        ExecutionMode::RiskGate | ExecutionMode::HumanConfirm => BenchCaseKind::ToolTransaction,
-        _ => BenchCaseKind::VerificationGuard,
     }
 }
 
@@ -598,7 +602,7 @@ mod tests {
             &["system prompt".to_string()],
         );
 
-        assert_eq!(kernel.strategy().mode, ExecutionMode::DirectAnswer);
+        assert_eq!(kernel.strategy().pattern, ExecutionPattern::Direct);
         assert!(!kernel.context_epoch().selected.is_empty());
         let trace = kernel.finalize("done", 0, 0);
         assert!(trace.verification_report.can_finalize);

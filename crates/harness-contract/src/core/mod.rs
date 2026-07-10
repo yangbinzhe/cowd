@@ -62,46 +62,35 @@ pub enum TaskRisk {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    DirectAnswer,
-    FastEdit,
-    ExploreThenAnswer,
-    PlanExecute,
-    ReActLoop,
-    DeliberationSearch,
-    ReflexionRetry,
-    SupervisorSubagents,
-    ParallelReadFanout,
-    ParallelWorktree,
-    BackgroundReview,
-    RiskGate,
-    HumanConfirm,
+pub enum ExecutionPattern {
+    Direct,
+    Explore,
+    Execute,
+    Deliberate,
+    Collaborate,
+    Supervise,
 }
 
-impl ExecutionMode {
+impl ExecutionPattern {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::DirectAnswer => "direct_answer",
-            Self::FastEdit => "fast_edit",
-            Self::ExploreThenAnswer => "explore_then_answer",
-            Self::PlanExecute => "plan_execute",
-            Self::ReActLoop => "react_loop",
-            Self::DeliberationSearch => "deliberation_search",
-            Self::ReflexionRetry => "reflexion_retry",
-            Self::SupervisorSubagents => "supervisor_subagents",
-            Self::ParallelReadFanout => "parallel_read_fanout",
-            Self::ParallelWorktree => "parallel_worktree",
-            Self::BackgroundReview => "background_review",
-            Self::RiskGate => "risk_gate",
-            Self::HumanConfirm => "human_confirm",
+            Self::Direct => "direct",
+            Self::Explore => "explore",
+            Self::Execute => "execute",
+            Self::Deliberate => "deliberate",
+            Self::Collaborate => "collaborate",
+            Self::Supervise => "supervise",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StrategyDecorator {
+pub enum ExecutionModifier {
+    Parallel,
+    BoundedChange,
+    Background,
     WithExternalResearch,
     WithSemanticRetrieval,
     WithSymbolGraph,
@@ -116,10 +105,13 @@ pub enum StrategyDecorator {
     WithWorktreeIsolation,
 }
 
-impl StrategyDecorator {
+impl ExecutionModifier {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Parallel => "parallel",
+            Self::BoundedChange => "bounded_change",
+            Self::Background => "background",
             Self::WithExternalResearch => "with_external_research",
             Self::WithSemanticRetrieval => "with_semantic_retrieval",
             Self::WithSymbolGraph => "with_symbol_graph",
@@ -132,6 +124,27 @@ impl StrategyDecorator {
             Self::WithTrace => "with_trace",
             Self::WithReflection => "with_reflection",
             Self::WithWorktreeIsolation => "with_worktree_isolation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPolicyGate {
+    Risk,
+    Approval,
+    Permission,
+    Budget,
+}
+
+impl ExecutionPolicyGate {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Risk => "risk",
+            Self::Approval => "approval",
+            Self::Permission => "permission",
+            Self::Budget => "budget",
         }
     }
 }
@@ -231,8 +244,8 @@ mod tests {
 
     #[test]
     fn execution_mode_wire_names_are_stable() {
-        assert_eq!(ExecutionMode::DirectAnswer.as_str(), "direct_answer");
-        assert_eq!(ExecutionMode::PlanExecute.as_str(), "plan_execute");
+        assert_eq!(ExecutionPattern::Direct.as_str(), "direct");
+        assert_eq!(ExecutionPattern::Execute.as_str(), "execute");
     }
 
     #[test]

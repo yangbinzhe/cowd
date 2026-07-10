@@ -2437,7 +2437,7 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "objective": "research architecture and review implementation",
-                            "execution_mode": "manual_mailbox"
+                            "execution_pattern": "manual_mailbox"
                         })
                         .to_string(),
                     ))
@@ -4205,7 +4205,7 @@ pub(crate) mod tests {
 
         let record = harness_contract::growth::LearningRecord::from_input(
             harness_contract::growth::GrowthInput {
-                selected_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                selected_pattern: harness_contract::core::ExecutionPattern::Execute,
                 complexity: harness_contract::core::TaskComplexity::Complex,
                 risk: harness_contract::core::TaskRisk::Medium,
                 context_omitted: 0,
@@ -4219,7 +4219,7 @@ pub(crate) mod tests {
             harness_contract::growth::GrowthEventInput {
                 session_id: "session-reality-recall".to_string(),
                 source_event_kind: "runtime.context.reality_test".to_string(),
-                strategy_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                strategy_pattern: harness_contract::core::ExecutionPattern::Execute,
                 learning_record: record,
                 evidence_refs: vec![harness_contract::growth::GrowthEvidenceRef::new(
                     "test_evidence",
@@ -7030,9 +7030,10 @@ pub(crate) mod tests {
         assert_eq!(json["control_policy"]["enabled"], true);
         assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
         assert_eq!(
-            json["control_policy"]["task"]["thresholds"]["critical_min"],
-            80
+            json["control_policy"]["task"]["max_failures_before_review"],
+            2
         );
+        assert!(json["control_policy"]["task"].get("thresholds").is_none());
         assert!(json["warnings"].as_array().unwrap().is_empty());
     }
 
