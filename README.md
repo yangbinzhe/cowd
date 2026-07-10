@@ -2,6 +2,8 @@
 
 > 核心版本：`v0.9.438` | Rust 2021 Edition | 22 crates | MIT
 
+📊 **[交互式能力全景 Dashboard →](docs/capability-dashboard.html)** — 7 面板 · 4 张 SVG 架构图 · 20 张特性卡片 · 18 域模块归属图 · 全中文
+
 ---
 
 ## 🏗️ 架构全景
