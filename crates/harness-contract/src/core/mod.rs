@@ -83,6 +83,74 @@ impl ExecutionPattern {
             Self::Supervise => "supervise",
         }
     }
+
+    #[must_use]
+    pub const fn supported_modifiers(self) -> &'static [ExecutionModifier] {
+        use ExecutionModifier::{
+            Background, BoundedChange, Parallel, WithCheckpoint, WithExternalResearch,
+            WithGuardrails, WithMatrixEvidence, WithReviewer, WithTrace, WithVerifier,
+            WithWorktreeIsolation,
+        };
+
+        match self {
+            Self::Direct => &[WithTrace],
+            Self::Explore => &[Parallel, WithExternalResearch, WithTrace],
+            Self::Execute => &[
+                BoundedChange,
+                Parallel,
+                WithExternalResearch,
+                WithCheckpoint,
+                WithVerifier,
+                WithGuardrails,
+            ],
+            Self::Deliberate => &[
+                Parallel,
+                WithExternalResearch,
+                WithReviewer,
+                WithMatrixEvidence,
+                WithTrace,
+            ],
+            Self::Collaborate => &[
+                Parallel,
+                WithExternalResearch,
+                WithReviewer,
+                WithTrace,
+                WithWorktreeIsolation,
+            ],
+            Self::Supervise => &[
+                Background,
+                Parallel,
+                WithExternalResearch,
+                WithCheckpoint,
+                WithReviewer,
+                WithTrace,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn supports_modifier(self, modifier: ExecutionModifier) -> bool {
+        self.supported_modifiers().contains(&modifier)
+    }
+
+    #[must_use]
+    pub const fn supported_gates(self) -> &'static [ExecutionPolicyGate] {
+        use ExecutionPolicyGate::{Approval, Budget, Permission, Risk};
+
+        match self {
+            Self::Direct => &[Budget],
+            Self::Explore => &[Budget, Permission],
+            Self::Execute | Self::Collaborate | Self::Supervise => {
+                &[Budget, Permission, Risk, Approval]
+            }
+            Self::Deliberate => &[Budget, Risk],
+        }
+    }
+
+    #[must_use]
+    pub fn supports_gate(self, gate: ExecutionPolicyGate) -> bool {
+        self.supported_gates().contains(&gate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,16 +160,12 @@ pub enum ExecutionModifier {
     BoundedChange,
     Background,
     WithExternalResearch,
-    WithSemanticRetrieval,
-    WithSymbolGraph,
-    WithMemoryRecall,
     WithMatrixEvidence,
     WithCheckpoint,
     WithVerifier,
     WithReviewer,
     WithGuardrails,
     WithTrace,
-    WithReflection,
     WithWorktreeIsolation,
 }
 
@@ -113,16 +177,12 @@ impl ExecutionModifier {
             Self::BoundedChange => "bounded_change",
             Self::Background => "background",
             Self::WithExternalResearch => "with_external_research",
-            Self::WithSemanticRetrieval => "with_semantic_retrieval",
-            Self::WithSymbolGraph => "with_symbol_graph",
-            Self::WithMemoryRecall => "with_memory_recall",
             Self::WithMatrixEvidence => "with_matrix_evidence",
             Self::WithCheckpoint => "with_checkpoint",
             Self::WithVerifier => "with_verifier",
             Self::WithReviewer => "with_reviewer",
             Self::WithGuardrails => "with_guardrails",
             Self::WithTrace => "with_trace",
-            Self::WithReflection => "with_reflection",
             Self::WithWorktreeIsolation => "with_worktree_isolation",
         }
     }
@@ -138,6 +198,8 @@ pub enum ExecutionPolicyGate {
 }
 
 impl ExecutionPolicyGate {
+    pub const ALL: [Self; 4] = [Self::Budget, Self::Permission, Self::Risk, Self::Approval];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -145,6 +207,16 @@ impl ExecutionPolicyGate {
             Self::Approval => "approval",
             Self::Permission => "permission",
             Self::Budget => "budget",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_required_for(self, risk: TaskRisk, requires_write: bool) -> bool {
+        match self {
+            Self::Budget => true,
+            Self::Permission => requires_write,
+            Self::Risk => matches!(risk, TaskRisk::High | TaskRisk::Critical),
+            Self::Approval => matches!(risk, TaskRisk::Critical),
         }
     }
 }
@@ -243,9 +315,106 @@ mod tests {
     }
 
     #[test]
-    fn execution_mode_wire_names_are_stable() {
+    fn execution_pattern_wire_names_are_stable() {
         assert_eq!(ExecutionPattern::Direct.as_str(), "direct");
         assert_eq!(ExecutionPattern::Execute.as_str(), "execute");
+    }
+
+    #[test]
+    fn execution_pattern_modifier_support_is_explicit() {
+        use ExecutionModifier::{
+            Background, BoundedChange, Parallel, WithCheckpoint, WithExternalResearch,
+            WithGuardrails, WithMatrixEvidence, WithReviewer, WithTrace, WithVerifier,
+            WithWorktreeIsolation,
+        };
+
+        assert_eq!(ExecutionPattern::Direct.supported_modifiers(), &[WithTrace]);
+        assert_eq!(
+            ExecutionPattern::Explore.supported_modifiers(),
+            &[Parallel, WithExternalResearch, WithTrace]
+        );
+        assert_eq!(
+            ExecutionPattern::Execute.supported_modifiers(),
+            &[
+                BoundedChange,
+                Parallel,
+                WithExternalResearch,
+                WithCheckpoint,
+                WithVerifier,
+                WithGuardrails,
+            ]
+        );
+        assert_eq!(
+            ExecutionPattern::Deliberate.supported_modifiers(),
+            &[
+                Parallel,
+                WithExternalResearch,
+                WithReviewer,
+                WithMatrixEvidence,
+                WithTrace,
+            ]
+        );
+        assert_eq!(
+            ExecutionPattern::Collaborate.supported_modifiers(),
+            &[
+                Parallel,
+                WithExternalResearch,
+                WithReviewer,
+                WithTrace,
+                WithWorktreeIsolation,
+            ]
+        );
+        assert_eq!(
+            ExecutionPattern::Supervise.supported_modifiers(),
+            &[
+                Background,
+                Parallel,
+                WithExternalResearch,
+                WithCheckpoint,
+                WithReviewer,
+                WithTrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_pattern_gate_support_is_explicit() {
+        use ExecutionPolicyGate::{Approval, Budget, Permission, Risk};
+
+        assert_eq!(ExecutionPattern::Direct.supported_gates(), &[Budget]);
+        assert_eq!(
+            ExecutionPattern::Explore.supported_gates(),
+            &[Budget, Permission]
+        );
+        assert_eq!(
+            ExecutionPattern::Execute.supported_gates(),
+            &[Budget, Permission, Risk, Approval]
+        );
+        assert_eq!(
+            ExecutionPattern::Deliberate.supported_gates(),
+            &[Budget, Risk]
+        );
+        assert_eq!(
+            ExecutionPattern::Collaborate.supported_gates(),
+            &[Budget, Permission, Risk, Approval]
+        );
+        assert_eq!(
+            ExecutionPattern::Supervise.supported_gates(),
+            &[Budget, Permission, Risk, Approval]
+        );
+    }
+
+    #[test]
+    fn policy_gate_requirements_follow_typed_task_signals() {
+        use ExecutionPolicyGate::{Approval, Budget, Permission, Risk};
+
+        assert!(Budget.is_required_for(TaskRisk::Low, false));
+        assert!(Permission.is_required_for(TaskRisk::Medium, true));
+        assert!(!Permission.is_required_for(TaskRisk::Medium, false));
+        assert!(Risk.is_required_for(TaskRisk::High, false));
+        assert!(!Risk.is_required_for(TaskRisk::Medium, true));
+        assert!(Approval.is_required_for(TaskRisk::Critical, false));
+        assert!(!Approval.is_required_for(TaskRisk::High, true));
     }
 
     #[test]

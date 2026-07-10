@@ -21,7 +21,7 @@ use harness_contract::policy::{
     agent_spec_policy_receipts, behavior_policy_receipt, tool_transaction_policy_receipts,
     PolicyReceipt,
 };
-use harness_contract::strategy::{decide_strategy, StrategyDecision, StrategyInput};
+use harness_contract::strategy::{StrategyDecision, StrategyInput};
 use harness_contract::tool::{
     ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
 };
@@ -33,10 +33,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextProfile;
+use crate::execution_core::{
+    RuntimeCompileTarget, RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAiKernelTrace {
-    pub strategy: StrategyDecision,
+    pub execution_decision: RuntimeExecutionDecision,
     pub collaboration_decision: CollaborationDecision,
     pub context_epoch: ContextEpoch,
     pub context_envelope_id: Option<String>,
@@ -61,7 +64,7 @@ pub struct RuntimeAiKernelTrace {
 #[derive(Debug, Clone)]
 pub struct RuntimeAiKernel {
     user_input: String,
-    strategy: StrategyDecision,
+    execution_decision: RuntimeExecutionDecision,
     collaboration_decision: CollaborationDecision,
     context_epoch: ContextEpoch,
     tool_transaction: Option<ToolTransactionPlan>,
@@ -70,6 +73,7 @@ pub struct RuntimeAiKernel {
     behavior_policy: BehaviorPolicyDecision,
     context_envelope_id: Option<String>,
     context_envelope_counts: Option<(usize, usize)>,
+    checkpoint_created: bool,
 }
 
 impl RuntimeAiKernel {
@@ -96,18 +100,40 @@ impl RuntimeAiKernel {
         system_prompt: &[String],
         strategy_input: StrategyInput,
     ) -> Self {
+        let execution_decision = StrategyDecisionEngine.decide_with_input(
+            strategy_input,
+            Some(profile),
+            StrategyResourceHealth::default(),
+        );
+        Self::begin_turn_with_execution_decision(
+            session_id,
+            user_input,
+            profile,
+            system_prompt,
+            execution_decision,
+        )
+    }
+
+    pub fn begin_turn_with_execution_decision(
+        session_id: impl Into<String>,
+        user_input: impl Into<String>,
+        profile: ContextProfile,
+        system_prompt: &[String],
+        execution_decision: RuntimeExecutionDecision,
+    ) -> Self {
         let session_id = session_id.into();
         let user_input = user_input.into();
-        let strategy = decide_strategy(&strategy_input);
+        let strategy = &execution_decision.strategy;
         let collaboration_decision =
-            CollaborationTemplateMatcher::default().decide(&user_input, &strategy);
-        let behavior_policy = decide_behavior_policy(&user_input, &strategy);
+            CollaborationTemplateMatcher::default().decide(&user_input, strategy);
+        let behavior_policy = decide_behavior_policy(&user_input, strategy);
         let context_epoch =
-            build_context_epoch(&session_id, &user_input, profile, system_prompt, &strategy);
-        let workgraph = build_initial_workgraph(&user_input, &strategy);
+            build_context_epoch(&session_id, &user_input, profile, system_prompt, strategy);
+        let workgraph =
+            build_initial_workgraph(&user_input, strategy, execution_decision.compile_target);
         Self {
             user_input,
-            strategy,
+            execution_decision,
             collaboration_decision,
             context_epoch,
             tool_transaction: None,
@@ -116,11 +142,16 @@ impl RuntimeAiKernel {
             behavior_policy,
             context_envelope_id: None,
             context_envelope_counts: None,
+            checkpoint_created: false,
         }
     }
 
     pub fn strategy(&self) -> &StrategyDecision {
-        &self.strategy
+        &self.execution_decision.strategy
+    }
+
+    pub fn execution_decision(&self) -> &RuntimeExecutionDecision {
+        &self.execution_decision
     }
 
     pub fn context_epoch(&self) -> &ContextEpoch {
@@ -168,6 +199,10 @@ impl RuntimeAiKernel {
         self.context_envelope_counts = Some((selected_count, omitted_count));
     }
 
+    pub fn record_checkpoint_created(&mut self) {
+        self.checkpoint_created = true;
+    }
+
     pub fn finalize(
         mut self,
         assistant_text: &str,
@@ -191,10 +226,13 @@ impl RuntimeAiKernel {
             ));
         }
 
-        let tool_receipt = self
-            .tool_transaction
-            .as_ref()
-            .map(|plan| plan.receipt(completed_tool_results, failed_tool_results));
+        let tool_receipt = self.tool_transaction.as_ref().map(|plan| {
+            plan.receipt(
+                completed_tool_results,
+                failed_tool_results,
+                self.checkpoint_created,
+            )
+        });
         let verification_report = self.verification.report();
         let finalization_blocked = !verification_report.can_finalize;
         let prompt_plan = self.context_epoch.prompt_assembly_plan();
@@ -210,11 +248,11 @@ impl RuntimeAiKernel {
                 )
             });
         let mut bench_case = CowdBenchCase::new(
-            bench_kind_for_mode(self.strategy.pattern),
+            bench_kind_for_mode(self.execution_decision.strategy.pattern),
             self.user_input.clone(),
-            self.strategy.pattern,
+            self.execution_decision.strategy.pattern,
         );
-        bench_case.expected_modifiers = self.strategy.modifiers.clone();
+        bench_case.expected_modifiers = self.execution_decision.strategy.modifiers.clone();
         bench_case
             .required_checks
             .push("verification_report".to_string());
@@ -222,17 +260,23 @@ impl RuntimeAiKernel {
             .required_checks
             .extend(self.behavior_policy.eval_checks.clone());
         let trajectory = if verification_report.can_finalize {
-            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.pattern)
-                .pass("verification_report");
-            trajectory.selected_modifiers = self.strategy.modifiers.clone();
+            let mut trajectory = Trajectory::new(
+                bench_case.id.clone(),
+                self.execution_decision.strategy.pattern,
+            )
+            .pass("verification_report");
+            trajectory.selected_modifiers = self.execution_decision.strategy.modifiers.clone();
             for check in &self.behavior_policy.eval_checks {
                 trajectory = trajectory.pass(check.clone());
             }
             trajectory
         } else {
-            let mut trajectory = Trajectory::new(bench_case.id.clone(), self.strategy.pattern)
-                .fail("verification_report");
-            trajectory.selected_modifiers = self.strategy.modifiers.clone();
+            let mut trajectory = Trajectory::new(
+                bench_case.id.clone(),
+                self.execution_decision.strategy.pattern,
+            )
+            .fail("verification_report");
+            trajectory.selected_modifiers = self.execution_decision.strategy.modifiers.clone();
             trajectory
         };
         let bench_result = score_case(&bench_case, &trajectory);
@@ -261,8 +305,8 @@ impl RuntimeAiKernel {
             .map(harness_contract::workgraph::WorkGraph::quality_report);
         let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
-            self.strategy.pattern,
-            self.strategy.understanding.risk,
+            self.execution_decision.strategy.pattern,
+            self.execution_decision.strategy.understanding.risk,
         );
         let mut policy_receipts = agent_spec_policy_receipts(&agent_spec);
         policy_receipts.extend(tool_transaction_policy_receipts(
@@ -277,9 +321,9 @@ impl RuntimeAiKernel {
             &self.behavior_policy.overengineering_risks,
         ));
         let mut learning_record = LearningRecord::from_input(GrowthInput {
-            selected_pattern: self.strategy.pattern,
-            complexity: self.strategy.understanding.complexity,
-            risk: self.strategy.understanding.risk,
+            selected_pattern: self.execution_decision.strategy.pattern,
+            complexity: self.execution_decision.strategy.understanding.complexity,
+            risk: self.execution_decision.strategy.understanding.risk,
             context_omitted: self.context_epoch.omitted.len(),
             tool_requires_checkpoint,
             tool_requires_human_confirm,
@@ -348,7 +392,7 @@ impl RuntimeAiKernel {
         let growth_event = GrowthEvent::from_input(GrowthEventInput {
             session_id: self.context_epoch.identity.session_id.clone(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_pattern: self.strategy.pattern,
+            strategy_pattern: self.execution_decision.strategy.pattern,
             learning_record: learning_record.clone(),
             evidence_refs,
         });
@@ -357,7 +401,7 @@ impl RuntimeAiKernel {
             .execute_turn(
                 HarnessTurnInput {
                     agent_spec: agent_spec.clone(),
-                    strategy: self.strategy.clone(),
+                    strategy: self.execution_decision.strategy.clone(),
                     context_epoch: self.context_epoch.clone(),
                     tool_plan: self.tool_transaction.clone(),
                     policy_context: policy_receipts
@@ -376,7 +420,12 @@ impl RuntimeAiKernel {
                 id: format!("harness-receipt-degraded-{}", uuid::Uuid::new_v4()),
                 harness_id: "cowd-native".to_string(),
                 agent_spec_id: agent_spec.id.clone(),
-                strategy_pattern: self.strategy.pattern.as_str().to_string(),
+                strategy_pattern: self
+                    .execution_decision
+                    .strategy
+                    .pattern
+                    .as_str()
+                    .to_string(),
                 context_epoch_id: self.context_epoch.epoch_id.clone(),
                 tool_transaction_id: self.tool_transaction.as_ref().map(|plan| plan.id.clone()),
                 verification_can_finalize: verification_report.can_finalize,
@@ -384,7 +433,7 @@ impl RuntimeAiKernel {
                 output_summary: format!("harness receipt degraded: {error}"),
             });
         RuntimeAiKernelTrace {
-            strategy: self.strategy,
+            execution_decision: self.execution_decision,
             collaboration_decision: self.collaboration_decision,
             context_epoch: self.context_epoch,
             context_envelope_id: self.context_envelope_id,
@@ -469,27 +518,53 @@ fn build_context_epoch(
     })
 }
 
-fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Option<WorkGraph> {
-    if !matches!(
-        strategy.pattern,
-        ExecutionPattern::Explore
-            | ExecutionPattern::Execute
-            | ExecutionPattern::Deliberate
-            | ExecutionPattern::Collaborate
-            | ExecutionPattern::Supervise
-    ) && !strategy
-        .modifiers
-        .contains(&ExecutionModifier::WithVerifier)
+fn build_initial_workgraph(
+    user_input: &str,
+    strategy: &StrategyDecision,
+    compile_target: RuntimeCompileTarget,
+) -> Option<WorkGraph> {
+    if compile_target == RuntimeCompileTarget::InlineModel
+        && !strategy
+            .modifiers
+            .contains(&ExecutionModifier::WithVerifier)
     {
         return None;
     }
     let mut graph = WorkGraph::new(user_input.to_string());
-    let plan = graph
-        .add_node(WorkNode::new(
+    let (first_kind, first_label, first_objective) = match compile_target {
+        RuntimeCompileTarget::InlineModel => (
             WorkNodeKind::AgentTask,
-            "plan",
-            "understand and plan the task",
-        ))
+            "respond",
+            "produce a bounded answer from current context",
+        ),
+        RuntimeCompileTarget::EvidenceGraph => (
+            WorkNodeKind::ReadOnlyFanout,
+            "gather-evidence",
+            "acquire independent checked evidence in parallel",
+        ),
+        RuntimeCompileTarget::ExecutionGraph => (
+            WorkNodeKind::ToolTask,
+            "execute",
+            "apply the bounded change through governed tools",
+        ),
+        RuntimeCompileTarget::DeliberationGraph => (
+            WorkNodeKind::AgentTask,
+            "generate-candidates",
+            "generate competing evidence-backed proposals",
+        ),
+        RuntimeCompileTarget::TeamGraph => (
+            WorkNodeKind::AgentTask,
+            "dispatch-team",
+            "dispatch independent workstreams to governed agents",
+        ),
+        RuntimeCompileTarget::MissionGraph => (
+            WorkNodeKind::AgentTask,
+            "mission-checkpoint",
+            "advance the mission through a resumable checkpoint",
+        ),
+    };
+    let first = graph
+        .add_node(WorkNode::new(first_kind, first_label, first_objective))
         .ok()?;
     let verify = graph
         .add_node(WorkNode::new(
@@ -506,7 +581,7 @@ fn build_initial_workgraph(user_input: &str, strategy: &StrategyDecision) -> Opt
         ))
         .ok()?;
     let _ = graph.add_edge(
-        &plan,
+        &first,
         &verify,
         harness_contract::workgraph::WorkEdgeKind::DependsOn,
     );
@@ -618,6 +693,66 @@ mod tests {
             trace.collaboration_decision.template_id,
             CollaborationTemplateId::SingleExecutor
         );
+    }
+
+    #[test]
+    fn runtime_kernel_consumes_the_leased_decision_without_reclassifying() {
+        let prompts = [
+            ("解释这个函数", RuntimeCompileTarget::InlineModel, None),
+            (
+                "调研当前架构并并行汇总证据",
+                RuntimeCompileTarget::EvidenceGraph,
+                Some("gather-evidence"),
+            ),
+            (
+                "实现这个明确的重构并验证",
+                RuntimeCompileTarget::ExecutionGraph,
+                Some("execute"),
+            ),
+            (
+                "权衡两个架构方案并解决冲突",
+                RuntimeCompileTarget::DeliberationGraph,
+                Some("generate-candidates"),
+            ),
+            (
+                "使用多 Agent 并行审查 runtime gateway memory",
+                RuntimeCompileTarget::TeamGraph,
+                Some("dispatch-team"),
+            ),
+            (
+                "后台持续推进这项长期 mission 任务",
+                RuntimeCompileTarget::MissionGraph,
+                Some("mission-checkpoint"),
+            ),
+        ];
+
+        for (prompt, target, expected_first_label) in prompts {
+            let decision = StrategyDecisionEngine.decide(prompt, None);
+            assert_eq!(decision.compile_target, target, "prompt: {prompt}");
+            let lease_id = decision.lease.lease_id.clone();
+            let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
+                "session-strategy-lease",
+                prompt,
+                ContextProfile::MainTurn,
+                &[],
+                decision,
+            );
+            assert_eq!(kernel.execution_decision().lease.lease_id, lease_id);
+            let trace = kernel.finalize("done", 0, 0);
+            assert_eq!(trace.execution_decision.compile_target, target);
+            match expected_first_label {
+                Some(label) => assert_eq!(
+                    trace
+                        .workgraph
+                        .as_ref()
+                        .and_then(|graph| graph.nodes.first())
+                        .map(|node| node.label.as_str()),
+                    Some(label),
+                    "prompt: {prompt}"
+                ),
+                None => assert!(trace.workgraph.is_none(), "prompt: {prompt}"),
+            }
+        }
     }
 
     #[test]

@@ -207,9 +207,8 @@ impl LearningRecord {
                 GrowthSeverity::Improve,
                 "complex task used an underspecified execution mode",
             ));
-            hints.push(
-                "prefer plan_execute or supervisor_subagents for comparable tasks".to_string(),
-            );
+            hints
+                .push("prefer execute, collaborate, or supervise for comparable tasks".to_string());
         }
 
         if input.context_omitted > 0 {

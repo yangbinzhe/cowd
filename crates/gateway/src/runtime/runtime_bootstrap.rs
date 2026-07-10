@@ -355,7 +355,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_capabilities".to_string(),
             description: Some(
-                "Return Cowd runtime capability guidance, execution modes, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
+                "Return Cowd runtime capability guidance, execution patterns, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -365,7 +365,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "action_selection", "budget_controls", "policy_gates"]
+                        "enum": ["summary", "execution_patterns", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "action_selection", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],

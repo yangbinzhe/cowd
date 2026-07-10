@@ -1,15 +1,15 @@
+use harness_contract::core::ExecutionModifier;
 use harness_contract::core::ExecutionPattern;
 use std::collections::BTreeSet;
 
+use crate::execution_core::RuntimeCompileTarget;
 use serde_json::{json, Value};
 
 use crate::execution_core::reflexion::ReflexionRecord;
-use crate::orchestration::planner::{
-    plan_runtime_collaboration_decision, RuntimeOrchestrationPlan,
-};
+use crate::orchestration::planner::RuntimeOrchestrationPlan;
 use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
 use crate::tool_host::{
-    execute_tool_dag_with_host, RuntimeActionExecutionReceipt, RuntimeToolExecutionHost,
+    execute_tool_dag_with_host, RuntimeActionExecutionReceipt, RuntimeExecutionHost,
 };
 use crate::{
     global_agent_lifecycle_service, global_mission_runtime, global_steward_runtime_service,
@@ -24,16 +24,52 @@ pub fn execute_orchestration_request(
     request: &RuntimeOrchestrationRequest,
     plan: &RuntimeOrchestrationPlan,
     decision_status: &str,
-    tool_host: Option<&dyn RuntimeToolExecutionHost>,
+    execution_host: Option<&dyn RuntimeExecutionHost>,
 ) -> (Option<String>, Value) {
-    let mode = plan.execution_decision.recommended_pattern;
+    let mode = plan.execution_decision.pattern();
+    if !plan.execution_decision.executable {
+        return (
+            Some("rejected".to_string()),
+            json!({
+                "type": "resource_contract_guard",
+                "status": "rejected",
+                "blocked_reasons": &plan.execution_decision.blocked_reasons,
+                "action": request.action,
+                "side_effects_started": false,
+            }),
+        );
+    }
+    if !compile_target_allows(plan.execution_decision.compile_target, request.action) {
+        return (
+            Some("rejected".to_string()),
+            json!({
+                "type": "compile_target_guard",
+                "status": "rejected",
+                "compile_target": plan.execution_decision.compile_target,
+                "action": request.action,
+                "side_effects_started": false,
+            }),
+        );
+    }
+    if !modifier_contract_allows(&plan.execution_decision, request.action) {
+        return (
+            Some("rejected".to_string()),
+            json!({
+                "type": "modifier_contract_guard",
+                "status": "rejected",
+                "modifiers": plan.execution_decision.modifiers(),
+                "action": request.action,
+                "side_effects_started": false,
+            }),
+        );
+    }
     match request.action {
         RuntimeOrchestrationAction::RequestRewooEvidence => execute_tool_dag_action(
             "request_rewoo_evidence",
             "rewoo_executor",
             mode,
             &plan.tool_dag,
-            tool_host,
+            execution_host,
             Some(json!(plan.rewoo_plan.synthetic_result())),
         ),
         RuntimeOrchestrationAction::RequestParallelTools => execute_tool_dag_action(
@@ -41,14 +77,14 @@ pub fn execute_orchestration_request(
             "tool_dag_executor",
             mode,
             &plan.tool_dag,
-            tool_host,
+            execution_host,
             None,
         ),
         RuntimeOrchestrationAction::RequestDeliberation => (
             Some("ready".to_string()),
             json!({
                 "type": "deliberation_executor",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": "ready",
                 "execution_fidelity": "runtime_owned_deliberation_packet",
                 "engine": {
@@ -69,7 +105,7 @@ pub fn execute_orchestration_request(
             Some("ready".to_string()),
             json!({
                 "type": "reflexion_executor",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": "ready",
                 "execution_fidelity": "runtime_owned_reflexion_guard",
                 "engine": {
@@ -86,20 +122,20 @@ pub fn execute_orchestration_request(
             None,
             json!({
                 "type": "plan_only",
-                "mode": mode.as_str(),
-                "execution_modes": plan.pattern_catalog.summary(),
+                "pattern": mode.as_str(),
+                "execution_patterns": plan.pattern_catalog.summary(),
                 "rewoo_candidate": plan.rewoo_plan,
                 "tool_dag_candidate": plan.tool_dag,
             }),
         ),
         RuntimeOrchestrationAction::RequestTeam => {
-            execute_team_request(request, mode, decision_status)
+            execute_team_request(request, plan, mode, decision_status, execution_host)
         }
         RuntimeOrchestrationAction::RequestRiskGate => (
             None,
             json!({
                 "type": "risk_gate",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": decision_status,
                 "required_context": ["approval_policy", "risk_reason", "permission_scope"],
                 "next_step": "request approval or provide a lower-risk alternative before execution",
@@ -120,15 +156,85 @@ pub fn execute_orchestration_request(
     }
 }
 
+fn modifier_contract_allows(
+    decision: &crate::execution_core::RuntimeExecutionDecision,
+    action: RuntimeOrchestrationAction,
+) -> bool {
+    match action {
+        RuntimeOrchestrationAction::RequestParallelTools => {
+            decision.modifiers().contains(&ExecutionModifier::Parallel)
+        }
+        RuntimeOrchestrationAction::RequestTeam => {
+            decision.modifiers().contains(&ExecutionModifier::Parallel)
+        }
+        RuntimeOrchestrationAction::RequestBackgroundReview
+        | RuntimeOrchestrationAction::RequestSessionLink => decision
+            .modifiers()
+            .contains(&ExecutionModifier::Background),
+        _ => true,
+    }
+}
+
+fn compile_target_allows(target: RuntimeCompileTarget, action: RuntimeOrchestrationAction) -> bool {
+    use RuntimeCompileTarget as Target;
+    use RuntimeOrchestrationAction as Action;
+
+    match target {
+        Target::InlineModel => matches!(action, Action::PlanOnly | Action::RequestRiskGate),
+        Target::EvidenceGraph => matches!(
+            action,
+            Action::PlanOnly
+                | Action::RequestParallelTools
+                | Action::RequestRewooEvidence
+                | Action::RequestVerification
+                | Action::RequestReflexionRetry
+                | Action::RequestRiskGate
+        ),
+        Target::ExecutionGraph => matches!(
+            action,
+            Action::PlanOnly
+                | Action::RequestSubagent
+                | Action::RequestVerification
+                | Action::RequestParallelTools
+                | Action::RequestReflexionRetry
+                | Action::RequestRiskGate
+        ),
+        Target::DeliberationGraph => matches!(
+            action,
+            Action::PlanOnly
+                | Action::RequestDeliberation
+                | Action::RequestVerification
+                | Action::RequestReflexionRetry
+                | Action::RequestRiskGate
+        ),
+        Target::TeamGraph => matches!(
+            action,
+            Action::PlanOnly
+                | Action::RequestTeam
+                | Action::RequestVerification
+                | Action::RequestReflexionRetry
+                | Action::RequestRiskGate
+        ),
+        Target::MissionGraph => matches!(
+            action,
+            Action::PlanOnly
+                | Action::RequestBackgroundReview
+                | Action::RequestSessionLink
+                | Action::RequestVerification
+                | Action::RequestRiskGate
+        ),
+    }
+}
+
 fn execute_tool_dag_action(
     action: &str,
     executor_type: &str,
     mode: ExecutionPattern,
     dag: &crate::execution_core::tool_dag::ToolDagPlan,
-    tool_host: Option<&dyn RuntimeToolExecutionHost>,
+    execution_host: Option<&dyn RuntimeExecutionHost>,
     observation_packet: Option<Value>,
 ) -> (Option<String>, Value) {
-    let receipt = match tool_host {
+    let receipt = match execution_host {
         Some(host) => execute_tool_dag_with_host(action, dag, host),
         None => RuntimeActionExecutionReceipt::blocked_missing_executor(action, dag),
     };
@@ -143,13 +249,13 @@ fn execute_tool_dag_action(
     };
     let mut detail = json!({
         "type": executor_type,
-        "mode": mode.as_str(),
+        "pattern": mode.as_str(),
         "status": status,
         "execution_fidelity": "runtime_owned_executable_dag",
         "engine": {
             "name": "RuntimeActionExecutor",
             "owned_by": "runtime",
-            "dispatch_surface": "runtime_tool_host"
+            "dispatch_surface": "runtime_execution_host"
         },
         "tool_dag": dag,
         "schedule": dag.safety_summary.schedule,
@@ -165,15 +271,17 @@ fn execute_tool_dag_action(
 
 fn execute_team_request(
     request: &RuntimeOrchestrationRequest,
+    plan: &RuntimeOrchestrationPlan,
     mode: ExecutionPattern,
     decision_status: &str,
+    host: Option<&dyn RuntimeExecutionHost>,
 ) -> (Option<String>, Value) {
     if decision_status != "accepted" {
         return (
             None,
             json!({
                 "type": "team_runtime",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": decision_status,
                 "reason": "team runtime was not started because validation did not accept the request",
                 "required_context": ["session_id"],
@@ -189,18 +297,34 @@ fn execute_team_request(
             Some("rejected".to_string()),
             json!({
                 "type": "team_runtime",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": "rejected",
                 "reason": "request_team requires session_id to attach a real TeamRuntime",
                 "required_context": ["session_id"],
             }),
         );
     };
-    let collaboration_decision = plan_runtime_collaboration_decision(&request.intent);
+    if let Some(host) = host {
+        if let Some(result) = host.start_runtime_team(request, &plan.collaboration_decision) {
+            return match result {
+                Ok(value) => (Some("running".to_string()), value),
+                Err(error) => (
+                    Some("failed".to_string()),
+                    json!({
+                        "type": "team_runtime",
+                        "pattern": mode.as_str(),
+                        "status": "failed",
+                        "error": error,
+                        "execution_fidelity": "runtime_owned_gateway_adapter",
+                    }),
+                ),
+            };
+        }
+    }
     match global_team_runtime_service().start(StartTeamRuntimeRequest {
         session_id: session_id.to_string(),
         objective: request.intent.clone(),
-        collaboration_decision,
+        collaboration_decision: plan.collaboration_decision.clone(),
     }) {
         Ok(team) => {
             let team_id = team.team_id.clone();
@@ -211,7 +335,7 @@ fn execute_team_request(
                 Some("running".to_string()),
                 json!({
                     "type": "team_runtime",
-                    "mode": mode.as_str(),
+                    "pattern": mode.as_str(),
                     "status": "running",
                     "team": team,
                     "collaboration_run": collaboration_run,
@@ -225,7 +349,7 @@ fn execute_team_request(
             Some("failed".to_string()),
             json!({
                 "type": "team_runtime",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "status": "failed",
                 "error": error,
             }),
@@ -279,7 +403,7 @@ fn execute_agent_lifecycle_request(
                 Some("failed".to_string()),
                 json!({
                     "type": "runtime_orchestration_result",
-                    "mode": mode.as_str(),
+                    "pattern": mode.as_str(),
                     "action": action,
                     "status": "failed",
                     "execution_fidelity": "runtime_owned_agent_lifecycle",
@@ -321,7 +445,7 @@ fn execute_agent_lifecycle_request(
         Some(status.to_string()),
         json!({
             "type": "runtime_orchestration_result",
-            "mode": mode.as_str(),
+            "pattern": mode.as_str(),
             "action": action,
             "status": status,
             "execution_fidelity": if action == "request_verification" {
@@ -364,7 +488,7 @@ fn execute_background_review_request(
             let steward_id = steward.steward_id.clone();
             json!({
             "type": "runtime_orchestration_result",
-            "mode": mode.as_str(),
+            "pattern": mode.as_str(),
             "action": "request_background_review",
             "status": "running",
             "execution_fidelity": "runtime_owned_steward_lifecycle",
@@ -382,7 +506,7 @@ fn execute_background_review_request(
             Some("failed".to_string()),
             json!({
                 "type": "runtime_orchestration_result",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "action": "request_background_review",
                 "status": "failed",
                 "execution_fidelity": "runtime_owned_steward_lifecycle",
@@ -409,7 +533,7 @@ fn execute_session_link_request(
             Some("rejected".to_string()),
             json!({
                 "type": "runtime_orchestration_result",
-                "mode": mode.as_str(),
+                "pattern": mode.as_str(),
                 "action": "request_session_link",
                 "status": "rejected",
                 "execution_fidelity": "runtime_owned_session_bridge",
@@ -438,7 +562,7 @@ fn execute_session_link_request(
         Some(status.to_string()),
         json!({
             "type": "runtime_orchestration_result",
-            "mode": mode.as_str(),
+            "pattern": mode.as_str(),
             "action": "request_session_link",
             "status": status,
             "execution_fidelity": "runtime_owned_session_bridge",
@@ -458,7 +582,7 @@ fn lifecycle_not_started(
         None,
         json!({
             "type": "runtime_orchestration_result",
-            "mode": mode.as_str(),
+            "pattern": mode.as_str(),
             "action": action,
             "status": decision_status,
             "execution_fidelity": "runtime_owned_lifecycle_guard",

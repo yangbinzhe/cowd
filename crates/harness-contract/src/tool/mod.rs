@@ -241,12 +241,13 @@ impl ToolTransactionPlan {
         &self,
         completed_operations: usize,
         failed_operations: usize,
+        checkpoint_created: bool,
     ) -> ToolTransactionReceipt {
         ToolTransactionReceipt {
             transaction_id: self.id.clone(),
             completed_operations,
             failed_operations,
-            checkpoint_created: self.requires_checkpoint,
+            checkpoint_created,
         }
     }
 }
@@ -328,5 +329,20 @@ mod tests {
             .unwrap();
 
         assert!(plan.requires_human_confirm);
+    }
+
+    #[test]
+    fn receipt_reports_observed_checkpoint_not_planned_checkpoint() {
+        let plan = ToolTransactionPlanner
+            .plan(vec![ToolOperation::write(
+                "write_file",
+                ToolRisk::High,
+                Some("a.rs".to_string()),
+            )])
+            .unwrap();
+
+        assert!(plan.requires_checkpoint);
+        assert!(!plan.receipt(0, 1, false).checkpoint_created);
+        assert!(plan.receipt(1, 0, true).checkpoint_created);
     }
 }

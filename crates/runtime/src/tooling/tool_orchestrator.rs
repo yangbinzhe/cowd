@@ -15,6 +15,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bash_validation::{classify_command, CommandIntent};
+
 // ---------------------------------------------------------------------------
 // ToolSafetyCategory
 // ---------------------------------------------------------------------------
@@ -99,6 +101,8 @@ impl ToolSafetyCategory {
             | "runtime_capabilities"
             | "list_mcp_resources"
             | "read_mcp_resource" => Self::ReadOnly,
+
+            "add" | "calculator" => Self::ReadOnly,
 
             "write"
             | "write_file"
@@ -343,6 +347,35 @@ impl ToolSafetyRegistry {
         } else {
             built_in
         }
+    }
+
+    /// Classify a tool request, refining command-bearing shell tools when the
+    /// input exposes enough structured information to do so safely.
+    pub fn classify_request(&self, tool_name: &str, input: &str) -> ToolSafetyCategory {
+        let normalized = normalize_tool_name_for_safety(tool_name);
+        let fallback = self.classify(&normalized);
+        if normalized != "bash" {
+            return fallback;
+        }
+
+        let command = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        command.map_or(fallback, |command| match classify_command(&command) {
+            CommandIntent::ReadOnly => ToolSafetyCategory::ReadOnly,
+            CommandIntent::Write => ToolSafetyCategory::WriteLocal,
+            CommandIntent::Network => ToolSafetyCategory::Network,
+            CommandIntent::Destructive
+            | CommandIntent::ProcessManagement
+            | CommandIntent::PackageManagement
+            | CommandIntent::SystemAdmin
+            | CommandIntent::Unknown => ToolSafetyCategory::Destructive,
+        })
     }
 
     /// Register a custom tool with an explicit category (for plugin tools).
@@ -665,6 +698,45 @@ mod tests {
         assert_eq!(
             ToolSafetyCategory::from_tool_name("WebFetch"),
             ToolSafetyCategory::Network
+        );
+    }
+
+    #[test]
+    fn classifies_pure_computation_tools_as_read_only() {
+        let registry = ToolSafetyRegistry::builtin();
+
+        for name in ["add", "calculator"] {
+            assert_eq!(
+                ToolSafetyCategory::from_tool_name(name),
+                ToolSafetyCategory::ReadOnly
+            );
+            assert_eq!(registry.classify(name), ToolSafetyCategory::ReadOnly);
+        }
+    }
+
+    #[test]
+    fn registry_refines_bash_json_commands_by_intent() {
+        let registry = ToolSafetyRegistry::builtin();
+
+        assert_eq!(
+            registry.classify_request("bash", r#"{"command":"git status"}"#),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            registry.classify_request("bash", r#"{"command":"mkdir target/new"}"#),
+            ToolSafetyCategory::WriteLocal
+        );
+        assert_eq!(
+            registry.classify_request("bash", r#"{"command":"curl https://example.com"}"#),
+            ToolSafetyCategory::Network
+        );
+        assert_eq!(
+            registry.classify_request("bash", r#"{"command":"rm -rf target"}"#),
+            ToolSafetyCategory::Destructive
+        );
+        assert_eq!(
+            registry.classify_request("bash", "not-json"),
+            ToolSafetyCategory::Destructive
         );
     }
 

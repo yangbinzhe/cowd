@@ -1501,8 +1501,9 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     assert!(
         (runtime_host.contains("GatewayServices::new(")
             || runtime_host.contains("GatewayServices::new_with_config_home("))
-            && runtime_host.contains("Arc::new(RuntimeService::new("),
-        "runtime host must register RuntimeService through GatewayServices"
+            && runtime_host.contains("RuntimeService::new(")
+            && runtime_host.contains(".with_approval_gate("),
+        "runtime host must register an approval-wired RuntimeService through GatewayServices"
     );
     assert!(
         !runtime_host.contains("PlatformRuntime"),

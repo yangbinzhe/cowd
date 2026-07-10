@@ -47,7 +47,7 @@ impl HarnessObservation {
             .unwrap_or(false);
         Self {
             scenario_id: scenario_id.into(),
-            strategy_pattern: trace.strategy.pattern,
+            strategy_pattern: trace.execution_decision.strategy.pattern,
             finalization_blocked: trace.finalization_blocked,
             regression_allowed: trace.regression_gate.allowed,
             has_workgraph: trace.workgraph.is_some(),
@@ -148,7 +148,7 @@ fn simple_question_stays_direct_and_clean() {
 }
 
 #[test]
-fn complex_task_builds_plan_execute_workgraph() {
+fn complex_task_builds_execution_workgraph() {
     let spec = ScenarioSpec::new(
         "complex_workgraph",
         "全面规划 runtime gateway service crate 的复杂架构演进",
@@ -236,6 +236,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         vec!["system prompt".to_string()],
     )
     .without_memory();
+    runtime.set_active_model("test-model");
 
     let summary = runtime
         .run_turn_async("answer this", &SharedPrompter::none())
@@ -385,7 +386,7 @@ fn underspecified_complex_trace_exposes_improvement_signal() {
     assert!(record
         .next_strategy_hints
         .iter()
-        .any(|hint| hint.contains("plan_execute")));
+        .any(|hint| hint.contains("execute")));
 }
 
 #[derive(Clone)]

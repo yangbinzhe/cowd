@@ -63,6 +63,7 @@ pub struct ProductionExecutor<C, T> {
     make_client: std::sync::Arc<dyn Fn() -> C + Send + Sync>,
     /// Shared tool executor across all sub-agent invocations.
     tool_executor: std::sync::Arc<T>,
+    approval_gate: Arc<std::sync::RwLock<Option<Arc<crate::approval_gate::SmartApprovalGate>>>>,
 }
 
 impl<C, T> ProductionExecutor<C, T>
@@ -79,7 +80,16 @@ where
         Self {
             make_client: std::sync::Arc::new(make_client),
             tool_executor,
+            approval_gate: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    pub fn with_approval_gate_slot(
+        mut self,
+        approval_gate: Arc<std::sync::RwLock<Option<Arc<crate::approval_gate::SmartApprovalGate>>>>,
+    ) -> Self {
+        self.approval_gate = approval_gate;
+        self
     }
 }
 
@@ -94,7 +104,7 @@ where
         task: &str,
     ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
         let client = (self.make_client)();
-        let rt = crate::conversation::ConversationRuntime::<C, T>::new_with_features(
+        let mut rt = crate::conversation::ConversationRuntime::<C, T>::new_with_features(
             crate::session::Session::new(),
             client,
             std::sync::Arc::clone(&self.tool_executor),
@@ -104,6 +114,14 @@ where
             vec!["system".to_string()],
             &crate::config::RuntimeFeatureConfig::default(),
         );
+        if let Some(approval_gate) = self
+            .approval_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            rt = rt.with_approval_gate(approval_gate);
+        }
         let config_for_sub = config;
         let task_owned = task.to_string();
         async move {

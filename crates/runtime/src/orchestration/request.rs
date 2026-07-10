@@ -43,12 +43,33 @@ impl Default for RuntimeOrchestrationAction {
     }
 }
 
+impl RuntimeOrchestrationAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanOnly => "plan_only",
+            Self::RequestTeam => "request_team",
+            Self::RequestSubagent => "request_subagent",
+            Self::RequestVerification => "request_verification",
+            Self::RequestParallelTools => "request_parallel_tools",
+            Self::RequestRewooEvidence => "request_rewoo_evidence",
+            Self::RequestDeliberation => "request_deliberation",
+            Self::RequestReflexionRetry => "request_reflexion_retry",
+            Self::RequestBackgroundReview => "request_background_review",
+            Self::RequestRiskGate => "request_risk_gate",
+            Self::RequestSessionLink => "request_session_link",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationConstraints {
     #[serde(default)]
     pub max_parallel_agents: Option<usize>,
     #[serde(default)]
     pub risk: Option<String>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
     #[serde(default)]
     pub requires_write: Option<bool>,
     #[serde(default)]

@@ -69,6 +69,7 @@ pub enum StrategyDecisionSource {
     Deterministic,
     ModelValidated,
     ExperienceAdapted,
+    ResourceAdapted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,8 +86,12 @@ pub struct StrategyInput {
     pub workspace_available: bool,
     pub changed_files: usize,
     pub explicit_write: bool,
+    #[serde(default)]
+    pub risk_override: Option<TaskRisk>,
     pub experience: Option<StrategyExperienceSummary>,
     pub proposal: Option<StrategyProposal>,
+    #[serde(default)]
+    pub understanding: Option<TaskUnderstanding>,
 }
 
 impl StrategyInput {
@@ -97,8 +102,10 @@ impl StrategyInput {
             workspace_available: true,
             changed_files: 0,
             explicit_write: false,
+            risk_override: None,
             experience: None,
             proposal: None,
+            understanding: None,
         }
     }
 
@@ -121,6 +128,12 @@ impl StrategyInput {
     }
 
     #[must_use]
+    pub const fn with_risk_override(mut self, risk: TaskRisk) -> Self {
+        self.risk_override = Some(risk);
+        self
+    }
+
+    #[must_use]
     pub fn with_experience(mut self, experience: StrategyExperienceSummary) -> Self {
         self.experience = Some(experience);
         self
@@ -129,6 +142,12 @@ impl StrategyInput {
     #[must_use]
     pub fn with_proposal(mut self, proposal: StrategyProposal) -> Self {
         self.proposal = Some(proposal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_understanding(mut self, understanding: TaskUnderstanding) -> Self {
+        self.understanding = Some(understanding);
         self
     }
 }
@@ -226,6 +245,15 @@ impl StrategyExperienceStore {
         &self,
         understanding: &TaskUnderstanding,
     ) -> Option<StrategyExperienceSummary> {
+        self.summary_for_pattern(understanding, None)
+    }
+
+    #[must_use]
+    pub fn summary_for_pattern(
+        &self,
+        understanding: &TaskUnderstanding,
+        selected_pattern: Option<ExecutionPattern>,
+    ) -> Option<StrategyExperienceSummary> {
         let comparable = self
             .records
             .iter()
@@ -233,6 +261,7 @@ impl StrategyExperienceStore {
                 record.domain == understanding.domain
                     && record.complexity == understanding.complexity
                     && record.risk == understanding.risk
+                    && selected_pattern.is_none_or(|pattern| record.selected_pattern == pattern)
             })
             .collect::<Vec<_>>();
         if comparable.is_empty() {
@@ -271,8 +300,13 @@ impl StrategyExperienceStore {
 
     #[must_use]
     pub fn enrich_input(&self, mut input: StrategyInput) -> StrategyInput {
-        let understanding = understand(&input);
-        input.experience = self.summary_for(&understanding);
+        let understanding = input
+            .understanding
+            .clone()
+            .unwrap_or_else(|| understand(&input));
+        input.understanding = Some(understanding.clone());
+        let baseline_pattern = StrategyRouter::default().decide(&input).pattern;
+        input.experience = self.summary_for_pattern(&understanding, Some(baseline_pattern));
         input
     }
 }
@@ -301,11 +335,32 @@ impl StrategyDecision {
     pub fn uses_gate(&self, gate: ExecutionPolicyGate) -> bool {
         self.gates.contains(&gate)
     }
+
+    pub fn retarget(
+        &mut self,
+        pattern: ExecutionPattern,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        if !pattern_supports_required_gates(pattern, &self.understanding) {
+            return Err(format!(
+                "pattern `{}` cannot preserve the required policy gates",
+                pattern.as_str()
+            ));
+        }
+        self.pattern = pattern;
+        normalize_modifiers(pattern, &mut self.modifiers);
+        self.gates = policy_gates_for(pattern, &self.understanding);
+        self.required_capabilities =
+            required_capabilities_for(&self.understanding, pattern, &self.modifiers);
+        self.source = StrategyDecisionSource::ResourceAdapted;
+        self.reasons.push(reason.into());
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrategyPolicy {
-    pub enable_parallel_read_fanout: bool,
+    pub enable_parallel_evidence: bool,
     pub enable_multi_agent: bool,
     pub require_verifier_for_complex: bool,
     pub require_guardrails_for_writes: bool,
@@ -314,7 +369,7 @@ pub struct StrategyPolicy {
 impl Default for StrategyPolicy {
     fn default() -> Self {
         Self {
-            enable_parallel_read_fanout: true,
+            enable_parallel_evidence: true,
             enable_multi_agent: true,
             require_verifier_for_complex: true,
             require_guardrails_for_writes: true,
@@ -335,9 +390,11 @@ impl StrategyRouter {
 
     #[must_use]
     pub fn decide(&self, input: &StrategyInput) -> StrategyDecision {
-        let understanding = understand(input);
+        let understanding = input
+            .understanding
+            .clone()
+            .unwrap_or_else(|| understand(input));
         let mut modifiers = Vec::new();
-        let mut gates = vec![ExecutionPolicyGate::Budget];
         let mut reasons = Vec::new();
 
         if understanding.requires_external_facts {
@@ -345,32 +402,13 @@ impl StrategyRouter {
             reasons.push("task asks for current or external facts".to_string());
         }
 
-        if input.workspace_available
-            && matches!(
-                understanding.domain,
-                TaskDomain::Backend
-                    | TaskDomain::Frontend
-                    | TaskDomain::Bugfix
-                    | TaskDomain::Review
-                    | TaskDomain::Architecture
-            )
-        {
-            modifiers.push(ExecutionModifier::WithSymbolGraph);
-        }
-
         if understanding.requires_write && self.policy.require_guardrails_for_writes {
             modifiers.push(ExecutionModifier::WithGuardrails);
-            gates.push(ExecutionPolicyGate::Permission);
         }
 
         if matches!(understanding.risk, TaskRisk::High | TaskRisk::Critical) {
             modifiers.push(ExecutionModifier::WithCheckpoint);
             modifiers.push(ExecutionModifier::WithReviewer);
-            gates.push(ExecutionPolicyGate::Risk);
-        }
-
-        if understanding.risk == TaskRisk::Critical {
-            gates.push(ExecutionPolicyGate::Approval);
         }
 
         if matches!(
@@ -383,7 +421,7 @@ impl StrategyRouter {
         }
 
         if understanding.requests_multi_agent && self.policy.enable_multi_agent {
-            modifiers.push(ExecutionModifier::WithReflection);
+            modifiers.push(ExecutionModifier::WithReviewer);
             reasons.push("task explicitly benefits from multiple agents".to_string());
         }
 
@@ -406,7 +444,7 @@ impl StrategyRouter {
                 reasons.push(format!("validated model proposal: {}", proposal.rationale));
                 source = StrategyDecisionSource::ModelValidated;
             } else {
-                reasons.push("model proposal was rejected by runtime policy".to_string());
+                reasons.push("model proposal was rejected by contract policy".to_string());
             }
         }
         if let Some(experience) = &input.experience {
@@ -417,13 +455,17 @@ impl StrategyRouter {
                 pattern = adapted;
             }
         }
-        dedupe_modifiers(&mut modifiers);
-        gates.sort_by_key(|gate| gate.as_str());
-        gates.dedup();
         let collaboration_lift =
             estimate_collaboration_lift(&understanding, input.experience.as_ref());
         if pattern == ExecutionPattern::Collaborate && !collaboration_lift.accepted {
             reasons.push("collaboration lift gate rejected team execution".to_string());
+            pattern = ExecutionPattern::Execute;
+        }
+        if !pattern_supports_required_gates(pattern, &understanding) {
+            reasons.push(format!(
+                "{} cannot represent the required policy gates; using execute",
+                pattern.as_str()
+            ));
             pattern = ExecutionPattern::Execute;
         }
         let mut confidence = confidence_for(&understanding, pattern);
@@ -432,11 +474,14 @@ impl StrategyRouter {
                 adapt_confidence_from_experience(confidence, pattern, experience, &mut reasons);
             if experience.verification_block_rate_bp >= 3000
                 && !modifiers.contains(&ExecutionModifier::WithVerifier)
+                && pattern.supports_modifier(ExecutionModifier::WithVerifier)
             {
                 modifiers.push(ExecutionModifier::WithVerifier);
                 reasons.push("experience shows verification gaps for comparable tasks".to_string());
             }
         }
+        normalize_modifiers(pattern, &mut modifiers);
+        let gates = policy_gates_for(pattern, &understanding);
         let required_capabilities = required_capabilities_for(&understanding, pattern, &modifiers);
 
         StrategyDecision {
@@ -480,7 +525,7 @@ fn adapt_pattern_from_experience(
         )
     {
         reasons.push(
-            "experience shows frequent verification blocks; upgrading to plan-execute".to_string(),
+            "experience shows frequent verification blocks; upgrading to execute".to_string(),
         );
         return ExecutionPattern::Execute;
     }
@@ -584,7 +629,11 @@ fn select_pattern(
     if understanding.requests_multi_agent && policy.enable_multi_agent {
         return ExecutionPattern::Collaborate;
     }
-    if understanding.requests_parallelism && policy.enable_parallel_read_fanout {
+    if understanding.requires_write {
+        reasons.push("write work requires the governed execution graph".to_string());
+        return ExecutionPattern::Execute;
+    }
+    if understanding.requests_parallelism && policy.enable_parallel_evidence {
         return ExecutionPattern::Explore;
     }
     if matches!(
@@ -592,10 +641,6 @@ fn select_pattern(
         TaskComplexity::Complex | TaskComplexity::Strategic
     ) || understanding.requests_deep_plan
     {
-        return ExecutionPattern::Execute;
-    }
-    if understanding.requires_write && understanding.likely_single_file {
-        reasons.push("bounded write can use fast edit path".to_string());
         return ExecutionPattern::Execute;
     }
     if understanding.requires_external_facts {
@@ -673,7 +718,9 @@ fn classify_domain(normalized: &str) -> TaskDomain {
 }
 
 fn classify_risk(input: &StrategyInput, normalized: &str, requires_write: bool) -> TaskRisk {
-    if contains_any(normalized, CRITICAL_RISK_TERMS) {
+    if let Some(risk) = input.risk_override {
+        risk
+    } else if contains_any(normalized, CRITICAL_RISK_TERMS) {
         TaskRisk::Critical
     } else if contains_any(normalized, HIGH_RISK_TERMS) || input.changed_files > 20 {
         TaskRisk::High
@@ -745,9 +792,33 @@ fn contains_many_scopes(prompt: &str) -> bool {
     count >= 3
 }
 
-fn dedupe_modifiers(modifiers: &mut Vec<ExecutionModifier>) {
+fn normalize_modifiers(pattern: ExecutionPattern, modifiers: &mut Vec<ExecutionModifier>) {
     let mut seen = std::collections::HashSet::new();
-    modifiers.retain(|decorator| seen.insert(*decorator));
+    modifiers.retain(|modifier| pattern.supports_modifier(*modifier) && seen.insert(*modifier));
+}
+
+fn policy_gates_for(
+    pattern: ExecutionPattern,
+    understanding: &TaskUnderstanding,
+) -> Vec<ExecutionPolicyGate> {
+    ExecutionPolicyGate::ALL
+        .iter()
+        .copied()
+        .filter(|gate| {
+            gate.is_required_for(understanding.risk, understanding.requires_write)
+                && pattern.supports_gate(*gate)
+        })
+        .collect()
+}
+
+fn pattern_supports_required_gates(
+    pattern: ExecutionPattern,
+    understanding: &TaskUnderstanding,
+) -> bool {
+    ExecutionPolicyGate::ALL.iter().copied().all(|gate| {
+        !gate.is_required_for(understanding.risk, understanding.requires_write)
+            || pattern.supports_gate(gate)
+    })
 }
 
 fn proposal_is_executable(proposal: &StrategyProposal, understanding: &TaskUnderstanding) -> bool {
@@ -760,7 +831,11 @@ fn proposal_is_executable(proposal: &StrategyProposal, understanding: &TaskUnder
     if understanding.requires_write && proposal.pattern == ExecutionPattern::Direct {
         return false;
     }
-    true
+    proposal
+        .modifiers
+        .iter()
+        .all(|modifier| proposal.pattern.supports_modifier(*modifier))
+        && pattern_supports_required_gates(proposal.pattern, understanding)
 }
 
 fn estimate_collaboration_lift(
@@ -934,6 +1009,27 @@ const CRITICAL_RISK_TERMS: &[&str] = &[
 mod tests {
     use super::*;
 
+    fn proposal(pattern: ExecutionPattern, modifiers: Vec<ExecutionModifier>) -> StrategyProposal {
+        StrategyProposal {
+            pattern,
+            modifiers,
+            template: None,
+            confidence: 90,
+            rationale: "test proposal".to_string(),
+        }
+    }
+
+    fn assert_contract_legal(decision: &StrategyDecision) {
+        assert!(decision
+            .modifiers
+            .iter()
+            .all(|modifier| decision.pattern.supports_modifier(*modifier)));
+        assert!(decision
+            .gates
+            .iter()
+            .all(|gate| decision.pattern.supports_gate(*gate)));
+    }
+
     #[test]
     fn routes_simple_question_to_direct() {
         let decision = decide_strategy(&StrategyInput::from_prompt("解释一下这个函数有什么用"));
@@ -992,7 +1088,119 @@ mod tests {
         ));
 
         assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
-        assert!(decision.uses_modifier(ExecutionModifier::WithReflection));
+        assert!(decision.uses_modifier(ExecutionModifier::WithReviewer));
+        assert_contract_legal(&decision);
+    }
+
+    #[test]
+    fn rejects_model_proposal_with_unsupported_modifier() {
+        let decision = decide_strategy(&StrategyInput::from_prompt("解释这个函数").with_proposal(
+            proposal(
+                ExecutionPattern::Execute,
+                vec![ExecutionModifier::Background],
+            ),
+        ));
+
+        assert_eq!(decision.pattern, ExecutionPattern::Direct);
+        assert_eq!(decision.source, StrategyDecisionSource::Deterministic);
+        assert!(!decision.uses_modifier(ExecutionModifier::Background));
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("rejected by contract policy")));
+        assert_contract_legal(&decision);
+    }
+
+    #[test]
+    fn accepts_model_proposal_with_supported_modifier() {
+        let decision = decide_strategy(&StrategyInput::from_prompt("解释这个函数").with_proposal(
+            proposal(ExecutionPattern::Explore, vec![ExecutionModifier::Parallel]),
+        ));
+
+        assert_eq!(decision.pattern, ExecutionPattern::Explore);
+        assert_eq!(decision.source, StrategyDecisionSource::ModelValidated);
+        assert!(decision.uses_modifier(ExecutionModifier::Parallel));
+        assert_contract_legal(&decision);
+    }
+
+    #[test]
+    fn six_patterns_generate_their_key_policy_gates() {
+        use ExecutionPolicyGate::{Approval, Budget, Permission, Risk};
+
+        let direct = decide_strategy(&StrategyInput::from_prompt("解释这个值"));
+        let explore = decide_strategy(
+            &StrategyInput::from_prompt("收集资料并更新记录")
+                .with_explicit_write(true)
+                .with_proposal(proposal(ExecutionPattern::Explore, Vec::new())),
+        );
+        let execute = decide_strategy(
+            &StrategyInput::from_prompt("force push secret change").with_explicit_write(true),
+        );
+        let deliberate = decide_strategy(
+            &StrategyInput::from_prompt("对两个方案做 tradeoff").with_changed_files(21),
+        );
+        let collaborate = decide_strategy(
+            &StrategyInput::from_prompt(
+                "使用多 Agent 协同分析 runtime gateway memory 的 secret 变更",
+            )
+            .with_explicit_write(true)
+            .with_proposal(proposal(ExecutionPattern::Collaborate, Vec::new())),
+        );
+        let supervise = decide_strategy(
+            &StrategyInput::from_prompt("后台持续监控 secret 变更")
+                .with_explicit_write(true)
+                .with_proposal(proposal(ExecutionPattern::Supervise, Vec::new())),
+        );
+
+        assert_eq!(direct.pattern, ExecutionPattern::Direct);
+        assert_eq!(direct.gates, vec![Budget]);
+        assert_eq!(explore.pattern, ExecutionPattern::Explore);
+        assert_eq!(explore.gates, vec![Budget, Permission]);
+        assert_eq!(execute.pattern, ExecutionPattern::Execute);
+        assert_eq!(execute.gates, vec![Budget, Permission, Risk, Approval]);
+        assert_eq!(deliberate.pattern, ExecutionPattern::Deliberate);
+        assert_eq!(deliberate.gates, vec![Budget, Risk]);
+        assert_eq!(collaborate.pattern, ExecutionPattern::Collaborate);
+        assert_eq!(collaborate.gates, vec![Budget, Permission, Risk, Approval]);
+        assert_eq!(supervise.pattern, ExecutionPattern::Supervise);
+        assert_eq!(supervise.gates, vec![Budget, Permission, Risk, Approval]);
+
+        for decision in [direct, explore, execute, deliberate, collaborate, supervise] {
+            assert_contract_legal(&decision);
+        }
+    }
+
+    #[test]
+    fn same_input_is_stable_across_all_six_patterns() {
+        let cases = [
+            ("解释一下这个函数有什么用", ExecutionPattern::Direct),
+            (
+                "调研最新 AI harness 实践并汇总证据",
+                ExecutionPattern::Explore,
+            ),
+            ("实现并修复这个单文件小问题", ExecutionPattern::Execute),
+            (
+                "权衡两个架构方案并解决冲突方案",
+                ExecutionPattern::Deliberate,
+            ),
+            (
+                "使用多 Agent 协同完成复杂架构分析",
+                ExecutionPattern::Collaborate,
+            ),
+            ("后台持续监控这项长期运行任务", ExecutionPattern::Supervise),
+        ];
+
+        for (prompt, expected_pattern) in cases {
+            let input = StrategyInput::from_prompt(prompt);
+            let first = decide_strategy(&input);
+            let second = decide_strategy(&input);
+            let wire = serde_json::to_value(&first).expect("strategy decision wire payload");
+
+            assert_eq!(first.pattern, expected_pattern, "prompt: {prompt}");
+            assert_eq!(first, second, "prompt: {prompt}");
+            assert_eq!(wire["pattern"], expected_pattern.as_str());
+            assert!(wire.get("mode").is_none());
+        }
     }
 
     #[test]

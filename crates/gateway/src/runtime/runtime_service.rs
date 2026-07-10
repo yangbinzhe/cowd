@@ -129,6 +129,7 @@ pub(crate) struct RuntimeService {
     session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
+    approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +158,17 @@ impl RuntimeService {
             session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
+            approval_gate: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_approval_gate(
+        mut self,
+        approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
+    ) -> Self {
+        self.approval_gate = Some(approval_gate);
+        self
     }
 
     #[must_use]
@@ -443,9 +454,12 @@ impl RuntimeService {
     pub(crate) fn register_runtime(
         &self,
         session_id: String,
-        runtime: crate::runtime_entry::GatewayRuntimeEntry,
+        mut runtime: crate::runtime_entry::GatewayRuntimeEntry,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>>, String>
     {
+        if let Some(approval_gate) = &self.approval_gate {
+            runtime.install_approval_gate(Arc::clone(approval_gate));
+        }
         let input_stream = runtime.session_input_stream();
         let cowd_bus = runtime.cowd_bus().cloned();
         let model = runtime
@@ -863,7 +877,8 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
         let model = runtime_guard
-            .session()
+            .session_async()
+            .await
             .model
             .filter(|model| !model.trim().is_empty());
         if let Some(model) = model.as_ref() {
@@ -1391,7 +1406,7 @@ impl RuntimeService {
     pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
-        Some(runtime_guard.session().clone())
+        Some(runtime_guard.session_async().await)
     }
 
     pub(crate) async fn sync_session_snapshot(
@@ -1518,7 +1533,7 @@ impl RuntimeService {
     ) -> Option<ActiveMessagesPage> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
-        let session = runtime_guard.session();
+        let session = runtime_guard.session_async().await;
 
         let all_messages: Vec<serde_json::Value> = session
             .messages

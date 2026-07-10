@@ -64,6 +64,13 @@ impl GatewayRuntimeEntry {
             .install_turn_control(cancellation_token, hook_abort_signal);
     }
 
+    pub(crate) fn install_approval_gate(
+        &mut self,
+        approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
+    ) {
+        self.runtime_mut().install_approval_gate(approval_gate);
+    }
+
     pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -149,6 +156,10 @@ impl GatewayRuntimeEntry {
 
     pub(crate) fn session(&self) -> runtime::Session {
         self.runtime_ref().session()
+    }
+
+    pub(crate) async fn session_async(&self) -> runtime::Session {
+        self.runtime_ref().session_async().await
     }
 
     pub(crate) fn compact_active_session(

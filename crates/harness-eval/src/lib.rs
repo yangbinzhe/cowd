@@ -62,7 +62,7 @@ pub struct CowdBenchCase {
     pub id: String,
     pub kind: BenchCaseKind,
     pub prompt: String,
-    pub expected_mode: ExecutionPattern,
+    pub expected_pattern: ExecutionPattern,
     #[serde(default)]
     pub expected_modifiers: Vec<ExecutionModifier>,
     pub required_checks: Vec<String>,
@@ -73,13 +73,13 @@ impl CowdBenchCase {
     pub fn new(
         kind: BenchCaseKind,
         prompt: impl Into<String>,
-        expected_mode: ExecutionPattern,
+        expected_pattern: ExecutionPattern,
     ) -> Self {
         Self {
             id: format!("cowdbench-{}", uuid::Uuid::new_v4()),
             kind,
             prompt: prompt.into(),
-            expected_mode,
+            expected_pattern,
             expected_modifiers: Vec::new(),
             required_checks: Vec::new(),
         }
@@ -249,7 +249,7 @@ pub struct KnowledgeFabricEvalReport {
 pub struct RealityScenarioEvalSpec {
     pub id: String,
     pub objective: String,
-    pub expected_mode: String,
+    pub expected_pattern: ExecutionPattern,
     pub input_summary: String,
     pub required_sources: Vec<RecallSourceKind>,
 }
@@ -259,7 +259,7 @@ pub struct RealityScenarioEvalResult {
     pub scenario_id: String,
     pub status: String,
     pub objective: String,
-    pub expected_mode: String,
+    pub expected_pattern: ExecutionPattern,
     pub request_summary: String,
     pub response_summary: String,
     pub source_candidates: Vec<String>,
@@ -431,8 +431,8 @@ pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
             "simple_direct",
             SimpleDirect,
             "简单问题一次性直接处理",
-            "简单问题应选择 direct answer，不启动团队、工具和复杂恢复链路。",
-            vec!["direct_answer"],
+            "简单问题应选择 Direct 决策，不启动团队、工具和复杂恢复链路。",
+            vec!["direct"],
             vec!["strategy"],
             0,
             false,
@@ -708,7 +708,7 @@ fn next_gen_terminal_evidence(
 ) -> Value {
     match spec.kind {
         NextGenHarnessScenarioKind::SimpleDirect => json!({
-            "direct_answer_selected": true,
+            "selected_pattern": ExecutionPattern::Direct.as_str(),
             "team_started": false,
             "source": "strategy_contract"
         }),
@@ -808,7 +808,7 @@ fn next_gen_evidence_refs(
 ) -> Vec<String> {
     match spec.kind {
         NextGenHarnessScenarioKind::SimpleDirect => {
-            vec!["strategy:direct_answer:no_over_orchestration".to_string()]
+            vec!["strategy:direct:no_over_orchestration".to_string()]
         }
         NextGenHarnessScenarioKind::ComplexStrategySelection => {
             vec!["runtime-capability:use_team_template".to_string()]
@@ -863,28 +863,28 @@ pub fn reality_context_eval_specs() -> Vec<RealityScenarioEvalSpec> {
         RealityScenarioEvalSpec {
             id: "simple_question_fast_path".to_string(),
             objective: "简单问题快速回答，不启用全量 Reality 负载".to_string(),
-            expected_mode: "direct_answer".to_string(),
+            expected_pattern: ExecutionPattern::Direct,
             input_summary: "用户询问当前能力是否健康".to_string(),
             required_sources: vec![RecallSourceKind::Runtime],
         },
         RealityScenarioEvalSpec {
             id: "cross_project_memory_isolation".to_string(),
             objective: "项目 A 与项目 B 记忆召回隔离，避免跨项目污染".to_string(),
-            expected_mode: "memory_scoped_recall".to_string(),
+            expected_pattern: ExecutionPattern::Explore,
             input_summary: "在 cowd 项目内召回架构约束，排除 unrelated-crm 规则".to_string(),
             required_sources: vec![RecallSourceKind::Memory, RecallSourceKind::Knowledge],
         },
         RealityScenarioEvalSpec {
             id: "global_knowledge_default_activation".to_string(),
             objective: "全局知识在符合 domain policy 时默认激活".to_string(),
-            expected_mode: "knowledge_activation".to_string(),
+            expected_pattern: ExecutionPattern::Direct,
             input_summary: "供应链类任务自动获得共享流程规约".to_string(),
             required_sources: vec![RecallSourceKind::Knowledge],
         },
         RealityScenarioEvalSpec {
             id: "context_compaction_recall".to_string(),
             objective: "上下文压缩后保留可召回线索，不出现绝对遗忘".to_string(),
-            expected_mode: "compact_navigation".to_string(),
+            expected_pattern: ExecutionPattern::Explore,
             input_summary: "长会话触发压缩并继续追问关键决策依据".to_string(),
             required_sources: vec![
                 RecallSourceKind::CompactNavigation,
@@ -894,35 +894,35 @@ pub fn reality_context_eval_specs() -> Vec<RealityScenarioEvalSpec> {
         RealityScenarioEvalSpec {
             id: "fact_matrix_evidence_trace".to_string(),
             objective: "Fact/Matrix 证据能进入 RecallReport 与 ContextEnvelope".to_string(),
-            expected_mode: "structured_evidence".to_string(),
+            expected_pattern: ExecutionPattern::Deliberate,
             input_summary: "制造 what-if 需要结构化指标、事实与证据引用".to_string(),
             required_sources: vec![RecallSourceKind::Fact, RecallSourceKind::Matrix],
         },
         RealityScenarioEvalSpec {
             id: "growth_promotion_governance".to_string(),
             objective: "运行时增长候选通过 observed/conflict/hypothetical 边界治理".to_string(),
-            expected_mode: "fact_flow_governance".to_string(),
+            expected_pattern: ExecutionPattern::Execute,
             input_summary: "从工具输出抽取候选事实并判断是否晋升".to_string(),
             required_sources: vec![RecallSourceKind::Runtime, RecallSourceKind::Fact],
         },
         RealityScenarioEvalSpec {
             id: "tool_large_output_sandbox".to_string(),
             objective: "工具大输出以摘要/证据引用进入上下文，避免上下文过载".to_string(),
-            expected_mode: "tool_sandbox_summary".to_string(),
+            expected_pattern: ExecutionPattern::Explore,
             input_summary: "代码扫描产生大量输出，模型只接收摘要和可追溯路径".to_string(),
             required_sources: vec![RecallSourceKind::ToolTrace, RecallSourceKind::Workspace],
         },
         RealityScenarioEvalSpec {
             id: "multi_agent_shared_evidence".to_string(),
             objective: "多 Agent 协同能共享必要 evidence，同时保留隔离边界".to_string(),
-            expected_mode: "supervisor_subagents".to_string(),
+            expected_pattern: ExecutionPattern::Collaborate,
             input_summary: "Planner/Implementer/Reviewer 协同解决架构修订".to_string(),
             required_sources: vec![RecallSourceKind::AgentPeer, RecallSourceKind::Runtime],
         },
         RealityScenarioEvalSpec {
             id: "cross_session_linked_work".to_string(),
             objective: "跨 Session 能建立关联、查看进度、引用对方证据".to_string(),
-            expected_mode: "session_link".to_string(),
+            expected_pattern: ExecutionPattern::Supervise,
             input_summary: "主 session 调度另一 session 继续独立分析".to_string(),
             required_sources: vec![
                 RecallSourceKind::SessionCheckpoint,
@@ -932,7 +932,7 @@ pub fn reality_context_eval_specs() -> Vec<RealityScenarioEvalSpec> {
         RealityScenarioEvalSpec {
             id: "conflict_latest_fact_resolution".to_string(),
             objective: "新旧事实冲突时优先最新可信证据并保留冲突说明".to_string(),
-            expected_mode: "conflict_resolution".to_string(),
+            expected_pattern: ExecutionPattern::Deliberate,
             input_summary: "用户前后规则冲突，系统根据时间和证据做治理".to_string(),
             required_sources: vec![
                 RecallSourceKind::Memory,
@@ -1043,7 +1043,10 @@ fn evaluate_reality_context_scenario(spec: RealityScenarioEvalSpec) -> RealitySc
         profile: ContextProfile::DeepInvestigation,
         intent: spec.input_summary.clone(),
         stable_head: vec!["cowd-reality-eval:v1".to_string()],
-        runtime_header: vec![format!("expected_mode:{}", spec.expected_mode)],
+        runtime_header: vec![format!(
+            "expected_pattern:{}",
+            spec.expected_pattern.as_str()
+        )],
         dynamic_items: context_items,
         omitted: context_omissions,
         total_budget_tokens: 32_000,
@@ -1065,7 +1068,7 @@ fn evaluate_reality_context_scenario(spec: RealityScenarioEvalSpec) -> RealitySc
         scenario_id: spec.id.clone(),
         status: if passed { "passed" } else { "failed" }.to_string(),
         objective: spec.objective,
-        expected_mode: spec.expected_mode,
+        expected_pattern: spec.expected_pattern,
         request_summary: spec.input_summary,
         response_summary: if passed {
             "Reality context selected scoped evidence and preserved omitted trace".to_string()
@@ -1144,7 +1147,7 @@ fn recall_candidate_for(
             score,
             vec![
                 "scenario_required_source".to_string(),
-                format!("expected_mode:{}", spec.expected_mode),
+                format!("expected_pattern:{}", spec.expected_pattern.as_str()),
             ],
         ),
     }
@@ -1741,7 +1744,7 @@ pub struct CowdBenchSmokeSuite {
 pub struct ScenarioSpec {
     pub id: String,
     pub prompt: String,
-    pub expected_mode: Option<ExecutionPattern>,
+    pub expected_pattern: Option<ExecutionPattern>,
     pub required_checks: Vec<ScenarioCheck>,
 }
 
@@ -1751,14 +1754,14 @@ impl ScenarioSpec {
         Self {
             id: id.into(),
             prompt: prompt.into(),
-            expected_mode: None,
+            expected_pattern: None,
             required_checks: Vec::new(),
         }
     }
 
     #[must_use]
-    pub const fn expect_mode(mut self, mode: ExecutionPattern) -> Self {
-        self.expected_mode = Some(mode);
+    pub const fn expect_pattern(mut self, pattern: ExecutionPattern) -> Self {
+        self.expected_pattern = Some(pattern);
         self
     }
 
@@ -1970,12 +1973,12 @@ pub fn evaluate_scenario(
     observation: &ScenarioObservation,
 ) -> ScenarioVerdict {
     let mut failed_checks = Vec::new();
-    if let Some(expected_mode) = spec.expected_mode {
-        if observation.strategy_pattern != expected_mode {
+    if let Some(expected_pattern) = spec.expected_pattern {
+        if observation.strategy_pattern != expected_pattern {
             failed_checks.push(FailedScenarioCheck {
                 check_id: "strategy.pattern".to_string(),
                 owner: "ai-strategy".to_string(),
-                expected: expected_mode.as_str().to_string(),
+                expected: expected_pattern.as_str().to_string(),
                 actual: observation.strategy_pattern.as_str().to_string(),
                 repair_hint: "inspect strategy classifier and experience adapter".to_string(),
             });
@@ -1986,7 +1989,7 @@ pub fn evaluate_scenario(
             failed_checks.push(failure);
         }
     }
-    let total_checks = spec.required_checks.len() + usize::from(spec.expected_mode.is_some());
+    let total_checks = spec.required_checks.len() + usize::from(spec.expected_pattern.is_some());
     let passed_checks = total_checks.saturating_sub(failed_checks.len());
     let score = if total_checks == 0 {
         1.0
@@ -2196,14 +2199,14 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
         ),
         (
             BenchCaseKind::ArchitecturePlan,
-            "plan a multi-crate architecture change",
-            ExecutionPattern::Execute,
+            "compare architecture tradeoffs before selecting a plan",
+            ExecutionPattern::Deliberate,
             "workgraph",
         ),
         (
             BenchCaseKind::ContextAssembly,
-            "assemble relevant memory and workspace context",
-            ExecutionPattern::Execute,
+            "explore relevant memory and workspace evidence",
+            ExecutionPattern::Explore,
             "context_epoch",
         ),
         (
@@ -2232,8 +2235,8 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
         ),
         (
             BenchCaseKind::MemoryGrowthLoop,
-            "turn runtime learning into reviewable memory candidates",
-            ExecutionPattern::Execute,
+            "supervise long-running runtime learning and memory promotion",
+            ExecutionPattern::Supervise,
             "memory_candidate",
         ),
         (
@@ -2251,8 +2254,8 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
     ];
     specs
         .into_iter()
-        .map(|(kind, prompt, expected_mode, required_check)| {
-            let mut case = CowdBenchCase::new(kind, prompt, expected_mode);
+        .map(|(kind, prompt, expected_pattern, required_check)| {
+            let mut case = CowdBenchCase::new(kind, prompt, expected_pattern);
             case.required_checks.push(required_check.to_string());
             case
         })
@@ -2279,12 +2282,12 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
 pub fn score_case(case: &CowdBenchCase, trajectory: &Trajectory) -> BenchCaseResult {
     let mut score = 0.0f32;
     let mut reasons = Vec::new();
-    if case.expected_mode == trajectory.selected_pattern {
+    if case.expected_pattern == trajectory.selected_pattern {
         score += 0.4;
     } else {
         reasons.push(format!(
-            "mode mismatch: expected {}, got {}",
-            case.expected_mode.as_str(),
+            "pattern mismatch: expected {}, got {}",
+            case.expected_pattern.as_str(),
             trajectory.selected_pattern.as_str()
         ));
     }
@@ -2696,7 +2699,7 @@ mod tests {
             .iter()
             .map(|case| {
                 case.required_checks.iter().fold(
-                    Trajectory::new(case.id.clone(), case.expected_mode),
+                    Trajectory::new(case.id.clone(), case.expected_pattern),
                     |trajectory, check| trajectory.pass(check.clone()),
                 )
             })
@@ -2706,6 +2709,39 @@ mod tests {
 
         assert!(verdict.allowed);
         assert_eq!(suite.cases.len(), 11);
+    }
+
+    #[test]
+    fn fixtures_use_pattern_wire_and_cover_all_six_patterns() {
+        let cases = cowdbench_smoke_cases();
+        let expected_patterns = [
+            ExecutionPattern::Direct,
+            ExecutionPattern::Explore,
+            ExecutionPattern::Execute,
+            ExecutionPattern::Deliberate,
+            ExecutionPattern::Collaborate,
+            ExecutionPattern::Supervise,
+        ];
+
+        for expected_pattern in expected_patterns {
+            assert!(cases
+                .iter()
+                .any(|case| case.expected_pattern == expected_pattern));
+        }
+
+        let wire = serde_json::to_value(&cases).expect("bench fixture wire payload");
+        assert!(wire
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| {
+                item.get("expected_pattern")
+                    .and_then(Value::as_str)
+                    .is_some()
+            })));
+        assert!(reality_context_eval_specs().iter().all(|spec| {
+            expected_patterns
+                .iter()
+                .any(|pattern| *pattern == spec.expected_pattern)
+        }));
     }
 
     #[test]
@@ -2720,7 +2756,7 @@ mod tests {
     #[test]
     fn scenario_suite_reports_owner_and_repair_hint() {
         let spec = ScenarioSpec::new("empty_answer", "answer this")
-            .expect_mode(ExecutionPattern::Direct)
+            .expect_pattern(ExecutionPattern::Direct)
             .require(ScenarioCheck::bool(
                 "verification.finalization_blocked",
                 ScenarioCheckKind::FinalizationBlocked,
@@ -2758,7 +2794,7 @@ mod tests {
     #[test]
     fn scenario_suite_accepts_growth_signal_checks() {
         let spec = ScenarioSpec::new("matrix_quality", "quality gate")
-            .expect_mode(ExecutionPattern::Execute)
+            .expect_pattern(ExecutionPattern::Execute)
             .require(ScenarioCheck::growth_signal(
                 "growth.matrix_quality_gate",
                 "MatrixQualityGate",

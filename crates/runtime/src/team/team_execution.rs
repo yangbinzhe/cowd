@@ -231,6 +231,18 @@ impl TeamExecutionLoop {
                     "evidence_refs": assigned.evidence_refs,
                 });
                 match global_agent_lifecycle_service().command_capability(agent_id) {
+                    Some(capability)
+                        if capability.backend
+                            == crate::AgentExecutionBackendKind::ManualMailbox =>
+                    {
+                        let _ = global_agent_task_mailbox().set_status(
+                            &assigned.task_id,
+                            AgentTaskStatus::Claimed,
+                            "task assigned to manual mailbox agent",
+                        );
+                        global_agent_task_binding_registry()
+                            .mark_task_status(agent_id, AgentTaskStatus::Claimed);
+                    }
                     Some(capability) if !capability.supports_input => {
                         let message = format!(
                             "agent backend {} does not support runtime input",
@@ -1011,6 +1023,64 @@ mod tests {
             .as_ref()
             .expect("backend capability");
         assert!(!capability.supports_input);
+    }
+
+    #[test]
+    fn manual_mailbox_agent_claims_task_without_command_channel_failure() {
+        let suffix = uuid::Uuid::new_v4();
+        let session_id = format!("team-manual-mailbox-session-{suffix}");
+        crate::global_mission_runtime()
+            .start_session(StartMissionSessionRequest {
+                title: "team manual mailbox".to_string(),
+                session_id: Some(session_id.clone()),
+            })
+            .expect("session");
+        let prompt = "use a team to answer one delegated question";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
+        let team = global_team_runtime_service()
+            .start_with_agent_spawner(
+                StartTeamRuntimeRequest {
+                    session_id,
+                    objective: prompt.to_string(),
+                    collaboration_decision: decision,
+                },
+                |request| {
+                    let agent_id = format!("agent-manual-{}-{suffix}", request.role_id);
+                    let snapshot = AgentSnapshot {
+                        agent_id: agent_id.clone(),
+                        name: request.role_id.clone(),
+                        description: request.responsibility.clone(),
+                        subagent_type: Some("Manual".to_string()),
+                        model: None,
+                        status: "queued".to_string(),
+                        backend: AgentExecutionBackendKind::ManualMailbox,
+                        output_file: String::new(),
+                        manifest_file: String::new(),
+                        created_at: "1".to_string(),
+                        started_at: None,
+                        completed_at: None,
+                        lane_events: Vec::new(),
+                        current_blocker: None,
+                        derived_state: "awaiting_manual_outcome".to_string(),
+                        error: None,
+                    };
+                    crate::global_agent_lifecycle_service()
+                        .register_started(snapshot.clone(), CancellationToken::new());
+                    Ok(snapshot)
+                },
+            )
+            .expect("team");
+
+        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
+        assert!(report.errors.is_empty());
+        let claimed = global_agent_task_mailbox()
+            .list_for_team(&team.team_id)
+            .into_iter()
+            .filter(|task| task.status == AgentTaskStatus::Claimed)
+            .count();
+        assert_eq!(claimed, report.assigned_task_count);
+        assert!(claimed > 0);
     }
 
     #[test]

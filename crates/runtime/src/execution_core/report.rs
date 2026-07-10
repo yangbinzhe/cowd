@@ -15,7 +15,7 @@ impl RuntimeExecutionReportSpec {
                 "model-visible capability context".to_string(),
                 "runtime_capabilities usage".to_string(),
                 "runtime_orchestrate usage".to_string(),
-                "execution mode and template".to_string(),
+                "execution pattern and template".to_string(),
                 "token and latency".to_string(),
                 "tool and agent counts".to_string(),
                 "correctness and residual risks".to_string(),

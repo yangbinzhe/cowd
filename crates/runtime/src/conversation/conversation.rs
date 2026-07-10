@@ -80,7 +80,6 @@ use crate::fact_extraction::{
     RuntimeFactExtractor,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
-use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::knowledge_activation::KnowledgeActivationRuntime;
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
 use crate::runtime_control::RuntimeControlPolicy;
@@ -90,7 +89,7 @@ use crate::skill::{
     memory_candidate_from_skill_activation, SkillActivationEngine, SkillActivationInput,
     SkillActivationRecord, SkillMemoryPolicy,
 };
-use crate::tool_execution_plan::ToolExecutionPlan;
+use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
@@ -304,6 +303,10 @@ pub trait ApiClient {
         request: ApiRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>;
 
+    fn provider_available(&self) -> bool {
+        true
+    }
+
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut pinned = self.stream(request);
@@ -330,6 +333,38 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor: Send + Sync + 'static {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn has_registered_tools(&self) -> bool {
+        !self.available_tool_names().is_empty()
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        self.available_tool_names()
+            .iter()
+            .any(|available| available == tool_name)
+    }
+
+    fn classify_tool_safety(
+        &self,
+        _tool_name: &str,
+        _input: &str,
+    ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
+        None
+    }
+
+    fn collaboration_runtime_available(&self) -> bool {
+        false
+    }
+
+    fn mission_runtime_available(&self) -> bool {
+        false
+    }
+
+    fn bind_execution_decision(&self, _decision: crate::execution_core::RuntimeExecutionDecision) {}
 }
 
 /// Tool execution lifecycle callback for real-time visualization.
@@ -624,8 +659,6 @@ pub struct ConversationRuntime<C, T> {
     skill_profiles: Vec<SkillCapabilityProfile>,
     /// Agent-scoped Skill visibility and adapter policy.
     agent_skill_profile: AgentSkillProfile,
-    /// Type-erased Joint Problem Solving pipeline for high-complexity tasks.
-    jps_pipeline: Option<Arc<dyn JpsOps>>,
     /// When true, inject available peer agents from AgentDirectory into the system prompt.
     inject_peer_context: bool,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
@@ -857,7 +890,6 @@ where
             collaboration: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
-            jps_pipeline: None,
             inject_peer_context: true,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(
@@ -1674,12 +1706,6 @@ where
     }
 
     #[must_use]
-    pub fn with_jps_pipeline(mut self, pipeline: Arc<dyn JpsOps>) -> Self {
-        self.jps_pipeline = Some(pipeline);
-        self
-    }
-
-    #[must_use]
     pub fn with_runtime_control_policy(mut self, policy: RuntimeControlPolicy) -> Self {
         self.runtime_control_policy = policy;
         self
@@ -1929,17 +1955,17 @@ where
     }
 
     /// Determine whether the current user message warrants multi-agent collaboration.
-    fn should_use_collaboration(&self, user_message: &str) -> bool {
+    fn should_use_collaboration(
+        &self,
+        decision: &crate::execution_core::RuntimeExecutionDecision,
+    ) -> bool {
         if !self.runtime_control_policy.enabled || !self.runtime_control_policy.agent.enabled {
             return false;
         }
-        let decision = crate::execution_core::build_runtime_execution_decision(
-            user_message,
-            Some(self.context_profile()),
-        );
-        decision.recommended_pattern == harness_contract::core::ExecutionPattern::Collaborate
+        decision.executable
+            && decision.pattern() == harness_contract::core::ExecutionPattern::Collaborate
             && (!self.runtime_control_policy.agent.require_positive_lift
-                || decision.collaboration_lift.accepted)
+                || decision.collaboration_lift().accepted)
     }
 
     /// Infer required capability keywords from a task description.
@@ -2176,6 +2202,29 @@ where
         let mut provider_usage_seen = false;
         let mut models_used: Vec<String> = Vec::new();
         let user_input = user_input.into();
+        let strategy_input = self.strategy_input_for_turn(&user_input);
+        let resource_health = crate::execution_core::StrategyResourceHealth {
+            provider_available: self.api_client.provider_available(),
+            tools_available: self.tool_executor.has_registered_tools(),
+            collaboration_available: self.runtime_control_policy.enabled
+                && self.runtime_control_policy.agent.enabled
+                && (self.collaboration.is_some()
+                    || self.tool_executor.collaboration_runtime_available()),
+            mission_available: self.runtime_control_policy.enabled
+                && self.tool_executor.mission_runtime_available(),
+            observed: true,
+        };
+        let execution_decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
+            strategy_input,
+            Some(self.context_profile()),
+            resource_health,
+        );
+        if !execution_decision.executable {
+            return Err(RuntimeError::new(format!(
+                "runtime strategy is not executable: {}",
+                execution_decision.blocked_reasons.join("; ")
+            )));
+        }
         let runtime_turn_id = self
             .session_input_stream
             .active_turn_id()
@@ -2193,14 +2242,15 @@ where
         self.clear_collaboration_result();
         self.clear_turn_tool_observations();
         let _ = self.take_turn_knowledge_report();
-        let strategy_input = self.strategy_input_for_turn(&user_input);
-        let mut runtime_harness = RuntimeAiKernel::begin_turn_with_strategy_input(
+        let mut runtime_harness = RuntimeAiKernel::begin_turn_with_execution_decision(
             self.session().session_id.clone(),
             user_input.clone(),
             self.context_profile(),
             &self.system_prompt,
-            strategy_input,
+            execution_decision.clone(),
         );
+        self.tool_executor
+            .bind_execution_decision(execution_decision.clone());
 
         if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -2222,12 +2272,11 @@ where
             &ConversationMessage::user_text(user_input.clone()),
             user_sequence,
         );
-        let evidence_plan = crate::evidence_planner::plan_evidence(&user_input);
-        let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
-        let execution_decision = crate::execution_core::build_runtime_execution_decision(
+        let evidence_plan = crate::evidence_planner::plan_evidence_with_understanding(
             &user_input,
-            Some(self.context_profile()),
+            &execution_decision.strategy.understanding,
         );
+        let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
         self.record_runtime_policy_decision(&execution_decision, user_sequence);
         let execution_decision_guidance =
             crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
@@ -2247,7 +2296,7 @@ where
             "runtime",
             &format!(
                 "{}: {:?}",
-                execution_decision.recommended_pattern.as_str(),
+                execution_decision.pattern().as_str(),
                 execution_decision.recommended_actions
             ),
             8,
@@ -2808,7 +2857,7 @@ where
             let accepted_tool_round = accepted_tool_rounds;
             let mut callback_inject = None;
             {
-                use crate::execution_scheduler::schedule_tool_requests;
+                use crate::execution_scheduler::schedule_tool_execution_plan_for_decision;
                 use crate::tool_dispatch::ToolRequest;
 
                 let mut requests: Vec<ToolRequest> = pending_tool_uses
@@ -2824,26 +2873,90 @@ where
                 let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
                 let ordered_ids: Vec<String> =
                     requests.iter().map(|r| r.tool_use_id.clone()).collect();
-                let execution_plan = ToolExecutionPlan::from_requests(&requests);
+                let execution_plan = ToolExecutionPlan::from_requests_with_classifier(
+                    &requests,
+                    |tool_name, input| self.tool_executor.classify_tool_safety(tool_name, input),
+                );
                 self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
-                let tool_schedule = schedule_tool_requests(&requests);
-                self.record_tool_schedule(&tool_schedule, &requests, self.session().messages.len());
+                let mut strategy_validation =
+                    execution_plan.validate_against_execution_decision(&execution_decision);
+                if strategy_validation.allowed {
+                    self.satisfy_tool_strategy_gates(
+                        &execution_plan,
+                        &execution_decision,
+                        &mut strategy_validation,
+                    )
+                    .await;
+                    if strategy_validation.checkpoint_created {
+                        runtime_harness.record_checkpoint_created();
+                    }
+                }
+                self.record_tool_strategy_validation(
+                    &strategy_validation,
+                    self.session().messages.len(),
+                );
 
                 let mut result_map: std::collections::HashMap<
                     String,
                     (ConversationMessage, Option<String>),
                 > = std::collections::HashMap::new();
 
-                for batch in &tool_schedule.batches {
-                    self.execute_tool_schedule_batch(
-                        batch,
+                if strategy_validation.allowed {
+                    let tool_schedule = schedule_tool_execution_plan_for_decision(
                         &requests,
-                        &pending_tool_uses,
-                        prompter,
-                        iterations,
-                        &mut result_map,
-                    )
-                    .await?;
+                        &execution_plan,
+                        &execution_decision,
+                    );
+                    self.record_tool_schedule(
+                        &tool_schedule,
+                        &requests,
+                        self.session().messages.len(),
+                    );
+                    for batch in &tool_schedule.batches {
+                        self.execute_tool_schedule_batch(
+                            batch,
+                            &requests,
+                            &pending_tool_uses,
+                            prompter,
+                            iterations,
+                            strategy_validation.approval_satisfied,
+                            &mut result_map,
+                        )
+                        .await?;
+                    }
+                } else {
+                    let reason = format!(
+                        "runtime strategy lease `{}` denied tool batch: {}",
+                        strategy_validation.lease_id,
+                        strategy_validation.findings.join(", ")
+                    );
+                    for (tool_use_id, tool_name, input) in &pending_tool_uses {
+                        self.record_tool_invocation_denied(
+                            tool_use_id,
+                            tool_name,
+                            input,
+                            iterations,
+                            ToolFailureKind::GateDenied,
+                            &reason,
+                        );
+                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
+                        let denied = ConversationMessage::tool_result(
+                            tool_use_id.clone(),
+                            tool_name.clone(),
+                            reason.clone(),
+                            true,
+                        );
+                        self.session
+                            .write()
+                            .await
+                            .push_message(denied.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.dual_write_message(
+                            &denied,
+                            self.session().messages.len().wrapping_sub(1),
+                        );
+                        result_map.insert(tool_use_id.clone(), (denied, None));
+                    }
                 }
 
                 for id in &ordered_ids {
@@ -3148,7 +3261,7 @@ where
                 })
                 .unwrap_or_default();
 
-            if self.should_use_collaboration(&last_user_msg) {
+            if self.should_use_collaboration(&execution_decision) {
                 let capability_refs: Vec<String> =
                     Self::infer_required_capabilities(&last_user_msg);
                 if !capability_refs.is_empty() {
@@ -3180,7 +3293,11 @@ where
                     let memory = self.memory_manager().cloned();
 
                     if let Some(collab_result) = collab_clone
-                        .run_with_context_boxed(&task, &capability_refs_clone)
+                        .run_with_strategy_boxed(
+                            &task,
+                            &capability_refs_clone,
+                            &execution_decision.strategy,
+                        )
                         .await
                     {
                         let mut collab_result = collab_result;
@@ -3233,31 +3350,6 @@ where
                                 visibility: memory::types::AgentVisibility::Shared,
                             };
                             let _ = kernel.remember(&memory_ctx, entry).await;
-                        }
-                    }
-                }
-            }
-
-            // JPS routing for very high-complexity tasks (10+ clauses or explicit keywords).
-            let word_count = last_user_msg
-                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
-                .filter(|s| !s.trim().is_empty())
-                .count();
-            let is_jps_complex = word_count > 10
-                || last_user_msg.to_lowercase().contains("analyze")
-                || last_user_msg.to_lowercase().contains("refactor");
-            if is_jps_complex {
-                if let Some(ref jps) = self.jps_pipeline {
-                    let problem = ProblemStatement::new(last_user_msg);
-                    match jps.run_boxed(problem).await {
-                        Some(result) => {
-                            tracing::info!(
-                                solutions_count = result.solutions.len(),
-                                "JPS pipeline completed"
-                            );
-                        }
-                        None => {
-                            tracing::info!("JPS pipeline returned no solution");
                         }
                     }
                 }
@@ -3388,6 +3480,126 @@ where
         Ok(summary)
     }
 
+    async fn satisfy_tool_strategy_gates(
+        &self,
+        execution_plan: &ToolExecutionPlan,
+        execution_decision: &crate::execution_core::RuntimeExecutionDecision,
+        validation: &mut ToolExecutionPolicyValidationReport,
+    ) {
+        if validation.requires_approval {
+            let Some(gate) = &self.approval_gate else {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push("critical_mutation_missing_approval_runtime".to_string());
+                return;
+            };
+            let operations = execution_plan
+                .tasks
+                .iter()
+                .map(|task| {
+                    serde_json::json!({
+                        "tool_call_id": task.tool_call_id,
+                        "tool_name": task.tool_name,
+                        "safety_category": task.safety_category,
+                        "resource_scope": task.resource_scope,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let approval_input = serde_json::json!({
+                "strategy_lease_id": execution_decision.lease.lease_id,
+                "risk": execution_decision.risk(),
+                "operations": operations,
+            })
+            .to_string();
+            match gate
+                .require_explicit_approval("runtime_strategy_tool_batch", &approval_input)
+                .await
+            {
+                crate::approval_gate::ApprovalGateResult::Approved { .. }
+                | crate::approval_gate::ApprovalGateResult::AutoPass { .. } => {
+                    validation.approval_satisfied = true;
+                }
+                crate::approval_gate::ApprovalGateResult::Denied { reason } => {
+                    validation.allowed = false;
+                    validation
+                        .findings
+                        .push(format!("critical_mutation_approval_denied:{reason}"));
+                    return;
+                }
+                crate::approval_gate::ApprovalGateResult::TimedOut => {
+                    validation.allowed = false;
+                    validation
+                        .findings
+                        .push("critical_mutation_approval_timed_out".to_string());
+                    return;
+                }
+            }
+        }
+
+        if !validation.requires_checkpoint {
+            return;
+        }
+        if !self.tool_executor.has_tool("checkpoint_create") {
+            validation.allowed = false;
+            validation
+                .findings
+                .push("checkpoint_create_tool_unavailable".to_string());
+            return;
+        }
+
+        let checkpoint_input = serde_json::json!({
+            "label": format!(
+                "runtime strategy lease {} before high-risk mutation",
+                execution_decision.lease.lease_id
+            )
+        })
+        .to_string();
+        let executor = Arc::clone(&self.tool_executor);
+        let timeout = self.tool_timeout.unwrap_or_else(|| {
+            Duration::from_secs(
+                crate::tool_orchestrator::ToolSafetyRegistry::global()
+                    .get_timeout_secs("checkpoint_create"),
+            )
+        });
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                executor.execute("checkpoint_create", &checkpoint_input)
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(output))) => {
+                validation.checkpoint_created = true;
+                tracing::info!(
+                    strategy_lease_id = %execution_decision.lease.lease_id,
+                    checkpoint = %preview_chars(&output, 240),
+                    "strategy checkpoint created before mutation"
+                );
+            }
+            Ok(Ok(Err(error))) => {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push(format!("checkpoint_creation_failed:{error}"));
+            }
+            Ok(Err(error)) => {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push(format!("checkpoint_creation_panicked:{error}"));
+            }
+            Err(_) => {
+                validation.allowed = false;
+                validation.findings.push(format!(
+                    "checkpoint_creation_timed_out:{}s",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+
     /// Extract the per-tool execution logic from run_turn for reuse.
     async fn execute_single_tool(
         &self,
@@ -3396,6 +3608,7 @@ where
         input: &str,
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
+        strategy_approval_satisfied: bool,
     ) -> Result<ConversationMessage, RuntimeError> {
         let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
         let effective_input = pre_hook_result
@@ -3442,35 +3655,46 @@ where
         match permission_outcome {
             PermissionOutcome::Allow => {
                 // Smart approval gate check
-                if let Some(gate) = &self.approval_gate {
-                    let gate_result = gate.evaluate(tool_name, &effective_input).await;
-                    if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result
-                    {
-                        self.record_tool_invocation_denied(
-                            tool_use_id,
-                            tool_name,
-                            &effective_input,
-                            iterations,
-                            ToolFailureKind::ApprovalDenied,
-                            &reason,
-                        );
-                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
-                        let denied = ConversationMessage::tool_result(
-                            tool_use_id.to_string(),
-                            tool_name.to_string(),
-                            reason,
-                            true,
-                        );
-                        self.session
-                            .write()
-                            .await
-                            .push_message(denied.clone())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(
-                            &denied,
-                            self.session().messages.len().wrapping_sub(1),
-                        );
-                        return Ok(denied);
+                if !strategy_approval_satisfied {
+                    if let Some(gate) = &self.approval_gate {
+                        let gate_result = gate.evaluate(tool_name, &effective_input).await;
+                        let denial_reason = match gate_result {
+                            crate::approval_gate::ApprovalGateResult::Denied { reason } => {
+                                Some(reason)
+                            }
+                            crate::approval_gate::ApprovalGateResult::TimedOut => {
+                                Some(format!("approval timed out for tool `{tool_name}`"))
+                            }
+                            crate::approval_gate::ApprovalGateResult::AutoPass { .. }
+                            | crate::approval_gate::ApprovalGateResult::Approved { .. } => None,
+                        };
+                        if let Some(reason) = denial_reason {
+                            self.record_tool_invocation_denied(
+                                tool_use_id,
+                                tool_name,
+                                &effective_input,
+                                iterations,
+                                ToolFailureKind::ApprovalDenied,
+                                &reason,
+                            );
+                            self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
+                            let denied = ConversationMessage::tool_result(
+                                tool_use_id.to_string(),
+                                tool_name.to_string(),
+                                reason,
+                                true,
+                            );
+                            self.session
+                                .write()
+                                .await
+                                .push_message(denied.clone())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            self.dual_write_message(
+                                &denied,
+                                self.session().messages.len().wrapping_sub(1),
+                            );
+                            return Ok(denied);
+                        }
                     }
                 }
 
@@ -3762,6 +3986,7 @@ where
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
+        strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         match batch.mode {
@@ -3778,6 +4003,7 @@ where
                     prompter,
                     iterations,
                     true,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await
@@ -3790,6 +4016,7 @@ where
                     iterations,
                     batch.max_concurrency,
                     false,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await
@@ -3802,6 +4029,7 @@ where
                     iterations,
                     batch.max_concurrency,
                     true,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await
@@ -3812,6 +4040,7 @@ where
                     pending_tool_uses,
                     prompter,
                     iterations,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await
@@ -3823,6 +4052,7 @@ where
                     prompter,
                     iterations,
                     true,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await
@@ -3838,6 +4068,7 @@ where
         iterations: usize,
         max_concurrency: usize,
         acquire_category_permit: bool,
+        strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -3852,6 +4083,7 @@ where
                     prompter,
                     iterations,
                     acquire_category_permit,
+                    strategy_approval_satisfied,
                 ));
             }
             while let Some(result) = futures.next().await {
@@ -3868,6 +4100,7 @@ where
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
+        strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -3881,6 +4114,7 @@ where
                     iterations,
                     batch.max_concurrency,
                     true,
+                    strategy_approval_satisfied,
                     result_map,
                 )
                 .await;
@@ -3896,6 +4130,7 @@ where
                     prompter,
                     iterations,
                     true,
+                    strategy_approval_satisfied,
                 ));
             }
             while let Some(result) = futures.next().await {
@@ -3914,6 +4149,7 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         acquire_category_permit: bool,
+        strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         for (id, message) in self
@@ -3923,6 +4159,7 @@ where
                 prompter,
                 iterations,
                 acquire_category_permit,
+                strategy_approval_satisfied,
             )
             .await?
         {
@@ -3938,6 +4175,7 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         acquire_category_permit: bool,
+        strategy_approval_satisfied: bool,
     ) -> Result<Vec<(String, (ConversationMessage, Option<String>))>, RuntimeError> {
         let mut results = Vec::with_capacity(indices.len());
         for &idx in indices {
@@ -3948,6 +4186,7 @@ where
                     prompter,
                     iterations,
                     acquire_category_permit,
+                    strategy_approval_satisfied,
                 )
                 .await?,
             );
@@ -3962,6 +4201,7 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         acquire_category_permit: bool,
+        strategy_approval_satisfied: bool,
     ) -> Result<(String, (ConversationMessage, Option<String>)), RuntimeError> {
         let Some((tool_use_id, tool_name, input)) = pending_tool_uses.get(idx) else {
             return Err(RuntimeError::new(format!(
@@ -3974,11 +4214,25 @@ where
             let _permit = sem.acquire().await.map_err(|error| {
                 RuntimeError::new(format!("tool category semaphore closed: {error}"))
             })?;
-            self.execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
-                .await?
+            self.execute_single_tool(
+                tool_use_id,
+                tool_name,
+                input,
+                prompter,
+                iterations,
+                strategy_approval_satisfied,
+            )
+            .await?
         } else {
-            self.execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
-                .await?
+            self.execute_single_tool(
+                tool_use_id,
+                tool_name,
+                input,
+                prompter,
+                iterations,
+                strategy_approval_satisfied,
+            )
+            .await?
         };
         Ok(self.collect_tool_result_message(result_msg))
     }
@@ -4176,6 +4430,11 @@ where
                 routed.push(model);
             }
         }
+        if routed.is_empty() {
+            // An empty model delegates selection to the configured provider. This keeps
+            // embedded runtimes valid when they intentionally rely on a provider default.
+            routed.push(String::new());
+        }
         routed
     }
 
@@ -4186,7 +4445,17 @@ where
 
     #[must_use]
     pub fn session(&self) -> Session {
-        tokio::task::block_in_place(|| self.session.blocking_read().clone())
+        if let Ok(session) = self.session.try_read() {
+            return session.clone();
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            panic!("session() cannot wait for a contended session lock inside an async runtime; use session_async()")
+        }
+        self.session.blocking_read().clone()
+    }
+
+    pub async fn session_async(&self) -> Session {
+        self.session.read().await.clone()
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
@@ -5312,6 +5581,38 @@ where
         self.append_tool_runtime_events(sequence, "tool.execution.plan.created", vec![event]);
     }
 
+    fn record_tool_strategy_validation(
+        &self,
+        report: &ToolExecutionPolicyValidationReport,
+        sequence: usize,
+    ) {
+        if self.session_store.is_none() {
+            return;
+        }
+        let session_id = self.session().session_id;
+        let mut event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Tool,
+            "tool.strategy_validation.completed",
+            serde_json::to_value(report).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "allowed": false,
+                    "findings": ["strategy_validation_serialization_failed"],
+                    "lease_id": report.lease_id,
+                })
+            }),
+            now_ms(),
+        );
+        event.status = Some(if report.allowed { "allowed" } else { "denied" }.to_string());
+        event.span_id = Some(report.lease_id.clone());
+        self.append_tool_runtime_events(
+            sequence,
+            "tool.strategy_validation.completed",
+            vec![event],
+        );
+    }
+
     fn record_tool_schedule(
         &self,
         schedule: &crate::execution_scheduler::ToolSchedule,
@@ -5388,14 +5689,14 @@ where
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "strategy": {
-                "mode": trace.strategy.pattern.as_str(),
-                "confidence": trace.strategy.confidence,
-                "policy_version": trace.strategy.policy_version,
-                "reasons": trace.strategy.reasons,
-                "required_capabilities": trace.strategy.required_capabilities.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>(),
-                "complexity": format!("{:?}", trace.strategy.understanding.complexity),
-                "risk": format!("{:?}", trace.strategy.understanding.risk),
-                "modifiers": trace.strategy.modifiers.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
+                "pattern": trace.execution_decision.strategy.pattern.as_str(),
+                "confidence": trace.execution_decision.strategy.confidence,
+                "policy_version": trace.execution_decision.strategy.policy_version,
+                "reasons": trace.execution_decision.strategy.reasons,
+                "required_capabilities": trace.execution_decision.strategy.required_capabilities.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>(),
+                "complexity": format!("{:?}", trace.execution_decision.strategy.understanding.complexity),
+                "risk": format!("{:?}", trace.execution_decision.strategy.understanding.risk),
+                "modifiers": trace.execution_decision.strategy.modifiers.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
             },
             "collaboration": {
                 "template_id": trace.collaboration_decision.template_id.as_str(),
@@ -5509,7 +5810,7 @@ where
                 "packet_contract": {
                     "problem_statement": "AI harness execution quality",
                     "trace_ref": format!("runtime:event:{sequence}"),
-                    "strategy_pattern": trace.strategy.pattern.as_str(),
+                    "strategy_pattern": trace.execution_decision.strategy.pattern.as_str(),
                     "verification_can_finalize": trace.verification_report.can_finalize,
                     "regression_allowed": trace.regression_gate.allowed,
                     "harness_receipt_id": trace.harness_receipt.id,
@@ -5633,22 +5934,22 @@ where
         decision: &crate::execution_core::RuntimeExecutionDecision,
         sequence: usize,
     ) {
-        let requires_review = decision.selected_modifiers.iter().any(|modifier| {
+        let requires_review = decision.modifiers().iter().any(|modifier| {
             matches!(
                 modifier,
                 harness_contract::core::ExecutionModifier::WithVerifier
                     | harness_contract::core::ExecutionModifier::WithReviewer
             )
         }) || decision
-            .selected_gates
+            .gates()
             .contains(&harness_contract::core::ExecutionPolicyGate::Approval);
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::RuntimePolicyDecision {
                 summary: crate::cowd_event::RuntimePolicyDecisionSummary {
-                    level: format!("{:?}", decision.complexity),
+                    level: format!("{:?}", decision.complexity()),
                     score: (decision.confidence * 100.0).round() as u16,
                     recommended_profile: format!("{:?}", self.context_profile()),
-                    agent_mode: decision.recommended_pattern.as_str().to_string(),
+                    agent_mode: decision.pattern().as_str().to_string(),
                     requires_review,
                     signal_count: decision.reasons.len(),
                 },
@@ -5661,13 +5962,16 @@ where
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "decision_id": decision.decision_id,
-            "pattern": decision.recommended_pattern,
-            "complexity": decision.complexity,
-            "risk": decision.risk,
+            "pattern": decision.pattern(),
+            "complexity": decision.complexity(),
+            "risk": decision.risk(),
             "confidence": decision.confidence,
-            "modifiers": decision.selected_modifiers,
-            "gates": decision.selected_gates,
-            "collaboration_lift": decision.collaboration_lift,
+            "modifiers": decision.modifiers(),
+            "gates": decision.gates(),
+            "collaboration_lift": decision.collaboration_lift(),
+            "compile_target": decision.compile_target,
+            "strategy_lease": decision.lease,
+            "decision_source": decision.strategy.source,
             "requires_review": requires_review,
             "reasons": decision.reasons,
         });
@@ -6093,7 +6397,7 @@ fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienc
         && trace.bench_result.passed
         && trace.regression_gate.allowed;
     StrategyExperienceRecord::from_decision(
-        &trace.strategy,
+        &trace.execution_decision.strategy,
         succeeded,
         trace.finalization_blocked,
         context_pressure,
@@ -6282,6 +6586,14 @@ impl ToolExecutor for StaticToolExecutor {
         self.handlers
             .get(tool_name)
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
+    }
+
+    fn has_registered_tools(&self) -> bool {
+        !self.handlers.is_empty()
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        self.handlers.keys().cloned().collect()
     }
 }
 
@@ -6499,6 +6811,44 @@ mod tests {
         assert_eq!(deep_timeout, Duration::from_secs(600));
     }
 
+    #[test]
+    fn runtime_decision_keeps_all_six_patterns_stable_for_same_input() {
+        use harness_contract::core::ExecutionPattern;
+
+        let cases = [
+            ("解释一下这个函数有什么用", ExecutionPattern::Direct),
+            (
+                "调研最新 AI harness 实践并汇总证据",
+                ExecutionPattern::Explore,
+            ),
+            ("实现并修复这个单文件小问题", ExecutionPattern::Execute),
+            (
+                "权衡两个架构方案并解决冲突方案",
+                ExecutionPattern::Deliberate,
+            ),
+            (
+                "使用多 Agent 协同完成复杂架构分析",
+                ExecutionPattern::Collaborate,
+            ),
+            ("后台持续监控这项长期运行任务", ExecutionPattern::Supervise),
+        ];
+
+        for (prompt, expected_pattern) in cases {
+            let first = crate::execution_core::build_runtime_execution_decision(prompt, None);
+            let second = crate::execution_core::build_runtime_execution_decision(prompt, None);
+            let wire = serde_json::to_value(&first).expect("runtime decision wire payload");
+
+            assert_eq!(first.pattern(), expected_pattern, "prompt: {prompt}");
+            assert_eq!(first.strategy, second.strategy, "prompt: {prompt}");
+            assert_eq!(
+                first.lease.input_fingerprint, second.lease.input_fingerprint,
+                "prompt: {prompt}"
+            );
+            assert_eq!(first.lease.locked_pattern, expected_pattern);
+            assert_eq!(wire["strategy"]["pattern"], expected_pattern.as_str());
+        }
+    }
+
     fn test_skill_profile(
         skill_id: &str,
         name: &str,
@@ -6543,6 +6893,55 @@ mod tests {
 
     struct ScriptedApiClient {
         call_count: usize,
+    }
+
+    struct UnavailableApiClient {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    struct DirectWriteApiClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for DirectWriteApiClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.call_count += 1;
+            let events = if self.call_count == 1 {
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: "direct-write-1".to_string(),
+                        name: "write_file".to_string(),
+                        input: r#"{"path":"README.md","content":"unsafe"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]
+            } else {
+                vec![
+                    AssistantEvent::TextDelta(
+                        "I cannot mutate files from the direct answer strategy.".to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ]
+            };
+            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+
+    impl ApiClient for UnavailableApiClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::empty())
+        }
+
+        fn provider_available(&self) -> bool {
+            false
+        }
     }
 
     impl ApiClient for ScriptedApiClient {
@@ -6895,6 +7294,128 @@ mod tests {
         assert_eq!(runtime.max_iterations(), original);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unavailable_provider_blocks_before_the_provider_stream_starts() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnavailableApiClient {
+                call_count: Arc::clone(&call_count),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let before_input_projection = runtime.session_input_projection();
+
+        let error = runtime
+            .run_turn_async("解释这个名称", &SharedPrompter::none())
+            .await
+            .expect_err("unavailable provider must block the turn");
+
+        assert!(error.to_string().contains("provider runtime unavailable"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        assert!(runtime.session().messages.is_empty());
+        let after_input_projection = runtime.session_input_projection();
+        assert_eq!(after_input_projection.active_turn_id, None);
+        assert_eq!(after_input_projection.total, before_input_projection.total);
+        assert_eq!(
+            after_input_projection.queued_next_count,
+            before_input_projection.queued_next_count
+        );
+        assert_eq!(
+            after_input_projection.pending_count,
+            before_input_projection.pending_count
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn high_risk_mutation_creates_real_checkpoint_before_dispatch() {
+        use harness_contract::core::{
+            ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskRisk,
+        };
+
+        let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let mutation_calls = Arc::new(AtomicUsize::new(0));
+        let checkpoint_counter = Arc::clone(&checkpoint_calls);
+        let mutation_counter = Arc::clone(&mutation_calls);
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new()
+                .register("checkpoint_create", move |_| {
+                    checkpoint_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(r#"{"id":"checkpoint-test"}"#.to_string())
+                })
+                .register("write_file", move |_| {
+                    mutation_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok("written".to_string())
+                }),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let requests = vec![crate::tool_dispatch::ToolRequest {
+            tool_use_id: "write-1".to_string(),
+            tool_name: "write_file".to_string(),
+            input: r#"{"path":"src/lib.rs","content":"x"}"#.to_string(),
+            depends_on: Vec::new(),
+        }];
+        let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
+        let mut decision =
+            crate::execution_core::build_runtime_execution_decision("实现并修改这个文件", None);
+        decision.strategy.pattern = ExecutionPattern::Execute;
+        decision.strategy.understanding.risk = TaskRisk::High;
+        decision.strategy.modifiers = vec![
+            ExecutionModifier::WithGuardrails,
+            ExecutionModifier::WithCheckpoint,
+        ];
+        decision.strategy.gates = vec![ExecutionPolicyGate::Permission, ExecutionPolicyGate::Risk];
+        decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
+        decision.executable = true;
+        decision.blocked_reasons.clear();
+        let mut validation = plan.validate_against_execution_decision(&decision);
+
+        runtime
+            .satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
+            .await;
+
+        assert!(validation.allowed, "{:?}", validation.findings);
+        assert!(validation.checkpoint_created);
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+
+        decision.strategy.understanding.risk = TaskRisk::Critical;
+        decision.strategy.gates.push(ExecutionPolicyGate::Approval);
+        let mut critical_validation = plan.validate_against_execution_decision(&decision);
+        runtime
+            .satisfy_tool_strategy_gates(&plan, &decision, &mut critical_validation)
+            .await;
+        assert!(!critical_validation.allowed);
+        assert!(!critical_validation.checkpoint_created);
+        assert!(critical_validation
+            .findings
+            .iter()
+            .any(|finding| finding == "critical_mutation_missing_approval_runtime"));
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn model_router_delegates_to_provider_default_when_no_model_is_explicit() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        assert_eq!(runtime.model_candidates_for_turn("简单问题"), vec![""]);
+    }
+
     #[test]
     fn model_router_keeps_primary_model_first_and_routes_fallbacks() {
         let mut runtime = ConversationRuntime::new(
@@ -7007,7 +7528,10 @@ mod tests {
         let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let summary = rt
-            .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
+            .block_on(runtime.run_turn_async(
+                "implement this calculation using the add tool: what is 2 + 2?",
+                &prompter,
+            ))
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -7027,8 +7551,8 @@ mod tests {
         assert!(summary.model_telemetry.tokens_per_second.is_some());
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(
-            summary.ai_kernel_trace.strategy.pattern,
-            harness_contract::core::ExecutionPattern::Direct
+            summary.ai_kernel_trace.execution_decision.strategy.pattern,
+            harness_contract::core::ExecutionPattern::Execute
         );
         assert!(summary.ai_kernel_trace.verification_report.can_finalize);
         assert!(summary.ai_kernel_trace.tool_transaction.is_some());
@@ -7047,6 +7571,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_strategy_denies_mutating_model_tool_use_before_dispatch() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let tool_executor = StaticToolExecutor::new().register("write_file", move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected write".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DirectWriteApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let summary = runtime
+            .run_turn_async("解释这个名称", &SharedPrompter::none())
+            .await
+            .expect("the model should recover from a denied tool request");
+
+        assert_eq!(
+            summary.ai_kernel_trace.execution_decision.pattern(),
+            harness_contract::core::ExecutionPattern::Direct
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(summary.tool_results[0].blocks.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { output, is_error: true, .. }
+                if output.contains("tool_category_not_allowed_by_compile_target"))
+        }));
     }
 
     #[test]
@@ -7152,7 +7710,7 @@ mod tests {
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(runtime.run_turn_async(
-                "inspect web evidence",
+                "parallel research the latest web evidence",
                 &SharedPrompter::new(Box::new(PromptAllowAll)),
             ))
             .expect("network tools should execute");
@@ -7198,7 +7756,7 @@ mod tests {
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(runtime.run_turn_async(
-                "write the same file twice",
+                "parallel implement two writes to the same file",
                 &SharedPrompter::new(Box::new(PromptAllowAll)),
             ))
             .expect("write tools should execute");
@@ -7236,7 +7794,7 @@ mod tests {
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(runtime.run_turn_async(
-                "write two independent files",
+                "parallel implement changes to two independent files",
                 &SharedPrompter::new(Box::new(PromptAllowAll)),
             ))
             .expect("independent write tools should execute");
@@ -7424,7 +7982,9 @@ mod tests {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new(),
+            StaticToolExecutor::new().register("blocked", |_| {
+                panic!("permission denial must happen before tool dispatch")
+            }),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
@@ -7433,7 +7993,10 @@ mod tests {
         let handle = tokio::runtime::Handle::try_current()
             .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
-            .block_on(runtime.run_turn_async("use the tool", &prompter))
+            .block_on(
+                runtime
+                    .run_turn_async("implement the change in parallel using the tool", &prompter),
+            )
             .expect("conversation should continue after denied tool");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -7492,7 +8055,10 @@ mod tests {
         let handle = tokio::runtime::Handle::try_current()
             .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
-            .block_on(runtime.run_turn_async("use the tool", &prompter))
+            .block_on(
+                runtime
+                    .run_turn_async("implement the change in parallel using the tool", &prompter),
+            )
             .expect("conversation should continue after hook denial");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -7562,7 +8128,10 @@ mod tests {
         let prompter = SharedPrompter::none();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let summary = rt
-            .block_on(runtime.run_turn_async("use the tool", &prompter))
+            .block_on(
+                runtime
+                    .run_turn_async("implement the change in parallel using the tool", &prompter),
+            )
             .expect("conversation should continue after hook failure");
 
         // then
@@ -7722,7 +8291,9 @@ mod tests {
         let prompter = SharedPrompter::none();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let summary = rt
-            .block_on(runtime.run_turn_async("use fail", &prompter))
+            .block_on(
+                runtime.run_turn_async("implement the change in parallel using fail", &prompter),
+            )
             .expect("tool loop succeeds");
 
         // then
@@ -8083,6 +8654,7 @@ mod tests {
                 vec!["system".to_string()],
             )
             .with_session_store(Arc::clone(&store));
+            runtime.model = Some("test-model".to_string());
 
             runtime
                 .run_turn_async("persist events", &SharedPrompter::none())
@@ -8163,8 +8735,12 @@ mod tests {
                 .expect("runtime policy event");
             assert_eq!(policy.scope, memory::RuntimeEventScope::Policy);
             assert_eq!(policy.kind, "runtime.policy.decided");
-            assert_eq!(policy.payload["complexity"]["level"], "Simple");
-            assert_eq!(policy.payload["agent_mode"], "Off");
+            assert_eq!(policy.payload["pattern"], "direct");
+            assert_eq!(policy.payload["complexity"], "simple");
+            assert_eq!(policy.payload["risk"], "low");
+            assert_eq!(policy.payload["compile_target"], "inline_model");
+            assert_eq!(policy.payload["strategy_lease"]["locked_pattern"], "direct");
+            assert_eq!(policy.payload["decision_source"], "deterministic");
             assert_eq!(policy.payload["requires_review"], false);
 
             let ai_kernel_trace = events
@@ -8173,10 +8749,18 @@ mod tests {
                 .find(|event| event.kind == "runtime.harness_contract.trace")
                 .expect("AI kernel trace event");
             assert_eq!(ai_kernel_trace.scope, memory::RuntimeEventScope::Task);
-            assert_eq!(ai_kernel_trace.payload["strategy"]["mode"], "direct_answer");
             assert_eq!(
                 ai_kernel_trace.payload["strategy"]["policy_version"],
-                "strategy-router-v2"
+                "strategy-decision-v3"
+            );
+            assert_eq!(
+                ai_kernel_trace.payload["harness"]["strategy_pattern"],
+                "direct"
+            );
+            assert_eq!(
+                ai_kernel_trace.payload["matrix_evidence_signal"]["packet_contract"]
+                    ["strategy_pattern"],
+                "direct"
             );
             assert_eq!(
                 ai_kernel_trace.payload["collaboration"]["template_id"],
@@ -8514,6 +9098,15 @@ mod tests {
             })
         }
 
+        fn run_with_strategy_boxed<'a>(
+            &'a self,
+            task: &'a str,
+            skills: &'a [String],
+            _strategy: &'a harness_contract::strategy::StrategyDecision,
+        ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+            self.run_with_context_boxed(task, skills)
+        }
+
         fn decompose_task(&self, _task: &str) -> Vec<SubTask> {
             Vec::new()
         }
@@ -8561,7 +9154,7 @@ mod tests {
 
         runtime
             .run_turn_async(
-                "please refactor rust tests and implement the plan",
+                "use multi-agent collaboration to refactor rust tests and implement the plan",
                 &SharedPrompter::none(),
             )
             .await
@@ -8666,7 +9259,7 @@ mod tests {
 
         runtime
             .run_turn_async(
-                "please review the release plan and implementation evidence",
+                "use multi-agent collaboration to review the release plan and implementation evidence",
                 &SharedPrompter::none(),
             )
             .await
@@ -8768,9 +9361,11 @@ mod tests {
         )
         .without_memory();
 
-        assert!(!runtime.should_use_collaboration(
-            "please refactor the architecture, design a multi agent plan, implement tests, and review risks"
-        ));
+        let decision = crate::execution_core::build_runtime_execution_decision(
+            "please refactor the architecture, design a multi agent plan, implement tests, and review risks",
+            Some(runtime.context_profile()),
+        );
+        assert!(!runtime.should_use_collaboration(&decision));
     }
 
     #[test]

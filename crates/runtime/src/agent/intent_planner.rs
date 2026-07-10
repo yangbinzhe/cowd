@@ -1,10 +1,8 @@
 //! Lightweight intent and dependency planning for tool execution.
 
-use harness_contract::strategy::{decide_strategy, StrategyInput, TaskDomain};
+use harness_contract::strategy::{understand, StrategyInput, TaskDomain, TaskUnderstanding};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-pub use harness_contract::strategy::{StrategyDecision, TaskUnderstanding};
 
 use crate::tool_dispatch::ToolRequest;
 
@@ -30,21 +28,21 @@ pub struct IntentPlan {
 
 #[must_use]
 pub fn classify_intent(prompt: &str) -> IntentPlan {
-    let decision = classify_strategy(prompt);
-    let intent = intent_from_domain(decision.understanding.domain);
+    let understanding = understand(&StrategyInput::from_prompt(prompt));
+    classify_understanding(&understanding)
+}
+
+#[must_use]
+pub fn classify_understanding(understanding: &TaskUnderstanding) -> IntentPlan {
+    let intent = intent_from_domain(understanding.domain);
     let recommended_tools = recommended_tools_for(intent);
-    let reason = reason_for(intent, &decision);
+    let reason = reason_for(intent, &understanding);
 
     IntentPlan {
         intent,
         recommended_tools,
         reason,
     }
-}
-
-#[must_use]
-pub fn classify_strategy(prompt: &str) -> StrategyDecision {
-    decide_strategy(&StrategyInput::from_prompt(prompt))
 }
 
 fn intent_from_domain(domain: TaskDomain) -> TaskIntent {
@@ -74,7 +72,7 @@ fn recommended_tools_for(intent: TaskIntent) -> Vec<String> {
     tools.into_iter().map(str::to_string).collect()
 }
 
-fn reason_for(intent: TaskIntent, decision: &StrategyDecision) -> String {
+fn reason_for(intent: TaskIntent, understanding: &TaskUnderstanding) -> String {
     let base = match intent {
         TaskIntent::Review => {
             "review tasks need workspace status, changed files, and targeted reads"
@@ -88,10 +86,8 @@ fn reason_for(intent: TaskIntent, decision: &StrategyDecision) -> String {
         TaskIntent::Explore => "exploration starts with workspace snapshot and fanout search/read",
     };
     format!(
-        "{base}; strategy_pattern={}; complexity={:?}; risk={:?}",
-        decision.pattern.as_str(),
-        decision.understanding.complexity,
-        decision.understanding.risk
+        "{base}; task_complexity={:?}; risk={:?}",
+        understanding.complexity, understanding.risk
     )
 }
 
@@ -174,7 +170,6 @@ fn path_related(previous: Option<&str>, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::core::ExecutionPattern;
 
     fn request(id: &str, name: &str, input: &str) -> ToolRequest {
         ToolRequest {
@@ -195,11 +190,17 @@ mod tests {
     }
 
     #[test]
-    fn exposes_strategy_decision_for_runtime_callers() {
-        let decision = classify_strategy("全面规划 runtime gateway service 的架构演进");
+    fn exposes_task_understanding_without_running_a_second_strategy_router() {
+        let understanding = understand(&StrategyInput::from_prompt(
+            "全面规划 runtime gateway service 的架构演进",
+        ));
 
-        assert_eq!(decision.pattern, ExecutionPattern::Execute);
-        assert!(decision.confidence >= 70);
+        assert_eq!(understanding.domain, TaskDomain::Architecture);
+        assert!(matches!(
+            understanding.complexity,
+            harness_contract::core::TaskComplexity::Complex
+                | harness_contract::core::TaskComplexity::Strategic
+        ));
     }
 
     #[test]

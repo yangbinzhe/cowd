@@ -1,11 +1,13 @@
 //! Explainable tool execution planning for batched tool requests.
 
+use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::execution_core::{RuntimeCompileTarget, RuntimeExecutionDecision};
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::{ToolSafetyCategory, ToolSafetyRegistry};
 
@@ -136,9 +138,28 @@ pub struct ToolExecutionPlan {
     pub tasks: Vec<ToolExecutionPlanTask>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionPolicyValidationReport {
+    pub allowed: bool,
+    pub findings: Vec<String>,
+    pub lease_id: String,
+    pub requires_approval: bool,
+    pub requires_checkpoint: bool,
+    pub approval_satisfied: bool,
+    pub checkpoint_created: bool,
+}
+
 impl ToolExecutionPlan {
     #[must_use]
     pub fn from_requests(requests: &[ToolRequest]) -> Self {
+        Self::from_requests_with_classifier(requests, |_, _| None)
+    }
+
+    #[must_use]
+    pub fn from_requests_with_classifier(
+        requests: &[ToolRequest],
+        classify_registered_tool: impl Fn(&str, &str) -> Option<ToolSafetyCategory>,
+    ) -> Self {
         let registry = ToolSafetyRegistry::global();
         let mut parallel_read_count = 0;
         let mut limited_count = 0;
@@ -148,7 +169,14 @@ impl ToolExecutionPlan {
         let mut tasks = requests
             .iter()
             .map(|request| {
-                let safety_category = registry.classify(&request.tool_name);
+                let builtin_category =
+                    registry.classify_request(&request.tool_name, &request.input);
+                let safety_category = if builtin_category == ToolSafetyCategory::WriteLocal {
+                    classify_registered_tool(&request.tool_name, &request.input)
+                        .unwrap_or(builtin_category)
+                } else {
+                    builtin_category
+                };
                 let analysis = analyze_request(request, safety_category);
                 let execution_mode = if !request.depends_on.is_empty() {
                     wave_count += 1;
@@ -218,6 +246,109 @@ impl ToolExecutionPlan {
     }
 
     #[must_use]
+    pub fn validate_against_execution_decision(
+        &self,
+        decision: &RuntimeExecutionDecision,
+    ) -> ToolExecutionPolicyValidationReport {
+        let mut findings = Vec::new();
+        if !decision.executable {
+            findings.push("execution_decision_not_executable".to_string());
+            return ToolExecutionPolicyValidationReport {
+                allowed: false,
+                findings,
+                lease_id: decision.lease.lease_id.clone(),
+                requires_approval: false,
+                requires_checkpoint: false,
+                approval_satisfied: false,
+                checkpoint_created: false,
+            };
+        }
+
+        let governed_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| !uses_inner_runtime_validator(&task.tool_name))
+            .collect::<Vec<_>>();
+        let has_network = governed_tasks
+            .iter()
+            .any(|task| task.safety_category == ToolSafetyCategory::Network);
+        let has_mutation = governed_tasks.iter().any(|task| is_mutation(task));
+        let high_or_critical = matches!(decision.risk(), TaskRisk::High | TaskRisk::Critical);
+        let requires_approval = has_mutation
+            && decision.risk() == TaskRisk::Critical
+            && decision.gates().contains(&ExecutionPolicyGate::Approval);
+        let requires_checkpoint = has_mutation
+            && high_or_critical
+            && decision
+                .modifiers()
+                .contains(&ExecutionModifier::WithCheckpoint);
+
+        if governed_tasks.iter().any(|task| {
+            !compile_target_allows_category(decision.compile_target, task.safety_category)
+        }) {
+            push_finding(&mut findings, "tool_category_not_allowed_by_compile_target");
+        }
+
+        if has_network
+            && !decision
+                .modifiers()
+                .contains(&ExecutionModifier::WithExternalResearch)
+        {
+            push_finding(&mut findings, "network_requires_with_external_research");
+        }
+
+        if decision.compile_target == RuntimeCompileTarget::ExecutionGraph && has_mutation {
+            if !decision.gates().contains(&ExecutionPolicyGate::Permission) {
+                push_finding(&mut findings, "mutation_requires_permission_gate");
+            }
+            if !decision
+                .modifiers()
+                .contains(&ExecutionModifier::WithGuardrails)
+            {
+                push_finding(&mut findings, "mutation_requires_with_guardrails");
+            }
+
+            if high_or_critical && !decision.gates().contains(&ExecutionPolicyGate::Risk) {
+                push_finding(&mut findings, "high_risk_mutation_requires_risk_gate");
+            }
+            if decision.risk() == TaskRisk::Critical
+                && !decision.gates().contains(&ExecutionPolicyGate::Approval)
+            {
+                push_finding(&mut findings, "critical_mutation_requires_approval_gate");
+            }
+            if high_or_critical
+                && !decision
+                    .modifiers()
+                    .contains(&ExecutionModifier::WithCheckpoint)
+            {
+                push_finding(&mut findings, "high_risk_mutation_requires_with_checkpoint");
+            }
+        }
+
+        if has_mutation
+            && decision
+                .modifiers()
+                .contains(&ExecutionModifier::BoundedChange)
+            && !has_single_known_mutation_path(&governed_tasks)
+        {
+            push_finding(
+                &mut findings,
+                "bounded_change_requires_single_known_path_scope",
+            );
+        }
+
+        ToolExecutionPolicyValidationReport {
+            allowed: findings.is_empty(),
+            findings,
+            lease_id: decision.lease.lease_id.clone(),
+            requires_approval,
+            requires_checkpoint,
+            approval_satisfied: false,
+            checkpoint_created: false,
+        }
+    }
+
+    #[must_use]
     pub fn to_runtime_event(
         &self,
         session_id: impl Into<String>,
@@ -253,6 +384,68 @@ impl ToolExecutionPlan {
             })
             .collect();
         event
+    }
+}
+
+fn compile_target_allows_category(
+    compile_target: RuntimeCompileTarget,
+    category: ToolSafetyCategory,
+) -> bool {
+    match compile_target {
+        RuntimeCompileTarget::InlineModel => category == ToolSafetyCategory::ReadOnly,
+        RuntimeCompileTarget::EvidenceGraph
+        | RuntimeCompileTarget::DeliberationGraph
+        | RuntimeCompileTarget::TeamGraph
+        | RuntimeCompileTarget::MissionGraph => matches!(
+            category,
+            ToolSafetyCategory::ReadOnly | ToolSafetyCategory::Network
+        ),
+        RuntimeCompileTarget::ExecutionGraph => true,
+    }
+}
+
+fn is_mutation(task: &ToolExecutionPlanTask) -> bool {
+    matches!(
+        task.safety_category,
+        ToolSafetyCategory::WriteLocal | ToolSafetyCategory::Destructive
+    )
+}
+
+fn uses_inner_runtime_validator(tool_name: &str) -> bool {
+    let normalized = tool_name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "runtimecapabilities" | "runtimeorchestrate"
+    )
+}
+
+fn has_single_known_mutation_path(tasks: &[&ToolExecutionPlanTask]) -> bool {
+    let mut bounded_path: Option<&str> = None;
+    for task in tasks.iter().copied().filter(|task| is_mutation(task)) {
+        if task.resource_scope.unknown || task.resource_scope.kind != "paths" {
+            return false;
+        }
+        let [path] = task.resource_scope.paths.as_slice() else {
+            return false;
+        };
+        if path.is_empty() || path == "." {
+            return false;
+        }
+        if bounded_path.is_some_and(|known| known != path) {
+            return false;
+        }
+        bounded_path = Some(path);
+    }
+    bounded_path.is_some()
+}
+
+fn push_finding(findings: &mut Vec<String>, finding: &str) {
+    if !findings.iter().any(|existing| existing == finding) {
+        findings.push(finding.to_string());
     }
 }
 
@@ -485,13 +678,41 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::execution_core::build_runtime_execution_decision;
+
     fn request(id: &str, tool_name: &str, depends_on: Vec<String>) -> ToolRequest {
+        request_with_input(id, tool_name, "{}", depends_on)
+    }
+
+    fn request_with_input(
+        id: &str,
+        tool_name: &str,
+        input: &str,
+        depends_on: Vec<String>,
+    ) -> ToolRequest {
         ToolRequest {
             tool_use_id: id.to_string(),
             tool_name: tool_name.to_string(),
-            input: "{}".to_string(),
+            input: input.to_string(),
             depends_on,
         }
+    }
+
+    fn execution_decision(
+        compile_target: RuntimeCompileTarget,
+        risk: TaskRisk,
+        modifiers: &[ExecutionModifier],
+        gates: &[ExecutionPolicyGate],
+    ) -> RuntimeExecutionDecision {
+        let mut decision = build_runtime_execution_decision("explain this function", None);
+        decision.compile_target = compile_target;
+        decision.strategy.understanding.risk = risk;
+        decision.strategy.modifiers = modifiers.to_vec();
+        decision.strategy.gates = gates.to_vec();
+        decision.lease.lease_id = "lease-test".to_string();
+        decision.executable = true;
+        decision.blocked_reasons.clear();
+        decision
     }
 
     #[test]
@@ -636,5 +857,330 @@ mod tests {
         assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
         assert_eq!(plan.tasks[0].output_budget_class, "batch");
         assert!(plan.tasks[0].conflicts.is_empty());
+    }
+
+    #[test]
+    fn compile_targets_enforce_normal_tool_categories() {
+        let read_plan =
+            ToolExecutionPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
+        let network_plan =
+            ToolExecutionPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+        let write_plan = ToolExecutionPlan::from_requests(&[request_with_input(
+            "write-1",
+            "write_file",
+            r#"{"path":"src/lib.rs","content":"x"}"#,
+            Vec::new(),
+        )]);
+
+        let inline = execution_decision(
+            RuntimeCompileTarget::InlineModel,
+            TaskRisk::Low,
+            &[ExecutionModifier::WithExternalResearch],
+            &[],
+        );
+        assert!(
+            read_plan
+                .validate_against_execution_decision(&inline)
+                .allowed
+        );
+        assert_eq!(
+            network_plan
+                .validate_against_execution_decision(&inline)
+                .findings,
+            vec!["tool_category_not_allowed_by_compile_target"]
+        );
+
+        let evidence = execution_decision(
+            RuntimeCompileTarget::EvidenceGraph,
+            TaskRisk::Low,
+            &[ExecutionModifier::WithExternalResearch],
+            &[],
+        );
+        assert!(
+            read_plan
+                .validate_against_execution_decision(&evidence)
+                .allowed
+        );
+        assert!(
+            network_plan
+                .validate_against_execution_decision(&evidence)
+                .allowed
+        );
+        assert_eq!(
+            write_plan
+                .validate_against_execution_decision(&evidence)
+                .findings,
+            vec!["tool_category_not_allowed_by_compile_target"]
+        );
+
+        let execution = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Medium,
+            &[ExecutionModifier::WithGuardrails],
+            &[ExecutionPolicyGate::Permission],
+        );
+        assert!(
+            write_plan
+                .validate_against_execution_decision(&execution)
+                .allowed
+        );
+
+        for compile_target in [
+            RuntimeCompileTarget::DeliberationGraph,
+            RuntimeCompileTarget::TeamGraph,
+            RuntimeCompileTarget::MissionGraph,
+        ] {
+            let decision = execution_decision(
+                compile_target,
+                TaskRisk::Low,
+                &[ExecutionModifier::WithExternalResearch],
+                &[],
+            );
+            assert!(
+                read_plan
+                    .validate_against_execution_decision(&decision)
+                    .allowed
+            );
+            assert!(
+                network_plan
+                    .validate_against_execution_decision(&decision)
+                    .allowed
+            );
+            assert_eq!(
+                write_plan
+                    .validate_against_execution_decision(&decision)
+                    .findings,
+                vec!["tool_category_not_allowed_by_compile_target"],
+                "{compile_target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_graph_mutation_requires_typed_gates_and_modifiers() {
+        let plan = ToolExecutionPlan::from_requests(&[request_with_input(
+            "write-1",
+            "write_file",
+            r#"{"path":"src/lib.rs","content":"x"}"#,
+            Vec::new(),
+        )]);
+
+        let medium = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Medium,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            plan.validate_against_execution_decision(&medium).findings,
+            vec![
+                "mutation_requires_permission_gate",
+                "mutation_requires_with_guardrails",
+            ]
+        );
+
+        let high = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::High,
+            &[ExecutionModifier::WithGuardrails],
+            &[ExecutionPolicyGate::Permission],
+        );
+        assert_eq!(
+            plan.validate_against_execution_decision(&high).findings,
+            vec![
+                "high_risk_mutation_requires_risk_gate",
+                "high_risk_mutation_requires_with_checkpoint",
+            ]
+        );
+
+        let critical = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Critical,
+            &[
+                ExecutionModifier::WithGuardrails,
+                ExecutionModifier::WithCheckpoint,
+            ],
+            &[ExecutionPolicyGate::Permission, ExecutionPolicyGate::Risk],
+        );
+        assert_eq!(
+            plan.validate_against_execution_decision(&critical).findings,
+            vec!["critical_mutation_requires_approval_gate"]
+        );
+
+        let fully_gated = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Critical,
+            &[
+                ExecutionModifier::WithGuardrails,
+                ExecutionModifier::WithCheckpoint,
+            ],
+            &[
+                ExecutionPolicyGate::Permission,
+                ExecutionPolicyGate::Risk,
+                ExecutionPolicyGate::Approval,
+            ],
+        );
+        assert!(
+            plan.validate_against_execution_decision(&fully_gated)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn network_tools_require_external_research_modifier() {
+        let plan =
+            ToolExecutionPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+        let without_research =
+            execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
+
+        assert_eq!(
+            plan.validate_against_execution_decision(&without_research)
+                .findings,
+            vec!["network_requires_with_external_research"]
+        );
+
+        let with_research = execution_decision(
+            RuntimeCompileTarget::EvidenceGraph,
+            TaskRisk::Low,
+            &[ExecutionModifier::WithExternalResearch],
+            &[],
+        );
+        assert!(
+            plan.validate_against_execution_decision(&with_research)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn registered_read_only_tool_metadata_overrides_unknown_tool_fallback() {
+        let plan = ToolExecutionPlan::from_requests_with_classifier(
+            &[request("plugin-read", "company_catalog_lookup", Vec::new())],
+            |name, _| (name == "company_catalog_lookup").then_some(ToolSafetyCategory::ReadOnly),
+        );
+
+        assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            plan.tasks[0].execution_mode,
+            ToolExecutionMode::ParallelRead
+        );
+        let decision =
+            execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
+        assert!(plan.validate_against_execution_decision(&decision).allowed);
+    }
+
+    #[test]
+    fn bounded_change_requires_one_known_mutation_path_scope() {
+        let decision = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Medium,
+            &[
+                ExecutionModifier::BoundedChange,
+                ExecutionModifier::WithGuardrails,
+            ],
+            &[ExecutionPolicyGate::Permission],
+        );
+        let one_path = ToolExecutionPlan::from_requests(&[
+            request_with_input(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+                Vec::new(),
+            ),
+            request_with_input(
+                "edit-1",
+                "edit_file",
+                r#"{"path":"src/lib.rs","old_string":"x","new_string":"y"}"#,
+                Vec::new(),
+            ),
+        ]);
+        assert!(
+            one_path
+                .validate_against_execution_decision(&decision)
+                .allowed
+        );
+
+        let multiple_paths = ToolExecutionPlan::from_requests(&[
+            request_with_input(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+                Vec::new(),
+            ),
+            request_with_input(
+                "write-2",
+                "write_file",
+                r#"{"path":"src/main.rs","content":"y"}"#,
+                Vec::new(),
+            ),
+        ]);
+        assert_eq!(
+            multiple_paths
+                .validate_against_execution_decision(&decision)
+                .findings,
+            vec!["bounded_change_requires_single_known_path_scope"]
+        );
+
+        let unknown_path =
+            ToolExecutionPlan::from_requests(&[request("custom-1", "custom_mutation", Vec::new())]);
+        assert_eq!(
+            unknown_path
+                .validate_against_execution_decision(&decision)
+                .findings,
+            vec!["bounded_change_requires_single_known_path_scope"]
+        );
+    }
+
+    #[test]
+    fn runtime_entry_tools_defer_to_their_inner_validators() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            request("capabilities-1", "RuntimeCapabilities", Vec::new()),
+            request("orchestrate-1", "runtime_orchestrate", Vec::new()),
+        ]);
+        let decision =
+            execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
+
+        assert!(plan.validate_against_execution_decision(&decision).allowed);
+    }
+
+    #[test]
+    fn non_executable_decision_is_rejected_with_serializable_lease_report() {
+        let plan = ToolExecutionPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
+        let mut decision =
+            execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
+        decision.executable = false;
+
+        let report = plan.validate_against_execution_decision(&decision);
+        let wire = serde_json::to_value(&report).expect("validation report serializes");
+
+        assert!(!report.allowed);
+        assert_eq!(report.findings, vec!["execution_decision_not_executable"]);
+        assert_eq!(report.lease_id, "lease-test");
+        assert_eq!(wire["allowed"], false);
+        assert_eq!(wire["findings"][0], "execution_decision_not_executable");
+        assert_eq!(wire["lease_id"], "lease-test");
+    }
+
+    #[test]
+    fn plan_uses_request_level_bash_classification() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            request_with_input(
+                "bash-read",
+                "bash",
+                r#"{"command":"git status"}"#,
+                Vec::new(),
+            ),
+            request_with_input(
+                "bash-write",
+                "bash",
+                r#"{"command":"mkdir target/new"}"#,
+                Vec::new(),
+            ),
+        ]);
+
+        assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            plan.tasks[1].safety_category,
+            ToolSafetyCategory::WriteLocal
+        );
     }
 }

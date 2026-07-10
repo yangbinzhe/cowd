@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use crate::agent_collaboration::CollaborationContextResult;
 use crate::{
-    agent, agent_collaboration, joint_problem_solving, model_context_window_with_overrides,
-    permissions::SharedPrompter, CompactionConfig, CompactionResult, ContextEnvelope, ContextItem,
-    ContextProfile, ContextSourceKind, ConversationMessage, CowdEvent, CowdEventBus,
-    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
-    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    ToolCallback, ToolExecutor, TurnSummary,
+    agent, agent_collaboration, model_context_window_with_overrides, permissions::SharedPrompter,
+    CompactionConfig, CompactionResult, ContextEnvelope, ContextItem, ContextProfile,
+    ContextSourceKind, ConversationMessage, CowdEvent, CowdEventBus, HookAbortSignal,
+    HookProgressReporter, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition,
+    ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor,
+    TurnSummary,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 use harness_contract::turn::{
@@ -23,6 +23,8 @@ where
     T: ToolExecutor,
 {
     runtime: Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+    approval_gate_slot:
+        Arc<std::sync::RwLock<Option<Arc<crate::approval_gate::SmartApprovalGate>>>>,
 }
 
 /// Inputs required to build a standard provider-backed runtime host.
@@ -57,6 +59,7 @@ where
     T: ToolExecutor,
 {
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
+        let approval_gate_slot = Arc::new(std::sync::RwLock::new(None));
         let active_model = config.model.clone();
         let model_context_window = config.model_context_window.unwrap_or_else(|| {
             let overrides = config.feature_config.model_context_windows();
@@ -103,18 +106,15 @@ where
                     .expect("sub-agent provider client creation failed")
                 },
                 config.subagent_tool_executor.clone(),
-            );
+            )
+            .with_approval_gate_slot(Arc::clone(&approval_gate_slot));
             let executor_arc = Arc::new(executor);
-            runtime =
-                runtime.with_collaboration(agent_collaboration::new_boxed(executor_arc.clone()));
-            let jps_pipeline = joint_problem_solving::new_boxed::<
-                agent::ProductionExecutor<ProviderRuntimeClient, T>,
-            >(executor_arc);
-            runtime = runtime.with_jps_pipeline(jps_pipeline);
+            runtime = runtime.with_collaboration(agent_collaboration::new_boxed(executor_arc));
         }
 
         Ok(Self {
             runtime: Some(runtime),
+            approval_gate_slot,
         })
     }
 
@@ -141,6 +141,21 @@ where
                 .with_cancellation_token(cancellation_token)
                 .with_hook_abort_signal(hook_abort_signal),
         );
+    }
+
+    pub fn install_approval_gate(
+        &mut self,
+        approval_gate: Arc<crate::approval_gate::SmartApprovalGate>,
+    ) {
+        *self
+            .approval_gate_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&approval_gate));
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing approval gate");
+        self.runtime = Some(runtime.with_approval_gate(approval_gate));
     }
 
     pub fn cowd_bus(&self) -> Option<&CowdEventBus> {
@@ -214,6 +229,10 @@ where
 
     pub fn session(&self) -> Session {
         self.runtime_ref().session()
+    }
+
+    pub async fn session_async(&self) -> Session {
+        self.runtime_ref().session_async().await
     }
 
     pub fn compact_active_session(

@@ -124,6 +124,16 @@ use serde_json::json;
 use services::GatewayServices;
 
 #[cfg(test)]
+static TEST_PROCESS_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+pub(crate) fn test_process_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 pub(crate) use entry::env_entry::resolve_tui_model;
 pub(crate) use entry::env_entry::{
     default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
@@ -3564,6 +3574,11 @@ pub(crate) fn runtime_capability_context_item(
     } else {
         "runtime_capabilities=unavailable"
     };
+    let runtime_orchestration = if has_tool("runtime_orchestrate") {
+        "runtime_orchestrate=available"
+    } else {
+        "runtime_orchestrate=unavailable"
+    };
     let allowed_state = allowed_tools.map_or_else(
         || "allowed_tools=all available registry tools".to_string(),
         |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
@@ -3583,6 +3598,7 @@ model_context_window={model_ctx}\n\
 available_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
+{runtime_orchestration}\n\
 {active_evolution_summary}\n\
 batch_readonly_tools={}\n\
 prepared_readonly_tools={}\n\
@@ -5186,10 +5202,7 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_process_env_lock()
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -6811,6 +6824,7 @@ mod tests {
         assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
         assert_eq!(item.role, runtime::ContextRole::Orientation);
         assert!(item.content.contains("runtime_capabilities=available"));
+        assert!(item.content.contains("runtime_orchestrate=unavailable"));
         assert!(item.content.contains("active_evolution_capabilities=1"));
         assert!(item.content.contains("prefer_parallel_tools"));
         assert!(item.content.contains("read_many"));

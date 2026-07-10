@@ -390,6 +390,9 @@ where
     let spawn_result = match job.manifest.backend {
         AgentExecutionBackendKind::InProcess => spawn_agent_job(job, tool_executor),
         AgentExecutionBackendKind::ProcessJsonl => spawn_process_jsonl_agent_job(job),
+        AgentExecutionBackendKind::ManualMailbox => Err(String::from(
+            "manual-mailbox agents must be registered by their mailbox host",
+        )),
     };
     if let Err(error) = spawn_result {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -884,11 +887,7 @@ pub fn agent_store_dir() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("COWD_AGENT_STORE") {
         return Ok(PathBuf::from(path));
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".cowd/agents"));
-    }
-    Ok(cwd.join(".cowd/agents"))
+    Ok(crate::cowd_dirs::user_agents_dir())
 }
 
 pub fn persist_agent_terminal_state(
@@ -1328,6 +1327,68 @@ const CONTEXTUAL_SUMMARY_WORDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AgentStoreTestEnv {
+        cwd: PathBuf,
+        agent_store: Option<std::ffi::OsString>,
+        config_home: Option<std::ffi::OsString>,
+    }
+
+    impl AgentStoreTestEnv {
+        fn capture() -> Self {
+            Self {
+                cwd: std::env::current_dir().expect("current dir"),
+                agent_store: std::env::var_os("COWD_AGENT_STORE"),
+                config_home: std::env::var_os("COWD_CONFIG_HOME"),
+            }
+        }
+    }
+
+    impl Drop for AgentStoreTestEnv {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.cwd);
+            restore_env_var("COWD_AGENT_STORE", self.agent_store.as_ref());
+            restore_env_var("COWD_CONFIG_HOME", self.config_home.as_ref());
+        }
+    }
+
+    fn restore_env_var(key: &str, value: Option<&std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn agent_store_default_is_independent_of_current_dir() {
+        let _lock = crate::test_env_lock();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let _env = AgentStoreTestEnv::capture();
+        let config_home = temp.path().join("config-home");
+        let first_cwd = temp.path().join("first/project/nested");
+        let second_cwd = temp.path().join("second/project/nested");
+        std::fs::create_dir_all(&first_cwd).expect("first cwd");
+        std::fs::create_dir_all(&second_cwd).expect("second cwd");
+        std::env::remove_var("COWD_AGENT_STORE");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
+        std::env::set_current_dir(&first_cwd).expect("switch to first cwd");
+        let first = agent_store_dir().expect("first agent store");
+        std::env::set_current_dir(&second_cwd).expect("switch to second cwd");
+        let second = agent_store_dir().expect("second agent store");
+
+        assert_eq!(first, crate::cowd_dirs::user_agents_dir());
+        assert_eq!(second, first);
+        assert_eq!(second, config_home.join("agents"));
+
+        let explicit_store = temp.path().join("explicit-agent-store");
+        std::env::set_var("COWD_AGENT_STORE", &explicit_store);
+        assert_eq!(
+            agent_store_dir().expect("explicit agent store"),
+            explicit_store
+        );
+    }
 
     #[test]
     fn normalizes_builtin_subagent_aliases() {

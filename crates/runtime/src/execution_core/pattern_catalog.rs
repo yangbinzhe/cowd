@@ -35,13 +35,7 @@ pub struct ExecutionPatternCatalog {
 impl ExecutionPatternCatalog {
     #[must_use]
     pub fn current() -> Self {
-        use ExecutionModifier::{
-            Background, BoundedChange, Parallel, WithCheckpoint, WithExternalResearch,
-            WithGuardrails, WithMatrixEvidence, WithReviewer, WithTrace, WithVerifier,
-            WithWorktreeIsolation,
-        };
         use ExecutionPattern::{Collaborate, Deliberate, Direct, Execute, Explore, Supervise};
-        use ExecutionPolicyGate::{Approval, Budget, Permission, Risk};
 
         Self {
             patterns: vec![
@@ -60,8 +54,6 @@ impl ExecutionPatternCatalog {
                     ],
                     &[],
                     &["inline_model"],
-                    &[WithTrace],
-                    &[Budget],
                     RuntimeCompileTarget::InlineModel,
                 ),
                 spec(
@@ -75,8 +67,6 @@ impl ExecutionPatternCatalog {
                     &["irreversible mutation", "evidence already sufficient"],
                     &["fanout_research_synthesis"],
                     &["tool_dag", "evidence_ledger"],
-                    &[Parallel, WithExternalResearch, WithTrace],
-                    &[Budget, Permission],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
                 spec(
@@ -95,14 +85,6 @@ impl ExecutionPatternCatalog {
                         "implementation_review_fix",
                     ],
                     &["tool_dag", "agent_runtime", "verification"],
-                    &[
-                        BoundedChange,
-                        Parallel,
-                        WithCheckpoint,
-                        WithVerifier,
-                        WithGuardrails,
-                    ],
-                    &[Budget, Permission, Risk, Approval],
                     RuntimeCompileTarget::ExecutionGraph,
                 ),
                 spec(
@@ -112,8 +94,6 @@ impl ExecutionPatternCatalog {
                     &["straightforward factual answer", "no material uncertainty"],
                     &["debate_consensus", "joint_problem_solving"],
                     &["agent_runtime", "evidence_ledger", "verification"],
-                    &[Parallel, WithReviewer, WithMatrixEvidence, WithTrace],
-                    &[Budget, Risk],
                     RuntimeCompileTarget::DeliberationGraph,
                 ),
                 spec(
@@ -131,8 +111,6 @@ impl ExecutionPatternCatalog {
                     ],
                     &["fanout_research_synthesis", "implementation_review_fix"],
                     &["team_runtime", "agent_runtime", "evidence_ledger"],
-                    &[Parallel, WithReviewer, WithTrace, WithWorktreeIsolation],
-                    &[Budget, Permission, Risk, Approval],
                     RuntimeCompileTarget::TeamGraph,
                 ),
                 spec(
@@ -149,14 +127,6 @@ impl ExecutionPatternCatalog {
                     ],
                     &["long_running_project", "incident_response"],
                     &["mission_runtime", "checkpoint", "recovery"],
-                    &[
-                        Background,
-                        Parallel,
-                        WithCheckpoint,
-                        WithReviewer,
-                        WithTrace,
-                    ],
-                    &[Budget, Permission, Risk, Approval],
                     RuntimeCompileTarget::MissionGraph,
                 ),
             ],
@@ -197,8 +167,6 @@ fn spec(
     avoid_when: &[&str],
     default_templates: &[&str],
     required_runtime_capabilities: &[&str],
-    supported_modifiers: &[ExecutionModifier],
-    supported_gates: &[ExecutionPolicyGate],
     compile_target: RuntimeCompileTarget,
 ) -> RuntimeExecutionPatternSpec {
     RuntimeExecutionPatternSpec {
@@ -218,8 +186,8 @@ fn spec(
             .iter()
             .map(|item| (*item).to_string())
             .collect(),
-        supported_modifiers: supported_modifiers.to_vec(),
-        supported_gates: supported_gates.to_vec(),
+        supported_modifiers: pattern.supported_modifiers().to_vec(),
+        supported_gates: pattern.supported_gates().to_vec(),
         compile_target,
     }
 }

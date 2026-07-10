@@ -29,13 +29,14 @@ pub use pattern_catalog::{
 pub use reflexion::{ReflexionRecord, ReflexionTrigger};
 pub use report::RuntimeExecutionReportSpec;
 pub use rewoo_plan::{
-    rewoo_plan_for_intent, RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep,
-    RewooObservation, RewooSolverContract,
+    rewoo_plan_for_intent, rewoo_plan_for_intent_with_evidence_plan, RewooEvidencePlan,
+    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
 };
 pub use strategy_decision::{
-    build_runtime_action_selection_report, build_runtime_execution_decision,
-    RuntimeActionSelectionReport, RuntimeExecutionActionHint, RuntimeExecutionDecision,
-    RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
+    action_selection_report_for_decision, build_runtime_action_selection_report,
+    build_runtime_execution_decision, RuntimeActionSelectionReport, RuntimeExecutionActionHint,
+    RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
+    StrategyLease, StrategyResourceHealth,
 };
 pub use tool_dag::{
     tool_dag_from_rewoo, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,

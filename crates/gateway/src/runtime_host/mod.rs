@@ -676,13 +676,16 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         "surface host discovery completed"
     );
     let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
-        Arc::new(RuntimeService::new(
-            sessions.clone(),
-            lease_registry.clone(),
-            session_kernel.clone(),
-            lifecycle_kernel.clone(),
-            started_at,
-        )),
+        Arc::new(
+            RuntimeService::new(
+                sessions.clone(),
+                lease_registry.clone(),
+                session_kernel.clone(),
+                lifecycle_kernel.clone(),
+                started_at,
+            )
+            .with_approval_gate(approval_gate.clone()),
+        ),
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),

@@ -573,7 +573,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
     let checks = vec![
         (
             "simple_question_direct",
-            simple_decision.recommended_pattern == ExecutionPattern::Direct,
+            simple_decision.pattern() == ExecutionPattern::Direct,
         ),
         (
             "template_selected",
@@ -634,8 +634,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         "model_provider": "deterministic_runtime_contract",
         "profile": "DeepInvestigation",
         "selected_strategy": {
-            "simple_mode": simple_decision.recommended_pattern.as_str(),
-            "complex_mode": strategy.pattern.as_str(),
+            "simple_pattern": simple_decision.pattern().as_str(),
+            "complex_pattern": strategy.pattern.as_str(),
             "template": collaboration.template_id.as_str(),
             "runtime_actions": ["continue_single", "use_team_template", "build_workgraph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
         },
@@ -902,7 +902,7 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
         .iter()
         .map(|item| {
             ScenarioSpec::new(item.id.clone(), item.objective.clone())
-                .expect_mode(mode_for_scenario(item.kind))
+                .expect_pattern(pattern_for_scenario(item.kind))
                 .require(ScenarioCheck::text_contains(
                     format!("{}.evidence", item.id),
                     item.required_evidence[0].clone(),
@@ -915,7 +915,7 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
         .iter()
         .map(|item| ScenarioObservation {
             scenario_id: item.id.clone(),
-            strategy_pattern: mode_for_scenario(item.kind),
+            strategy_pattern: pattern_for_scenario(item.kind),
             finalization_blocked: item.kind == E2eScenarioKind::Recovery,
             regression_allowed: item.kind != E2eScenarioKind::Recovery,
             has_workgraph: matches!(
@@ -940,7 +940,7 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
     ScenarioSuite::new(specs).evaluate(&observations)
 }
 
-fn mode_for_scenario(kind: E2eScenarioKind) -> ExecutionPattern {
+fn pattern_for_scenario(kind: E2eScenarioKind) -> ExecutionPattern {
     match kind {
         E2eScenarioKind::SimpleOnce => ExecutionPattern::Direct,
         E2eScenarioKind::TeamParallel => ExecutionPattern::Collaborate,

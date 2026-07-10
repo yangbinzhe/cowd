@@ -21,7 +21,15 @@ pub struct ContextFanoutPlan {
 #[must_use]
 pub fn plan_context_fanout(prompt: &str) -> ContextFanoutPlan {
     let intent = classify_intent(prompt);
-    let calls = match intent.intent {
+    plan_context_fanout_for_intent(intent.intent, intent.reason)
+}
+
+#[must_use]
+pub fn plan_context_fanout_for_intent(
+    intent: TaskIntent,
+    reason: impl Into<String>,
+) -> ContextFanoutPlan {
+    let calls = match intent {
         TaskIntent::Review => vec![
             call(
                 "workspace_snapshot",
@@ -101,9 +109,9 @@ pub fn plan_context_fanout(prompt: &str) -> ContextFanoutPlan {
     };
 
     ContextFanoutPlan {
-        intent: intent.intent,
+        intent,
         calls,
-        reason: intent.reason,
+        reason: reason.into(),
     }
 }
 

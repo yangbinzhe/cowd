@@ -44,7 +44,10 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
         .workgraph_quality
         .as_ref()
         .expect("complex closure should produce workgraph quality");
-    assert_eq!(trace.strategy.pattern, ExecutionPattern::Execute);
+    assert_eq!(
+        trace.execution_decision.strategy.pattern,
+        ExecutionPattern::Execute
+    );
     assert!(
         trace.workgraph.is_some(),
         "complex task should allocate workgraph"
@@ -93,7 +96,7 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
         ));
     let observation = runtime::eval_gate::ScenarioObservation {
         scenario_id: "deep_task_closure".to_string(),
-        strategy_pattern: trace.strategy.pattern,
+        strategy_pattern: trace.execution_decision.strategy.pattern,
         finalization_blocked: trace.finalization_blocked,
         regression_allowed: trace.regression_gate.allowed,
         has_workgraph: trace.workgraph.is_some(),

@@ -7,8 +7,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::context_fanout::{plan_context_fanout, FanoutToolCall};
-use crate::intent_planner::{classify_intent, TaskIntent};
+use harness_contract::strategy::TaskUnderstanding;
+
+use crate::context_fanout::{plan_context_fanout_for_intent, FanoutToolCall};
+use crate::intent_planner::{classify_intent, classify_understanding, TaskIntent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,13 +34,31 @@ pub struct EvidencePlan {
 #[must_use]
 pub fn plan_evidence(prompt: &str) -> EvidencePlan {
     let classified = classify_intent(prompt);
+    plan_evidence_for_intent(prompt, classified)
+}
+
+#[must_use]
+pub fn plan_evidence_with_understanding(
+    prompt: &str,
+    understanding: &TaskUnderstanding,
+) -> EvidencePlan {
+    plan_evidence_for_intent(prompt, classify_understanding(understanding))
+}
+
+fn plan_evidence_for_intent(
+    prompt: &str,
+    classified: crate::intent_planner::IntentPlan,
+) -> EvidencePlan {
     let mode = acquisition_mode(prompt, classified.intent);
     let recommended_calls = if is_mixed_doc_engineering_review(prompt, classified.intent) {
-        merge_calls(readme_review_calls(), plan_context_fanout(prompt).calls)
+        merge_calls(
+            readme_review_calls(),
+            plan_context_fanout_for_intent(classified.intent, classified.reason.clone()).calls,
+        )
     } else if is_readme_or_doc_review(prompt) {
         readme_review_calls()
     } else {
-        plan_context_fanout(prompt).calls
+        plan_context_fanout_for_intent(classified.intent, classified.reason.clone()).calls
     };
     let avoid_patterns = avoid_patterns_for(mode, prompt);
     let use_subagents_when = subagent_guidance_for(mode, classified.intent);

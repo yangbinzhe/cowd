@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_execute_spec_declares_matrix_and_memory_contracts() {
+    fn execute_spec_declares_matrix_and_memory_contracts() {
         let spec = AgentSpec::for_turn("重构 runtime", ExecutionPattern::Execute, TaskRisk::Medium);
 
         assert!(spec.tools.contains(&AgentToolPermission::WriteWorkspace));

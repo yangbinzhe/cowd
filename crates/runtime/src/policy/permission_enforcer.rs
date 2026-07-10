@@ -1183,10 +1183,11 @@ impl DestructivePatternDetector {
         let cache_key = self.command_cache_key(&normalized);
 
         match &persistence {
-            ApprovalPersistence::Session | ApprovalPersistence::Once => {
+            ApprovalPersistence::Session => {
                 let mut cache = self.session_approved.write().await;
                 cache.insert(cache_key, persistence);
             }
+            ApprovalPersistence::Once => {}
             ApprovalPersistence::Always => {
                 let _ = self.approval_repository.add_always_allowed(&normalized);
             }

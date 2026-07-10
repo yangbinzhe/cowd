@@ -2398,6 +2398,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn mission_routes_write_approvals_relations_proxies_and_routes() {
         let _guard = mission_route_lock().lock().await;
+        let _env_guard = crate::test_process_env_lock();
         let app = api_router(test_state());
         let session_a = format!("mission-route-a-{}", uuid::Uuid::new_v4());
         let session_b = format!("mission-route-b-{}", uuid::Uuid::new_v4());
@@ -2437,7 +2438,7 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "objective": "research architecture and review implementation",
-                            "execution_pattern": "manual_mailbox"
+                            "execution_mode": "manual_mailbox"
                         })
                         .to_string(),
                     ))
@@ -2523,6 +2524,7 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(handoff.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(handoff_json["receipt"]["command"], "handoff");
+        assert_eq!(handoff_json["receipt"]["status"], "accepted");
         assert!(handoff_json["run"]["team"]["review_notes"]
             .as_array()
             .expect("review notes")

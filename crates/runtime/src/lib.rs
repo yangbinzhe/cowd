@@ -336,7 +336,9 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use capability_manifest::{
     runtime_capabilities_response, runtime_capabilities_response_with_detail,
-    runtime_capabilities_response_with_detail_and_overlay, runtime_capability_primer,
+    runtime_capabilities_response_with_detail_and_overlay,
+    runtime_capabilities_response_with_leased_decision,
+    runtime_capabilities_response_with_leased_decision_and_tools, runtime_capability_primer,
     runtime_capability_primer_with_overlay, ActiveEvolutionCapabilityOverlay,
     ActiveEvolutionCapabilitySummary, RuntimeActionContract, RuntimeCapability,
     RuntimeCapabilityCatalog, RuntimeCapabilityManifest, RuntimeOperation, RuntimeOperationGroup,
@@ -397,15 +399,17 @@ pub use evidence_planner::{
     evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
 };
 pub use execution_core::{
-    build_runtime_action_selection_report, build_runtime_execution_decision,
-    execution_pattern_catalog_response, rewoo_plan_for_intent, runtime_execution_guidance_prompt,
-    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
-    DeliberationMode, DeliberationPlan, ExecutionPatternCatalog, ReflexionRecord, ReflexionTrigger,
-    RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep, RewooObservation,
-    RewooSolverContract, RuntimeActionSelectionReport, RuntimeCompileTarget,
-    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionDecision,
-    RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec,
-    ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary, ToolDagTask,
+    action_selection_report_for_decision, build_runtime_action_selection_report,
+    build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
+    runtime_execution_guidance_prompt, runtime_orchestration_action_guidance,
+    runtime_orchestration_actions, tool_dag_from_rewoo, DeliberationMode, DeliberationPlan,
+    ExecutionPatternCatalog, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
+    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
+    RuntimeActionSelectionReport, RuntimeCompileTarget, RuntimeEvidenceSummary,
+    RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
+    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, StrategyDecisionEngine, StrategyLease,
+    StrategyResourceHealth, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
+    ToolDagTask,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -433,7 +437,7 @@ pub use host::{StandardRuntimeHost, StandardRuntimeHostConfig};
 pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
-    AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,
+    AgentDiscussion, DiscussionTurn, PhaseStatus, PipelineResult, ProblemSolvingConfig,
     ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
 };
 pub use lane_events::{
@@ -511,8 +515,9 @@ pub use mutation_plan::{
 };
 pub use orchestration::{
     handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_host,
-    plan_runtime_collaboration_decision, runtime_orchestration_response,
-    runtime_orchestration_response_with_host, RuntimeOrchestrationAction,
+    handle_runtime_orchestration_request_with_host_and_decision, runtime_orchestration_response,
+    runtime_orchestration_response_with_host,
+    runtime_orchestration_response_with_host_and_decision, RuntimeOrchestrationAction,
     RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationRequest,
     RuntimeOrchestrationResult,
 };
@@ -647,7 +652,7 @@ pub use team_runtime::{
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_host::{
-    RuntimeActionExecutionReceipt, RuntimeToolExecutionHost, RuntimeToolExecutionOutcome,
+    RuntimeActionExecutionReceipt, RuntimeExecutionHost, RuntimeToolExecutionOutcome,
     RuntimeToolExecutionRequest, RuntimeToolExecutionStatus,
 };
 pub use tool_invocation::{

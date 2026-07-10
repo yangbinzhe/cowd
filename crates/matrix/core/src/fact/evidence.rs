@@ -217,7 +217,7 @@ mod tests {
 
         packet.add_ai_kernel_trace_source(
             "runtime:event:event-1",
-            "plan_execute",
+            "execute",
             false,
             false,
             "verification blocked finalization",

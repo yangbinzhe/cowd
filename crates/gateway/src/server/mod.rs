@@ -262,6 +262,7 @@ mod tests {
     #[test]
     #[serial]
     fn config_home_override_disables_default_gateway_discovery() {
+        let _env_guard = crate::test_process_env_lock();
         let original_config_home = std::env::var_os("COWD_CONFIG_HOME");
         let original_xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR");
         let config_home = tempfile::tempdir().unwrap();

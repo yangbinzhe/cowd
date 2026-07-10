@@ -22,7 +22,7 @@ async fn provider_config_live_smoke_returns_structured_health_signal() {
             expected_value: "live_provider",
         },
         LiveProbe {
-            name: "simple_direct_answer",
+            name: "simple_answer",
             max_tokens: 96,
             prompt:
                 "A user asks: what is 2+2? Return only JSON: {\"status\":\"ok\",\"route\":\"direct\",\"answer\":\"4\"}",

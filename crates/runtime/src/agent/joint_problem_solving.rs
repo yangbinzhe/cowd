@@ -1022,41 +1022,6 @@ impl<E: SubAgentExecutor + Default + 'static> Default for ProblemSolvingPipeline
     }
 }
 
-// ── JpsOps ─────────────────────────────────────────────────────────────────────
-
-/// Type-erased interface for ProblemSolvingPipeline.
-///
-/// Enables storing a generic `ProblemSolvingPipeline<E>` behind a single
-/// `Arc<dyn JpsOps>` so that the conversation runtime can trigger JPS
-/// without knowing the concrete executor type `E`.
-pub trait JpsOps: Send + Sync {
-    fn run_boxed<'a>(
-        &'a self,
-        problem: ProblemStatement,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PipelineResult>> + 'a>>;
-}
-
-impl<E: SubAgentExecutor + Send + Sync + 'static> JpsOps for ProblemSolvingPipeline<E> {
-    fn run_boxed<'a>(
-        &'a self,
-        problem: ProblemStatement,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PipelineResult>> + 'a>> {
-        Box::pin(async move { self.run(problem).await })
-    }
-}
-
-/// Factory: create a type-erased `Arc<dyn JpsOps>`.
-///
-/// Produces a boxed pipeline that can be passed to
-/// `ConversationRuntime::with_jps_pipeline()` without propagating the
-/// `E` type parameter.
-pub fn new_boxed<E>(executor: Arc<E>) -> Arc<dyn JpsOps>
-where
-    E: SubAgentExecutor + Send + Sync + 'static,
-{
-    Arc::new(ProblemSolvingPipeline::<E>::new(executor))
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Truncate a string for display.

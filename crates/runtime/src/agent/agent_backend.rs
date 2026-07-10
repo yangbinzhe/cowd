@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum AgentExecutionBackendKind {
     InProcess,
     ProcessJsonl,
+    ManualMailbox,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,7 @@ impl AgentExecutionBackendKind {
                 (Self::ProcessJsonl, false) => "process-jsonl-observe-only",
                 (Self::InProcess, true) => "in-process-command-channel",
                 (Self::InProcess, false) => "in-process-one-shot",
+                (Self::ManualMailbox, _) => "manual-mailbox",
             }
             .to_string(),
         }

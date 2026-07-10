@@ -21,12 +21,15 @@ pub(crate) struct AttachMissionAgentHttpRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StartMissionTeamRuntimeHttpRequest {
     pub(crate) objective: String,
     #[serde(default)]
     pub(crate) model: Option<String>,
     #[serde(default)]
     pub(crate) execution_mode: MissionTeamExecutionMode,
+    #[serde(default)]
+    pub(crate) approval_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -638,16 +641,43 @@ impl MissionService {
         session_id: &str,
         request: StartMissionTeamRuntimeHttpRequest,
     ) -> Result<serde_json::Value, String> {
-        let team = start_team_runtime_with_spawner(
-            session_id,
-            request.objective.clone(),
-            request.model.as_deref(),
-            request.execution_mode,
-        )?;
+        let host = MissionTeamExecutionHost {
+            model: request.model.as_deref(),
+            execution_mode: request.execution_mode,
+        };
+        let orchestration = runtime::handle_runtime_orchestration_request_with_host(
+            runtime::RuntimeOrchestrationRequest {
+                intent: request.objective,
+                session_id: Some(session_id.to_string()),
+                action: runtime::RuntimeOrchestrationAction::RequestTeam,
+                reason: Some("explicit mission team start requested through gateway".to_string()),
+                template_hint: None,
+                capabilities: Vec::new(),
+                evidence_refs: Vec::new(),
+                constraints: runtime::RuntimeOrchestrationConstraints {
+                    approval_id: request.approval_id,
+                    ..Default::default()
+                },
+                surface: Some("gateway_http".to_string()),
+            },
+            Some(&host),
+        );
+        if orchestration.status != "running" {
+            return Err(format!(
+                "runtime rejected mission team start: status={} findings={:?}",
+                orchestration.status, orchestration.decision.validation_findings
+            ));
+        }
+        let team = orchestration
+            .execution
+            .get("team")
+            .cloned()
+            .ok_or_else(|| "runtime team execution did not return a team snapshot".to_string())?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
             "team": team,
+            "orchestration": orchestration,
             "mission": runtime::global_mission_runtime().projection(),
         }))
     }
@@ -951,11 +981,62 @@ impl MissionService {
     }
 }
 
-pub(crate) fn start_team_runtime_with_spawner(
+struct MissionTeamExecutionHost<'a> {
+    model: Option<&'a str>,
+    execution_mode: MissionTeamExecutionMode,
+}
+
+impl runtime::RuntimeExecutionHost for MissionTeamExecutionHost<'_> {
+    fn execute_runtime_tool(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> runtime::RuntimeToolExecutionOutcome {
+        runtime::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+            category: request.category,
+            output: None,
+            error: Some("mission team host only supports team lifecycle start".to_string()),
+            evidence_ref: format!("mission-team-host:{}:blocked", request.tool_use_id),
+        }
+    }
+
+    fn start_runtime_team(
+        &self,
+        request: &runtime::RuntimeOrchestrationRequest,
+        decision: &runtime::CollaborationDecision,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let result = (|| {
+            let session_id = request
+                .session_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "request_team requires session_id".to_string())?;
+            let team = start_team_runtime_with_spawner_decision(
+                session_id,
+                request.intent.clone(),
+                self.model,
+                self.execution_mode,
+                decision.clone(),
+            )?;
+            Ok(serde_json::json!({
+                "type": "team_runtime",
+                "status": "running",
+                "execution_fidelity": "runtime_owned_mission_http_adapter",
+                "team": team,
+            }))
+        })();
+        Some(result)
+    }
+}
+
+pub(crate) fn start_team_runtime_with_spawner_decision(
     session_id: &str,
     objective: String,
     model: Option<&str>,
     execution_mode: MissionTeamExecutionMode,
+    collaboration_decision: runtime::CollaborationDecision,
 ) -> Result<runtime::TeamRuntimeSnapshot, String> {
     if runtime::global_mission_runtime()
         .get_session(session_id)
@@ -966,12 +1047,11 @@ pub(crate) fn start_team_runtime_with_spawner(
     if objective.trim().is_empty() {
         return Err("team objective must not be empty".to_string());
     }
-    let decision = runtime::plan_runtime_collaboration_decision(&objective);
     let team = runtime::global_team_runtime_service().start_with_agent_spawner(
         runtime::StartTeamRuntimeRequest {
             session_id: session_id.to_string(),
             objective,
-            collaboration_decision: decision,
+            collaboration_decision,
         },
         |agent_request| spawn_lifecycle_agent_for_team(&agent_request, model, execution_mode),
     )?;
@@ -1139,7 +1219,7 @@ fn register_lifecycle_agent_for_team(
         subagent_type: Some(request.role_id.clone()),
         model: Some(model.unwrap_or(runtime::DEFAULT_AGENT_MODEL).to_string()),
         status: "queued".to_string(),
-        backend: runtime::AgentExecutionBackendKind::InProcess,
+        backend: runtime::AgentExecutionBackendKind::ManualMailbox,
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
         created_at: created_at.clone(),
@@ -1237,6 +1317,24 @@ fn route_mission_command_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_mission_team_runtime_request_rejects_unknown_fields() {
+        let error =
+            serde_json::from_value::<StartMissionTeamRuntimeHttpRequest>(serde_json::json!({
+                "objective": "review the implementation",
+                "execution_mode": "manual_mailbox",
+                "execution_pattern": "manual_mailbox",
+            }))
+            .expect_err("unknown fields must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `execution_pattern`"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn mission_service_projects_runtime_control_surfaces() {
@@ -1358,6 +1456,7 @@ mod tests {
                     objective: "answer one delegated question".to_string(),
                     model: None,
                     execution_mode: MissionTeamExecutionMode::ManualMailbox,
+                    approval_id: None,
                 },
             )
             .expect("team");
@@ -1365,23 +1464,42 @@ mod tests {
             .as_str()
             .expect("team id")
             .to_string();
-        let plan = runtime::TeamExecutionLoop::plan(&team_id).expect("plan");
-        let task = plan.tasks[0].clone();
-        runtime::global_agent_task_mailbox().assign(task.clone());
-
-        let response = service
-            .submit_agent_task_outcome(
-                &team_id,
-                &task.task_id,
-                SubmitAgentTaskOutcomeHttpRequest {
-                    result_summary: "completed via gateway outcome API".to_string(),
-                    evidence_refs: vec!["evidence:gateway-outcome".to_string()],
-                    conflicts: Vec::new(),
-                    suggested_next_actions: vec!["synthesize".to_string()],
-                    quality_status: runtime::AgentTaskQualityStatus::Accepted,
-                },
-            )
-            .expect("outcome");
+        assert_eq!(started["orchestration"]["status"], "running");
+        assert_eq!(
+            started["orchestration"]["decision"]["selected_pattern"],
+            "collaborate"
+        );
+        assert!(started["orchestration"]["evidence"]["strategy_lease"]["lease_id"].is_string());
+        let initial = runtime::TeamExecutionLoop::tick_ready(&team_id).expect("initial tick");
+        assert!(initial.errors.is_empty());
+        let mut response = serde_json::Value::Null;
+        for _ in 0..16 {
+            let task = runtime::global_agent_task_mailbox()
+                .list_for_team(&team_id)
+                .into_iter()
+                .find(|task| task.status == runtime::AgentTaskStatus::Claimed)
+                .expect("a ready manual-mailbox task should be claimed");
+            response = service
+                .submit_agent_task_outcome(
+                    &team_id,
+                    &task.task_id,
+                    SubmitAgentTaskOutcomeHttpRequest {
+                        result_summary: format!(
+                            "{} completed via gateway outcome API",
+                            task.role_id
+                        ),
+                        evidence_refs: vec![format!("evidence:gateway-outcome:{}", task.role_id)],
+                        conflicts: Vec::new(),
+                        suggested_next_actions: vec!["synthesize".to_string()],
+                        quality_status: runtime::AgentTaskQualityStatus::Accepted,
+                    },
+                )
+                .expect("outcome");
+            assert_eq!(response["ok"], true);
+            if response["report"]["synthesis_ready"] == true {
+                break;
+            }
+        }
 
         assert_eq!(response["ok"], true);
         assert_eq!(

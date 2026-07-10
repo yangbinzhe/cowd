@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn repeated_tool_progress_triggers_self_regulation_decision() {
         let mut controller = AdaptiveController::new();
-        let mut last = RuntimeAdaptiveDecision::continue_now();
+        let mut decisions = Vec::new();
         for _ in 0..4 {
             let (_, decision) = controller.observe_tool_result(
                 "read_file",
@@ -41,13 +41,18 @@ mod tests {
                 "same README evidence",
                 false,
             );
-            last = decision;
+            decisions.push(decision);
         }
 
-        assert_eq!(last.kind, RuntimeAdaptiveDecisionKind::NudgeModel);
-        assert!(last
+        let nudge = &decisions[2];
+        assert_eq!(nudge.kind, RuntimeAdaptiveDecisionKind::NudgeModel);
+        assert!(nudge
             .recommended_action()
             .is_some_and(|action| action.contains("request_reflexion_retry")));
+        assert_eq!(
+            decisions[3].kind,
+            RuntimeAdaptiveDecisionKind::FallbackAnswerWithCheckedEvidence
+        );
         assert!(controller
             .progress_ledger()
             .compact_summary()

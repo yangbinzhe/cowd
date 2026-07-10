@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use runtime::{ToolError, ToolExecutor};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use tools::permissions::PermissionMode as ToolPermissionMode;
 
 use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
-use crate::services::{start_team_runtime_with_spawner, MissionTeamExecutionMode};
+use crate::services::{start_team_runtime_with_spawner_decision, MissionTeamExecutionMode};
 use crate::{format_tool_result, AllowedToolSet};
 
 #[derive(Debug, Deserialize)]
@@ -40,33 +41,13 @@ struct RuntimeCapabilitiesRequest {
     detail: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct RuntimeOrchestrateGatewayRequest {
-    intent: String,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    action: runtime::RuntimeOrchestrationAction,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    template_hint: Option<String>,
-    #[serde(default)]
-    capabilities: Vec<String>,
-    #[serde(default)]
-    evidence_refs: Vec<String>,
-    #[serde(default)]
-    constraints: runtime::RuntimeOrchestrationConstraints,
-    #[serde(default)]
-    surface: Option<String>,
-}
-
 pub(crate) struct GatewayToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GatewayToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
+    runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
 }
 
 impl GatewayToolExecutor {
@@ -82,6 +63,7 @@ impl GatewayToolExecutor {
             tool_registry,
             mcp_state,
             runtime_session_id: None,
+            runtime_execution_decision: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,13 +109,20 @@ impl GatewayToolExecutor {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
             let active_evolution = crate::current_active_evolution_capability_overlay();
+            let leased_decision = self
+                .runtime_execution_decision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             return serde_json::to_string_pretty(
-                &runtime::runtime_capabilities_response_with_detail_and_overlay(
+                &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
                     &input.intent,
                     input.surface.as_deref(),
                     input.profile.as_deref(),
                     input.detail.as_deref(),
                     &active_evolution,
+                    leased_decision.as_ref(),
+                    &self.available_tool_names(),
                 ),
             )
             .map_err(|error| ToolError::new(error.to_string()));
@@ -154,11 +143,17 @@ impl GatewayToolExecutor {
                     }
                 }
             }
-            if let Some(output) = self.try_execute_gateway_runtime_orchestration(&value)? {
-                return Ok(output);
-            }
+            let leased_decision = self
+                .runtime_execution_decision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             return serde_json::to_string_pretty(
-                &runtime::runtime_orchestration_response_with_host(value, Some(self)),
+                &runtime::runtime_orchestration_response_with_host_and_decision(
+                    value,
+                    Some(self),
+                    leased_decision.as_ref(),
+                ),
             )
             .map_err(|error| ToolError::new(error.to_string()));
         }
@@ -199,129 +194,20 @@ impl GatewayToolExecutor {
         }
     }
 
-    fn try_execute_gateway_runtime_orchestration(
-        &self,
-        value: &serde_json::Value,
-    ) -> Result<Option<String>, ToolError> {
-        let request: RuntimeOrchestrateGatewayRequest = match serde_json::from_value(value.clone())
-        {
-            Ok(request) => request,
-            Err(_) => return Ok(None),
-        };
-        match request.action {
-            runtime::RuntimeOrchestrationAction::RequestTeam => {
-                let Some(session_id) = request
-                    .session_id
-                    .as_deref()
-                    .filter(|session_id| !session_id.trim().is_empty())
-                else {
-                    return Ok(None);
-                };
-                ensure_gateway_mission_session(session_id, &request.intent)?;
-                let team = start_team_runtime_with_spawner(
-                    session_id,
-                    request.intent.clone(),
-                    None,
-                    MissionTeamExecutionMode::ProviderInProcess,
-                )
-                .map_err(ToolError::new)?;
-                let workgraph = runtime::TeamExecutionLoop::plan(&team.team_id)
-                    .ok()
-                    .map(|plan| {
-                        serde_json::json!({
-                            "workgraph_id": plan.workgraph.id,
-                            "ready_node_ids": plan.ready_node_ids,
-                            "blocked_node_ids": plan.blocked_node_ids,
-                            "quality": plan.workgraph_quality,
-                        })
-                    });
-                let action_selection =
-                    runtime::build_runtime_action_selection_report(&request.intent, None);
-                let selected_template = action_selection
-                    .recommended_template
-                    .map(|template| template.as_str().to_string());
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "type": "runtime_orchestration_result",
-                    "request_id": format!("runtime-orch-{}", uuid::Uuid::new_v4()),
-                    "status": "running",
-                    "decision": {
-                        "selected_pattern": action_selection.recommended_pattern,
-                        "selected_template": selected_template,
-                        "reason": request.reason.unwrap_or_else(|| action_selection.reason.clone()),
-                        "policy_gates": ["gateway_session_auto_bound", "mission_session_ensured", "team_spawner_provider_in_process"],
-                        "budget": {},
-                        "permission": {"mode": "workspace_write", "team_execution_mode": "provider_in_process"},
-                        "status": "accepted"
-                    },
-                    "execution": {
-                        "type": "team_runtime",
-                        "status": "running",
-                        "execution_fidelity": "gateway_mission_team_spawner",
-                        "team": team,
-                        "workgraph": workgraph,
-                        "mission": runtime::global_mission_runtime().projection(),
-                        "control_actions": ["inspect", "tick_ready", "synthesis", "handoff", "cancel", "pause"],
-                        "note": "Gateway-bound runtime_orchestrate used MissionService spawner semantics and starts provider-backed lifecycle agents for real team execution."
-                    },
-                    "evidence": {
-                        "type": "runtime_orchestration_evidence",
-                        "runtime_action": "use_team_template",
-                        "tool_action": "request_team",
-                        "runtime_owner": "runtime.orchestration",
-                        "gateway_adapter": "mission_team_spawner",
-                        "session_id": session_id,
-                    },
-                    "action_selection_report": action_selection,
-                    "next_model_guidance": "Inspect mission projection and tick/dispatch the team when the task should continue; use runtime_capabilities for read-only planning before additional stateful orchestration."
-                }))
-                .map(Some)
-                .map_err(|error| ToolError::new(error.to_string()))
-            }
-            runtime::RuntimeOrchestrationAction::RequestSessionLink => {
-                let Some(session_id) = request
-                    .session_id
-                    .as_deref()
-                    .filter(|session_id| !session_id.trim().is_empty())
-                else {
-                    return Ok(None);
-                };
-                ensure_gateway_mission_session(session_id, &request.intent)?;
-                let receipt =
-                    runtime::SessionExecutionPlane::bridge(runtime::CrossSessionMessage {
-                        from_session_id: session_id.to_string(),
-                        target_ref: request
-                            .template_hint
-                            .clone()
-                            .unwrap_or_else(|| format!("@{session_id}")),
-                        command: request.intent.clone(),
-                        actor: Some("runtime_orchestrate".to_string()),
-                        evidence_refs: request.evidence_refs.clone(),
-                    });
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "type": "runtime_orchestration_result",
-                    "request_id": format!("runtime-orch-{}", uuid::Uuid::new_v4()),
-                    "status": receipt.status,
-                    "execution": {
-                        "type": "session_link",
-                        "execution_fidelity": "gateway_session_bridge",
-                        "receipt": receipt,
-                        "mission": runtime::global_mission_runtime().projection(),
-                    },
-                    "evidence": {
-                        "type": "runtime_orchestration_evidence",
-                        "runtime_action": "dispatch_session",
-                        "tool_action": "request_session_link",
-                        "gateway_adapter": "session_execution_bridge",
-                        "session_id": session_id,
-                    },
-                    "action_selection_report": runtime::build_runtime_action_selection_report(&request.intent, None),
-                    "next_model_guidance": "Use the returned session command or route receipt as the traceable cross-session handoff."
-                }))
-                .map(Some)
-                .map_err(|error| ToolError::new(error.to_string()))
-            }
-            _ => Ok(None),
-        }
+    fn available_tool_names(&self) -> Vec<String> {
+        self.tool_registry
+            .definitions(self.allowed_tools.as_ref())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    }
+
+    fn tool_permission_mode(&self, tool_name: &str) -> Option<ToolPermissionMode> {
+        self.tool_registry
+            .permission_specs(self.allowed_tools.as_ref())
+            .ok()?
+            .into_iter()
+            .find_map(|(name, permission)| (name == tool_name).then_some(permission))
     }
 }
 
@@ -383,9 +269,47 @@ impl ToolExecutor for GatewayToolExecutor {
             }
         }
     }
+
+    fn has_registered_tools(&self) -> bool {
+        !self.available_tool_names().is_empty()
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        GatewayToolExecutor::available_tool_names(self)
+    }
+
+    fn classify_tool_safety(
+        &self,
+        tool_name: &str,
+        _input: &str,
+    ) -> Option<runtime::ToolSafetyCategory> {
+        self.tool_permission_mode(tool_name)
+            .map(|permission| match permission {
+                ToolPermissionMode::ReadOnly => runtime::ToolSafetyCategory::ReadOnly,
+                ToolPermissionMode::WorkspaceWrite => runtime::ToolSafetyCategory::WriteLocal,
+                ToolPermissionMode::DangerFullAccess
+                | ToolPermissionMode::Prompt
+                | ToolPermissionMode::Allow => runtime::ToolSafetyCategory::Destructive,
+            })
+    }
+
+    fn collaboration_runtime_available(&self) -> bool {
+        self.has_tool("runtime_orchestrate")
+    }
+
+    fn mission_runtime_available(&self) -> bool {
+        self.has_tool("runtime_orchestrate")
+    }
+
+    fn bind_execution_decision(&self, decision: runtime::RuntimeExecutionDecision) {
+        *self
+            .runtime_execution_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(decision);
+    }
 }
 
-impl runtime::RuntimeToolExecutionHost for GatewayToolExecutor {
+impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
     fn execute_runtime_tool(
         &self,
         request: &runtime::RuntimeToolExecutionRequest,
@@ -411,6 +335,49 @@ impl runtime::RuntimeToolExecutionHost for GatewayToolExecutor {
                 evidence_ref,
             },
         }
+    }
+
+    fn start_runtime_team(
+        &self,
+        request: &runtime::RuntimeOrchestrationRequest,
+        decision: &runtime::CollaborationDecision,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let result = (|| {
+            let session_id = request
+                .session_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "request_team requires session_id".to_string())?;
+            ensure_gateway_mission_session(session_id, &request.intent)
+                .map_err(|error| error.to_string())?;
+            let team = start_team_runtime_with_spawner_decision(
+                session_id,
+                request.intent.clone(),
+                None,
+                MissionTeamExecutionMode::ProviderInProcess,
+                decision.clone(),
+            )?;
+            let workgraph = runtime::TeamExecutionLoop::plan(&team.team_id)
+                .ok()
+                .map(|plan| {
+                    serde_json::json!({
+                        "workgraph_id": plan.workgraph.id,
+                        "ready_node_ids": plan.ready_node_ids,
+                        "blocked_node_ids": plan.blocked_node_ids,
+                        "quality": plan.workgraph_quality,
+                    })
+                });
+            Ok(serde_json::json!({
+                "type": "team_runtime",
+                "status": "running",
+                "execution_fidelity": "runtime_owned_gateway_adapter",
+                "team": team,
+                "workgraph": workgraph,
+                "mission": runtime::global_mission_runtime().projection(),
+                "control_actions": ["inspect", "tick_ready", "synthesis", "handoff", "cancel", "pause"],
+            }))
+        })();
+        Some(result)
     }
 }
 
@@ -450,7 +417,11 @@ mod tests {
         assert!(output.contains("runtime_capabilities"));
         assert!(output.contains("evidence_plan"));
         assert!(output.contains("tool_batch_readonly"));
-        assert!(output.contains("runtime_orchestrate"));
+        let response: serde_json::Value = serde_json::from_str(&output).expect("capability json");
+        assert_eq!(response["runtime_orchestrate"]["available"], false);
+        assert!(response["strategy"]["model_callable_tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")));
     }
 
     #[test]
@@ -485,7 +456,81 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tool_permission_metadata_drives_safety_classification() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "company_catalog_lookup".to_string(),
+                description: Some("read company catalog".to_string()),
+                input_schema: json!({"type":"object"}),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+
+        assert_eq!(
+            executor.classify_tool_safety("company_catalog_lookup", "{}"),
+            Some(runtime::ToolSafetyCategory::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn capabilities_and_orchestration_reuse_the_bound_turn_strategy_lease() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![
+                RuntimeToolDefinition {
+                    name: "runtime_capabilities".to_string(),
+                    description: Some("capability guidance".to_string()),
+                    input_schema: json!({"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}),
+                    required_permission: ToolPermissionMode::ReadOnly,
+                },
+                RuntimeToolDefinition {
+                    name: "runtime_orchestrate".to_string(),
+                    description: Some("runtime orchestration".to_string()),
+                    input_schema: json!({"type":"object","properties":{"intent":{"type":"string"},"action":{"type":"string"}},"required":["intent"]}),
+                    required_permission: ToolPermissionMode::WorkspaceWrite,
+                },
+            ])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let decision = runtime::build_runtime_execution_decision(
+            "并行调研 runtime gateway memory 的当前实现",
+            None,
+        );
+        let lease_id = decision.lease.lease_id.clone();
+        executor.bind_execution_decision(decision);
+
+        let capabilities: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute(
+                    "runtime_capabilities",
+                    r#"{"intent":"换一个描述也必须复用当前 turn 决策"}"#,
+                )
+                .expect("capabilities"),
+        )
+        .expect("capability json");
+        let orchestration: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute(
+                    "runtime_orchestrate",
+                    r#"{"intent":"换一个描述也必须复用当前 turn 决策","action":"plan_only"}"#,
+                )
+                .expect("orchestration"),
+        )
+        .expect("orchestration json");
+
+        assert_eq!(
+            capabilities["execution_decision"]["lease"]["lease_id"],
+            lease_id
+        );
+        assert_eq!(
+            orchestration["evidence"]["strategy_lease"]["lease_id"],
+            lease_id
+        );
+    }
+
+    #[test]
     fn runtime_orchestrate_auto_binds_gateway_session_for_team_requests() {
+        let _env_guard = crate::test_process_env_lock();
         let registry = GatewayToolRegistry::builtin()
             .with_runtime_tools(vec![RuntimeToolDefinition {
                 name: "runtime_orchestrate".to_string(),

@@ -16,7 +16,7 @@ use crate::collaboration_template::{CollaborationDecision, CollaborationTemplate
 use crate::context_runtime::ContextItem;
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
-use harness_contract::strategy::{decide_strategy, StrategyInput};
+use harness_contract::strategy::StrategyDecision;
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::fact_checker::{FactCheckResult, FactChecker};
@@ -385,20 +385,53 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     // ── dispatch_subtasks ──────────────────────────────────────────────────
 
-    /// Dispatch subtasks in dependency-resolved waves.
-    /// Tasks within each wave run sequentially.
+    /// Dispatch subtasks in dependency-resolved waves with the default limit.
     pub async fn dispatch_subtasks(
         &self,
         _team: &AgentTeam,
         subtasks: &[SubTask],
     ) -> Vec<SubAgentResult> {
+        self.dispatch_subtasks_in_waves(subtasks, 4).await
+    }
+
+    /// Dispatch dependency waves using the collaboration budget selected by
+    /// the leased strategy decision.
+    pub async fn dispatch_subtasks_with_strategy(
+        &self,
+        _team: &AgentTeam,
+        subtasks: &[SubTask],
+        strategy: &StrategyDecision,
+    ) -> Vec<SubAgentResult> {
+        let task_summary = subtasks
+            .iter()
+            .map(|subtask| subtask.description.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let collaboration_decision =
+            CollaborationTemplateMatcher::default().decide(&task_summary, strategy);
+        self.dispatch_subtasks_in_waves(
+            subtasks,
+            collaboration_decision
+                .plan
+                .budget_policy
+                .max_parallel_agents,
+        )
+        .await
+    }
+
+    async fn dispatch_subtasks_in_waves(
+        &self,
+        subtasks: &[SubTask],
+        max_parallel: usize,
+    ) -> Vec<SubAgentResult> {
         if subtasks.is_empty() {
             return Vec::new();
         }
 
+        let max_parallel = max_parallel.max(1);
         let mut orchestrator = WaveOrchestrator::new().with_config(
             WaveConfig::default()
-                .with_max_parallel(4)
+                .with_max_parallel(max_parallel)
                 .with_continue_on_failure(true),
         );
 
@@ -421,33 +454,65 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             return self.dispatch_sequential(subtasks).await;
         }
 
-        let mut all_results: Vec<SubAgentResult> = Vec::new();
+        let mut all_results = vec![None; subtasks.len()];
         let wave_count = orchestrator.wave_count();
 
         for wave_num in 1..=wave_count as u32 {
-            let tasks = match orchestrator.get_wave_tasks(wave_num) {
+            let mut tasks = match orchestrator.get_wave_tasks(wave_num) {
                 Some(t) => t,
                 None => continue,
             };
 
-            for task in tasks {
-                let desc = task.description.clone().unwrap_or_default();
-                let config = SubAgentConfig {
-                    task_description: task.name.clone(),
-                    ..SubAgentConfig::default()
-                };
-                match self.executor.execute(config, &desc).await {
-                    Ok(result) => all_results.push(result),
-                    Err(e) => all_results.push(SubAgentResult {
-                        output: format!("dispatch error: {e}"),
-                        completed_normally: false,
-                        ..SubAgentResult::default()
-                    }),
+            tasks.sort_by_key(|task| {
+                subtasks
+                    .iter()
+                    .position(|subtask| subtask.id == task.id.0)
+                    .unwrap_or(usize::MAX)
+            });
+
+            for chunk in tasks.chunks(max_parallel) {
+                let executions = chunk.iter().filter_map(|task| {
+                    let index = subtasks
+                        .iter()
+                        .position(|subtask| subtask.id == task.id.0)?;
+                    let description = task
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| task.name.clone());
+                    let config = SubAgentConfig {
+                        task_description: description.clone(),
+                        ..SubAgentConfig::default()
+                    };
+                    Some(async move {
+                        let result = match self.executor.execute(config, &description).await {
+                            Ok(result) => result,
+                            Err(error) => SubAgentResult {
+                                output: format!("dispatch error: {error}"),
+                                completed_normally: false,
+                                ..SubAgentResult::default()
+                            },
+                        };
+                        (index, result)
+                    })
+                });
+
+                for (index, result) in futures::future::join_all(executions).await {
+                    all_results[index] = Some(result);
                 }
             }
         }
 
         all_results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.unwrap_or_else(|| SubAgentResult {
+                    output: format!("dispatch error: no wave result for {}", subtasks[index].id),
+                    completed_normally: false,
+                    ..SubAgentResult::default()
+                })
+            })
+            .collect()
     }
 
     /// Sequential fallback when wave building fails.
@@ -678,21 +743,21 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     /// End-to-end collaboration loop: decompose, assemble, dispatch,
     /// synthesize, finalize.
     pub async fn run(&self, task: &str, required_capabilities: &[String]) -> Option<String> {
-        self.run_with_context(task, required_capabilities)
+        let decision = crate::execution_core::StrategyDecisionEngine.decide(task, None);
+        self.run_with_context_and_strategy(task, required_capabilities, &decision.strategy)
             .await
             .map(|result| result.synthesis)
     }
 
-    pub async fn run_with_context(
+    pub async fn run_with_context_and_strategy(
         &self,
         task: &str,
         required_capabilities: &[String],
+        strategy: &StrategyDecision,
     ) -> Option<CollaborationContextResult> {
         // 1. Decompose
-        let subtasks = self.decompose_sequential(task);
-        let strategy = decide_strategy(&StrategyInput::from_prompt(task));
-        let collaboration_decision =
-            CollaborationTemplateMatcher::default().decide(task, &strategy);
+        let subtasks = self.decompose_task(task);
+        let collaboration_decision = CollaborationTemplateMatcher::default().decide(task, strategy);
 
         // 2. Assemble team
         let collab_task = CollaborationTask {
@@ -705,7 +770,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         let team = self.assemble_team(&collab_task)?;
 
         // 3. Dispatch
-        let results = self.dispatch_subtasks(&team, &subtasks).await;
+        let results = self
+            .dispatch_subtasks_with_strategy(&team, &subtasks, strategy)
+            .await;
 
         // 4. Synthesize
         let synthesis = self.synthesize(&results);
@@ -1187,10 +1254,17 @@ pub trait CollaborationOps: Send + Sync {
         task: &'a str,
         capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
+    #[cfg(test)]
     fn run_with_context_boxed<'a>(
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
+    fn run_with_strategy_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        capabilities: &'a [String],
+        strategy: &'a StrategyDecision,
     ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
     fn decompose_task(&self, task: &str) -> Vec<SubTask>;
     fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
@@ -1204,12 +1278,25 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
     ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
         Box::pin(self.run(task, capabilities))
     }
+    #[cfg(test)]
     fn run_with_context_boxed<'a>(
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
-        Box::pin(self.run_with_context(task, capabilities))
+        Box::pin(async move {
+            let decision = crate::execution_core::StrategyDecisionEngine.decide(task, None);
+            self.run_with_context_and_strategy(task, capabilities, &decision.strategy)
+                .await
+        })
+    }
+    fn run_with_strategy_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        capabilities: &'a [String],
+        strategy: &'a StrategyDecision,
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+        Box::pin(self.run_with_context_and_strategy(task, capabilities, strategy))
     }
     fn decompose_task(&self, task: &str) -> Vec<SubTask> {
         self.decompose_task(task)
@@ -1223,6 +1310,10 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use super::*;
     use memory::agent_directory::AgentStatus;
 
@@ -1241,6 +1332,60 @@ mod tests {
             async move {
                 Ok(SubAgentResult {
                     output: format!("dummy output for: {task}"),
+                    completed_normally: true,
+                    ..SubAgentResult::default()
+                })
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingState {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        events: Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
+    struct TrackingExecutor {
+        state: Arc<TrackingState>,
+    }
+
+    impl SubAgentExecutor for TrackingExecutor {
+        fn execute(
+            &self,
+            _config: SubAgentConfig,
+            task: &str,
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>>
+        {
+            let state = Arc::clone(&self.state);
+            let task = task.to_string();
+            async move {
+                state
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("start:{task}"));
+                let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+                state.peak.fetch_max(active, Ordering::SeqCst);
+
+                let delay_ms = if task.contains("slow") {
+                    60
+                } else if task.contains("medium") {
+                    35
+                } else {
+                    10
+                };
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                state.active.fetch_sub(1, Ordering::SeqCst);
+                state
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("end:{task}"));
+                Ok(SubAgentResult {
+                    output: task,
                     completed_normally: true,
                     ..SubAgentResult::default()
                 })
@@ -1328,6 +1473,103 @@ mod tests {
         let results = orch.dispatch_subtasks(&team, &subtasks).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].completed_normally);
+    }
+
+    #[tokio::test]
+    async fn strategy_dispatch_runs_independent_tasks_concurrently_and_merges_stably() {
+        let executor = Arc::new(TrackingExecutor::default());
+        let state = Arc::clone(&executor.state);
+        let orch = CollaborationOrchestrator::new(executor);
+        let team = AgentTeam {
+            leader: dummy_agent_info("lead", vec![]),
+            workers: vec![],
+        };
+        let subtasks = vec![
+            subtask("a", "research slow source", &[]),
+            subtask("b", "research fast source", &[]),
+            subtask("c", "research medium source", &[]),
+        ];
+        let leased = crate::execution_core::StrategyDecisionEngine
+            .decide("research and compare sources in parallel", None);
+
+        let results = orch
+            .dispatch_subtasks_with_strategy(&team, &subtasks, &leased.strategy)
+            .await;
+
+        assert!(
+            state.peak.load(Ordering::SeqCst) > 1,
+            "independent tasks in one wave must overlap"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.output.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "research slow source",
+                "research fast source",
+                "research medium source"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_dispatch_respects_dependency_waves_and_original_result_order() {
+        let executor = Arc::new(TrackingExecutor::default());
+        let state = Arc::clone(&executor.state);
+        let orch = CollaborationOrchestrator::new(executor);
+        let team = AgentTeam {
+            leader: dummy_agent_info("lead", vec![]),
+            workers: vec![],
+        };
+        let subtasks = vec![
+            subtask("final", "research final synthesis", &["child-a", "child-b"]),
+            subtask("root", "research slow root", &[]),
+            subtask("peer", "research fast peer", &[]),
+            subtask("child-a", "research child a", &["root"]),
+            subtask("child-b", "research child b", &["peer"]),
+        ];
+        let leased = crate::execution_core::StrategyDecisionEngine
+            .decide("research and compare sources in parallel", None);
+
+        let results = orch
+            .dispatch_subtasks_with_strategy(&team, &subtasks, &leased.strategy)
+            .await;
+        let events = state
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert!(
+            event_position(&events, "end:research slow root")
+                < event_position(&events, "start:research child a")
+        );
+        assert!(
+            event_position(&events, "end:research fast peer")
+                < event_position(&events, "start:research child b")
+        );
+        assert!(
+            event_position(&events, "end:research child a")
+                < event_position(&events, "start:research final synthesis")
+        );
+        assert!(
+            event_position(&events, "end:research child b")
+                < event_position(&events, "start:research final synthesis")
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.output.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "research final synthesis",
+                "research slow root",
+                "research fast peer",
+                "research child a",
+                "research child b"
+            ]
+        );
     }
 
     #[test]
@@ -1628,20 +1870,28 @@ Memory: lightweight spike has a live-memory pulse candidate"
     }
 
     #[tokio::test]
-    async fn run_with_context_attaches_collaboration_template_decision() {
+    async fn leased_strategy_run_attaches_template_without_artificial_dependencies() {
         AgentDirectory::global().register(dummy_agent_info(
             "template-contract-worker",
             vec!["rust".to_string(), "testing".to_string()],
         ));
         let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let task = "implement a runtime refactor then compile and test";
+        let leased = crate::execution_core::StrategyDecisionEngine.decide(task, None);
 
         let result = orch
-            .run_with_context(
-                "implement a runtime refactor then compile and test",
+            .run_with_context_and_strategy(
+                task,
                 &["rust".to_string(), "testing".to_string()],
+                &leased.strategy,
             )
             .await
             .expect("collaboration result");
+        assert!(result
+            .collaboration_task
+            .subtasks
+            .iter()
+            .all(|subtask| subtask.depends_on.is_empty()));
         let decision = result
             .collaboration_task
             .collaboration_decision
@@ -1653,6 +1903,26 @@ Memory: lightweight spike has a live-memory pulse candidate"
         );
         assert!(decision.plan.review_contract.contains("mandatory"));
         assert!(decision.plan.budget_policy.max_parallel_agents >= 2);
+        AgentDirectory::global().unregister("template-contract-worker");
+    }
+
+    fn subtask(id: &str, description: &str, dependencies: &[&str]) -> SubTask {
+        SubTask {
+            id: id.to_string(),
+            description: description.to_string(),
+            required_capabilities: vec!["research".to_string()],
+            depends_on: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_string())
+                .collect(),
+        }
+    }
+
+    fn event_position(events: &[String], expected: &str) -> usize {
+        events
+            .iter()
+            .position(|event| event == expected)
+            .unwrap_or_else(|| panic!("missing event {expected}: {events:?}"))
     }
 
     fn dummy_agent_info(id: &str, capabilities: Vec<String>) -> AgentInfo {
