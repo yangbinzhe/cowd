@@ -117,6 +117,8 @@ struct GetEventsParams {
     from_seq: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_payload: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -929,6 +931,7 @@ async fn get_session_events(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(500);
+    let include_payload = params.include_payload.unwrap_or(false);
     let Some((total, stored_events)) = state
         .services
         .session
@@ -955,6 +958,8 @@ async fn get_session_events(
         .map(|event| {
             let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+            let payload =
+                session_event_payload_for_response(&event.event_type, payload, include_payload);
             serde_json::json!({
                 "session_id": event.session_id,
                 "type": event.event_type,
@@ -973,7 +978,107 @@ async fn get_session_events(
         "from_seq": from_seq,
         "limit": limit,
         "has_more": has_more,
+        "include_payload": include_payload,
     })))
+}
+
+fn session_event_payload_for_response(
+    event_type: &str,
+    payload: serde_json::Value,
+    include_payload: bool,
+) -> serde_json::Value {
+    if include_payload {
+        return payload;
+    }
+    if event_type == "ContextEnvelope" {
+        return slim_context_envelope_payload(&payload);
+    }
+    if event_type == "ContextTurnReport" {
+        return slim_context_turn_report_payload(&payload);
+    }
+
+    let serialized = payload.to_string();
+    if serialized.chars().count() <= 4_000 {
+        return payload;
+    }
+
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String(event_type.to_string())),
+        "kind": payload.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "status": payload.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "summary": payload.get("summary").cloned().or_else(|| payload.get("message").cloned()).unwrap_or(serde_json::Value::Null),
+        "run_id": payload.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "turn_id": payload.get("turn_id").cloned().unwrap_or(serde_json::Value::Null),
+        "payload_truncated": true,
+        "payload_size_chars": serialized.chars().count(),
+        "payload_preview": take_chars(&serialized, 1_200),
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full event evidence",
+    })
+}
+
+fn slim_context_envelope_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let envelope = payload.get("envelope").unwrap_or(payload);
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String("ContextEnvelope".to_string())),
+        "envelope_id": payload
+            .get("envelope_id")
+            .cloned()
+            .or_else(|| envelope.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "session_id": payload
+            .get("session_id")
+            .cloned()
+            .or_else(|| envelope.pointer("/identity/session_id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "agent_id": payload
+            .get("agent_id")
+            .cloned()
+            .or_else(|| envelope.pointer("/identity/agent_id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "profile": payload
+            .get("profile")
+            .cloned()
+            .or_else(|| envelope.get("profile").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "budget": payload
+            .get("budget")
+            .cloned()
+            .or_else(|| envelope.get("budget").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "diagnostics": payload
+            .get("diagnostics")
+            .cloned()
+            .or_else(|| envelope.get("diagnostics").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "selected_count": envelope.get("selected").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        "omitted_count": envelope.get("omitted").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        "payload_truncated": true,
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full ContextEnvelope evidence",
+    })
+}
+
+fn slim_context_turn_report_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let report = payload.get("context_turn_report").unwrap_or(payload);
+    let knowledge = report.get("knowledge").unwrap_or(&serde_json::Value::Null);
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String("ContextTurnReport".to_string())),
+        "report_id": report.get("report_id").cloned().unwrap_or(serde_json::Value::Null),
+        "session_id": report.get("session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "turn_id": report.get("turn_id").cloned().unwrap_or(serde_json::Value::Null),
+        "input_token_estimate": report.get("input_token_estimate").cloned().unwrap_or(serde_json::Value::Null),
+        "governance_decision": report.get("governance_decision").cloned().unwrap_or(serde_json::Value::Null),
+        "knowledge": {
+            "activation_plan_id": knowledge.get("activation_plan_id").cloned().unwrap_or(serde_json::Value::Null),
+            "active_pack_count": knowledge.get("active_pack_ids").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+            "blocked_namespace_count": knowledge.get("blocked_namespaces").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        },
+        "payload_truncated": true,
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full ContextTurnReport evidence",
+    })
+}
+
+fn take_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {

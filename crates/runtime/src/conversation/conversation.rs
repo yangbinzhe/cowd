@@ -2303,6 +2303,9 @@ where
         let mut iterations = 0;
         let mut adaptive_controller = crate::self_regulation::AdaptiveController::new();
         let mut self_regulation_final_answer_deadline: Option<usize> = None;
+        let explicit_tool_round_budget =
+            crate::turn_supervisor::explicit_tool_round_budget(&user_input);
+        let mut accepted_tool_rounds = 0usize;
 
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
@@ -2675,6 +2678,82 @@ where
                 }
             }
 
+            if !pending_tool_uses.is_empty()
+                && explicit_tool_round_budget
+                    .is_some_and(|max_rounds| max_rounds > 0 && accepted_tool_rounds >= max_rounds)
+            {
+                let max_rounds = explicit_tool_round_budget.unwrap_or_default();
+                let reason =
+                    format!("user-requested tool round budget exhausted max_rounds={max_rounds}");
+                tracing::warn!(
+                    iterations,
+                    accepted_tool_rounds,
+                    tool_count = pending_tool_uses.len(),
+                    "runtime self-regulation blocked new tool batch after explicit user budget"
+                );
+                let partial_text = adaptive_controller.partial_answer_text(&reason);
+                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: partial_text.clone(),
+                }]);
+                self.session
+                    .write()
+                    .await
+                    .push_message(partial_msg.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(
+                    &partial_msg,
+                    self.session().messages.len().wrapping_sub(1),
+                );
+                if let Some(ref cowd) = self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
+                        message: format!(
+                            "tool governance blocked explicit-budget tool batch: {}; {}",
+                            reason,
+                            adaptive_controller.tool_ledger().compact_summary()
+                        ),
+                    });
+                }
+                assistant_messages.push(partial_msg);
+                break;
+            }
+
+            if !pending_tool_uses.is_empty()
+                && self_regulation_final_answer_deadline
+                    .is_some_and(|deadline| iterations >= deadline)
+            {
+                let reason =
+                    "runtime self-regulation blocked a new tool batch after fallback guidance was ignored";
+                tracing::warn!(
+                    iterations,
+                    tool_count = pending_tool_uses.len(),
+                    "runtime self-regulation blocked new tool batch"
+                );
+                let partial_text = adaptive_controller.partial_answer_text(reason);
+                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: partial_text.clone(),
+                }]);
+                self.session
+                    .write()
+                    .await
+                    .push_message(partial_msg.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(
+                    &partial_msg,
+                    self.session().messages.len().wrapping_sub(1),
+                );
+                if let Some(ref cowd) = self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
+                        message: format!(
+                            "tool governance blocked new tool batch: {}; {}",
+                            reason,
+                            adaptive_controller.tool_ledger().compact_summary()
+                        ),
+                    });
+                }
+                assistant_messages.push(partial_msg);
+                break;
+            }
+
             // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
             if !thinking_text.is_empty() {
@@ -2727,6 +2806,8 @@ where
             }
 
             // Phase 2: Parallel+serial tool dispatch based on safety categories
+            accepted_tool_rounds = accepted_tool_rounds.saturating_add(1);
+            let accepted_tool_round = accepted_tool_rounds;
             let mut callback_inject = None;
             {
                 use crate::execution_scheduler::schedule_tool_requests;
@@ -2871,6 +2952,22 @@ where
                 TurnInputCheckpoint::AfterToolResult,
                 &mut effective_system_prompt,
             );
+            if explicit_tool_round_budget
+                .is_some_and(|max_rounds| max_rounds > 0 && accepted_tool_round >= max_rounds)
+                && self_regulation_final_answer_deadline.is_none()
+            {
+                let max_rounds = explicit_tool_round_budget.unwrap_or_default();
+                self_regulation_final_answer_deadline = Some(iterations.saturating_add(1));
+                effective_system_prompt.push(format!(
+                    "\n## Runtime self-regulation guidance\nThe user explicitly limited tool usage to {max_rounds} tool round(s). You have reached that budget. Do not request more tools; synthesize the final answer from the checked evidence now, and list uncertainty instead of probing further."
+                ));
+                self.record_context_event(
+                    "self_regulation",
+                    "runtime",
+                    &format!("explicit_tool_round_budget_reached:{max_rounds}"),
+                    8,
+                );
+            }
             if let Some(inject) = callback_inject {
                 let inject_text = inject.clone();
                 self.session

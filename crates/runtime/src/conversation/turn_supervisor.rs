@@ -279,7 +279,7 @@ impl TurnSupervisor {
         novel_output: bool,
         is_error: bool,
     ) -> SupervisorDecision {
-        if self.total_observations >= 36 && self.injected_decisions >= 2 {
+        if self.total_observations >= 16 && self.injected_decisions >= 1 {
             return SupervisorDecision::FallbackAnswer {
                 reason: "many tool calls after repeated replanning guidance".to_string(),
                 prompt: fallback_prompt(),
@@ -290,6 +290,17 @@ impl TurnSupervisor {
         }
 
         if target_count >= 8 || exact_count >= 5 {
+            if self.injected_decisions >= 1 {
+                return SupervisorDecision::FallbackAnswer {
+                    reason: format!(
+                        "repeated evidence target continued after guidance target_count={target_count} exact_count={exact_count}"
+                    ),
+                    prompt: fallback_prompt(),
+                    reason_code: "repeated_evidence_target_after_guidance".to_string(),
+                    recommended_mode: ExecutionMode::DirectAnswer,
+                    recommended_action: "answer_with_checked_evidence".to_string(),
+                };
+            }
             return SupervisorDecision::Replan {
                 reason: format!(
                     "repeated evidence target detected target_count={target_count} exact_count={exact_count}"
@@ -318,6 +329,17 @@ impl TurnSupervisor {
         }
 
         if (target_count >= 4 || exact_count >= 3) && !novel_output {
+            if self.injected_decisions >= 1 {
+                return SupervisorDecision::FallbackAnswer {
+                    reason: format!(
+                        "low-novelty repeated tool usage continued after guidance target_count={target_count} exact_count={exact_count}"
+                    ),
+                    prompt: fallback_prompt(),
+                    reason_code: "low_novelty_tool_loop_after_guidance".to_string(),
+                    recommended_mode: ExecutionMode::DirectAnswer,
+                    recommended_action: "answer_with_checked_evidence".to_string(),
+                };
+            }
             return SupervisorDecision::Nudge {
                 reason: format!(
                     "low-novelty repeated tool usage target_count={target_count} exact_count={exact_count}"
@@ -337,6 +359,46 @@ impl Default for TurnSupervisor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[must_use]
+pub fn explicit_tool_round_budget(input: &str) -> Option<usize> {
+    let lower = input.to_lowercase();
+    let has_tool_scope = lower.contains("tool") || input.contains("工具");
+    let has_budget_marker = input.contains("最多")
+        || input.contains("不超过")
+        || input.contains("不要超过")
+        || lower.contains("at most")
+        || lower.contains("no more than")
+        || lower.contains("maximum")
+        || lower.contains("max ");
+    if !has_tool_scope || !has_budget_marker {
+        return None;
+    }
+
+    for (marker, value) in [
+        ("一", 1),
+        ("1", 1),
+        ("one", 1),
+        ("两", 2),
+        ("二", 2),
+        ("2", 2),
+        ("two", 2),
+        ("三", 3),
+        ("3", 3),
+        ("three", 3),
+        ("四", 4),
+        ("4", 4),
+        ("four", 4),
+        ("五", 5),
+        ("5", 5),
+        ("five", 5),
+    ] {
+        if lower.contains(marker) || input.contains(marker) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[must_use]
@@ -459,7 +521,11 @@ mod tests {
         }
 
         assert!(decisions.contains(&"nudge"));
-        assert!(decisions.contains(&"replan"));
+        assert!(decisions.contains(&"fallback_answer"));
+        assert!(!decisions
+            .iter()
+            .skip(4)
+            .any(|decision| decision == &"replan"));
     }
 
     #[test]
@@ -513,5 +579,21 @@ mod tests {
         assert!(partial.contains("partial answer"));
         assert!(partial.contains("duplicates="));
         assert!(partial.contains("grep_search"));
+    }
+
+    #[test]
+    fn explicit_tool_round_budget_recognizes_user_constraints() {
+        assert_eq!(
+            explicit_tool_round_budget("最多两轮工具调用，然后直接回答。"),
+            Some(2)
+        );
+        assert_eq!(
+            explicit_tool_round_budget("Use at most two tool rounds before answering."),
+            Some(2)
+        );
+        assert_eq!(
+            explicit_tool_round_budget("请尽可能少用工具，但没有硬限制。"),
+            None
+        );
     }
 }
