@@ -3,7 +3,7 @@
 //! When a tool output exceeds a configurable token threshold, the output is
 //! split into chunks and indexed in an in-memory SQLite FTS5 table. A compact
 //! summary replaces the raw output in the conversation context, and the model
-//! can later retrieve specific chunks via `/sandbox-search`.
+//! can later retrieve specific chunks through the runtime `evidence_retrieve` tool.
 //!
 //! Inspired by context-mode's "batch→index→search→inject" pipeline.
 
@@ -79,7 +79,7 @@ impl ToolOutputSandbox {
         threshold_min_lines: usize,
     ) -> Option<ToolOutputSummary> {
         let lines: Vec<&str> = output.lines().collect();
-        if lines.len() < threshold_min_lines {
+        if lines.len() < threshold_min_lines && output.chars().count() < 16_000 {
             return None;
         }
 
@@ -89,14 +89,30 @@ impl ToolOutputSandbox {
         // Chunk by 50 lines and insert into FTS5.
         let chunk_size = 50;
         if let Ok(tx) = self.conn.transaction() {
-            for chunk_start in (0..total_lines).step_by(chunk_size) {
-                let chunk_end = (chunk_start + chunk_size).min(total_lines);
-                let chunk_content: String = lines[chunk_start..chunk_end].join("\n");
-                let line_range = format!("L{}-L{}", chunk_start + 1, chunk_end);
-                let _ = tx.execute(
-                    "INSERT INTO tool_output_fts(call_id, line_range, content) VALUES (?1, ?2, ?3)",
-                    params![tool_call_id, line_range, chunk_content],
-                );
+            if total_lines < threshold_min_lines {
+                let chars = output.chars().collect::<Vec<_>>();
+                for (chunk_index, chunk) in chars.chunks(8_000).enumerate() {
+                    let chunk_content = chunk.iter().collect::<String>();
+                    let line_range = format!(
+                        "C{}-C{}",
+                        chunk_index * 8_000,
+                        (chunk_index * 8_000) + chunk.len()
+                    );
+                    let _ = tx.execute(
+                        "INSERT INTO tool_output_fts(call_id, line_range, content) VALUES (?1, ?2, ?3)",
+                        params![tool_call_id, line_range, chunk_content],
+                    );
+                }
+            } else {
+                for chunk_start in (0..total_lines).step_by(chunk_size) {
+                    let chunk_end = (chunk_start + chunk_size).min(total_lines);
+                    let chunk_content: String = lines[chunk_start..chunk_end].join("\n");
+                    let line_range = format!("L{}-L{}", chunk_start + 1, chunk_end);
+                    let _ = tx.execute(
+                        "INSERT INTO tool_output_fts(call_id, line_range, content) VALUES (?1, ?2, ?3)",
+                        params![tool_call_id, line_range, chunk_content],
+                    );
+                }
             }
             let _ = tx.commit();
         }
@@ -116,7 +132,7 @@ impl ToolOutputSandbox {
             keyword_highlights: keywords,
             search_hint: format!(
                 "Output indexed ({} lines, {} bytes). \
-                 Use /sandbox-search {} <query> to locate specific content.",
+                 Use evidence_retrieve with evidence_ref tool://{} and a focused query.",
                 total_lines, full_size_bytes, tool_call_id
             ),
         })
@@ -139,10 +155,7 @@ impl ToolOutputSandbox {
         let rows = stmt.query_map(params![tool_call_id, query, limit as i64], |row| {
             let line_range: String = row.get(0)?;
             let content: String = row.get(1)?;
-            // Parse "L{start}-L{end}" format.
-            let parts: Vec<&str> = line_range.trim_start_matches('L').split("-L").collect();
-            let start: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let end: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(start);
+            let (start, end) = parse_range(&line_range);
             Ok(SearchSnippet {
                 line_start: start,
                 line_end: end,
@@ -154,6 +167,29 @@ impl ToolOutputSandbox {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
             Err(_) => vec![],
         }
+    }
+
+    /// Read the first indexed chunks for an evidence reference without an FTS query.
+    #[must_use]
+    pub fn read(&self, tool_call_id: &str, limit: usize) -> Vec<SearchSnippet> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT line_range, content FROM tool_output_fts WHERE call_id = ?1 ORDER BY rowid LIMIT ?2",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![tool_call_id, limit as i64], |row| {
+            let range: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let (line_start, line_end) = parse_range(&range);
+            Ok(SearchSnippet {
+                line_start,
+                line_end,
+                content,
+            })
+        });
+        rows.map(|mapped| mapped.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     /// Search across ALL indexed tool outputs (not restricted to a specific call_id).
@@ -170,9 +206,7 @@ impl ToolOutputSandbox {
         let rows = stmt.query_map(params![query, limit as i64], |row| {
             let line_range: String = row.get(0)?;
             let content: String = row.get(1)?;
-            let parts: Vec<&str> = line_range.trim_start_matches('L').split("-L").collect();
-            let start: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let end: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(start);
+            let (start, end) = parse_range(&line_range);
             Ok(SearchSnippet {
                 line_start: start,
                 line_end: end,
@@ -227,6 +261,24 @@ impl ToolOutputSandbox {
             );
         }
     }
+}
+
+fn parse_range(range: &str) -> (usize, usize) {
+    let normalized = range
+        .trim_start_matches('L')
+        .trim_start_matches('C')
+        .replace("-L", "-")
+        .replace("-C", "-");
+    let mut parts = normalized.split('-');
+    let start = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let end = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(start);
+    (start, end)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -309,6 +361,16 @@ mod tests {
         let sandbox = ToolOutputSandbox::new().unwrap();
         let results = sandbox.search("nonexistent", "error", 5);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn large_single_line_json_is_indexed_and_readable() {
+        let mut sandbox = ToolOutputSandbox::new().unwrap();
+        let output = format!(r#"{{"records":["{}"]}}"#, "important-value,".repeat(2_000));
+        let summary = sandbox.index_tool_output("evidence-json", "query", &output, 100);
+        assert!(summary.is_some());
+        assert!(!sandbox.read("evidence-json", 1).is_empty());
+        assert!(!sandbox.search("evidence-json", "important", 1).is_empty());
     }
 
     #[test]

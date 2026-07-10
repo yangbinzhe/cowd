@@ -395,15 +395,10 @@ impl Default for VectorConfig {
 pub struct MicroCompactConfig {
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
-    #[serde(default = "default_tool_result_max_chars")]
-    pub tool_result_max_chars: u32,
     #[serde(default = "default_decay_factor")]
     pub time_decay_factor: f32,
 }
 
-fn default_tool_result_max_chars() -> u32 {
-    4000
-}
 fn default_decay_factor() -> f32 {
     0.9
 }
@@ -413,7 +408,6 @@ impl Default for MicroCompactConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            tool_result_max_chars: 4000,
             time_decay_factor: 0.9,
         }
     }
@@ -2057,12 +2051,6 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         MicroCompactConfig {
             enabled: optional_bool_dual(m, "enabled", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().enabled),
-            tool_result_max_chars: optional_u32_dual(
-                m,
-                "tool_result_max_chars",
-                "merged settings.compression.micro",
-            )?
-            .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
             time_decay_factor: optional_f32_dual(
                 m,
                 "time_decay_factor",
@@ -4276,7 +4264,6 @@ gateway:
             r#"{
                 "compression": {
                     "micro": {
-                        "tool_result_max_chars": 8000,
                         "time_decay_factor": 1
                     },
                     "session": {
@@ -4301,7 +4288,6 @@ gateway:
         assert_eq!(compression.session.threshold_tokens, 0);
         assert_eq!(compression.session.threshold_ratio_bp, 6500);
         assert_eq!(compression.session.preserve_recent, 12);
-        assert_eq!(compression.micro.tool_result_max_chars, 8000);
         assert!((compression.micro.time_decay_factor - 1.0).abs() < f32::EPSILON);
         assert!(!compression.deep.iterative_update);
         assert_eq!(compression.circuit_breaker.max_retries, 5);

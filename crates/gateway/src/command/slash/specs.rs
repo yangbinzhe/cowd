@@ -1756,9 +1756,6 @@ pub enum SlashCommand {
     Closet {
         topic: Option<String>,
     },
-    SandboxSearch {
-        query: Option<String>,
-    },
     Retry,
     Undo,
     NewSession,

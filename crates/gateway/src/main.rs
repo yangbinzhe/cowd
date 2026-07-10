@@ -2543,7 +2543,6 @@ fn run_resume_command(
         | SlashCommand::SubAgent { .. }
         | SlashCommand::Pipeline { .. }
         | SlashCommand::Closet { .. }
-        | SlashCommand::SandboxSearch { .. }
         | SlashCommand::Retry
         | SlashCommand::Undo
         | SlashCommand::NewSession

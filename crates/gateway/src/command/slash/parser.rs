@@ -83,7 +83,6 @@ impl SlashCommand {
             Self::Export { .. } => "/export",
             Self::Handoff { .. } => "/handoff",
             Self::Closet { .. } => "/closet",
-            Self::SandboxSearch { .. } => "/sandbox-search",
             Self::Retry => "/retry",
             Self::Undo => "/undo",
             Self::NewSession => "/new",
@@ -329,9 +328,6 @@ pub fn validate_slash_command_input(
         }
         "closet" | "rooms" | "memory-rooms" => SlashCommand::Closet {
             topic: args.first().map(|s| s.to_string()),
-        },
-        "sandbox-search" => SlashCommand::SandboxSearch {
-            query: args.first().map(|s| s.to_string()),
         },
         "retry" => SlashCommand::Retry,
         "undo" => SlashCommand::Undo,

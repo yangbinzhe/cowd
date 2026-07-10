@@ -115,12 +115,12 @@ impl RuntimeBudgetPlan {
             .saturating_sub(reserved_response);
 
         let profile_multiplier = profile_multiplier(inputs.profile);
-        let tool_total = ((effective_context_budget as f64 * 0.08) as usize).clamp(16_000, 120_000);
-        let tool_single = ((tool_total as f64 * 0.24) as usize).clamp(4_000, 32_000);
+        let tool_total = scaled_budget(effective_context_budget, 0.08, 256, 120_000) as usize;
+        let tool_single =
+            scaled_budget(tool_total as u64, 0.24, 128, 32_000).min(tool_total as u64) as usize;
         let subagent_default_budget =
-            ((effective_context_budget as f64 * profile_multiplier) as u64).clamp(16_000, 160_000);
-        let team_total_budget =
-            ((effective_context_budget as f64 * 0.35) as u64).clamp(32_000, 320_000);
+            scaled_budget(effective_context_budget, profile_multiplier, 512, 160_000);
+        let team_total_budget = scaled_budget(effective_context_budget, 0.35, 1_024, 320_000);
 
         let memory_retrieval_budget = ((memory_available as f64 * 0.45) as u64).max(1);
         let selected_item_limit = ((memory_retrieval_budget / 600) as usize).clamp(12, 80);
@@ -164,11 +164,26 @@ impl RuntimeBudgetPlan {
             subagent_default_budget,
             team_total_budget,
             runtime_control_budget: RuntimeControlBudgetLease {
-                yolo_budget_tokens: (effective_context_budget / 10).clamp(12_000, 96_000),
-                collaboration_budget_tokens: (effective_context_budget / 12).clamp(10_000, 80_000),
-                review_budget_tokens: (effective_context_budget / 16).clamp(9_000, 64_000),
+                yolo_budget_tokens: scaled_budget(effective_context_budget, 0.10, 256, 96_000),
+                collaboration_budget_tokens: scaled_budget(
+                    effective_context_budget,
+                    1.0 / 12.0,
+                    256,
+                    80_000,
+                ),
+                review_budget_tokens: scaled_budget(
+                    effective_context_budget,
+                    1.0 / 16.0,
+                    256,
+                    64_000,
+                ),
             },
-            projection_budget_hint: (effective_context_budget / 64).clamp(8_000, 32_000),
+            projection_budget_hint: scaled_budget(
+                effective_context_budget,
+                1.0 / 64.0,
+                128,
+                32_000,
+            ),
         }
     }
 }
@@ -216,6 +231,12 @@ fn profile_multiplier(profile: ContextProfile) -> f64 {
     }
 }
 
+fn scaled_budget(total: u64, ratio: f64, floor: u64, ceiling: u64) -> u64 {
+    let upper = ceiling.min(total).max(1);
+    let lower = floor.min(upper);
+    ((total as f64 * ratio) as u64).clamp(lower, upper)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +271,8 @@ mod tests {
 
         assert_eq!(plan.model_context_window, 8_000);
         assert_eq!(plan.effective_context_budget, 5_600);
+        assert!(plan.tool_result_budget.max_total_tokens < 5_600);
+        assert!(plan.subagent_default_budget <= 5_600);
+        assert!(plan.team_total_budget <= 5_600);
     }
 }

@@ -1,7 +1,10 @@
 // M5: ProviderPool — multi-API-key rotation with history preservation.
 // Derived from GenericAgent's next_llm() + hermes-agent's adapter pattern.
 
-use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
+use crate::conversation::{
+    ApiClient, ApiRequest, AssistantEvent, ProviderContextInventory, RuntimeError,
+    ToolContractScope,
+};
 use futures::stream;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -69,6 +72,20 @@ impl ApiClient for ProviderPool {
             }));
         }
         self.clients[idx].stream(request)
+    }
+
+    fn configure_tool_contract_scope(&mut self, scope: ToolContractScope) {
+        for client in &mut self.clients {
+            client.configure_tool_contract_scope(scope);
+        }
+    }
+
+    fn context_inventory(&self) -> ProviderContextInventory {
+        if self.clients.is_empty() {
+            return ProviderContextInventory::default();
+        }
+        let idx = self.current.load(Ordering::Relaxed) % self.clients.len();
+        self.clients[idx].context_inventory()
     }
 }
 

@@ -193,6 +193,19 @@ pub struct ApiRequest {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolContractScope {
+    Minimal,
+    ReadOnly,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderContextInventory {
+    pub tool_count: usize,
+    pub tool_schema_tokens: u64,
+}
+
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
@@ -275,6 +288,19 @@ fn active_rate_per_second(count: u64, active_duration_ms: Option<u64>) -> Option
         .and_then(|duration| rate_per_second(count, duration))
 }
 
+fn tool_contract_scope_for_pattern(
+    pattern: harness_contract::core::ExecutionPattern,
+) -> ToolContractScope {
+    match pattern {
+        harness_contract::core::ExecutionPattern::Direct => ToolContractScope::Minimal,
+        harness_contract::core::ExecutionPattern::Explore
+        | harness_contract::core::ExecutionPattern::Deliberate => ToolContractScope::ReadOnly,
+        harness_contract::core::ExecutionPattern::Execute
+        | harness_contract::core::ExecutionPattern::Collaborate
+        | harness_contract::core::ExecutionPattern::Supervise => ToolContractScope::Full,
+    }
+}
+
 fn apply_runtime_budget_to_control_policy(
     policy: &mut RuntimeControlPolicy,
     budget_plan: &RuntimeBudgetPlan,
@@ -305,6 +331,12 @@ pub trait ApiClient {
 
     fn provider_available(&self) -> bool {
         true
+    }
+
+    fn configure_tool_contract_scope(&mut self, _scope: ToolContractScope) {}
+
+    fn context_inventory(&self) -> ProviderContextInventory {
+        ProviderContextInventory::default()
     }
 
     /// Convenience: collect all events synchronously (backward compat).
@@ -512,7 +544,7 @@ fn vision_index_summary(payload: &PreparedVisionPayload) -> String {
     )
 }
 
-fn vision_tool_model_summary(payload: &PreparedVisionPayload, raw_ref: &EvidenceRef) -> String {
+fn vision_tool_model_receipt(payload: &PreparedVisionPayload, raw_ref: &EvidenceRef) -> String {
     format!(
         "Tool `vision_analyze` completed. Raw evidence ref: tool://{}. Image input is attached as a structured vision block for the next model call. path={}, media_type={}, size_bytes={}, prompt={}",
         raw_ref.id(),
@@ -687,6 +719,8 @@ pub struct ConversationRuntime<C, T> {
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
     turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
+    /// Per-turn component accounting and tool-result lease consumption.
+    turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.
     last_context_turn_report: std::sync::Mutex<Option<ContextTurnReport>>,
     /// Knowledge activation report prepared from the active memory packet.
@@ -910,6 +944,10 @@ where
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
+            turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
+                initial_budget_plan.effective_context_budget,
+                initial_budget_plan.tool_result_budget.max_total_tokens as u64,
+            )),
             last_context_turn_report: std::sync::Mutex::new(None),
             turn_knowledge_report: std::sync::Mutex::new(None),
             write_semaphore: Arc::new(Semaphore::new(
@@ -1456,6 +1494,9 @@ where
         let mut report = ContextTurnReport::new(turn_id.to_string(), pressure)
             .with_output_token_estimate(u64::from(usage.output_tokens))
             .with_governance_decision(decision);
+        if let Ok(ledger) = self.turn_context_ledger.lock() {
+            report = report.with_ledger(ledger.projection());
+        }
         if let Some(receipt) = compaction_receipt {
             report = report.with_compaction_receipt(receipt);
         }
@@ -2225,6 +2266,13 @@ where
                 execution_decision.blocked_reasons.join("; ")
             )));
         }
+        let turn_budget_plan = self.runtime_budget_plan();
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            ledger.reset(
+                turn_budget_plan.effective_context_budget,
+                turn_budget_plan.tool_result_budget.max_total_tokens as u64,
+            );
+        }
         let runtime_turn_id = self
             .session_input_stream
             .active_turn_id()
@@ -2277,6 +2325,10 @@ where
             &execution_decision.strategy.understanding,
         );
         let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
+        self.api_client
+            .configure_tool_contract_scope(tool_contract_scope_for_pattern(
+                execution_decision.pattern(),
+            ));
         self.record_runtime_policy_decision(&execution_decision, user_sequence);
         let execution_decision_guidance =
             crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
@@ -2474,6 +2526,7 @@ where
                     for attempt in 0..max_retries {
                         let mut req = request.clone();
                         req.model = model.to_string();
+                        self.record_provider_context_request(&req, iterations);
 
                         let stream_idle_timeout = stream_idle_timeout_for_messages(&req.messages);
                         let mut stream = self.api_client.stream(req);
@@ -2719,6 +2772,7 @@ where
             }
 
             if let Some(usage) = turn_usage {
+                self.reconcile_provider_context_usage(usage);
                 self.usage_tracker.record(usage);
                 if let Some(cb) = &self.tool_callback {
                     cb.on_usage(&usage);
@@ -2816,6 +2870,12 @@ where
             }
             blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
+                self.record_context_component(
+                    crate::context_ledger::ContextComponentKind::ToolInput,
+                    crate::context_ledger::estimate_text_tokens(input),
+                    Some(format!("tool-input:{id}:{name}")),
+                    iterations,
+                );
                 blocks.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -3780,7 +3840,6 @@ where
                 }
 
                 let start = Instant::now();
-                let tool_exec = Arc::clone(&self.tool_executor);
                 let tname = tool_name.to_string();
                 let tname_for_err = tname.clone();
                 let tinput = effective_input.clone();
@@ -3793,30 +3852,38 @@ where
                 let tool_timeout = self
                     .tool_timeout
                     .map_or(registry_timeout, |t| t.min(registry_timeout));
-                let (output, mut is_error, mut failure_kind) = match tokio::time::timeout(
-                    tool_timeout,
-                    tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
-                )
-                .await
-                {
-                    Ok(Ok(Ok(output))) => (output, false, None),
-                    Ok(Ok(Err(error))) => (
-                        error.to_string(),
-                        true,
-                        Some(ToolFailureKind::ExecutionError),
-                    ),
-                    Ok(Err(join_error)) => (
-                        format!("tool execution panicked: {join_error}"),
-                        true,
-                        Some(ToolFailureKind::Panic),
-                    ),
-                    Err(_elapsed) => {
-                        tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
-                        (
-                            format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                let (output, mut is_error, mut failure_kind) = if tool_name == "evidence_retrieve" {
+                    match self.retrieve_tool_evidence(&effective_input) {
+                        Ok(output) => (output, false, None),
+                        Err(error) => (error, true, Some(ToolFailureKind::ExecutionError)),
+                    }
+                } else {
+                    let tool_exec = Arc::clone(&self.tool_executor);
+                    match tokio::time::timeout(
+                        tool_timeout,
+                        tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(output))) => (output, false, None),
+                        Ok(Ok(Err(error))) => (
+                            error.to_string(),
                             true,
-                            Some(ToolFailureKind::Timeout),
-                        )
+                            Some(ToolFailureKind::ExecutionError),
+                        ),
+                        Ok(Err(join_error)) => (
+                            format!("tool execution panicked: {join_error}"),
+                            true,
+                            Some(ToolFailureKind::Panic),
+                        ),
+                        Err(_elapsed) => {
+                            tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
+                            (
+                                format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                                true,
+                                Some(ToolFailureKind::Timeout),
+                            )
+                        }
                     }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -3882,7 +3949,6 @@ where
                     .as_ref()
                     .map(vision_index_summary)
                     .unwrap_or_else(|| combined.clone());
-                self.maybe_index_tool_output(tool_use_id, tool_name, &indexable_output);
                 let raw_ref = self.record_tool_raw_evidence(
                     tool_use_id,
                     tool_name,
@@ -3891,14 +3957,28 @@ where
                     is_error,
                     elapsed_ms,
                 );
+                self.maybe_index_tool_output(raw_ref.id(), tool_name, &indexable_output);
                 let completed_record =
                     completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()));
                 let model_summary = prepared_vision
                     .as_ref()
-                    .map(|payload| vision_tool_model_summary(payload, &raw_ref))
+                    .map(|payload| vision_tool_model_receipt(payload, &raw_ref))
                     .unwrap_or_else(|| {
-                        self.tool_model_summary(tool_name, &combined, is_error, &raw_ref)
+                        self.tool_model_receipt(tool_name, &combined, is_error, &raw_ref)
                     });
+                if prepared_vision.is_some() {
+                    let receipt_tokens =
+                        crate::context_ledger::estimate_text_tokens(&model_summary);
+                    if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+                        let _ = ledger.reserve_tool_result(receipt_tokens);
+                    }
+                    self.record_context_component(
+                        crate::context_ledger::ContextComponentKind::ToolResult,
+                        receipt_tokens,
+                        Some(format!("tool://{}", raw_ref.id())),
+                        iterations,
+                    );
+                }
                 self.emit_tool_completed(
                     tool_use_id,
                     tool_name,
@@ -5445,6 +5525,201 @@ where
         }
     }
 
+    fn retrieve_tool_evidence(&self, input: &str) -> Result<String, String> {
+        let request: serde_json::Value = serde_json::from_str(input)
+            .map_err(|error| format!("invalid evidence retrieval input: {error}"))?;
+        let evidence_ref = request
+            .get("evidence_ref")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "evidence_ref is required".to_string())?;
+        let evidence_id = evidence_ref.strip_prefix("tool://").unwrap_or(evidence_ref);
+        let query = request
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let limit = request
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(4)
+            .clamp(1, 16) as usize;
+        let Some(sandbox) = self.tool_output_sandbox.as_ref() else {
+            return Err("tool evidence sandbox is unavailable".to_string());
+        };
+        let sandbox = sandbox
+            .lock()
+            .map_err(|_| "tool evidence sandbox lock poisoned".to_string())?;
+        let mut snippets = if query.is_empty() {
+            sandbox.read(evidence_id, limit)
+        } else {
+            sandbox.search(evidence_id, query, limit)
+        };
+        if snippets.is_empty() && !query.is_empty() {
+            let normalized_query = query
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if normalized_query != query && !normalized_query.is_empty() {
+                snippets = sandbox.search(evidence_id, &normalized_query, limit);
+            }
+        }
+        if snippets.is_empty() {
+            return Err(format!(
+                "no indexed evidence matched `{evidence_ref}`; use the session evidence API for the immutable raw payload"
+            ));
+        }
+        serde_json::to_string_pretty(
+            &snippets
+                .iter()
+                .map(|snippet| {
+                    serde_json::json!({
+                        "range_start": snippet.line_start,
+                        "range_end": snippet.line_end,
+                        "content": snippet.content,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| format!("evidence retrieval serialization failed: {error}"))
+    }
+
+    fn record_context_component(
+        &self,
+        component: crate::context_ledger::ContextComponentKind,
+        tokens: u64,
+        reference: Option<String>,
+        request_sequence: usize,
+    ) {
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            ledger.record(component, tokens, reference, request_sequence);
+        }
+    }
+
+    fn record_provider_context_request(&self, request: &ApiRequest, request_sequence: usize) {
+        let mut system_tokens =
+            crate::context_ledger::estimate_text_tokens(&request.system_prompt.join("\n\n"));
+        let mut history_tokens = 0u64;
+        let mut tool_input_tokens = 0u64;
+        let mut tool_result_tokens = 0u64;
+        for block in request
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+        {
+            match block {
+                ContentBlock::Text { text } => {
+                    history_tokens = history_tokens
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(text));
+                }
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => {
+                    history_tokens = history_tokens
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(media_type))
+                        .saturating_add((data.len() as u64).div_ceil(4));
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    history_tokens = history_tokens
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(thinking));
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    tool_input_tokens = tool_input_tokens
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(id))
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(name))
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(input));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    ..
+                } => {
+                    tool_result_tokens = tool_result_tokens
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(tool_use_id))
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(tool_name))
+                        .saturating_add(crate::context_ledger::estimate_text_tokens(output));
+                }
+            }
+        }
+        let mut memory_tokens = 0u64;
+        let mut handoff_tokens = 0u64;
+        if let Some(envelope) = self.last_context_envelope() {
+            for item in envelope.selected {
+                match item.source {
+                    ContextSourceKind::Memory
+                    | ContextSourceKind::Knowledge
+                    | ContextSourceKind::Fact
+                    | ContextSourceKind::Matrix => {
+                        memory_tokens = memory_tokens.saturating_add(item.token_estimate);
+                    }
+                    ContextSourceKind::AgentPeer | ContextSourceKind::Handoff => {
+                        handoff_tokens = handoff_tokens.saturating_add(item.token_estimate);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        system_tokens = system_tokens.saturating_sub(memory_tokens.saturating_add(handoff_tokens));
+        let inventory = self.api_client.context_inventory();
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            ledger.begin_request(request_sequence);
+        }
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::System,
+            system_tokens,
+            Some(format!("provider-request:{request_sequence}:system")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::History,
+            history_tokens,
+            Some(format!("provider-request:{request_sequence}:history")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::Memory,
+            memory_tokens,
+            Some(format!("provider-request:{request_sequence}:memory")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::AgentHandoff,
+            handoff_tokens,
+            Some(format!("provider-request:{request_sequence}:handoff")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::ToolInput,
+            tool_input_tokens,
+            Some(format!("provider-request:{request_sequence}:tool-input")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::ToolResult,
+            tool_result_tokens,
+            Some(format!("provider-request:{request_sequence}:tool-result")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::ToolSchema,
+            inventory.tool_schema_tokens,
+            Some(format!(
+                "provider-request:{request_sequence}:tools:{}",
+                inventory.tool_count
+            )),
+            request_sequence,
+        );
+    }
+
+    fn reconcile_provider_context_usage(&self, usage: TokenUsage) {
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            ledger.reconcile_input_tokens(u64::from(usage.input_tokens));
+        }
+    }
+
     fn record_tool_raw_evidence(
         &self,
         tool_use_id: &str,
@@ -5454,7 +5729,16 @@ where
         is_error: bool,
         duration_ms: u64,
     ) -> EvidenceRef {
-        let evidence_id = format!("tool-raw-{}-{}", tool_use_id, uuid::Uuid::new_v4());
+        let content_hash = model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes());
+        let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
+        let is_new = self
+            .turn_context_ledger
+            .lock()
+            .map(|mut ledger| ledger.register_evidence_hash(evidence_id.clone()))
+            .unwrap_or(true);
+        if !is_new {
+            return EvidenceRef::new("tool", evidence_id);
+        }
         let Some(ref store) = self.session_store else {
             return EvidenceRef::new("tool", evidence_id);
         };
@@ -5470,6 +5754,7 @@ where
             "duration_ms": duration_ms,
             "line_count": output.lines().count(),
             "byte_count": output.len(),
+            "content_hash": format!("{content_hash:016x}"),
             "raw": output,
         });
         let store = Arc::clone(store);
@@ -5505,23 +5790,38 @@ where
         EvidenceRef::new("tool", evidence_id)
     }
 
-    fn tool_model_summary(
+    fn tool_model_receipt(
         &self,
         tool_name: &str,
         output: &str,
         is_error: bool,
         raw_ref: &EvidenceRef,
     ) -> String {
-        let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
-        let max_chars = if is_error { 1_200 } else { 900 };
-        let preview = preview_chars(&collapsed, max_chars);
-        format!(
-            "Tool `{}` {}. Raw evidence ref: {}. Summary: {}",
+        let raw_tokens = crate::context_ledger::estimate_text_tokens(output);
+        let per_tool_limit = self
+            .runtime_budget_plan()
+            .tool_result_budget
+            .per_tool_max_tokens as u64;
+        let requested = raw_tokens.min(per_tool_limit).max(1);
+        let granted = self
+            .turn_context_ledger
+            .lock()
+            .map(|mut ledger| ledger.reserve_tool_result(requested))
+            .unwrap_or(requested);
+        let receipt = crate::context_evidence::build_tool_receipt(
             tool_name,
-            if is_error { "failed" } else { "completed" },
-            format!("tool://{}", raw_ref.id()),
-            preview
-        )
+            output,
+            is_error,
+            raw_ref.clone(),
+            granted.max(24),
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::ToolResult,
+            receipt.receipt_tokens,
+            Some(format!("tool://{}", raw_ref.id())),
+            self.session().messages.len(),
+        );
+        receipt.summary
     }
 
     #[allow(dead_code)]
@@ -7157,6 +7457,34 @@ mod tests {
         assert_eq!(lease.task_contract, "review implementation");
         assert_eq!(lease.max_tokens, 2_048);
         assert_eq!(sub_agent.agent_id(), lease.child_agent_id);
+    }
+
+    #[test]
+    fn model_can_retrieve_a_focused_chunk_from_tool_evidence() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let evidence_id = "tool-raw-call-1-deadbeef";
+        let output = format!(
+            "{} target_failure_code {}",
+            "ordinary evidence ".repeat(1_200),
+            "remaining evidence ".repeat(1_200)
+        );
+        runtime.maybe_index_tool_output(evidence_id, "read_file", &output);
+
+        let retrieved = runtime
+            .retrieve_tool_evidence(&format!(
+                r#"{{"evidence_ref":"tool://{evidence_id}","query":"target_failure_code","limit":2}}"#
+            ))
+            .expect("focused evidence should be retrievable");
+
+        assert!(retrieved.contains("target_failure_code"));
+        assert!(retrieved.len() < output.len());
     }
 
     #[test]

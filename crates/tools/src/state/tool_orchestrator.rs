@@ -97,6 +97,7 @@ impl ToolSafetyCategory {
             | "ask_user_question"
             | "tool_search"
             | "runtime_capabilities"
+            | "evidence_retrieve"
             | "list_mcp_resources"
             | "read_mcp_resource" => Self::ReadOnly,
 

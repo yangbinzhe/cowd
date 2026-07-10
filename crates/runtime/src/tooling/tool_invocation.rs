@@ -166,6 +166,12 @@ impl ToolInvocationRecord {
     pub fn with_full_output_ref(mut self, full_output_ref: impl Into<String>) -> Self {
         let full_output_ref = full_output_ref.into();
         if !full_output_ref.trim().is_empty() {
+            if let Some(output_ref) = self.output_ref.as_mut() {
+                output_ref.ref_id.clone_from(&full_output_ref);
+                output_ref.search_hint = format!(
+                    "Use evidence_retrieve with evidence_ref `{full_output_ref}` and a focused query."
+                );
+            }
             self.full_output_ref = Some(full_output_ref);
         }
         self
@@ -406,7 +412,7 @@ fn large_output_ref(
     byte_count: usize,
     output_ref_min_lines: usize,
 ) -> Option<ToolOutputRef> {
-    if line_count < output_ref_min_lines {
+    if line_count < output_ref_min_lines && byte_count < 16_000 {
         return None;
     }
     let sha256 = stable_hash(output);
@@ -417,7 +423,7 @@ fn large_output_ref(
         line_count,
         byte_count,
         sha256,
-        search_hint: format!("/sandbox-search {tool_call_id} <query>"),
+        search_hint: format!("Tool output `{tool_call_id}` will receive an evidence reference."),
     })
 }
 
@@ -545,10 +551,35 @@ mod tests {
             .starts_with("tool-output:toolu-large"));
         assert_eq!(
             event.payload["output_ref"]["search_hint"],
-            "/sandbox-search toolu-large <query>"
+            "Tool output `toolu-large` will receive an evidence reference."
         );
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(!serialized.contains("unique-large-output-token-79"));
+    }
+
+    #[test]
+    fn immutable_evidence_ref_replaces_the_transient_output_hint() {
+        let output = "large evidence\n".repeat(100);
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-large",
+            "bash",
+            "generate",
+            ToolSafetyCategory::WriteLocal,
+            200,
+        )
+        .completed_with_output_policy(&output, 250, 3)
+        .with_full_output_ref("tool://tool-raw-toolu-large-deadbeef");
+
+        assert_eq!(
+            record.evidence_reference(),
+            "tool://tool-raw-toolu-large-deadbeef"
+        );
+        assert!(record
+            .output_ref
+            .as_ref()
+            .is_some_and(|reference| reference.search_hint.contains("evidence_retrieve")));
     }
 
     #[test]

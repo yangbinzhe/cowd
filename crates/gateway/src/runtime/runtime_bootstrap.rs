@@ -424,6 +424,23 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             }),
             required_permission: ToolPermissionMode::WorkspaceWrite,
         },
+        RuntimeToolDefinition {
+            name: "evidence_retrieve".to_string(),
+            description: Some(
+                "Retrieve selected chunks from an immutable tool evidence reference returned by a prior tool receipt. Use a focused query when the raw result is large.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "evidence_ref": { "type": "string", "description": "tool:// evidence reference from a prior receipt" },
+                    "query": { "type": "string", "description": "Optional FTS query; omit to read the first chunks" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 16 }
+                },
+                "required": ["evidence_ref"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
     ]
 }
 
@@ -545,5 +562,15 @@ mod tests {
         assert!(capability_tool.input_schema["properties"]["detail"]["enum"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "budget_controls")));
+
+        let evidence_tool = tools
+            .iter()
+            .find(|tool| tool.name == "evidence_retrieve")
+            .expect("evidence retrieval tool");
+        assert_eq!(
+            evidence_tool.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        assert_eq!(evidence_tool.input_schema["required"][0], "evidence_ref");
     }
 }

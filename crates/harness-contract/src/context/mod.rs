@@ -528,6 +528,8 @@ pub struct ContextTurnReport {
     pub governance_decision: Option<ContextGovernanceDecision>,
     pub compaction_receipt: Option<CompactionReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<ContextLedgerProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge::KnowledgeTurnReport>,
 }
 
@@ -544,8 +546,15 @@ impl ContextTurnReport {
             observations: Vec::new(),
             governance_decision: None,
             compaction_receipt: None,
+            ledger: None,
             knowledge: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: ContextLedgerProjection) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     #[must_use]
@@ -584,6 +593,26 @@ impl ContextTurnReport {
         self.knowledge = Some(report);
         self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextComponentUsage {
+    pub kind: String,
+    pub tokens: u64,
+    pub occurrences: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextLedgerProjection {
+    pub max_tokens: u64,
+    pub consumed_tokens: u64,
+    pub remaining_tokens: u64,
+    pub tool_result_limit: u64,
+    pub tool_result_consumed: u64,
+    pub components: Vec<ContextComponentUsage>,
+    pub request_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_input_tokens: Option<u64>,
 }
 
 impl EvidenceRef {

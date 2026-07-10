@@ -55,6 +55,10 @@ mod json;
 pub use json::JsonValue;
 #[path = "context/budget_policy.rs"]
 pub mod budget_policy;
+#[path = "context/evidence/mod.rs"]
+pub mod context_evidence;
+#[path = "context/ledger/mod.rs"]
+pub mod context_ledger;
 #[path = "context/context_profiler.rs"]
 pub mod context_profiler;
 #[path = "context/context_runtime.rs"]
@@ -380,8 +384,8 @@ pub use control_plane::{global_runtime_control_plane, global_task_registry, Runt
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, image_user_message_from_path,
     ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, CancellationToken,
-    ConversationRuntime, MemoryCallback, PromptCacheEvent, RuntimeError, StaticToolExecutor,
-    ToolCallback, ToolError, ToolExecutor, TurnSummary,
+    ConversationRuntime, MemoryCallback, PromptCacheEvent, ProviderContextInventory, RuntimeError,
+    StaticToolExecutor, ToolCallback, ToolContractScope, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CowdEvent, CowdEventBus, RunModelTelemetry, RuntimePolicyDecisionSummary,

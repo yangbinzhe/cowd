@@ -11,7 +11,8 @@ use provider::{
 
 use crate::{
     resolve_global_provider, ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock,
-    ConversationMessage, MessageRole, PromptCacheEvent, RuntimeError,
+    ConversationMessage, MessageRole, PromptCacheEvent, ProviderContextInventory, RuntimeError,
+    ToolContractScope,
 };
 
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
@@ -26,6 +27,7 @@ struct ProviderEntry {
 pub struct ProviderRuntimeClient {
     chain: Vec<ProviderEntry>,
     tool_definitions: Vec<ToolDefinition>,
+    active_tool_scope: ToolContractScope,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
@@ -66,6 +68,7 @@ impl ProviderRuntimeClient {
         Ok(Self {
             chain,
             tool_definitions,
+            active_tool_scope: ToolContractScope::Full,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -126,6 +129,34 @@ impl ProviderRuntimeClient {
         }
         self.chain.dedup_by(|a, b| a.model == b.model);
     }
+
+    fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tool_definitions
+            .iter()
+            .filter(|definition| tool_visible_in_scope(&definition.name, self.active_tool_scope))
+            .cloned()
+            .collect()
+    }
+}
+
+fn tool_visible_in_scope(name: &str, scope: ToolContractScope) -> bool {
+    if scope == ToolContractScope::Full {
+        return true;
+    }
+    let normalized = name.to_ascii_lowercase();
+    let discovery = matches!(
+        normalized.as_str(),
+        "runtime_capabilities" | "runtime_orchestrate" | "tool_search" | "list_tools"
+    );
+    if discovery || scope == ToolContractScope::Minimal {
+        return discovery;
+    }
+    [
+        "read", "grep", "glob", "search", "find", "list", "get", "inspect", "status", "snapshot",
+        "query", "fetch", "retrieve",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
@@ -175,6 +206,21 @@ impl ApiClient for ProviderRuntimeClient {
         };
         Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
     }
+
+    fn configure_tool_contract_scope(&mut self, scope: ToolContractScope) {
+        self.active_tool_scope = scope;
+    }
+
+    fn context_inventory(&self) -> ProviderContextInventory {
+        let tools = self.active_tool_definitions();
+        let tool_schema_tokens = serde_json::to_string(&tools)
+            .map(|json| crate::context_ledger::estimate_text_tokens(&json))
+            .unwrap_or(0);
+        ProviderContextInventory {
+            tool_count: tools.len(),
+            tool_schema_tokens,
+        }
+    }
 }
 
 impl ProviderRuntimeClient {
@@ -185,7 +231,8 @@ impl ProviderRuntimeClient {
         let messages = convert_messages(&request.messages);
         let system =
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
-        let tool_choice = (!self.tool_definitions.is_empty()).then_some(ToolChoice::Auto);
+        let active_tools = self.active_tool_definitions();
+        let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let needs_vision = request_has_image_input(&messages);
         let chain = self.candidate_chain(&request.model, needs_vision);
@@ -196,7 +243,7 @@ impl ProviderRuntimeClient {
                 max_tokens: max_tokens_for_model(&entry.model),
                 messages: messages.clone(),
                 system: system.clone(),
-                tools: (!self.tool_definitions.is_empty()).then(|| self.tool_definitions.clone()),
+                tools: (!active_tools.is_empty()).then(|| active_tools.clone()),
                 tool_choice: tool_choice.clone(),
                 stream: true,
                 reasoning_effort: self.reasoning_effort.clone(),
@@ -523,8 +570,62 @@ fn prompt_cache_record_to_runtime_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_vision_unsupported, request_has_image_input};
+    use super::{looks_like_vision_unsupported, request_has_image_input, tool_visible_in_scope};
     use provider::{ApiError, ImageSource, InputContentBlock, InputMessage};
+
+    use crate::ToolContractScope;
+
+    #[test]
+    fn minimal_scope_only_exposes_runtime_discovery() {
+        assert!(tool_visible_in_scope(
+            "runtime_capabilities",
+            ToolContractScope::Minimal
+        ));
+        assert!(tool_visible_in_scope(
+            "runtime_orchestrate",
+            ToolContractScope::Minimal
+        ));
+        assert!(!tool_visible_in_scope(
+            "read_file",
+            ToolContractScope::Minimal
+        ));
+        assert!(!tool_visible_in_scope(
+            "write_file",
+            ToolContractScope::Minimal
+        ));
+    }
+
+    #[test]
+    fn readonly_scope_keeps_inspection_and_rejects_mutation() {
+        assert!(tool_visible_in_scope(
+            "workspace_snapshot",
+            ToolContractScope::ReadOnly
+        ));
+        assert!(tool_visible_in_scope(
+            "grep_many",
+            ToolContractScope::ReadOnly
+        ));
+        assert!(!tool_visible_in_scope(
+            "apply_patch",
+            ToolContractScope::ReadOnly
+        ));
+        assert!(!tool_visible_in_scope(
+            "shell_exec",
+            ToolContractScope::ReadOnly
+        ));
+    }
+
+    #[test]
+    fn full_scope_keeps_every_registered_contract() {
+        assert!(tool_visible_in_scope(
+            "apply_patch",
+            ToolContractScope::Full
+        ));
+        assert!(tool_visible_in_scope(
+            "custom_domain_tool",
+            ToolContractScope::Full
+        ));
+    }
 
     #[test]
     fn request_has_image_input_detects_structured_image_blocks() {
